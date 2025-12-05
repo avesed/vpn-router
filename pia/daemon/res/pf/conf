@@ -1,0 +1,26 @@
+# This root anchor file establishes multiple sub-anchors which can be
+# individually turned on or off; they have a numeric prefix in order to
+# produce a well-defined alphabetical order.
+
+rdr-anchor "000.stubDNS"
+anchor "000.allowLoopback"
+anchor "100.blockAll"
+anchor "200.allowVPN"
+anchor "250.blockIPv6"
+anchor "290.allowDHCP"
+anchor "299.allowIPv6Prefix"
+anchor "305.allowSubnets"
+anchor "400.allowPIA"
+anchor "450.routeDefaultApps4"
+anchor "450.routeDefaultApps6"
+anchor "460.routeBypassApps4"
+anchor "460.routeBypassApps6"
+anchor "470.routeVpnOnlyApps4"
+anchor "470.routeVpnOnlyApps6"
+anchor "490.allowLAN"
+anchor "500.blockDNS"
+anchor "510.stubDNS"
+anchor "520.allowHnsd"
+
+# For debugging and testing
+anchor "999.override"

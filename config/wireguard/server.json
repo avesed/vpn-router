@@ -1,0 +1,18 @@
+{
+  "interface": {
+    "name": "wg-ingress",
+    "address": "10.23.0.1/24",
+    "listen_port": 36100,
+    "mtu": 1420,
+    "private_key": "c/UlvHemJEFch8oLNgIPNaVg9LBzvnpf2Nqt87TILRY="
+  },
+  "peers": [
+    {
+      "name": "testclient",
+      "public_key": "YCQgMy8bRt9gh7L9xMmimw+GiRADINKcqw8aj7Q1YnU=",
+      "allowed_ips": [
+        "10.23.0.4/32"
+      ]
+    }
+  ]
+}

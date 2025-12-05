@@ -1,0 +1,12 @@
+[Unit]
+Description={{BRAND_NAME}} daemon
+After=syslog.target network.target
+
+[Service]
+Environment="LD_LIBRARY_PATH=/opt/{{BRAND_CODE}}vpn/lib"
+ExecStart=/opt/{{BRAND_CODE}}vpn/bin/{{BRAND_CODE}}-daemon
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Build outputs
+/frontend/dist/
+/out/
+/build/
+/build-*/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Config files with sensitive data
+/config/pia-profiles.json
+/config/sing-box.json
+/config/sing-box.generated.json
+/config/custom-egress.json
+/config/rulesets/
+
+# Downloaded rule lists (regeneratable)
+/domain-list/
+/ip-list/
+/config/domain-list/
+/config/ip-list/
+
+# Test WireGuard configs
+/test-wg/
+
+# IDE & editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# Claude Code
+.claude/
+
+# Misc
+coverage/
+.cache/
+tmp/

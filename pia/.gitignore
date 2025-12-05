@@ -1,0 +1,40 @@
+/qbs/
+/out/
+/build-*/
+# Local build variable defaults (see rake/util/buildenv.rb)
+.buildenv
+# Default build directory when opening CMake glue project in most IDEs
+/build/
+# Cache directory used in CI to store the clone of kapps-swift-package, which we
+# must commit to in order to publish a Swift package
+/cache/
+.DS_Store
+*.qm
+node_modules
+releases
+*.qmlc
+# Various IDEs
+# Qt Creator project preferences
+*.user
+# KDevelop / Kate
+*.kdev4
+*.swp
+# IntelliJ IDEA
+.idea/*
+cmake-build-debug/*
+# Visual Studio
+/.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+/Debug/
+.vscode/
+
+# Vagrant box for running Linux-only scripts
+tools/.vagrant
+
+# Ruby gemfile lock 
+Gemfile.lock
+
+# Ruby coverage results from simplecov
+coverage

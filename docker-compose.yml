@@ -1,0 +1,46 @@
+services:
+  vpn-gateway:
+    container_name: vpn-gateway
+    build:
+      context: .
+    image: vpn-gateway:latest
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+      net.ipv4.conf.default.rp_filter: "0"
+    environment:
+      - TZ=Asia/Shanghai
+      - DISABLE_IPV6=1
+      - PIA_USERNAME=${PIA_USERNAME:-}
+      - PIA_PASSWORD=${PIA_PASSWORD:-}
+      - WG_SERVER_ENDPOINT=${WG_SERVER_ENDPOINT:-}
+    ports:
+      - "36100:36100/udp"
+      - "8000:8000"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./config:/etc/sing-box
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sing-box", "check", "-c", "/etc/sing-box/sing-box.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    container_name: vpn-gateway-frontend
+    build:
+      context: ./frontend
+    image: vpn-gateway-frontend:latest
+    ports:
+      - "5173:80"
+    depends_on:
+      - vpn-gateway
+    restart: unless-stopped

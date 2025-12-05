@@ -1,0 +1,9 @@
+profiles:
+- description: 美国测试线路
+  dns_strategy: direct-dns
+  name: us_test
+  region_id: us_atlanta
+- description: canada-on
+  dns_strategy: direct-dns
+  name: canada_on
+  region_id: ca_ontario-so
