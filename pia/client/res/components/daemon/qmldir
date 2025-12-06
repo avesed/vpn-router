@@ -1,2 +1,0 @@
-module PIA.Daemon
-singleton Daemon Daemon.qml

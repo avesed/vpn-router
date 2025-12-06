@@ -14,10 +14,21 @@ GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.gener
 WG_CONFIG_PATH="${WG_CONFIG_PATH:-/etc/sing-box/wireguard/server.json}"
 RULESET_DIR="${RULESET_DIR:-/etc/sing-box}"
 GEO_DATA_READY_FLAG="${RULESET_DIR}/.geodata-ready"
+USER_DB_PATH="${USER_DB_PATH:-/etc/sing-box/user-config.db}"
 
 if [ ! -f "${BASE_CONFIG_PATH}" ]; then
   echo "[entrypoint] config ${BASE_CONFIG_PATH} not found" >&2
   exit 1
+fi
+
+# 初始化用户数据库（如果不存在）
+if [ ! -f "${USER_DB_PATH}" ]; then
+  echo "[entrypoint] initializing user database: ${USER_DB_PATH}"
+  python3 /usr/local/bin/init_user_db.py /etc/sing-box
+  if [ $? -ne 0 ]; then
+    echo "[entrypoint] failed to initialize user database" >&2
+    exit 1
+  fi
 fi
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true

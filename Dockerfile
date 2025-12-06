@@ -31,21 +31,26 @@ RUN set -eux; \
 
 COPY --from=singbox-binary /usr/local/bin/sing-box /usr/local/bin/sing-box
 COPY config /etc/sing-box/
-RUN mkdir -p /opt/pia/ca /etc/sing-box/domain-list
+RUN mkdir -p /opt/pia/ca
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY scripts/fetch-geodata.sh /usr/local/bin/fetch-geodata.sh
 COPY scripts/render_singbox.py /usr/local/bin/render_singbox.py
 COPY scripts/pia/pia_provision.py /usr/local/bin/pia_provision.py
 COPY scripts/setup-wg.sh /usr/local/bin/setup-wg.sh
 COPY scripts/api_server.py /usr/local/bin/api_server.py
-COPY scripts/parse_domain_list.py /usr/local/bin/parse_domain_list.py
+COPY scripts/db_helper.py /usr/local/bin/db_helper.py
+COPY scripts/init_user_db.py /usr/local/bin/init_user_db.py
+COPY scripts/get_wg_config.py /usr/local/bin/get_wg_config.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
-COPY domain-list/data /etc/sing-box/domain-list/data
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
     /usr/local/bin/setup-wg.sh /usr/local/bin/api_server.py \
-    /usr/local/bin/parse_domain_list.py && \
-    python3 /usr/local/bin/parse_domain_list.py /etc/sing-box/domain-list/data /etc/sing-box/domain-catalog.json
+    /usr/local/bin/init_user_db.py /usr/local/bin/get_wg_config.py
+
+# Note: Databases and config are mounted via docker-compose volumes
+# - geoip-geodata.db is pre-built and volume-mounted (49 MB, read-only)
+# - user-config.db is auto-created on first run by init_user_db.py
+# - All config files are accessed via: ./config:/etc/sing-box
 
 WORKDIR /etc/sing-box
 VOLUME ["/etc/sing-box"]

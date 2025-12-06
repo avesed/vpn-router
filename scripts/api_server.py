@@ -37,7 +37,19 @@ try:
 except ImportError:
     HAS_QRCODE = False
 
+# 数据库支持
+import sys
+sys.path.insert(0, str(ENTRY_DIR if 'ENTRY_DIR' in dir() else Path("/usr/local/bin")))
+try:
+    from db_helper import get_db
+    HAS_DATABASE = True
+except ImportError:
+    HAS_DATABASE = False
+    print("WARNING: Database helper not available, falling back to JSON storage")
+
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
+GEODATA_DB_PATH = Path(os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db"))
+USER_DB_PATH = Path(os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db"))
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
 PIA_PROFILES_OUTPUT = Path(os.environ.get("PIA_PROFILES_OUTPUT", "/etc/sing-box/pia-profiles.json"))
 WG_CONFIG_PATH = Path(os.environ.get("WG_CONFIG_PATH", "/etc/sing-box/wireguard/server.json"))
@@ -361,27 +373,126 @@ def save_pia_profiles_yaml(profiles: List[Dict[str, Any]]) -> None:
 
 
 def load_custom_rules() -> Dict[str, Any]:
-    """加载自定义路由规则"""
+    """加载自定义路由规则（数据库优先，降级到 JSON）"""
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        # 从数据库加载
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            rules = db.get_routing_rules(enabled_only=True)
+            # 转换为旧格式以保持兼容性
+            legacy_rules = []
+            for rule in rules:
+                legacy_rule = {
+                    "id": rule["id"],
+                    "tag": f"rule-{rule['id']}",
+                    "outbound": rule["outbound"],
+                    "rule_type": rule["rule_type"],
+                    "target": rule["target"],
+                    "priority": rule.get("priority", 0)
+                }
+                legacy_rules.append(legacy_rule)
+            return {"rules": legacy_rules, "default_outbound": "direct", "source": "database"}
+        except Exception as e:
+            print(f"WARNING: Failed to load from database: {e}, falling back to JSON")
+
+    # 降级到 JSON 文件
     if not CUSTOM_RULES_FILE.exists():
-        return {"rules": [], "default_outbound": "direct"}
-    return json.loads(CUSTOM_RULES_FILE.read_text())
+        return {"rules": [], "default_outbound": "direct", "source": "json"}
+    return {**json.loads(CUSTOM_RULES_FILE.read_text()), "source": "json"}
 
 
 def save_custom_rules(data: Dict[str, Any]) -> None:
-    """保存自定义路由规则"""
+    """保存自定义路由规则（仅作为备份）"""
     CUSTOM_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
     CUSTOM_RULES_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
+    """从数据库生成 sing-box 路由规则"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        return []
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    rules_db = db.get_routing_rules(enabled_only=True)
+
+    # 按优先级排序（高优先级在前）
+    rules_db.sort(key=lambda r: r.get("priority", 0), reverse=True)
+
+    singbox_rules = []
+
+    # 按规则类型和出口分组
+    domain_rules = {}  # outbound -> [domains]
+    ip_rules = {}      # outbound -> [cidrs]
+
+    for rule in rules_db:
+        rule_type = rule["rule_type"]
+        target = rule["target"]
+        outbound = rule["outbound"]
+
+        if rule_type == "domain":
+            if outbound not in domain_rules:
+                domain_rules[outbound] = []
+            domain_rules[outbound].append(target)
+
+        elif rule_type == "domain_keyword":
+            singbox_rules.append({
+                "domain_keyword": [target],
+                "outbound": outbound
+            })
+
+        elif rule_type == "ip":
+            if outbound not in ip_rules:
+                ip_rules[outbound] = []
+            ip_rules[outbound].append(target)
+
+        elif rule_type == "geosite":
+            singbox_rules.append({
+                "rule_set": [f"geosite-{target}"],
+                "outbound": outbound
+            })
+
+        elif rule_type == "geoip":
+            singbox_rules.append({
+                "rule_set": [f"geoip-{target}"],
+                "outbound": outbound
+            })
+
+    # 合并同出口的域名规则
+    for outbound, domains in domain_rules.items():
+        if domains:
+            singbox_rules.append({
+                "domain": domains,
+                "outbound": outbound
+            })
+
+    # 合并同出口的 IP 规则
+    for outbound, cidrs in ip_rules.items():
+        if cidrs:
+            singbox_rules.append({
+                "ip_cidr": cidrs,
+                "outbound": outbound
+            })
+
+    return singbox_rules
+
+
 def load_custom_category_items() -> Dict[str, List[Dict]]:
-    """加载分类自定义项目"""
+    """加载分类自定义项目（数据库优先，降级到 JSON）"""
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            return db.get_custom_category_items()
+        except Exception as e:
+            print(f"WARNING: Failed to load custom category items from database: {e}")
+
+    # 降级到 JSON 文件
     if not CUSTOM_CATEGORY_ITEMS_FILE.exists():
         return {}
     return json.loads(CUSTOM_CATEGORY_ITEMS_FILE.read_text())
 
 
 def save_custom_category_items(data: Dict[str, List[Dict]]) -> None:
-    """保存分类自定义项目"""
+    """保存分类自定义项目（仅作为备份）"""
     CUSTOM_CATEGORY_ITEMS_FILE.parent.mkdir(parents=True, exist_ok=True)
     CUSTOM_CATEGORY_ITEMS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
@@ -543,7 +654,13 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
 
 @app.get("/api/pia/profiles")
 def api_get_pia_profiles():
-    return load_pia_profiles_yaml()
+    """获取所有 PIA profiles（从数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    profiles = db.get_pia_profiles(enabled_only=False)
+    return {"profiles": profiles}
 
 
 @app.get("/api/pia/regions")
@@ -557,12 +674,16 @@ def api_get_pia_regions():
 
 @app.get("/api/profiles")
 def api_list_profiles():
-    """获取所有 VPN 线路配置"""
-    profiles_config = load_pia_profiles_yaml()
-    profiles = profiles_config.get("profiles", [])
+    """获取所有 VPN 线路配置（从数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        # 降级到 YAML
+        profiles_config = load_pia_profiles_yaml()
+        profiles = profiles_config.get("profiles", [])
+    else:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        profiles = db.get_pia_profiles(enabled_only=False)
 
     # 获取当前连接状态
-    generated_config = Path("/etc/sing-box/sing-box.generated.json")
     pia_output = {}
     if PIA_PROFILES_OUTPUT.exists():
         pia_output = json.loads(PIA_PROFILES_OUTPUT.read_text()).get("profiles", {})
@@ -581,21 +702,24 @@ def api_list_profiles():
             "server_ip": profile_data.get("server_ip"),
             "server_port": profile_data.get("server_port"),
             "is_connected": bool(profile_data.get("server_ip")),
+            "enabled": p.get("enabled", 1) == 1,
         })
     return {"profiles": result}
 
 
 @app.post("/api/profiles")
 def api_create_profile(payload: ProfileCreateRequest):
-    """创建新的 VPN 线路"""
-    profiles_config = load_pia_profiles_yaml()
-    profiles = profiles_config.get("profiles", [])
+    """创建新的 VPN 线路（存入数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
     # 检查 tag 是否已存在
     name = payload.tag.replace("-", "_")
-    for p in profiles:
-        if p.get("name") == name:
-            raise HTTPException(status_code=400, detail=f"线路 {payload.tag} 已存在")
+    existing = db.get_pia_profile_by_name(name)
+    if existing:
+        raise HTTPException(status_code=400, detail=f"线路 {payload.tag} 已存在")
 
     # 验证 region_id
     regions = fetch_pia_regions()
@@ -603,15 +727,13 @@ def api_create_profile(payload: ProfileCreateRequest):
     if payload.region_id not in valid_region_ids:
         raise HTTPException(status_code=400, detail=f"无效的地区 ID: {payload.region_id}")
 
-    # 添加新 profile
-    new_profile = {
-        "name": name,
-        "description": payload.description,
-        "region_id": payload.region_id,
-        "dns_strategy": "direct-dns",
-    }
-    profiles.append(new_profile)
-    save_pia_profiles_yaml(profiles)
+    # 添加新 profile 到数据库
+    profile_id = db.add_pia_profile(
+        name=name,
+        region_id=payload.region_id,
+        description=payload.description,
+        dns_strategy="direct-dns"
+    )
 
     # 如果有 PIA 凭证，自动配置新线路
     username = os.environ.get("PIA_USERNAME")
@@ -642,49 +764,55 @@ def api_create_profile(payload: ProfileCreateRequest):
 
     return {
         "message": f"线路 {payload.tag} 创建成功" + ("，已自动配置" if provision_result and provision_result.get("success") else "，请重新登录 PIA 以配置"),
-        "profile": new_profile,
+        "profile_id": profile_id,
         "provision": provision_result
     }
 
 
 @app.put("/api/profiles/{tag}")
 def api_update_profile(tag: str, payload: ProfileUpdateRequest):
-    """更新 VPN 线路配置"""
-    profiles_config = load_pia_profiles_yaml()
-    profiles = profiles_config.get("profiles", [])
+    """更新 VPN 线路配置（数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not available")
 
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
     name = tag.replace("-", "_")
-    for p in profiles:
-        if p.get("name") == name:
-            if payload.description is not None:
-                p["description"] = payload.description
-            if payload.region_id is not None:
-                # 验证 region_id
-                regions = fetch_pia_regions()
-                valid_region_ids = [r["id"] for r in regions]
-                if payload.region_id not in valid_region_ids:
-                    raise HTTPException(status_code=400, detail=f"无效的地区 ID: {payload.region_id}")
-                p["region_id"] = payload.region_id
-            save_pia_profiles_yaml(profiles)
-            return {"message": f"线路 {tag} 更新成功"}
+    profile = db.get_pia_profile_by_name(name)
 
-    raise HTTPException(status_code=404, detail=f"线路 {tag} 不存在")
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"线路 {tag} 不存在")
+
+    # 验证 region_id
+    if payload.region_id is not None:
+        regions = fetch_pia_regions()
+        valid_region_ids = [r["id"] for r in regions]
+        if payload.region_id not in valid_region_ids:
+            raise HTTPException(status_code=400, detail=f"无效的地区 ID: {payload.region_id}")
+
+    # 更新数据库
+    db.update_pia_profile(
+        profile_id=profile["id"],
+        description=payload.description,
+        region_id=payload.region_id
+    )
+    return {"message": f"线路 {tag} 更新成功"}
 
 
 @app.delete("/api/profiles/{tag}")
 def api_delete_profile(tag: str):
-    """删除 VPN 线路"""
-    profiles_config = load_pia_profiles_yaml()
-    profiles = profiles_config.get("profiles", [])
+    """删除 VPN 线路（数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not available")
 
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
     name = tag.replace("-", "_")
-    original_len = len(profiles)
-    profiles = [p for p in profiles if p.get("name") != name]
+    profile = db.get_pia_profile_by_name(name)
 
-    if len(profiles) == original_len:
+    if not profile:
         raise HTTPException(status_code=404, detail=f"线路 {tag} 不存在")
 
-    save_pia_profiles_yaml(profiles)
+    # 从数据库删除
+    db.delete_pia_profile(profile["id"])
     return {"message": f"线路 {tag} 已删除"}
 
 
@@ -692,132 +820,190 @@ def api_delete_profile(tag: str):
 
 @app.get("/api/rules")
 def api_get_rules():
-    """获取路由规则配置"""
-    # 从 sing-box 配置中读取当前规则
+    """获取路由规则配置（从数据库读取）"""
+    # 从配置中提取可用出口
     generated_config = Path("/etc/sing-box/sing-box.generated.json")
     config_path = generated_config if generated_config.exists() else CONFIG_PATH
 
-    if not config_path.exists():
-        return {"rules": [], "default_outbound": "direct", "available_outbounds": ["direct"]}
-
-    config = json.loads(config_path.read_text())
-    route = config.get("route", {})
-
-    # 提取可用出口
     available_outbounds = ["direct"]
-    for endpoint in config.get("endpoints", []):
-        if endpoint.get("type") == "wireguard":
-            available_outbounds.append(endpoint.get("tag"))
+    default_outbound = "direct"
 
-    # 提取路由规则
-    rules = []
-    rule_sets = {rs["tag"]: rs for rs in route.get("rule_set", [])}
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        route = config.get("route", {})
+        default_outbound = route.get("final", "direct")
 
-    for rule in route.get("rules", []):
-        rule_set_tags = rule.get("rule_set", [])
-        outbound = rule.get("outbound", "direct")
+        # 提取可用出口
+        for endpoint in config.get("endpoints", []):
+            if endpoint.get("type") == "wireguard":
+                available_outbounds.append(endpoint.get("tag"))
 
-        for rs_tag in rule_set_tags:
-            rs = rule_sets.get(rs_tag, {})
-            if rs.get("type") == "inline":
-                inline_rules = rs.get("rules", [])
-                domains = []
-                for ir in inline_rules:
-                    domains.extend(ir.get("domain_suffix", []))
-                rules.append({
-                    "tag": rs_tag,
+    # 从数据库读取自定义规则
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db_rules = db.get_routing_rules(enabled_only=True)
+
+        # 按 outbound 分组规则
+        rules_by_tag = {}
+        for rule in db_rules:
+            rule_type = rule["rule_type"]
+            target = rule["target"]
+            outbound = rule["outbound"]
+
+            # 使用 outbound 作为 tag（或创建唯一 tag）
+            tag = f"custom-{outbound}"
+
+            if tag not in rules_by_tag:
+                rules_by_tag[tag] = {
+                    "tag": tag,
                     "outbound": outbound,
-                    "domains": domains,
-                    "type": "custom",
-                })
-            else:
-                rules.append({
-                    "tag": rs_tag,
-                    "outbound": outbound,
-                    "type": "geosite" if "geosite" in rs_tag else "geoip",
-                })
+                    "domains": [],
+                    "domain_keywords": [],
+                    "ip_cidrs": [],
+                    "type": "custom"
+                }
 
-    # 加载自定义规则（如果有）
-    custom = load_custom_rules()
+            # 根据规则类型添加到对应字段
+            if rule_type == "domain":
+                rules_by_tag[tag]["domains"].append(target)
+            elif rule_type == "domain_keyword":
+                rules_by_tag[tag]["domain_keywords"].append(target)
+            elif rule_type == "ip":
+                rules_by_tag[tag]["ip_cidrs"].append(target)
+
+        rules = list(rules_by_tag.values())
+    else:
+        # 降级到 JSON 文件
+        custom = load_custom_rules()
+        rules = custom.get("rules", [])
 
     return {
         "rules": rules,
-        "custom_rules": custom.get("rules", []),
-        "default_outbound": route.get("final", "direct"),
+        "default_outbound": default_outbound,
         "available_outbounds": available_outbounds,
     }
 
 
 @app.put("/api/rules")
 def api_update_rules(payload: RouteRulesUpdateRequest):
-    """更新路由规则"""
-    # 保存自定义规则到文件
-    custom_data = {
-        "rules": [r.dict(exclude_none=True) for r in payload.rules],
-        "default_outbound": payload.default_outbound,
-    }
-    save_custom_rules(custom_data)
+    """更新路由规则（数据库版本）"""
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        # 使用数据库存储（方案 B）
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    return {"message": "路由规则已保存，需要重新连接 VPN 生效"}
+        # 先删除所有现有的自定义规则（type == "custom"）
+        # 注意：只删除 type 为 custom 的规则，保留其他规则
+        all_rules = db.get_routing_rules(enabled_only=False)
+        for rule in all_rules:
+            # 删除所有规则以重新创建（简化实现）
+            db.delete_routing_rule(rule["id"])
+
+        # 添加新规则到数据库
+        for rule in payload.rules:
+            # 为每个域名创建一条规则
+            if rule.domains:
+                for domain in rule.domains:
+                    db.add_routing_rule("domain", domain, rule.outbound, priority=0)
+
+            # 为每个关键词创建一条规则
+            if rule.domain_keywords:
+                for keyword in rule.domain_keywords:
+                    db.add_routing_rule("domain_keyword", keyword, rule.outbound, priority=0)
+
+            # 为每个 IP 创建一条规则
+            if rule.ip_cidrs:
+                for cidr in rule.ip_cidrs:
+                    db.add_routing_rule("ip", cidr, rule.outbound, priority=0)
+
+        # 保存到 JSON 作为备份
+        custom_data = {
+            "rules": [r.dict(exclude_none=True) for r in payload.rules],
+            "default_outbound": payload.default_outbound,
+        }
+        save_custom_rules(custom_data)
+
+        return {"message": "路由规则已保存到数据库"}
+    else:
+        # 降级到 JSON 文件存储
+        custom_data = {
+            "rules": [r.dict(exclude_none=True) for r in payload.rules],
+            "default_outbound": payload.default_outbound,
+        }
+        save_custom_rules(custom_data)
+        return {"message": "路由规则已保存，需要重新连接 VPN 生效"}
 
 
 @app.post("/api/rules/custom")
 def api_add_custom_rule(payload: CustomRuleRequest):
-    """添加自定义路由规则"""
+    """添加自定义路由规则（数据库版本）"""
     # 验证至少有一种匹配规则
     if not payload.domains and not payload.domain_keywords and not payload.ip_cidrs:
         raise HTTPException(status_code=400, detail="至少需要提供一种匹配规则（域名、关键词或 IP）")
 
-    # 加载现有规则
-    custom_rules = load_custom_rules()
-    rules = custom_rules.get("rules", [])
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="数据库不可用")
 
-    # 检查标签是否已存在
-    for r in rules:
-        if r.get("tag") == payload.tag:
-            raise HTTPException(status_code=400, detail=f"规则标签 '{payload.tag}' 已存在")
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    added_count = 0
 
-    # 构建新规则
-    new_rule = {
-        "tag": payload.tag,
-        "outbound": payload.outbound,
-    }
-    if payload.domains:
-        new_rule["domains"] = payload.domains
-    if payload.domain_keywords:
-        new_rule["domain_keywords"] = payload.domain_keywords
-    if payload.ip_cidrs:
-        new_rule["ip_cidrs"] = payload.ip_cidrs
+    try:
+        # 添加域名规则
+        if payload.domains:
+            for domain in payload.domains:
+                db.add_routing_rule("domain", domain, payload.outbound, priority=0)
+                added_count += 1
 
-    # 添加规则
-    rules.append(new_rule)
-    custom_rules["rules"] = rules
-    save_custom_rules(custom_rules)
+        # 添加域名关键词规则
+        if payload.domain_keywords:
+            for keyword in payload.domain_keywords:
+                db.add_routing_rule("domain_keyword", keyword, payload.outbound, priority=0)
+                added_count += 1
 
-    return {
-        "message": f"自定义规则 '{payload.tag}' 已添加",
-        "tag": payload.tag,
-        "outbound": payload.outbound,
-    }
+        # 添加 IP 规则
+        if payload.ip_cidrs:
+            for cidr in payload.ip_cidrs:
+                db.add_routing_rule("ip", cidr, payload.outbound, priority=0)
+                added_count += 1
+
+        return {
+            "message": f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）",
+            "tag": payload.tag,
+            "outbound": payload.outbound,
+            "count": added_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"添加规则失败: {str(e)}")
 
 
-@app.delete("/api/rules/custom/{tag}")
-def api_delete_custom_rule(tag: str):
-    """删除自定义路由规则"""
-    custom_rules = load_custom_rules()
-    rules = custom_rules.get("rules", [])
+@app.delete("/api/rules/custom/{rule_id}")
+def api_delete_custom_rule(rule_id: int):
+    """删除自定义路由规则（数据库版本）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="数据库不可用")
 
-    # 查找并删除规则
-    original_count = len(rules)
-    rules = [r for r in rules if r.get("tag") != tag]
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    success = db.delete_routing_rule(rule_id)
 
-    if len(rules) == original_count:
-        raise HTTPException(status_code=404, detail=f"规则 '{tag}' 不存在")
+    if not success:
+        raise HTTPException(status_code=404, detail=f"规则 ID {rule_id} 不存在")
 
-    custom_rules["rules"] = rules
-    save_custom_rules(custom_rules)
+    return {"message": f"规则 ID {rule_id} 已删除"}
 
-    return {"message": f"规则 '{tag}' 已删除"}
+
+@app.delete("/api/rules/custom/by-tag/{tag}")
+def api_delete_custom_rule_by_tag(tag: str):
+    """删除自定义路由规则（通过 tag，兼容旧接口）
+    注意：此端点已废弃，建议使用 DELETE /api/rules/custom/{rule_id}
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    # 由于数据库中没有直接存储 tag，我们无法通过 tag 删除
+    # 返回提示信息，建议使用新的 API
+    raise HTTPException(
+        status_code=410,
+        detail="此 API 已废弃。请使用 DELETE /api/rules/custom/{rule_id} 或通过前端界面删除规则"
+    )
 
 
 @app.post("/api/pia/login")
@@ -1086,25 +1272,76 @@ def api_list_wireguard_peers():
 # ============ Ingress WireGuard Management APIs ============
 
 def load_ingress_config() -> dict:
-    """加载入口 WireGuard 配置"""
-    if not WG_CONFIG_PATH.exists():
-        return {
-            "interface": {
-                "name": "wg-ingress",
-                "address": "10.23.0.1/24",
-                "listen_port": 36100,
-                "mtu": 1420,
-                "private_key": ""
-            },
-            "peers": []
-        }
-    return json.loads(WG_CONFIG_PATH.read_text())
+    """加载入口 WireGuard 配置（从数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        # 降级到 JSON 文件
+        if not WG_CONFIG_PATH.exists():
+            return {
+                "interface": {
+                    "name": "wg-ingress",
+                    "address": "10.23.0.1/24",
+                    "listen_port": 36100,
+                    "mtu": 1420,
+                    "private_key": ""
+                },
+                "peers": []
+            }
+        return json.loads(WG_CONFIG_PATH.read_text())
+
+    # 从数据库加载
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 获取服务器配置
+    server = db.get_wireguard_server()
+    interface_data = {
+        "name": server.get("interface_name", "wg-ingress") if server else "wg-ingress",
+        "address": server.get("address", "10.23.0.1/24") if server else "10.23.0.1/24",
+        "listen_port": server.get("listen_port", 36100) if server else 36100,
+        "mtu": server.get("mtu", 1420) if server else 1420,
+        "private_key": server.get("private_key", "") if server else ""
+    }
+
+    # 获取对等点配置
+    peers = db.get_wireguard_peers(enabled_only=False)
+    peers_data = []
+    for peer in peers:
+        peers_data.append({
+            "id": peer["id"],
+            "name": peer["name"],
+            "public_key": peer["public_key"],
+            "allowed_ips": peer["allowed_ips"].split(",") if isinstance(peer["allowed_ips"], str) else peer["allowed_ips"],
+            "preshared_key": peer.get("preshared_key"),
+            "enabled": peer.get("enabled", 1) == 1
+        })
+
+    return {
+        "interface": interface_data,
+        "peers": peers_data
+    }
 
 
 def save_ingress_config(data: dict) -> None:
-    """保存入口 WireGuard 配置"""
-    WG_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    WG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    """保存入口 WireGuard 配置（到数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        # 降级到 JSON 文件
+        WG_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 保存服务器配置
+    interface = data.get("interface", {})
+    db.set_wireguard_server(
+        interface_name=interface.get("name", "wg-ingress"),
+        address=interface.get("address", "10.23.0.1/24"),
+        listen_port=interface.get("listen_port", 36100),
+        mtu=interface.get("mtu", 1420),
+        private_key=interface.get("private_key", "")
+    )
+
+    # 注意：对等点的添加/删除应该通过专用的 db.add_wireguard_peer() 和 db.delete_wireguard_peer()
+    # 这个函数主要用于保存接口配置，对等点管理在 API 层面单独处理
 
 
 def generate_wireguard_keypair() -> tuple:
@@ -1139,7 +1376,11 @@ def get_next_peer_ip(config: dict) -> str:
     # 收集已用的 IP
     used_ips = {1}  # 1 是网关自己
     for peer in config.get("peers", []):
-        for allowed_ip in peer.get("allowed_ips", []):
+        allowed_ips = peer.get("allowed_ips", [])
+        # 处理数据库中的字符串格式和列表格式
+        if isinstance(allowed_ips, str):
+            allowed_ips = [allowed_ips]
+        for allowed_ip in allowed_ips:
             ip = allowed_ip.split("/")[0]
             if ip.startswith(base):
                 last_octet = int(ip.rsplit(".", 1)[1])
@@ -1320,7 +1561,7 @@ def api_get_ingress():
 
 @app.post("/api/ingress/peers")
 def api_add_ingress_peer(payload: IngressPeerCreateRequest):
-    """添加新的入口 peer（客户端）"""
+    """添加新的入口 peer（客户端）到数据库"""
     config = load_ingress_config()
 
     # 检查名称是否已存在
@@ -1340,18 +1581,26 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
         # 服务端生成密钥对
         client_private_key, client_public_key = generate_wireguard_keypair()
 
-    # 添加 peer
-    new_peer = {
-        "name": payload.name,
-        "public_key": client_public_key,
-        "allowed_ips": [f"{peer_ip}/32"],
-    }
-    config.setdefault("peers", []).append(new_peer)
+    # 添加到数据库
+    if HAS_DATABASE and USER_DB_PATH.exists():
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        peer_id = db.add_wireguard_peer(
+            name=payload.name,
+            public_key=client_public_key,
+            allowed_ips=f"{peer_ip}/32"
+        )
+    else:
+        # 降级到配置文件
+        new_peer = {
+            "name": payload.name,
+            "public_key": client_public_key,
+            "allowed_ips": [f"{peer_ip}/32"],
+        }
+        config.setdefault("peers", []).append(new_peer)
+        save_ingress_config(config)
 
-    # 保存配置
-    save_ingress_config(config)
-
-    # 应用配置
+    # 重新加载配置并应用
+    config = load_ingress_config()
     apply_result = apply_ingress_config(config)
 
     result = {
@@ -1373,20 +1622,31 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
 
 @app.delete("/api/ingress/peers/{peer_name}")
 def api_delete_ingress_peer(peer_name: str):
-    """删除入口 peer"""
+    """删除入口 peer（从数据库）"""
     config = load_ingress_config()
 
-    # 查找并删除
-    original_count = len(config.get("peers", []))
-    config["peers"] = [p for p in config.get("peers", []) if p.get("name") != peer_name]
+    # 查找 peer
+    peer_to_delete = None
+    for peer in config.get("peers", []):
+        if peer.get("name") == peer_name:
+            peer_to_delete = peer
+            break
 
-    if len(config["peers"]) == original_count:
+    if not peer_to_delete:
         raise HTTPException(status_code=404, detail=f"客户端 '{peer_name}' 不存在")
 
-    # 保存配置
-    save_ingress_config(config)
+    # 从数据库删除
+    if HAS_DATABASE and USER_DB_PATH.exists():
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        if "id" in peer_to_delete:
+            db.delete_wireguard_peer(peer_to_delete["id"])
+    else:
+        # 降级到配置文件
+        config["peers"] = [p for p in config.get("peers", []) if p.get("name") != peer_name]
+        save_ingress_config(config)
 
-    # 应用配置
+    # 重新加载配置并应用
+    config = load_ingress_config()
     apply_result = apply_ingress_config(config)
 
     return {
@@ -1763,10 +2023,45 @@ def _regenerate_and_reload():
 # ============ Domain List Catalog APIs ============
 
 def load_domain_catalog() -> dict:
-    """加载域名列表目录"""
-    if not DOMAIN_CATALOG_FILE.exists():
-        return {"categories": {}, "lists": {}}
-    return json.loads(DOMAIN_CATALOG_FILE.read_text())
+    """加载域名列表目录（从数据库读取）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 获取所有分类
+    categories = {}
+    db_categories = db.geodata.get_domain_categories()
+    for cat in db_categories:
+        categories[cat["id"]] = {
+            "name": cat["name"],
+            "description": cat.get("description", ""),
+            "group": cat.get("group_type", "type"),
+            "recommended_exit": cat.get("recommended_exit", "direct"),
+            "lists": []
+        }
+
+    # 获取所有域名列表
+    domain_lists = db.geodata.get_domain_lists()
+
+    # 为每个列表获取样本域名
+    for dlist in domain_lists:
+        list_id = dlist["id"]
+        domain_count = dlist["domain_count"]
+
+        # 获取样本域名（最多10个）
+        sample_domains = db.geodata.get_domains_by_list(list_id, limit=10)
+
+        # 获取该列表所属的分类
+        list_categories = db.geodata.get_list_categories(list_id)
+
+        # 添加到相应分类
+        for cat_id in list_categories:
+            if cat_id in categories:
+                categories[cat_id]["lists"].append({
+                    "id": list_id,
+                    "domain_count": domain_count,
+                    "sample_domains": sample_domains
+                })
+
+    return {"categories": categories}
 
 
 def parse_domain_list_file(name: str, visited: Optional[set] = None) -> dict:
@@ -1932,18 +2227,26 @@ class QuickRuleRequest(BaseModel):
 @app.post("/api/domain-catalog/quick-rule")
 def api_create_quick_rule(payload: QuickRuleRequest):
     """从域名列表快速创建路由规则"""
+    # 使用数据库存储
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
     # 收集所有域名
     all_domains = []
-    catalog = load_domain_catalog()
-    lists = catalog.get("lists", {})
-
     for list_id in payload.list_ids:
-        if list_id in lists:
-            all_domains.extend(lists[list_id].get("domains", []))
-        else:
-            # 尝试直接解析
-            data = parse_domain_list_file(list_id)
-            all_domains.extend(data.get("domains", []))
+        # 直接从数据库读取域名
+        try:
+            domains = db.geodata.get_domains_by_list(list_id, limit=100000)
+            all_domains.extend(domains)
+        except Exception as e:
+            # 如果数据库中找不到，尝试从文件解析
+            try:
+                data = parse_domain_list_file(list_id)
+                all_domains.extend(data.get("domains", []))
+            except Exception:
+                print(f"跳过列表 {list_id}: {e}")
 
     if not all_domains:
         raise HTTPException(status_code=400, detail="没有找到任何域名")
@@ -1956,34 +2259,20 @@ def api_create_quick_rule(payload: QuickRuleRequest):
     if not tag.startswith("custom-"):
         tag = f"custom-{tag}"
 
-    # 加载现有规则
-    custom_rules = load_custom_rules()
-    rules = custom_rules.get("rules", [])
-
-    # 检查是否已存在同名规则
-    existing_tags = [r.get("tag") for r in rules]
-    if tag in existing_tags:
-        # 更新现有规则
-        for r in rules:
-            if r.get("tag") == tag:
-                r["domains"] = all_domains
-                r["outbound"] = payload.outbound
-                break
-    else:
-        # 添加新规则
-        rules.append({
-            "tag": tag,
-            "domains": all_domains,
-            "outbound": payload.outbound,
-        })
-
-    custom_rules["rules"] = rules
-    save_custom_rules(custom_rules)
+    # 将所有域名添加到数据库
+    added_count = 0
+    for domain in all_domains:
+        try:
+            db.add_routing_rule("domain", domain, payload.outbound, priority=0)
+            added_count += 1
+        except Exception as e:
+            # 可能是重复规则，跳过
+            print(f"跳过域名 {domain}: {e}")
 
     return {
-        "message": f"规则 {tag} 已创建，包含 {len(all_domains)} 个域名",
+        "message": f"快速规则已创建，添加了 {added_count} 个域名到数据库",
         "tag": tag,
-        "domain_count": len(all_domains),
+        "domain_count": added_count,
         "outbound": payload.outbound,
     }
 
@@ -2005,35 +2294,42 @@ def api_add_custom_category_item(category_id: str, payload: CustomCategoryItemRe
     # 生成唯一的项目 ID
     item_id = f"custom-{category_id}-{payload.name}"
 
-    # 加载现有自定义项目
-    custom_items = load_custom_category_items()
-    if category_id not in custom_items:
-        custom_items[category_id] = []
+    # 使用数据库存储
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    # 检查是否已存在同名项目
-    existing_ids = [item["id"] for item in custom_items[category_id]]
-    if item_id in existing_ids:
-        raise HTTPException(status_code=400, detail=f"项目 '{payload.name}' 已存在于此分类中")
+        # 检查是否已存在
+        existing_item = db.get_custom_category_item(item_id)
+        if existing_item:
+            raise HTTPException(status_code=400, detail=f"项目 '{payload.name}' 已存在于此分类中")
 
-    # 添加新项目
-    custom_items[category_id].append({
-        "id": item_id,
-        "name": payload.name,
-        "domains": domains,
-        "domain_count": len(domains),
-        "sample_domains": domains[:5],
-    })
+        # 添加到数据库
+        db.add_custom_category_item(category_id, item_id, payload.name, domains)
 
-    save_custom_category_items(custom_items)
+        # 同步保存到 JSON 作为备份
+        custom_items = db.get_custom_category_items()
+        save_custom_category_items(custom_items)
+    else:
+        # 降级到 JSON 文件
+        custom_items = load_custom_category_items()
+        if category_id not in custom_items:
+            custom_items[category_id] = []
 
-    # 同时将域名保存到 catalog lists 缓存，以便 quick-rule 可以使用
-    catalog_lists = catalog.get("lists", {})
-    catalog_lists[item_id] = {
-        "domains": domains,
-        "full_domains": [],
-    }
-    catalog["lists"] = catalog_lists
-    DOMAIN_CATALOG_FILE.write_text(json.dumps(catalog, indent=2, ensure_ascii=False))
+        # 检查是否已存在同名项目
+        existing_ids = [item["id"] for item in custom_items[category_id]]
+        if item_id in existing_ids:
+            raise HTTPException(status_code=400, detail=f"项目 '{payload.name}' 已存在于此分类中")
+
+        # 添加新项目
+        custom_items[category_id].append({
+            "id": item_id,
+            "name": payload.name,
+            "domains": domains,
+            "domain_count": len(domains),
+            "sample_domains": domains[:5],
+        })
+
+        save_custom_category_items(custom_items)
 
     return {
         "message": f"已添加 '{payload.name}' 到 {categories[category_id]['name']}",
@@ -2046,32 +2342,40 @@ def api_add_custom_category_item(category_id: str, payload: CustomCategoryItemRe
 @app.delete("/api/domain-catalog/categories/{category_id}/items/{item_id}")
 def api_delete_custom_category_item(category_id: str, item_id: str):
     """删除分类中的自定义域名列表项"""
-    custom_items = load_custom_category_items()
+    # 使用数据库删除
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    if category_id not in custom_items:
-        raise HTTPException(status_code=404, detail=f"分类 {category_id} 没有自定义项目")
+        # 删除项目
+        deleted = db.delete_custom_category_item(item_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"项目 {item_id} 不存在")
 
-    # 查找并删除项目
-    original_count = len(custom_items[category_id])
-    custom_items[category_id] = [
-        item for item in custom_items[category_id]
-        if item["id"] != item_id
-    ]
+        # 同步保存到 JSON 作为备份
+        custom_items = db.get_custom_category_items()
+        save_custom_category_items(custom_items)
+    else:
+        # 降级到 JSON 文件
+        custom_items = load_custom_category_items()
 
-    if len(custom_items[category_id]) == original_count:
-        raise HTTPException(status_code=404, detail=f"项目 {item_id} 不存在")
+        if category_id not in custom_items:
+            raise HTTPException(status_code=404, detail=f"分类 {category_id} 没有自定义项目")
 
-    # 如果分类为空，删除整个分类
-    if not custom_items[category_id]:
-        del custom_items[category_id]
+        # 查找并删除项目
+        original_count = len(custom_items[category_id])
+        custom_items[category_id] = [
+            item for item in custom_items[category_id]
+            if item["id"] != item_id
+        ]
 
-    save_custom_category_items(custom_items)
+        if len(custom_items[category_id]) == original_count:
+            raise HTTPException(status_code=404, detail=f"项目 {item_id} 不存在")
 
-    # 同时从 catalog lists 缓存中删除
-    catalog = load_domain_catalog()
-    if item_id in catalog.get("lists", {}):
-        del catalog["lists"][item_id]
-        DOMAIN_CATALOG_FILE.write_text(json.dumps(catalog, indent=2, ensure_ascii=False))
+        # 如果分类为空，删除整个分类
+        if not custom_items[category_id]:
+            del custom_items[category_id]
+
+        save_custom_category_items(custom_items)
 
     return {"message": f"项目 '{item_id}' 已删除"}
 
@@ -2099,70 +2403,68 @@ POPULAR_COUNTRIES = ["cn", "hk", "tw", "jp", "kr", "sg", "us", "gb", "de", "fr",
 
 
 def load_ip_catalog() -> dict:
-    """加载 IP 列表目录"""
-    if not IP_CATALOG_FILE.exists():
-        return {"countries": {}, "popular": [], "stats": {}}
-    return json.loads(IP_CATALOG_FILE.read_text())
+    """加载 IP 列表目录（从数据库读取）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 获取所有国家
+    all_countries = db.geodata.get_countries(limit=500)
+
+    countries = {}
+    for country in all_countries:
+        code = country["code"]
+        countries[code] = {
+            "country_code": code.upper(),
+            "country_name": country["name"],
+            "display_name": COUNTRY_NAMES.get(code, country["display_name"]),
+            "ipv4_count": country.get("ipv4_count", 0),
+            "ipv6_count": country.get("ipv6_count", 0),
+            "recommended_exit": RECOMMENDED_IP_EXITS.get(code, country.get("recommended_exit", "direct"))
+        }
+
+    # 构建热门国家列表
+    popular = []
+    for code in POPULAR_COUNTRIES:
+        if code in countries:
+            popular.append(countries[code])
+
+    stats = {
+        "total_countries": len(countries),
+        "total_ipv4": sum(c.get("ipv4_count", 0) for c in countries.values()),
+        "total_ipv6": sum(c.get("ipv6_count", 0) for c in countries.values())
+    }
+
+    return {"countries": countries, "popular": popular, "stats": stats}
 
 
 def get_country_ip_info(country_code: str) -> dict:
-    """获取国家 IP 信息（从文件直接读取）"""
-    json_file = IP_LIST_DIR / country_code / "aggregated.json"
-    if not json_file.exists():
+    """获取国家 IP 信息（从数据库读取）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 获取国家信息
+    country_info = db.geodata.get_country(country_code.lower())
+    if not country_info:
         return {}
 
-    data = json.loads(json_file.read_text())
-    subnets = data.get("subnets", {})
+    # 获取该国家的 IP 范围
+    ipv4_cidrs = db.geodata.get_country_ips(country_code.lower(), ip_version=4, limit=100000)
+    ipv6_cidrs = db.geodata.get_country_ips(country_code.lower(), ip_version=6, limit=100000)
+
     return {
         "country_code": country_code.upper(),
-        "country_name": data.get("country", country_code.upper()),
-        "display_name": COUNTRY_NAMES.get(country_code, data.get("country", country_code.upper())),
-        "ipv4_cidrs": subnets.get("ipv4", []),
-        "ipv6_cidrs": subnets.get("ipv6", []),
-        "ipv4_count": len(subnets.get("ipv4", [])),
-        "ipv6_count": len(subnets.get("ipv6", [])),
-        "recommended_exit": RECOMMENDED_IP_EXITS.get(country_code, "direct"),
+        "country_name": country_info["name"],
+        "display_name": COUNTRY_NAMES.get(country_code.lower(), country_info["display_name"]),
+        "ipv4_cidrs": ipv4_cidrs,
+        "ipv6_cidrs": ipv6_cidrs,
+        "ipv4_count": len(ipv4_cidrs),
+        "ipv6_count": len(ipv6_cidrs),
+        "recommended_exit": RECOMMENDED_IP_EXITS.get(country_code.lower(), country_info.get("recommended_exit", "direct")),
     }
 
 
 @app.get("/api/ip-catalog")
 def api_get_ip_catalog():
     """获取 IP 列表目录（国家概览）"""
-    catalog = load_ip_catalog()
-    if catalog.get("countries"):
-        return catalog
-
-    # 如果没有预生成的 catalog，动态生成
-    if not IP_LIST_DIR.exists():
-        return {"countries": {}, "popular": [], "stats": {"total_countries": 0}}
-
-    countries = {}
-    for country_dir in IP_LIST_DIR.iterdir():
-        if not country_dir.is_dir():
-            continue
-        cc = country_dir.name
-        json_file = country_dir / "aggregated.json"
-        if not json_file.exists():
-            continue
-
-        data = json.loads(json_file.read_text())
-        subnets = data.get("subnets", {})
-        countries[cc] = {
-            "country_code": cc.upper(),
-            "country_name": data.get("country", cc.upper()),
-            "display_name": COUNTRY_NAMES.get(cc, data.get("country", cc.upper())),
-            "ipv4_count": len(subnets.get("ipv4", [])),
-            "ipv6_count": len(subnets.get("ipv6", [])),
-            "recommended_exit": RECOMMENDED_IP_EXITS.get(cc, "direct"),
-            "sample_ipv4": subnets.get("ipv4", [])[:5],
-        }
-
-    popular = [cc for cc in POPULAR_COUNTRIES if cc in countries]
-    return {
-        "countries": countries,
-        "popular": popular,
-        "stats": {"total_countries": len(countries)},
-    }
+    return load_ip_catalog()
 
 
 @app.get("/api/ip-catalog/countries/{country_code}")
@@ -2180,20 +2482,19 @@ def api_search_countries(q: str):
     """搜索国家/地区"""
     q_lower = q.lower()
     results = []
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 从数据库获取所有国家
+    all_countries = db.geodata.get_countries(limit=500)
 
     # 搜索国家代码和名称
-    for cc, name in COUNTRY_NAMES.items():
-        if q_lower in cc or q_lower in name.lower():
-            results.append({"country_code": cc, "display_name": name})
+    for country in all_countries:
+        cc = country["code"].lower()
+        name = country["name"]
+        display_name = COUNTRY_NAMES.get(cc, country["display_name"])
 
-    # 如果没在预定义中找到，尝试从目录搜索
-    if IP_LIST_DIR.exists():
-        for country_dir in IP_LIST_DIR.iterdir():
-            if not country_dir.is_dir():
-                continue
-            cc = country_dir.name
-            if cc not in [r["country_code"] for r in results] and q_lower in cc:
-                results.append({"country_code": cc, "display_name": cc.upper()})
+        if q_lower in cc or q_lower in name.lower() or q_lower in display_name.lower():
+            results.append({"country_code": cc.upper(), "display_name": display_name})
 
     return {"results": results[:30]}
 
@@ -2229,32 +2530,26 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
     if not tag.startswith("ip-"):
         tag = f"ip-{tag}"
 
-    # 加载现有规则
-    custom_rules = load_custom_rules()
-    rules = custom_rules.get("rules", [])
+    # 使用数据库存储
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
 
-    # 检查是否已存在同名规则
-    existing_tags = [r.get("tag") for r in rules]
-    if tag in existing_tags:
-        for r in rules:
-            if r.get("tag") == tag:
-                r["ip_cidrs"] = all_cidrs
-                r["outbound"] = payload.outbound
-                break
-    else:
-        rules.append({
-            "tag": tag,
-            "ip_cidrs": all_cidrs,
-            "outbound": payload.outbound,
-        })
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    custom_rules["rules"] = rules
-    save_custom_rules(custom_rules)
+    # 将所有 IP CIDR 添加到数据库
+    added_count = 0
+    for cidr in all_cidrs:
+        try:
+            db.add_routing_rule("ip", cidr, payload.outbound, priority=0)
+            added_count += 1
+        except Exception as e:
+            # 可能是重复规则，跳过
+            print(f"跳过 CIDR {cidr}: {e}")
 
     return {
-        "message": f"IP 规则 {tag} 已创建，包含 {len(all_cidrs)} 个 CIDR",
+        "message": f"IP 快速规则已创建，添加了 {added_count} 个 CIDR 到数据库",
         "tag": tag,
-        "cidr_count": len(all_cidrs),
+        "cidr_count": added_count,
         "outbound": payload.outbound,
     }
 
@@ -2352,9 +2647,44 @@ def api_export_backup(payload: BackupExportRequest):
                 json.dumps(pia_creds), payload.password
             )
 
-    # 6. 导出路由规则
-    custom_rules = load_custom_rules()
-    backup_data["custom_rules"] = custom_rules
+    # 6. 导出路由规则（从数据库）
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db_rules = db.get_routing_rules(enabled_only=False)
+
+        # 将数据库规则转换为备份格式
+        custom_rules = {
+            "rules": [],
+            "default_outbound": "direct",
+            "source": "database"
+        }
+
+        # 按 outbound 分组
+        rules_by_outbound = {}
+        for rule in db_rules:
+            outbound = rule["outbound"]
+            if outbound not in rules_by_outbound:
+                rules_by_outbound[outbound] = {
+                    "tag": f"custom-{outbound}",
+                    "outbound": outbound,
+                    "domains": [],
+                    "domain_keywords": [],
+                    "ip_cidrs": []
+                }
+
+            if rule["rule_type"] == "domain":
+                rules_by_outbound[outbound]["domains"].append(rule["target"])
+            elif rule["rule_type"] == "domain_keyword":
+                rules_by_outbound[outbound]["domain_keywords"].append(rule["target"])
+            elif rule["rule_type"] == "ip":
+                rules_by_outbound[outbound]["ip_cidrs"].append(rule["target"])
+
+        custom_rules["rules"] = list(rules_by_outbound.values())
+        backup_data["custom_rules"] = custom_rules
+    else:
+        # 降级到 JSON 文件
+        custom_rules = load_custom_rules()
+        backup_data["custom_rules"] = custom_rules
 
     return {
         "message": "备份已生成",
@@ -2505,19 +2835,56 @@ def api_import_backup(payload: BackupImportRequest):
         except Exception as exc:
             print(f"[backup] 导入 PIA 凭证失败: {exc}")
 
-    # 6. 导入路由规则
+    # 6. 导入路由规则（到数据库）
     if "custom_rules" in backup_data:
         try:
-            rules = backup_data["custom_rules"]
-            if payload.merge_mode == "merge":
-                existing = load_custom_rules()
-                existing_tags = {r.get("tag") for r in existing.get("rules", [])}
-                for r in rules.get("rules", []):
-                    if r.get("tag") not in existing_tags:
-                        existing.setdefault("rules", []).append(r)
-                rules = existing
-            save_custom_rules(rules)
-            results["custom_rules"] = True
+            rules_data = backup_data["custom_rules"]
+            rules_list = rules_data.get("rules", [])
+
+            if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+                db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+                # 如果是替换模式，先删除所有规则
+                if payload.merge_mode == "replace":
+                    existing_rules = db.get_routing_rules(enabled_only=False)
+                    for rule in existing_rules:
+                        db.delete_routing_rule(rule["id"])
+
+                # 导入规则到数据库
+                imported_count = 0
+                for rule in rules_list:
+                    outbound = rule.get("outbound", "direct")
+
+                    # 导入域名规则
+                    for domain in rule.get("domains", []):
+                        try:
+                            db.add_routing_rule("domain", domain, outbound, priority=0)
+                            imported_count += 1
+                        except Exception as e:
+                            print(f"跳过域名 {domain}: {e}")
+
+                    # 导入域名关键词规则
+                    for keyword in rule.get("domain_keywords", []):
+                        try:
+                            db.add_routing_rule("domain_keyword", keyword, outbound, priority=0)
+                            imported_count += 1
+                        except Exception as e:
+                            print(f"跳过关键词 {keyword}: {e}")
+
+                    # 导入 IP 规则
+                    for cidr in rule.get("ip_cidrs", []):
+                        try:
+                            db.add_routing_rule("ip", cidr, outbound, priority=0)
+                            imported_count += 1
+                        except Exception as e:
+                            print(f"跳过 IP {cidr}: {e}")
+
+                print(f"[backup] 成功导入 {imported_count} 条规则到数据库")
+                results["custom_rules"] = True
+            else:
+                # 降级到 JSON 文件
+                save_custom_rules(rules_data)
+                results["custom_rules"] = True
         except Exception as exc:
             print(f"[backup] 导入路由规则失败: {exc}")
 
@@ -2551,6 +2918,167 @@ def api_backup_status():
         "has_pia_credentials": bool(os.environ.get("PIA_USERNAME")),
         "has_settings": bool(settings.get("server_endpoint")),
     }
+
+
+# ============ Database API Endpoints ============
+
+@app.get("/api/db/stats")
+def api_get_db_stats():
+    """获取数据库统计信息"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    return db.get_statistics()
+
+
+@app.get("/api/db/rules")
+def api_get_db_rules(enabled_only: bool = True):
+    """获取数据库中的所有路由规则"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    rules = db.get_routing_rules(enabled_only=enabled_only)
+    return {"rules": rules, "count": len(rules)}
+
+
+@app.put("/api/db/rules/{rule_id}")
+def api_update_db_rule(
+    rule_id: int,
+    outbound: Optional[str] = None,
+    priority: Optional[int] = None,
+    enabled: Optional[bool] = None
+):
+    """更新路由规则"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    success = db.update_routing_rule(rule_id, outbound, priority, enabled)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=f"规则 ID {rule_id} 不存在")
+
+    return {"message": f"规则 ID {rule_id} 已更新"}
+
+
+@app.get("/api/db/countries")
+def api_get_countries(limit: int = 100):
+    """获取国家列表"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    countries = db.get_countries(limit=limit)
+    return {"countries": countries, "count": len(countries)}
+
+
+@app.get("/api/db/countries/{country_code}")
+def api_get_country(country_code: str):
+    """获取国家详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    country = db.get_country(country_code)
+
+    if not country:
+        raise HTTPException(status_code=404, detail=f"国家 {country_code} 不存在")
+
+    return country
+
+
+@app.get("/api/db/countries/{country_code}/ips")
+def api_get_country_ips(
+    country_code: str,
+    ip_version: Optional[int] = None,
+    limit: int = 1000
+):
+    """获取国家的 IP 范围"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    country = db.get_country(country_code)
+
+    if not country:
+        raise HTTPException(status_code=404, detail=f"国家 {country_code} 不存在")
+
+    ips = db.get_country_ips(country_code, ip_version=ip_version, limit=limit)
+    return {
+        "country": country,
+        "ip_count": len(ips),
+        "ips": ips
+    }
+
+
+@app.get("/api/db/domain-categories")
+def api_get_domain_categories(group_type: Optional[str] = None):
+    """获取域名分类"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    categories = db.get_domain_categories(group_type=group_type)
+    return {"categories": categories, "count": len(categories)}
+
+
+@app.get("/api/db/domain-lists/{list_id}")
+def api_get_domain_list(list_id: str, include_domains: bool = False):
+    """获取域名列表详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    if include_domains:
+        list_data = db.get_domain_list_with_domains(list_id, limit=5000)
+    else:
+        list_data = db.get_domain_list(list_id)
+
+    if not list_data:
+        raise HTTPException(status_code=404, detail=f"域名列表 {list_id} 不存在")
+
+    return list_data
+
+
+@app.post("/api/config/regenerate")
+def api_regenerate_config():
+    """重新生成 sing-box 配置（包含数据库规则）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    try:
+        # 从数据库获取规则
+        db_rules = generate_singbox_rules_from_db()
+
+        # 读取现有配置
+        if not CONFIG_PATH.exists():
+            raise HTTPException(status_code=500, detail="sing-box 配置文件不存在")
+
+        config = json.loads(CONFIG_PATH.read_text())
+
+        # 更新路由规则（将数据库规则插入到配置中）
+        route = config.get("route", {})
+        static_rules = route.get("rules", [])
+
+        # 数据库规则优先（放在前面）
+        route["rules"] = db_rules + static_rules
+        config["route"] = route
+
+        # 保存配置
+        output_path = CONFIG_PATH.parent / "sing-box.generated.json"
+        output_path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+
+        return {
+            "message": "配置已重新生成",
+            "output": str(output_path),
+            "db_rules_count": len(db_rules),
+            "static_rules_count": len(static_rules)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"生成配置失败: {str(e)}")
 
 
 if __name__ == "__main__":

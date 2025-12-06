@@ -1,7 +1,0 @@
-source 'https://rubygems.org'
-
-gem 'rspec', '~> 3.11'
-gem 'simplecov'
-gem "aws-sdk-lambda", "~> 1.106"
-gem "nokogiri"
-gem "base64"

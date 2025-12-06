@@ -15,12 +15,21 @@ from typing import Any, Dict, List
 
 import yaml
 
+# 尝试导入数据库模块（如果可用）
+try:
+    sys.path.insert(0, '/usr/local/bin')
+    from db_helper import get_db
+    HAS_DATABASE = True
+except ImportError:
+    HAS_DATABASE = False
+
 BASE_CONFIG = Path(os.environ.get("SING_BOX_BASE_CONFIG", "/etc/sing-box/sing-box.json"))
-PIA_DATA = Path(os.environ.get("PIA_PROFILES_OUTPUT", "/etc/sing-box/pia-profiles.json"))
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
 CUSTOM_RULES_FILE = Path(os.environ.get("CUSTOM_RULES_FILE", "/etc/sing-box/custom-rules.json"))
 CUSTOM_EGRESS_FILE = Path(os.environ.get("CUSTOM_EGRESS_FILE", "/etc/sing-box/custom-egress.json"))
 OUTPUT = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
+GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
+USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 
 
 def load_json(path: Path) -> dict:
@@ -104,6 +113,41 @@ def build_profile_map(profiles_config: dict) -> Dict[str, str]:
         tag = name.replace("_", "-")
         profile_map[tag] = name
     return profile_map
+
+
+def load_pia_profiles_from_db() -> dict:
+    """从数据库加载 PIA profiles"""
+    if not HAS_DATABASE or not Path(USER_DB_PATH).exists():
+        raise RuntimeError("数据库不可用，无法加载 PIA profiles")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    profiles_list = db.get_pia_profiles(enabled_only=True)
+
+    # 转换为 endpoint 配置所需的格式
+    profiles = {"profiles": {}}
+    for profile in profiles_list:
+        name = profile["name"]
+        # 只包含有凭证的 profiles
+        if profile.get("private_key"):
+            profiles["profiles"][name] = {
+                "region_id": profile["region_id"],
+                "description": profile.get("description", name),
+                "server_cn": profile.get("server_cn"),
+                "server_ip": profile.get("server_ip"),
+                "server_port": profile.get("server_port"),
+                "server_public_key": profile.get("server_public_key"),
+                "peer_ip": profile.get("peer_ip"),
+                "server_virtual_ip": profile.get("server_virtual_ip"),
+                "private_key": profile.get("private_key"),
+                "public_key": profile.get("public_key"),
+            }
+
+    if profiles["profiles"]:
+        print(f"[render] 从数据库加载了 {len(profiles['profiles'])} 个 PIA profiles")
+        return profiles
+
+    print("[render] 警告: 数据库中没有已配置凭证的 PIA profiles")
+    return None
 
 
 def ensure_endpoints(config: dict, pia_profiles: dict, profile_map: Dict[str, str]) -> None:
@@ -361,9 +405,10 @@ def main() -> None:
     profile_map = build_profile_map(profiles_config)
 
     if profile_map:
-        # 需要 PIA 数据文件存在
-        if PIA_DATA.exists():
-            pia_profiles = load_json(PIA_DATA)
+        # 从数据库加载 PIA profiles
+        pia_profiles = load_pia_profiles_from_db()
+
+        if pia_profiles:
             print(f"[render] 处理 {len(profile_map)} 个 PIA profiles: {list(profile_map.keys())}")
 
             # 确保 PIA endpoints 存在
@@ -374,7 +419,7 @@ def main() -> None:
 
             all_egress_tags.extend(profile_map.keys())
         else:
-            print("[render] PIA 数据文件不存在，跳过 PIA profiles")
+            print("[render] 跳过 PIA profiles（数据库中没有已配置凭证的 profiles）")
 
     # 加载并处理自定义出口
     custom_egress = load_custom_egress()

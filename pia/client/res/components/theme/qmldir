@@ -1,2 +1,0 @@
-module PIA.Theme
-singleton Theme Theme.qml

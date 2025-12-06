@@ -15,6 +15,14 @@ from urllib.parse import quote
 import requests
 import yaml
 
+# 尝试导入数据库模块（如果可用）
+try:
+    sys.path.insert(0, '/usr/local/bin')
+    from db_helper import get_db
+    HAS_DATABASE = True
+except ImportError:
+    HAS_DATABASE = False
+
 TOKEN_URL = os.environ.get(
     "PIA_TOKEN_URL",
     "https://www.privateinternetaccess.com/api/client/v2/token",
@@ -23,14 +31,17 @@ SERVERLIST_URL = os.environ.get(
     "PIA_SERVERLIST_URL",
     "https://serverlist.piaservers.net/vpninfo/servers/v6",
 )
-DEFAULT_OUTPUT = os.environ.get(
-    "PIA_PROFILES_OUTPUT", "/etc/sing-box/pia-profiles.json"
-)
 DEFAULT_PROFILE_FILE = os.environ.get(
     "PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"
 )
 CA_CERT = os.environ.get(
     "PIA_CA_CERT", "/opt/pia/ca/rsa_4096.crt"
+)
+GEODATA_DB_PATH = os.environ.get(
+    "GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db"
+)
+USER_DB_PATH = os.environ.get(
+    "USER_DB_PATH", "/etc/sing-box/user-config.db"
 )
 
 
@@ -188,8 +199,25 @@ def main() -> None:
                 "public_key": pub,
             }
 
-        Path(DEFAULT_OUTPUT).write_text(json.dumps(output, indent=2))
-        print(f"[pia] 生成 {DEFAULT_OUTPUT}")
+        # 保存到数据库
+        if not HAS_DATABASE or not Path(USER_DB_PATH).exists():
+            raise ProvisionError("数据库不可用，无法保存 PIA 凭证")
+
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        updated_count = 0
+        for name, creds in output["profiles"].items():
+            # 更新凭证到数据库
+            updated = db.update_pia_credentials(name, creds)
+            if updated:
+                print(f"[pia] ✓ 已更新 {name} 凭证到数据库")
+                updated_count += 1
+            else:
+                print(f"[pia] 警告: 未找到 profile {name}，请先在数据库中创建")
+
+        if updated_count == 0:
+            raise ProvisionError("没有成功更新任何 profile，请检查数据库配置")
+
+        print(f"[pia] 成功更新 {updated_count}/{len(output['profiles'])} 个 profiles")
     except ProvisionError as exc:
         print(f"[pia] 错误: {exc}", file=sys.stderr)
         sys.exit(1)

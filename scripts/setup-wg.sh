@@ -2,13 +2,9 @@
 set -euo pipefail
 
 WG_CONFIG_PATH="${WG_CONFIG_PATH:-/etc/sing-box/wireguard/server.json}"
+USER_DB_PATH="${USER_DB_PATH:-/etc/sing-box/user-config.db}"
 WG_BIN="$(command -v wg)"
 IP_BIN="$(command -v ip)"
-
-if [ ! -f "${WG_CONFIG_PATH}" ]; then
-  echo "[wireguard] config ${WG_CONFIG_PATH} not found, skip" >&2
-  exit 0
-fi
 
 if [ -z "${WG_BIN}" ] || [ -z "${IP_BIN}" ]; then
   echo "[wireguard] wg/ip command not available" >&2
@@ -21,11 +17,28 @@ if [ -z "${jq_bin}" ]; then
   exit 1
 fi
 
-iface=$(jq -r '.interface.name // "wg-ingress"' "${WG_CONFIG_PATH}")
-listen_port=$(jq -r '.interface.listen_port // 51820' "${WG_CONFIG_PATH}")
-address_json=$(jq -c '.interface.address // empty' "${WG_CONFIG_PATH}")
-mtu=$(jq -r '.interface.mtu // empty' "${WG_CONFIG_PATH}")
-priv_key=$(jq -r '.interface.private_key // empty' "${WG_CONFIG_PATH}")
+# 尝试从数据库读取配置
+config_json=""
+if [ -f "${USER_DB_PATH}" ]; then
+  echo "[wireguard] loading config from database" >&2
+  config_json=$(python3 /usr/local/bin/get_wg_config.py 2>/dev/null || echo "")
+fi
+
+# 降级到 JSON 文件
+if [ -z "${config_json}" ]; then
+  if [ ! -f "${WG_CONFIG_PATH}" ]; then
+    echo "[wireguard] config not found in database or file, skip" >&2
+    exit 0
+  fi
+  echo "[wireguard] loading config from ${WG_CONFIG_PATH}" >&2
+  config_json=$(cat "${WG_CONFIG_PATH}")
+fi
+
+iface=$(echo "${config_json}" | jq -r '.interface.name // "wg-ingress"')
+listen_port=$(echo "${config_json}" | jq -r '.interface.listen_port // 51820')
+address_json=$(echo "${config_json}" | jq -c '.interface.address // empty')
+mtu=$(echo "${config_json}" | jq -r '.interface.mtu // empty')
+priv_key=$(echo "${config_json}" | jq -r '.interface.private_key // empty')
 
 if [ -z "${priv_key}" ]; then
   echo "[wireguard] missing interface.private_key" >&2
@@ -48,7 +61,7 @@ if [ -n "${address_json}" ] && [ "${address_json}" != "null" ]; then
       [ -n "${addr}" ] && ${IP_BIN} address add "${addr}" dev "${iface}"
     done
   else
-    addr=$(jq -r '.interface.address' "${WG_CONFIG_PATH}")
+    addr=$(echo "${config_json}" | jq -r '.interface.address')
     [ -n "${addr}" ] && ${IP_BIN} address add "${addr}" dev "${iface}"
   fi
 fi
@@ -62,7 +75,7 @@ chmod 600 "${key_file}"
 ${WG_BIN} set "${iface}" listen-port "${listen_port}" private-key "${key_file}"
 rm -f "${key_file}"
 
-jq -c '.peers[]?' "${WG_CONFIG_PATH}" | while read -r peer; do
+echo "${config_json}" | jq -c '.peers[]?' | while read -r peer; do
   name=$(jq -r '.name // empty' <<<"${peer}")
   pub=$(jq -r '.public_key // empty' <<<"${peer}")
   allowed=$(jq -r '.allowed_ips // [] | join(",")' <<<"${peer}")

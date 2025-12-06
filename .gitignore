@@ -26,10 +26,26 @@ vite.config.d.ts
 /config/custom-egress.json
 /config/rulesets/
 
-# Downloaded rule lists (regeneratable)
-/domain-list/
+# Auto-generated backup files (primary storage: database)
+/config/custom-rules.json
+/config/custom-category-items.json
+
+# Old database files (migrated to separated databases)
+/config/routing.db
+
+# User config database (auto-created on container startup)
+/config/user-config.db
+
+# Auto-downloaded geo data files
+/config/geoip.db
+/config/geosite.db
+/config/.geodata-ready
+
+# User settings (auto-generated)
+/config/settings.json
+
+# Old source data directories (data now in databases)
 /ip-list/
-/config/domain-list/
 /config/ip-list/
 
 # Test WireGuard configs
@@ -52,6 +68,7 @@ docker-compose.override.yml
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Misc
 coverage/
