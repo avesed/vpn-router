@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-根据 config/pia/profiles.yml 中定义的地区，调用 PIA 的 API (参考 desktop-pia)
-以用户名/密码登录并为每个地区生成 WireGuard 配置。输出将用于改写 sing-box
-配置，确保多个出口同时在线。
+从数据库读取 PIA profiles，调用 PIA 的 API (参考 desktop-pia)
+以用户名/密码登录并为每个地区生成 WireGuard 配置。
+凭证存储到数据库，供 sing-box 使用。
 """
 import json
 import os
@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import quote
 
 import requests
-import yaml
 
 # 尝试导入数据库模块（如果可用）
 try:
@@ -30,9 +29,6 @@ TOKEN_URL = os.environ.get(
 SERVERLIST_URL = os.environ.get(
     "PIA_SERVERLIST_URL",
     "https://serverlist.piaservers.net/vpninfo/servers/v6",
-)
-DEFAULT_PROFILE_FILE = os.environ.get(
-    "PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"
 )
 CA_CERT = os.environ.get(
     "PIA_CA_CERT", "/opt/pia/ca/rsa_4096.crt"
@@ -56,13 +52,20 @@ def require_env(name: str) -> str:
     return value
 
 
-def load_profiles(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        raise ProvisionError(f"找不到 profiles 文件: {path}")
-    data = yaml.safe_load(path.read_text())
-    profiles = data.get("profiles") if isinstance(data, dict) else None
+def load_profiles_from_db() -> List[Dict[str, Any]]:
+    """从数据库加载 PIA profiles"""
+    if not HAS_DATABASE:
+        raise ProvisionError("数据库模块不可用")
+
+    if not Path(USER_DB_PATH).exists():
+        raise ProvisionError(f"数据库文件不存在: {USER_DB_PATH}")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    profiles = db.get_pia_profiles()
+
     if not profiles:
-        raise ProvisionError("profiles.yml 中没有 profiles 配置")
+        raise ProvisionError("数据库中没有 PIA profiles，请先通过 API 或前端添加")
+
     return profiles
 
 
@@ -167,7 +170,7 @@ def add_key(server: Dict[str, Any], port: int, token: str, public_key: str) -> D
 
 def main() -> None:
     try:
-        profiles = load_profiles(Path(DEFAULT_PROFILE_FILE))
+        profiles = load_profiles_from_db()
         username = require_env("PIA_USERNAME")
         password = require_env("PIA_PASSWORD")
         token = fetch_token(username, password)
