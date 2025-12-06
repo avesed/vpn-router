@@ -2,12 +2,17 @@
 set -euo pipefail
 
 cleanup() {
+  if [ -n "${NGINX_PID:-}" ] && kill -0 "${NGINX_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping nginx (PID ${NGINX_PID})"
+    kill "${NGINX_PID}" >/dev/null 2>&1 || true
+  fi
   if [ -n "${API_PID:-}" ] && kill -0 "${API_PID}" >/dev/null 2>&1; then
     kill "${API_PID}" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 API_PID=""
+NGINX_PID=""
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
@@ -15,6 +20,19 @@ WG_CONFIG_PATH="${WG_CONFIG_PATH:-/etc/sing-box/wireguard/server.json}"
 RULESET_DIR="${RULESET_DIR:-/etc/sing-box}"
 GEO_DATA_READY_FLAG="${RULESET_DIR}/.geodata-ready"
 USER_DB_PATH="${USER_DB_PATH:-/etc/sing-box/user-config.db}"
+GEODATA_DB_PATH="${GEODATA_DB_PATH:-/etc/sing-box/geoip-geodata.db}"
+DEFAULT_CONFIG_DIR="/opt/default-config"
+
+# 首次启动初始化：从镜像内置配置复制到挂载目录
+if [ ! -f "${GEODATA_DB_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" ]; then
+  echo "[entrypoint] initializing geodata database from default config"
+  cp "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" "${GEODATA_DB_PATH}"
+fi
+
+if [ ! -f "${BASE_CONFIG_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/sing-box.json" ]; then
+  echo "[entrypoint] initializing sing-box config from default config"
+  cp "${DEFAULT_CONFIG_DIR}/sing-box.json" "${BASE_CONFIG_PATH}"
+fi
 
 if [ ! -f "${BASE_CONFIG_PATH}" ]; then
   echo "[entrypoint] config ${BASE_CONFIG_PATH} not found" >&2
@@ -42,10 +60,8 @@ fi
 
 /usr/local/bin/fetch-geodata.sh "${RULESET_DIR}" "${GEO_DATA_READY_FLAG}"
 
-if [ -n "${WG_CONFIG_PATH}" ]; then
-  export WG_CONFIG_PATH
-  /usr/local/bin/setup-wg.sh
-fi
+# Note: WireGuard server is now handled by sing-box endpoint (wg-server)
+# setup-wg.sh is no longer needed - sing-box binds to listen_port directly
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
@@ -57,7 +73,30 @@ start_api_server() {
   fi
 }
 
-CONFIG_PATH="${BASE_CONFIG_PATH}"
+start_nginx() {
+  echo "[entrypoint] starting nginx on port 80"
+
+  # Test nginx configuration
+  nginx -t
+  if [ $? -ne 0 ]; then
+    echo "[entrypoint] nginx configuration test failed" >&2
+    exit 1
+  fi
+
+  # Start nginx in foreground mode (daemon off)
+  nginx -g "daemon off;" &
+  NGINX_PID=$!
+  echo "[entrypoint] nginx started with PID ${NGINX_PID}"
+
+  # Verify startup success
+  sleep 2
+  if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
+    echo "[entrypoint] nginx failed to start" >&2
+    exit 1
+  fi
+}
+
+# PIA provisioning (if credentials provided)
 if [ -n "${PIA_USERNAME:-}" ] && [ -n "${PIA_PASSWORD:-}" ]; then
   export PIA_PROFILES_FILE="${PIA_PROFILES_FILE:-/etc/sing-box/pia/profiles.yml}"
   export PIA_PROFILES_OUTPUT="${PIA_PROFILES_OUTPUT:-/etc/sing-box/pia-profiles.json}"
@@ -69,14 +108,20 @@ if [ -n "${PIA_USERNAME:-}" ] && [ -n "${PIA_PASSWORD:-}" ]; then
     echo "[entrypoint] pia provisioning failed" >&2
     exit 1
   fi
-  if ! python3 /usr/local/bin/render_singbox.py; then
-    echo "[entrypoint] render sing-box config failed" >&2
-    exit 1
-  fi
-  CONFIG_PATH="${GENERATED_CONFIG_PATH}"
 fi
 
+# Always render sing-box config (adds wg-server endpoint, sniff action, etc.)
+export SING_BOX_BASE_CONFIG="${BASE_CONFIG_PATH}"
+export SING_BOX_GENERATED_CONFIG="${GENERATED_CONFIG_PATH}"
+echo "[entrypoint] rendering sing-box config"
+if ! python3 /usr/local/bin/render_singbox.py; then
+  echo "[entrypoint] render sing-box config failed" >&2
+  exit 1
+fi
+CONFIG_PATH="${GENERATED_CONFIG_PATH}"
+
 start_api_server
+start_nginx
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -113,9 +158,19 @@ trap handle_signals SIGTERM SIGINT
 
 start_singbox "${CONFIG_PATH}"
 
-# 主循环：监控 sing-box 进程
-# 如果 sing-box 退出，检查是否有新配置需要加载
+# 主循环：监控 nginx, API 和 sing-box 进程
 while true; do
+  # Check nginx
+  if [ -n "${NGINX_PID}" ] && ! kill -0 "${NGINX_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: nginx died" >&2
+  fi
+
+  # Check API server
+  if [ -n "${API_PID}" ] && ! kill -0 "${API_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: API server died" >&2
+  fi
+
+  # Check sing-box
   if ! kill -0 "${SINGBOX_PID}" 2>/dev/null; then
     wait "${SINGBOX_PID}" 2>/dev/null || true
     EXIT_CODE=$?

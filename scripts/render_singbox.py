@@ -52,6 +52,99 @@ def _normalize_peer_ip(peer_ip: str | None) -> str | None:
     return peer_ip
 
 
+def load_wireguard_server_config() -> dict | None:
+    """从数据库加载 WireGuard 服务器配置"""
+    if not HAS_DATABASE or not Path(USER_DB_PATH).exists():
+        return None
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 获取服务器配置
+    server = db.get_wireguard_server()
+    if not server or not server.get("private_key"):
+        return None
+
+    # 获取对等端列表
+    peers = db.get_wireguard_peers()
+    if not peers:
+        print("[render] 警告: 没有配置 WireGuard 客户端对等端")
+        return None
+
+    return {
+        "server": server,
+        "peers": peers
+    }
+
+
+def create_wireguard_server_endpoint(wg_config: dict) -> dict:
+    """创建 WireGuard 服务器端点（接受客户端连接）"""
+    server = wg_config["server"]
+    peers = wg_config["peers"]
+
+    endpoint = {
+        "type": "wireguard",
+        "tag": "wg-server",
+        "system": False,
+        "mtu": server.get("mtu", 1420),
+        "address": [server.get("address", "10.23.0.1/24")],
+        "private_key": server.get("private_key", ""),
+        "listen_port": server.get("listen_port", 36100),
+        "peers": []
+    }
+
+    for peer in peers:
+        peer_config = {
+            "public_key": peer.get("public_key", ""),
+            "allowed_ips": [peer.get("allowed_ips", "10.23.0.2/32")]
+        }
+        if peer.get("preshared_key"):
+            peer_config["pre_shared_key"] = peer["preshared_key"]
+        endpoint["peers"].append(peer_config)
+
+    return endpoint
+
+
+def ensure_wireguard_server_endpoint(config: dict) -> bool:
+    """确保 WireGuard 服务器端点存在
+
+    返回 True 如果成功添加/更新，False 如果无配置
+    """
+    wg_config = load_wireguard_server_config()
+    if not wg_config:
+        return False
+
+    endpoints = config.setdefault("endpoints", [])
+
+    # 移除旧的 wg-server endpoint
+    endpoints[:] = [ep for ep in endpoints if ep.get("tag") != "wg-server"]
+
+    # 创建新的 wg-server endpoint
+    wg_endpoint = create_wireguard_server_endpoint(wg_config)
+    endpoints.insert(0, wg_endpoint)  # 放在列表开头
+    print(f"[render] 创建 WireGuard 服务器端点: wg-server ({len(wg_config['peers'])} 个客户端)")
+    return True
+
+
+def ensure_sniff_action(config: dict) -> None:
+    """确保路由规则中有 sniff 动作以支持域名匹配"""
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+
+    # 检查是否已有 sniff 动作
+    has_sniff = any(r.get("action") == "sniff" for r in rules)
+    if has_sniff:
+        return
+
+    # 在规则列表开头添加 sniff 动作
+    sniff_rule = {
+        "action": "sniff",
+        "sniffer": ["tls", "http"],
+        "timeout": "300ms"
+    }
+    rules.insert(0, sniff_rule)
+    print("[render] 添加 sniff 动作以支持域名匹配")
+
+
 def _create_wireguard_endpoint(tag: str, profile: dict, index: int) -> dict:
     """为 profile 创建新的 WireGuard endpoint（sing-box 1.11+ 格式）
 
@@ -400,26 +493,29 @@ def main() -> None:
 
     all_egress_tags = []
 
-    # 加载 PIA profiles（如果存在）
-    profiles_config = load_yaml(PIA_PROFILES_FILE)
-    profile_map = build_profile_map(profiles_config)
+    # 确保 WireGuard 服务器端点存在（用于接受客户端连接）
+    if ensure_wireguard_server_endpoint(config):
+        print("[render] WireGuard 服务器端点已配置")
 
-    if profile_map:
-        # 从数据库加载 PIA profiles
-        pia_profiles = load_pia_profiles_from_db()
+    # 从数据库加载 PIA profiles
+    pia_profiles = load_pia_profiles_from_db()
 
-        if pia_profiles:
-            print(f"[render] 处理 {len(profile_map)} 个 PIA profiles: {list(profile_map.keys())}")
+    if pia_profiles and pia_profiles.get("profiles"):
+        # 从数据库构建 profile_map (tag -> name)
+        profile_map = {}
+        for name in pia_profiles["profiles"].keys():
+            tag = name.replace("_", "-")
+            profile_map[tag] = name
 
-            # 确保 PIA endpoints 存在
-            ensure_endpoints(config, pia_profiles, profile_map)
+        print(f"[render] 处理 {len(profile_map)} 个 PIA profiles: {list(profile_map.keys())}")
 
-            # 确保 PIA DNS 服务器存在
-            ensure_dns_servers(config, profile_map)
+        # 确保 PIA endpoints 存在
+        ensure_endpoints(config, pia_profiles, profile_map)
 
-            all_egress_tags.extend(profile_map.keys())
-        else:
-            print("[render] 跳过 PIA profiles（数据库中没有已配置凭证的 profiles）")
+        # 确保 PIA DNS 服务器存在
+        ensure_dns_servers(config, profile_map)
+
+        all_egress_tags.extend(profile_map.keys())
 
     # 加载并处理自定义出口
     custom_egress = load_custom_egress()
@@ -440,9 +536,15 @@ def main() -> None:
 
     # 应用自定义规则
     custom_rules = load_custom_rules()
-    if custom_rules.get("rules"):
+    if custom_rules.get("rules") or custom_rules.get("default_outbound"):
         apply_custom_rules(config, custom_rules)
-        print(f"[render] 应用了 {len(custom_rules['rules'])} 条自定义规则")
+        if custom_rules.get("rules"):
+            print(f"[render] 应用了 {len(custom_rules['rules'])} 条自定义规则")
+        if custom_rules.get("default_outbound"):
+            print(f"[render] 默认出口设置为: {custom_rules['default_outbound']}")
+
+    # 确保路由规则中有 sniff 动作（放在最后以确保它在规则列表开头）
+    ensure_sniff_action(config)
 
     OUTPUT.write_text(json.dumps(config, indent=2))
     print(f"[sing-box] 已写入 {OUTPUT}")

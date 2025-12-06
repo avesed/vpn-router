@@ -47,7 +47,6 @@ export default function DomainCatalog() {
   const [expandedCountry, setExpandedCountry] = useState<string | null>(null);
   const [countryDetails, setCountryDetails] = useState<CountryIpInfo | null>(null);
   const [loadingCountryDetails, setLoadingCountryDetails] = useState(false);
-  const [showAllCountries, setShowAllCountries] = useState(false);
 
   // Add item to category modal state
   const [showAddItemModal, setShowAddItemModal] = useState(false);
@@ -288,13 +287,7 @@ export default function DomainCatalog() {
 
   const getDisplayCountries = () => {
     if (!ipCatalog) return [];
-    const countries = Object.entries(ipCatalog.countries);
-    if (showAllCountries) {
-      return countries.sort((a, b) => a[1].display_name.localeCompare(b[1].display_name));
-    }
-    return ipCatalog.popular
-      .filter(cc => ipCatalog.countries[cc])
-      .map(cc => [cc, ipCatalog.countries[cc]] as [string, CountryIpInfo]);
+    return Object.entries(ipCatalog.countries).sort((a, b) => a[1].display_name.localeCompare(b[1].display_name));
   };
 
   const openAddItemModal = (categoryId: string, categoryName: string) => {
@@ -455,44 +448,72 @@ export default function DomainCatalog() {
         </div>
       )}
 
-      {/* Search */}
-      <div className="relative">
-        <MagnifyingGlassIcon className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
-        <input
-          type="text"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="搜索域名列表... (如: netflix, steam, bilibili)"
-          className="w-full pl-12 pr-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand/50 focus:ring-1 focus:ring-brand/50"
-        />
-        {searching && (
-          <div className="absolute right-4 top-1/2 -translate-y-1/2">
-            <div className="animate-spin h-4 w-4 border-2 border-brand border-t-transparent rounded-full" />
-          </div>
-        )}
+      {/* Tabs */}
+      <div className="flex gap-2 p-1 rounded-xl bg-white/5 w-fit">
+        <button
+          onClick={() => setActiveTab("type")}
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === "type"
+              ? "bg-brand text-white"
+              : "text-slate-400 hover:text-white hover:bg-white/5"
+          }`}
+        >
+          📋 按域名
+        </button>
+        <button
+          onClick={() => setActiveTab("ip")}
+          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === "ip"
+              ? "bg-brand text-white"
+              : "text-slate-400 hover:text-white hover:bg-white/5"
+          }`}
+        >
+          🌍 按IP
+        </button>
       </div>
 
-      {/* Search Results */}
-      {searchResults.length > 0 && (
-        <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-          <h3 className="text-sm font-semibold text-slate-400 mb-3">搜索结果</h3>
-          <div className="flex flex-wrap gap-2">
-            {searchResults.map((result) => (
-              <button
-                key={result.id}
-                onClick={() => toggleListSelection(result.id)}
-                className={`px-3 py-1.5 rounded-lg text-sm transition-colors ${
-                  selectedLists.has(result.id)
-                    ? "bg-brand text-white"
-                    : "bg-white/10 text-slate-300 hover:bg-white/20"
-                }`}
-              >
-                {selectedLists.has(result.id) && <CheckIcon className="inline h-4 w-4 mr-1" />}
-                {result.name}
-              </button>
-            ))}
+      {/* Domain Search - only show in domain tab */}
+      {activeTab === "type" && (
+        <>
+          <div className="relative">
+            <MagnifyingGlassIcon className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="搜索域名列表... (如: netflix, steam, bilibili)"
+              className="w-full pl-12 pr-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand/50 focus:ring-1 focus:ring-brand/50"
+            />
+            {searching && (
+              <div className="absolute right-4 top-1/2 -translate-y-1/2">
+                <div className="animate-spin h-4 w-4 border-2 border-brand border-t-transparent rounded-full" />
+              </div>
+            )}
           </div>
-        </div>
+
+          {/* Search Results */}
+          {searchResults.length > 0 && (
+            <div className="rounded-xl bg-white/5 border border-white/10 p-4">
+              <h3 className="text-sm font-semibold text-slate-400 mb-3">搜索结果</h3>
+              <div className="flex flex-wrap gap-2">
+                {searchResults.map((result) => (
+                  <button
+                    key={result.id}
+                    onClick={() => toggleListSelection(result.id)}
+                    className={`px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                      selectedLists.has(result.id)
+                        ? "bg-brand text-white"
+                        : "bg-white/10 text-slate-300 hover:bg-white/20"
+                    }`}
+                  >
+                    {selectedLists.has(result.id) && <CheckIcon className="inline h-4 w-4 mr-1" />}
+                    {result.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {/* Selected Lists & Create Rule */}
@@ -555,30 +576,6 @@ export default function DomainCatalog() {
           </div>
         </div>
       )}
-
-      {/* Tabs */}
-      <div className="flex gap-2 p-1 rounded-xl bg-white/5 w-fit">
-        <button
-          onClick={() => setActiveTab("type")}
-          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-            activeTab === "type"
-              ? "bg-brand text-white"
-              : "text-slate-400 hover:text-white hover:bg-white/5"
-          }`}
-        >
-          📋 按域名
-        </button>
-        <button
-          onClick={() => setActiveTab("ip")}
-          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-            activeTab === "ip"
-              ? "bg-brand text-white"
-              : "text-slate-400 hover:text-white hover:bg-white/5"
-          }`}
-        >
-          🌍 按IP
-        </button>
-      </div>
 
       {/* Domain Categories (按域名 tab) */}
       {activeTab === "type" && (
@@ -841,26 +838,6 @@ export default function DomainCatalog() {
               </div>
             </div>
           )}
-
-          {/* Toggle All/Popular Countries */}
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => setShowAllCountries(false)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                !showAllCountries ? "bg-brand text-white" : "bg-white/5 text-slate-400 hover:bg-white/10"
-              }`}
-            >
-              热门国家
-            </button>
-            <button
-              onClick={() => setShowAllCountries(true)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                showAllCountries ? "bg-brand text-white" : "bg-white/5 text-slate-400 hover:bg-white/10"
-              }`}
-            >
-              全部国家 ({ipCatalog?.stats.total_countries || 0})
-            </button>
-          </div>
 
           {/* Countries Grid */}
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

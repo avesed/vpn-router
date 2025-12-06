@@ -9,7 +9,8 @@ import {
   CheckCircleIcon,
   XCircleIcon,
   MapPinIcon,
-  PencilIcon
+  PencilIcon,
+  KeyIcon
 } from "@heroicons/react/24/outline";
 
 export default function ProfileManager() {
@@ -30,11 +31,18 @@ export default function ProfileManager() {
   const [editingTag, setEditingTag] = useState<string | null>(null);
   const [editRegionId, setEditRegionId] = useState("");
 
+  // Login modal
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [pendingReconnectTag, setPendingReconnectTag] = useState<string | null>(null);
+
   const fetchProfiles = async () => {
+    setError(null);
     try {
       const data = await api.getProfiles();
       setProfiles(data.profiles);
-      setError(null);
     } catch (err: unknown) {
       setError((err as Error).message);
     } finally {
@@ -108,13 +116,46 @@ export default function ProfileManager() {
 
   const handleReconnect = async (tag: string) => {
     setActionLoading(`reconnect-${tag}`);
+    setError(null);
     try {
+      // First check if credentials are available
+      const credStatus = await api.getPiaCredentialsStatus();
+      if (!credStatus.has_credentials) {
+        // Show login modal instead of error
+        setPendingReconnectTag(tag);
+        setShowLoginModal(true);
+        setActionLoading(null);
+        return;
+      }
       await api.reconnectProfile(tag);
       fetchProfiles();
     } catch (err: unknown) {
       setError((err as Error).message);
     } finally {
       setActionLoading(null);
+    }
+  };
+
+  const handleLogin = async () => {
+    if (!loginUsername || !loginPassword) return;
+    setLoginLoading(true);
+    setError(null);
+    try {
+      await api.piaLogin(loginUsername, loginPassword);
+      setShowLoginModal(false);
+      setLoginUsername("");
+      setLoginPassword("");
+      // If there was a pending reconnect, do it now
+      if (pendingReconnectTag) {
+        const tag = pendingReconnectTag;
+        setPendingReconnectTag(null);
+        await handleReconnect(tag);
+      }
+      fetchProfiles();
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setLoginLoading(false);
     }
   };
 
@@ -163,6 +204,67 @@ export default function ProfileManager() {
       {error && (
         <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-5 py-4">
           <p className="text-sm text-rose-300">{error}</p>
+        </div>
+      )}
+
+      {/* Login Modal */}
+      {showLoginModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand/20">
+                <KeyIcon className="h-5 w-5 text-brand" />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-white">登录 PIA</h3>
+                <p className="text-sm text-slate-400">需要登录后才能重新连接</p>
+              </div>
+            </div>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">用户名</label>
+                <input
+                  type="text"
+                  value={loginUsername}
+                  onChange={(e) => setLoginUsername(e.target.value)}
+                  className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
+                  placeholder="PIA 用户名"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">密码</label>
+                <input
+                  type="password"
+                  value={loginPassword}
+                  onChange={(e) => setLoginPassword(e.target.value)}
+                  className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
+                  placeholder="PIA 密码"
+                  onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                />
+              </div>
+            </div>
+            <div className="mt-6 flex gap-3">
+              <button
+                onClick={handleLogin}
+                disabled={!loginUsername || !loginPassword || loginLoading}
+                className="flex-1 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+              >
+                {loginLoading ? "登录中..." : "登录并连接"}
+              </button>
+              <button
+                onClick={() => {
+                  setShowLoginModal(false);
+                  setPendingReconnectTag(null);
+                  setLoginUsername("");
+                  setLoginPassword("");
+                }}
+                className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-300 hover:bg-white/20"
+              >
+                取消
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

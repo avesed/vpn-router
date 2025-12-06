@@ -468,19 +468,19 @@ class UserDatabase:
     # ============ PIA Profiles 管理 ============
 
     def get_pia_profiles(self, enabled_only: bool = True) -> List[Dict]:
-        """获取 PIA profiles 列表"""
+        """获取 PIA profiles 列表（包含凭证信息）"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             if enabled_only:
                 rows = cursor.execute("""
-                    SELECT id, name, description, region_id, dns_strategy, enabled, created_at, updated_at
+                    SELECT *
                     FROM pia_profiles
                     WHERE enabled = 1
                     ORDER BY name
                 """).fetchall()
             else:
                 rows = cursor.execute("""
-                    SELECT id, name, description, region_id, dns_strategy, enabled, created_at, updated_at
+                    SELECT *
                     FROM pia_profiles
                     ORDER BY name
                 """).fetchall()

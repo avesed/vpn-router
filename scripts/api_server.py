@@ -614,13 +614,15 @@ def parse_wireguard_conf(content: str) -> Dict[str, Any]:
 def api_status():
     config_stat = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
     wireguard = get_wireguard_status()
-    pia_profiles = load_pia_profiles_yaml()
+    # 从数据库获取 PIA profiles
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sing_box_running": list_processes("sing-box"),
         "wireguard_interface": wireguard,
         "config_mtime": config_stat.st_mtime if config_stat else None,
-        "pia_profiles": pia_profiles.get("profiles", []),
+        "pia_profiles": pia_profiles,
     }
 
 
@@ -670,11 +672,23 @@ def api_get_pia_regions():
     return {"regions": regions}
 
 
+@app.get("/api/pia/credentials-status")
+def api_pia_credentials_status():
+    """检查 PIA 凭证是否可用"""
+    username = os.environ.get("PIA_USERNAME")
+    password = os.environ.get("PIA_PASSWORD")
+    has_credentials = bool(username and password)
+    return {
+        "has_credentials": has_credentials,
+        "message": "已登录" if has_credentials else "未登录，需要重新登录 PIA"
+    }
+
+
 # ============ Profile Management APIs ============
 
 @app.get("/api/profiles")
 def api_list_profiles():
-    """获取所有 VPN 线路配置（从数据库）"""
+    """获取所有 VPN 线路配置（从数据库，包含连接状态）"""
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         # 降级到 YAML
         profiles_config = load_pia_profiles_yaml()
@@ -683,25 +697,23 @@ def api_list_profiles():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         profiles = db.get_pia_profiles(enabled_only=False)
 
-    # 获取当前连接状态
-    pia_output = {}
-    if PIA_PROFILES_OUTPUT.exists():
-        pia_output = json.loads(PIA_PROFILES_OUTPUT.read_text()).get("profiles", {})
-
     result = []
     for p in profiles:
         name = p.get("name", "")
         tag = name.replace("_", "-")
-        profile_data = pia_output.get(name, {})
+        # 直接从数据库读取服务器信息
+        server_ip = p.get("server_ip")
+        server_port = p.get("server_port")
+        is_connected = bool(server_ip and p.get("private_key"))
         result.append({
             "tag": tag,
             "name": name,
             "description": p.get("description", ""),
             "region_id": p.get("region_id", ""),
             "dns_strategy": p.get("dns_strategy", "direct-dns"),
-            "server_ip": profile_data.get("server_ip"),
-            "server_port": profile_data.get("server_port"),
-            "is_connected": bool(profile_data.get("server_ip")),
+            "server_ip": server_ip,
+            "server_port": server_port,
+            "is_connected": is_connected,
             "enabled": p.get("enabled", 1) == 1,
         })
     return {"profiles": result}
@@ -1030,9 +1042,9 @@ def api_pia_login(payload: PiaLoginRequest):
     os.environ["PIA_USERNAME"] = payload.username
     os.environ["PIA_PASSWORD"] = payload.password
 
-    # 检查是否有 profiles 配置
-    pia_profiles = load_pia_profiles_yaml()
-    profiles = pia_profiles.get("profiles", [])
+    # 检查是否有 profiles 配置（从数据库读取）
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    profiles = db.get_pia_profiles(enabled_only=True)
 
     if not profiles:
         # 没有配置线路，仅保存凭证
@@ -1149,46 +1161,31 @@ def api_reload_singbox():
 
 @app.get("/api/profiles/status")
 def api_profiles_status():
-    """获取各 WireGuard 出口的连接状态"""
-    generated_config = Path("/etc/sing-box/sing-box.generated.json")
-    config_path = generated_config if generated_config.exists() else CONFIG_PATH
+    """获取各 WireGuard 出口的连接状态（从数据库）"""
+    # 从数据库获取 PIA profiles
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db_profiles = db.get_pia_profiles(enabled_only=True)
 
-    if not config_path.exists():
-        return {"profiles": [], "error": "配置文件不存在"}
-
-    config = json.loads(config_path.read_text())
-    pia_data_path = PIA_PROFILES_OUTPUT
-    pia_profiles = {}
-    if pia_data_path.exists():
-        pia_data = json.loads(pia_data_path.read_text())
-        pia_profiles = pia_data.get("profiles", {})
+    # 构建 name -> profile 映射
+    profile_by_name = {p["name"]: p for p in db_profiles}
 
     profiles = []
     sing_box_running = list_processes("sing-box")
 
-    for endpoint in config.get("endpoints", []):
-        if endpoint.get("type") != "wireguard":
-            continue
-        tag = endpoint.get("tag", "unknown")
-        peers = endpoint.get("peers", [])
-        peer = peers[0] if peers else {}
+    for db_profile in db_profiles:
+        name = db_profile["name"]
+        tag = name.replace("_", "-")
+        server_ip = db_profile.get("server_ip", "")
+        server_port = db_profile.get("server_port", 0)
+        private_key = db_profile.get("private_key", "")
 
-        server_ip = peer.get("address", "")
-        server_port = peer.get("port", 0)
-        public_key = peer.get("public_key", "")
-
-        # 检查是否有有效配置（非占位符）
-        is_placeholder = not server_ip or server_ip.startswith("198.51.100")
-        is_configured = bool(server_ip and public_key and not is_placeholder)
-
-        # 获取 profile 描述
-        profile_key = tag.replace("-", "_")
-        pia_profile = pia_profiles.get(profile_key, {})
+        # 检查是否有有效配置
+        is_configured = bool(server_ip and private_key)
 
         profiles.append({
             "tag": tag,
-            "description": pia_profile.get("description", tag),
-            "region_id": pia_profile.get("region_id", ""),
+            "description": db_profile.get("description", tag),
+            "region_id": db_profile.get("region_id", ""),
             "server_ip": server_ip if is_configured else "未配置",
             "server_port": server_port,
             "is_configured": is_configured,
@@ -1209,13 +1206,6 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     此 API 会为指定的 profile 重新生成 WireGuard 密钥并重新连接。
     需要先登录 PIA（凭证存储在环境变量中或之前的会话中）。
     """
-    # 读取现有的 PIA profiles 数据
-    if not PIA_PROFILES_OUTPUT.exists():
-        raise HTTPException(status_code=400, detail="请先登录 PIA")
-
-    pia_data = json.loads(PIA_PROFILES_OUTPUT.read_text())
-    profiles = pia_data.get("profiles", {})
-
     # 检查环境变量中是否有 PIA 凭证
     username = os.environ.get("PIA_USERNAME")
     password = os.environ.get("PIA_PASSWORD")
@@ -1225,9 +1215,10 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     # 动态映射 tag 到 profile key（tag 用 - 分隔，key 用 _ 分隔）
     profile_key = payload.profile_tag.replace("-", "_")
 
-    # 验证 profile 是否存在于 profiles.yml
-    profiles_config = load_pia_profiles_yaml()
-    valid_names = [p.get("name") for p in profiles_config.get("profiles", [])]
+    # 验证 profile 是否存在于数据库
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    profiles = db.get_pia_profiles(enabled_only=True)
+    valid_names = [p.get("name") for p in profiles]
     if profile_key not in valid_names:
         raise HTTPException(status_code=400, detail=f"未知的 profile: {payload.profile_tag}")
 
@@ -1789,27 +1780,21 @@ def api_list_all_egress():
     pia_result = []
     custom_result = []
 
-    # 获取 PIA profiles
-    pia_profiles = load_pia_profiles_yaml().get("profiles", [])
-    pia_data = {}
-    if PIA_PROFILES_OUTPUT.exists():
-        try:
-            pia_data = json.loads(PIA_PROFILES_OUTPUT.read_text()).get("profiles", {})
-        except Exception:
-            pass
+    # 从数据库获取 PIA profiles
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
 
     for p in pia_profiles:
         name = p.get("name", "")
         tag = name.replace("_", "-")
-        profile_data = pia_data.get(name, {})
         pia_result.append({
             "tag": tag,
             "type": "pia",
             "description": p.get("description", ""),
             "region_id": p.get("region_id", ""),
-            "server": profile_data.get("server_ip", ""),
-            "port": profile_data.get("server_port", 0),
-            "is_configured": bool(profile_data.get("private_key")),
+            "server": p.get("server_ip", ""),
+            "port": p.get("server_port", 0),
+            "is_configured": bool(p.get("private_key")),
         })
 
     # 获取自定义出口
@@ -1859,8 +1844,9 @@ def api_create_custom_egress(payload: CustomEgressCreateRequest):
     if payload.tag in existing_tags:
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 已存在")
 
-    # 检查是否与 PIA profiles 冲突
-    pia_profiles = load_pia_profiles_yaml().get("profiles", [])
+    # 检查是否与 PIA profiles 冲突（从数据库检查）
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
     pia_tags = {p.get("name", "").replace("_", "-") for p in pia_profiles}
     if payload.tag in pia_tags:
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 PIA 线路冲突")
@@ -2199,22 +2185,10 @@ def api_get_domain_list(list_id: str):
 
 @app.get("/api/domain-catalog/search")
 def api_search_domain_lists(q: str):
-    """搜索域名列表"""
-    if not DOMAIN_LIST_DIR.exists():
-        return {"results": []}
-
-    q_lower = q.lower()
-    results = []
-
-    for file_path in DOMAIN_LIST_DIR.iterdir():
-        if file_path.is_file() and q_lower in file_path.name.lower():
-            results.append({
-                "id": file_path.name,
-                "name": file_path.name,
-            })
-
-    # 限制结果数量
-    return {"results": results[:50]}
+    """搜索域名列表（从数据库）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    results = db.search_domain_lists(q, limit=50)
+    return {"results": [{"id": r["id"], "name": r["id"]} for r in results]}
 
 
 class QuickRuleRequest(BaseModel):
@@ -2399,9 +2373,6 @@ RECOMMENDED_IP_EXITS = {
     "kr": "kr-stream", "sg": "sg-stream", "us": "us-stream", "gb": "uk-stream",
 }
 
-POPULAR_COUNTRIES = ["cn", "hk", "tw", "jp", "kr", "sg", "us", "gb", "de", "fr", "nl", "au", "ca", "ru"]
-
-
 def load_ip_catalog() -> dict:
     """加载 IP 列表目录（从数据库读取）"""
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -2421,19 +2392,13 @@ def load_ip_catalog() -> dict:
             "recommended_exit": RECOMMENDED_IP_EXITS.get(code, country.get("recommended_exit", "direct"))
         }
 
-    # 构建热门国家列表
-    popular = []
-    for code in POPULAR_COUNTRIES:
-        if code in countries:
-            popular.append(countries[code])
-
     stats = {
         "total_countries": len(countries),
         "total_ipv4": sum(c.get("ipv4_count", 0) for c in countries.values()),
         "total_ipv6": sum(c.get("ipv6_count", 0) for c in countries.values())
     }
 
-    return {"countries": countries, "popular": popular, "stats": stats}
+    return {"countries": countries, "stats": stats}
 
 
 def get_country_ip_info(country_code: str) -> dict:
@@ -2633,9 +2598,20 @@ def api_export_backup(payload: BackupExportRequest):
         json.dumps(egress_sensitive), payload.password
     )
 
-    # 4. 导出 PIA 配置
-    pia_profiles = load_pia_profiles_yaml()
-    backup_data["pia_profiles"] = pia_profiles.get("profiles", [])
+    # 4. 导出 PIA 配置（从数据库）
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
+    # 转换为备份格式（不包含敏感凭证）
+    backup_data["pia_profiles"] = [
+        {
+            "name": p["name"],
+            "description": p.get("description", ""),
+            "region_id": p.get("region_id", ""),
+            "dns_strategy": p.get("dns_strategy", "direct-dns"),
+            "enabled": p.get("enabled", 1) == 1,
+        }
+        for p in pia_profiles
+    ]
 
     # 5. 导出 PIA 凭证（如果存在且用户要求）
     if payload.include_pia_credentials:
@@ -2805,18 +2781,27 @@ def api_import_backup(payload: BackupImportRequest):
         except Exception as exc:
             print(f"[backup] 导入自定义出口失败: {exc}")
 
-    # 4. 导入 PIA profiles
+    # 4. 导入 PIA profiles（到数据库）
     if "pia_profiles" in backup_data:
         try:
             profiles = backup_data["pia_profiles"]
-            if payload.merge_mode == "merge":
-                existing = load_pia_profiles_yaml()
-                existing_names = {p.get("name") for p in existing.get("profiles", [])}
-                for p in profiles:
-                    if p.get("name") not in existing_names:
-                        existing.setdefault("profiles", []).append(p)
-                profiles = existing.get("profiles", [])
-            save_pia_profiles_yaml(profiles)
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+            if payload.merge_mode == "replace":
+                # 删除所有现有 profiles
+                existing = db.get_pia_profiles(enabled_only=False)
+                for p in existing:
+                    db.delete_pia_profile(p["id"])
+
+            existing_names = {p["name"] for p in db.get_pia_profiles(enabled_only=False)}
+            for p in profiles:
+                if p.get("name") not in existing_names:
+                    db.add_pia_profile(
+                        name=p["name"],
+                        region_id=p.get("region_id", ""),
+                        description=p.get("description", ""),
+                        dns_strategy=p.get("dns_strategy", "direct-dns")
+                    )
             results["pia_profiles"] = True
         except Exception as exc:
             print(f"[backup] 导入 PIA 配置失败: {exc}")
@@ -2906,15 +2891,18 @@ def api_backup_status():
     """获取备份相关状态"""
     ingress = load_ingress_config()
     custom_egress = load_custom_egress()
-    pia_profiles = load_pia_profiles_yaml()
     settings = load_settings()
+
+    # 从数据库获取 PIA profile 数量
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
 
     return {
         "encryption_available": HAS_CRYPTO,
         "has_ingress": bool(ingress.get("interface", {}).get("private_key")),
         "ingress_peer_count": len(ingress.get("peers", [])),
         "custom_egress_count": len(custom_egress.get("egress", [])),
-        "pia_profile_count": len(pia_profiles.get("profiles", [])),
+        "pia_profile_count": len(pia_profiles),
         "has_pia_credentials": bool(os.environ.get("PIA_USERNAME")),
         "has_settings": bool(settings.get("server_endpoint")),
     }

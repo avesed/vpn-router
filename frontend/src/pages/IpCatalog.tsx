@@ -28,7 +28,6 @@ export default function IpCatalog() {
   const [expandedCountry, setExpandedCountry] = useState<string | null>(null);
   const [countryDetails, setCountryDetails] = useState<CountryIpInfo | null>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
-  const [showAll, setShowAll] = useState(false);
 
   const loadCatalog = useCallback(async () => {
     try {
@@ -133,14 +132,7 @@ export default function IpCatalog() {
   // Get countries to display
   const getDisplayCountries = () => {
     if (!catalog) return [];
-    const countries = Object.entries(catalog.countries);
-    if (showAll) {
-      return countries.sort((a, b) => a[1].display_name.localeCompare(b[1].display_name));
-    }
-    // Show popular countries first
-    return catalog.popular
-      .filter(cc => catalog.countries[cc])
-      .map(cc => [cc, catalog.countries[cc]] as [string, CountryIpInfo]);
+    return Object.entries(catalog.countries).sort((a, b) => a[1].display_name.localeCompare(b[1].display_name));
   };
 
   if (loading) {
@@ -288,26 +280,6 @@ export default function IpCatalog() {
           </div>
         </div>
       )}
-
-      {/* Toggle All/Popular */}
-      <div className="flex items-center gap-4">
-        <button
-          onClick={() => setShowAll(false)}
-          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-            !showAll ? "bg-brand text-white" : "bg-white/5 text-slate-400 hover:bg-white/10"
-          }`}
-        >
-          热门国家
-        </button>
-        <button
-          onClick={() => setShowAll(true)}
-          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-            showAll ? "bg-brand text-white" : "bg-white/5 text-slate-400 hover:bg-white/10"
-          }`}
-        >
-          全部国家 ({catalog?.stats.total_countries || 0})
-        </button>
-      </div>
 
       {/* Countries Grid */}
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

@@ -72,6 +72,9 @@ export const api = {
   // PIA Regions
   getPiaRegions: () => request<PiaRegionsResponse>("/pia/regions"),
 
+  // PIA Credentials Status
+  getPiaCredentialsStatus: () => request<{ has_credentials: boolean; message: string }>("/pia/credentials-status"),
+
   // Profiles (legacy status)
   getProfilesStatus: () => request<ProfilesStatusResponse>("/profiles/status"),
 

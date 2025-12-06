@@ -48,8 +48,10 @@ vite.config.d.ts
 /ip-list/
 /config/ip-list/
 
-# Test WireGuard configs
+# Test directories
 /test-wg/
+/test-client/
+/test-egress/
 
 # IDE & editor
 .idea/

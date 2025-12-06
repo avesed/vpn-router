@@ -20,27 +20,16 @@ services:
       - PIA_PASSWORD=${PIA_PASSWORD:-}
       - WG_SERVER_ENDPOINT=${WG_SERVER_ENDPOINT:-}
     ports:
+      - "80:80"
       - "36100:36100/udp"
-      - "8000:8000"
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./config:/etc/sing-box
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sing-box", "check", "-c", "/etc/sing-box/sing-box.json"]
+      test: ["CMD-SHELL", "curl -f http://localhost/api/status || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
-
-  frontend:
-    container_name: vpn-gateway-frontend
-    build:
-      context: ./frontend
-    image: vpn-gateway-frontend:latest
-    ports:
-      - "5173:80"
-    depends_on:
-      - vpn-gateway
-    restart: unless-stopped
+      start_period: 15s

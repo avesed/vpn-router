@@ -179,7 +179,6 @@ export interface CountryIpInfo {
 
 export interface IpCatalogResponse {
   countries: Record<string, CountryIpInfo>;
-  popular: string[];
   stats: {
     total_countries: number;
     total_ipv4_cidrs?: number;

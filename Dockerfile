@@ -1,6 +1,22 @@
-# Use official sing-box image
+# ==========================================
+# Stage 1: Build Frontend
+# ==========================================
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /app
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ==========================================
+# Stage 2: Extract sing-box Binary
+# ==========================================
 FROM ghcr.io/sagernet/sing-box:latest AS singbox-binary
 
+# ==========================================
+# Stage 3: Production Runtime
+# ==========================================
 FROM debian:12-slim
 
 ENV SING_BOX_CONFIG=/etc/sing-box/sing-box.json \
@@ -25,12 +41,32 @@ RUN set -eux; \
         python3-pydantic \
         python3-qrcode \
         python3-pil \
-        wireguard-tools; \
+        wireguard-tools \
+        nginx-light; \
     pip3 install --no-cache-dir --break-system-packages cryptography; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=singbox-binary /usr/local/bin/sing-box /usr/local/bin/sing-box
+
+# Copy frontend build output
+COPY --from=frontend-builder /app/dist /var/www/html
+
+# Copy nginx configuration
+COPY frontend/nginx.conf /etc/nginx/sites-available/default
+
+# Configure nginx
+RUN rm -f /etc/nginx/sites-enabled/default && \
+    ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && \
+    mkdir -p /var/log/nginx && \
+    chown -R www-data:www-data /var/log/nginx
+
 COPY config /etc/sing-box/
+
+# Copy default config to a separate location (not affected by volume mount)
+# This allows first-run initialization of geodata database
+COPY config/geoip-geodata.db /opt/default-config/geoip-geodata.db
+COPY config/sing-box.json /opt/default-config/sing-box.json
+
 RUN mkdir -p /opt/pia/ca
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY scripts/fetch-geodata.sh /usr/local/bin/fetch-geodata.sh
@@ -55,7 +91,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
 WORKDIR /etc/sing-box
 VOLUME ["/etc/sing-box"]
 
-EXPOSE 36100/udp 8000
+EXPOSE 80 8000 36100/udp
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sing-box", "run", "-c", "/etc/sing-box/sing-box.json"]
