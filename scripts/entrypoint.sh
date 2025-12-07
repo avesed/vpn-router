@@ -22,11 +22,19 @@ GEO_DATA_READY_FLAG="${RULESET_DIR}/.geodata-ready"
 USER_DB_PATH="${USER_DB_PATH:-/etc/sing-box/user-config.db}"
 GEODATA_DB_PATH="${GEODATA_DB_PATH:-/etc/sing-box/geoip-geodata.db}"
 DEFAULT_CONFIG_DIR="/opt/default-config"
+GEODATA_RELEASE_URL="https://github.com/avesed/vpn-router/releases/download/geodata/geoip-geodata.db"
 
-# 首次启动初始化：从镜像内置配置复制到挂载目录
-if [ ! -f "${GEODATA_DB_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" ]; then
-  echo "[entrypoint] initializing geodata database from default config"
-  cp "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" "${GEODATA_DB_PATH}"
+# 首次启动初始化：下载或复制 geodata 数据库
+if [ ! -f "${GEODATA_DB_PATH}" ]; then
+  echo "[entrypoint] geodata database not found, attempting to download..."
+  if curl -fsSL -o "${GEODATA_DB_PATH}" "${GEODATA_RELEASE_URL}"; then
+    echo "[entrypoint] geodata database downloaded successfully"
+  elif [ -f "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" ]; then
+    echo "[entrypoint] download failed, using default config"
+    cp "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" "${GEODATA_DB_PATH}"
+  else
+    echo "[entrypoint] WARNING: geodata database not available, some features may be limited"
+  fi
 fi
 
 if [ ! -f "${BASE_CONFIG_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/sing-box.json" ]; then
