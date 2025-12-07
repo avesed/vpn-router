@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { IngressResponse, IngressPeer } from "../types";
 import {
@@ -24,22 +25,23 @@ function formatBytes(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 }
 
-function formatLastSeen(timestamp: number): string {
-  if (timestamp === 0) return "从未连接";
-  const now = Math.floor(Date.now() / 1000);
-  const diff = now - timestamp;
-  if (diff < 60) return "刚刚";
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-  return `${Math.floor(diff / 86400)} 天前`;
-}
-
 export default function IngressManager() {
+  const { t } = useTranslation();
   const [ingress, setIngress] = useState<IngressResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+
+  const formatLastSeen = (timestamp: number): string => {
+    if (timestamp === 0) return t("ingress.neverConnected");
+    const now = Math.floor(Date.now() / 1000);
+    const diff = now - timestamp;
+    if (diff < 60) return t("ingress.justNow");
+    if (diff < 3600) return t("ingress.minutesAgo", { count: Math.floor(diff / 60) });
+    if (diff < 86400) return t("ingress.hoursAgo", { count: Math.floor(diff / 3600) });
+    return t("ingress.daysAgo", { count: Math.floor(diff / 86400) });
+  };
 
   // Add peer modal
   const [showAddModal, setShowAddModal] = useState(false);
@@ -76,16 +78,15 @@ export default function IngressManager() {
       const data = await api.getIngress();
       setIngress(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
+      setError(err instanceof Error ? err.message : t("common.loadFailed"));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     loadIngress();
     loadSettings();
-    // 自动刷新状态（每 30 秒）
     const interval = setInterval(loadIngress, 30000);
     return () => clearInterval(interval);
   }, [loadIngress, loadSettings]);
@@ -95,11 +96,11 @@ export default function IngressManager() {
     try {
       await api.updateSettings(serverEndpoint.trim());
       setServerEndpointSaved(serverEndpoint.trim());
-      setSuccessMessage("服务器地址已保存");
+      setSuccessMessage(t("ingress.serverAddressSaved"));
       setShowSettingsModal(false);
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "保存失败");
+      setError(err instanceof Error ? err.message : t("common.saveFailed"));
     } finally {
       setSavingSettings(false);
     }
@@ -107,7 +108,7 @@ export default function IngressManager() {
 
   const handleAddPeer = async () => {
     if (!newPeerName.trim()) {
-      setError("请输入客户端名称");
+      setError(t("ingress.pleaseEnterClientName"));
       return;
     }
 
@@ -123,7 +124,6 @@ export default function IngressManager() {
       setNewPeerPublicKey("");
       setUseCustomKey(false);
 
-      // 如果服务端生成了私钥，显示配置
       if (result.client_private_key) {
         setConfigPeerName(newPeerName.trim());
         setConfigPrivateKey(result.client_private_key);
@@ -133,23 +133,23 @@ export default function IngressManager() {
       loadIngress();
       setTimeout(() => setSuccessMessage(null), 5000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "添加失败");
+      setError(err instanceof Error ? err.message : t("ingress.addFailed"));
     } finally {
       setActionLoading(null);
     }
   };
 
   const handleDeletePeer = async (name: string) => {
-    if (!confirm(`确定要删除客户端 "${name}" 吗？`)) return;
+    if (!confirm(t("ingress.confirmDelete", { name }))) return;
 
     setActionLoading(`delete-${name}`);
     try {
       await api.deleteIngressPeer(name);
-      setSuccessMessage(`客户端 "${name}" 已删除`);
+      setSuccessMessage(t("ingress.clientDeleted", { name }));
       loadIngress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      setError(err instanceof Error ? err.message : t("common.deleteFailed"));
     } finally {
       setActionLoading(null);
     }
@@ -170,7 +170,7 @@ export default function IngressManager() {
       setConfigCopied(true);
       setTimeout(() => setConfigCopied(false), 2000);
     } catch {
-      setError("复制失败");
+      setError(t("common.copyFailed"));
     }
   };
 
@@ -203,14 +203,14 @@ export default function IngressManager() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">客户端管理</h1>
-          <p className="text-slate-400 mt-1">管理连接到网关的 WireGuard 客户端</p>
+          <h1 className="text-2xl font-bold text-white">{t("ingress.title")}</h1>
+          <p className="text-slate-400 mt-1">{t("ingress.subtitle")}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => setShowSettingsModal(true)}
             className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
-            title="设置"
+            title={t("ingress.settings")}
           >
             <Cog6ToothIcon className="h-5 w-5 text-slate-400" />
           </button>
@@ -218,7 +218,7 @@ export default function IngressManager() {
             onClick={loadIngress}
             disabled={loading}
             className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50"
-            title="刷新"
+            title={t("common.refresh")}
           >
             <ArrowPathIcon className={`h-5 w-5 text-slate-400 ${loading ? "animate-spin" : ""}`} />
           </button>
@@ -227,7 +227,7 @@ export default function IngressManager() {
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white font-medium transition-colors"
           >
             <PlusIcon className="h-5 w-5" />
-            添加客户端
+            {t("ingress.addClient")}
           </button>
         </div>
       </div>
@@ -251,18 +251,18 @@ export default function IngressManager() {
       {/* Interface Info */}
       {ingress && (
         <div className="rounded-xl bg-white/5 border border-white/10 p-5">
-          <h3 className="text-sm font-semibold text-slate-400 mb-3">入口接口</h3>
+          <h3 className="text-sm font-semibold text-slate-400 mb-3">{t("ingress.ingressInterface")}</h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div>
-              <p className="text-xs text-slate-500">接口名称</p>
+              <p className="text-xs text-slate-500">{t("ingress.interfaceName")}</p>
               <p className="font-mono text-white">{ingress.interface.name}</p>
             </div>
             <div>
-              <p className="text-xs text-slate-500">监听端口</p>
+              <p className="text-xs text-slate-500">{t("ingress.listenPort")}</p>
               <p className="font-mono text-white">{ingress.interface.listen_port}</p>
             </div>
             <div>
-              <p className="text-xs text-slate-500">地址</p>
+              <p className="text-xs text-slate-500">{t("common.address")}</p>
               <p className="font-mono text-white">{ingress.interface.address}</p>
             </div>
             <div>
@@ -272,7 +272,7 @@ export default function IngressManager() {
           </div>
           {ingress.interface.public_key && (
             <div className="mt-3 pt-3 border-t border-white/5">
-              <p className="text-xs text-slate-500 mb-1">服务端公钥</p>
+              <p className="text-xs text-slate-500 mb-1">{t("ingress.serverPublicKey")}</p>
               <p className="font-mono text-xs text-slate-300 break-all">{ingress.interface.public_key}</p>
             </div>
           )}
@@ -282,18 +282,18 @@ export default function IngressManager() {
       {/* Peers List */}
       <div className="space-y-3">
         <h3 className="text-sm font-semibold text-slate-400">
-          已连接客户端 ({ingress?.peer_count || 0})
+          {t("ingress.connectedClients")} ({ingress?.peer_count || 0})
         </h3>
 
         {ingress?.peers.length === 0 ? (
           <div className="rounded-xl bg-white/5 border border-white/10 p-12 text-center">
             <WifiIcon className="h-12 w-12 text-slate-600 mx-auto mb-4" />
-            <p className="text-slate-400">还没有添加任何客户端</p>
+            <p className="text-slate-400">{t("ingress.noClientsYet")}</p>
             <button
               onClick={() => setShowAddModal(true)}
               className="mt-4 px-4 py-2 rounded-lg bg-brand text-white text-sm font-medium"
             >
-              添加第一个客户端
+              {t("ingress.addFirstClient")}
             </button>
           </div>
         ) : (
@@ -326,7 +326,7 @@ export default function IngressManager() {
                       <button
                         onClick={() => handleShowConfig(peer)}
                         className="p-2 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
-                        title="获取配置"
+                        title={t("ingress.getConfig")}
                       >
                         <QrCodeIcon className="h-4 w-4" />
                       </button>
@@ -334,7 +334,7 @@ export default function IngressManager() {
                         onClick={() => handleDeletePeer(peer.name)}
                         disabled={actionLoading === `delete-${peer.name}`}
                         className="p-2 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
-                        title="删除"
+                        title={t("common.delete")}
                       >
                         <TrashIcon className="h-4 w-4" />
                       </button>
@@ -343,17 +343,17 @@ export default function IngressManager() {
 
                   <div className="mt-3 pt-3 border-t border-white/5 grid grid-cols-3 gap-2 text-xs">
                     <div>
-                      <p className="text-slate-500">状态</p>
+                      <p className="text-slate-500">{t("ingress.clientStatus")}</p>
                       <p className={peer.is_online ? "text-emerald-400" : "text-slate-400"}>
-                        {peer.is_online ? "在线" : "离线"}
+                        {peer.is_online ? t("ingress.online") : t("common.offline")}
                       </p>
                     </div>
                     <div>
-                      <p className="text-slate-500">最后活跃</p>
+                      <p className="text-slate-500">{t("ingress.lastHandshake")}</p>
                       <p className="text-slate-300">{formatLastSeen(peer.last_handshake)}</p>
                     </div>
                     <div>
-                      <p className="text-slate-500">流量</p>
+                      <p className="text-slate-500">{t("ingress.traffic")}</p>
                       <p className="text-slate-300">
                         ↓{formatBytes(peer.rx_bytes)} ↑{formatBytes(peer.tx_bytes)}
                       </p>
@@ -372,7 +372,7 @@ export default function IngressManager() {
           <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">添加客户端</h2>
+                <h2 className="text-xl font-bold text-white">{t("ingress.addClient")}</h2>
                 <button
                   onClick={() => setShowAddModal(false)}
                   className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
@@ -385,13 +385,13 @@ export default function IngressManager() {
             <div className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  客户端名称 <span className="text-red-400">*</span>
+                  {t("ingress.clientName")} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
                   value={newPeerName}
                   onChange={(e) => setNewPeerName(e.target.value)}
-                  placeholder="例如: laptop, phone, tablet"
+                  placeholder={t("ingress.clientNamePlaceholder")}
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
               </div>
@@ -404,24 +404,24 @@ export default function IngressManager() {
                     onChange={(e) => setUseCustomKey(e.target.checked)}
                     className="rounded border-slate-600"
                   />
-                  使用自定义公钥（高级）
+                  {t("ingress.useCustomPublicKey")}
                 </label>
               </div>
 
               {useCustomKey && (
                 <div>
                   <label className="block text-sm font-medium text-slate-400 mb-2">
-                    客户端公钥
+                    {t("ingress.clientPublicKey")}
                   </label>
                   <input
                     type="text"
                     value={newPeerPublicKey}
                     onChange={(e) => setNewPeerPublicKey(e.target.value)}
-                    placeholder="Base64 编码的 WireGuard 公钥"
+                    placeholder={t("ingress.publicKeyPlaceholder")}
                     className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
                   />
                   <p className="text-xs text-slate-500 mt-1">
-                    如果您已有密钥对，可在此填入公钥
+                    {t("ingress.publicKeyHint")}
                   </p>
                 </div>
               )}
@@ -429,7 +429,7 @@ export default function IngressManager() {
               {!useCustomKey && (
                 <div className="rounded-lg bg-blue-500/10 border border-blue-500/20 p-3">
                   <p className="text-xs text-blue-300">
-                    服务端将自动生成密钥对，添加后会显示配置文件和二维码
+                    {t("ingress.autoGenerateKeyHint")}
                   </p>
                 </div>
               )}
@@ -440,7 +440,7 @@ export default function IngressManager() {
                 onClick={() => setShowAddModal(false)}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                取消
+                {t("common.cancel")}
               </button>
               <button
                 onClick={handleAddPeer}
@@ -452,7 +452,7 @@ export default function IngressManager() {
                 ) : (
                   <PlusIcon className="h-4 w-4" />
                 )}
-                添加
+                {t("ingress.add")}
               </button>
             </div>
           </div>
@@ -465,7 +465,7 @@ export default function IngressManager() {
           <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">客户端配置 - {configPeerName}</h2>
+                <h2 className="text-xl font-bold text-white">{t("ingress.clientConfig")} - {configPeerName}</h2>
                 <button
                   onClick={() => {
                     setShowConfigModal(false);
@@ -482,20 +482,20 @@ export default function IngressManager() {
               {!configPrivateKey && (
                 <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
                   <p className="text-xs text-amber-300">
-                    如果您有客户端私钥，请输入以生成完整配置；否则配置中的私钥将显示为占位符
+                    {t("ingress.privateKeyHint")}
                   </p>
                 </div>
               )}
 
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  客户端私钥（可选）
+                  {t("ingress.clientPrivateKey")}
                 </label>
                 <input
                   type="text"
                   value={configPrivateKey}
                   onChange={(e) => setConfigPrivateKey(e.target.value)}
-                  placeholder="添加时生成的私钥"
+                  placeholder={t("ingress.privateKeyPlaceholder")}
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
               </div>
@@ -505,7 +505,7 @@ export default function IngressManager() {
                 <div className="bg-white p-2 rounded-lg">
                   <img
                     src={api.getIngressPeerQrcodeUrl(configPeerName, configPrivateKey || undefined)}
-                    alt="WireGuard 配置二维码"
+                    alt={t("ingress.qrCodeAlt")}
                     className="w-48 h-48"
                     onError={(e) => {
                       (e.target as HTMLImageElement).style.display = "none";
@@ -515,7 +515,7 @@ export default function IngressManager() {
               </div>
 
               <p className="text-xs text-slate-500 text-center">
-                使用 WireGuard 客户端扫描二维码快速导入配置
+                {t("ingress.qrCodeHint")}
               </p>
             </div>
 
@@ -527,12 +527,12 @@ export default function IngressManager() {
                 {configCopied ? (
                   <>
                     <CheckIcon className="h-4 w-4 text-emerald-400" />
-                    已复制
+                    {t("ingress.copied")}
                   </>
                 ) : (
                   <>
                     <ClipboardDocumentIcon className="h-4 w-4" />
-                    复制配置
+                    {t("ingress.copyConfig")}
                   </>
                 )}
               </button>
@@ -541,7 +541,7 @@ export default function IngressManager() {
                 className="flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors"
               >
                 <ArrowDownTrayIcon className="h-4 w-4" />
-                下载 .conf 文件
+                {t("ingress.downloadConf")}
               </button>
             </div>
           </div>
@@ -554,7 +554,7 @@ export default function IngressManager() {
           <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">入口设置</h2>
+                <h2 className="text-xl font-bold text-white">{t("ingress.ingressSettings")}</h2>
                 <button
                   onClick={() => {
                     setShowSettingsModal(false);
@@ -570,24 +570,24 @@ export default function IngressManager() {
             <div className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  服务器公网地址 <span className="text-red-400">*</span>
+                  {t("ingress.serverPublicAddress")} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
                   value={serverEndpoint}
                   onChange={(e) => setServerEndpoint(e.target.value)}
-                  placeholder="例如: 1.2.3.4 或 vpn.example.com"
+                  placeholder={t("ingress.serverAddressPlaceholder")}
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
                 <p className="text-xs text-slate-500 mt-2">
-                  客户端将通过此地址连接到服务器，请确保端口 {ingress?.interface.listen_port || 36100} 已开放
+                  {t("ingress.serverAddressHint", { port: ingress?.interface.listen_port || 36100 })}
                 </p>
               </div>
 
               {!serverEndpointSaved && (
                 <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
                   <p className="text-xs text-amber-300">
-                    未设置服务器地址，生成的客户端配置将显示占位符
+                    {t("ingress.noServerAddressWarning")}
                   </p>
                 </div>
               )}
@@ -595,7 +595,7 @@ export default function IngressManager() {
               {serverEndpointSaved && (
                 <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3">
                   <p className="text-xs text-emerald-300">
-                    当前服务器地址: {serverEndpointSaved}:{ingress?.interface.listen_port || 36100}
+                    {t("ingress.currentServerAddress")}: {serverEndpointSaved}:{ingress?.interface.listen_port || 36100}
                   </p>
                 </div>
               )}
@@ -609,7 +609,7 @@ export default function IngressManager() {
                 }}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                取消
+                {t("common.cancel")}
               </button>
               <button
                 onClick={handleSaveSettings}
@@ -621,7 +621,7 @@ export default function IngressManager() {
                 ) : (
                   <CheckIcon className="h-4 w-4" />
                 )}
-                保存
+                {t("common.save")}
               </button>
             </div>
           </div>

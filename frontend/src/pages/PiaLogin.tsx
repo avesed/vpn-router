@@ -1,4 +1,5 @@
 import { FormEvent, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import {
   UserCircleIcon,
@@ -11,6 +12,7 @@ import {
 } from "@heroicons/react/24/outline";
 
 export default function PiaLogin() {
+  const { t } = useTranslation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -20,7 +22,7 @@ export default function PiaLogin() {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!username || !password) {
-      setStatus("请输入用户名和密码");
+      setStatus(t('pia.enterCredentials'));
       setIsSuccess(false);
       return;
     }
@@ -35,7 +37,7 @@ export default function PiaLogin() {
       setIsSuccess(true);
     } catch (error: unknown) {
       const err = error as Error;
-      setStatus(err.message || "登录失败");
+      setStatus(err.message || t('pia.loginFailed'));
       setIsSuccess(false);
     } finally {
       setLoading(false);
@@ -47,9 +49,9 @@ export default function PiaLogin() {
   return (
     <div className="mx-auto max-w-xl space-y-6">
       <div>
-        <h2 className="text-3xl font-bold text-white">PIA 登录</h2>
+        <h2 className="text-3xl font-bold text-white">{t('pia.title')}</h2>
         <p className="mt-2 text-sm text-slate-400">
-          输入 Private Internet Access 凭证以配置 VPN 出口线路
+          {t('pia.subtitle')}
         </p>
       </div>
 
@@ -58,7 +60,7 @@ export default function PiaLogin() {
           <div>
             <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-slate-400">
               <UserCircleIcon className="h-4 w-4" />
-              用户名
+              {t('pia.username')}
             </label>
             <div className="relative mt-2">
               <input
@@ -75,7 +77,7 @@ export default function PiaLogin() {
           <div>
             <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-slate-400">
               <LockClosedIcon className="h-4 w-4" />
-              密码
+              {t('pia.password')}
             </label>
             <div className="relative mt-2">
               <input
@@ -118,12 +120,12 @@ export default function PiaLogin() {
           {loading ? (
             <>
               <ArrowPathIcon className="h-5 w-5 animate-spin" />
-              正在连接 PIA...
+              {t('pia.loggingIn')}
             </>
           ) : (
             <>
               <ShieldCheckIcon className="h-5 w-5" />
-              登录 PIA
+              {t('pia.login')}
             </>
           )}
         </button>
@@ -138,9 +140,9 @@ export default function PiaLogin() {
               </svg>
             </div>
             <div className="flex-1">
-              <p className="font-semibold text-amber-200">安全提醒</p>
+              <p className="font-semibold text-amber-200">{t('pia.securityNote')}</p>
               <p className="mt-1.5 text-xs leading-relaxed text-amber-300/90">
-                凭证仅在容器内使用，不会写入磁盘。
+                {t('pia.securityNoteDesc')}
               </p>
             </div>
           </div>
@@ -152,9 +154,9 @@ export default function PiaLogin() {
               <SignalIcon className="h-5 w-5 text-blue-400" />
             </div>
             <div className="flex-1">
-              <p className="font-semibold text-blue-200">出口管理</p>
+              <p className="font-semibold text-blue-200">{t('pia.egressManagement')}</p>
               <p className="mt-1.5 text-xs leading-relaxed text-blue-300/90">
-                登录后在「出口线路」页面添加和管理 PIA 线路。
+                {t('pia.egressManagementDesc')}
               </p>
             </div>
           </div>

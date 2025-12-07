@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { DomainCategory, DomainListResponse, TypeBreakdownItem, CountryIpInfo, IpCatalogResponse } from "../types";
 import {
@@ -18,6 +19,7 @@ interface CategoryData {
 }
 
 export default function DomainCatalog() {
+  const { t } = useTranslation();
   const [categories, setCategories] = useState<CategoryData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -300,7 +302,7 @@ export default function DomainCatalog() {
 
   const addItemToCategory = async () => {
     if (!addItemName.trim()) {
-      setError("请输入列表名称");
+      setError(t('catalog.enterListName'));
       return;
     }
 
@@ -310,7 +312,7 @@ export default function DomainCatalog() {
       .filter(Boolean);
 
     if (domains.length === 0) {
-      setError("请输入至少一个域名");
+      setError(t('catalog.enterAtLeastOneDomain'));
       return;
     }
 
@@ -320,7 +322,7 @@ export default function DomainCatalog() {
       const res = await api.addCategoryItem(addItemCategoryId, addItemName.trim(), domains);
       setSuccessMessage(res.message);
       setShowAddItemModal(false);
-      loadCatalog(); // 刷新列表
+      loadCatalog();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
       setError(err instanceof Error ? err.message : "添加失败");
@@ -330,13 +332,13 @@ export default function DomainCatalog() {
   };
 
   const deleteCustomItem = async (categoryId: string, itemId: string) => {
-    if (!confirm("确定要删除此自定义项目吗？")) return;
+    if (!confirm(t('catalog.confirmDeleteItem'))) return;
 
     try {
       setError(null);
       await api.deleteCategoryItem(categoryId, itemId);
       setSuccessMessage("已删除");
-      loadCatalog(); // 刷新列表
+      loadCatalog();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败");
@@ -414,12 +416,12 @@ export default function DomainCatalog() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">规则库</h1>
+          <h1 className="text-2xl font-bold text-white">{t('catalog.title')}</h1>
           <p className="text-slate-400 mt-1">
-            从预置规则快速创建路由规则
+            {t('catalog.subtitle')}
             {activeTab === "ip" && ipCatalog && (
               <span className="ml-2 text-slate-500">
-                ({ipCatalog.stats.total_countries} 个国家/地区)
+                ({ipCatalog.stats.total_countries} {t('catalog.countriesCount')})
               </span>
             )}
           </p>
@@ -428,7 +430,7 @@ export default function DomainCatalog() {
           <button
             onClick={loadCatalog}
             className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
-            title="刷新"
+            title={t('common.refresh')}
           >
             <ArrowPathIcon className="h-5 w-5 text-slate-400" />
           </button>
@@ -458,7 +460,7 @@ export default function DomainCatalog() {
               : "text-slate-400 hover:text-white hover:bg-white/5"
           }`}
         >
-          📋 按域名
+          📋 {t('catalog.byDomain')}
         </button>
         <button
           onClick={() => setActiveTab("ip")}
@@ -468,7 +470,7 @@ export default function DomainCatalog() {
               : "text-slate-400 hover:text-white hover:bg-white/5"
           }`}
         >
-          🌍 按IP
+          🌍 {t('catalog.byIp')}
         </button>
       </div>
 
@@ -481,7 +483,7 @@ export default function DomainCatalog() {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索域名列表... (如: netflix, steam, bilibili)"
+              placeholder={t('catalog.searchDomainLists')}
               className="w-full pl-12 pr-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand/50 focus:ring-1 focus:ring-brand/50"
             />
             {searching && (
@@ -494,7 +496,7 @@ export default function DomainCatalog() {
           {/* Search Results */}
           {searchResults.length > 0 && (
             <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-              <h3 className="text-sm font-semibold text-slate-400 mb-3">搜索结果</h3>
+              <h3 className="text-sm font-semibold text-slate-400 mb-3">{t('common.searchResults')}</h3>
               <div className="flex flex-wrap gap-2">
                 {searchResults.map((result) => (
                   <button
@@ -522,7 +524,7 @@ export default function DomainCatalog() {
           <div className="flex items-start justify-between gap-4">
             <div className="flex-1">
               <h3 className="text-sm font-semibold text-white mb-2">
-                已选择 {selectedLists.size} 个列表
+                {t('catalog.selectedLists', { count: selectedLists.size })}
               </h3>
               <div className="flex flex-wrap gap-2 mb-4">
                 {Array.from(selectedLists).map((listId) => (
@@ -556,7 +558,7 @@ export default function DomainCatalog() {
                   type="text"
                   value={customTag}
                   onChange={(e) => setCustomTag(e.target.value)}
-                  placeholder="自定义规则名称 (可选)"
+                  placeholder={t('catalog.customRuleName')}
                   className="px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
                 <button
@@ -569,7 +571,7 @@ export default function DomainCatalog() {
                   ) : (
                     <PlusIcon className="h-4 w-4" />
                   )}
-                  创建规则
+                  {t('catalog.createRule')}
                 </button>
               </div>
             </div>
@@ -599,7 +601,7 @@ export default function DomainCatalog() {
                 </div>
                 <div className="flex items-center gap-3">
                   <span className="px-2 py-1 rounded-lg bg-white/10 text-xs text-slate-400">
-                    {category.lists.length} 个列表
+                    {category.lists.length} {t('common.lists')}
                   </span>
                   {expandedCategories.has(id) ? (
                     <ChevronDownIcon className="h-5 w-5 text-slate-400" />
@@ -618,13 +620,13 @@ export default function DomainCatalog() {
                     className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1"
                   >
                     <PlusIcon className="h-3 w-3" />
-                    添加项目
+                    {t('catalog.addItem')}
                   </button>
                   <button
                     onClick={() => selectAllInCategory(category)}
                     className="text-xs text-brand hover:text-brand/80"
                   >
-                    全选此分类
+                    {t('catalog.selectAllCategory')}
                   </button>
                 </div>
                 <div className="grid gap-2">
@@ -656,11 +658,11 @@ export default function DomainCatalog() {
                                 <GlobeAltIcon className="h-4 w-4 text-slate-400" />
                                 <span className="font-medium text-white">{list.id}</span>
                                 <span className="text-xs text-slate-500">
-                                  {list.domain_count} 个域名
+                                  {t('catalog.domainCount', { count: list.domain_count })}
                                 </span>
                                 {list.is_custom && (
                                   <span className="px-1.5 py-0.5 text-xs bg-emerald-500/20 text-emerald-400 rounded">
-                                    自定义
+                                    {t('common.custom')}
                                   </span>
                                 )}
                               </div>
@@ -678,14 +680,14 @@ export default function DomainCatalog() {
                                 onClick={() => deleteCustomItem(id, list.id)}
                                 className="text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded hover:bg-red-500/10"
                               >
-                                删除
+                                {t('common.delete')}
                               </button>
                             )}
                             <button
                               onClick={() => loadListDetails(list.id)}
                               className="text-xs text-slate-400 hover:text-white px-2 py-1 rounded hover:bg-white/10"
                             >
-                              {expandedList === list.id ? "收起" : "查看全部"}
+                              {expandedList === list.id ? t('common.collapse') : t('common.viewAll')}
                             </button>
                           </div>
                         </div>
@@ -697,12 +699,12 @@ export default function DomainCatalog() {
                           {loadingDetails ? (
                             <div className="flex items-center gap-2 text-slate-400">
                               <div className="animate-spin h-4 w-4 border-2 border-brand border-t-transparent rounded-full" />
-                              加载中...
+                              {t('common.loading')}
                             </div>
                           ) : listDetails ? (
                             <div className="space-y-2">
                               <h4 className="text-xs font-semibold text-slate-400">
-                                域名列表 ({listDetails.domains.length} 个)
+                                {t('catalog.domainList')} ({listDetails.domains.length} {t('common.items')})
                               </h4>
                               <div className="max-h-48 overflow-y-auto">
                                 <div className="flex flex-wrap gap-1">
@@ -716,7 +718,7 @@ export default function DomainCatalog() {
                                   ))}
                                   {listDetails.domains.length > 100 && (
                                     <span className="px-2 py-0.5 text-xs text-slate-500">
-                                      ... 还有 {listDetails.domains.length - 100} 个
+                                      ... {t('catalog.moreItems', { count: listDetails.domains.length - 100 })}
                                     </span>
                                   )}
                                 </div>
@@ -745,7 +747,7 @@ export default function DomainCatalog() {
               type="text"
               value={ipSearchQuery}
               onChange={(e) => setIpSearchQuery(e.target.value)}
-              placeholder="搜索国家/地区... (如: cn, 中国, us, japan)"
+              placeholder={t('catalog.searchCountries')}
               className="w-full pl-12 pr-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand/50 focus:ring-1 focus:ring-brand/50"
             />
             {ipSearching && (
@@ -758,7 +760,7 @@ export default function DomainCatalog() {
           {/* IP Search Results */}
           {ipSearchResults.length > 0 && (
             <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-              <h3 className="text-sm font-semibold text-slate-400 mb-3">搜索结果</h3>
+              <h3 className="text-sm font-semibold text-slate-400 mb-3">{t('common.searchResults')}</h3>
               <div className="flex flex-wrap gap-2">
                 {ipSearchResults.map((result) => (
                   <button
@@ -784,7 +786,7 @@ export default function DomainCatalog() {
               <div className="flex items-start justify-between gap-4">
                 <div className="flex-1">
                   <h3 className="text-sm font-semibold text-white mb-2">
-                    已选择 {selectedCountries.size} 个国家/地区
+                    {t('catalog.selectedCountries', { count: selectedCountries.size })}
                   </h3>
                   <div className="flex flex-wrap gap-2 mb-4">
                     {Array.from(selectedCountries).map((cc) => (
@@ -818,7 +820,7 @@ export default function DomainCatalog() {
                       type="text"
                       value={ipCustomTag}
                       onChange={(e) => setIpCustomTag(e.target.value)}
-                      placeholder="自定义规则名称 (可选)"
+                      placeholder={t('catalog.customRuleName')}
                       className="px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
                     />
                     <button
@@ -831,7 +833,7 @@ export default function DomainCatalog() {
                       ) : (
                         <PlusIcon className="h-4 w-4" />
                       )}
-                      创建 IP 规则
+                      {t('catalog.createIpRule')}
                     </button>
                   </div>
                 </div>
@@ -870,9 +872,9 @@ export default function DomainCatalog() {
                           <span className="text-lg">{info.display_name}</span>
                         </div>
                         <div className="flex items-center gap-2 text-xs text-slate-500">
-                          <span>{info.ipv4_count.toLocaleString()} IPv4</span>
+                          <span>{info.ipv4_count.toLocaleString()} {t('catalog.ipv4')}</span>
                           <span>·</span>
-                          <span>{info.ipv6_count.toLocaleString()} IPv6</span>
+                          <span>{info.ipv6_count.toLocaleString()} {t('catalog.ipv6')}</span>
                         </div>
                       </div>
                     </div>
@@ -902,12 +904,12 @@ export default function DomainCatalog() {
                     {loadingCountryDetails ? (
                       <div className="flex items-center gap-2 text-slate-400 py-2">
                         <div className="animate-spin h-4 w-4 border-2 border-brand border-t-transparent rounded-full" />
-                        加载中...
+                        {t('common.loading')}
                       </div>
                     ) : countryDetails ? (
                       <div className="space-y-2 pt-3">
                         <div className="flex items-center justify-between text-xs text-slate-400">
-                          <span>推荐出口: {countryDetails.recommended_exit}</span>
+                          <span>{t('catalog.recommendedExit')}: {countryDetails.recommended_exit}</span>
                         </div>
                         <div className="max-h-32 overflow-y-auto">
                           <div className="flex flex-wrap gap-1">
@@ -921,7 +923,7 @@ export default function DomainCatalog() {
                             ))}
                             {(countryDetails.ipv4_cidrs?.length || 0) > 50 && (
                               <span className="px-2 py-0.5 text-xs text-slate-500">
-                                ... 还有 {(countryDetails.ipv4_cidrs?.length || 0) - 50} 个
+                                ... {t('catalog.moreItems', { count: (countryDetails.ipv4_cidrs?.length || 0) - 50 })}
                               </span>
                             )}
                           </div>
@@ -943,7 +945,7 @@ export default function DomainCatalog() {
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">
-                  添加项目到 {addItemCategoryName}
+                  {t('catalog.addItemTo', { name: addItemCategoryName })}
                 </h2>
                 <button
                   onClick={() => setShowAddItemModal(false)}
@@ -957,7 +959,7 @@ export default function DomainCatalog() {
             <div className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  列表名称 <span className="text-red-400">*</span>
+                  {t('catalog.listName')} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
@@ -970,7 +972,7 @@ export default function DomainCatalog() {
 
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  域名列表 <span className="text-red-400">*</span>
+                  {t('catalog.domainList')} <span className="text-red-400">*</span>
                 </label>
                 <textarea
                   value={addItemDomains}
@@ -990,7 +992,7 @@ export default function DomainCatalog() {
                 onClick={() => setShowAddItemModal(false)}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 onClick={addItemToCategory}
@@ -1002,7 +1004,7 @@ export default function DomainCatalog() {
                 ) : (
                   <PlusIcon className="h-4 w-4" />
                 )}
-                添加
+                {t('common.add')}
               </button>
             </div>
           </div>

@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import StatsCard from "../components/StatsCard";
 import { api } from "../api/client";
 import type { GatewayStatus } from "../types";
@@ -12,6 +13,7 @@ import {
 } from "@heroicons/react/24/outline";
 
 export default function Dashboard() {
+  const { t, i18n } = useTranslation();
   const [status, setStatus] = useState<GatewayStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -49,9 +51,11 @@ export default function Dashboard() {
     const diff = now.getTime() - date.getTime();
     const minutes = Math.floor(diff / 60000);
     const hours = Math.floor(minutes / 60);
-    if (hours > 0) return `${hours}小时${minutes % 60}分钟`;
-    return `${minutes}分钟`;
+    if (hours > 0) return `${hours}${t('dashboard.hours')}${minutes % 60}${t('dashboard.minutes')}`;
+    return `${minutes}${t('dashboard.minutes')}`;
   };
+
+  const locale = i18n.language === 'zh' ? 'zh-CN' : 'en-US';
 
   type StatusType = "success" | "warning" | "error" | "info";
   interface StatCard {
@@ -64,23 +68,23 @@ export default function Dashboard() {
 
   const mainStats: StatCard[] = [
     {
-      title: "Sing-Box 状态",
-      value: status?.sing_box_running ? "运行中" : "未运行",
-      description: status ? `运行时长: ${formatUptime(status.timestamp)}` : "",
+      title: t('dashboard.singboxStatus'),
+      value: status?.sing_box_running ? t('common.running') : t('common.stopped'),
+      description: status ? `${t('dashboard.runningTime')}: ${formatUptime(status.timestamp)}` : "",
       icon: ServerIcon,
       status: status?.sing_box_running ? "success" : "error"
     },
     {
-      title: "PIA 线路",
+      title: t('dashboard.piaLines'),
       value: status?.pia_profiles?.length ?? 0,
-      description: status?.pia_profiles?.length ? "条线路已配置" : "未配置",
+      description: status?.pia_profiles?.length ? t('dashboard.linesConfigured') : t('dashboard.notConfigured'),
       icon: GlobeAltIcon,
       status: status?.pia_profiles?.length ? "success" : "warning"
     },
     {
-      title: "配置状态",
-      value: status?.config_mtime ? "已同步" : "未知",
-      description: status?.config_mtime ? new Date(status.config_mtime * 1000).toLocaleString("zh-CN", {
+      title: t('dashboard.configStatus'),
+      value: status?.config_mtime ? t('common.synced') : t('common.unknown'),
+      description: status?.config_mtime ? new Date(status.config_mtime * 1000).toLocaleString(locale, {
         month: "short",
         day: "numeric",
         hour: "2-digit",
@@ -93,23 +97,23 @@ export default function Dashboard() {
 
   const additionalStats: StatCard[] = [
     {
-      title: "最后更新",
-      value: lastUpdate.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-      description: "自动刷新间隔 15 秒",
+      title: t('dashboard.lastUpdate'),
+      value: lastUpdate.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+      description: t('dashboard.autoRefresh'),
       icon: ClockIcon,
       status: "info"
     },
     {
-      title: "网关类型",
+      title: t('dashboard.gatewayType'),
       value: "WireGuard",
-      description: "基于 sing-box",
+      description: t('dashboard.basedOnSingbox'),
       icon: CpuChipIcon,
       status: "info"
     },
     {
-      title: "连接状态",
-      value: status?.sing_box_running ? "在线" : "离线",
-      description: error ? "连接错误" : "正常",
+      title: t('dashboard.connectionStatus'),
+      value: status?.sing_box_running ? t('common.online') : t('common.offline'),
+      description: error ? t('dashboard.connectionError') : t('dashboard.normal'),
       icon: SignalIcon,
       status: error ? "error" : "success"
     }
@@ -119,12 +123,12 @@ export default function Dashboard() {
     <div className="space-y-8">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-3xl font-bold text-white">实时概览</h2>
-          <p className="mt-1 text-sm text-slate-400">监控 sing-box 服务、PIA profile 以及 WireGuard 状态</p>
+          <h2 className="text-3xl font-bold text-white">{t('dashboard.title')}</h2>
+          <p className="mt-1 text-sm text-slate-400">{t('dashboard.subtitle')}</p>
         </div>
         <div className="flex items-center gap-2 rounded-full bg-white/5 px-4 py-2">
           <div className={`h-2 w-2 rounded-full ${status?.sing_box_running ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
-          <span className="text-sm text-slate-300">{status?.sing_box_running ? '服务运行中' : '服务已停止'}</span>
+          <span className="text-sm text-slate-300">{status?.sing_box_running ? t('dashboard.serviceRunning') : t('dashboard.serviceStopped')}</span>
         </div>
       </div>
 
@@ -137,7 +141,7 @@ export default function Dashboard() {
               </svg>
             </div>
             <div className="flex-1">
-              <p className="font-semibold text-rose-200">连接错误</p>
+              <p className="font-semibold text-rose-200">{t('dashboard.connectionError')}</p>
               <p className="mt-1 text-sm text-rose-300">{error}</p>
             </div>
           </div>
@@ -148,7 +152,7 @@ export default function Dashboard() {
         <div className="flex items-center justify-center py-12">
           <div className="flex flex-col items-center gap-4">
             <div className="h-12 w-12 animate-spin rounded-full border-4 border-slate-700 border-t-blue-500" />
-            <p className="text-slate-400">加载中...</p>
+            <p className="text-slate-400">{t('common.loading')}</p>
           </div>
         </div>
       ) : (
@@ -170,19 +174,19 @@ export default function Dashboard() {
       <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
         <div className="mb-4 flex items-center justify-between">
           <div>
-            <h3 className="text-lg font-semibold text-white">WireGuard 接口状态</h3>
-            <p className="mt-1 text-sm text-slate-400">实时 WireGuard 接口信息</p>
+            <h3 className="text-lg font-semibold text-white">{t('dashboard.wireguardInterface')}</h3>
+            <p className="mt-1 text-sm text-slate-400">{t('dashboard.wireguardInterfaceDesc')}</p>
           </div>
           <button
             onClick={() => window.location.reload()}
             className="rounded-xl bg-white/5 px-4 py-2 text-sm text-slate-300 transition hover:bg-white/10"
           >
-            刷新
+            {t('common.refresh')}
           </button>
         </div>
         <div className="rounded-2xl bg-black/30 p-4">
           <pre className="max-h-96 overflow-auto text-xs text-emerald-200 font-mono">
-            {typeof status?.wireguard_interface?.raw === "string" ? status.wireguard_interface.raw : "未获取到 WireGuard 状态"}
+            {typeof status?.wireguard_interface?.raw === "string" ? status.wireguard_interface.raw : t('dashboard.noWireguardStatus')}
           </pre>
         </div>
       </section>

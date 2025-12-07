@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { BackupStatus } from "../types";
 import {
@@ -14,6 +15,7 @@ import {
 } from "@heroicons/react/24/outline";
 
 export default function BackupRestore() {
+  const { t } = useTranslation();
   const [status, setStatus] = useState<BackupStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -40,7 +42,7 @@ export default function BackupRestore() {
       setStatus(data);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载状态失败");
+      setError(err instanceof Error ? err.message : t('backup.statusLoadFailed'));
     } finally {
       setLoading(false);
     }
@@ -82,12 +84,12 @@ export default function BackupRestore() {
 
       setSuccessMessage(
         result.encrypted
-          ? "备份已导出（已加密）"
-          : "备份已导出（未加密，敏感数据可见）"
+          ? t('backup.exportedEncrypted')
+          : t('backup.exportedPlaintext')
       );
       setExportPassword("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "导出失败");
+      setError(err instanceof Error ? err.message : t('backup.exportFailed'));
     } finally {
       setExporting(false);
     }
@@ -104,14 +106,14 @@ export default function BackupRestore() {
       JSON.parse(content);
       setError(null);
     } catch {
-      setError("无效的备份文件格式");
+      setError(t('backup.invalidBackupFile'));
       setImportData("");
     }
   };
 
   const handleImport = async () => {
     if (!importData) {
-      setError("请先选择备份文件");
+      setError(t('backup.selectFileFirst'));
       return;
     }
 
@@ -128,17 +130,17 @@ export default function BackupRestore() {
         .filter(([, v]) => v)
         .map(([k]) => {
           const names: Record<string, string> = {
-            settings: "设置",
-            ingress: "入口配置",
-            custom_egress: "自定义出口",
-            pia_profiles: "PIA 线路",
-            pia_credentials: "PIA 凭证",
-            custom_rules: "路由规则"
+            settings: t('backup.backupItems.settings'),
+            ingress: t('backup.backupItems.ingress'),
+            custom_egress: t('backup.backupItems.customEgress'),
+            pia_profiles: t('backup.backupItems.piaProfiles'),
+            pia_credentials: t('backup.backupItems.piaCredentials'),
+            custom_rules: t('backup.backupItems.customRules')
           };
           return names[k] || k;
         });
 
-      setSuccessMessage(`已导入: ${imported.join(", ")}`);
+      setSuccessMessage(`${t('backup.imported')}: ${imported.join(", ")}`);
       setImportData("");
       setImportPassword("");
       if (fileInputRef.current) {
@@ -146,7 +148,7 @@ export default function BackupRestore() {
       }
       loadStatus();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "导入失败");
+      setError(err instanceof Error ? err.message : t('backup.importFailed'));
     } finally {
       setImporting(false);
     }
@@ -165,16 +167,16 @@ export default function BackupRestore() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">备份与恢复</h1>
+          <h1 className="text-2xl font-bold text-white">{t('backup.title')}</h1>
           <p className="text-slate-400 mt-1">
-            导出配置以便迁移或备份，导入配置以恢复设置
+            {t('backup.subtitle')}
           </p>
         </div>
         <button
           onClick={loadStatus}
           disabled={loading}
           className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
-          title="刷新"
+          title={t('common.refresh')}
         >
           <ArrowPathIcon
             className={`h-5 w-5 text-slate-400 ${loading ? "animate-spin" : ""}`}
@@ -200,26 +202,26 @@ export default function BackupRestore() {
         <div className="rounded-xl bg-white/5 border border-white/10 p-5">
           <h3 className="text-sm font-semibold text-slate-400 mb-3 flex items-center gap-2">
             <DocumentTextIcon className="h-4 w-4" />
-            当前配置概览
+            {t('backup.currentStatus')}
           </h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div className="text-center p-3 rounded-lg bg-white/5">
               <p className="text-2xl font-bold text-white">
                 {status.ingress_peer_count}
               </p>
-              <p className="text-xs text-slate-400">入口客户端</p>
+              <p className="text-xs text-slate-400">{t('backup.ingressClients')}</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-white/5">
               <p className="text-2xl font-bold text-white">
                 {status.custom_egress_count}
               </p>
-              <p className="text-xs text-slate-400">自定义出口</p>
+              <p className="text-xs text-slate-400">{t('backup.customEgress')}</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-white/5">
               <p className="text-2xl font-bold text-white">
                 {status.pia_profile_count}
               </p>
-              <p className="text-xs text-slate-400">PIA 线路</p>
+              <p className="text-xs text-slate-400">{t('backup.piaLines')}</p>
             </div>
             <div className="text-center p-3 rounded-lg bg-white/5">
               <div className="flex justify-center">
@@ -229,7 +231,7 @@ export default function BackupRestore() {
                   <XCircleIcon className="h-6 w-6 text-slate-500" />
                 )}
               </div>
-              <p className="text-xs text-slate-400">PIA 凭证</p>
+              <p className="text-xs text-slate-400">{t('backup.piaCredentials')}</p>
             </div>
           </div>
         </div>
@@ -243,8 +245,8 @@ export default function BackupRestore() {
               <ArrowDownTrayIcon className="h-5 w-5 text-blue-400" />
             </div>
             <div>
-              <h3 className="font-semibold text-white">导出配置</h3>
-              <p className="text-xs text-slate-400">生成备份文件</p>
+              <h3 className="font-semibold text-white">{t('backup.export')}</h3>
+              <p className="text-xs text-slate-400">{t('backup.exportDesc')}</p>
             </div>
           </div>
 
@@ -252,14 +254,14 @@ export default function BackupRestore() {
             {/* Encryption Password */}
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
-                加密密码（可选）
+                {t('backup.encryptionPassword')}
               </label>
               <div className="relative">
                 <input
                   type={showExportPassword ? "text" : "password"}
                   value={exportPassword}
                   onChange={(e) => setExportPassword(e.target.value)}
-                  placeholder="留空则不加密敏感数据"
+                  placeholder={t('backup.encryptionPasswordHint')}
                   className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 pr-10 text-sm text-white"
                 />
                 <button
@@ -275,7 +277,7 @@ export default function BackupRestore() {
                 </button>
               </div>
               <p className="text-xs text-slate-500 mt-1">
-                设置密码后，私钥和凭证将使用 AES-256 加密
+                {t('backup.encryptionNote')}
               </p>
             </div>
 
@@ -287,7 +289,7 @@ export default function BackupRestore() {
                 onChange={(e) => setIncludePiaCredentials(e.target.checked)}
                 className="rounded border-white/20 bg-slate-900 text-brand focus:ring-brand"
               />
-              <span className="text-sm text-slate-300">包含 PIA 账户凭证</span>
+              <span className="text-sm text-slate-300">{t('backup.includePiaCredentials')}</span>
             </label>
 
             {/* Warning if no password */}
@@ -295,7 +297,7 @@ export default function BackupRestore() {
               <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
                 <p className="text-xs text-amber-400">
                   <ShieldCheckIcon className="h-4 w-4 inline mr-1" />
-                  未设置密码时，私钥和凭证将以明文保存，请妥善保管备份文件
+                  {t('backup.noPasswordWarning')}
                 </p>
               </div>
             )}
@@ -308,12 +310,12 @@ export default function BackupRestore() {
               {exporting ? (
                 <>
                   <ArrowPathIcon className="h-4 w-4 animate-spin" />
-                  导出中...
+                  {t('common.exporting')}
                 </>
               ) : (
                 <>
                   <ArrowDownTrayIcon className="h-4 w-4" />
-                  导出备份
+                  {t('backup.exportBackup')}
                 </>
               )}
             </button>
@@ -327,8 +329,8 @@ export default function BackupRestore() {
               <ArrowUpTrayIcon className="h-5 w-5 text-emerald-400" />
             </div>
             <div>
-              <h3 className="font-semibold text-white">导入配置</h3>
-              <p className="text-xs text-slate-400">从备份文件恢复</p>
+              <h3 className="font-semibold text-white">{t('backup.import')}</h3>
+              <p className="text-xs text-slate-400">{t('backup.importDesc')}</p>
             </div>
           </div>
 
@@ -336,7 +338,7 @@ export default function BackupRestore() {
             {/* File Upload */}
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
-                选择备份文件
+                {t('backup.selectBackupFile')}
               </label>
               <input
                 ref={fileInputRef}
@@ -348,7 +350,7 @@ export default function BackupRestore() {
               {importData && (
                 <p className="text-xs text-emerald-400 mt-1">
                   <CheckCircleIcon className="h-3 w-3 inline mr-1" />
-                  已加载备份文件
+                  {t('backup.backupLoaded')}
                 </p>
               )}
             </div>
@@ -356,14 +358,14 @@ export default function BackupRestore() {
             {/* Decryption Password */}
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
-                解密密码
+                {t('backup.decryptionPassword')}
               </label>
               <div className="relative">
                 <input
                   type={showImportPassword ? "text" : "password"}
                   value={importPassword}
                   onChange={(e) => setImportPassword(e.target.value)}
-                  placeholder="如果备份已加密，请输入密码"
+                  placeholder={t('backup.decryptionPasswordHint')}
                   className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 pr-10 text-sm text-white"
                 />
                 <button
@@ -383,7 +385,7 @@ export default function BackupRestore() {
             {/* Merge Mode */}
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-2">
-                导入模式
+                {t('backup.importMode')}
               </label>
               <div className="flex gap-4">
                 <label className="flex items-center gap-2 cursor-pointer">
@@ -395,7 +397,7 @@ export default function BackupRestore() {
                     onChange={() => setMergeMode("replace")}
                     className="text-brand focus:ring-brand"
                   />
-                  <span className="text-sm text-slate-300">替换现有配置</span>
+                  <span className="text-sm text-slate-300">{t('backup.replaceExisting')}</span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -406,7 +408,7 @@ export default function BackupRestore() {
                     onChange={() => setMergeMode("merge")}
                     className="text-brand focus:ring-brand"
                   />
-                  <span className="text-sm text-slate-300">合并（保留现有）</span>
+                  <span className="text-sm text-slate-300">{t('backup.mergeKeepExisting')}</span>
                 </label>
               </div>
             </div>
@@ -419,12 +421,12 @@ export default function BackupRestore() {
               {importing ? (
                 <>
                   <ArrowPathIcon className="h-4 w-4 animate-spin" />
-                  导入中...
+                  {t('common.importing')}
                 </>
               ) : (
                 <>
                   <ArrowUpTrayIcon className="h-4 w-4" />
-                  导入配置
+                  {t('backup.import')}
                 </>
               )}
             </button>
@@ -434,25 +436,25 @@ export default function BackupRestore() {
 
       {/* Info */}
       <div className="rounded-xl bg-slate-800/50 border border-white/5 p-5">
-        <h4 className="font-semibold text-white mb-2">备份内容说明</h4>
+        <h4 className="font-semibold text-white mb-2">{t('backup.backupContents')}</h4>
         <ul className="text-sm text-slate-400 space-y-1">
           <li>
-            <span className="text-slate-300">入口配置</span>：WireGuard 入口接口设置和客户端列表
+            <span className="text-slate-300">{t('backup.backupItems.ingress')}</span>：{t('backup.backupItems.ingressDesc')}
           </li>
           <li>
-            <span className="text-slate-300">自定义出口</span>：自定义 WireGuard 出口服务器配置
+            <span className="text-slate-300">{t('backup.backupItems.customEgress')}</span>：{t('backup.backupItems.customEgressDesc')}
           </li>
           <li>
-            <span className="text-slate-300">PIA 线路</span>：PIA VPN 地区选择配置
+            <span className="text-slate-300">{t('backup.backupItems.piaProfiles')}</span>：{t('backup.backupItems.piaProfilesDesc')}
           </li>
           <li>
-            <span className="text-slate-300">PIA 凭证</span>：PIA 账户用户名和密码
+            <span className="text-slate-300">{t('backup.backupItems.piaCredentials')}</span>：{t('backup.backupItems.piaCredentialsDesc')}
           </li>
           <li>
-            <span className="text-slate-300">路由规则</span>：域名和 IP 分流规则
+            <span className="text-slate-300">{t('backup.backupItems.customRules')}</span>：{t('backup.backupItems.customRulesDesc')}
           </li>
           <li>
-            <span className="text-slate-300">系统设置</span>：服务器公网地址等设置
+            <span className="text-slate-300">{t('backup.backupItems.settings')}</span>：{t('backup.backupItems.settingsDesc')}
           </li>
         </ul>
       </div>

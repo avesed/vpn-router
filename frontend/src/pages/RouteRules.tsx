@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { RouteRule, VpnProfile } from "../types";
 import {
@@ -28,6 +29,7 @@ const emptyRule: RuleFormData = {
 };
 
 export default function RouteRules() {
+  const { t } = useTranslation();
   const [rules, setRules] = useState<RouteRule[]>([]);
   const [profiles, setProfiles] = useState<VpnProfile[]>([]);
   const [defaultOutbound, setDefaultOutbound] = useState("direct");
@@ -95,7 +97,7 @@ export default function RouteRules() {
 
   const handleDeleteRule = (index: number) => {
     const rule = rules[index];
-    if (!confirm(`确定要删除规则 ${rule.tag} 吗？`)) return;
+    if (!confirm(t('rules.confirmDeleteRule', { name: rule.tag }))) return;
     setRules(rules.filter((_, i) => i !== index));
   };
 
@@ -135,7 +137,7 @@ export default function RouteRules() {
 
     try {
       await api.updateRouteRules(rules, defaultOutbound);
-      setSuccess("路由规则已保存，sing-box 配置已更新");
+      setSuccess(t('rules.rulesSaved'));
       setTimeout(() => setSuccess(null), 3000);
     } catch (err: unknown) {
       setError((err as Error).message);
@@ -145,7 +147,7 @@ export default function RouteRules() {
   };
 
   const outboundOptions = [
-    { value: "direct", label: "直连 (Direct)" },
+    { value: "direct", label: `${t('common.direct')} (Direct)` },
     ...profiles.map((p) => ({ value: p.tag, label: `${p.tag} (${p.description})` }))
   ];
 
@@ -153,9 +155,9 @@ export default function RouteRules() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-3xl font-bold text-white">路由规则</h2>
+          <h2 className="text-3xl font-bold text-white">{t('rules.title')}</h2>
           <p className="mt-1 text-sm text-slate-400">
-            配置流量分流规则，决定哪些域名或 IP 走哪条 VPN 线路
+            {t('rules.subtitle')}
           </p>
         </div>
         <div className="flex gap-3">
@@ -165,14 +167,14 @@ export default function RouteRules() {
             className="flex items-center gap-2 rounded-xl bg-white/5 px-4 py-2 text-sm text-slate-300 transition hover:bg-white/10 disabled:opacity-50"
           >
             <ArrowPathIcon className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-            刷新
+            {t('common.refresh')}
           </button>
           <button
             onClick={() => setShowNewForm(true)}
             className="flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-sm font-medium text-white transition hover:bg-brand/90"
           >
             <PlusIcon className="h-4 w-4" />
-            添加规则
+            {t('rules.addRule')}
           </button>
         </div>
       </div>
@@ -197,8 +199,8 @@ export default function RouteRules() {
             <ServerStackIcon className="h-5 w-5 text-blue-400" />
           </div>
           <div>
-            <h3 className="font-semibold text-white">默认出口</h3>
-            <p className="text-xs text-slate-400">未匹配任何规则的流量将使用此出口</p>
+            <h3 className="font-semibold text-white">{t('rules.defaultOutbound')}</h3>
+            <p className="text-xs text-slate-400">{t('rules.defaultOutboundDesc')}</p>
           </div>
         </div>
         <select
@@ -217,12 +219,12 @@ export default function RouteRules() {
       {/* New Rule Form */}
       {showNewForm && (
         <div className="rounded-2xl border border-brand/30 bg-brand/5 p-6">
-          <h3 className="text-lg font-semibold text-white mb-4">添加新规则</h3>
+          <h3 className="text-lg font-semibold text-white mb-4">{t('rules.addNewRule')}</h3>
           <div className="grid gap-4">
             <div className="grid gap-4 md:grid-cols-2">
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-1">
-                  规则标识 (英文)
+                  {t('rules.ruleTag')} ({t('rules.ruleTagHint')})
                 </label>
                 <input
                   value={newRule.tag}
@@ -235,7 +237,7 @@ export default function RouteRules() {
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-1">
-                  出口线路
+                  {t('rules.outboundLine')}
                 </label>
                 <select
                   value={newRule.outbound}
@@ -252,7 +254,7 @@ export default function RouteRules() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
-                域名后缀 (每行一个，如 netflix.com)
+                {t('rules.domainSuffix')} ({t('rules.domainSuffixHint')})
               </label>
               <textarea
                 value={newRule.domains}
@@ -264,7 +266,7 @@ export default function RouteRules() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
-                域名关键词 (每行一个，如 youtube)
+                {t('rules.domainKeyword')} ({t('rules.domainKeywordHint')})
               </label>
               <textarea
                 value={newRule.domain_keywords}
@@ -276,7 +278,7 @@ export default function RouteRules() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
-                IP 段 (CIDR 格式，每行一个)
+                {t('rules.ipCidr')} ({t('rules.ipCidrHint')})
               </label>
               <textarea
                 value={newRule.ip_cidrs}
@@ -293,7 +295,7 @@ export default function RouteRules() {
               disabled={!newRule.tag}
               className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
             >
-              添加
+              {t('common.add')}
             </button>
             <button
               onClick={() => {
@@ -302,7 +304,7 @@ export default function RouteRules() {
               }}
               className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-300"
             >
-              取消
+              {t('common.cancel')}
             </button>
           </div>
         </div>
@@ -316,13 +318,13 @@ export default function RouteRules() {
       ) : rules.length === 0 ? (
         <div className="rounded-2xl border border-white/5 bg-slate-900/40 p-12 text-center">
           <GlobeAltIcon className="mx-auto h-12 w-12 text-slate-600" />
-          <p className="mt-4 text-slate-400">还没有配置任何路由规则</p>
-          <p className="mt-2 text-sm text-slate-500">所有流量将使用默认出口</p>
+          <p className="mt-4 text-slate-400">{t('rules.noRulesConfigured')}</p>
+          <p className="mt-2 text-sm text-slate-500">{t('rules.allTrafficDefault')}</p>
           <button
             onClick={() => setShowNewForm(true)}
             className="mt-4 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white"
           >
-            添加第一条规则
+            {t('rules.addFirstRule')}
           </button>
         </div>
       ) : (
@@ -338,7 +340,7 @@ export default function RouteRules() {
                   <div className="grid gap-4 md:grid-cols-2">
                     <div>
                       <label className="block text-xs font-medium text-slate-400 mb-1">
-                        规则标识
+                        {t('rules.ruleTag')}
                       </label>
                       <input
                         value={editRule.tag}
@@ -349,7 +351,7 @@ export default function RouteRules() {
                     </div>
                     <div>
                       <label className="block text-xs font-medium text-slate-400 mb-1">
-                        出口线路
+                        {t('rules.outboundLine')}
                       </label>
                       <select
                         value={editRule.outbound}
@@ -366,7 +368,7 @@ export default function RouteRules() {
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      域名后缀
+                      {t('rules.domainSuffix')}
                     </label>
                     <textarea
                       value={editRule.domains}
@@ -377,7 +379,7 @@ export default function RouteRules() {
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      域名关键词
+                      {t('rules.domainKeyword')}
                     </label>
                     <textarea
                       value={editRule.domain_keywords}
@@ -388,7 +390,7 @@ export default function RouteRules() {
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-400 mb-1">
-                      IP 段
+                      {t('rules.ipCidr')}
                     </label>
                     <textarea
                       value={editRule.ip_cidrs}
@@ -402,7 +404,7 @@ export default function RouteRules() {
                       onClick={handleSaveEdit}
                       className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white"
                     >
-                      保存
+                      {t('common.save')}
                     </button>
                     <button
                       onClick={() => {
@@ -411,7 +413,7 @@ export default function RouteRules() {
                       }}
                       className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-300"
                     >
-                      取消
+                      {t('common.cancel')}
                     </button>
                   </div>
                 </div>
@@ -426,7 +428,7 @@ export default function RouteRules() {
                       <div>
                         <h4 className="font-semibold text-white">{rule.tag}</h4>
                         <p className="text-sm text-slate-400">
-                          出口: <span className="text-blue-400">{rule.outbound}</span>
+                          {t('rules.outbound')}: <span className="text-blue-400">{rule.outbound}</span>
                         </p>
                       </div>
                     </div>
@@ -434,7 +436,7 @@ export default function RouteRules() {
                       <button
                         onClick={() => handleEditRule(index)}
                         className="rounded-lg p-2 text-slate-400 hover:bg-white/10 hover:text-white"
-                        title="编辑"
+                        title={t('common.edit')}
                       >
                         <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
@@ -443,7 +445,7 @@ export default function RouteRules() {
                       <button
                         onClick={() => handleDeleteRule(index)}
                         className="rounded-lg p-2 text-slate-400 hover:bg-rose-500/20 hover:text-rose-400"
-                        title="删除"
+                        title={t('common.delete')}
                       >
                         <TrashIcon className="h-4 w-4" />
                       </button>
@@ -453,7 +455,7 @@ export default function RouteRules() {
                   <div className="mt-4 grid gap-3 md:grid-cols-3">
                     {rule.domains && rule.domains.length > 0 && (
                       <div className="rounded-lg bg-black/20 p-3">
-                        <p className="text-xs font-medium text-slate-500 mb-1">域名后缀</p>
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.domainSuffix')}</p>
                         <div className="flex flex-wrap gap-1">
                           {rule.domains.slice(0, 5).map((d) => (
                             <span
@@ -471,7 +473,7 @@ export default function RouteRules() {
                     )}
                     {rule.domain_keywords && rule.domain_keywords.length > 0 && (
                       <div className="rounded-lg bg-black/20 p-3">
-                        <p className="text-xs font-medium text-slate-500 mb-1">域名关键词</p>
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.domainKeyword')}</p>
                         <div className="flex flex-wrap gap-1">
                           {rule.domain_keywords.slice(0, 5).map((k) => (
                             <span
@@ -489,7 +491,7 @@ export default function RouteRules() {
                     )}
                     {rule.ip_cidrs && rule.ip_cidrs.length > 0 && (
                       <div className="rounded-lg bg-black/20 p-3">
-                        <p className="text-xs font-medium text-slate-500 mb-1">IP 段</p>
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.ipCidr')}</p>
                         <div className="flex flex-wrap gap-1">
                           {rule.ip_cidrs.slice(0, 3).map((ip) => (
                             <span
@@ -524,12 +526,12 @@ export default function RouteRules() {
             {saving ? (
               <>
                 <ArrowPathIcon className="h-4 w-4 animate-spin" />
-                保存中...
+                {t('common.saving')}
               </>
             ) : (
               <>
                 <CheckCircleIcon className="h-4 w-4" />
-                保存并应用规则
+                {t('rules.saveAndApply')}
               </>
             )}
           </button>
@@ -538,13 +540,13 @@ export default function RouteRules() {
 
       {/* Help Info */}
       <div className="rounded-2xl border border-blue-500/20 bg-blue-500/5 p-5">
-        <h4 className="font-semibold text-blue-200 mb-2">规则说明</h4>
+        <h4 className="font-semibold text-blue-200 mb-2">{t('rules.ruleExplanation')}</h4>
         <ul className="text-xs text-blue-300/80 space-y-1">
-          <li>• <strong>域名后缀</strong>: 匹配以指定后缀结尾的域名，如 netflix.com 会匹配 www.netflix.com</li>
-          <li>• <strong>域名关键词</strong>: 匹配包含指定关键词的域名，如 youtube 会匹配 www.youtube.com</li>
-          <li>• <strong>IP 段</strong>: 匹配 CIDR 格式的 IP 地址段，如 8.8.8.0/24</li>
-          <li>• 规则按顺序匹配，第一条匹配的规则生效</li>
-          <li>• 未匹配任何规则的流量使用默认出口</li>
+          <li>• {t('rules.ruleExplanationItems.domainSuffix')}</li>
+          <li>• {t('rules.ruleExplanationItems.domainKeyword')}</li>
+          <li>• {t('rules.ruleExplanationItems.ipCidr')}</li>
+          <li>• {t('rules.ruleExplanationItems.order')}</li>
+          <li>• {t('rules.ruleExplanationItems.default')}</li>
         </ul>
       </div>
     </div>

@@ -12,6 +12,7 @@ import IpCatalog from "./pages/IpCatalog";
 import IngressManager from "./pages/IngressManager";
 import BackupRestore from "./pages/BackupRestore";
 import "./index.css";
+import "./i18n";
 
 const router = createBrowserRouter([
   {

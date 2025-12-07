@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile } from "../types";
 import {
@@ -25,6 +26,7 @@ type TabType = "all" | "pia" | "custom";
 type ImportMethod = "upload" | "paste" | "manual";
 
 export default function EgressManager() {
+  const { t } = useTranslation();
   const [piaEgress, setPiaEgress] = useState<EgressItem[]>([]);
   const [customEgress, setCustomEgress] = useState<CustomEgress[]>([]);
   const [piaProfiles, setPiaProfiles] = useState<VpnProfile[]>([]);
@@ -92,11 +94,11 @@ export default function EgressManager() {
       setCustomEgress(customData.egress);
       setPiaProfiles(profilesData.profiles);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载失败");
+      setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   const loadPiaRegions = useCallback(async () => {
     try {
@@ -196,13 +198,13 @@ export default function EgressManager() {
     setActionLoading("create-pia");
     try {
       await api.createProfile(piaFormTag, piaFormDescription, piaFormRegionId);
-      setSuccessMessage("PIA 线路添加成功");
+      setSuccessMessage(t('egress.piaLineAddSuccess'));
       setShowPiaModal(false);
       resetPiaForm();
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "创建失败");
+      setError(err instanceof Error ? err.message : t('common.createFailed'));
     } finally {
       setActionLoading(null);
     }
@@ -217,29 +219,29 @@ export default function EgressManager() {
         description: piaFormDescription,
         region_id: piaFormRegionId
       });
-      setSuccessMessage("PIA 线路已更新");
+      setSuccessMessage(t('egress.piaLineUpdated'));
       setShowPiaModal(false);
       resetPiaForm();
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "更新失败");
+      setError(err instanceof Error ? err.message : t('common.updateFailed'));
     } finally {
       setActionLoading(null);
     }
   };
 
   const handleDeletePiaProfile = async (tag: string) => {
-    if (!confirm(`确定要删除 PIA 线路 "${tag}" 吗？`)) return;
+    if (!confirm(t('egress.confirmDeletePiaLine', { tag }))) return;
 
     setActionLoading(`delete-pia-${tag}`);
     try {
       await api.deleteProfile(tag);
-      setSuccessMessage(`PIA 线路 "${tag}" 已删除`);
+      setSuccessMessage(t('egress.piaLineDeleted', { tag }));
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      setError(err instanceof Error ? err.message : t('common.deleteFailed'));
     } finally {
       setActionLoading(null);
     }
@@ -259,11 +261,11 @@ export default function EgressManager() {
         return;
       }
       await api.reconnectProfile(tag);
-      setSuccessMessage(`PIA 线路 "${tag}" 重新连接中...`);
+      setSuccessMessage(t('egress.piaLineReconnecting', { tag }));
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "重连失败");
+      setError(err instanceof Error ? err.message : t('egress.reconnectFailed'));
     } finally {
       setActionLoading(null);
     }
@@ -286,7 +288,7 @@ export default function EgressManager() {
       }
       loadEgress();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "登录失败");
+      setError(err instanceof Error ? err.message : t('pia.loginFailed'));
     } finally {
       setLoginLoading(false);
     }
@@ -304,7 +306,7 @@ export default function EgressManager() {
       const baseName = file.name.replace(/\.conf$/i, "").toLowerCase().replace(/[^a-z0-9-]/g, "-");
       setFormTag(baseName);
     } catch (err) {
-      setParseError(err instanceof Error ? err.message : "文件解析失败");
+      setParseError(err instanceof Error ? err.message : t('customEgress.fileParseError'));
     }
   };
 
@@ -322,14 +324,14 @@ export default function EgressManager() {
       if (result.dns) setFormDns(result.dns);
       if (result.pre_shared_key) setFormPreSharedKey(result.pre_shared_key);
     } catch (err) {
-      setParseError(err instanceof Error ? err.message : "解析失败");
+      setParseError(err instanceof Error ? err.message : t('customEgress.parseError'));
       throw err;
     }
   };
 
   const handlePasteConfig = async () => {
     if (!pasteContent.trim()) {
-      setParseError("请粘贴配置内容");
+      setParseError(t('customEgress.pasteContentError'));
       return;
     }
     try {
@@ -341,7 +343,7 @@ export default function EgressManager() {
 
   const handleCreateEgress = async () => {
     if (!formTag.trim() || !formServer.trim() || !formPrivateKey.trim() || !formPublicKey.trim() || !formAddress.trim()) {
-      setError("请填写所有必填字段");
+      setError(t('customEgress.fillAllFieldsError'));
       return;
     }
 
@@ -359,13 +361,13 @@ export default function EgressManager() {
         dns: formDns.trim(),
         pre_shared_key: formPreSharedKey.trim() || undefined
       });
-      setSuccessMessage("自定义出口添加成功");
+      setSuccessMessage(t('customEgress.addSuccess'));
       setShowAddModal(false);
       resetForm();
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "创建失败");
+      setError(err instanceof Error ? err.message : t('common.createFailed'));
     } finally {
       setActionLoading(null);
     }
@@ -402,30 +404,30 @@ export default function EgressManager() {
         dns: formDns.trim(),
         pre_shared_key: formPreSharedKey.trim() || undefined
       });
-      setSuccessMessage("出口配置已更新");
+      setSuccessMessage(t('customEgress.updateSuccess'));
       setShowEditModal(false);
       setEditingEgress(null);
       resetForm();
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "更新失败");
+      setError(err instanceof Error ? err.message : t('common.updateFailed'));
     } finally {
       setActionLoading(null);
     }
   };
 
   const handleDeleteEgress = async (tag: string) => {
-    if (!confirm(`确定要删除出口 "${tag}" 吗？`)) return;
+    if (!confirm(t('customEgress.confirmDelete', { tag }))) return;
 
     setActionLoading(`delete-${tag}`);
     try {
       await api.deleteCustomEgress(tag);
-      setSuccessMessage(`出口 "${tag}" 已删除`);
+      setSuccessMessage(t('customEgress.deleteSuccess', { tag }));
       loadEgress();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      setError(err instanceof Error ? err.message : t('common.deleteFailed'));
     } finally {
       setActionLoading(null);
     }
@@ -448,15 +450,15 @@ export default function EgressManager() {
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-white">出口管理</h1>
-          <p className="text-slate-400 mt-1">管理 VPN 出口线路（PIA 和自定义 WireGuard）</p>
+          <h1 className="text-2xl font-bold text-white">{t('egress.title')}</h1>
+          <p className="text-slate-400 mt-1">{t('egress.subtitle')}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={loadEgress}
             disabled={loading}
             className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50"
-            title="刷新"
+            title={t('common.refresh')}
           >
             <ArrowPathIcon className={`h-5 w-5 text-slate-400 ${loading ? "animate-spin" : ""}`} />
           </button>
@@ -488,30 +490,30 @@ export default function EgressManager() {
                 <KeyIcon className="h-5 w-5 text-brand" />
               </div>
               <div>
-                <h3 className="text-lg font-semibold text-white">登录 PIA</h3>
-                <p className="text-sm text-slate-400">需要登录后才能重新连接</p>
+                <h3 className="text-lg font-semibold text-white">{t('pia.loginTitle')}</h3>
+                <p className="text-sm text-slate-400">{t('pia.loginRequired')}</p>
               </div>
             </div>
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">用户名</label>
+                <label className="block text-xs font-medium text-slate-400 mb-1">{t('pia.username')}</label>
                 <input
                   type="text"
                   value={loginUsername}
                   onChange={(e) => setLoginUsername(e.target.value)}
                   className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
-                  placeholder="PIA 用户名"
+                  placeholder={t('pia.usernamePlaceholder')}
                   autoFocus
                 />
               </div>
               <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">密码</label>
+                <label className="block text-xs font-medium text-slate-400 mb-1">{t('pia.password')}</label>
                 <input
                   type="password"
                   value={loginPassword}
                   onChange={(e) => setLoginPassword(e.target.value)}
                   className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
-                  placeholder="PIA 密码"
+                  placeholder={t('pia.passwordPlaceholder')}
                   onKeyDown={(e) => e.key === "Enter" && handleLogin()}
                 />
               </div>
@@ -522,7 +524,7 @@ export default function EgressManager() {
                 disabled={!loginUsername || !loginPassword || loginLoading}
                 className="flex-1 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
-                {loginLoading ? "登录中..." : "登录并连接"}
+                {loginLoading ? t('pia.loggingIn') : t('pia.loginAndConnect')}
               </button>
               <button
                 onClick={() => {
@@ -533,7 +535,7 @@ export default function EgressManager() {
                 }}
                 className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-300 hover:bg-white/20"
               >
-                取消
+                {t('common.cancel')}
               </button>
             </div>
           </div>
@@ -543,9 +545,9 @@ export default function EgressManager() {
       {/* Tabs */}
       <div className="flex gap-2 border-b border-white/10 pb-2 mb-6">
         {[
-          { key: "all", label: `全部 (${totalCount})` },
-          { key: "pia", label: `PIA (${piaProfiles.length})` },
-          { key: "custom", label: `自定义 (${customEgress.length})` }
+          { key: "all", label: `${t('common.all')} (${totalCount})` },
+          { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
+          { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` }
         ].map((tab) => (
           <button
             key={tab.key}
@@ -566,7 +568,7 @@ export default function EgressManager() {
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? "还没有添加自定义出口" : activeTab === "pia" ? "还没有添加 PIA 线路" : "没有找到出口配置"}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : t('egress.noEgressFound')}
           </p>
           {activeTab !== "all" && (
             <div className="mt-4">
@@ -575,7 +577,7 @@ export default function EgressManager() {
                   onClick={handleAddPiaProfile}
                   className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium"
                 >
-                  添加 PIA 线路
+                  {t('egress.addPiaLine')}
                 </button>
               )}
               {activeTab === "custom" && (
@@ -583,7 +585,7 @@ export default function EgressManager() {
                   onClick={() => setShowAddModal(true)}
                   className="px-4 py-2 rounded-lg bg-brand text-white text-sm font-medium"
                 >
-                  添加自定义出口
+                  {t('egress.addCustomEgress')}
                 </button>
               )}
             </div>
@@ -597,7 +599,7 @@ export default function EgressManager() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
                   <ShieldCheckIcon className="h-4 w-4" />
-                  PIA 线路 ({filteredPia.length})
+                  {t('egress.piaLines')} ({filteredPia.length})
                 </h3>
                 {activeTab === "pia" && (
                   <button
@@ -605,7 +607,7 @@ export default function EgressManager() {
                     className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 text-xs font-medium transition-colors"
                   >
                     <PlusIcon className="h-3.5 w-3.5" />
-                    添加线路
+                    {t('egress.addLine')}
                   </button>
                 )}
               </div>
@@ -640,7 +642,7 @@ export default function EgressManager() {
                         <button
                           onClick={() => handleEditPiaProfile(profile)}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
-                          title="编辑"
+                          title={t('common.edit')}
                         >
                           <PencilIcon className="h-4 w-4" />
                         </button>
@@ -648,7 +650,7 @@ export default function EgressManager() {
                           onClick={() => handleDeletePiaProfile(profile.tag)}
                           disabled={actionLoading === `delete-pia-${profile.tag}`}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
-                          title="删除"
+                          title={t('common.delete')}
                         >
                           <TrashIcon className="h-4 w-4" />
                         </button>
@@ -676,12 +678,12 @@ export default function EgressManager() {
                         {actionLoading === `reconnect-${profile.tag}` ? (
                           <>
                             <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
-                            连接中...
+                            {t('common.connecting')}
                           </>
                         ) : (
                           <>
                             <ArrowPathIcon className="h-3.5 w-3.5" />
-                            {profile.is_connected ? "重新连接" : "连接"}
+                            {profile.is_connected ? t('egress.reconnect') : t('egress.connect')}
                           </>
                         )}
                       </button>
@@ -698,7 +700,7 @@ export default function EgressManager() {
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
                   <ServerIcon className="h-4 w-4" />
-                  自定义出口 ({filteredCustom.length})
+                  {t('egress.customEgress')} ({filteredCustom.length})
                 </h3>
                 {activeTab === "custom" && (
                   <button
@@ -709,7 +711,7 @@ export default function EgressManager() {
                     className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 text-xs font-medium transition-colors"
                   >
                     <PlusIcon className="h-3.5 w-3.5" />
-                    添加出口
+                    {t('egress.addEgress')}
                   </button>
                 )}
               </div>
@@ -726,14 +728,14 @@ export default function EgressManager() {
                         </div>
                         <div>
                           <h4 className="font-semibold text-white">{egress.tag}</h4>
-                          <p className="text-xs text-slate-500">{egress.description || "自定义 WireGuard"}</p>
+                          <p className="text-xs text-slate-500">{egress.description || t('customEgress.defaultDescription')}</p>
                         </div>
                       </div>
                       <div className="flex gap-1">
                         <button
                           onClick={() => handleEditEgress(egress)}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
-                          title="编辑"
+                          title={t('common.edit')}
                         >
                           <PencilIcon className="h-4 w-4" />
                         </button>
@@ -741,7 +743,7 @@ export default function EgressManager() {
                           onClick={() => handleDeleteEgress(egress.tag)}
                           disabled={actionLoading === `delete-${egress.tag}`}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
-                          title="删除"
+                          title={t('common.delete')}
                         >
                           <TrashIcon className="h-4 w-4" />
                         </button>
@@ -752,7 +754,7 @@ export default function EgressManager() {
                         {egress.server}:{egress.port}
                       </p>
                       <p className="text-xs text-slate-500">
-                        地址: {egress.address} | MTU: {egress.mtu}
+                        {t('customEgress.addressLabel')}: {egress.address} | MTU: {egress.mtu}
                       </p>
                     </div>
                   </div>
@@ -771,7 +773,7 @@ export default function EgressManager() {
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">
-                  {piaModalMode === "add" ? "添加 PIA 线路" : `编辑线路 - ${editingPiaProfile?.tag}`}
+                  {piaModalMode === "add" ? t('egress.addPiaLine') : t('egress.editPiaLine', { tag: editingPiaProfile?.tag })}
                 </h2>
                 <button
                   onClick={() => {
@@ -789,35 +791,35 @@ export default function EgressManager() {
               {piaModalMode === "add" && (
                 <div>
                   <label className="block text-sm font-medium text-slate-400 mb-2">
-                    线路标识 <span className="text-red-400">*</span>
+                    {t('egress.lineTag')} <span className="text-red-400">*</span>
                   </label>
                   <input
                     type="text"
                     value={piaFormTag}
                     onChange={(e) => setPiaFormTag(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))}
-                    placeholder="例如: uk-stream"
+                    placeholder={t('egress.lineTagPlaceholder')}
                     className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                   />
-                  <p className="text-xs text-slate-500 mt-1">英文小写字母、数字和连字符</p>
+                  <p className="text-xs text-slate-500 mt-1">{t('egress.lineTagHint')}</p>
                 </div>
               )}
 
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  描述 <span className="text-red-400">*</span>
+                  {t('common.description')} <span className="text-red-400">*</span>
                 </label>
                 <input
                   type="text"
                   value={piaFormDescription}
                   onChange={(e) => setPiaFormDescription(e.target.value)}
-                  placeholder="例如: 英国流媒体线路"
+                  placeholder={t('egress.descriptionPlaceholder')}
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  地区 <span className="text-red-400">*</span>
+                  {t('egress.region')} <span className="text-red-400">*</span>
                 </label>
                 {/* Custom Region Dropdown */}
                 <div className="relative" ref={regionDropdownRef}>
@@ -827,7 +829,7 @@ export default function EgressManager() {
                     className="w-full px-3 py-2.5 rounded-lg bg-slate-800 border border-white/10 text-white focus:outline-none focus:border-brand flex items-center justify-between transition-colors hover:bg-slate-700"
                   >
                     <span className={piaFormRegionId ? "text-white" : "text-slate-400"}>
-                      {piaFormRegionId ? getRegionName(piaFormRegionId) : "选择地区..."}
+                      {piaFormRegionId ? getRegionName(piaFormRegionId) : t('egress.selectRegion')}
                     </span>
                     <ChevronUpDownIcon className="h-5 w-5 text-slate-400" />
                   </button>
@@ -842,7 +844,7 @@ export default function EgressManager() {
                             type="text"
                             value={regionSearchQuery}
                             onChange={(e) => setRegionSearchQuery(e.target.value)}
-                            placeholder="搜索地区..."
+                            placeholder={t('egress.searchRegion')}
                             className="w-full pl-9 pr-3 py-2 rounded-lg bg-slate-900/50 border border-white/5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-brand/50"
                             autoFocus
                           />
@@ -853,7 +855,7 @@ export default function EgressManager() {
                       <div className="max-h-64 overflow-y-auto">
                         {Object.keys(filteredRegionsByCountry).length === 0 ? (
                           <div className="px-4 py-3 text-sm text-slate-500 text-center">
-                            没有找到匹配的地区
+                            {t('common.noMatchingResults')}
                           </div>
                         ) : (
                           Object.entries(filteredRegionsByCountry).map(([country, countryRegions]) => (
@@ -894,7 +896,7 @@ export default function EgressManager() {
               {piaRegions.length > 0 && (
                 <div className="rounded-lg bg-blue-500/10 border border-blue-500/20 p-3">
                   <p className="text-xs text-blue-300">
-                    共 {piaRegions.length} 个支持 WireGuard 的 PIA 地区可供选择
+                    {t('egress.piaRegionsAvailable', { count: piaRegions.length })}
                   </p>
                 </div>
               )}
@@ -908,7 +910,7 @@ export default function EgressManager() {
                 }}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 onClick={piaModalMode === "add" ? handleCreatePiaProfile : handleUpdatePiaProfile}
@@ -926,7 +928,7 @@ export default function EgressManager() {
                 ) : (
                   <CheckIcon className="h-4 w-4" />
                 )}
-                {piaModalMode === "add" ? "添加" : "保存"}
+                {piaModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
           </div>
@@ -939,7 +941,7 @@ export default function EgressManager() {
           <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl m-4">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">添加自定义出口</h2>
+                <h2 className="text-xl font-bold text-white">{t('egress.addCustomEgress')}</h2>
                 <button
                   onClick={() => {
                     setShowAddModal(false);
@@ -956,9 +958,9 @@ export default function EgressManager() {
               {/* Import Method Tabs */}
               <div className="flex gap-2">
                 {[
-                  { key: "upload", label: "上传文件", icon: ArrowUpTrayIcon },
-                  { key: "paste", label: "粘贴配置", icon: ClipboardDocumentIcon },
-                  { key: "manual", label: "手动输入", icon: PencilIcon }
+                  { key: "upload", label: t('customEgress.uploadFile'), icon: ArrowUpTrayIcon },
+                  { key: "paste", label: t('customEgress.pasteConfig'), icon: ClipboardDocumentIcon },
+                  { key: "manual", label: t('customEgress.manualInput'), icon: PencilIcon }
                 ].map((method) => (
                   <button
                     key={method.key}
@@ -990,13 +992,13 @@ export default function EgressManager() {
                     className="w-full border-2 border-dashed border-white/20 rounded-xl p-8 text-center hover:border-brand/50 hover:bg-brand/5 transition-colors"
                   >
                     <ArrowUpTrayIcon className="h-8 w-8 text-slate-400 mx-auto mb-2" />
-                    <p className="text-slate-300">点击上传 .conf 文件</p>
-                    <p className="text-xs text-slate-500 mt-1">支持标准 WireGuard 配置文件</p>
+                    <p className="text-slate-300">{t('customEgress.uploadPrompt')}</p>
+                    <p className="text-xs text-slate-500 mt-1">{t('customEgress.uploadHint')}</p>
                   </button>
                   {parsedConfig && (
                     <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3">
-                      <p className="text-sm text-emerald-400">配置解析成功！</p>
-                      <p className="text-xs text-emerald-300 mt-1">服务器: {parsedConfig.server}:{parsedConfig.port}</p>
+                      <p className="text-sm text-emerald-400">{t('customEgress.parseSuccess')}</p>
+                      <p className="text-xs text-emerald-300 mt-1">{t('customEgress.serverInfo', { server: parsedConfig.server, port: parsedConfig.port })}</p>
                     </div>
                   )}
                 </div>
@@ -1008,19 +1010,19 @@ export default function EgressManager() {
                   <textarea
                     value={pasteContent}
                     onChange={(e) => setPasteContent(e.target.value)}
-                    placeholder={`[Interface]\nPrivateKey = ...\nAddress = 10.0.0.2/32\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = ...\nEndpoint = server:51820\nAllowedIPs = 0.0.0.0/0`}
+                    placeholder={t('customEgress.pastePlaceholder')}
                     className="w-full h-48 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm placeholder-slate-500 focus:outline-none focus:border-brand resize-none"
                   />
                   <button
                     onClick={handlePasteConfig}
                     className="px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium"
                   >
-                    解析配置
+                    {t('customEgress.parseButton')}
                   </button>
                   {parsedConfig && (
                     <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3">
-                      <p className="text-sm text-emerald-400">配置解析成功！</p>
-                      <p className="text-xs text-emerald-300 mt-1">服务器: {parsedConfig.server}:{parsedConfig.port}</p>
+                      <p className="text-sm text-emerald-400">{t('customEgress.parseSuccess')}</p>
+                      <p className="text-xs text-emerald-300 mt-1">{t('customEgress.serverInfo', { server: parsedConfig.server, port: parsedConfig.port })}</p>
                     </div>
                   )}
                 </div>
@@ -1038,23 +1040,23 @@ export default function EgressManager() {
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-medium text-slate-400 mb-2">
-                        标识符 <span className="text-red-400">*</span>
+                        {t('customEgress.identifier')} <span className="text-red-400">*</span>
                       </label>
                       <input
                         type="text"
                         value={formTag}
                         onChange={(e) => setFormTag(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))}
-                        placeholder="例如: my-server"
+                        placeholder={t('customEgress.identifierPlaceholder')}
                         className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                       />
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-slate-400 mb-2">描述</label>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('common.description')}</label>
                       <input
                         type="text"
                         value={formDescription}
                         onChange={(e) => setFormDescription(e.target.value)}
-                        placeholder="我的 WireGuard 服务器"
+                        placeholder={t('customEgress.descriptionPlaceholder')}
                         className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                       />
                     </div>
@@ -1063,18 +1065,18 @@ export default function EgressManager() {
                   <div className="grid grid-cols-3 gap-4">
                     <div className="col-span-2">
                       <label className="block text-sm font-medium text-slate-400 mb-2">
-                        服务器地址 <span className="text-red-400">*</span>
+                        {t('customEgress.serverAddress')} <span className="text-red-400">*</span>
                       </label>
                       <input
                         type="text"
                         value={formServer}
                         onChange={(e) => setFormServer(e.target.value)}
-                        placeholder="1.2.3.4 或 server.example.com"
+                        placeholder={t('customEgress.serverPlaceholder')}
                         className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                       />
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-slate-400 mb-2">端口</label>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.port')}</label>
                       <input
                         type="number"
                         value={formPort}
@@ -1086,39 +1088,39 @@ export default function EgressManager() {
 
                   <div>
                     <label className="block text-sm font-medium text-slate-400 mb-2">
-                      客户端地址 <span className="text-red-400">*</span>
+                      {t('customEgress.clientAddress')} <span className="text-red-400">*</span>
                     </label>
                     <input
                       type="text"
                       value={formAddress}
                       onChange={(e) => setFormAddress(e.target.value)}
-                      placeholder="10.0.0.2/32"
+                      placeholder={t('customEgress.clientAddressPlaceholder')}
                       className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono placeholder-slate-500 focus:outline-none focus:border-brand"
                     />
                   </div>
 
                   <div>
                     <label className="block text-sm font-medium text-slate-400 mb-2">
-                      客户端私钥 <span className="text-red-400">*</span>
+                      {t('customEgress.clientPrivateKey')} <span className="text-red-400">*</span>
                     </label>
                     <input
                       type="password"
                       value={formPrivateKey}
                       onChange={(e) => setFormPrivateKey(e.target.value)}
-                      placeholder="Base64 编码的私钥"
+                      placeholder={t('customEgress.privateKeyPlaceholder')}
                       className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono placeholder-slate-500 focus:outline-none focus:border-brand"
                     />
                   </div>
 
                   <div>
                     <label className="block text-sm font-medium text-slate-400 mb-2">
-                      服务端公钥 <span className="text-red-400">*</span>
+                      {t('customEgress.serverPublicKey')} <span className="text-red-400">*</span>
                     </label>
                     <input
                       type="text"
                       value={formPublicKey}
                       onChange={(e) => setFormPublicKey(e.target.value)}
-                      placeholder="Base64 编码的公钥"
+                      placeholder={t('customEgress.publicKeyPlaceholder')}
                       className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono placeholder-slate-500 focus:outline-none focus:border-brand"
                     />
                   </div>
@@ -1146,12 +1148,12 @@ export default function EgressManager() {
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-slate-400 mb-2">预共享密钥（可选）</label>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.preSharedKey')}</label>
                     <input
                       type="password"
                       value={formPreSharedKey}
                       onChange={(e) => setFormPreSharedKey(e.target.value)}
-                      placeholder="如果有的话"
+                      placeholder={t('customEgress.preSharedKeyPlaceholder')}
                       className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono placeholder-slate-500 focus:outline-none focus:border-brand"
                     />
                   </div>
@@ -1167,7 +1169,7 @@ export default function EgressManager() {
                 }}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleCreateEgress}
@@ -1179,7 +1181,7 @@ export default function EgressManager() {
                 ) : (
                   <PlusIcon className="h-4 w-4" />
                 )}
-                添加
+                {t('common.add')}
               </button>
             </div>
           </div>
@@ -1192,7 +1194,7 @@ export default function EgressManager() {
           <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl m-4">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">编辑出口 - {editingEgress.tag}</h2>
+                <h2 className="text-xl font-bold text-white">{t('customEgress.editTitle', { tag: editingEgress.tag })}</h2>
                 <button
                   onClick={() => {
                     setShowEditModal(false);
@@ -1208,7 +1210,7 @@ export default function EgressManager() {
 
             <div className="p-6 space-y-4">
               <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">描述</label>
+                <label className="block text-sm font-medium text-slate-400 mb-2">{t('common.description')}</label>
                 <input
                   type="text"
                   value={formDescription}
@@ -1219,7 +1221,7 @@ export default function EgressManager() {
 
               <div className="grid grid-cols-3 gap-4">
                 <div className="col-span-2">
-                  <label className="block text-sm font-medium text-slate-400 mb-2">服务器地址</label>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.serverAddress')}</label>
                   <input
                     type="text"
                     value={formServer}
@@ -1228,7 +1230,7 @@ export default function EgressManager() {
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-slate-400 mb-2">端口</label>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.port')}</label>
                   <input
                     type="number"
                     value={formPort}
@@ -1239,7 +1241,7 @@ export default function EgressManager() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">客户端地址</label>
+                <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.clientAddress')}</label>
                 <input
                   type="text"
                   value={formAddress}
@@ -1249,7 +1251,7 @@ export default function EgressManager() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">客户端私钥</label>
+                <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.clientPrivateKey')}</label>
                 <input
                   type="password"
                   value={formPrivateKey}
@@ -1259,7 +1261,7 @@ export default function EgressManager() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">服务端公钥</label>
+                <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.serverPublicKey')}</label>
                 <input
                   type="text"
                   value={formPublicKey}
@@ -1290,7 +1292,7 @@ export default function EgressManager() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">预共享密钥（可选）</label>
+                <label className="block text-sm font-medium text-slate-400 mb-2">{t('customEgress.preSharedKey')}</label>
                 <input
                   type="password"
                   value={formPreSharedKey}
@@ -1309,7 +1311,7 @@ export default function EgressManager() {
                 }}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 onClick={handleUpdateEgress}
@@ -1321,7 +1323,7 @@ export default function EgressManager() {
                 ) : (
                   <CheckIcon className="h-4 w-4" />
                 )}
-                保存
+                {t('common.save')}
               </button>
             </div>
           </div>

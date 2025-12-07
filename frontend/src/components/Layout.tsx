@@ -1,5 +1,6 @@
 import { PropsWithChildren, useState } from "react";
 import { Link } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import {
   ChartBarIcon,
   CogIcon,
@@ -15,48 +16,49 @@ import {
   ServerIcon,
   CloudArrowUpIcon
 } from "@heroicons/react/24/outline";
+import LanguageSwitcher from "./LanguageSwitcher";
 
 interface NavItem {
-  label: string;
+  labelKey: string;
   path: string;
   icon: React.ComponentType<{ className?: string }>;
-  description: string;
+  descriptionKey: string;
 }
 
 interface NavGroup {
-  label: string;
+  labelKey: string;
   icon: React.ComponentType<{ className?: string }>;
   items: NavItem[];
 }
 
 const standaloneItems: NavItem[] = [
-  { label: "仪表盘", path: "/", icon: ChartBarIcon, description: "实时监控" }
+  { labelKey: "nav.dashboard", path: "/", icon: ChartBarIcon, descriptionKey: "nav.dashboardDesc" }
 ];
 
 const navGroups: NavGroup[] = [
   {
-    label: "入口管理",
+    labelKey: "nav.ingress",
     icon: ArrowLeftEndOnRectangleIcon,
     items: [
-      { label: "客户端配置", path: "/ingress", icon: UsersIcon, description: "WireGuard 客户端" }
+      { labelKey: "nav.ingressClient", path: "/ingress", icon: UsersIcon, descriptionKey: "nav.ingressClientDesc" }
     ]
   },
   {
-    label: "出口管理",
+    labelKey: "nav.egress",
     icon: ArrowRightStartOnRectangleIcon,
     items: [
-      { label: "出口线路", path: "/egress", icon: ServerIcon, description: "PIA 和自定义出口" },
-      { label: "路由规则", path: "/rules", icon: AdjustmentsHorizontalIcon, description: "流量分流配置" },
-      { label: "规则库", path: "/domain-catalog", icon: RectangleStackIcon, description: "域名和IP分流" }
+      { labelKey: "nav.egressLines", path: "/egress", icon: ServerIcon, descriptionKey: "nav.egressLinesDesc" },
+      { labelKey: "nav.routeRules", path: "/rules", icon: AdjustmentsHorizontalIcon, descriptionKey: "nav.routeRulesDesc" },
+      { labelKey: "nav.ruleCatalog", path: "/domain-catalog", icon: RectangleStackIcon, descriptionKey: "nav.ruleCatalogDesc" }
     ]
   },
   {
-    label: "系统设置",
+    labelKey: "nav.system",
     icon: WrenchScrewdriverIcon,
     items: [
-      { label: "PIA 登录", path: "/pia", icon: LockClosedIcon, description: "凭证管理" },
-      { label: "端点配置", path: "/endpoints", icon: CogIcon, description: "WireGuard 参数" },
-      { label: "备份恢复", path: "/backup", icon: CloudArrowUpIcon, description: "配置导入导出" }
+      { labelKey: "nav.piaLogin", path: "/pia", icon: LockClosedIcon, descriptionKey: "nav.piaLoginDesc" },
+      { labelKey: "nav.endpoints", path: "/endpoints", icon: CogIcon, descriptionKey: "nav.endpointsDesc" },
+      { labelKey: "nav.backup", path: "/backup", icon: CloudArrowUpIcon, descriptionKey: "nav.backupDesc" }
     ]
   }
 ];
@@ -66,30 +68,32 @@ interface LayoutProps extends PropsWithChildren {
 }
 
 export default function Layout({ children, currentPath }: LayoutProps) {
+  const { t } = useTranslation();
+
   // Initialize expanded groups based on current path
   const getInitialExpanded = () => {
     const expanded: Set<string> = new Set();
     navGroups.forEach((group) => {
       if (group.items.some((item) => currentPath === item.path || (item.path !== "/" && currentPath.startsWith(item.path)))) {
-        expanded.add(group.label);
+        expanded.add(group.labelKey);
       }
     });
     // Default expand first group if nothing is active
     if (expanded.size === 0 && navGroups.length > 0) {
-      expanded.add(navGroups[0].label);
+      expanded.add(navGroups[0].labelKey);
     }
     return expanded;
   };
 
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(getInitialExpanded);
 
-  const toggleGroup = (label: string) => {
+  const toggleGroup = (labelKey: string) => {
     setExpandedGroups((prev) => {
       const next = new Set(prev);
-      if (next.has(label)) {
-        next.delete(label);
+      if (next.has(labelKey)) {
+        next.delete(labelKey);
       } else {
-        next.add(label);
+        next.add(labelKey);
       }
       return next;
     });
@@ -112,14 +116,17 @@ export default function Layout({ children, currentPath }: LayoutProps) {
           <div className="rounded-3xl bg-gradient-to-br from-slate-900/90 to-slate-900/70 backdrop-blur-xl border border-white/10 p-6 shadow-2xl shadow-black/40">
             {/* Logo Section */}
             <div className="mb-8 pb-6 border-b border-white/5">
-              <div className="flex items-center gap-3">
-                <div className="rounded-2xl bg-gradient-to-br from-brand to-blue-600 p-2.5 shadow-lg shadow-brand/20">
-                  <ShieldCheckIcon className="h-7 w-7 text-white" />
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="rounded-2xl bg-gradient-to-br from-brand to-blue-600 p-2.5 shadow-lg shadow-brand/20">
+                    <ShieldCheckIcon className="h-7 w-7 text-white" />
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-widest text-slate-400 font-semibold">{t('nav.brand')}</p>
+                    <h1 className="text-xl font-bold text-white">{t('nav.title')}</h1>
+                  </div>
                 </div>
-                <div>
-                  <p className="text-xs uppercase tracking-widest text-slate-400 font-semibold">Smart VPN</p>
-                  <h1 className="text-xl font-bold text-white">网关控制台</h1>
-                </div>
+                <LanguageSwitcher />
               </div>
             </div>
 
@@ -144,7 +151,7 @@ export default function Layout({ children, currentPath }: LayoutProps) {
                     }`}>
                       <Icon className="h-4 w-4" />
                     </div>
-                    <span className="font-semibold">{item.label}</span>
+                    <span className="font-semibold">{t(item.labelKey)}</span>
                   </Link>
                 );
               })}
@@ -152,14 +159,14 @@ export default function Layout({ children, currentPath }: LayoutProps) {
               {/* Grouped items */}
               {navGroups.map((group) => {
                 const GroupIcon = group.icon;
-                const isExpanded = expandedGroups.has(group.label);
+                const isExpanded = expandedGroups.has(group.labelKey);
                 const hasActiveItem = group.items.some(isItemActive);
 
                 return (
-                  <div key={group.label} className="pt-2">
+                  <div key={group.labelKey} className="pt-2">
                     {/* Group Header */}
                     <button
-                      onClick={() => toggleGroup(group.label)}
+                      onClick={() => toggleGroup(group.labelKey)}
                       className={`w-full flex items-center gap-3 rounded-xl px-4 py-2.5 text-sm font-medium transition-all duration-200 ${
                         hasActiveItem
                           ? "text-white bg-white/5"
@@ -171,7 +178,7 @@ export default function Layout({ children, currentPath }: LayoutProps) {
                       }`}>
                         <GroupIcon className="h-4 w-4" />
                       </div>
-                      <span className="flex-1 text-left font-semibold">{group.label}</span>
+                      <span className="flex-1 text-left font-semibold">{t(group.labelKey)}</span>
                       <ChevronDownIcon
                         className={`h-4 w-4 transition-transform duration-200 ${
                           isExpanded ? "rotate-180" : ""
@@ -201,9 +208,9 @@ export default function Layout({ children, currentPath }: LayoutProps) {
                             >
                               <Icon className={`h-4 w-4 ${active ? "text-brand" : ""}`} />
                               <div className="flex-1">
-                                <div className="font-medium">{item.label}</div>
+                                <div className="font-medium">{t(item.labelKey)}</div>
                                 <div className={`text-xs ${active ? "text-slate-300" : "text-slate-500"}`}>
-                                  {item.description}
+                                  {t(item.descriptionKey)}
                                 </div>
                               </div>
                             </Link>
@@ -221,9 +228,9 @@ export default function Layout({ children, currentPath }: LayoutProps) {
               <div className="rounded-xl bg-white/5 p-3">
                 <div className="flex items-center gap-2 mb-1">
                   <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span className="text-xs font-semibold text-slate-300">系统在线</span>
+                  <span className="text-xs font-semibold text-slate-300">{t('nav.systemOnline')}</span>
                 </div>
-                <p className="text-xs text-slate-500">基于 sing-box</p>
+                <p className="text-xs text-slate-500">{t('nav.poweredBy')}</p>
               </div>
             </div>
           </div>
