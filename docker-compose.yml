@@ -15,7 +15,7 @@ services:
       - PIA_PASSWORD=${PIA_PASSWORD:-}
       - WG_SERVER_ENDPOINT=${WG_SERVER_ENDPOINT:-}
     ports:
-      - "80:80"
+      - "8080:80"
       - "36100:36100/udp"
     devices:
       - /dev/net/tun:/dev/net/tun
