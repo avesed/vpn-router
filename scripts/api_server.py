@@ -1284,6 +1284,26 @@ def load_ingress_config() -> dict:
 
     # 获取服务器配置
     server = db.get_wireguard_server()
+
+    # 如果没有服务器配置或没有私钥，自动初始化
+    if not server or not server.get("private_key"):
+        try:
+            private_key = subprocess.run(
+                ["wg", "genkey"],
+                capture_output=True, text=True, check=True
+            ).stdout.strip()
+            db.set_wireguard_server(
+                interface_name="wg-ingress",
+                address="10.23.0.1/24",
+                listen_port=36100,
+                mtu=1420,
+                private_key=private_key
+            )
+            server = db.get_wireguard_server()
+            print("[api] Auto-initialized WireGuard server config with generated private key")
+        except Exception as e:
+            print(f"[api] Warning: Failed to auto-initialize WireGuard server: {e}")
+
     interface_data = {
         "name": server.get("interface_name", "wg-ingress") if server else "wg-ingress",
         "address": server.get("address", "10.23.0.1/24") if server else "10.23.0.1/24",

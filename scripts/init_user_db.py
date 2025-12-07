@@ -2,6 +2,7 @@
 """初始化用户配置数据库（用户数据）"""
 import sqlite3
 import json
+import subprocess
 from pathlib import Path
 import sys
 import yaml
@@ -105,6 +106,47 @@ def init_user_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def generate_wireguard_private_key() -> str:
+    """生成 WireGuard 私钥"""
+    try:
+        result = subprocess.run(
+            ["wg", "genkey"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        print(f"⚠ 无法生成 WireGuard 私钥: {e}")
+        return ""
+
+
+def init_wireguard_server(conn: sqlite3.Connection):
+    """初始化默认 WireGuard 服务器配置"""
+    cursor = conn.cursor()
+
+    # 检查是否已存在
+    cursor.execute("SELECT id FROM wireguard_server WHERE id = 1")
+    if cursor.fetchone():
+        print("⊘ WireGuard 服务器配置已存在，跳过")
+        return
+
+    # 生成私钥
+    private_key = generate_wireguard_private_key()
+    if not private_key:
+        print("⚠ 未能生成私钥，WireGuard 服务器配置初始化失败")
+        return
+
+    # 插入默认配置
+    cursor.execute("""
+        INSERT INTO wireguard_server (id, interface_name, address, listen_port, mtu, private_key)
+        VALUES (1, 'wg-ingress', '10.23.0.1/24', 36100, 1420, ?)
+    """, (private_key,))
+
+    conn.commit()
+    print("✓ 初始化 WireGuard 服务器配置（已生成私钥）")
+
+
 def add_default_outbounds(conn: sqlite3.Connection):
     """添加默认出口"""
     cursor = conn.cursor()
@@ -190,6 +232,9 @@ def main():
     # 添加默认数据
     add_default_outbounds(conn)
 
+    # 初始化 WireGuard 服务器配置
+    init_wireguard_server(conn)
+
     # 加载 PIA profiles（如果存在）
     load_pia_profiles(conn, config_dir)
 
@@ -204,6 +249,7 @@ def main():
     stats = {
         "routing_rules": cursor.execute("SELECT COUNT(*) FROM routing_rules").fetchone()[0],
         "outbounds": cursor.execute("SELECT COUNT(*) FROM outbounds").fetchone()[0],
+        "wireguard_server": cursor.execute("SELECT COUNT(*) FROM wireguard_server").fetchone()[0],
         "wireguard_peers": cursor.execute("SELECT COUNT(*) FROM wireguard_peers").fetchone()[0],
         "pia_profiles": cursor.execute("SELECT COUNT(*) FROM pia_profiles").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
@@ -217,6 +263,7 @@ def main():
     print("=" * 60)
     print(f"路由规则数:       {stats['routing_rules']:,}")
     print(f"出口配置数:       {stats['outbounds']:,}")
+    print(f"WireGuard 服务器: {stats['wireguard_server']:,}")
     print(f"WireGuard 客户端: {stats['wireguard_peers']:,}")
     print(f"PIA Profiles:     {stats['pia_profiles']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
