@@ -127,22 +127,31 @@ def ensure_wireguard_server_endpoint(config: dict) -> bool:
 
 
 def ensure_sniff_action(config: dict) -> None:
-    """确保路由规则中有 sniff 动作以支持域名匹配，且位于规则列表开头"""
+    """确保路由规则中有 sniff 动作和 DNS 劫持，支持域名匹配"""
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
 
+    # sniff 规则 - 从 TLS/HTTP/QUIC 中检测域名
     sniff_rule = {
         "action": "sniff",
-        "sniffer": ["tls", "http"],
+        "sniffer": ["tls", "http", "quic"],
         "timeout": "300ms"
     }
 
-    # 移除所有现有的 sniff 动作
-    rules[:] = [r for r in rules if r.get("action") != "sniff"]
+    # DNS 劫持规则 - 让 sing-box 接管 DNS 解析
+    # 这样可以通过 VPN 隧道解析 DNS，防止 DNS 泄露
+    hijack_dns_rule = {
+        "action": "hijack-dns",
+        "protocol": "dns"
+    }
 
-    # 在规则列表开头添加 sniff 动作
+    # 移除所有现有的 sniff 和 hijack-dns 动作
+    rules[:] = [r for r in rules if r.get("action") not in ("sniff", "hijack-dns")]
+
+    # 在规则列表开头添加：先 sniff，再 hijack-dns
+    rules.insert(0, hijack_dns_rule)
     rules.insert(0, sniff_rule)
-    print("[render] sniff 动作已置于规则列表开头")
+    print("[render] sniff 和 hijack-dns 动作已置于规则列表开头")
 
 
 def _create_wireguard_endpoint(tag: str, profile: dict, index: int) -> dict:
@@ -286,21 +295,29 @@ def ensure_endpoints(config: dict, pia_profiles: dict, profile_map: Dict[str, st
 
 
 def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
-    """确保每个 profile 都有对应的 DNS 服务器"""
+    """确保每个 profile 都有对应的 DNS 服务器
+
+    使用 PIA 的私有 DNS 服务器 10.0.0.241 (DNS+Streaming+MACE)
+    这些 DNS 必须通过 VPN 隧道访问，可以防止 DNS 泄露
+    """
     dns = config.setdefault("dns", {})
     servers = dns.setdefault("servers", [])
-    existing_tags = {s.get("tag") for s in servers}
+
+    # PIA 私有 DNS: 10.0.0.241 (DNS+Streaming+MACE)
+    PIA_DNS = "10.0.0.241"
 
     for tag in profile_map.keys():
         dns_tag = f"{tag}-dns"
-        if dns_tag not in existing_tags:
-            # 添加新的 DNS 服务器（通过对应的 VPN 出口）
-            servers.append({
-                "type": "tls",
-                "tag": dns_tag,
-                "server": "1.1.1.1",
-                "detour": tag
-            })
+
+        # 移除旧的同名 DNS 服务器
+        servers[:] = [s for s in servers if s.get("tag") != dns_tag]
+
+        # 添加使用 PIA 私有 DNS 的服务器
+        servers.append({
+            "tag": dns_tag,
+            "address": f"udp://{PIA_DNS}",
+            "detour": tag
+        })
 
 
 def ensure_outbound_selector(config: dict, all_egress_tags: List[str]) -> None:
