@@ -1683,65 +1683,32 @@ def get_peer_transfer_info() -> dict:
 
 
 def apply_ingress_config(config: dict) -> dict:
-    """应用入口 WireGuard 配置到系统"""
-    interface = config.get("interface", {})
-    iface_name = interface.get("name", "wg-ingress")
+    """应用入口 WireGuard 配置到系统
 
+    sing-box 1.12+ 使用 userspace WireGuard endpoint，因此主要通过
+    regenerate sing-box config 和 reload sing-box 来应用配置。
+    """
     try:
-        # 检查接口是否存在
-        result = subprocess.run(["ip", "link", "show", iface_name], capture_output=True)
-        iface_exists = result.returncode == 0
+        # 重新生成 sing-box 配置（包含 wg-server endpoint 和 peers）
+        render_script = ENTRY_DIR / "render_singbox.py"
+        result = subprocess.run(
+            ["python3", str(render_script)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            error_msg = f"配置生成失败: {result.stderr.strip() or result.stdout.strip()}"
+            print(f"[api] render_singbox.py 失败: {result.stderr}")
+            return {"success": False, "message": error_msg}
 
-        if not iface_exists:
-            # 创建接口
-            subprocess.run(["ip", "link", "add", iface_name, "type", "wireguard"], check=True)
+        print(f"[api] render_singbox.py 成功: {result.stdout.strip()}")
 
-        # 配置接口
-        private_key = interface.get("private_key", "")
-        listen_port = interface.get("listen_port", DEFAULT_WG_PORT)
+        # 重载 sing-box 使配置生效
+        reload_result = reload_singbox()
+        if not reload_result.get("success", False):
+            return {"success": False, "message": f"重载失败: {reload_result.get('message', 'unknown error')}"}
 
-        # 设置私钥（通过临时文件）
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            f.write(private_key)
-            key_file = f.name
-        try:
-            subprocess.run(["wg", "set", iface_name, "private-key", key_file, "listen-port", str(listen_port)], check=True)
-        finally:
-            os.unlink(key_file)
-
-        # 清除现有 peers
-        existing_peers = subprocess.run(
-            ["wg", "show", iface_name, "peers"],
-            capture_output=True, text=True
-        ).stdout.strip().split("\n")
-
-        for peer_key in existing_peers:
-            if peer_key:
-                subprocess.run(["wg", "set", iface_name, "peer", peer_key, "remove"], capture_output=True)
-
-        # 添加 peers
-        for peer in config.get("peers", []):
-            cmd = ["wg", "set", iface_name, "peer", peer["public_key"]]
-            allowed_ips = ",".join(peer.get("allowed_ips", []))
-            if allowed_ips:
-                cmd.extend(["allowed-ips", allowed_ips])
-            subprocess.run(cmd, check=True)
-
-        # 配置 IP 地址
-        address = interface.get("address", "10.23.0.1/24")
-        # 先删除旧地址
-        subprocess.run(["ip", "addr", "flush", "dev", iface_name], capture_output=True)
-        subprocess.run(["ip", "addr", "add", address, "dev", iface_name], check=True)
-
-        # 启动接口
-        subprocess.run(["ip", "link", "set", iface_name, "up"], check=True)
-
-        # 设置 MTU
-        mtu = interface.get("mtu", 1420)
-        subprocess.run(["ip", "link", "set", iface_name, "mtu", str(mtu)], check=True)
-
-        return {"success": True, "message": "配置已应用"}
+        return {"success": True, "message": "配置已应用", "reload": reload_result}
     except subprocess.CalledProcessError as exc:
         return {"success": False, "message": f"应用配置失败: {exc}"}
     except Exception as exc:

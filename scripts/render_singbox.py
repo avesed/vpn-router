@@ -127,23 +127,22 @@ def ensure_wireguard_server_endpoint(config: dict) -> bool:
 
 
 def ensure_sniff_action(config: dict) -> None:
-    """确保路由规则中有 sniff 动作以支持域名匹配"""
+    """确保路由规则中有 sniff 动作以支持域名匹配，且位于规则列表开头"""
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
 
-    # 检查是否已有 sniff 动作
-    has_sniff = any(r.get("action") == "sniff" for r in rules)
-    if has_sniff:
-        return
-
-    # 在规则列表开头添加 sniff 动作
     sniff_rule = {
         "action": "sniff",
         "sniffer": ["tls", "http"],
         "timeout": "300ms"
     }
+
+    # 移除所有现有的 sniff 动作
+    rules[:] = [r for r in rules if r.get("action") != "sniff"]
+
+    # 在规则列表开头添加 sniff 动作
     rules.insert(0, sniff_rule)
-    print("[render] 添加 sniff 动作以支持域名匹配")
+    print("[render] sniff 动作已置于规则列表开头")
 
 
 def _create_wireguard_endpoint(tag: str, profile: dict, index: int) -> dict:
@@ -520,11 +519,21 @@ def load_custom_rules() -> Dict[str, Any]:
         return result
 
 
-def apply_custom_rules(config: dict, custom_rules: Dict[str, Any]) -> None:
-    """应用自定义路由规则到配置"""
+def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outbounds: List[str]) -> None:
+    """应用自定义路由规则到配置
+
+    Args:
+        config: sing-box 配置
+        custom_rules: 自定义规则配置
+        valid_outbounds: 有效的出口标签列表（用于过滤无效规则）
+    """
     route = config.setdefault("route", {})
     rule_set = route.setdefault("rule_set", [])
     rules = route.setdefault("rules", [])
+
+    # 始终有效的出口：direct 和 block
+    always_valid = {"direct", "block"}
+    all_valid = always_valid | set(valid_outbounds)
 
     # 获取现有的 custom rule_set tags
     existing_custom_tags = set()
@@ -539,6 +548,7 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any]) -> None:
     )]
 
     # 添加新的自定义规则
+    skipped_rules = []
     for custom_rule in custom_rules.get("rules", []):
         rule_tag = custom_rule.get("tag", "")
         if not rule_tag.startswith("custom-"):
@@ -548,6 +558,11 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any]) -> None:
         domain_keywords = custom_rule.get("domain_keywords", [])
         ip_cidrs = custom_rule.get("ip_cidrs", [])
         outbound = custom_rule.get("outbound", "direct")
+
+        # 过滤掉指向不存在出口的规则
+        if outbound not in all_valid:
+            skipped_rules.append(f"{rule_tag} -> {outbound}")
+            continue
 
         if domains or domain_keywords or ip_cidrs:
             # 创建 inline rule_set
@@ -571,9 +586,18 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any]) -> None:
                 "outbound": outbound
             })
 
-    # 更新默认出口
-    if custom_rules.get("default_outbound"):
-        route["final"] = custom_rules["default_outbound"]
+    # 输出跳过的规则警告
+    if skipped_rules:
+        print(f"[render] 警告: 跳过 {len(skipped_rules)} 条指向无效出口的规则: {skipped_rules}")
+
+    # 更新默认出口（验证是否有效）
+    default_outbound = custom_rules.get("default_outbound")
+    if default_outbound:
+        if default_outbound in all_valid:
+            route["final"] = default_outbound
+        else:
+            print(f"[render] 警告: 默认出口 '{default_outbound}' 无效，使用 'direct'")
+            route["final"] = "direct"
 
 
 def main() -> None:
@@ -625,10 +649,10 @@ def main() -> None:
     if all_egress_tags:
         ensure_outbound_selector(config, all_egress_tags)
 
-    # 应用自定义规则
+    # 应用自定义规则（传入有效出口列表用于验证）
     custom_rules = load_custom_rules()
     if custom_rules.get("rules") or custom_rules.get("default_outbound"):
-        apply_custom_rules(config, custom_rules)
+        apply_custom_rules(config, custom_rules, all_egress_tags)
         if custom_rules.get("rules"):
             print(f"[render] 应用了 {len(custom_rules['rules'])} 条自定义规则")
         if custom_rules.get("default_outbound"):
