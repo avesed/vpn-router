@@ -23,6 +23,7 @@ config/geosite.db
 config/settings.json
 config/sing-box.generated.json
 config/custom-rules.json
+config/cache.db
 
 # Python cache
 __pycache__/
