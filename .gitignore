@@ -23,12 +23,7 @@ vite.config.d.ts
 /config/pia-profiles.json
 /config/sing-box.json
 /config/sing-box.generated.json
-/config/custom-egress.json
 /config/rulesets/
-
-# Auto-generated backup files (primary storage: database)
-/config/custom-rules.json
-/config/custom-category-items.json
 
 # Old database files (migrated to separated databases)
 /config/routing.db
@@ -41,7 +36,8 @@ vite.config.d.ts
 /config/geosite.db
 /config/.geodata-ready
 
-# User settings (auto-generated)
+# Runtime generated files
+/config/cache.db
 /config/settings.json
 
 # Old source data directories (data now in databases)

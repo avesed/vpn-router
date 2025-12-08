@@ -240,29 +240,49 @@ class UserDatabase:
             cursor = conn.cursor()
             if enabled_only:
                 rows = cursor.execute("""
-                    SELECT id, rule_type, target, outbound, priority, enabled, created_at, updated_at
+                    SELECT id, rule_type, target, outbound, tag, priority, enabled, created_at, updated_at
                     FROM routing_rules
                     WHERE enabled = 1
                     ORDER BY priority DESC, id ASC
                 """).fetchall()
             else:
                 rows = cursor.execute("""
-                    SELECT id, rule_type, target, outbound, priority, enabled, created_at, updated_at
+                    SELECT id, rule_type, target, outbound, tag, priority, enabled, created_at, updated_at
                     FROM routing_rules
                     ORDER BY priority DESC, id ASC
                 """).fetchall()
             return [dict(row) for row in rows]
 
-    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0) -> int:
+    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0, tag: Optional[str] = None) -> int:
         """添加路由规则"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO routing_rules (rule_type, target, outbound, priority)
-                VALUES (?, ?, ?, ?)
-            """, (rule_type, target, outbound, priority))
+                INSERT INTO routing_rules (rule_type, target, outbound, tag, priority)
+                VALUES (?, ?, ?, ?, ?)
+            """, (rule_type, target, outbound, tag, priority))
             conn.commit()
             return cursor.lastrowid
+
+    def add_routing_rules_batch(self, rules: List[tuple]) -> int:
+        """批量添加路由规则
+
+        Args:
+            rules: [(rule_type, target, outbound, tag, priority), ...]
+
+        Returns:
+            成功插入的数量
+        """
+        if not rules:
+            return 0
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.executemany("""
+                INSERT OR IGNORE INTO routing_rules (rule_type, target, outbound, tag, priority)
+                VALUES (?, ?, ?, ?, ?)
+            """, rules)
+            conn.commit()
+            return cursor.rowcount
 
     def update_routing_rule(
         self,
@@ -308,6 +328,14 @@ class UserDatabase:
             cursor.execute("DELETE FROM routing_rules WHERE id = ?", (rule_id,))
             conn.commit()
             return cursor.rowcount > 0
+
+    def delete_all_routing_rules(self) -> int:
+        """删除所有路由规则（用于备份恢复的替换模式）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM routing_rules")
+            conn.commit()
+            return cursor.rowcount
 
     # ============ 出口管理 ============
 
@@ -671,6 +699,130 @@ class UserDatabase:
                 return row_dict
             return None
 
+    # ============ 设置管理 ============
+
+    def get_setting(self, key: str, default: str = None) -> Optional[str]:
+        """获取设置值"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> bool:
+        """设置或更新设置值"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """, (key, value))
+            conn.commit()
+            return True
+
+    def get_all_settings(self) -> Dict[str, str]:
+        """获取所有设置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("SELECT key, value FROM settings").fetchall()
+            return {row[0]: row[1] for row in rows}
+
+    # ============ Custom Egress 方法 ============
+
+    def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有自定义出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM custom_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM custom_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            result = []
+            for row in rows:
+                item = dict(zip(columns, row))
+                # 解析 reserved JSON
+                if item.get("reserved"):
+                    try:
+                        item["reserved"] = json.loads(item["reserved"])
+                    except:
+                        item["reserved"] = None
+                result.append(item)
+            return result
+
+    def get_custom_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取自定义出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM custom_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            item = dict(zip(columns, row))
+            if item.get("reserved"):
+                try:
+                    item["reserved"] = json.loads(item["reserved"])
+                except:
+                    item["reserved"] = None
+            return item
+
+    def add_custom_egress(self, tag: str, server: str, private_key: str,
+                          public_key: str, address: str, description: str = "",
+                          port: int = 51820, mtu: int = 1420, dns: str = "1.1.1.1",
+                          pre_shared_key: Optional[str] = None,
+                          reserved: Optional[List[int]] = None) -> int:
+        """添加自定义出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            reserved_json = json.dumps(reserved) if reserved else None
+            cursor.execute("""
+                INSERT INTO custom_egress
+                (tag, description, server, port, private_key, public_key, address, mtu, dns, pre_shared_key, reserved)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, description, server, port, private_key, public_key, address, mtu, dns, pre_shared_key, reserved_json))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_custom_egress(self, tag: str, **kwargs) -> bool:
+        """更新自定义出口"""
+        allowed_fields = {"description", "server", "port", "private_key", "public_key",
+                          "address", "mtu", "dns", "pre_shared_key", "reserved", "enabled"}
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields and value is not None:
+                if key == "reserved":
+                    value = json.dumps(value) if value else None
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE custom_egress SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_custom_egress(self, tag: str) -> bool:
+        """删除自定义出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM custom_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
@@ -714,8 +866,11 @@ class DatabaseManager:
     def get_routing_rules(self, enabled_only: bool = True) -> List[Dict]:
         return self.user.get_routing_rules(enabled_only)
 
-    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0) -> int:
-        return self.user.add_routing_rule(rule_type, target, outbound, priority)
+    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0, tag: Optional[str] = None) -> int:
+        return self.user.add_routing_rule(rule_type, target, outbound, priority, tag)
+
+    def add_routing_rules_batch(self, rules: List[tuple]) -> int:
+        return self.user.add_routing_rules_batch(rules)
 
     def update_routing_rule(self, rule_id: int, outbound: Optional[str] = None,
                           priority: Optional[int] = None, enabled: Optional[bool] = None) -> bool:
@@ -723,6 +878,9 @@ class DatabaseManager:
 
     def delete_routing_rule(self, rule_id: int) -> bool:
         return self.user.delete_routing_rule(rule_id)
+
+    def delete_all_routing_rules(self) -> int:
+        return self.user.delete_all_routing_rules()
 
     def get_outbounds(self, enabled_only: bool = True) -> List[Dict]:
         return self.user.get_outbounds(enabled_only)
@@ -797,6 +955,38 @@ class DatabaseManager:
 
     def get_custom_category_item(self, item_id: str) -> Optional[Dict]:
         return self.user.get_custom_category_item(item_id)
+
+    # Settings
+    def get_setting(self, key: str, default: str = None) -> Optional[str]:
+        return self.user.get_setting(key, default)
+
+    def set_setting(self, key: str, value: str) -> bool:
+        return self.user.set_setting(key, value)
+
+    def get_all_settings(self) -> Dict[str, str]:
+        return self.user.get_all_settings()
+
+    # Custom Egress
+    def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_custom_egress_list(enabled_only)
+
+    def get_custom_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_custom_egress(tag)
+
+    def add_custom_egress(self, tag: str, server: str, private_key: str,
+                          public_key: str, address: str, description: str = "",
+                          port: int = 51820, mtu: int = 1420, dns: str = "1.1.1.1",
+                          pre_shared_key: Optional[str] = None,
+                          reserved: Optional[List[int]] = None) -> int:
+        return self.user.add_custom_egress(tag, server, private_key, public_key,
+                                           address, description, port, mtu, dns,
+                                           pre_shared_key, reserved)
+
+    def update_custom_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_custom_egress(tag, **kwargs)
+
+    def delete_custom_egress(self, tag: str) -> bool:
+        return self.user.delete_custom_egress(tag)
 
 
 # 全局缓存

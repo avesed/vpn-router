@@ -60,6 +60,22 @@ export default function IngressManager() {
   const [serverEndpoint, setServerEndpoint] = useState("");
   const [serverEndpointSaved, setServerEndpointSaved] = useState("");
   const [savingSettings, setSavingSettings] = useState(false);
+  const [detectedIps, setDetectedIps] = useState<{ public_ip: string | null; lan_ip: string | null } | null>(null);
+  const [detectingIp, setDetectingIp] = useState(false);
+
+  const detectIp = useCallback(async () => {
+    setDetectingIp(true);
+    try {
+      const result = await api.detectIp();
+      setDetectedIps({ public_ip: result.public_ip, lan_ip: result.lan_ip });
+      return result;
+    } catch {
+      setDetectedIps(null);
+      return null;
+    } finally {
+      setDetectingIp(false);
+    }
+  }, []);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -98,6 +114,7 @@ export default function IngressManager() {
       setServerEndpointSaved(serverEndpoint.trim());
       setSuccessMessage(t("ingress.serverAddressSaved"));
       setShowSettingsModal(false);
+      setDetectedIps(null);
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
       setError(err instanceof Error ? err.message : t("common.saveFailed"));
@@ -114,6 +131,12 @@ export default function IngressManager() {
 
     setActionLoading("add");
     try {
+      // Save server endpoint if it was set in the modal
+      if (!serverEndpointSaved && serverEndpoint.trim()) {
+        await api.updateSettings(serverEndpoint.trim());
+        setServerEndpointSaved(serverEndpoint.trim());
+      }
+
       const result = await api.addIngressPeer(
         newPeerName.trim(),
         useCustomKey ? newPeerPublicKey.trim() : undefined
@@ -123,6 +146,7 @@ export default function IngressManager() {
       setNewPeerName("");
       setNewPeerPublicKey("");
       setUseCustomKey(false);
+      setDetectedIps(null);
 
       if (result.client_private_key) {
         setConfigPeerName(newPeerName.trim());
@@ -345,7 +369,7 @@ export default function IngressManager() {
                     <div>
                       <p className="text-slate-500">{t("ingress.clientStatus")}</p>
                       <p className={peer.is_online ? "text-emerald-400" : "text-slate-400"}>
-                        {peer.is_online ? t("ingress.online") : t("common.offline")}
+                        {peer.is_online ? t("ingress.active") : t("ingress.idle")}
                       </p>
                     </div>
                     <div>
@@ -395,6 +419,69 @@ export default function IngressManager() {
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
               </div>
+
+              {/* Server Address Setup - show if not configured */}
+              {!serverEndpointSaved && (
+                <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Cog6ToothIcon className="h-4 w-4 text-amber-400" />
+                    <span className="text-sm font-medium text-amber-300">
+                      {t("ingress.setupServerAddress")}
+                    </span>
+                  </div>
+                  <p className="text-xs text-amber-200/70">
+                    {t("ingress.setupServerAddressHint")}
+                  </p>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={serverEndpoint}
+                      onChange={(e) => setServerEndpoint(e.target.value)}
+                      placeholder={t("ingress.serverAddressPlaceholder")}
+                      className="flex-1 px-3 py-2 rounded-lg bg-black/20 border border-amber-500/30 text-white placeholder-slate-500 focus:outline-none focus:border-amber-400 text-sm"
+                    />
+                    <button
+                      onClick={detectIp}
+                      disabled={detectingIp}
+                      className="px-3 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-sm transition-colors disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {detectingIp ? (
+                        <div className="animate-spin h-4 w-4 border-2 border-amber-400 border-t-transparent rounded-full" />
+                      ) : (
+                        t("ingress.autoDetect")
+                      )}
+                    </button>
+                  </div>
+                  {detectedIps && (detectedIps.public_ip || detectedIps.lan_ip) && (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {detectedIps.public_ip && (
+                        <button
+                          onClick={() => setServerEndpoint(detectedIps.public_ip!)}
+                          className={`px-3 py-1.5 rounded-lg text-xs transition-colors ${
+                            serverEndpoint === detectedIps.public_ip
+                              ? "bg-amber-500/30 border border-amber-400 text-amber-200"
+                              : "bg-black/20 border border-amber-500/20 text-amber-300 hover:bg-amber-500/20"
+                          }`}
+                        >
+                          {t("ingress.publicIp")}: {detectedIps.public_ip}
+                        </button>
+                      )}
+                      {detectedIps.lan_ip && (
+                        <button
+                          onClick={() => setServerEndpoint(detectedIps.lan_ip!)}
+                          className={`px-3 py-1.5 rounded-lg text-xs transition-colors ${
+                            serverEndpoint === detectedIps.lan_ip
+                              ? "bg-amber-500/30 border border-amber-400 text-amber-200"
+                              : "bg-black/20 border border-amber-500/20 text-amber-300 hover:bg-amber-500/20"
+                          }`}
+                        >
+                          {t("ingress.lanIp")}: {detectedIps.lan_ip}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div>
                 <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
@@ -559,6 +646,7 @@ export default function IngressManager() {
                   onClick={() => {
                     setShowSettingsModal(false);
                     setServerEndpoint(serverEndpointSaved);
+                    setDetectedIps(null);
                   }}
                   className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
                 >
@@ -572,19 +660,66 @@ export default function IngressManager() {
                 <label className="block text-sm font-medium text-slate-400 mb-2">
                   {t("ingress.serverPublicAddress")} <span className="text-red-400">*</span>
                 </label>
-                <input
-                  type="text"
-                  value={serverEndpoint}
-                  onChange={(e) => setServerEndpoint(e.target.value)}
-                  placeholder={t("ingress.serverAddressPlaceholder")}
-                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={serverEndpoint}
+                    onChange={(e) => setServerEndpoint(e.target.value)}
+                    placeholder={t("ingress.serverAddressPlaceholder")}
+                    className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                  />
+                  <button
+                    onClick={detectIp}
+                    disabled={detectingIp}
+                    className="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors disabled:opacity-50 whitespace-nowrap"
+                    title={t("ingress.autoDetect")}
+                  >
+                    {detectingIp ? (
+                      <div className="animate-spin h-4 w-4 border-2 border-slate-400 border-t-transparent rounded-full" />
+                    ) : (
+                      t("ingress.autoDetect")
+                    )}
+                  </button>
+                </div>
                 <p className="text-xs text-slate-500 mt-2">
                   {t("ingress.serverAddressHint", { port: ingress?.interface.listen_port || 36100 })}
                 </p>
               </div>
 
-              {!serverEndpointSaved && (
+              {/* Detected IPs selection */}
+              {detectedIps && (detectedIps.public_ip || detectedIps.lan_ip) && (
+                <div className="rounded-lg bg-blue-500/10 border border-blue-500/20 p-4 space-y-3">
+                  <p className="text-xs text-blue-300">{t("ingress.selectDetectedIp")}</p>
+                  <div className="flex flex-wrap gap-2">
+                    {detectedIps.public_ip && (
+                      <button
+                        onClick={() => setServerEndpoint(detectedIps.public_ip!)}
+                        className={`px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                          serverEndpoint === detectedIps.public_ip
+                            ? "bg-blue-500/30 border border-blue-400 text-blue-200"
+                            : "bg-white/5 border border-white/10 text-slate-300 hover:bg-white/10"
+                        }`}
+                      >
+                        {t("ingress.publicIp")}: {detectedIps.public_ip}
+                      </button>
+                    )}
+                    {detectedIps.lan_ip && (
+                      <button
+                        onClick={() => setServerEndpoint(detectedIps.lan_ip!)}
+                        className={`px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                          serverEndpoint === detectedIps.lan_ip
+                            ? "bg-blue-500/30 border border-blue-400 text-blue-200"
+                            : "bg-white/5 border border-white/10 text-slate-300 hover:bg-white/10"
+                        }`}
+                      >
+                        {t("ingress.lanIp")}: {detectedIps.lan_ip}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {!serverEndpointSaved && !detectedIps && !serverEndpoint && (
                 <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
                   <p className="text-xs text-amber-300">
                     {t("ingress.noServerAddressWarning")}
@@ -606,6 +741,7 @@ export default function IngressManager() {
                 onClick={() => {
                   setShowSettingsModal(false);
                   setServerEndpoint(serverEndpointSaved);
+                  setDetectedIps(null);
                 }}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >

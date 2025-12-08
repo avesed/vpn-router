@@ -24,6 +24,10 @@ GEODATA_DB_PATH="${GEODATA_DB_PATH:-/etc/sing-box/geoip-geodata.db}"
 DEFAULT_CONFIG_DIR="/opt/default-config"
 GEODATA_RELEASE_URL="https://github.com/avesed/vpn-router/releases/download/geodata/geoip-geodata.db"
 
+# Port configuration
+export WEB_PORT="${WEB_PORT:-36000}"
+export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
+
 # 首次启动初始化：下载或复制 geodata 数据库
 if [ ! -f "${GEODATA_DB_PATH}" ]; then
   echo "[entrypoint] geodata database not found, attempting to download..."
@@ -47,14 +51,12 @@ if [ ! -f "${BASE_CONFIG_PATH}" ]; then
   exit 1
 fi
 
-# 初始化用户数据库（如果不存在）
-if [ ! -f "${USER_DB_PATH}" ]; then
-  echo "[entrypoint] initializing user database: ${USER_DB_PATH}"
-  python3 /usr/local/bin/init_user_db.py /etc/sing-box
-  if [ $? -ne 0 ]; then
-    echo "[entrypoint] failed to initialize user database" >&2
-    exit 1
-  fi
+# 初始化/升级用户数据库（使用 CREATE TABLE IF NOT EXISTS，安全运行）
+echo "[entrypoint] initializing user database: ${USER_DB_PATH}"
+python3 /usr/local/bin/init_user_db.py /etc/sing-box
+if [ $? -ne 0 ]; then
+  echo "[entrypoint] failed to initialize user database" >&2
+  exit 1
 fi
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -82,7 +84,15 @@ start_api_server() {
 }
 
 start_nginx() {
-  echo "[entrypoint] starting nginx on port 80"
+  echo "[entrypoint] starting nginx on port ${WEB_PORT}"
+
+  # Generate nginx.conf from template with environment variables
+  NGINX_TEMPLATE="/etc/nginx/nginx.conf.template"
+  NGINX_CONF="/etc/nginx/conf.d/default.conf"
+  if [ -f "${NGINX_TEMPLATE}" ]; then
+    envsubst '${WEB_PORT}' < "${NGINX_TEMPLATE}" > "${NGINX_CONF}"
+    echo "[entrypoint] generated nginx config with WEB_PORT=${WEB_PORT}"
+  fi
 
   # Test nginx configuration
   nginx -t

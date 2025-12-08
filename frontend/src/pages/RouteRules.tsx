@@ -32,6 +32,7 @@ export default function RouteRules() {
   const { t } = useTranslation();
   const [rules, setRules] = useState<RouteRule[]>([]);
   const [profiles, setProfiles] = useState<VpnProfile[]>([]);
+  const [availableOutbounds, setAvailableOutbounds] = useState<string[]>([]);
   const [defaultOutbound, setDefaultOutbound] = useState("direct");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -54,6 +55,7 @@ export default function RouteRules() {
       ]);
       setRules(rulesData.rules);
       setDefaultOutbound(rulesData.default_outbound);
+      setAvailableOutbounds(rulesData.available_outbounds || []);
       setProfiles(profilesData.profiles);
       setError(null);
     } catch (err: unknown) {
@@ -146,10 +148,15 @@ export default function RouteRules() {
     }
   };
 
-  const outboundOptions = [
-    { value: "direct", label: `${t('common.direct')} (Direct)` },
-    ...profiles.map((p) => ({ value: p.tag, label: `${p.tag} (${p.description})` }))
-  ];
+  // Build outbound options from available_outbounds (includes custom egress)
+  // Use profiles map for descriptions where available
+  const profileMap = new Map(profiles.map(p => [p.tag, p.description]));
+  const outboundOptions = availableOutbounds.map(ob => {
+    if (ob === "direct") return { value: "direct", label: `${t('common.direct')} (Direct)` };
+    if (ob === "block") return { value: "block", label: `${t('common.block')} (Block)` };
+    const description = profileMap.get(ob);
+    return { value: ob, label: description ? `${ob} (${description})` : ob };
+  });
 
   return (
     <div className="space-y-6">
@@ -515,28 +522,26 @@ export default function RouteRules() {
         </div>
       )}
 
-      {/* Save Button */}
-      {rules.length > 0 && (
-        <div className="flex justify-end">
-          <button
-            onClick={handleSaveAll}
-            disabled={saving}
-            className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-brand/20 transition hover:shadow-xl hover:shadow-brand/30 disabled:opacity-50"
-          >
-            {saving ? (
-              <>
-                <ArrowPathIcon className="h-4 w-4 animate-spin" />
-                {t('common.saving')}
-              </>
-            ) : (
-              <>
-                <CheckCircleIcon className="h-4 w-4" />
-                {t('rules.saveAndApply')}
-              </>
-            )}
-          </button>
-        </div>
-      )}
+      {/* Save Button - Always visible to save default outbound */}
+      <div className="flex justify-end">
+        <button
+          onClick={handleSaveAll}
+          disabled={saving}
+          className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-brand to-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-brand/20 transition hover:shadow-xl hover:shadow-brand/30 disabled:opacity-50"
+        >
+          {saving ? (
+            <>
+              <ArrowPathIcon className="h-4 w-4 animate-spin" />
+              {t('common.saving')}
+            </>
+          ) : (
+            <>
+              <CheckCircleIcon className="h-4 w-4" />
+              {t('rules.saveAndApply')}
+            </>
+          )}
+        </button>
+      </div>
 
       {/* Help Info */}
       <div className="rounded-2xl border border-blue-500/20 bg-blue-500/5 p-5">

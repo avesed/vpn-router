@@ -175,6 +175,7 @@ export const api = {
       method: "PUT",
       body: { server_endpoint: serverEndpoint }
     }),
+  detectIp: () => request<{ public_ip: string | null; lan_ip: string | null; message: string }>("/settings/detect-ip"),
 
   // Egress Management
   getAllEgress: () => request<AllEgressResponse>("/egress"),

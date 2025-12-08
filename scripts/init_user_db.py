@@ -2,6 +2,7 @@
 """初始化用户配置数据库（用户数据）"""
 import sqlite3
 import json
+import os
 import subprocess
 from pathlib import Path
 import sys
@@ -16,6 +17,7 @@ CREATE TABLE IF NOT EXISTS routing_rules (
     rule_type TEXT NOT NULL,  -- 'domain', 'domain_keyword', 'ip', 'domain_list', 'country'
     target TEXT NOT NULL,      -- 目标值（域名、IP CIDR、列表ID、国家代码等）
     outbound TEXT NOT NULL,    -- 出口标签
+    tag TEXT,                  -- 规则组标签/名称
     priority INTEGER DEFAULT 0,
     enabled INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -23,6 +25,7 @@ CREATE TABLE IF NOT EXISTS routing_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_enabled ON routing_rules(enabled, priority);
 CREATE INDEX IF NOT EXISTS idx_rule_outbound ON routing_rules(outbound);
+CREATE INDEX IF NOT EXISTS idx_rule_tag ON routing_rules(tag);
 
 -- 出口配置表
 CREATE TABLE IF NOT EXISTS outbounds (
@@ -94,6 +97,33 @@ CREATE TABLE IF NOT EXISTS custom_category_items (
 );
 CREATE INDEX IF NOT EXISTS idx_category_items_category ON custom_category_items(category_id);
 CREATE INDEX IF NOT EXISTS idx_category_items_item_id ON custom_category_items(item_id);
+
+-- 用户设置表
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 自定义出口表（WireGuard 出口）
+CREATE TABLE IF NOT EXISTS custom_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    server TEXT NOT NULL,
+    port INTEGER DEFAULT 51820,
+    private_key TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    address TEXT NOT NULL,
+    mtu INTEGER DEFAULT 1420,
+    dns TEXT DEFAULT '1.1.1.1',
+    pre_shared_key TEXT,
+    reserved TEXT,  -- JSON 数组格式，如 [0, 0, 0]
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_custom_egress_tag ON custom_egress(tag);
 """
 
 
@@ -137,11 +167,12 @@ def init_wireguard_server(conn: sqlite3.Connection):
         print("⚠ 未能生成私钥，WireGuard 服务器配置初始化失败")
         return
 
-    # 插入默认配置
+    # 插入默认配置（使用环境变量或默认端口）
+    wg_listen_port = int(os.environ.get("WG_LISTEN_PORT", "36100"))
     cursor.execute("""
         INSERT INTO wireguard_server (id, interface_name, address, listen_port, mtu, private_key)
-        VALUES (1, 'wg-ingress', '10.23.0.1/24', 36100, 1420, ?)
-    """, (private_key,))
+        VALUES (1, 'wg-ingress', '10.23.0.1/24', ?, 1420, ?)
+    """, (wg_listen_port, private_key))
 
     conn.commit()
     print("✓ 初始化 WireGuard 服务器配置（已生成私钥）")
@@ -164,6 +195,24 @@ def add_default_outbounds(conn: sqlite3.Connection):
 
     conn.commit()
     print(f"✓ 添加 {len(default_outbounds)} 个默认出口")
+
+
+def init_default_settings(conn: sqlite3.Connection):
+    """初始化默认设置"""
+    cursor = conn.cursor()
+
+    default_settings = [
+        ("default_outbound", "direct"),
+    ]
+
+    for key, value in default_settings:
+        cursor.execute("""
+            INSERT OR IGNORE INTO settings (key, value)
+            VALUES (?, ?)
+        """, (key, value))
+
+    conn.commit()
+    print("✓ 初始化默认设置")
 
 
 def load_pia_profiles(conn: sqlite3.Connection, config_dir: Path):
@@ -231,6 +280,9 @@ def main():
 
     # 添加默认数据
     add_default_outbounds(conn)
+
+    # 初始化默认设置
+    init_default_settings(conn)
 
     # 初始化 WireGuard 服务器配置
     init_wireguard_server(conn)

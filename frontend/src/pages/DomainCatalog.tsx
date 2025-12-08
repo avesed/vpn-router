@@ -398,6 +398,32 @@ export default function DomainCatalog() {
     return icons[categoryId] || "📁";
   };
 
+  // 获取翻译后的分类名称和描述（优先使用 i18n，fallback 到 API 数据）
+  const getCategoryName = (categoryId: string, fallbackName: string): string => {
+    const translationKey = `catalog.categories.${categoryId}.name`;
+    const translated = t(translationKey);
+    // 如果翻译键不存在，t() 会返回键本身
+    return translated === translationKey ? fallbackName : translated;
+  };
+
+  const getCategoryDescription = (categoryId: string, fallbackDesc: string): string => {
+    const translationKey = `catalog.categories.${categoryId}.description`;
+    const translated = t(translationKey);
+    return translated === translationKey ? fallbackDesc : translated;
+  };
+
+  // 获取翻译后的国家名称（优先使用 i18n，fallback 到 API 数据）
+  const getCountryName = (countryCode: string, fallbackName: string): string => {
+    const translationKey = `catalog.countries.${countryCode.toLowerCase()}`;
+    const translated = t(translationKey);
+    // 移除 emoji 前缀（如果有的话）
+    let cleanFallback = fallbackName;
+    if (fallbackName.includes(' ') && /[\u{1F1E0}-\u{1F1FF}]/u.test(fallbackName.split(' ')[0])) {
+      cleanFallback = fallbackName.split(' ').slice(1).join(' ');
+    }
+    return translated === translationKey ? cleanFallback : translated;
+  };
+
   // 过滤当前标签页的分类 (只显示按类型分类)
   const filteredCategories = categories.filter(
     ({ category }) => category.group === "type"
@@ -421,7 +447,7 @@ export default function DomainCatalog() {
             {t('catalog.subtitle')}
             {activeTab === "ip" && ipCatalog && (
               <span className="ml-2 text-slate-500">
-                ({ipCatalog.stats.total_countries} {t('catalog.countriesCount')})
+                ({t('catalog.countriesCount', { count: ipCatalog.stats.total_countries })})
               </span>
             )}
           </p>
@@ -595,8 +621,8 @@ export default function DomainCatalog() {
                 <div className="flex items-center gap-3">
                   <span className="text-2xl">{getCategoryIcon(id)}</span>
                   <div className="text-left">
-                    <h3 className="font-semibold text-white">{category.name}</h3>
-                    <p className="text-sm text-slate-400">{category.description}</p>
+                    <h3 className="font-semibold text-white">{getCategoryName(id, category.name)}</h3>
+                    <p className="text-sm text-slate-400">{getCategoryDescription(id, category.description)}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
@@ -616,7 +642,7 @@ export default function DomainCatalog() {
                 <div className="px-4 pb-4 border-t border-white/10">
                   <div className="flex justify-between items-center py-2">
                   <button
-                    onClick={() => openAddItemModal(id, category.name)}
+                    onClick={() => openAddItemModal(id, getCategoryName(id, category.name))}
                     className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1"
                   >
                     <PlusIcon className="h-3 w-3" />
@@ -773,7 +799,8 @@ export default function DomainCatalog() {
                     }`}
                   >
                     {selectedCountries.has(result.country_code) && <CheckIcon className="inline h-4 w-4 mr-1" />}
-                    {result.display_name}
+                    <span className="font-medium">{result.country_code.toUpperCase()}</span>
+                    <span className="ml-1">{getCountryName(result.country_code, result.display_name)}</span>
                   </button>
                 ))}
               </div>
@@ -794,7 +821,7 @@ export default function DomainCatalog() {
                         key={cc}
                         className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/10 text-sm text-slate-300"
                       >
-                        {ipCatalog?.countries[cc]?.display_name || cc.toUpperCase()}
+                        {getCountryName(cc, ipCatalog?.countries[cc]?.display_name || cc.toUpperCase())}
                         <button
                           onClick={() => toggleCountrySelection(cc)}
                           className="hover:text-red-400"
@@ -869,7 +896,8 @@ export default function DomainCatalog() {
                       </button>
                       <div>
                         <div className="flex items-center gap-2">
-                          <span className="text-lg">{info.display_name}</span>
+                          <span className="font-medium text-white">{cc.toUpperCase()}</span>
+                          <span className="text-slate-300">{getCountryName(cc, info.display_name)}</span>
                         </div>
                         <div className="flex items-center gap-2 text-xs text-slate-500">
                           <span>{info.ipv4_count.toLocaleString()} {t('catalog.ipv4')}</span>

@@ -26,7 +26,6 @@ except ImportError:
 BASE_CONFIG = Path(os.environ.get("SING_BOX_BASE_CONFIG", "/etc/sing-box/sing-box.json"))
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
 CUSTOM_RULES_FILE = Path(os.environ.get("CUSTOM_RULES_FILE", "/etc/sing-box/custom-rules.json"))
-CUSTOM_EGRESS_FILE = Path(os.environ.get("CUSTOM_EGRESS_FILE", "/etc/sing-box/custom-egress.json"))
 OUTPUT = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
@@ -81,6 +80,8 @@ def create_wireguard_server_endpoint(wg_config: dict) -> dict:
     server = wg_config["server"]
     peers = wg_config["peers"]
 
+    # 使用环境变量作为默认端口
+    default_wg_port = int(os.environ.get("WG_LISTEN_PORT", "36100"))
     endpoint = {
         "type": "wireguard",
         "tag": "wg-server",
@@ -88,7 +89,7 @@ def create_wireguard_server_endpoint(wg_config: dict) -> dict:
         "mtu": server.get("mtu", 1420),
         "address": [server.get("address", "10.23.0.1/24")],
         "private_key": server.get("private_key", ""),
-        "listen_port": server.get("listen_port", 36100),
+        "listen_port": server.get("listen_port", default_wg_port),
         "peers": []
     }
 
@@ -315,14 +316,15 @@ def ensure_outbound_selector(config: dict, all_egress_tags: List[str]) -> None:
 
 
 def load_custom_egress() -> List[dict]:
-    """加载自定义出口配置"""
-    if not CUSTOM_EGRESS_FILE.exists():
+    """从数据库加载自定义出口配置"""
+    if not HAS_DATABASE:
         return []
     try:
-        data = json.loads(CUSTOM_EGRESS_FILE.read_text())
-        return data.get("egress", [])
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress_list = db.get_custom_egress_list(enabled_only=True)
+        return egress_list
     except Exception as e:
-        print(f"[render] 加载自定义出口配置失败: {e}")
+        print(f"[render] 从数据库加载自定义出口配置失败: {e}")
         return []
 
 
@@ -425,11 +427,97 @@ def ensure_custom_dns_servers(config: dict, custom_tags: List[str]) -> None:
             })
 
 
+def cleanup_stale_endpoints(config: dict, valid_tags: List[str]) -> None:
+    """移除不再存在于数据库中的旧端点
+
+    valid_tags: 所有有效的端点标签列表（PIA profiles + custom egress）
+    wg-server 端点始终保留
+    """
+    endpoints = config.get("endpoints", [])
+    if not endpoints:
+        return
+
+    # 保留的端点: wg-server + 所有有效的出口端点
+    keep_tags = {"wg-server"} | set(valid_tags)
+
+    # 找出需要移除的端点
+    stale_endpoints = [
+        ep.get("tag") for ep in endpoints
+        if ep.get("tag") not in keep_tags and ep.get("type") == "wireguard"
+    ]
+
+    if stale_endpoints:
+        print(f"[render] 移除过期端点: {stale_endpoints}")
+        config["endpoints"] = [
+            ep for ep in endpoints
+            if ep.get("tag") in keep_tags or ep.get("type") != "wireguard"
+        ]
+
+    # 同时清理对应的 DNS 服务器
+    dns = config.get("dns", {})
+    servers = dns.get("servers", [])
+    if servers:
+        stale_dns_tags = {f"{tag}-dns" for tag in stale_endpoints}
+        if stale_dns_tags:
+            dns["servers"] = [
+                s for s in servers
+                if s.get("tag") not in stale_dns_tags
+            ]
+
+
+
+
 def load_custom_rules() -> Dict[str, Any]:
-    """加载自定义路由规则"""
-    if not CUSTOM_RULES_FILE.exists():
-        return {"rules": [], "default_outbound": "direct"}
-    return json.loads(CUSTOM_RULES_FILE.read_text())
+    """从数据库加载自定义路由规则和默认出口"""
+    result = {"rules": [], "default_outbound": "direct"}
+
+    if not HAS_DATABASE:
+        # 降级到 JSON 文件
+        if CUSTOM_RULES_FILE.exists():
+            return json.loads(CUSTOM_RULES_FILE.read_text())
+        return result
+
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+
+        # 读取默认出口
+        default_outbound = db.get_setting("default_outbound", "direct")
+        result["default_outbound"] = default_outbound
+
+        # 读取路由规则并按 tag 分组
+        db_rules = db.get_routing_rules(enabled_only=True)
+        rules_by_tag = {}
+
+        for rule in db_rules:
+            tag = rule.get("tag") or f"custom-{rule['outbound']}"
+            if tag not in rules_by_tag:
+                rules_by_tag[tag] = {
+                    "tag": tag,
+                    "outbound": rule["outbound"],
+                    "domains": [],
+                    "domain_keywords": [],
+                    "ip_cidrs": []
+                }
+
+            rule_type = rule["rule_type"]
+            target = rule["target"]
+
+            if rule_type == "domain":
+                rules_by_tag[tag]["domains"].append(target)
+            elif rule_type == "domain_keyword":
+                rules_by_tag[tag]["domain_keywords"].append(target)
+            elif rule_type == "ip":
+                rules_by_tag[tag]["ip_cidrs"].append(target)
+
+        result["rules"] = list(rules_by_tag.values())
+        return result
+
+    except Exception as e:
+        print(f"[render] 警告: 从数据库加载规则失败: {e}")
+        # 降级到 JSON 文件
+        if CUSTOM_RULES_FILE.exists():
+            return json.loads(CUSTOM_RULES_FILE.read_text())
+        return result
 
 
 def apply_custom_rules(config: dict, custom_rules: Dict[str, Any]) -> None:
@@ -525,6 +613,9 @@ def main() -> None:
         ensure_custom_dns_servers(config, custom_tags)
         all_egress_tags.extend(custom_tags)
 
+    # 清理不再存在于数据库中的旧端点
+    cleanup_stale_endpoints(config, all_egress_tags)
+
     # 检查是否有任何出口配置
     if not all_egress_tags:
         print("[render] 警告: 没有找到任何出口配置（PIA 或自定义）")
@@ -545,6 +636,19 @@ def main() -> None:
 
     # 确保路由规则中有 sniff 动作（放在最后以确保它在规则列表开头）
     ensure_sniff_action(config)
+
+    # 添加 experimental API 用于获取连接状态
+    config["experimental"] = {
+        "clash_api": {
+            "external_controller": "127.0.0.1:9090",
+            "secret": ""
+        },
+        "cache_file": {
+            "enabled": True,
+            "path": "/etc/sing-box/cache.db"
+        }
+    }
+    print("[render] 已启用 clash_api (127.0.0.1:9090)")
 
     OUTPUT.write_text(json.dumps(config, indent=2))
     print(f"[sing-box] 已写入 {OUTPUT}")

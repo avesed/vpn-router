@@ -48,6 +48,7 @@ except ImportError:
     print("WARNING: Database helper not available, falling back to JSON storage")
 
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
+GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = Path(os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db"))
 USER_DB_PATH = Path(os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db"))
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
@@ -60,8 +61,11 @@ IP_CATALOG_FILE = Path(os.environ.get("IP_CATALOG_FILE", "/etc/sing-box/ip-catal
 IP_LIST_DIR = Path(os.environ.get("IP_LIST_DIR", "/etc/sing-box/ip-list/country"))
 CUSTOM_CATEGORY_ITEMS_FILE = Path(os.environ.get("CUSTOM_CATEGORY_ITEMS_FILE", "/etc/sing-box/custom-category-items.json"))
 SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "/etc/sing-box/settings.json"))
-CUSTOM_EGRESS_FILE = Path(os.environ.get("CUSTOM_EGRESS_FILE", "/etc/sing-box/custom-egress.json"))
 ENTRY_DIR = Path("/usr/local/bin")
+
+# Port configuration from environment
+DEFAULT_WG_PORT = int(os.environ.get("WG_LISTEN_PORT", "DEFAULT_WG_PORT"))
+DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "36000"))
 
 PIA_SERVERLIST_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
 
@@ -121,6 +125,7 @@ class RouteRulesUpdateRequest(BaseModel):
     """批量更新路由规则"""
     rules: List[RouteRuleRequest]
     default_outbound: str = Field("direct", description="默认出口")
+    regenerate_config: bool = Field(True, description="是否重新生成配置并重载")
 
 
 class CustomRuleRequest(BaseModel):
@@ -261,6 +266,17 @@ def load_json_config() -> dict:
         raise HTTPException(status_code=500, detail="配置文件不存在")
     with CONFIG_LOCK:
         data = json.loads(CONFIG_PATH.read_text())
+    return data
+
+
+def load_generated_config() -> dict:
+    """读取生成的配置文件（当前运行的配置）"""
+    # 优先使用生成的配置文件，如果不存在则回退到基础配置
+    config_path = GENERATED_CONFIG_PATH if GENERATED_CONFIG_PATH.exists() else CONFIG_PATH
+    if not config_path.exists():
+        raise HTTPException(status_code=500, detail="配置文件不存在")
+    with CONFIG_LOCK:
+        data = json.loads(config_path.read_text())
     return data
 
 
@@ -500,7 +516,7 @@ def save_custom_category_items(data: Dict[str, List[Dict]]) -> None:
 def load_settings() -> Dict[str, Any]:
     """加载系统设置"""
     if not SETTINGS_FILE.exists():
-        return {"server_endpoint": "", "listen_port": 36100}
+        return {"server_endpoint": "", "listen_port": DEFAULT_WG_PORT}
     return json.loads(SETTINGS_FILE.read_text())
 
 
@@ -508,19 +524,6 @@ def save_settings(data: Dict[str, Any]) -> None:
     """保存系统设置"""
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-
-
-def load_custom_egress() -> Dict[str, Any]:
-    """加载自定义出口配置"""
-    if not CUSTOM_EGRESS_FILE.exists():
-        return {"egress": []}
-    return json.loads(CUSTOM_EGRESS_FILE.read_text())
-
-
-def save_custom_egress(data: Dict[str, Any]) -> None:
-    """保存自定义出口配置"""
-    CUSTOM_EGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CUSTOM_EGRESS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def parse_wireguard_conf(content: str) -> Dict[str, Any]:
@@ -628,29 +631,133 @@ def api_status():
 
 @app.get("/api/endpoints")
 def api_list_endpoints():
-    config = load_json_config()
-    return {"endpoints": config.get("endpoints", [])}
+    """从数据库获取所有端点配置"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    endpoints = []
+
+    # 1. WireGuard 服务器端点 (wg-server)
+    server = db.get_wireguard_server()
+    if server and server.get("private_key"):
+        peers = db.get_wireguard_peers()
+        wg_endpoint = {
+            "type": "wireguard",
+            "tag": "wg-server",
+            "system": False,
+            "mtu": server.get("mtu", 1420),
+            "address": [server.get("address", "10.23.0.1/24")],
+            "private_key": server.get("private_key", ""),
+            "listen_port": server.get("listen_port", DEFAULT_WG_PORT),
+            "peers": [
+                {
+                    "public_key": p.get("public_key", ""),
+                    "allowed_ips": [p.get("allowed_ips", "10.23.0.2/32")]
+                }
+                for p in peers
+            ] if peers else []
+        }
+        endpoints.append(wg_endpoint)
+
+    # 2. PIA 出口端点
+    pia_profiles = db.get_pia_profiles(enabled_only=True)
+    for idx, profile in enumerate(pia_profiles):
+        if not profile.get("private_key"):
+            continue  # 跳过未配置凭证的 profile
+        tag = profile["name"].replace("_", "-")
+        peer_ip = profile.get("peer_ip", "")
+        if peer_ip and "/" not in peer_ip:
+            peer_ip = f"{peer_ip}/32"
+        pia_endpoint = {
+            "type": "wireguard",
+            "tag": tag,
+            "address": [peer_ip] if peer_ip else [f"172.31.{30 + idx}.2/32"],
+            "private_key": profile.get("private_key", ""),
+            "mtu": 1300,
+            "peers": [{
+                "address": profile.get("server_ip", ""),
+                "port": profile.get("server_port", 51820),
+                "public_key": profile.get("server_public_key", ""),
+                "allowed_ips": ["0.0.0.0/0", "::/0"],
+                "persistent_keepalive_interval": 25
+            }]
+        }
+        endpoints.append(pia_endpoint)
+
+    # 3. 自定义出口端点
+    custom_egress = db.get_custom_egress_list(enabled_only=True)
+    for egress in custom_egress:
+        address = egress.get("address", "")
+        if address and "/" not in address:
+            address = f"{address}/32"
+        custom_endpoint = {
+            "type": "wireguard",
+            "tag": egress.get("tag", "custom"),
+            "address": [address] if address else [],
+            "private_key": egress.get("private_key", ""),
+            "mtu": egress.get("mtu", 1420),
+            "peers": [{
+                "address": egress.get("server", ""),
+                "port": egress.get("port", 51820),
+                "public_key": egress.get("public_key", ""),
+                "allowed_ips": ["0.0.0.0/0", "::/0"],
+                "persistent_keepalive_interval": 25
+            }]
+        }
+        if egress.get("pre_shared_key"):
+            custom_endpoint["peers"][0]["pre_shared_key"] = egress["pre_shared_key"]
+        endpoints.append(custom_endpoint)
+
+    return {"endpoints": endpoints}
 
 
 @app.put("/api/endpoints/{tag}")
 def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
-    config = load_json_config()
-    endpoints = config.get("endpoints", [])
-    for endpoint in endpoints:
-        if endpoint.get("tag") != tag:
-            continue
-        if payload.address is not None:
-            endpoint["address"] = payload.address
+    """更新端点配置（写入数据库）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not available")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 判断端点类型并更新对应的数据库表
+    if tag == "wg-server":
+        # 更新 WireGuard 服务器配置
+        updates = {}
+        if payload.address is not None and payload.address:
+            updates["address"] = payload.address[0] if isinstance(payload.address, list) else payload.address
         if payload.private_key is not None:
-            endpoint["private_key"] = payload.private_key
+            updates["private_key"] = payload.private_key
         if payload.mtu is not None:
-            endpoint["mtu"] = payload.mtu
-        if payload.workers is not None:
-            endpoint["workers"] = payload.workers
-        if payload.peers is not None:
-            endpoint["peers"] = [peer.dict(exclude_none=True) for peer in payload.peers]
-        save_json_config(config)
+            updates["mtu"] = payload.mtu
+        if updates:
+            db.update_wireguard_server(**updates)
         return {"message": f"endpoint {tag} updated"}
+
+    # 检查是否是 PIA profile
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
+    for profile in pia_profiles:
+        profile_tag = profile["name"].replace("_", "-")
+        if profile_tag == tag:
+            # 更新 PIA profile（主要是 MTU，其他字段由 PIA 服务器返回）
+            # PIA profile 的更新通常通过重新连接来完成
+            return {"message": f"endpoint {tag} updated (PIA profiles are managed via Profile Manager)"}
+
+    # 检查是否是自定义出口
+    custom_egress = db.get_custom_egress_list(enabled_only=False)
+    for egress in custom_egress:
+        if egress.get("tag") == tag:
+            updates = {}
+            if payload.address is not None and payload.address:
+                updates["address"] = payload.address[0] if isinstance(payload.address, list) else payload.address
+            if payload.private_key is not None:
+                updates["private_key"] = payload.private_key
+            if payload.mtu is not None:
+                updates["mtu"] = payload.mtu
+            if updates:
+                db.update_custom_egress(tag, **updates)
+            return {"message": f"endpoint {tag} updated"}
+
     raise HTTPException(status_code=404, detail=f"endpoint {tag} not found")
 
 
@@ -837,33 +944,54 @@ def api_get_rules():
     generated_config = Path("/etc/sing-box/sing-box.generated.json")
     config_path = generated_config if generated_config.exists() else CONFIG_PATH
 
-    available_outbounds = ["direct"]
+    available_outbounds = ["direct", "block"]
     default_outbound = "direct"
 
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        route = config.get("route", {})
-        default_outbound = route.get("final", "direct")
+    # 从数据库读取默认出口设置和所有出口
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            default_outbound = db.get_setting("default_outbound", "direct")
 
-        # 提取可用出口
-        for endpoint in config.get("endpoints", []):
-            if endpoint.get("type") == "wireguard":
-                available_outbounds.append(endpoint.get("tag"))
+            # 从数据库读取 PIA profiles
+            pia_profiles = db.get_pia_profiles(enabled_only=False)
+            for profile in pia_profiles:
+                if profile.get("tag") and profile["tag"] not in available_outbounds:
+                    available_outbounds.append(profile["tag"])
+
+            # 从数据库读取自定义出口
+            custom_egress = db.get_custom_egress()
+            for egress in custom_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+        except Exception:
+            pass
+
+    # 如果数据库没有数据，回退到配置文件
+    if len(available_outbounds) == 2:  # only direct and block
+        if config_path.exists():
+            config = json.loads(config_path.read_text())
+
+            # 提取可用出口
+            for endpoint in config.get("endpoints", []):
+                if endpoint.get("type") == "wireguard":
+                    tag = endpoint.get("tag")
+                    if tag and tag != "wg-server" and tag not in available_outbounds:
+                        available_outbounds.append(tag)
 
     # 从数据库读取自定义规则
     if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         db_rules = db.get_routing_rules(enabled_only=True)
 
-        # 按 outbound 分组规则
+        # 按 tag 分组规则（使用数据库中的实际 tag）
         rules_by_tag = {}
         for rule in db_rules:
             rule_type = rule["rule_type"]
             target = rule["target"]
             outbound = rule["outbound"]
-
-            # 使用 outbound 作为 tag（或创建唯一 tag）
-            tag = f"custom-{outbound}"
+            # 使用数据库中的 tag，如果没有则用 outbound 生成
+            tag = rule.get("tag") or f"custom-{outbound}"
 
             if tag not in rules_by_tag:
                 rules_by_tag[tag] = {
@@ -898,43 +1026,55 @@ def api_get_rules():
 
 @app.put("/api/rules")
 def api_update_rules(payload: RouteRulesUpdateRequest):
-    """更新路由规则（数据库版本）"""
+    """更新路由规则（数据库版本，使用批量操作优化性能）"""
     if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
         # 使用数据库存储（方案 B）
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-        # 先删除所有现有的自定义规则（type == "custom"）
-        # 注意：只删除 type 为 custom 的规则，保留其他规则
-        all_rules = db.get_routing_rules(enabled_only=False)
-        for rule in all_rules:
-            # 删除所有规则以重新创建（简化实现）
-            db.delete_routing_rule(rule["id"])
+        # 批量删除所有规则（单条 SQL）
+        deleted_count = db.delete_all_routing_rules()
 
-        # 添加新规则到数据库
+        # 收集所有规则用于批量插入
+        # 格式: (rule_type, target, outbound, tag, priority)
+        batch_rules = []
         for rule in payload.rules:
-            # 为每个域名创建一条规则
+            tag = rule.tag  # 使用规则的 tag
+
+            # 收集域名规则
             if rule.domains:
                 for domain in rule.domains:
-                    db.add_routing_rule("domain", domain, rule.outbound, priority=0)
+                    batch_rules.append(("domain", domain, rule.outbound, tag, 0))
 
-            # 为每个关键词创建一条规则
+            # 收集关键词规则
             if rule.domain_keywords:
                 for keyword in rule.domain_keywords:
-                    db.add_routing_rule("domain_keyword", keyword, rule.outbound, priority=0)
+                    batch_rules.append(("domain_keyword", keyword, rule.outbound, tag, 0))
 
-            # 为每个 IP 创建一条规则
+            # 收集 IP 规则
             if rule.ip_cidrs:
                 for cidr in rule.ip_cidrs:
-                    db.add_routing_rule("ip", cidr, rule.outbound, priority=0)
+                    batch_rules.append(("ip", cidr, rule.outbound, tag, 0))
 
-        # 保存到 JSON 作为备份
-        custom_data = {
-            "rules": [r.dict(exclude_none=True) for r in payload.rules],
-            "default_outbound": payload.default_outbound,
-        }
-        save_custom_rules(custom_data)
+        # 批量插入所有规则（使用 executemany）
+        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
 
-        return {"message": "路由规则已保存到数据库"}
+        # 保存默认出口到数据库
+        db.set_setting("default_outbound", payload.default_outbound)
+
+        # 重新生成配置并重载 sing-box
+        reload_status = None
+        if payload.regenerate_config:
+            try:
+                _regenerate_and_reload()
+                reload_status = "已重载"
+            except Exception as exc:
+                print(f"[api] 重载配置失败: {exc}")
+                reload_status = f"重载失败: {exc}"
+
+        message = f"路由规则已保存到数据库（删除 {deleted_count} 条，添加 {added_count} 条）"
+        if reload_status:
+            message += f"，{reload_status}"
+        return {"message": message}
     else:
         # 降级到 JSON 文件存储
         custom_data = {
@@ -947,7 +1087,7 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
 
 @app.post("/api/rules/custom")
 def api_add_custom_rule(payload: CustomRuleRequest):
-    """添加自定义路由规则（数据库版本）"""
+    """添加自定义路由规则（数据库版本，使用批量操作优化性能）"""
     # 验证至少有一种匹配规则
     if not payload.domains and not payload.domain_keywords and not payload.ip_cidrs:
         raise HTTPException(status_code=400, detail="至少需要提供一种匹配规则（域名、关键词或 IP）")
@@ -956,26 +1096,29 @@ def api_add_custom_rule(payload: CustomRuleRequest):
         raise HTTPException(status_code=500, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-    added_count = 0
 
     try:
-        # 添加域名规则
+        # 收集所有规则用于批量插入
+        # 格式: (rule_type, target, outbound, tag, priority)
+        batch_rules = []
+
+        # 收集域名规则
         if payload.domains:
             for domain in payload.domains:
-                db.add_routing_rule("domain", domain, payload.outbound, priority=0)
-                added_count += 1
+                batch_rules.append(("domain", domain, payload.outbound, payload.tag, 0))
 
-        # 添加域名关键词规则
+        # 收集域名关键词规则
         if payload.domain_keywords:
             for keyword in payload.domain_keywords:
-                db.add_routing_rule("domain_keyword", keyword, payload.outbound, priority=0)
-                added_count += 1
+                batch_rules.append(("domain_keyword", keyword, payload.outbound, payload.tag, 0))
 
-        # 添加 IP 规则
+        # 收集 IP 规则
         if payload.ip_cidrs:
             for cidr in payload.ip_cidrs:
-                db.add_routing_rule("ip", cidr, payload.outbound, priority=0)
-                added_count += 1
+                batch_rules.append(("ip", cidr, payload.outbound, payload.tag, 0))
+
+        # 批量插入所有规则
+        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
 
         return {
             "message": f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）",
@@ -1125,10 +1268,7 @@ def reload_singbox() -> dict:
                 return {"success": True, "message": "sing-box 已由 entrypoint 启动", "method": "auto"}
             return {"success": False, "message": "sing-box 未运行，请检查容器状态"}
 
-        # 将生成的配置复制到基础配置路径，以便 SIGHUP 能加载到新配置
-        shutil.copy(generated_config, CONFIG_PATH)
-
-        # 尝试 SIGHUP 热重载
+        # 尝试 SIGHUP 热重载 (sing-box 使用 generated_config 启动，会重新加载该文件)
         result = subprocess.run(
             ["pkill", "-HUP", "sing-box"],
             capture_output=True,
@@ -1271,7 +1411,7 @@ def load_ingress_config() -> dict:
                 "interface": {
                     "name": "wg-ingress",
                     "address": "10.23.0.1/24",
-                    "listen_port": 36100,
+                    "listen_port": DEFAULT_WG_PORT,
                     "mtu": 1420,
                     "private_key": ""
                 },
@@ -1295,7 +1435,7 @@ def load_ingress_config() -> dict:
             db.set_wireguard_server(
                 interface_name="wg-ingress",
                 address="10.23.0.1/24",
-                listen_port=36100,
+                listen_port=DEFAULT_WG_PORT,
                 mtu=1420,
                 private_key=private_key
             )
@@ -1307,7 +1447,7 @@ def load_ingress_config() -> dict:
     interface_data = {
         "name": server.get("interface_name", "wg-ingress") if server else "wg-ingress",
         "address": server.get("address", "10.23.0.1/24") if server else "10.23.0.1/24",
-        "listen_port": server.get("listen_port", 36100) if server else 36100,
+        "listen_port": server.get("listen_port", DEFAULT_WG_PORT) if server else DEFAULT_WG_PORT,
         "mtu": server.get("mtu", 1420) if server else 1420,
         "private_key": server.get("private_key", "") if server else ""
     }
@@ -1346,7 +1486,7 @@ def save_ingress_config(data: dict) -> None:
     db.set_wireguard_server(
         interface_name=interface.get("name", "wg-ingress"),
         address=interface.get("address", "10.23.0.1/24"),
-        listen_port=interface.get("listen_port", 36100),
+        listen_port=interface.get("listen_port", DEFAULT_WG_PORT),
         mtu=interface.get("mtu", 1420),
         private_key=interface.get("private_key", "")
     )
@@ -1421,38 +1561,124 @@ def get_ingress_public_key(config: dict) -> str:
         return ""
 
 
-def get_peer_handshake_info() -> dict:
-    """获取 peer 握手状态（从 wg show）"""
-    handshakes = {}
+def get_peer_status_from_clash_api() -> dict:
+    """从 sing-box clash_api 获取 peer 连接状态"""
+    import time
+    peer_status = {}  # ip -> {"active": bool, "last_seen": timestamp, "rx": int, "tx": int}
+
     try:
-        result = subprocess.run(
-            ["wg", "show", "wg-ingress", "latest-handshakes"],
-            capture_output=True, text=True, check=True
-        )
-        for line in result.stdout.strip().split("\n"):
-            if "\t" in line:
-                pubkey, timestamp = line.split("\t")
-                handshakes[pubkey] = int(timestamp) if timestamp != "0" else 0
-    except Exception:
+        # 查询 sing-box clash_api 获取活跃连接
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+
+        now = int(time.time())
+        connections = data.get("connections", [])
+
+        # 遍历所有连接，按源 IP 分组
+        for conn in connections:
+            metadata = conn.get("metadata", {})
+            src_ip = metadata.get("sourceIP", "")
+
+            # 只处理来自 WireGuard 网段的连接 (10.23.0.x)
+            if not src_ip.startswith("10.23.0."):
+                continue
+
+            # 提取流量数据
+            download = conn.get("download", 0)
+            upload = conn.get("upload", 0)
+            start_time = conn.get("start", "")
+
+            if src_ip not in peer_status:
+                peer_status[src_ip] = {
+                    "active": True,
+                    "last_seen": now,
+                    "rx": 0,
+                    "tx": 0,
+                    "connections": 0
+                }
+
+            peer_status[src_ip]["rx"] += download
+            peer_status[src_ip]["tx"] += upload
+            peer_status[src_ip]["connections"] += 1
+
+    except Exception as e:
+        # clash_api 不可用时静默失败
         pass
+
+    return peer_status
+
+
+def get_peer_handshake_info() -> dict:
+    """获取 peer 握手状态（从 clash_api 活跃连接推断）"""
+    import time
+    handshakes = {}
+
+    # 从 clash_api 获取连接状态
+    peer_status = get_peer_status_from_clash_api()
+
+    # 加载 peer 配置以获取 allowed_ips 到 public_key 的映射
+    config = load_ingress_config()
+    peers = config.get("peers", [])
+
+    now = int(time.time())
+
+    for peer in peers:
+        pubkey = peer.get("public_key", "")
+        allowed_ips = peer.get("allowed_ips", [])
+
+        # 处理 allowed_ips（可能是字符串或列表）
+        if isinstance(allowed_ips, str):
+            allowed_ips = [allowed_ips]
+
+        # 检查该 peer 的任意 IP 是否有活跃连接
+        is_active = False
+        for ip_cidr in allowed_ips:
+            # 提取 IP（去掉 CIDR 后缀）
+            ip = ip_cidr.split("/")[0] if "/" in ip_cidr else ip_cidr
+            if ip in peer_status and peer_status[ip]["active"]:
+                is_active = True
+                break
+
+        # 如果有活跃连接，设置 last_handshake 为当前时间
+        # 这样 is_online 检查（180秒内）会返回 True
+        if is_active:
+            handshakes[pubkey] = now
+        else:
+            handshakes[pubkey] = 0
+
     return handshakes
 
 
 def get_peer_transfer_info() -> dict:
-    """获取 peer 流量统计（从 wg show）"""
+    """获取 peer 流量统计（从 clash_api）"""
     transfers = {}
-    try:
-        result = subprocess.run(
-            ["wg", "show", "wg-ingress", "transfer"],
-            capture_output=True, text=True, check=True
-        )
-        for line in result.stdout.strip().split("\n"):
-            parts = line.split("\t")
-            if len(parts) >= 3:
-                pubkey, rx, tx = parts[0], int(parts[1]), int(parts[2])
-                transfers[pubkey] = {"rx": rx, "tx": tx}
-    except Exception:
-        pass
+
+    # 从 clash_api 获取连接状态
+    peer_status = get_peer_status_from_clash_api()
+
+    # 加载 peer 配置
+    config = load_ingress_config()
+    peers = config.get("peers", [])
+
+    for peer in peers:
+        pubkey = peer.get("public_key", "")
+        allowed_ips = peer.get("allowed_ips", [])
+
+        if isinstance(allowed_ips, str):
+            allowed_ips = [allowed_ips]
+
+        total_rx = 0
+        total_tx = 0
+
+        for ip_cidr in allowed_ips:
+            ip = ip_cidr.split("/")[0] if "/" in ip_cidr else ip_cidr
+            if ip in peer_status:
+                total_rx += peer_status[ip]["rx"]
+                total_tx += peer_status[ip]["tx"]
+
+        transfers[pubkey] = {"rx": total_rx, "tx": total_tx}
+
     return transfers
 
 
@@ -1472,7 +1698,7 @@ def apply_ingress_config(config: dict) -> dict:
 
         # 配置接口
         private_key = interface.get("private_key", "")
-        listen_port = interface.get("listen_port", 36100)
+        listen_port = interface.get("listen_port", DEFAULT_WG_PORT)
 
         # 设置私钥（通过临时文件）
         import tempfile
@@ -1692,7 +1918,7 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
 
     # 服务端地址（优先使用设置文件，其次使用环境变量）
     settings = load_settings()
-    listen_port = interface.get("listen_port", 36100)
+    listen_port = interface.get("listen_port", DEFAULT_WG_PORT)
     server_endpoint = settings.get("server_endpoint", "") or os.environ.get("WG_SERVER_ENDPOINT", "")
     if server_endpoint:
         if ":" not in server_endpoint:
@@ -1765,8 +1991,76 @@ def api_get_settings():
 
     return {
         "server_endpoint": settings.get("server_endpoint", ""),
-        "listen_port": interface.get("listen_port", 36100),
+        "listen_port": interface.get("listen_port", DEFAULT_WG_PORT),
     }
+
+
+@app.get("/api/settings/detect-ip")
+def api_detect_ip():
+    """自动检测服务器的公网和局域网 IP 地址"""
+    import socket
+    import urllib.request
+
+    result = {
+        "public_ip": None,
+        "lan_ip": None,
+        "message": ""
+    }
+
+    # 检测公网 IP（通过外部服务）
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as response:
+            result["public_ip"] = response.read().decode().strip()
+    except Exception:
+        # 备用服务
+        try:
+            with urllib.request.urlopen("https://ifconfig.me/ip", timeout=5) as response:
+                result["public_ip"] = response.read().decode().strip()
+        except Exception:
+            pass
+
+    # 检测局域网 IP
+    # 方法1：通过连接外部地址获取本机出口 IP（host 网络模式下可以获取真实局域网 IP）
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+        # 排除 localhost 和 Docker 内部网络
+        if lan_ip and not lan_ip.startswith("127.") and not lan_ip.startswith("172."):
+            result["lan_ip"] = lan_ip
+    except Exception:
+        pass
+
+    # 方法2：如果方法1失败，尝试从路由表获取
+    if not result["lan_ip"]:
+        try:
+            output = subprocess.check_output(["ip", "route", "get", "1"], text=True, timeout=5)
+            for line in output.split('\n'):
+                if 'src' in line:
+                    parts = line.split()
+                    src_idx = parts.index('src')
+                    src_ip = parts[src_idx + 1]
+                    if not src_ip.startswith("127."):
+                        result["lan_ip"] = src_ip
+                        break
+        except Exception:
+            pass
+
+    # 构建消息
+    messages = []
+    if result["public_ip"]:
+        messages.append(f"公网 IP: {result['public_ip']}")
+    if result["lan_ip"]:
+        messages.append(f"局域网 IP: {result['lan_ip']}")
+
+    if messages:
+        result["message"] = "，".join(messages)
+    else:
+        result["message"] = "无法自动检测 IP，请手动输入"
+
+    return result
 
 
 @app.put("/api/settings")
@@ -1818,7 +2112,7 @@ def api_list_all_egress():
         })
 
     # 获取自定义出口
-    custom_egress = load_custom_egress().get("egress", [])
+    custom_egress = db.get_custom_egress_list()
     for eg in custom_egress:
         custom_result.append({
             "tag": eg.get("tag", ""),
@@ -1835,10 +2129,11 @@ def api_list_all_egress():
 @app.get("/api/egress/custom")
 def api_list_custom_egress():
     """列出所有自定义出口"""
-    data = load_custom_egress()
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress_list = db.get_custom_egress_list()
     # 不返回敏感信息（私钥）
     result = []
-    for eg in data.get("egress", []):
+    for eg in egress_list:
         result.append({
             "tag": eg.get("tag", ""),
             "description": eg.get("description", ""),
@@ -1856,50 +2151,44 @@ def api_list_custom_egress():
 @app.post("/api/egress/custom")
 def api_create_custom_egress(payload: CustomEgressCreateRequest):
     """创建自定义出口"""
-    data = load_custom_egress()
-    egress_list = data.get("egress", [])
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
     # 检查 tag 是否已存在
-    existing_tags = {eg.get("tag") for eg in egress_list}
-    if payload.tag in existing_tags:
+    if db.get_custom_egress(payload.tag):
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 已存在")
 
-    # 检查是否与 PIA profiles 冲突（从数据库检查）
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    # 检查是否与 PIA profiles 冲突
     pia_profiles = db.get_pia_profiles(enabled_only=False)
     pia_tags = {p.get("name", "").replace("_", "-") for p in pia_profiles}
     if payload.tag in pia_tags:
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 PIA 线路冲突")
 
-    # 添加新出口
-    new_egress = {
-        "tag": payload.tag,
-        "description": payload.description,
-        "server": payload.server,
-        "port": payload.port,
-        "private_key": payload.private_key,
-        "public_key": payload.public_key,
-        "address": payload.address,
-        "mtu": payload.mtu,
-        "dns": payload.dns,
-    }
-    if payload.pre_shared_key:
-        new_egress["pre_shared_key"] = payload.pre_shared_key
-    if payload.reserved:
-        new_egress["reserved"] = payload.reserved
-
-    egress_list.append(new_egress)
-    data["egress"] = egress_list
-    save_custom_egress(data)
+    # 添加到数据库
+    db.add_custom_egress(
+        tag=payload.tag,
+        server=payload.server,
+        private_key=payload.private_key,
+        public_key=payload.public_key,
+        address=payload.address,
+        description=payload.description,
+        port=payload.port,
+        mtu=payload.mtu,
+        dns=payload.dns,
+        pre_shared_key=payload.pre_shared_key,
+        reserved=payload.reserved,
+    )
 
     # 重新渲染配置并重载
+    reload_status = ""
     try:
         _regenerate_and_reload()
+        reload_status = "，已重载配置"
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
 
     return {
-        "message": f"出口 '{payload.tag}' 已创建",
+        "message": f"出口 '{payload.tag}' 已创建{reload_status}",
         "tag": payload.tag,
     }
 
@@ -1921,11 +2210,13 @@ def api_parse_wireguard_conf(payload: WireGuardConfParseRequest):
         if not result.get("address"):
             errors.append("缺少 Address")
 
-        return {
-            "parsed": result,
-            "valid": len(errors) == 0,
-            "errors": errors,
-        }
+        if errors:
+            raise HTTPException(status_code=400, detail=f"配置解析错误: {', '.join(errors)}")
+
+        # 返回解析后的结果，直接作为顶层对象
+        return result
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"解析失败: {exc}")
 
@@ -1933,97 +2224,97 @@ def api_parse_wireguard_conf(payload: WireGuardConfParseRequest):
 @app.put("/api/egress/custom/{tag}")
 def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
     """更新自定义出口"""
-    data = load_custom_egress()
-    egress_list = data.get("egress", [])
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    # 查找出口
-    found_idx = None
-    for i, eg in enumerate(egress_list):
-        if eg.get("tag") == tag:
-            found_idx = i
-            break
-
-    if found_idx is None:
+    # 检查出口是否存在
+    if not db.get_custom_egress(tag):
         raise HTTPException(status_code=404, detail=f"出口 '{tag}' 不存在")
 
-    # 更新字段
-    eg = egress_list[found_idx]
+    # 构建更新字段
+    updates = {}
     if payload.description is not None:
-        eg["description"] = payload.description
+        updates["description"] = payload.description
     if payload.server is not None:
-        eg["server"] = payload.server
+        updates["server"] = payload.server
     if payload.port is not None:
-        eg["port"] = payload.port
+        updates["port"] = payload.port
     if payload.private_key is not None:
-        eg["private_key"] = payload.private_key
+        updates["private_key"] = payload.private_key
     if payload.public_key is not None:
-        eg["public_key"] = payload.public_key
+        updates["public_key"] = payload.public_key
     if payload.address is not None:
-        eg["address"] = payload.address
+        updates["address"] = payload.address
     if payload.mtu is not None:
-        eg["mtu"] = payload.mtu
+        updates["mtu"] = payload.mtu
     if payload.dns is not None:
-        eg["dns"] = payload.dns
+        updates["dns"] = payload.dns
     if payload.pre_shared_key is not None:
-        eg["pre_shared_key"] = payload.pre_shared_key
+        updates["pre_shared_key"] = payload.pre_shared_key
     if payload.reserved is not None:
-        eg["reserved"] = payload.reserved
+        updates["reserved"] = payload.reserved
 
-    save_custom_egress(data)
+    db.update_custom_egress(tag, **updates)
 
     # 重新渲染配置并重载
+    reload_status = ""
     try:
         _regenerate_and_reload()
+        reload_status = "，已重载配置"
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
 
-    return {"message": f"出口 '{tag}' 已更新"}
+    return {"message": f"出口 '{tag}' 已更新{reload_status}"}
 
 
 @app.delete("/api/egress/custom/{tag}")
 def api_delete_custom_egress(tag: str):
     """删除自定义出口"""
-    data = load_custom_egress()
-    egress_list = data.get("egress", [])
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    # 查找出口
-    found_idx = None
-    for i, eg in enumerate(egress_list):
-        if eg.get("tag") == tag:
-            found_idx = i
-            break
-
-    if found_idx is None:
+    # 检查出口是否存在
+    if not db.get_custom_egress(tag):
         raise HTTPException(status_code=404, detail=f"出口 '{tag}' 不存在")
 
     # 删除
-    egress_list.pop(found_idx)
-    data["egress"] = egress_list
-    save_custom_egress(data)
+    db.delete_custom_egress(tag)
 
     # 重新渲染配置并重载
+    reload_status = ""
     try:
         _regenerate_and_reload()
+        reload_status = "，已重载配置"
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
 
-    return {"message": f"出口 '{tag}' 已删除"}
+    return {"message": f"出口 '{tag}' 已删除{reload_status}"}
 
 
 def _regenerate_and_reload():
-    """重新生成配置并重载 sing-box"""
-    # 检查是否有 PIA 配置
-    if PIA_PROFILES_OUTPUT.exists():
-        # 调用 render_singbox.py
-        result = subprocess.run(
-            ["python3", str(ENTRY_DIR / "render_singbox.py")],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            print(f"[api] render_singbox.py 失败: {result.stderr}")
+    """重新生成配置并重载 sing-box
+
+    Raises:
+        RuntimeError: 如果配置生成或重载失败
+    """
+    # 调用 render_singbox.py 重新生成配置
+    result = subprocess.run(
+        ["python3", str(ENTRY_DIR / "render_singbox.py")],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        error_msg = f"配置生成失败: {result.stderr.strip() or result.stdout.strip()}"
+        print(f"[api] render_singbox.py 失败: {result.stderr}")
+        raise RuntimeError(error_msg)
+
+    print(f"[api] render_singbox.py 成功")
+
     # 重载 sing-box
-    reload_singbox()
+    reload_result = reload_singbox()
+    if not reload_result.get("success"):
+        error_msg = reload_result.get("message", "未知错误")
+        raise RuntimeError(f"配置重载失败: {error_msg}")
 
 
 # ============ Domain List Catalog APIs ============
@@ -2248,20 +2539,16 @@ def api_create_quick_rule(payload: QuickRuleRequest):
     # 去重
     all_domains = list(set(all_domains))
 
-    # 生成规则标签
-    tag = payload.tag or f"custom-{'-'.join(payload.list_ids[:3])}"
-    if not tag.startswith("custom-"):
-        tag = f"custom-{tag}"
+    # 生成规则标签（用户自定义的保持原样，自动生成的加前缀）
+    if payload.tag:
+        tag = payload.tag
+    else:
+        tag = f"custom-{'-'.join(payload.list_ids[:3])}"
 
-    # 将所有域名添加到数据库
-    added_count = 0
-    for domain in all_domains:
-        try:
-            db.add_routing_rule("domain", domain, payload.outbound, priority=0)
-            added_count += 1
-        except Exception as e:
-            # 可能是重复规则，跳过
-            print(f"跳过域名 {domain}: {e}")
+    # 批量添加域名到数据库（使用 executemany 一次性插入）
+    # 格式: (rule_type, target, outbound, tag, priority)
+    rules = [("domain", domain, payload.outbound, tag, 0) for domain in all_domains]
+    added_count = db.add_routing_rules_batch(rules)
 
     return {
         "message": f"快速规则已创建，添加了 {added_count} 个域名到数据库",
@@ -2510,10 +2797,11 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
     # 去重
     all_cidrs = list(set(all_cidrs))
 
-    # 生成规则标签
-    tag = payload.tag or f"ip-{'-'.join(payload.country_codes[:3])}"
-    if not tag.startswith("ip-"):
-        tag = f"ip-{tag}"
+    # 生成规则标签（用户自定义的保持原样，自动生成的加前缀）
+    if payload.tag:
+        tag = payload.tag
+    else:
+        tag = f"ip-{'-'.join(payload.country_codes[:3])}"
 
     # 使用数据库存储
     if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
@@ -2521,15 +2809,10 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    # 将所有 IP CIDR 添加到数据库
-    added_count = 0
-    for cidr in all_cidrs:
-        try:
-            db.add_routing_rule("ip", cidr, payload.outbound, priority=0)
-            added_count += 1
-        except Exception as e:
-            # 可能是重复规则，跳过
-            print(f"跳过 CIDR {cidr}: {e}")
+    # 批量添加 IP CIDR 到数据库（使用 executemany 一次性插入）
+    # 格式: (rule_type, target, outbound, tag, priority)
+    rules = [("ip", cidr, payload.outbound, tag, 0) for cidr in all_cidrs]
+    added_count = db.add_routing_rules_batch(rules)
 
     return {
         "message": f"IP 快速规则已创建，添加了 {added_count} 个 CIDR 到数据库",
@@ -2578,7 +2861,7 @@ def api_export_backup(payload: BackupExportRequest):
         "interface": {
             "name": ingress_config.get("interface", {}).get("name", "wg-ingress"),
             "address": ingress_config.get("interface", {}).get("address", "10.23.0.1/24"),
-            "listen_port": ingress_config.get("interface", {}).get("listen_port", 36100),
+            "listen_port": ingress_config.get("interface", {}).get("listen_port", DEFAULT_WG_PORT),
             "mtu": ingress_config.get("interface", {}).get("mtu", 1420),
         },
         "peer_count": len(ingress_config.get("peers", [])),
@@ -2588,9 +2871,9 @@ def api_export_backup(payload: BackupExportRequest):
         json.dumps(ingress_sensitive), payload.password
     )
 
-    # 3. 导出自定义出口配置
-    custom_egress = load_custom_egress()
-    egress_list = custom_egress.get("egress", [])
+    # 3. 导出自定义出口配置（从数据库）
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress_list = db.get_custom_egress_list()
 
     # 分离敏感和非敏感数据
     egress_public = []
@@ -2619,7 +2902,6 @@ def api_export_backup(payload: BackupExportRequest):
     )
 
     # 4. 导出 PIA 配置（从数据库）
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
     pia_profiles = db.get_pia_profiles(enabled_only=False)
     # 转换为备份格式（不包含敏感凭证）
     backup_data["pia_profiles"] = [
@@ -2737,7 +3019,7 @@ def api_import_backup(payload: BackupImportRequest):
                 "interface": {
                     "name": ingress_public.get("interface", {}).get("name", "wg-ingress"),
                     "address": ingress_public.get("interface", {}).get("address", "10.23.0.1/24"),
-                    "listen_port": ingress_public.get("interface", {}).get("listen_port", 36100),
+                    "listen_port": ingress_public.get("interface", {}).get("listen_port", DEFAULT_WG_PORT),
                     "mtu": ingress_public.get("interface", {}).get("mtu", 1420),
                     "private_key": sensitive.get("interface_private_key", ""),
                 },
@@ -2760,43 +3042,44 @@ def api_import_backup(payload: BackupImportRequest):
         except Exception as exc:
             print(f"[backup] 导入入口配置失败: {exc}")
 
-    # 3. 导入自定义出口
+    # 3. 导入自定义出口（到数据库）
     if "custom_egress" in backup_data and "custom_egress_sensitive" in backup_data:
         try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
             sensitive_json = decrypt_sensitive_data(
                 backup_data["custom_egress_sensitive"], payload.password
             )
             sensitive_list = json.loads(sensitive_json)
             sensitive_map = {s["tag"]: s for s in sensitive_list}
 
-            # 合并公开和敏感数据
-            egress_list = []
+            # 如果是替换模式，先删除所有现有出口
+            if payload.merge_mode == "replace":
+                existing = db.get_custom_egress_list()
+                for eg in existing:
+                    db.delete_custom_egress(eg["tag"])
+
+            # 获取现有标签（用于合并模式）
+            existing_tags = {eg["tag"] for eg in db.get_custom_egress_list()}
+
+            # 导入备份中的出口
             for eg in backup_data["custom_egress"]:
                 tag = eg.get("tag", "")
+                if tag in existing_tags:
+                    continue  # 跳过已存在的
                 sens = sensitive_map.get(tag, {})
-                egress_list.append({
-                    "tag": tag,
-                    "description": eg.get("description", ""),
-                    "server": eg.get("server", ""),
-                    "port": eg.get("port", 51820),
-                    "address": eg.get("address", ""),
-                    "mtu": eg.get("mtu", 1420),
-                    "dns": eg.get("dns", "1.1.1.1"),
-                    "private_key": sens.get("private_key", ""),
-                    "public_key": sens.get("public_key", ""),
-                    "pre_shared_key": sens.get("pre_shared_key", ""),
-                    "reserved": sens.get("reserved"),
-                })
-
-            if payload.merge_mode == "merge":
-                existing = load_custom_egress()
-                existing_tags = {e.get("tag") for e in existing.get("egress", [])}
-                for eg in egress_list:
-                    if eg.get("tag") not in existing_tags:
-                        existing.setdefault("egress", []).append(eg)
-                egress_list = existing.get("egress", [])
-
-            save_custom_egress({"egress": egress_list})
+                db.add_custom_egress(
+                    tag=tag,
+                    server=eg.get("server", ""),
+                    private_key=sens.get("private_key", ""),
+                    public_key=sens.get("public_key", ""),
+                    address=eg.get("address", ""),
+                    description=eg.get("description", ""),
+                    port=eg.get("port", 51820),
+                    mtu=eg.get("mtu", 1420),
+                    dns=eg.get("dns", "1.1.1.1"),
+                    pre_shared_key=sens.get("pre_shared_key"),
+                    reserved=sens.get("reserved"),
+                )
             results["custom_egress"] = True
         except Exception as exc:
             print(f"[backup] 导入自定义出口失败: {exc}")
@@ -2840,7 +3123,7 @@ def api_import_backup(payload: BackupImportRequest):
         except Exception as exc:
             print(f"[backup] 导入 PIA 凭证失败: {exc}")
 
-    # 6. 导入路由规则（到数据库）
+    # 6. 导入路由规则（到数据库）- 使用批量处理
     if "custom_rules" in backup_data:
         try:
             rules_data = backup_data["custom_rules"]
@@ -2849,42 +3132,37 @@ def api_import_backup(payload: BackupImportRequest):
             if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
                 db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-                # 如果是替换模式，先删除所有规则
+                # 如果是替换模式，先批量删除所有规则
                 if payload.merge_mode == "replace":
-                    existing_rules = db.get_routing_rules(enabled_only=False)
-                    for rule in existing_rules:
-                        db.delete_routing_rule(rule["id"])
+                    db.delete_all_routing_rules()
 
-                # 导入规则到数据库
-                imported_count = 0
+                # 收集所有规则用于批量插入
+                # 格式: [(rule_type, target, outbound, tag, priority), ...]
+                batch_rules = []
                 for rule in rules_list:
                     outbound = rule.get("outbound", "direct")
+                    tag = rule.get("tag", "custom-direct")
 
-                    # 导入域名规则
+                    # 收集域名规则
                     for domain in rule.get("domains", []):
-                        try:
-                            db.add_routing_rule("domain", domain, outbound, priority=0)
-                            imported_count += 1
-                        except Exception as e:
-                            print(f"跳过域名 {domain}: {e}")
+                        batch_rules.append(("domain", domain, outbound, tag, 0))
 
-                    # 导入域名关键词规则
+                    # 收集域名关键词规则
                     for keyword in rule.get("domain_keywords", []):
-                        try:
-                            db.add_routing_rule("domain_keyword", keyword, outbound, priority=0)
-                            imported_count += 1
-                        except Exception as e:
-                            print(f"跳过关键词 {keyword}: {e}")
+                        batch_rules.append(("domain_keyword", keyword, outbound, tag, 0))
 
-                    # 导入 IP 规则
+                    # 收集 IP 规则
                     for cidr in rule.get("ip_cidrs", []):
-                        try:
-                            db.add_routing_rule("ip", cidr, outbound, priority=0)
-                            imported_count += 1
-                        except Exception as e:
-                            print(f"跳过 IP {cidr}: {e}")
+                        batch_rules.append(("ip", cidr, outbound, tag, 0))
 
-                print(f"[backup] 成功导入 {imported_count} 条规则到数据库")
+                # 批量插入
+                if batch_rules:
+                    imported_count = db.add_routing_rules_batch(batch_rules)
+                    print(f"[backup] 批量导入 {imported_count} 条规则到数据库")
+                else:
+                    imported_count = 0
+                    print("[backup] 没有路由规则需要导入")
+
                 results["custom_rules"] = True
             else:
                 # 降级到 JSON 文件
@@ -2894,14 +3172,17 @@ def api_import_backup(payload: BackupImportRequest):
             print(f"[backup] 导入路由规则失败: {exc}")
 
     # 重新生成配置
+    reload_status = ""
     try:
         _regenerate_and_reload()
+        reload_status = "，已重载配置"
     except Exception as exc:
         print(f"[backup] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
 
     imported_count = sum(1 for v in results.values() if v)
     return {
-        "message": f"已导入 {imported_count} 项配置",
+        "message": f"已导入 {imported_count} 项配置{reload_status}",
         "results": results,
     }
 
@@ -2910,18 +3191,18 @@ def api_import_backup(payload: BackupImportRequest):
 def api_backup_status():
     """获取备份相关状态"""
     ingress = load_ingress_config()
-    custom_egress = load_custom_egress()
     settings = load_settings()
 
-    # 从数据库获取 PIA profile 数量
+    # 从数据库获取数据
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
     pia_profiles = db.get_pia_profiles(enabled_only=False)
+    custom_egress = db.get_custom_egress_list()
 
     return {
         "encryption_available": HAS_CRYPTO,
         "has_ingress": bool(ingress.get("interface", {}).get("private_key")),
         "ingress_peer_count": len(ingress.get("peers", [])),
-        "custom_egress_count": len(custom_egress.get("egress", [])),
+        "custom_egress_count": len(custom_egress),
         "pia_profile_count": len(pia_profiles),
         "has_pia_credentials": bool(os.environ.get("PIA_USERNAME")),
         "has_settings": bool(settings.get("server_endpoint")),

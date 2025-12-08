@@ -16,7 +16,9 @@ export default function Endpoints() {
     setLoading(true);
     try {
       const data = await api.getEndpoints();
-      setEndpoints(data.endpoints);
+      // Filter out wg-server (managed in Ingress Manager)
+      const exitEndpoints = data.endpoints.filter(ep => ep.tag !== "wg-server");
+      setEndpoints(exitEndpoints);
       setError(null);
     } catch (err: any) {
       setError(err.message);

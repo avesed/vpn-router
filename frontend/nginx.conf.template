@@ -1,5 +1,5 @@
 server {
-    listen 36000;
+    listen ${WEB_PORT};
     server_name _;
     root /var/www/html;
     index index.html;

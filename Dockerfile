@@ -27,6 +27,7 @@ RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        gettext-base \
         iproute2 \
         iptables \
         iputils-ping \
@@ -51,13 +52,12 @@ COPY --from=singbox-binary /usr/local/bin/sing-box /usr/local/bin/sing-box
 # Copy frontend build output
 COPY --from=frontend-builder /app/dist /var/www/html
 
-# Copy nginx configuration
-COPY frontend/nginx.conf /etc/nginx/sites-available/default
+# Copy nginx configuration template (processed by entrypoint.sh with envsubst)
+COPY frontend/nginx.conf.template /etc/nginx/nginx.conf.template
 
-# Configure nginx
-RUN rm -f /etc/nginx/sites-enabled/default && \
-    ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && \
-    mkdir -p /var/log/nginx && \
+# Configure nginx (use conf.d for dynamic config generation)
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default && \
+    mkdir -p /etc/nginx/conf.d /var/log/nginx && \
     chown -R www-data:www-data /var/log/nginx
 
 COPY config /etc/sing-box/
