@@ -1,8 +1,7 @@
 services:
   vpn-gateway:
     container_name: vpn-gateway
-    build: .
-    # image: ghcr.io/avesed/vpn-router:latest
+    image: ghcr.io/avesed/vpn-router:latest
     privileged: true
     network_mode: host
     # sysctls 在 host 网络模式下不可用，需要在宿主机上设置：
@@ -22,10 +21,4 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./config:/etc/sing-box
-      - ./scripts/api_server.py:/usr/local/bin/api_server.py:ro
-      - ./scripts/db_helper.py:/usr/local/bin/db_helper.py:ro
-      - ./scripts/render_singbox.py:/usr/local/bin/render_singbox.py:ro
-      - ./scripts/convert_adblock.py:/usr/local/bin/convert_adblock.py:ro
-      - ./scripts/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
-      - ./scripts/init_user_db.py:/usr/local/bin/init_user_db.py:ro
     restart: unless-stopped
