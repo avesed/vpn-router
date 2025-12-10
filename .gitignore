@@ -19,11 +19,22 @@ vite.config.d.ts
 *.pem
 *.key
 
-# Config files with sensitive data
+# Config files with sensitive data (NOT sing-box.json - that's the base template)
 /config/pia-profiles.json
-/config/sing-box.json
 /config/sing-box.generated.json
 /config/rulesets/
+
+# WireGuard client configs (contain private keys)
+*-client.conf
+*.wg.conf
+
+# Domain catalog (generated from blackmatrix7)
+/config/domain-catalog.json
+/config/domain-catalog-new.json
+
+# GeoIP JSON files (generated from database)
+/config/geoip-catalog.json
+/config/geoip/
 
 # Old database files (migrated to separated databases)
 /config/routing.db
@@ -35,6 +46,10 @@ vite.config.d.ts
 /config/geoip.db
 /config/geosite.db
 /config/.geodata-ready
+
+# Database backup files
+*.db.bak
+*.db-journal
 
 # Runtime generated files
 /config/cache.db

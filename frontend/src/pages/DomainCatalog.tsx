@@ -424,10 +424,8 @@ export default function DomainCatalog() {
     return translated === translationKey ? cleanFallback : translated;
   };
 
-  // 过滤当前标签页的分类 (只显示按类型分类)
-  const filteredCategories = categories.filter(
-    ({ category }) => category.group === "type"
-  );
+  // 显示所有分类
+  const filteredCategories = categories;
 
   if (loading) {
     return (
@@ -692,7 +690,7 @@ export default function DomainCatalog() {
                                   </span>
                                 )}
                               </div>
-                              {list.sample_domains.length > 0 && (
+                              {list.sample_domains && list.sample_domains.length > 0 && (
                                 <p className="text-xs text-slate-500 mt-1 truncate max-w-md">
                                   {list.sample_domains.slice(0, 3).join(", ")}
                                   {list.sample_domains.length > 3 && "..."}

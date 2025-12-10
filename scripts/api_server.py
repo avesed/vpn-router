@@ -58,7 +58,13 @@ CUSTOM_RULES_FILE = Path(os.environ.get("CUSTOM_RULES_FILE", "/etc/sing-box/cust
 DOMAIN_CATALOG_FILE = Path(os.environ.get("DOMAIN_CATALOG_FILE", "/etc/sing-box/domain-catalog.json"))
 DOMAIN_LIST_DIR = Path(os.environ.get("DOMAIN_LIST_DIR", "/etc/sing-box/domain-list/data"))
 IP_CATALOG_FILE = Path(os.environ.get("IP_CATALOG_FILE", "/etc/sing-box/ip-catalog.json"))
+GEOIP_CATALOG_FILE = Path(os.environ.get("GEOIP_CATALOG_FILE", "/etc/sing-box/geoip-catalog.json"))
+GEOIP_DIR = Path(os.environ.get("GEOIP_DIR", "/etc/sing-box/geoip"))
 IP_LIST_DIR = Path(os.environ.get("IP_LIST_DIR", "/etc/sing-box/ip-list/country"))
+
+# ============ 内存加载的目录数据 ============
+_DOMAIN_CATALOG: Dict[str, Any] = {}
+_GEOIP_CATALOG: Dict[str, Any] = {}
 CUSTOM_CATEGORY_ITEMS_FILE = Path(os.environ.get("CUSTOM_CATEGORY_ITEMS_FILE", "/etc/sing-box/custom-category-items.json"))
 SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "/etc/sing-box/settings.json"))
 ENTRY_DIR = Path("/usr/local/bin")
@@ -259,6 +265,59 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def load_catalogs():
+    """启动时加载目录数据到内存"""
+    global _DOMAIN_CATALOG, _GEOIP_CATALOG
+
+    # 加载域名目录
+    if DOMAIN_CATALOG_FILE.exists():
+        try:
+            _DOMAIN_CATALOG = json.loads(DOMAIN_CATALOG_FILE.read_text(encoding="utf-8"))
+            domain_count = sum(
+                lst.get("count", len(lst.get("domains", [])))
+                for lst in _DOMAIN_CATALOG.get("lists", {}).values()
+            )
+            print(f"[Catalog] 已加载域名目录: {len(_DOMAIN_CATALOG.get('lists', {}))} 服务, {domain_count:,} 域名")
+        except Exception as e:
+            print(f"[Catalog] 加载域名目录失败: {e}")
+            _DOMAIN_CATALOG = {"categories": {}, "lists": {}}
+    else:
+        print(f"[Catalog] 域名目录文件不存在: {DOMAIN_CATALOG_FILE}")
+        _DOMAIN_CATALOG = {"categories": {}, "lists": {}}
+
+    # 加载 GeoIP 目录
+    if GEOIP_CATALOG_FILE.exists():
+        try:
+            _GEOIP_CATALOG = json.loads(GEOIP_CATALOG_FILE.read_text(encoding="utf-8"))
+            print(f"[Catalog] 已加载 GeoIP 目录: {_GEOIP_CATALOG.get('total_countries', 0)} 国家 (JSON)")
+        except Exception as e:
+            print(f"[Catalog] 加载 GeoIP 目录失败: {e}")
+            _GEOIP_CATALOG = {"countries": []}
+    else:
+        # 从 SQLite 加载国家列表
+        print(f"[Catalog] GeoIP JSON 不存在，从 SQLite 加载...")
+        try:
+            db = get_db()
+            countries = db.get_countries(limit=500)
+            _GEOIP_CATALOG = {
+                "countries": countries,
+                "total_countries": len(countries),
+                "total_ipv4_ranges": sum(c.get("ipv4_count", 0) for c in countries),
+                "total_ipv6_ranges": sum(c.get("ipv6_count", 0) for c in countries),
+                "source": "sqlite"
+            }
+            print(f"[Catalog] 已加载 GeoIP 目录: {len(countries)} 国家 (SQLite)")
+        except Exception as e:
+            print(f"[Catalog] 加载 GeoIP 目录失败: {e}")
+            _GEOIP_CATALOG = {"countries": []}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时加载数据"""
+    load_catalogs()
 
 
 def load_json_config() -> dict:
@@ -1031,8 +1090,8 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
         # 使用数据库存储（方案 B）
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-        # 批量删除所有规则（单条 SQL）
-        deleted_count = db.delete_all_routing_rules()
+        # 批量删除所有规则，但保留 __adblock__ 前缀的规则（由广告拦截页面管理）
+        deleted_count = db.delete_all_routing_rules(preserve_adblock=True)
 
         # 收集所有规则用于批量插入
         # 格式: (rule_type, target, outbound, tag, priority)
@@ -2258,6 +2317,156 @@ def api_delete_custom_egress(tag: str):
     return {"message": f"出口 '{tag}' 已删除{reload_status}"}
 
 
+# ============ Adblock Rule Sets APIs ============
+
+class AdblockRuleSetUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    url: Optional[str] = None
+    format: Optional[str] = None
+    outbound: Optional[str] = None
+    enabled: Optional[int] = None
+    priority: Optional[int] = None
+    category: Optional[str] = None
+    region: Optional[str] = None
+
+
+class AdblockRuleSetCreateRequest(BaseModel):
+    tag: str
+    name: str
+    url: str
+    description: str = ""
+    format: str = "adblock"  # adblock, hosts, domains
+    outbound: str = "block"
+    category: str = "general"
+    region: Optional[str] = None
+    priority: int = 0
+
+
+@app.get("/api/adblock/rules")
+def api_list_adblock_rules(category: Optional[str] = None):
+    """列出所有广告拦截规则集"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    rules = db.get_remote_rule_sets(enabled_only=False, category=category)
+
+    # 按分类分组
+    by_category = {}
+    for rule in rules:
+        cat = rule.get("category", "general")
+        if cat not in by_category:
+            by_category[cat] = []
+        by_category[cat].append(rule)
+
+    return {
+        "rules": rules,
+        "by_category": by_category,
+        "total": len(rules),
+        "enabled_count": sum(1 for r in rules if r.get("enabled"))
+    }
+
+
+@app.get("/api/adblock/rules/{tag}")
+def api_get_adblock_rule(tag: str):
+    """获取单个广告拦截规则集"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+    return rule
+
+
+@app.put("/api/adblock/rules/{tag}/toggle")
+def api_toggle_adblock_rule(tag: str):
+    """切换广告拦截规则集启用状态"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查规则是否存在
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 切换状态
+    db.toggle_remote_rule_set(tag)
+    new_state = "启用" if not rule.get("enabled") else "禁用"
+
+    return {
+        "message": f"规则集 '{tag}' 已{new_state}",
+        "tag": tag,
+        "enabled": not rule.get("enabled")
+    }
+
+
+@app.put("/api/adblock/rules/{tag}")
+def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
+    """更新广告拦截规则集"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查规则是否存在
+    if not db.get_remote_rule_set(tag):
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 更新
+    updates = {k: v for k, v in payload.dict().items() if v is not None}
+    if updates:
+        db.update_remote_rule_set(tag, **updates)
+
+    return {"message": f"规则集 '{tag}' 已更新"}
+
+
+@app.post("/api/adblock/rules")
+def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
+    """创建新的广告拦截规则集"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查 tag 是否已存在
+    if db.get_remote_rule_set(payload.tag):
+        raise HTTPException(status_code=400, detail=f"规则集 '{payload.tag}' 已存在")
+
+    # 创建
+    db.add_remote_rule_set(
+        tag=payload.tag,
+        name=payload.name,
+        url=payload.url,
+        description=payload.description,
+        format=payload.format,
+        outbound=payload.outbound,
+        category=payload.category,
+        region=payload.region,
+        priority=payload.priority
+    )
+
+    return {"message": f"规则集 '{payload.tag}' 已创建", "tag": payload.tag}
+
+
+@app.delete("/api/adblock/rules/{tag}")
+def api_delete_adblock_rule(tag: str):
+    """删除广告拦截规则集"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查规则是否存在
+    if not db.get_remote_rule_set(tag):
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 删除
+    db.delete_remote_rule_set(tag)
+
+    return {"message": f"规则集 '{tag}' 已删除"}
+
+
+@app.post("/api/adblock/apply")
+def api_apply_adblock_rules():
+    """应用广告拦截规则（下载启用的规则并重新生成配置）"""
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "配置已重新生成并重载"
+    except Exception as exc:
+        print(f"[api] 应用广告拦截规则失败: {exc}")
+        raise HTTPException(status_code=500, detail=f"应用失败: {exc}")
+
+    return {"message": reload_status, "status": "success"}
+
+
 def _regenerate_and_reload():
     """重新生成配置并重载 sing-box
 
@@ -2287,45 +2496,26 @@ def _regenerate_and_reload():
 # ============ Domain List Catalog APIs ============
 
 def load_domain_catalog() -> dict:
-    """加载域名列表目录（从数据库读取）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    """从内存返回域名目录"""
+    return _DOMAIN_CATALOG
 
-    # 获取所有分类
-    categories = {}
-    db_categories = db.geodata.get_domain_categories()
-    for cat in db_categories:
-        categories[cat["id"]] = {
-            "name": cat["name"],
-            "description": cat.get("description", ""),
-            "group": cat.get("group_type", "type"),
-            "recommended_exit": cat.get("recommended_exit", "direct"),
-            "lists": []
-        }
 
-    # 获取所有域名列表
-    domain_lists = db.geodata.get_domain_lists()
+def get_domain_list(list_id: str) -> dict:
+    """获取指定域名列表的详细信息"""
+    lists = _DOMAIN_CATALOG.get("lists", {})
+    if list_id not in lists:
+        return {}
 
-    # 为每个列表获取样本域名
-    for dlist in domain_lists:
-        list_id = dlist["id"]
-        domain_count = dlist["domain_count"]
-
-        # 获取样本域名（最多10个）
-        sample_domains = db.geodata.get_domains_by_list(list_id, limit=10)
-
-        # 获取该列表所属的分类
-        list_categories = db.geodata.get_list_categories(list_id)
-
-        # 添加到相应分类
-        for cat_id in list_categories:
-            if cat_id in categories:
-                categories[cat_id]["lists"].append({
-                    "id": list_id,
-                    "domain_count": domain_count,
-                    "sample_domains": sample_domains
-                })
-
-    return {"categories": categories}
+    lst = lists[list_id]
+    domains = lst.get("domains", [])
+    return {
+        "id": list_id,
+        "name": lst.get("name", list_id),
+        "domains": domains,
+        "full_domains": lst.get("full_domains", []),
+        "regexps": lst.get("regexps", []),
+        "count": lst.get("count", len(domains))
+    }
 
 
 def parse_domain_list_file(name: str, visited: Optional[set] = None) -> dict:
@@ -2433,40 +2623,37 @@ def api_get_domain_category(category_id: str):
 
 
 @app.get("/api/domain-catalog/lists/{list_id}")
-def api_get_domain_list(list_id: str):
+def api_get_domain_list_detail(list_id: str):
     """获取指定域名列表的完整域名"""
-    # 先尝试从缓存的 catalog 获取
-    catalog = load_domain_catalog()
-    lists = catalog.get("lists", {})
-
-    if list_id in lists:
-        return {
-            "id": list_id,
-            "domains": lists[list_id].get("domains", []),
-            "full_domains": lists[list_id].get("full_domains", []),
-        }
-
-    # 如果不在 catalog 中，尝试直接解析文件
-    if not DOMAIN_LIST_DIR.exists():
-        raise HTTPException(status_code=404, detail="域名列表目录不存在")
-
-    data = parse_domain_list_file(list_id)
-    if not data["domains"] and not data["full_domains"]:
-        raise HTTPException(status_code=404, detail=f"域名列表 {list_id} 不存在或为空")
-
-    return {
-        "id": list_id,
-        "domains": data["domains"],
-        "full_domains": data["full_domains"],
-    }
+    data = get_domain_list(list_id)
+    if not data:
+        raise HTTPException(status_code=404, detail=f"域名列表 {list_id} 不存在")
+    return data
 
 
 @app.get("/api/domain-catalog/search")
 def api_search_domain_lists(q: str):
-    """搜索域名列表（从数据库）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-    results = db.search_domain_lists(q, limit=50)
-    return {"results": [{"id": r["id"], "name": r["id"]} for r in results]}
+    """搜索域名列表（从内存）"""
+    q_lower = q.lower()
+    results = []
+
+    lists = _DOMAIN_CATALOG.get("lists", {})
+    for list_id, lst in lists.items():
+        # 搜索列表 ID
+        if q_lower in list_id.lower():
+            results.append({"id": list_id, "name": lst.get("name", list_id)})
+            continue
+
+        # 搜索域名
+        for domain in lst.get("domains", [])[:100]:  # 只搜索前100个域名
+            if q_lower in domain.lower():
+                results.append({"id": list_id, "name": lst.get("name", list_id)})
+                break
+
+        if len(results) >= 50:
+            break
+
+    return {"results": results}
 
 
 class QuickRuleRequest(BaseModel):
@@ -2474,6 +2661,29 @@ class QuickRuleRequest(BaseModel):
     list_ids: List[str] = Field(..., description="域名列表 ID 列表")
     outbound: str = Field(..., description="出口线路 tag")
     tag: Optional[str] = Field(None, description="规则集标签，不填则自动生成")
+
+
+# 广告拦截相关的域名列表 (来自 advertising 和 adblock-extended 分类)
+ADBLOCK_LIST_IDS = {
+    "category-ads", "category-ads-all", "google-ads", "facebook-ads", "amazon-ads",
+    "baidu-ads", "bytedance-ads", "tencent-ads", "alibaba-ads", "apple-ads",
+    "acfun-ads", "dmm-ads", "sina-ads", "sohu-ads", "unity-ads", "spotify-ads",
+    "xiaomi-ads", "adjust-ads", "applovin-ads", "adcolony-ads", "clearbit-ads",
+    "segment-ads", "sensorsdata-ads", "taboola", "supersonic-ads", "tappx-ads",
+    "television-ads", "atom-data-ads", "emogi-ads", "umeng-ads", "xhamster-ads",
+    "uberads-ads", "tagtic-ads", "category-ads-ir", "ext-reject-all",
+    # 安全隐私类的广告拦截相关列表
+    "adblock", "adblockplus", "adguard"
+}
+
+
+def is_adblock_list(list_id: str) -> bool:
+    """检查是否为广告拦截相关的域名列表"""
+    list_lower = list_id.lower()
+    # 直接匹配或包含 -ads 后缀
+    if list_lower in ADBLOCK_LIST_IDS or list_lower.endswith("-ads"):
+        return True
+    return False
 
 
 @app.post("/api/domain-catalog/quick-rule")
@@ -2506,9 +2716,16 @@ def api_create_quick_rule(payload: QuickRuleRequest):
     # 去重
     all_domains = list(set(all_domains))
 
-    # 生成规则标签（用户自定义的保持原样，自动生成的加前缀）
+    # 检查是否为广告拦截规则 (所有选择的列表都是广告相关的)
+    is_adblock_rule = all(is_adblock_list(lid) for lid in payload.list_ids)
+
+    # 生成规则标签
     if payload.tag:
         tag = payload.tag
+    elif is_adblock_rule:
+        # 广告拦截规则使用 __adblock__ 前缀 + 随机ID，不会显示在路由规则页面
+        import uuid
+        tag = f"__adblock__{uuid.uuid4().hex[:8]}"
     else:
         tag = f"custom-{'-'.join(payload.list_ids[:3])}"
 
@@ -2648,19 +2865,16 @@ RECOMMENDED_IP_EXITS = {
 }
 
 def load_ip_catalog() -> dict:
-    """加载 IP 列表目录（从数据库读取）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-
-    # 获取所有国家
-    all_countries = db.geodata.get_countries(limit=500)
+    """从内存返回 IP 目录"""
+    countries_list = _GEOIP_CATALOG.get("countries", [])
 
     countries = {}
-    for country in all_countries:
-        code = country["code"]
+    for country in countries_list:
+        code = country["code"].lower()
         countries[code] = {
             "country_code": code.upper(),
             "country_name": country["name"],
-            "display_name": COUNTRY_NAMES.get(code, country["display_name"]),
+            "display_name": COUNTRY_NAMES.get(code, country.get("display_name", country["name"])),
             "ipv4_count": country.get("ipv4_count", 0),
             "ipv6_count": country.get("ipv6_count", 0),
             "recommended_exit": RECOMMENDED_IP_EXITS.get(code, country.get("recommended_exit", "direct"))
@@ -2668,35 +2882,58 @@ def load_ip_catalog() -> dict:
 
     stats = {
         "total_countries": len(countries),
-        "total_ipv4": sum(c.get("ipv4_count", 0) for c in countries.values()),
-        "total_ipv6": sum(c.get("ipv6_count", 0) for c in countries.values())
+        "total_ipv4": _GEOIP_CATALOG.get("total_ipv4_ranges", 0),
+        "total_ipv6": _GEOIP_CATALOG.get("total_ipv6_ranges", 0)
     }
 
     return {"countries": countries, "stats": stats}
 
 
 def get_country_ip_info(country_code: str) -> dict:
-    """获取国家 IP 信息（从数据库读取）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    """获取国家 IP 信息（优先 JSON，fallback 到 SQLite）"""
+    cc = country_code.lower()
 
-    # 获取国家信息
-    country_info = db.geodata.get_country(country_code.lower())
+    # 从目录中获取国家基本信息
+    country_info = None
+    for c in _GEOIP_CATALOG.get("countries", []):
+        if c["code"].lower() == cc:
+            country_info = c
+            break
+
     if not country_info:
         return {}
 
-    # 获取该国家的 IP 范围
-    ipv4_cidrs = db.geodata.get_country_ips(country_code.lower(), ip_version=4, limit=100000)
-    ipv6_cidrs = db.geodata.get_country_ips(country_code.lower(), ip_version=6, limit=100000)
+    ipv4_cidrs = []
+    ipv6_cidrs = []
+
+    # 优先从 JSON 文件加载
+    ip_file = GEOIP_DIR / f"{cc}.json"
+    if ip_file.exists():
+        try:
+            ip_data = json.loads(ip_file.read_text(encoding="utf-8"))
+            ipv4_cidrs = ip_data.get("ipv4_ranges", [])
+            ipv6_cidrs = ip_data.get("ipv6_ranges", [])
+        except Exception:
+            pass
+
+    # 如果 JSON 不存在或为空，从 SQLite 加载
+    if not ipv4_cidrs and not ipv6_cidrs:
+        try:
+            db = get_db()
+            ipv4_cidrs = db.get_country_ips(cc.upper(), ip_version=4)
+            ipv6_cidrs = db.get_country_ips(cc.upper(), ip_version=6)
+        except Exception:
+            pass
 
     return {
-        "country_code": country_code.upper(),
+        "country_code": cc.upper(),
         "country_name": country_info["name"],
-        "display_name": COUNTRY_NAMES.get(country_code.lower(), country_info["display_name"]),
+        "display_name": COUNTRY_NAMES.get(cc, country_info.get("display_name", country_info["name"])),
         "ipv4_cidrs": ipv4_cidrs,
         "ipv6_cidrs": ipv6_cidrs,
         "ipv4_count": len(ipv4_cidrs),
         "ipv6_count": len(ipv6_cidrs),
-        "recommended_exit": RECOMMENDED_IP_EXITS.get(country_code.lower(), country_info.get("recommended_exit", "direct")),
+        "recommended_exit": RECOMMENDED_IP_EXITS.get(cc, country_info.get("recommended_exit", "direct")),
     }
 
 
@@ -2718,24 +2955,23 @@ def api_get_country_ips(country_code: str):
 
 @app.get("/api/ip-catalog/search")
 def api_search_countries(q: str):
-    """搜索国家/地区"""
+    """搜索国家/地区（从内存）"""
     q_lower = q.lower()
     results = []
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    # 从数据库获取所有国家
-    all_countries = db.geodata.get_countries(limit=500)
-
-    # 搜索国家代码和名称
-    for country in all_countries:
+    # 从内存获取所有国家
+    for country in _GEOIP_CATALOG.get("countries", []):
         cc = country["code"].lower()
         name = country["name"]
-        display_name = COUNTRY_NAMES.get(cc, country["display_name"])
+        display_name = COUNTRY_NAMES.get(cc, country.get("display_name", name))
 
         if q_lower in cc or q_lower in name.lower() or q_lower in display_name.lower():
             results.append({"country_code": cc.upper(), "display_name": display_name})
 
-    return {"results": results[:30]}
+        if len(results) >= 30:
+            break
+
+    return {"results": results}
 
 
 class IpQuickRuleRequest(BaseModel):
@@ -3099,9 +3335,9 @@ def api_import_backup(payload: BackupImportRequest):
             if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
                 db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-                # 如果是替换模式，先批量删除所有规则
+                # 如果是替换模式，先批量删除所有规则（但保留广告拦截规则）
                 if payload.merge_mode == "replace":
-                    db.delete_all_routing_rules()
+                    db.delete_all_routing_rules(preserve_adblock=True)
 
                 # 收集所有规则用于批量插入
                 # 格式: [(rule_type, target, outbound, tag, priority), ...]

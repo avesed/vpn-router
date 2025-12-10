@@ -27,7 +27,11 @@ import type {
   WireGuardConfParseResult,
   BackupStatus,
   BackupExportResponse,
-  BackupImportResponse
+  BackupImportResponse,
+  AdBlockRulesResponse,
+  AdBlockRuleSet,
+  AdBlockRuleSetCreateRequest,
+  AdBlockToggleResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -209,5 +213,27 @@ export const api = {
     request<BackupImportResponse>("/backup/import", {
       method: "POST",
       body: { data, password, merge_mode: mergeMode }
-    })
+    }),
+
+  // AdBlock Rule Sets
+  getAdBlockRules: (category?: string) =>
+    request<AdBlockRulesResponse>(`/adblock/rules${category ? `?category=${encodeURIComponent(category)}` : ""}`),
+  getAdBlockRule: (tag: string) =>
+    request<AdBlockRuleSet>(`/adblock/rules/${encodeURIComponent(tag)}`),
+  toggleAdBlockRule: (tag: string) =>
+    request<AdBlockToggleResponse>(`/adblock/rules/${encodeURIComponent(tag)}/toggle`, { method: "PUT" }),
+  updateAdBlockRule: (tag: string, data: Partial<AdBlockRuleSetCreateRequest>) =>
+    request<{ message: string }>(`/adblock/rules/${encodeURIComponent(tag)}`, {
+      method: "PUT",
+      body: data
+    }),
+  createAdBlockRule: (data: AdBlockRuleSetCreateRequest) =>
+    request<{ message: string; tag: string }>("/adblock/rules", {
+      method: "POST",
+      body: data
+    }),
+  deleteAdBlockRule: (tag: string) =>
+    request<{ message: string }>(`/adblock/rules/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+  applyAdBlockRules: () =>
+    request<{ message: string; status: string }>("/adblock/apply", { method: "POST" })
 };

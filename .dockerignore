@@ -36,3 +36,7 @@ __pycache__/
 test-wg/
 test-client/
 test-egress/
+
+# WireGuard client configs
+*-client.conf
+*.wg.conf

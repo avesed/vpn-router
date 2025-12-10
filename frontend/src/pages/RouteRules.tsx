@@ -47,13 +47,19 @@ export default function RouteRules() {
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editRule, setEditRule] = useState<RuleFormData>(emptyRule);
 
+  // 过滤广告拦截规则（以 __adblock__ 前缀开头的规则由广告拦截页面管理）
+  const filterAdblockRules = (rules: RouteRule[]): RouteRule[] => {
+    return rules.filter(rule => !rule.tag.startsWith("__adblock__"));
+  };
+
   const fetchData = async () => {
     try {
       const [rulesData, profilesData] = await Promise.all([
         api.getRouteRules(),
         api.getProfiles()
       ]);
-      setRules(rulesData.rules);
+      // 过滤掉广告拦截规则，这些规则由广告拦截页面管理
+      setRules(filterAdblockRules(rulesData.rules));
       setDefaultOutbound(rulesData.default_outbound);
       setAvailableOutbounds(rulesData.available_outbounds || []);
       setProfiles(profilesData.profiles);

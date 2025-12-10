@@ -329,11 +329,18 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
-    def delete_all_routing_rules(self) -> int:
-        """删除所有路由规则（用于备份恢复的替换模式）"""
+    def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
+        """删除所有路由规则（用于备份恢复的替换模式）
+
+        Args:
+            preserve_adblock: 如果为 True，保留以 __adblock__ 开头的规则
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM routing_rules")
+            if preserve_adblock:
+                cursor.execute("DELETE FROM routing_rules WHERE tag NOT LIKE '__adblock__%'")
+            else:
+                cursor.execute("DELETE FROM routing_rules")
             conn.commit()
             return cursor.rowcount
 
@@ -823,6 +830,100 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ Remote Rule Sets 管理 ============
+
+    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None) -> List[Dict]:
+        """获取远程规则集列表"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM remote_rule_sets"
+            conditions = []
+            params = []
+
+            if enabled_only:
+                conditions.append("enabled = 1")
+            if category:
+                conditions.append("category = ?")
+                params.append(category)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY priority DESC, name"
+
+            rows = cursor.execute(query, params).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_remote_rule_set(self, tag: str) -> Optional[Dict]:
+        """获取单个远程规则集"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM remote_rule_sets WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def toggle_remote_rule_set(self, tag: str) -> bool:
+        """切换远程规则集启用状态"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE remote_rule_sets
+                SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
+                WHERE tag = ?
+            """, (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def update_remote_rule_set(self, tag: str, **kwargs) -> bool:
+        """更新远程规则集"""
+        allowed_fields = {"name", "description", "url", "format", "outbound",
+                          "enabled", "priority", "category", "region",
+                          "last_updated", "domain_count"}
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields and value is not None:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE remote_rule_sets SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def add_remote_rule_set(self, tag: str, name: str, url: str,
+                            description: str = "", format: str = "adblock",
+                            outbound: str = "block", category: str = "general",
+                            region: Optional[str] = None, priority: int = 0) -> int:
+        """添加远程规则集"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO remote_rule_sets
+                (tag, name, description, url, format, outbound, category, region, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, name, description, url, format, outbound, category, region, priority))
+            conn.commit()
+            return cursor.lastrowid
+
+    def delete_remote_rule_set(self, tag: str) -> bool:
+        """删除远程规则集"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
@@ -879,8 +980,8 @@ class DatabaseManager:
     def delete_routing_rule(self, rule_id: int) -> bool:
         return self.user.delete_routing_rule(rule_id)
 
-    def delete_all_routing_rules(self) -> int:
-        return self.user.delete_all_routing_rules()
+    def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
+        return self.user.delete_all_routing_rules(preserve_adblock)
 
     def get_outbounds(self, enabled_only: bool = True) -> List[Dict]:
         return self.user.get_outbounds(enabled_only)
@@ -987,6 +1088,29 @@ class DatabaseManager:
 
     def delete_custom_egress(self, tag: str) -> bool:
         return self.user.delete_custom_egress(tag)
+
+    # Remote Rule Sets
+    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None) -> List[Dict]:
+        return self.user.get_remote_rule_sets(enabled_only, category)
+
+    def get_remote_rule_set(self, tag: str) -> Optional[Dict]:
+        return self.user.get_remote_rule_set(tag)
+
+    def toggle_remote_rule_set(self, tag: str) -> bool:
+        return self.user.toggle_remote_rule_set(tag)
+
+    def update_remote_rule_set(self, tag: str, **kwargs) -> bool:
+        return self.user.update_remote_rule_set(tag, **kwargs)
+
+    def add_remote_rule_set(self, tag: str, name: str, url: str,
+                            description: str = "", format: str = "adblock",
+                            outbound: str = "block", category: str = "general",
+                            region: Optional[str] = None, priority: int = 0) -> int:
+        return self.user.add_remote_rule_set(tag, name, url, description, format,
+                                             outbound, category, region, priority)
+
+    def delete_remote_rule_set(self, tag: str) -> bool:
+        return self.user.delete_remote_rule_set(tag)
 
 
 # 全局缓存

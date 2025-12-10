@@ -11,6 +11,7 @@ import DomainCatalog from "./pages/DomainCatalog";
 import IpCatalog from "./pages/IpCatalog";
 import IngressManager from "./pages/IngressManager";
 import BackupRestore from "./pages/BackupRestore";
+import AdBlock from "./pages/AdBlock";
 import "./index.css";
 import "./i18n";
 
@@ -26,6 +27,7 @@ const router = createBrowserRouter([
       { path: "rules", element: <RouteRules /> },
       { path: "domain-catalog", element: <DomainCatalog /> },
       { path: "ip-catalog", element: <IpCatalog /> },
+      { path: "adblock", element: <AdBlock /> },
       { path: "endpoints", element: <Endpoints /> },
       { path: "pia", element: <PiaLogin /> },
       { path: "backup", element: <BackupRestore /> }

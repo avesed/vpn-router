@@ -124,6 +124,27 @@ CREATE TABLE IF NOT EXISTS custom_egress (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_custom_egress_tag ON custom_egress(tag);
+
+-- 远程规则集表（广告拦截等）
+CREATE TABLE IF NOT EXISTS remote_rule_sets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    url TEXT NOT NULL,
+    format TEXT DEFAULT 'adblock',  -- adblock, hosts, domains
+    outbound TEXT DEFAULT 'block',
+    enabled INTEGER DEFAULT 0,
+    priority INTEGER DEFAULT 0,
+    category TEXT DEFAULT 'general',  -- general, privacy, regional, security, antiadblock
+    region TEXT,  -- cn, de, fr, kr, ru, etc.
+    last_updated TIMESTAMP,
+    domain_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_enabled ON remote_rule_sets(enabled);
+CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_category ON remote_rule_sets(category);
 """
 
 
@@ -215,6 +236,66 @@ def init_default_settings(conn: sqlite3.Connection):
     print("✓ 初始化默认设置")
 
 
+def init_remote_rule_sets(conn: sqlite3.Connection):
+    """初始化预置广告拦截规则"""
+    cursor = conn.cursor()
+
+    # 预置规则列表
+    preset_rules = [
+        # === 通用规则 ===
+        ("easylist", "EasyList", "国际通用广告拦截列表",
+         "https://easylist.to/easylist/easylist.txt", "adblock", "general", None, 1),
+        ("easyprivacy", "EasyPrivacy", "隐私追踪拦截列表",
+         "https://easylist.to/easylist/easyprivacy.txt", "adblock", "privacy", None, 0),
+        ("adguard-dns", "AdGuard DNS", "AdGuard DNS 过滤规则",
+         "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt", "adblock", "general", None, 0),
+
+        # === 地区规则 ===
+        ("easylist-china", "EasyList China", "中国区广告拦截",
+         "https://easylist-downloads.adblockplus.org/easylistchina.txt", "adblock", "regional", "cn", 1),
+        ("easylist-germany", "EasyList Germany", "德国区广告拦截",
+         "https://easylist.to/easylistgermany/easylistgermany.txt", "adblock", "regional", "de", 0),
+        ("easylist-france", "Liste FR", "法国区广告拦截",
+         "https://easylist-downloads.adblockplus.org/liste_fr.txt", "adblock", "regional", "fr", 0),
+        ("easylist-korea", "KoreanList", "韩国区广告拦截",
+         "https://easylist-downloads.adblockplus.org/koreanlist+easylist.txt", "adblock", "regional", "kr", 0),
+        ("ruadlist", "RuAdList", "俄罗斯区广告拦截",
+         "https://easylist-downloads.adblockplus.org/ruadlist+easylist.txt", "adblock", "regional", "ru", 0),
+
+        # === 反反广告 ===
+        ("antiadblock-chinese", "Anti-Adblock (中文)", "移除中文网站的反广告拦截提示",
+         "https://raw.githubusercontent.com/easylist/antiadblockfilters/master/antiadblockfilters/antiadblock_chinese.txt", "adblock", "antiadblock", "cn", 0),
+        ("antiadblock-english", "Anti-Adblock (英文)", "移除英文网站的反广告拦截提示",
+         "https://raw.githubusercontent.com/easylist/antiadblockfilters/master/antiadblockfilters/antiadblock_english.txt", "adblock", "antiadblock", "en", 0),
+
+        # === 安全规则 ===
+        ("malware-domains", "Malware Domains", "恶意软件域名拦截",
+         "https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-hosts.txt", "hosts", "security", None, 0),
+        ("phishing-army", "Phishing Army", "钓鱼网站拦截",
+         "https://phishing.army/download/phishing_army_blocklist.txt", "domains", "security", None, 0),
+
+        # === 精简列表 ===
+        ("peter-lowe", "Peter Lowe's List", "精简广告服务器列表 (~3000 域名)",
+         "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts", "hosts", "general", None, 0),
+    ]
+
+    inserted = 0
+    for tag, name, description, url, format_, category, region, enabled in preset_rules:
+        cursor.execute("""
+            INSERT OR IGNORE INTO remote_rule_sets
+            (tag, name, description, url, format, category, region, enabled, outbound, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'block', 0)
+        """, (tag, name, description, url, format_, category, region, enabled))
+        if cursor.rowcount > 0:
+            inserted += 1
+
+    conn.commit()
+    if inserted > 0:
+        print(f"✓ 添加 {inserted} 个预置广告拦截规则")
+    else:
+        print("⊘ 预置广告拦截规则已存在")
+
+
 def load_pia_profiles(conn: sqlite3.Connection, config_dir: Path):
     """从 YAML 加载 PIA profiles（如果存在）"""
     pia_profiles_yaml = config_dir / "pia" / "profiles.yml"
@@ -283,6 +364,9 @@ def main():
 
     # 初始化默认设置
     init_default_settings(conn)
+
+    # 初始化预置广告拦截规则
+    init_remote_rule_sets(conn)
 
     # 初始化 WireGuard 服务器配置
     init_wireguard_server(conn)

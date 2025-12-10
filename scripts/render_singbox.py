@@ -6,12 +6,14 @@
 - 为每个 profile 创建或更新对应的 WireGuard endpoint（sing-box 1.11+ 格式）
 - 路由规则可直接引用 endpoint tag 作为出口
 - 应用自定义路由规则（如果有）
+- 支持广告拦截 rule_set（从 ABP/hosts 列表转换）
 """
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple, Set
 
 import yaml
 
@@ -23,12 +25,20 @@ try:
 except ImportError:
     HAS_DATABASE = False
 
+# 尝试导入 ABP 转换模块
+try:
+    from convert_adblock import download_and_convert, save_singbox_ruleset
+    HAS_ADBLOCK_CONVERTER = True
+except ImportError:
+    HAS_ADBLOCK_CONVERTER = False
+
 BASE_CONFIG = Path(os.environ.get("SING_BOX_BASE_CONFIG", "/etc/sing-box/sing-box.json"))
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
 CUSTOM_RULES_FILE = Path(os.environ.get("CUSTOM_RULES_FILE", "/etc/sing-box/custom-rules.json"))
 OUTPUT = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
+RULESETS_DIR = Path(os.environ.get("RULESETS_DIR", "/etc/sing-box/rulesets"))
 
 
 def load_json(path: Path) -> dict:
@@ -436,9 +446,8 @@ def ensure_custom_dns_servers(config: dict, custom_tags: List[str]) -> None:
         dns_tag = f"{tag}-dns"
         if dns_tag not in existing_tags:
             servers.append({
-                "type": "tls",
                 "tag": dns_tag,
-                "server": "1.1.1.1",
+                "address": "tls://1.1.1.1",
                 "detour": tag
             })
 
@@ -481,6 +490,91 @@ def cleanup_stale_endpoints(config: dict, valid_tags: List[str]) -> None:
             ]
 
 
+def generate_adblock_rule_sets() -> Tuple[List[Dict], List[Dict]]:
+    """生成广告拦截 rule_set 配置
+
+    从数据库读取已启用的远程规则集，下载并转换为 sing-box rule_set 格式。
+
+    Returns:
+        (rule_set_configs, route_rules): rule_set 配置和对应的路由规则
+    """
+    if not HAS_DATABASE or not HAS_ADBLOCK_CONVERTER:
+        if not HAS_ADBLOCK_CONVERTER:
+            print("[render] 警告: convert_adblock 模块不可用，跳过广告拦截规则")
+        return [], []
+
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        rules = db.get_remote_rule_sets(enabled_only=True)
+    except Exception as e:
+        print(f"[render] 警告: 无法加载远程规则集: {e}")
+        return [], []
+
+    if not rules:
+        return [], []
+
+    # 确保 rulesets 目录存在
+    RULESETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    rule_set_configs = []
+    route_rules = []
+    processed_count = 0
+
+    for rule in rules:
+        tag = rule["tag"]
+        url = rule["url"]
+        format_type = rule.get("format", "adblock")
+        outbound = rule.get("outbound", "block")
+
+        ruleset_path = RULESETS_DIR / f"{tag}.json"
+
+        try:
+            # 下载并转换
+            print(f"[render] 下载广告规则: {tag} ({url[:50]}...)")
+            domains = download_and_convert(url, format_type)
+
+            if not domains:
+                print(f"[render] 警告: {tag} 未获取到任何域名，跳过")
+                continue
+
+            # 保存为 sing-box rule_set 格式
+            save_singbox_ruleset(domains, ruleset_path)
+
+            # 更新数据库中的域名数量和更新时间
+            try:
+                db.update_remote_rule_set(
+                    tag,
+                    domain_count=len(domains),
+                    last_updated=datetime.now().isoformat()
+                )
+            except Exception:
+                pass  # 更新失败不影响配置生成
+
+            # 添加 rule_set 配置
+            rule_set_configs.append({
+                "tag": tag,
+                "type": "local",
+                "format": "source",
+                "path": str(ruleset_path)
+            })
+
+            # 添加路由规则
+            route_rules.append({
+                "rule_set": [tag],
+                "outbound": outbound
+            })
+
+            processed_count += 1
+            print(f"[render] 已转换 {tag}: {len(domains):,} 个域名")
+
+        except Exception as e:
+            print(f"[render] 警告: 处理 {tag} 失败: {e}")
+            continue
+
+    if processed_count > 0:
+        print(f"[render] 共处理 {processed_count} 个广告拦截规则集")
+
+    return rule_set_configs, route_rules
 
 
 def load_custom_rules() -> Dict[str, Any]:
@@ -674,6 +768,22 @@ def main() -> None:
             print(f"[render] 应用了 {len(custom_rules['rules'])} 条自定义规则")
         if custom_rules.get("default_outbound"):
             print(f"[render] 默认出口设置为: {custom_rules['default_outbound']}")
+
+    # 生成广告拦截 rule_set
+    adblock_rule_sets, adblock_route_rules = generate_adblock_rule_sets()
+    if adblock_rule_sets:
+        route = config.setdefault("route", {})
+        rule_set = route.setdefault("rule_set", [])
+        rules = route.setdefault("rules", [])
+
+        # 添加 rule_set 配置
+        rule_set.extend(adblock_rule_sets)
+
+        # 添加路由规则（广告拦截规则应该在较低优先级，排在 sniff/hijack-dns 和自定义规则之后）
+        # 但排在 final 之前
+        rules.extend(adblock_route_rules)
+
+        print(f"[render] 已添加 {len(adblock_rule_sets)} 个广告拦截 rule_set")
 
     # 确保路由规则中有 sniff 动作（放在最后以确保它在规则列表开头）
     ensure_sniff_action(config)

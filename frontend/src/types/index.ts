@@ -120,7 +120,7 @@ export interface TypeBreakdownItem {
 export interface DomainCategory {
   name: string;
   description: string;
-  group: "type" | "region";
+  group?: "type" | "region";  // Optional, legacy field
   recommended_exit: string;
   lists: DomainListSummary[];
   type_breakdown?: Record<string, TypeBreakdownItem>;
@@ -337,4 +337,43 @@ export interface BackupImportResponse {
     pia_credentials: boolean;
     custom_rules: boolean;
   };
+}
+
+// AdBlock Rule Sets
+export interface AdBlockRuleSet {
+  tag: string;
+  name: string;
+  description: string;
+  url: string;
+  format: "adblock" | "hosts" | "domains";
+  outbound: string;
+  enabled: number;
+  priority: number;
+  category: string;
+  region?: string;
+}
+
+export interface AdBlockRulesResponse {
+  rules: AdBlockRuleSet[];
+  by_category: Record<string, AdBlockRuleSet[]>;
+  total: number;
+  enabled_count: number;
+}
+
+export interface AdBlockRuleSetCreateRequest {
+  tag: string;
+  name: string;
+  url: string;
+  description?: string;
+  format?: string;
+  outbound?: string;
+  category?: string;
+  region?: string;
+  priority?: number;
+}
+
+export interface AdBlockToggleResponse {
+  message: string;
+  tag: string;
+  enabled: boolean;
 }

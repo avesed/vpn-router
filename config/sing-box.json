@@ -1,0 +1,31 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "direct-dns",
+        "address": "local"
+      }
+    ],
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "endpoints": [],
+  "route": {
+    "rules": [],
+    "rule_set": [],
+    "final": "direct"
+  }
+}

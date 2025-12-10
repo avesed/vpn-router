@@ -10,12 +10,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ==========================================
-# Stage 2: Extract sing-box Binary
-# ==========================================
-FROM ghcr.io/sagernet/sing-box:latest AS singbox-binary
-
-# ==========================================
-# Stage 3: Production Runtime
+# Stage 2: Production Runtime
 # ==========================================
 FROM debian:12-slim
 
@@ -47,7 +42,20 @@ RUN set -eux; \
     pip3 install --no-cache-dir --break-system-packages cryptography; \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=singbox-binary /usr/local/bin/sing-box /usr/local/bin/sing-box
+# Download sing-box from GitHub releases
+ARG SINGBOX_VERSION=1.11.0
+RUN set -eux; \
+    ARCH=$(dpkg --print-architecture); \
+    case "$ARCH" in \
+        amd64) SINGBOX_ARCH="amd64" ;; \
+        arm64) SINGBOX_ARCH="arm64" ;; \
+        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz" | \
+    tar -xzf - -C /tmp; \
+    mv /tmp/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}/sing-box /usr/local/bin/sing-box; \
+    chmod +x /usr/local/bin/sing-box; \
+    rm -rf /tmp/sing-box-*
 
 # Copy frontend build output
 COPY --from=frontend-builder /app/dist /var/www/html
@@ -72,16 +80,15 @@ COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY scripts/fetch-geodata.sh /usr/local/bin/fetch-geodata.sh
 COPY scripts/render_singbox.py /usr/local/bin/render_singbox.py
 COPY scripts/pia/pia_provision.py /usr/local/bin/pia_provision.py
-COPY scripts/setup-wg.sh /usr/local/bin/setup-wg.sh
 COPY scripts/api_server.py /usr/local/bin/api_server.py
 COPY scripts/db_helper.py /usr/local/bin/db_helper.py
 COPY scripts/init_user_db.py /usr/local/bin/init_user_db.py
-COPY scripts/get_wg_config.py /usr/local/bin/get_wg_config.py
+COPY scripts/convert_adblock.py /usr/local/bin/convert_adblock.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
-    /usr/local/bin/setup-wg.sh /usr/local/bin/api_server.py \
-    /usr/local/bin/init_user_db.py /usr/local/bin/get_wg_config.py
+    /usr/local/bin/api_server.py /usr/local/bin/init_user_db.py \
+    /usr/local/bin/convert_adblock.py
 
 # Note: Databases and config are mounted via docker-compose volumes
 # - geoip-geodata.db is pre-built and volume-mounted (49 MB, read-only)

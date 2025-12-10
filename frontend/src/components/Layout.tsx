@@ -6,6 +6,7 @@ import {
   CogIcon,
   LockClosedIcon,
   ShieldCheckIcon,
+  ShieldExclamationIcon,
   AdjustmentsHorizontalIcon,
   RectangleStackIcon,
   ChevronDownIcon,
@@ -49,7 +50,8 @@ const navGroups: NavGroup[] = [
     items: [
       { labelKey: "nav.egressLines", path: "/egress", icon: ServerIcon, descriptionKey: "nav.egressLinesDesc" },
       { labelKey: "nav.routeRules", path: "/rules", icon: AdjustmentsHorizontalIcon, descriptionKey: "nav.routeRulesDesc" },
-      { labelKey: "nav.ruleCatalog", path: "/domain-catalog", icon: RectangleStackIcon, descriptionKey: "nav.ruleCatalogDesc" }
+      { labelKey: "nav.ruleCatalog", path: "/domain-catalog", icon: RectangleStackIcon, descriptionKey: "nav.ruleCatalogDesc" },
+      { labelKey: "nav.adblock", path: "/adblock", icon: ShieldExclamationIcon, descriptionKey: "nav.adblockDesc" }
     ]
   },
   {
