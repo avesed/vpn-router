@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile } from "../types";
+import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress } from "../types";
 import {
   PlusIcon,
   TrashIcon,
@@ -19,16 +19,18 @@ import {
   XCircleIcon,
   ChevronUpDownIcon,
   MagnifyingGlassIcon,
-  KeyIcon
+  KeyIcon,
+  SignalIcon
 } from "@heroicons/react/24/outline";
 
-type TabType = "all" | "pia" | "custom";
+type TabType = "all" | "pia" | "custom" | "direct";
 type ImportMethod = "upload" | "paste" | "manual";
 
 export default function EgressManager() {
   const { t } = useTranslation();
   const [piaEgress, setPiaEgress] = useState<EgressItem[]>([]);
   const [customEgress, setCustomEgress] = useState<CustomEgress[]>([]);
+  const [directEgress, setDirectEgress] = useState<DirectEgress[]>([]);
   const [piaProfiles, setPiaProfiles] = useState<VpnProfile[]>([]);
   const [piaRegions, setPiaRegions] = useState<PiaRegion[]>([]);
   const [loading, setLoading] = useState(true);
@@ -81,18 +83,30 @@ export default function EgressManager() {
   const [loginLoading, setLoginLoading] = useState(false);
   const [pendingReconnectTag, setPendingReconnectTag] = useState<string | null>(null);
 
+  // Direct egress modal state
+  const [showDirectModal, setShowDirectModal] = useState(false);
+  const [directModalMode, setDirectModalMode] = useState<"add" | "edit">("add");
+  const [editingDirectEgress, setEditingDirectEgress] = useState<DirectEgress | null>(null);
+  const [directFormTag, setDirectFormTag] = useState("");
+  const [directFormDescription, setDirectFormDescription] = useState("");
+  const [directFormBindInterface, setDirectFormBindInterface] = useState("");
+  const [directFormInet4Address, setDirectFormInet4Address] = useState("");
+  const [directFormInet6Address, setDirectFormInet6Address] = useState("");
+
   const loadEgress = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const [allData, customData, profilesData] = await Promise.all([
+      const [allData, customData, profilesData, directData] = await Promise.all([
         api.getAllEgress(),
         api.getCustomEgress(),
-        api.getProfiles()
+        api.getProfiles(),
+        api.getDirectEgress()
       ]);
       setPiaEgress(allData.pia);
       setCustomEgress(customData.egress);
       setPiaProfiles(profilesData.profiles);
+      setDirectEgress(directData.egress);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
@@ -152,6 +166,15 @@ export default function EgressManager() {
     setRegionSearchQuery("");
   };
 
+  const resetDirectForm = () => {
+    setDirectFormTag("");
+    setDirectFormDescription("");
+    setDirectFormBindInterface("");
+    setDirectFormInet4Address("");
+    setDirectFormInet6Address("");
+    setEditingDirectEgress(null);
+  };
+
   // Close dropdown when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -193,11 +216,13 @@ export default function EgressManager() {
   };
 
   const handleCreatePiaProfile = async () => {
-    if (!piaFormTag || !piaFormDescription || !piaFormRegionId) return;
+    if (!piaFormTag || !piaFormRegionId) return;
 
     setActionLoading("create-pia");
     try {
-      await api.createProfile(piaFormTag, piaFormDescription, piaFormRegionId);
+      // Use tag as description if not provided
+      const description = piaFormDescription || piaFormTag;
+      await api.createProfile(piaFormTag, description, piaFormRegionId);
       setSuccessMessage(t('egress.piaLineAddSuccess'));
       setShowPiaModal(false);
       resetPiaForm();
@@ -433,11 +458,98 @@ export default function EgressManager() {
     }
   };
 
-  const filteredPia = activeTab === "custom" ? [] : piaProfiles;
-  const filteredCustom = activeTab === "pia" ? [] : customEgress;
-  const totalCount = piaProfiles.length + customEgress.length;
+  // ============ Direct Egress Management ============
 
-  if (loading && !piaProfiles.length && !customEgress.length) {
+  const handleAddDirectEgress = () => {
+    resetDirectForm();
+    setDirectModalMode("add");
+    setShowDirectModal(true);
+  };
+
+  const handleEditDirectEgress = (egress: DirectEgress) => {
+    setEditingDirectEgress(egress);
+    setDirectFormTag(egress.tag);
+    setDirectFormDescription(egress.description || "");
+    setDirectFormBindInterface(egress.bind_interface || "");
+    setDirectFormInet4Address(egress.inet4_bind_address || "");
+    setDirectFormInet6Address(egress.inet6_bind_address || "");
+    setDirectModalMode("edit");
+    setShowDirectModal(true);
+  };
+
+  const handleCreateDirectEgress = async () => {
+    if (!directFormTag) return;
+    if (!directFormBindInterface && !directFormInet4Address && !directFormInet6Address) {
+      setError(t('directEgress.bindRequiredError'));
+      return;
+    }
+
+    setActionLoading("create-direct");
+    try {
+      await api.createDirectEgress({
+        tag: directFormTag,
+        description: directFormDescription,
+        bind_interface: directFormBindInterface || undefined,
+        inet4_bind_address: directFormInet4Address || undefined,
+        inet6_bind_address: directFormInet6Address || undefined
+      });
+      setSuccessMessage(t('directEgress.createSuccess', { tag: directFormTag }));
+      setShowDirectModal(false);
+      resetDirectForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.createFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleUpdateDirectEgress = async () => {
+    if (!editingDirectEgress) return;
+
+    setActionLoading("update-direct");
+    try {
+      await api.updateDirectEgress(editingDirectEgress.tag, {
+        description: directFormDescription,
+        bind_interface: directFormBindInterface || undefined,
+        inet4_bind_address: directFormInet4Address || undefined,
+        inet6_bind_address: directFormInet6Address || undefined
+      });
+      setSuccessMessage(t('directEgress.updateSuccess', { tag: editingDirectEgress.tag }));
+      setShowDirectModal(false);
+      resetDirectForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.updateFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDeleteDirectEgress = async (tag: string) => {
+    if (!confirm(t('directEgress.confirmDelete', { tag }))) return;
+
+    setActionLoading(`delete-direct-${tag}`);
+    try {
+      await api.deleteDirectEgress(tag);
+      setSuccessMessage(t('directEgress.deleteSuccess', { tag }));
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.deleteFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const filteredPia = activeTab === "custom" || activeTab === "direct" ? [] : piaProfiles;
+  const filteredCustom = activeTab === "pia" || activeTab === "direct" ? [] : customEgress;
+  const filteredDirect = activeTab === "pia" || activeTab === "custom" ? [] : directEgress;
+  const totalCount = piaProfiles.length + customEgress.length + directEgress.length;
+
+  if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length) {
     return (
       <div className="flex items-center justify-center min-h-64">
         <div className="animate-spin rounded-full h-12 w-12 border-4 border-brand border-t-transparent" />
@@ -547,7 +659,8 @@ export default function EgressManager() {
         {[
           { key: "all", label: `${t('common.all')} (${totalCount})` },
           { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
-          { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` }
+          { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` },
+          { key: "direct", label: `Direct (${directEgress.length})` }
         ].map((tab) => (
           <button
             key={tab.key}
@@ -564,11 +677,11 @@ export default function EgressManager() {
       </div>
 
       {/* Egress List */}
-      {filteredPia.length === 0 && filteredCustom.length === 0 ? (
+      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 ? (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : t('egress.noEgressFound')}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "direct" ? t('directEgress.noDirectEgress') : t('egress.noEgressFound')}
           </p>
           {activeTab !== "all" && (
             <div className="mt-4">
@@ -586,6 +699,14 @@ export default function EgressManager() {
                   className="px-4 py-2 rounded-lg bg-brand text-white text-sm font-medium"
                 >
                   {t('egress.addCustomEgress')}
+                </button>
+              )}
+              {activeTab === "direct" && (
+                <button
+                  onClick={handleAddDirectEgress}
+                  className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-600 text-white text-sm font-medium"
+                >
+                  {t('directEgress.addDirectEgress')}
                 </button>
               )}
             </div>
@@ -763,6 +884,88 @@ export default function EgressManager() {
             </div>
           )}
 
+          {/* Direct Egress */}
+          {filteredDirect.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
+                  <SignalIcon className="h-4 w-4" />
+                  {t('directEgress.title')} ({filteredDirect.length})
+                </h3>
+                {activeTab === "direct" && (
+                  <button
+                    onClick={handleAddDirectEgress}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 text-xs font-medium transition-colors"
+                  >
+                    <PlusIcon className="h-3.5 w-3.5" />
+                    {t('directEgress.addEgress')}
+                  </button>
+                )}
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {filteredDirect.map((egress) => (
+                  <div
+                    key={egress.tag}
+                    className={`rounded-xl border p-4 ${egress.enabled ? "bg-cyan-500/5 border-cyan-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className={`p-2 rounded-lg ${egress.enabled ? "bg-cyan-500/20" : "bg-white/10"}`}>
+                          <SignalIcon className={`h-5 w-5 ${egress.enabled ? "text-cyan-400" : "text-slate-400"}`} />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-semibold text-white">{egress.tag}</h4>
+                            {egress.enabled ? (
+                              <CheckCircleIcon className="h-4 w-4 text-cyan-400" />
+                            ) : (
+                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                            )}
+                          </div>
+                          <p className="text-xs text-slate-500">{egress.description || t('directEgress.defaultDescription')}</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-1">
+                        <button
+                          onClick={() => handleEditDirectEgress(egress)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                          title={t('common.edit')}
+                        >
+                          <PencilIcon className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteDirectEgress(egress.tag)}
+                          disabled={actionLoading === `delete-direct-${egress.tag}`}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
+                          title={t('common.delete')}
+                        >
+                          <TrashIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                      {egress.bind_interface && (
+                        <p className="text-xs text-slate-400">
+                          <span className="text-slate-500">{t('directEgress.interface')}:</span> {egress.bind_interface}
+                        </p>
+                      )}
+                      {egress.inet4_bind_address && (
+                        <p className="text-xs font-mono text-slate-400">
+                          <span className="text-slate-500">IPv4:</span> {egress.inet4_bind_address}
+                        </p>
+                      )}
+                      {egress.inet6_bind_address && (
+                        <p className="text-xs font-mono text-slate-400">
+                          <span className="text-slate-500">IPv6:</span> {egress.inet6_bind_address}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
         </div>
       )}
 
@@ -806,15 +1009,16 @@ export default function EgressManager() {
 
               <div>
                 <label className="block text-sm font-medium text-slate-400 mb-2">
-                  {t('common.description')} <span className="text-red-400">*</span>
+                  {t('common.description')}
                 </label>
                 <input
                   type="text"
                   value={piaFormDescription}
                   onChange={(e) => setPiaFormDescription(e.target.value)}
-                  placeholder={t('egress.descriptionPlaceholder')}
+                  placeholder={piaFormTag || t('egress.descriptionPlaceholder')}
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
+                <p className="text-xs text-slate-500 mt-1">{t('egress.descriptionHint')}</p>
               </div>
 
               <div>
@@ -916,7 +1120,7 @@ export default function EgressManager() {
                 onClick={piaModalMode === "add" ? handleCreatePiaProfile : handleUpdatePiaProfile}
                 disabled={
                   (piaModalMode === "add" ? actionLoading === "create-pia" : actionLoading === "update-pia") ||
-                  (piaModalMode === "add" && (!piaFormTag || !piaFormDescription || !piaFormRegionId)) ||
+                  (piaModalMode === "add" && (!piaFormTag || !piaFormRegionId)) ||
                   (piaModalMode === "edit" && !piaFormRegionId)
                 }
                 className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
@@ -1324,6 +1528,134 @@ export default function EgressManager() {
                   <CheckIcon className="h-4 w-4" />
                 )}
                 {t('common.save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Direct Egress Modal */}
+      {showDirectModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
+          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg m-4">
+            <div className="p-6 border-b border-white/10">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold text-white">
+                  {directModalMode === "add" ? t('directEgress.addDirectEgress') : t('directEgress.editTitle', { tag: editingDirectEgress?.tag })}
+                </h2>
+                <button
+                  onClick={() => {
+                    setShowDirectModal(false);
+                    resetDirectForm();
+                  }}
+                  className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                >
+                  <XMarkIcon className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 space-y-4">
+              {directModalMode === "add" && (
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('directEgress.tag')} <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={directFormTag}
+                    onChange={(e) => setDirectFormTag(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))}
+                    placeholder={t('directEgress.tagPlaceholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                  />
+                  <p className="text-xs text-slate-500 mt-1">{t('directEgress.tagHint')}</p>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t('common.description')}
+                </label>
+                <input
+                  type="text"
+                  value={directFormDescription}
+                  onChange={(e) => setDirectFormDescription(e.target.value)}
+                  placeholder={t('directEgress.descriptionPlaceholder')}
+                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                />
+              </div>
+
+              <div className="rounded-lg bg-cyan-500/10 border border-cyan-500/20 p-3 mb-4">
+                <p className="text-xs text-cyan-300">{t('directEgress.bindHint')}</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t('directEgress.bindInterface')}
+                </label>
+                <input
+                  type="text"
+                  value={directFormBindInterface}
+                  onChange={(e) => setDirectFormBindInterface(e.target.value)}
+                  placeholder={t('directEgress.bindInterfacePlaceholder')}
+                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t('directEgress.inet4BindAddress')}
+                </label>
+                <input
+                  type="text"
+                  value={directFormInet4Address}
+                  onChange={(e) => setDirectFormInet4Address(e.target.value)}
+                  placeholder={t('directEgress.inet4Placeholder')}
+                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t('directEgress.inet6BindAddress')}
+                </label>
+                <input
+                  type="text"
+                  value={directFormInet6Address}
+                  onChange={(e) => setDirectFormInet6Address(e.target.value)}
+                  placeholder={t('directEgress.inet6Placeholder')}
+                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono"
+                />
+              </div>
+            </div>
+
+            <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowDirectModal(false);
+                  resetDirectForm();
+                }}
+                className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={directModalMode === "add" ? handleCreateDirectEgress : handleUpdateDirectEgress}
+                disabled={
+                  (directModalMode === "add" ? actionLoading === "create-direct" : actionLoading === "update-direct") ||
+                  (directModalMode === "add" && !directFormTag) ||
+                  (!directFormBindInterface && !directFormInet4Address && !directFormInet6Address)
+                }
+                className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+              >
+                {(actionLoading === "create-direct" || actionLoading === "update-direct") ? (
+                  <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                ) : directModalMode === "add" ? (
+                  <PlusIcon className="h-4 w-4" />
+                ) : (
+                  <CheckIcon className="h-4 w-4" />
+                )}
+                {directModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
           </div>

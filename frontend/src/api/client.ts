@@ -31,7 +31,11 @@ import type {
   AdBlockRulesResponse,
   AdBlockRuleSet,
   AdBlockRuleSetCreateRequest,
-  AdBlockToggleResponse
+  AdBlockToggleResponse,
+  DirectEgress,
+  DirectEgressCreateRequest,
+  DirectEgressUpdateRequest,
+  DirectEgressListResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -201,6 +205,23 @@ export const api = {
       method: "POST",
       body: { content }
     }),
+
+  // Direct Egress Management (绑定特定接口/IP)
+  getDirectEgress: () => request<DirectEgressListResponse>("/egress/direct"),
+  getDirectEgressByTag: (tag: string) =>
+    request<DirectEgress>(`/egress/direct/${encodeURIComponent(tag)}`),
+  createDirectEgress: (data: DirectEgressCreateRequest) =>
+    request<{ message: string; tag: string }>("/egress/direct", {
+      method: "POST",
+      body: data
+    }),
+  updateDirectEgress: (tag: string, data: DirectEgressUpdateRequest) =>
+    request<{ message: string }>(`/egress/direct/${encodeURIComponent(tag)}`, {
+      method: "PUT",
+      body: data
+    }),
+  deleteDirectEgress: (tag: string) =>
+    request<{ message: string }>(`/egress/direct/${encodeURIComponent(tag)}`, { method: "DELETE" }),
 
   // Backup / Restore
   getBackupStatus: () => request<BackupStatus>("/backup/status"),

@@ -125,6 +125,20 @@ CREATE TABLE IF NOT EXISTS custom_egress (
 );
 CREATE INDEX IF NOT EXISTS idx_custom_egress_tag ON custom_egress(tag);
 
+-- Direct 出口表（绑定特定接口/IP 的直连出口）
+CREATE TABLE IF NOT EXISTS direct_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    bind_interface TEXT,              -- 绑定的网络接口 (eth0, eth1, macvlan0, etc.)
+    inet4_bind_address TEXT,          -- 绑定的 IPv4 地址
+    inet6_bind_address TEXT,          -- 绑定的 IPv6 地址
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_direct_egress_tag ON direct_egress(tag);
+
 -- 远程规则集表（广告拦截等）
 CREATE TABLE IF NOT EXISTS remote_rule_sets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -388,6 +402,8 @@ def main():
         "wireguard_server": cursor.execute("SELECT COUNT(*) FROM wireguard_server").fetchone()[0],
         "wireguard_peers": cursor.execute("SELECT COUNT(*) FROM wireguard_peers").fetchone()[0],
         "pia_profiles": cursor.execute("SELECT COUNT(*) FROM pia_profiles").fetchone()[0],
+        "custom_egress": cursor.execute("SELECT COUNT(*) FROM custom_egress").fetchone()[0],
+        "direct_egress": cursor.execute("SELECT COUNT(*) FROM direct_egress").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
     }
 
@@ -402,6 +418,8 @@ def main():
     print(f"WireGuard 服务器: {stats['wireguard_server']:,}")
     print(f"WireGuard 客户端: {stats['wireguard_peers']:,}")
     print(f"PIA Profiles:     {stats['pia_profiles']:,}")
+    print(f"自定义 WG 出口:   {stats['custom_egress']:,}")
+    print(f"Direct 出口:      {stats['direct_egress']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

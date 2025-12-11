@@ -273,15 +273,54 @@ export interface CustomEgressCreateRequest {
 export interface EgressItem {
   tag: string;
   description: string;
-  type: "pia" | "custom";
+  type: "pia" | "custom" | "direct";
   server?: string;
   port?: number;
   is_configured: boolean;
+  // Direct egress specific fields
+  bind_interface?: string;
+  inet4_bind_address?: string;
+  inet6_bind_address?: string;
+  enabled?: number;
 }
 
 export interface AllEgressResponse {
   pia: EgressItem[];
   custom: EgressItem[];
+  direct: EgressItem[];
+}
+
+// Direct Egress (绑定特定接口/IP 的直连出口)
+export interface DirectEgress {
+  id?: number;
+  tag: string;
+  description: string;
+  bind_interface?: string;
+  inet4_bind_address?: string;
+  inet6_bind_address?: string;
+  enabled: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface DirectEgressCreateRequest {
+  tag: string;
+  description?: string;
+  bind_interface?: string;
+  inet4_bind_address?: string;
+  inet6_bind_address?: string;
+}
+
+export interface DirectEgressUpdateRequest {
+  description?: string;
+  bind_interface?: string;
+  inet4_bind_address?: string;
+  inet6_bind_address?: string;
+  enabled?: number;
+}
+
+export interface DirectEgressListResponse {
+  egress: DirectEgress[];
 }
 
 export interface CustomEgressListResponse {

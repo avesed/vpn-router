@@ -924,6 +924,80 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ Direct Egress 管理（多 direct 出口）============
+
+    def get_direct_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 direct 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM direct_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM direct_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_direct_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 direct 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM direct_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_direct_egress(self, tag: str, description: str = "",
+                          bind_interface: Optional[str] = None,
+                          inet4_bind_address: Optional[str] = None,
+                          inet6_bind_address: Optional[str] = None) -> int:
+        """添加 direct 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO direct_egress
+                (tag, description, bind_interface, inet4_bind_address, inet6_bind_address)
+                VALUES (?, ?, ?, ?, ?)
+            """, (tag, description, bind_interface, inet4_bind_address, inet6_bind_address))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_direct_egress(self, tag: str, **kwargs) -> bool:
+        """更新 direct 出口"""
+        allowed_fields = {"description", "bind_interface", "inet4_bind_address",
+                          "inet6_bind_address", "enabled"}
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE direct_egress SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_direct_egress(self, tag: str) -> bool:
+        """删除 direct 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM direct_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
@@ -1111,6 +1185,26 @@ class DatabaseManager:
 
     def delete_remote_rule_set(self, tag: str) -> bool:
         return self.user.delete_remote_rule_set(tag)
+
+    # Direct Egress
+    def get_direct_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_direct_egress_list(enabled_only)
+
+    def get_direct_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_direct_egress(tag)
+
+    def add_direct_egress(self, tag: str, description: str = "",
+                          bind_interface: Optional[str] = None,
+                          inet4_bind_address: Optional[str] = None,
+                          inet6_bind_address: Optional[str] = None) -> int:
+        return self.user.add_direct_egress(tag, description, bind_interface,
+                                           inet4_bind_address, inet6_bind_address)
+
+    def update_direct_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_direct_egress(tag, **kwargs)
+
+    def delete_direct_egress(self, tag: str) -> bool:
+        return self.user.delete_direct_egress(tag)
 
 
 # 全局缓存

@@ -189,6 +189,24 @@ class CustomEgressUpdateRequest(BaseModel):
     reserved: Optional[List[int]] = None
 
 
+class DirectEgressCreateRequest(BaseModel):
+    """创建 Direct 出口（绑定特定接口/IP）"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符，如 direct-eth1")
+    description: str = Field("", description="描述")
+    bind_interface: Optional[str] = Field(None, description="绑定的网络接口，如 eth1, macvlan0")
+    inet4_bind_address: Optional[str] = Field(None, description="绑定的 IPv4 地址")
+    inet6_bind_address: Optional[str] = Field(None, description="绑定的 IPv6 地址")
+
+
+class DirectEgressUpdateRequest(BaseModel):
+    """更新 Direct 出口"""
+    description: Optional[str] = None
+    bind_interface: Optional[str] = None
+    inet4_bind_address: Optional[str] = None
+    inet6_bind_address: Optional[str] = None
+    enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
 class WireGuardConfParseRequest(BaseModel):
     """解析 WireGuard .conf 文件内容"""
     content: str = Field(..., description=".conf 文件内容")
@@ -1012,15 +1030,21 @@ def api_get_rules():
             db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
             default_outbound = db.get_setting("default_outbound", "direct")
 
-            # 从数据库读取 PIA profiles
+            # 从数据库读取 PIA profiles (PIA uses 'name' as tag)
             pia_profiles = db.get_pia_profiles(enabled_only=False)
             for profile in pia_profiles:
-                if profile.get("tag") and profile["tag"] not in available_outbounds:
-                    available_outbounds.append(profile["tag"])
+                if profile.get("name") and profile["name"] not in available_outbounds:
+                    available_outbounds.append(profile["name"])
 
             # 从数据库读取自定义出口
-            custom_egress = db.get_custom_egress()
+            custom_egress = db.get_custom_egress_list()
             for egress in custom_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+
+            # 从数据库读取 direct 出口
+            direct_egress = db.get_direct_egress_list(enabled_only=True)
+            for egress in direct_egress:
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
         except Exception:
@@ -2116,9 +2140,10 @@ def api_update_settings(payload: SettingsUpdateRequest):
 
 @app.get("/api/egress")
 def api_list_all_egress():
-    """列出所有出口（PIA + 自定义）"""
+    """列出所有出口（PIA + 自定义 + Direct）"""
     pia_result = []
     custom_result = []
+    direct_result = []
 
     # 从数据库获取 PIA profiles
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -2149,7 +2174,21 @@ def api_list_all_egress():
             "is_configured": True,
         })
 
-    return {"pia": pia_result, "custom": custom_result}
+    # 获取 direct 出口
+    direct_egress = db.get_direct_egress_list()
+    for eg in direct_egress:
+        direct_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "direct",
+            "description": eg.get("description", ""),
+            "bind_interface": eg.get("bind_interface"),
+            "inet4_bind_address": eg.get("inet4_bind_address"),
+            "inet6_bind_address": eg.get("inet6_bind_address"),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,  # direct 出口总是已配置
+        })
+
+    return {"pia": pia_result, "custom": custom_result, "direct": direct_result}
 
 
 @app.get("/api/egress/custom")
@@ -2315,6 +2354,137 @@ def api_delete_custom_egress(tag: str):
         reload_status = f"，重载失败: {exc}"
 
     return {"message": f"出口 '{tag}' 已删除{reload_status}"}
+
+
+# ============ Direct Egress APIs ============
+
+@app.get("/api/egress/direct")
+def api_list_direct_egress():
+    """列出所有 direct 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress_list = db.get_direct_egress_list(enabled_only=False)
+    return {"egress": egress_list}
+
+
+@app.get("/api/egress/direct/{tag}")
+def api_get_direct_egress(tag: str):
+    """获取单个 direct 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_direct_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"Direct 出口 '{tag}' 不存在")
+    return egress
+
+
+@app.post("/api/egress/direct")
+def api_create_direct_egress(payload: DirectEgressCreateRequest):
+    """创建 direct 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 不允许使用保留名称
+    if payload.tag == "direct":
+        raise HTTPException(status_code=400, detail="'direct' 是保留名称，请使用其他名称")
+
+    # 检查 tag 是否已存在
+    if db.get_direct_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Direct 出口 '{payload.tag}' 已存在")
+
+    # 检查是否与其他出口冲突
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与自定义 WireGuard 出口冲突")
+
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
+    pia_tags = {p.get("name", "").replace("_", "-") for p in pia_profiles}
+    if payload.tag in pia_tags:
+        raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 PIA 线路冲突")
+
+    # 至少需要绑定接口或地址之一
+    if not payload.bind_interface and not payload.inet4_bind_address and not payload.inet6_bind_address:
+        raise HTTPException(status_code=400, detail="至少需要指定 bind_interface、inet4_bind_address 或 inet6_bind_address 之一")
+
+    # 添加到数据库
+    db.add_direct_egress(
+        tag=payload.tag,
+        description=payload.description,
+        bind_interface=payload.bind_interface,
+        inet4_bind_address=payload.inet4_bind_address,
+        inet6_bind_address=payload.inet6_bind_address,
+    )
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "，已重载配置"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {
+        "message": f"Direct 出口 '{payload.tag}' 已创建{reload_status}",
+        "tag": payload.tag,
+    }
+
+
+@app.put("/api/egress/direct/{tag}")
+def api_update_direct_egress(tag: str, payload: DirectEgressUpdateRequest):
+    """更新 direct 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    if not db.get_direct_egress(tag):
+        raise HTTPException(status_code=404, detail=f"Direct 出口 '{tag}' 不存在")
+
+    # 构建更新字段
+    updates = {}
+    if payload.description is not None:
+        updates["description"] = payload.description
+    if payload.bind_interface is not None:
+        updates["bind_interface"] = payload.bind_interface
+    if payload.inet4_bind_address is not None:
+        updates["inet4_bind_address"] = payload.inet4_bind_address
+    if payload.inet6_bind_address is not None:
+        updates["inet6_bind_address"] = payload.inet6_bind_address
+    if payload.enabled is not None:
+        updates["enabled"] = payload.enabled
+
+    if updates:
+        db.update_direct_egress(tag, **updates)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "，已重载配置"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {"message": f"Direct 出口 '{tag}' 已更新{reload_status}"}
+
+
+@app.delete("/api/egress/direct/{tag}")
+def api_delete_direct_egress(tag: str):
+    """删除 direct 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    if not db.get_direct_egress(tag):
+        raise HTTPException(status_code=404, detail=f"Direct 出口 '{tag}' 不存在")
+
+    # 删除
+    db.delete_direct_egress(tag)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "，已重载配置"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {"message": f"Direct 出口 '{tag}' 已删除{reload_status}"}
 
 
 # ============ Adblock Rule Sets APIs ============

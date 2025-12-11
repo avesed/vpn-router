@@ -354,6 +354,73 @@ def load_custom_egress() -> List[dict]:
         return []
 
 
+def load_direct_egress() -> List[dict]:
+    """从数据库加载 direct 出口配置（绑定特定接口/IP）"""
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress_list = db.get_direct_egress_list(enabled_only=True)
+        return egress_list
+    except Exception as e:
+        print(f"[render] 从数据库加载 direct 出口配置失败: {e}")
+        return []
+
+
+def ensure_direct_egress_outbounds(config: dict, direct_egress: List[dict]) -> List[str]:
+    """确保每个 direct 出口都有对应的 outbound
+
+    Args:
+        config: sing-box 配置
+        direct_egress: direct 出口列表
+
+    Returns:
+        所有 direct 出口的 tag 列表（不含默认 'direct'）
+    """
+    if not direct_egress:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    direct_tags = []
+
+    for egress in direct_egress:
+        tag = egress.get("tag")
+        if not tag or tag == "direct":
+            # 不允许覆盖默认 direct
+            continue
+
+        direct_tags.append(tag)
+
+        # 构建 direct outbound
+        outbound = {
+            "type": "direct",
+            "tag": tag
+        }
+
+        # 添加绑定配置
+        if egress.get("bind_interface"):
+            outbound["bind_interface"] = egress["bind_interface"]
+        if egress.get("inet4_bind_address"):
+            outbound["inet4_bind_address"] = egress["inet4_bind_address"]
+        if egress.get("inet6_bind_address"):
+            outbound["inet6_bind_address"] = egress["inet6_bind_address"]
+
+        if tag in existing_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag and ob.get("type") == "direct":
+                    outbounds[i] = outbound
+                    break
+        else:
+            # 在 block 之前插入（保持 direct, direct-xxx, block 的顺序）
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+            print(f"[render] 创建 direct 出口: {tag}")
+
+    return direct_tags
+
+
 def _create_custom_egress_endpoint(egress: dict, index: int) -> dict:
     """为自定义出口创建 WireGuard endpoint"""
     address = egress.get("address", "")
@@ -747,6 +814,13 @@ def main() -> None:
         custom_tags = ensure_custom_egress_endpoints(config, custom_egress)
         ensure_custom_dns_servers(config, custom_tags)
         all_egress_tags.extend(custom_tags)
+
+    # 加载并处理 direct 出口（绑定特定接口/IP）
+    direct_egress = load_direct_egress()
+    if direct_egress:
+        print(f"[render] 处理 {len(direct_egress)} 个 direct 出口")
+        direct_tags = ensure_direct_egress_outbounds(config, direct_egress)
+        all_egress_tags.extend(direct_tags)
 
     # 清理不再存在于数据库中的旧端点
     cleanup_stale_endpoints(config, all_egress_tags)
