@@ -80,6 +80,21 @@ CONFIG_LOCK = threading.Lock()
 # 缓存 PIA 地区列表（有效期 1 小时）
 _pia_regions_cache: Dict[str, Any] = {"data": None, "timestamp": 0}
 
+# ============ 流量统计 ============
+# 累计流量统计（按出口分组）
+_traffic_stats: Dict[str, Dict[str, int]] = {}  # {outbound: {download: int, upload: int}}
+# 已知连接的流量快照（用于计算增量）
+_known_connections: Dict[str, Dict[str, int]] = {}  # {conn_id: {download: int, upload: int, outbound: str}}
+# 上一次的流量快照（用于计算速率）
+_prev_traffic_stats: Dict[str, Dict[str, int]] = {}
+# 当前速率（bytes/s）
+_traffic_rates: Dict[str, Dict[str, float]] = {}  # {outbound: {download_rate: float, upload_rate: float}}
+# 速率历史记录（保留24小时）
+_rate_history: List[Dict[str, Any]] = []  # [{timestamp: int, rates: {outbound: rate_kb}}]
+_traffic_stats_lock = threading.Lock()
+_RATE_INTERVAL = 5  # 速率计算间隔（秒）
+_MAX_HISTORY_SECONDS = 24 * 60 * 60  # 保留24小时历史
+
 
 class WireGuardPeerModel(BaseModel):
     address: str
@@ -332,10 +347,136 @@ def load_catalogs():
             _GEOIP_CATALOG = {"countries": []}
 
 
+def _get_all_outbounds() -> List[str]:
+    """获取所有配置的出口（用于图表显示）"""
+    outbounds = ["direct"]  # 始终包含 direct
+
+    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+            # PIA profiles
+            for profile in db.get_pia_profiles(enabled_only=False):
+                tag = profile.get("name")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+
+            # Custom WireGuard egress
+            for egress in db.get_custom_egress_list():
+                tag = egress.get("tag")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+
+            # Direct egress (bound to interface/IP)
+            for egress in db.get_direct_egress_list(enabled_only=True):
+                tag = egress.get("tag")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+        except Exception:
+            pass
+
+    return outbounds
+
+
+def _update_traffic_stats():
+    """后台线程：定期更新累计流量统计和实时速率"""
+    import urllib.request
+    global _traffic_stats, _known_connections, _prev_traffic_stats, _traffic_rates, _rate_history
+
+    while True:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=2) as resp:
+                data = json.loads(resp.read().decode())
+
+            connections = data.get("connections", [])
+            current_conn_ids = set()
+
+            with _traffic_stats_lock:
+                for conn in connections:
+                    conn_id = conn.get("id", "")
+                    if not conn_id:
+                        continue
+
+                    current_conn_ids.add(conn_id)
+                    download = conn.get("download", 0)
+                    upload = conn.get("upload", 0)
+                    chains = conn.get("chains", [])
+                    outbound = chains[-1] if chains else "unknown"
+
+                    # 初始化出口统计
+                    if outbound not in _traffic_stats:
+                        _traffic_stats[outbound] = {"download": 0, "upload": 0}
+
+                    if conn_id in _known_connections:
+                        # 已知连接：计算增量
+                        prev = _known_connections[conn_id]
+                        dl_delta = download - prev["download"]
+                        ul_delta = upload - prev["upload"]
+                        if dl_delta > 0:
+                            _traffic_stats[outbound]["download"] += dl_delta
+                        if ul_delta > 0:
+                            _traffic_stats[outbound]["upload"] += ul_delta
+                    else:
+                        # 新连接：累加全部流量
+                        _traffic_stats[outbound]["download"] += download
+                        _traffic_stats[outbound]["upload"] += upload
+
+                    # 更新快照
+                    _known_connections[conn_id] = {
+                        "download": download,
+                        "upload": upload,
+                        "outbound": outbound
+                    }
+
+                # 清理已关闭的连接
+                closed_ids = set(_known_connections.keys()) - current_conn_ids
+                for conn_id in closed_ids:
+                    del _known_connections[conn_id]
+
+                # 计算速率（bytes/s）
+                for outbound, stats in _traffic_stats.items():
+                    prev = _prev_traffic_stats.get(outbound, {"download": 0, "upload": 0})
+                    dl_rate = (stats["download"] - prev["download"]) / _RATE_INTERVAL
+                    ul_rate = (stats["upload"] - prev["upload"]) / _RATE_INTERVAL
+                    _traffic_rates[outbound] = {
+                        "download_rate": max(0, dl_rate),
+                        "upload_rate": max(0, ul_rate)
+                    }
+
+                # 保存当前流量作为下次计算的基准
+                _prev_traffic_stats = {k: dict(v) for k, v in _traffic_stats.items()}
+
+                # 记录速率历史（KB/s）- 包含所有配置的出口
+                now = int(time.time())
+                history_point = {"timestamp": now, "rates": {}}
+                all_outbounds = _get_all_outbounds()
+                for outbound in all_outbounds:
+                    if outbound in _traffic_rates:
+                        rates = _traffic_rates[outbound]
+                        total_rate = (rates["download_rate"] + rates["upload_rate"]) / 1024
+                        history_point["rates"][outbound] = round(total_rate, 1)
+                    else:
+                        history_point["rates"][outbound] = 0.0
+                _rate_history.append(history_point)
+
+                # 清理24小时前的历史数据
+                cutoff = now - _MAX_HISTORY_SECONDS
+                _rate_history[:] = [p for p in _rate_history if p["timestamp"] > cutoff]
+
+        except Exception:
+            pass
+
+        time.sleep(_RATE_INTERVAL)
+
+
 @app.on_event("startup")
 async def startup_event():
     """应用启动时加载数据"""
     load_catalogs()
+    # 启动流量统计后台线程
+    traffic_thread = threading.Thread(target=_update_traffic_stats, daemon=True)
+    traffic_thread.start()
+    print("[Traffic] 流量统计后台线程已启动")
 
 
 def load_json_config() -> dict:
@@ -704,6 +845,88 @@ def api_status():
         "config_mtime": config_stat.st_mtime if config_stat else None,
         "pia_profiles": pia_profiles,
     }
+
+
+@app.get("/api/stats/dashboard")
+def api_stats_dashboard():
+    """获取 Dashboard 可视化统计数据
+
+    返回：
+    - online_clients: 在线客户端数量（有活跃连接的 WireGuard peer）
+    - total_clients: 总客户端数量（所有配置的 WireGuard peer）
+    - traffic_by_outbound: 按出口分组的流量 {tag: {download, upload}}
+    - adblock_connections: 匹配广告拦截规则的连接数
+    - active_connections: 总活跃连接数
+    """
+    import urllib.request
+
+    # 初始化返回数据
+    stats = {
+        "online_clients": 0,
+        "total_clients": 0,
+        "traffic_by_outbound": {},
+        "adblock_connections": 0,
+        "active_connections": 0,
+    }
+
+    # 获取总客户端数量（从数据库）
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        peers = db.get_wireguard_peers()
+        stats["total_clients"] = len(peers) if peers else 0
+    except Exception:
+        pass
+
+    # 从 clash_api 获取活跃连接数和在线客户端
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=2) as resp:
+            data = json.loads(resp.read().decode())
+
+        connections = data.get("connections", [])
+        stats["active_connections"] = len(connections)
+
+        # 统计在线客户端（WireGuard 网段的唯一 IP）
+        online_ips = set()
+        for conn in connections:
+            metadata = conn.get("metadata", {})
+            src_ip = metadata.get("sourceIP", "")
+            if src_ip.startswith("10.23.0."):
+                online_ips.add(src_ip)
+
+        stats["online_clients"] = len(online_ips)
+
+    except Exception as e:
+        # clash_api 不可用时返回空数据
+        pass
+
+    # 使用累计流量统计和实时速率（由后台线程更新）
+    # 包含所有配置的出口，没有流量的显示为 0
+    all_outbounds = _get_all_outbounds()
+    with _traffic_stats_lock:
+        stats["traffic_by_outbound"] = {k: dict(v) for k, v in _traffic_stats.items()}
+        # 确保所有出口都有速率数据
+        traffic_rates = {}
+        for outbound in all_outbounds:
+            if outbound in _traffic_rates:
+                traffic_rates[outbound] = dict(_traffic_rates[outbound])
+            else:
+                traffic_rates[outbound] = {"download_rate": 0.0, "upload_rate": 0.0}
+        stats["traffic_rates"] = traffic_rates
+        stats["rate_history"] = list(_rate_history)  # 24小时速率历史
+
+    # 从 sing-box 日志文件统计广告拦截
+    # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
+    try:
+        log_file = Path("/var/log/sing-box.log")
+        if log_file.exists():
+            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "outbound/block[adblock]: blocked connection" in line:
+                        stats["adblock_connections"] += 1
+    except Exception:
+        pass
+
+    return stats
 
 
 @app.get("/api/endpoints")

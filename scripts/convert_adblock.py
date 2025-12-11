@@ -32,8 +32,9 @@ def parse_adblock_rule(line: str) -> Optional[str]:
     if line.startswith('@@'):
         return None
 
-    # 匹配 ||domain^ 格式 (可能带参数如 $third-party)
-    match = re.match(r'^\|\|([a-zA-Z0-9][\w\-\.]*\.[a-zA-Z]{2,})\^?', line)
+    # 只匹配 ||domain^ 格式 (必须以^结尾，表示域名边界)
+    # 忽略带路径的规则如 ||youtube.com/pagead/
+    match = re.match(r'^\|\|([a-zA-Z0-9][\w\-\.]*\.[a-zA-Z]{2,})\^(\$|$)', line)
     if match:
         domain = match.group(1).lower()
         if is_valid_domain(domain):

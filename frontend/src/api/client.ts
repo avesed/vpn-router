@@ -35,7 +35,8 @@ import type {
   DirectEgress,
   DirectEgressCreateRequest,
   DirectEgressUpdateRequest,
-  DirectEgressListResponse
+  DirectEgressListResponse,
+  DashboardStats
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -66,6 +67,7 @@ async function request<T>(path: string, options: { method?: HttpMethod; body?: u
 export const api = {
   // Status
   getStatus: () => request<GatewayStatus>("/status"),
+  getDashboardStats: () => request<DashboardStats>("/stats/dashboard"),
   getEndpoints: () => request<{ endpoints: Endpoint[] }>("/endpoints"),
   updateEndpoint: (tag: string, payload: Partial<Endpoint>) =>
     request(`/endpoints/${tag}`, { method: "PUT", body: payload }),

@@ -416,3 +416,19 @@ export interface AdBlockToggleResponse {
   tag: string;
   enabled: boolean;
 }
+
+// Dashboard Stats
+export interface RateHistoryPoint {
+  timestamp: number;
+  rates: Record<string, number>;  // {outbound: rate_kb}
+}
+
+export interface DashboardStats {
+  online_clients: number;
+  total_clients: number;
+  traffic_by_outbound: Record<string, { download: number; upload: number }>;
+  traffic_rates: Record<string, { download_rate: number; upload_rate: number }>;
+  rate_history: RateHistoryPoint[];  // 24小时速率历史
+  adblock_connections: number;
+  active_connections: number;
+}

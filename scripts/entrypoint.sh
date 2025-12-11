@@ -46,6 +46,13 @@ if [ ! -f "${BASE_CONFIG_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/sing-box.json" 
   cp "${DEFAULT_CONFIG_DIR}/sing-box.json" "${BASE_CONFIG_PATH}"
 fi
 
+# 初始化 domain catalog 文件（规则库）
+DOMAIN_CATALOG="${RULESET_DIR}/domain-catalog.json"
+if [ ! -f "${DOMAIN_CATALOG}" ] && [ -f "${DEFAULT_CONFIG_DIR}/domain-catalog.json" ]; then
+  echo "[entrypoint] initializing domain catalog from default config"
+  cp "${DEFAULT_CONFIG_DIR}/domain-catalog.json" "${DOMAIN_CATALOG}"
+fi
+
 if [ ! -f "${BASE_CONFIG_PATH}" ]; then
   echo "[entrypoint] config ${BASE_CONFIG_PATH} not found" >&2
   exit 1

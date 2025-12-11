@@ -1,6 +1,8 @@
 {
   "log": {
-    "level": "info"
+    "level": "info",
+    "output": "/var/log/sing-box.log",
+    "timestamp": true
   },
   "dns": {
     "servers": [
@@ -20,6 +22,10 @@
     {
       "type": "block",
       "tag": "block"
+    },
+    {
+      "type": "block",
+      "tag": "adblock"
     }
   ],
   "endpoints": [],

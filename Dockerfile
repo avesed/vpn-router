@@ -71,9 +71,10 @@ RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default &&
 COPY config /etc/sing-box/
 
 # Copy default config to a separate location (not affected by volume mount)
-# This allows first-run initialization of geodata database
+# This allows first-run initialization of geodata database and catalogs
 COPY config/geoip-geodata.db /opt/default-config/geoip-geodata.db
 COPY config/sing-box.json /opt/default-config/sing-box.json
+COPY config/domain-catalog.json /opt/default-config/domain-catalog.json
 
 RUN mkdir -p /opt/pia/ca
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh

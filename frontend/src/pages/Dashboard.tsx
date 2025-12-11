@@ -1,33 +1,63 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import StatsCard from "../components/StatsCard";
 import { api } from "../api/client";
-import type { GatewayStatus } from "../types";
+import type { GatewayStatus, DashboardStats } from "../types";
 import {
   ServerIcon,
   ShieldCheckIcon,
-  ClockIcon,
-  SignalIcon,
   GlobeAltIcon,
-  CpuChipIcon
+  UsersIcon,
+  BoltIcon,
+  ShieldExclamationIcon
 } from "@heroicons/react/24/outline";
+import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip, LineChart, Line, XAxis, YAxis } from "recharts";
+
+// 图表显示的最大数据点数
+const MAX_DISPLAY_POINTS = 60;
+
+// 出口流量饼图颜色
+const CHART_COLORS = [
+  "#3b82f6", // blue
+  "#10b981", // emerald
+  "#f59e0b", // amber
+  "#ef4444", // red
+  "#8b5cf6", // violet
+  "#ec4899", // pink
+  "#06b6d4", // cyan
+  "#84cc16", // lime
+  "#f97316", // orange
+  "#6366f1", // indigo
+];
+
+// 格式化流量
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
 
 export default function Dashboard() {
   const { t, i18n } = useTranslation();
   const [status, setStatus] = useState<GatewayStatus | null>(null);
+  const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
 
   useEffect(() => {
     let mounted = true;
-    const fetchStatus = async () => {
+    const fetchData = async () => {
       try {
-        const data = await api.getStatus();
+        const [statusData, statsData] = await Promise.all([
+          api.getStatus(),
+          api.getDashboardStats()
+        ]);
         if (mounted) {
-          setStatus(data);
+          setStatus(statusData);
+          setDashboardStats(statsData);
           setError(null);
-          setLastUpdate(new Date());
         }
       } catch (err: any) {
         if (mounted) {
@@ -37,23 +67,43 @@ export default function Dashboard() {
         if (mounted) setLoading(false);
       }
     };
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 15000);
+    fetchData();
+    const interval = setInterval(fetchData, 5000); // 每 5 秒更新一次
     return () => {
       mounted = false;
       clearInterval(interval);
     };
   }, []);
 
-  const formatUptime = (timestamp: string) => {
-    const date = new Date(timestamp);
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const minutes = Math.floor(diff / 60000);
-    const hours = Math.floor(minutes / 60);
-    if (hours > 0) return `${hours}${t('dashboard.hours')}${minutes % 60}${t('dashboard.minutes')}`;
-    return `${minutes}${t('dashboard.minutes')}`;
-  };
+  // 从后端历史数据转换为图表格式（取最近 N 个点）
+  const { rateHistory, outbounds } = useMemo(() => {
+    if (!dashboardStats?.rate_history?.length) {
+      return { rateHistory: [], outbounds: [] };
+    }
+
+    // 取最近 N 个点用于显示
+    const recentHistory = dashboardStats.rate_history.slice(-MAX_DISPLAY_POINTS);
+
+    // 收集所有出口名称
+    const outboundSet = new Set<string>();
+    recentHistory.forEach(point => {
+      Object.keys(point.rates).forEach(name => outboundSet.add(name));
+    });
+    const outbounds = Array.from(outboundSet);
+
+    // 转换为图表数据格式
+    const rateHistory = recentHistory.map(point => {
+      const date = new Date(point.timestamp * 1000);
+      const timeStr = date.toLocaleTimeString('en-US', { hour12: false, minute: '2-digit', second: '2-digit' });
+      const chartPoint: Record<string, number | string> = { time: timeStr };
+      for (const [outbound, rate] of Object.entries(point.rates)) {
+        chartPoint[outbound] = rate;
+      }
+      return chartPoint;
+    });
+
+    return { rateHistory, outbounds };
+  }, [dashboardStats?.rate_history]);
 
   const locale = i18n.language === 'zh' ? 'zh-CN' : 'en-US';
 
@@ -70,7 +120,7 @@ export default function Dashboard() {
     {
       title: t('dashboard.singboxStatus'),
       value: status?.sing_box_running ? t('common.running') : t('common.stopped'),
-      description: status ? `${t('dashboard.runningTime')}: ${formatUptime(status.timestamp)}` : "",
+      description: status?.sing_box_running ? t('dashboard.serviceNormal') : t('dashboard.serviceStopped'),
       icon: ServerIcon,
       status: status?.sing_box_running ? "success" : "error"
     },
@@ -95,29 +145,84 @@ export default function Dashboard() {
     }
   ];
 
-  const additionalStats: StatCard[] = [
+  // 新增的实时统计卡片
+  const liveStats: StatCard[] = [
     {
-      title: t('dashboard.lastUpdate'),
-      value: lastUpdate.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
-      description: t('dashboard.autoRefresh'),
-      icon: ClockIcon,
-      status: "info"
+      title: t('dashboard.onlineClients'),
+      value: dashboardStats ? `${dashboardStats.online_clients}/${dashboardStats.total_clients}` : "0/0",
+      description: dashboardStats?.online_clients
+        ? t('dashboard.clientsOnline', { online: dashboardStats.online_clients, total: dashboardStats.total_clients })
+        : t('dashboard.totalClients'),
+      icon: UsersIcon,
+      status: dashboardStats?.online_clients ? "success" : "info"
     },
     {
-      title: t('dashboard.gatewayType'),
-      value: "WireGuard",
-      description: t('dashboard.basedOnSingbox'),
-      icon: CpuChipIcon,
-      status: "info"
+      title: t('dashboard.activeConnections'),
+      value: dashboardStats?.active_connections ?? 0,
+      description: t('dashboard.connectionsActive'),
+      icon: BoltIcon,
+      status: dashboardStats?.active_connections ? "success" : "info"
     },
     {
-      title: t('dashboard.connectionStatus'),
-      value: status?.sing_box_running ? t('common.online') : t('common.offline'),
-      description: error ? t('dashboard.connectionError') : t('dashboard.normal'),
-      icon: SignalIcon,
-      status: error ? "error" : "success"
+      title: t('dashboard.adblockCount'),
+      value: dashboardStats?.adblock_connections ?? 0,
+      description: t('dashboard.adblockBlocked'),
+      icon: ShieldExclamationIcon,
+      status: dashboardStats?.adblock_connections ? "warning" : "info"
     }
   ];
+
+  // 准备饼图数据
+  const trafficData = dashboardStats?.traffic_by_outbound
+    ? Object.entries(dashboardStats.traffic_by_outbound)
+        .map(([name, { download, upload }]) => ({
+          name,
+          value: download + upload,
+          download,
+          upload
+        }))
+        .filter(item => item.value > 0)
+        .sort((a, b) => b.value - a.value)
+    : [];
+
+  // 自定义 Tooltip
+  const CustomTooltip = ({ active, payload }: any) => {
+    if (active && payload && payload.length) {
+      const data = payload[0].payload;
+      return (
+        <div className="rounded-lg bg-slate-800 px-3 py-2 shadow-lg border border-slate-700">
+          <p className="text-sm font-medium text-white">{data.name}</p>
+          <p className="text-xs text-slate-300">
+            {t('dashboard.download')}: {formatBytes(data.download)}
+          </p>
+          <p className="text-xs text-slate-300">
+            {t('dashboard.upload')}: {formatBytes(data.upload)}
+          </p>
+          <p className="text-xs text-slate-400 mt-1">
+            {t('dashboard.total')}: {formatBytes(data.value)}
+          </p>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  // 自定义 Legend - 显示所有出口（包括无流量的）
+  const renderLegend = () => {
+    return (
+      <div className="flex flex-wrap justify-center gap-3 mt-4">
+        {outbounds.map((name, index) => (
+          <div key={`legend-${index}`} className="flex items-center gap-1.5">
+            <div
+              className="w-3 h-3 rounded-full"
+              style={{ backgroundColor: CHART_COLORS[index % CHART_COLORS.length] }}
+            />
+            <span className="text-xs text-slate-300">{name}</span>
+          </div>
+        ))}
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-8">
@@ -157,39 +262,129 @@ export default function Dashboard() {
         </div>
       ) : (
         <>
+          {/* 主要状态卡片 */}
           <div className="grid gap-5 md:grid-cols-3">
             {mainStats.map((card) => (
               <StatsCard key={card.title} {...card} />
             ))}
           </div>
 
+          {/* 实时统计卡片 */}
           <div className="grid gap-5 md:grid-cols-3">
-            {additionalStats.map((card) => (
+            {liveStats.map((card) => (
               <StatsCard key={card.title} {...card} />
             ))}
           </div>
+
+          {/* 图表区域 */}
+          <div className="grid gap-5 lg:grid-cols-2">
+            {/* 出口流量分布饼图 */}
+            <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
+              <div className="mb-4">
+                <h3 className="text-lg font-semibold text-white">{t('dashboard.trafficDistribution')}</h3>
+                <p className="mt-1 text-sm text-slate-400">{t('dashboard.trafficDistributionDesc')}</p>
+              </div>
+
+              {trafficData.length > 0 ? (
+                <div className="h-56">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={trafficData}
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={45}
+                        outerRadius={75}
+                        paddingAngle={2}
+                        dataKey="value"
+                        nameKey="name"
+                      >
+                        {trafficData.map((item) => {
+                          // 使用 outbounds 数组中的索引来确定颜色，保持与图例一致
+                          const colorIndex = outbounds.indexOf(item.name);
+                          const color = colorIndex >= 0
+                            ? CHART_COLORS[colorIndex % CHART_COLORS.length]
+                            : CHART_COLORS[0];
+                          return (
+                            <Cell
+                              key={`cell-${item.name}`}
+                              fill={color}
+                              stroke="transparent"
+                            />
+                          );
+                        })}
+                      </Pie>
+                      <Tooltip content={<CustomTooltip />} />
+                      <Legend content={renderLegend} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center h-56 text-slate-500">
+                  {t('dashboard.noTrafficData')}
+                </div>
+              )}
+            </section>
+
+            {/* 实时网速图表 */}
+            <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
+              <div className="mb-4">
+                <h3 className="text-lg font-semibold text-white">{t('dashboard.networkSpeed')}</h3>
+                <p className="mt-1 text-sm text-slate-400">{t('dashboard.networkSpeedDesc')}</p>
+              </div>
+
+              {rateHistory.length > 1 ? (
+                <div className="h-56">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={rateHistory}>
+                      <XAxis
+                        dataKey="time"
+                        stroke="#64748b"
+                        fontSize={10}
+                        tickLine={false}
+                        axisLine={false}
+                      />
+                      <YAxis
+                        stroke="#64748b"
+                        fontSize={10}
+                        tickLine={false}
+                        axisLine={false}
+                        tickFormatter={(value) => `${value.toFixed(0)}`}
+                        width={35}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: '#1e293b',
+                          border: '1px solid #334155',
+                          borderRadius: '8px',
+                          fontSize: '12px'
+                        }}
+                        labelStyle={{ color: '#e2e8f0' }}
+                        formatter={(value: number) => [`${value.toFixed(1)} KB/s`, '']}
+                      />
+                      {outbounds.map((outbound, index) => (
+                        <Line
+                          key={outbound}
+                          type="monotone"
+                          dataKey={outbound}
+                          stroke={CHART_COLORS[index % CHART_COLORS.length]}
+                          strokeWidth={2}
+                          dot={false}
+                          name={outbound}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center h-56 text-slate-500">
+                  {t('dashboard.collectingData')}
+                </div>
+              )}
+            </section>
+          </div>
         </>
       )}
-
-      <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <h3 className="text-lg font-semibold text-white">{t('dashboard.wireguardInterface')}</h3>
-            <p className="mt-1 text-sm text-slate-400">{t('dashboard.wireguardInterfaceDesc')}</p>
-          </div>
-          <button
-            onClick={() => window.location.reload()}
-            className="rounded-xl bg-white/5 px-4 py-2 text-sm text-slate-300 transition hover:bg-white/10"
-          >
-            {t('common.refresh')}
-          </button>
-        </div>
-        <div className="rounded-2xl bg-black/30 p-4">
-          <pre className="max-h-96 overflow-auto text-xs text-emerald-200 font-mono">
-            {typeof status?.wireguard_interface?.raw === "string" ? status.wireguard_interface.raw : t('dashboard.noWireguardStatus')}
-          </pre>
-        </div>
-      </section>
     </div>
   );
 }

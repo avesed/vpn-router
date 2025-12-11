@@ -557,10 +557,15 @@ def cleanup_stale_endpoints(config: dict, valid_tags: List[str]) -> None:
             ]
 
 
+# 合并后的广告拦截规则集固定 tag（用于 Dashboard 统计）
+ADBLOCK_COMBINED_TAG = "__adblock_combined__"
+
+
 def generate_adblock_rule_sets() -> Tuple[List[Dict], List[Dict]]:
     """生成广告拦截 rule_set 配置
 
-    从数据库读取已启用的远程规则集，下载并转换为 sing-box rule_set 格式。
+    从数据库读取已启用的远程规则集，下载并合并为单个 sing-box rule_set。
+    使用固定的 tag "__adblock_combined__" 方便 Dashboard 统计。
 
     Returns:
         (rule_set_configs, route_rules): rule_set 配置和对应的路由规则
@@ -583,17 +588,14 @@ def generate_adblock_rule_sets() -> Tuple[List[Dict], List[Dict]]:
     # 确保 rulesets 目录存在
     RULESETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    rule_set_configs = []
-    route_rules = []
-    processed_count = 0
+    # 合并所有规则的域名
+    all_domains: Set[str] = set()
+    processed_sources = []
 
     for rule in rules:
         tag = rule["tag"]
         url = rule["url"]
         format_type = rule.get("format", "adblock")
-        outbound = rule.get("outbound", "block")
-
-        ruleset_path = RULESETS_DIR / f"{tag}.json"
 
         try:
             # 下载并转换
@@ -603,9 +605,6 @@ def generate_adblock_rule_sets() -> Tuple[List[Dict], List[Dict]]:
             if not domains:
                 print(f"[render] 警告: {tag} 未获取到任何域名，跳过")
                 continue
-
-            # 保存为 sing-box rule_set 格式
-            save_singbox_ruleset(domains, ruleset_path)
 
             # 更新数据库中的域名数量和更新时间
             try:
@@ -617,29 +616,39 @@ def generate_adblock_rule_sets() -> Tuple[List[Dict], List[Dict]]:
             except Exception:
                 pass  # 更新失败不影响配置生成
 
-            # 添加 rule_set 配置
-            rule_set_configs.append({
-                "tag": tag,
-                "type": "local",
-                "format": "source",
-                "path": str(ruleset_path)
-            })
+            # 合并域名
+            before_count = len(all_domains)
+            all_domains.update(domains)
+            new_count = len(all_domains) - before_count
 
-            # 添加路由规则
-            route_rules.append({
-                "rule_set": [tag],
-                "outbound": outbound
-            })
-
-            processed_count += 1
-            print(f"[render] 已转换 {tag}: {len(domains):,} 个域名")
+            processed_sources.append(tag)
+            print(f"[render] 已处理 {tag}: {len(domains):,} 个域名 (+{new_count:,} 新增)")
 
         except Exception as e:
             print(f"[render] 警告: 处理 {tag} 失败: {e}")
             continue
 
-    if processed_count > 0:
-        print(f"[render] 共处理 {processed_count} 个广告拦截规则集")
+    if not all_domains:
+        return [], []
+
+    # 保存合并后的 rule_set
+    combined_path = RULESETS_DIR / f"{ADBLOCK_COMBINED_TAG}.json"
+    save_singbox_ruleset(list(all_domains), combined_path)
+
+    print(f"[render] 广告拦截规则已合并: {len(processed_sources)} 个来源, {len(all_domains):,} 个唯一域名")
+
+    # 返回单个合并的 rule_set 配置
+    rule_set_configs = [{
+        "tag": ADBLOCK_COMBINED_TAG,
+        "type": "local",
+        "format": "source",
+        "path": str(combined_path)
+    }]
+
+    route_rules = [{
+        "rule_set": [ADBLOCK_COMBINED_TAG],
+        "outbound": "adblock"
+    }]
 
     return rule_set_configs, route_rules
 
