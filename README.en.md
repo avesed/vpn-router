@@ -4,6 +4,7 @@ English | [中文](README.md)
 
 Docker container providing WireGuard ingress + sing-box smart routing (route traffic to different exits by domain/IP/region).
 
+```
 Client Devices
      │
      ▼ WireGuard (UDP 36100)
