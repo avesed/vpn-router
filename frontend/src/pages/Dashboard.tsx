@@ -84,12 +84,17 @@ export default function Dashboard() {
     // 取最近 N 个点用于显示
     const recentHistory = dashboardStats.rate_history.slice(-MAX_DISPLAY_POINTS);
 
-    // 收集所有出口名称
+    // 收集所有出口名称并排序（确保颜色分配一致）
     const outboundSet = new Set<string>();
     recentHistory.forEach(point => {
       Object.keys(point.rates).forEach(name => outboundSet.add(name));
     });
-    const outbounds = Array.from(outboundSet);
+    // 排序：direct 在最前，其他按字母顺序
+    const outbounds = Array.from(outboundSet).sort((a, b) => {
+      if (a === 'direct') return -1;
+      if (b === 'direct') return 1;
+      return a.localeCompare(b);
+    });
 
     // 转换为图表数据格式
     const rateHistory = recentHistory.map(point => {
@@ -362,6 +367,7 @@ export default function Dashboard() {
                         labelStyle={{ color: '#e2e8f0' }}
                         formatter={(value: number) => [`${value.toFixed(1)} KB/s`, '']}
                       />
+                      <Legend content={renderLegend} />
                       {outbounds.map((outbound, index) => (
                         <Line
                           key={outbound}

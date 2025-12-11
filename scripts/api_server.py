@@ -965,7 +965,7 @@ def api_list_endpoints():
     for idx, profile in enumerate(pia_profiles):
         if not profile.get("private_key"):
             continue  # 跳过未配置凭证的 profile
-        tag = profile["name"].replace("_", "-")
+        tag = profile["name"]  # 保持原始名称，不做转换
         peer_ip = profile.get("peer_ip", "")
         if peer_ip and "/" not in peer_ip:
             peer_ip = f"{peer_ip}/32"
@@ -1037,7 +1037,7 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
     # 检查是否是 PIA profile
     pia_profiles = db.get_pia_profiles(enabled_only=False)
     for profile in pia_profiles:
-        profile_tag = profile["name"].replace("_", "-")
+        profile_tag = profile["name"]  # 保持原始名称
         if profile_tag == tag:
             # 更新 PIA profile（主要是 MTU，其他字段由 PIA 服务器返回）
             # PIA profile 的更新通常通过重新连接来完成
@@ -1107,7 +1107,7 @@ def api_list_profiles():
     result = []
     for p in profiles:
         name = p.get("name", "")
-        tag = name.replace("_", "-")
+        tag = name  # 保持原始名称
         # 直接从数据库读取服务器信息
         server_ip = p.get("server_ip")
         server_port = p.get("server_port")
@@ -1620,7 +1620,7 @@ def api_profiles_status():
 
     for db_profile in db_profiles:
         name = db_profile["name"]
-        tag = name.replace("_", "-")
+        tag = name  # 保持原始名称
         server_ip = db_profile.get("server_ip", "")
         server_port = db_profile.get("server_port", 0)
         private_key = db_profile.get("private_key", "")
@@ -2374,7 +2374,7 @@ def api_list_all_egress():
 
     for p in pia_profiles:
         name = p.get("name", "")
-        tag = name.replace("_", "-")
+        tag = name  # 保持原始名称
         pia_result.append({
             "tag": tag,
             "type": "pia",
@@ -2447,7 +2447,7 @@ def api_create_custom_egress(payload: CustomEgressCreateRequest):
 
     # 检查是否与 PIA profiles 冲突
     pia_profiles = db.get_pia_profiles(enabled_only=False)
-    pia_tags = {p.get("name", "").replace("_", "-") for p in pia_profiles}
+    pia_tags = {p.get("name", "") for p in pia_profiles}  # 保持原始名称
     if payload.tag in pia_tags:
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 PIA 线路冲突")
 
@@ -2617,7 +2617,7 @@ def api_create_direct_egress(payload: DirectEgressCreateRequest):
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与自定义 WireGuard 出口冲突")
 
     pia_profiles = db.get_pia_profiles(enabled_only=False)
-    pia_tags = {p.get("name", "").replace("_", "-") for p in pia_profiles}
+    pia_tags = {p.get("name", "") for p in pia_profiles}  # 保持原始名称
     if payload.tag in pia_tags:
         raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 PIA 线路冲突")
 

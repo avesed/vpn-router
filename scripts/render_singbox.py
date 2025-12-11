@@ -221,9 +221,8 @@ def build_profile_map(profiles_config: dict) -> Dict[str, str]:
     profile_map = {}
     for p in profiles_config.get("profiles", []):
         name = p.get("name", "")
-        # tag 使用 - 分隔，name 使用 _ 分隔
-        tag = name.replace("_", "-")
-        profile_map[tag] = name
+        # tag 和 name 保持一致，不做转换
+        profile_map[name] = name
     return profile_map
 
 
@@ -800,11 +799,10 @@ def main() -> None:
     pia_profiles = load_pia_profiles_from_db()
 
     if pia_profiles and pia_profiles.get("profiles"):
-        # 从数据库构建 profile_map (tag -> name)
+        # 从数据库构建 profile_map (tag -> name)，保持名称一致
         profile_map = {}
         for name in pia_profiles["profiles"].keys():
-            tag = name.replace("_", "-")
-            profile_map[tag] = name
+            profile_map[name] = name
 
         print(f"[render] 处理 {len(profile_map)} 个 PIA profiles: {list(profile_map.keys())}")
 
