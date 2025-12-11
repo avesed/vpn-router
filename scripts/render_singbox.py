@@ -798,11 +798,31 @@ def ensure_log_config(config: dict) -> None:
         log_config["level"] = "info"
 
 
+def ensure_required_outbounds(config: dict) -> None:
+    """确保必需的 outbounds 存在（direct, block, adblock）"""
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {o.get("tag") for o in outbounds}
+
+    required_outbounds = [
+        {"type": "direct", "tag": "direct"},
+        {"type": "block", "tag": "block"},
+        {"type": "block", "tag": "adblock"}
+    ]
+
+    for outbound in required_outbounds:
+        if outbound["tag"] not in existing_tags:
+            outbounds.append(outbound)
+            print(f"[render] 已添加缺失的 outbound: {outbound['tag']}")
+
+
 def main() -> None:
     config = load_json(BASE_CONFIG)
 
     # 确保日志配置正确（用于 adblock 统计）
     ensure_log_config(config)
+
+    # 确保必需的 outbounds 存在（direct, block, adblock）
+    ensure_required_outbounds(config)
 
     all_egress_tags = []
 
