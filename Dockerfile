@@ -15,7 +15,8 @@ RUN npm run build
 FROM debian:12-slim
 
 ENV SING_BOX_CONFIG=/etc/sing-box/sing-box.json \
-    RULESET_DIR=/etc/sing-box
+    RULESET_DIR=/etc/sing-box \
+    PYTHONPATH=/usr/local/bin
 
 RUN set -eux; \
     apt-get update; \
