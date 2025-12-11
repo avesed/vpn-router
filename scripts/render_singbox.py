@@ -786,8 +786,23 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
             route["final"] = "direct"
 
 
+def ensure_log_config(config: dict) -> None:
+    """确保日志配置正确（包含 output 路径用于 adblock 统计）"""
+    log_config = config.setdefault("log", {})
+    if "output" not in log_config:
+        log_config["output"] = "/var/log/sing-box.log"
+        print("[render] 已添加日志输出路径: /var/log/sing-box.log")
+    if "timestamp" not in log_config:
+        log_config["timestamp"] = True
+    if "level" not in log_config:
+        log_config["level"] = "info"
+
+
 def main() -> None:
     config = load_json(BASE_CONFIG)
+
+    # 确保日志配置正确（用于 adblock 统计）
+    ensure_log_config(config)
 
     all_egress_tags = []
 
