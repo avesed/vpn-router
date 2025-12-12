@@ -162,10 +162,10 @@ export const api = {
 
   // Ingress WireGuard
   getIngress: () => request<IngressResponse>("/ingress"),
-  addIngressPeer: (name: string, publicKey?: string) =>
+  addIngressPeer: (name: string, publicKey?: string, allowLan?: boolean) =>
     request<IngressPeerCreateResponse>("/ingress/peers", {
       method: "POST",
-      body: { name, public_key: publicKey }
+      body: { name, public_key: publicKey, allow_lan: allowLan }
     }),
   deleteIngressPeer: (name: string) =>
     request<{ message: string }>(`/ingress/peers/${encodeURIComponent(name)}`, { method: "DELETE" }),

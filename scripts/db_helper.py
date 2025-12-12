@@ -424,14 +424,14 @@ class UserDatabase:
             cursor = conn.cursor()
             if enabled_only:
                 rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, enabled, created_at, updated_at
+                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
                     FROM wireguard_peers
                     WHERE enabled = 1
                     ORDER BY name
                 """).fetchall()
             else:
                 rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, enabled, created_at, updated_at
+                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
                     FROM wireguard_peers
                     ORDER BY name
                 """).fetchall()
@@ -442,26 +442,41 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
                 FROM wireguard_peers
                 WHERE id = ?
             """, (peer_id,)).fetchone()
             return dict(row) if row else None
 
+    def get_wireguard_peer_by_name(self, name: str) -> Optional[Dict]:
+        """根据名称获取单个 WireGuard 对等点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
+                FROM wireguard_peers
+                WHERE name = ?
+            """, (name,)).fetchone()
+            return dict(row) if row else None
+
     def add_wireguard_peer(self, name: str, public_key: str, allowed_ips: str,
-                          preshared_key: Optional[str] = None) -> int:
+                          preshared_key: Optional[str] = None,
+                          allow_lan: bool = False,
+                          lan_subnet: Optional[str] = None) -> int:
         """添加 WireGuard 对等点"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key)
-                VALUES (?, ?, ?, ?)
-            """, (name, public_key, allowed_ips, preshared_key))
+                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet))
             conn.commit()
             return cursor.lastrowid
 
     def update_wireguard_peer(self, peer_id: int, name: Optional[str] = None,
-                             allowed_ips: Optional[str] = None, enabled: Optional[bool] = None) -> bool:
+                             allowed_ips: Optional[str] = None, enabled: Optional[bool] = None,
+                             allow_lan: Optional[bool] = None,
+                             lan_subnet: Optional[str] = None) -> bool:
         """更新 WireGuard 对等点"""
         updates = []
         params = []
@@ -475,6 +490,12 @@ class UserDatabase:
         if enabled is not None:
             updates.append("enabled = ?")
             params.append(1 if enabled else 0)
+        if allow_lan is not None:
+            updates.append("allow_lan = ?")
+            params.append(1 if allow_lan else 0)
+        if lan_subnet is not None:
+            updates.append("lan_subnet = ?")
+            params.append(lan_subnet)
 
         if not updates:
             return False
@@ -1081,13 +1102,20 @@ class DatabaseManager:
     def get_wireguard_peer(self, peer_id: int) -> Optional[Dict]:
         return self.user.get_wireguard_peer(peer_id)
 
+    def get_wireguard_peer_by_name(self, name: str) -> Optional[Dict]:
+        return self.user.get_wireguard_peer_by_name(name)
+
     def add_wireguard_peer(self, name: str, public_key: str, allowed_ips: str,
-                          preshared_key: Optional[str] = None) -> int:
-        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key)
+                          preshared_key: Optional[str] = None,
+                          allow_lan: bool = False,
+                          lan_subnet: Optional[str] = None) -> int:
+        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet)
 
     def update_wireguard_peer(self, peer_id: int, name: Optional[str] = None,
-                             allowed_ips: Optional[str] = None, enabled: Optional[bool] = None) -> bool:
-        return self.user.update_wireguard_peer(peer_id, name, allowed_ips, enabled)
+                             allowed_ips: Optional[str] = None, enabled: Optional[bool] = None,
+                             allow_lan: Optional[bool] = None,
+                             lan_subnet: Optional[str] = None) -> bool:
+        return self.user.update_wireguard_peer(peer_id, name, allowed_ips, enabled, allow_lan, lan_subnet)
 
     def delete_wireguard_peer(self, peer_id: int) -> bool:
         return self.user.delete_wireguard_peer(peer_id)

@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS wireguard_peers (
     public_key TEXT NOT NULL UNIQUE,
     allowed_ips TEXT NOT NULL,
     preshared_key TEXT,
+    allow_lan INTEGER DEFAULT 0,      -- 是否允许访问本地局域网
+    lan_subnet TEXT,                  -- 局域网子网 (如 192.168.1.0/24)
     enabled INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -169,6 +171,32 @@ def init_user_db(db_path: Path) -> sqlite3.Connection:
     conn.executescript(USER_DB_SCHEMA)
     conn.commit()
     return conn
+
+
+def migrate_wireguard_peers_lan_fields(conn: sqlite3.Connection):
+    """为现有 wireguard_peers 表添加 LAN 访问字段"""
+    cursor = conn.cursor()
+
+    # 检查是否需要迁移（检查 allow_lan 列是否存在）
+    cursor.execute("PRAGMA table_info(wireguard_peers)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    migrations_done = 0
+
+    if "allow_lan" not in columns:
+        cursor.execute("ALTER TABLE wireguard_peers ADD COLUMN allow_lan INTEGER DEFAULT 0")
+        migrations_done += 1
+        print("✓ 添加 wireguard_peers.allow_lan 字段")
+
+    if "lan_subnet" not in columns:
+        cursor.execute("ALTER TABLE wireguard_peers ADD COLUMN lan_subnet TEXT")
+        migrations_done += 1
+        print("✓ 添加 wireguard_peers.lan_subnet 字段")
+
+    if migrations_done > 0:
+        conn.commit()
+    else:
+        print("⊘ wireguard_peers LAN 字段已存在，跳过迁移")
 
 
 def generate_wireguard_private_key() -> str:
@@ -372,6 +400,9 @@ def main():
 
     # 初始化数据库
     conn = init_user_db(user_db_path)
+
+    # 迁移现有数据库（添加新字段）
+    migrate_wireguard_peers_lan_fields(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

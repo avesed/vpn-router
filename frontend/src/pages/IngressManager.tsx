@@ -48,6 +48,7 @@ export default function IngressManager() {
   const [newPeerName, setNewPeerName] = useState("");
   const [newPeerPublicKey, setNewPeerPublicKey] = useState("");
   const [useCustomKey, setUseCustomKey] = useState(false);
+  const [allowLan, setAllowLan] = useState(false);
 
   // Config modal (shows after adding peer or for existing peer)
   const [showConfigModal, setShowConfigModal] = useState(false);
@@ -139,13 +140,15 @@ export default function IngressManager() {
 
       const result = await api.addIngressPeer(
         newPeerName.trim(),
-        useCustomKey ? newPeerPublicKey.trim() : undefined
+        useCustomKey ? newPeerPublicKey.trim() : undefined,
+        allowLan
       );
       setSuccessMessage(result.message);
       setShowAddModal(false);
       setNewPeerName("");
       setNewPeerPublicKey("");
       setUseCustomKey(false);
+      setAllowLan(false);
       setDetectedIps(null);
 
       if (result.client_private_key) {
@@ -493,6 +496,35 @@ export default function IngressManager() {
                   />
                   {t("ingress.useCustomPublicKey")}
                 </label>
+              </div>
+
+              {/* LAN Access Option */}
+              <div>
+                <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allowLan}
+                    onChange={(e) => {
+                      setAllowLan(e.target.checked);
+                      // 如果勾选了，自动检测 IP 以显示 LAN 子网
+                      if (e.target.checked && !detectedIps) {
+                        detectIp();
+                      }
+                    }}
+                    className="rounded border-slate-600"
+                  />
+                  {t("ingress.allowLanAccess")}
+                </label>
+                {allowLan && detectedIps?.lan_ip && (
+                  <p className="text-xs text-slate-500 mt-1 ml-5">
+                    {t("ingress.detectedLanSubnet")}: {detectedIps.lan_ip.split('.').slice(0, 3).join('.')}.0/24
+                  </p>
+                )}
+                {allowLan && !detectedIps?.lan_ip && !detectingIp && (
+                  <p className="text-xs text-amber-400 mt-1 ml-5">
+                    {t("ingress.cannotDetectLan")}
+                  </p>
+                )}
               </div>
 
               {useCustomKey && (

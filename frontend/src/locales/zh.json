@@ -194,7 +194,10 @@
     "qrCodeHint": "使用 WireGuard 应用扫描导入配置",
     "copied": "已复制！",
     "copyConfig": "复制配置",
-    "downloadConf": "下载 .conf"
+    "downloadConf": "下载 .conf",
+    "allowLanAccess": "允许访问本地局域网",
+    "detectedLanSubnet": "检测到局域网段",
+    "cannotDetectLan": "无法检测局域网，请检查服务器网络配置"
   },
   "egress": {
     "title": "出口管理",

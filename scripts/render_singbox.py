@@ -164,6 +164,52 @@ def ensure_sniff_action(config: dict) -> None:
     print("[render] sniff 和 hijack-dns 动作已置于规则列表开头")
 
 
+def generate_lan_access_rules(config: dict) -> None:
+    """为启用 LAN 访问的 peer 生成路由规则
+
+    收集所有启用了 allow_lan 的 peer 的 LAN 子网，
+    添加一条规则将 LAN 流量路由到 direct 出口。
+    """
+    if not HAS_DATABASE or not Path(USER_DB_PATH).exists():
+        return
+
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        peers = db.get_wireguard_peers(enabled_only=True)
+    except Exception as e:
+        print(f"[render] 警告: 无法加载 WireGuard peers: {e}")
+        return
+
+    # 收集所有需要 LAN 访问的子网
+    lan_subnets = set()
+    for peer in peers:
+        if peer.get("allow_lan") and peer.get("lan_subnet"):
+            lan_subnets.add(peer["lan_subnet"])
+
+    if not lan_subnets:
+        return
+
+    # 添加路由规则: LAN 子网 → direct
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+
+    lan_rule = {
+        "ip_cidr": list(lan_subnets),
+        "outbound": "direct"
+    }
+
+    # 找到合适的插入位置（在 sniff 和 hijack-dns 之后）
+    insert_pos = 0
+    for i, rule in enumerate(rules):
+        if rule.get("action") in ("sniff", "hijack-dns"):
+            insert_pos = i + 1
+        else:
+            break
+
+    rules.insert(insert_pos, lan_rule)
+    print(f"[render] 已添加 LAN 访问规则: {list(lan_subnets)} → direct")
+
+
 def _create_wireguard_endpoint(tag: str, profile: dict, index: int) -> dict:
     """为 profile 创建新的 WireGuard endpoint（sing-box 1.11+ 格式）
 
@@ -903,6 +949,9 @@ def main() -> None:
 
     # 确保路由规则中有 sniff 动作（放在最后以确保它在规则列表开头）
     ensure_sniff_action(config)
+
+    # 生成 LAN 访问规则（在 sniff 之后，其他规则之前）
+    generate_lan_access_rules(config)
 
     # 添加 experimental API 用于获取连接状态
     config["experimental"] = {

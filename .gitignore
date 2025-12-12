@@ -83,8 +83,10 @@ docker-compose.local.yml
 # Claude Code
 .claude/
 CLAUDE.md
+CODE_REVIEW_REPORT.md
 
 # Misc
 coverage/
 .cache/
 tmp/
+

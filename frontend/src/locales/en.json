@@ -194,7 +194,10 @@
     "qrCodeHint": "Scan with WireGuard app to import config",
     "copied": "Copied!",
     "copyConfig": "Copy Config",
-    "downloadConf": "Download .conf"
+    "downloadConf": "Download .conf",
+    "allowLanAccess": "Allow LAN access",
+    "detectedLanSubnet": "Detected LAN subnet",
+    "cannotDetectLan": "Unable to detect LAN, please check server network configuration"
   },
   "egress": {
     "title": "Egress Manager",

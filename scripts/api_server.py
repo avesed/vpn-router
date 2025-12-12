@@ -168,6 +168,7 @@ class IngressPeerCreateRequest(BaseModel):
     """添加入口 WireGuard peer"""
     name: str = Field(..., description="客户端名称，如 laptop, phone")
     public_key: Optional[str] = Field(None, description="客户端公钥（可选，不填则服务端生成密钥对）")
+    allow_lan: bool = Field(False, description="是否允许访问本地局域网")
 
 
 class IngressPeerUpdateRequest(BaseModel):
@@ -1768,6 +1769,8 @@ def load_ingress_config() -> dict:
             "public_key": peer["public_key"],
             "allowed_ips": peer["allowed_ips"].split(",") if isinstance(peer["allowed_ips"], str) else peer["allowed_ips"],
             "preshared_key": peer.get("preshared_key"),
+            "allow_lan": peer.get("allow_lan", 0) == 1,
+            "lan_subnet": peer.get("lan_subnet"),
             "enabled": peer.get("enabled", 1) == 1
         })
 
@@ -2054,6 +2057,8 @@ def api_get_ingress():
             "is_online": is_online,
             "rx_bytes": transfer.get("rx", 0),
             "tx_bytes": transfer.get("tx", 0),
+            "allow_lan": peer.get("allow_lan", False),
+            "lan_subnet": peer.get("lan_subnet"),
         })
 
     return {
@@ -2067,6 +2072,48 @@ def api_get_ingress():
         "peers": peers,
         "peer_count": len(peers),
     }
+
+
+def detect_lan_subnet() -> Optional[str]:
+    """检测本地局域网子网"""
+    import socket
+    lan_ip = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+
+    if not lan_ip or lan_ip.startswith("127.") or lan_ip.startswith("172."):
+        return None
+
+    # 从 IP 推断子网 (假设 /24)
+    parts = lan_ip.split('.')
+    if len(parts) == 4:
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    return None
+
+
+def calculate_allowed_ips_excluding_subnet(exclude_subnet: str) -> str:
+    """计算排除指定子网后的 AllowedIPs（真正的 Split Tunnel）
+
+    Args:
+        exclude_subnet: 要排除的子网，如 "192.168.1.0/24"
+
+    Returns:
+        排除该子网后的 CIDR 列表，用逗号分隔
+    """
+    import ipaddress
+    try:
+        base = ipaddress.ip_network("0.0.0.0/0")
+        exclude = ipaddress.ip_network(exclude_subnet)
+        result = list(base.address_exclude(exclude))
+        return ", ".join(str(net) for net in result)
+    except Exception:
+        return "0.0.0.0/0"  # fallback
 
 
 @app.post("/api/ingress/peers")
@@ -2091,13 +2138,20 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
         # 服务端生成密钥对
         client_private_key, client_public_key = generate_wireguard_keypair()
 
+    # 如果启用 LAN 访问，自动检测 LAN 子网
+    lan_subnet = None
+    if payload.allow_lan:
+        lan_subnet = detect_lan_subnet()
+
     # 添加到数据库
     if HAS_DATABASE and USER_DB_PATH.exists():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         peer_id = db.add_wireguard_peer(
             name=payload.name,
             public_key=client_public_key,
-            allowed_ips=f"{peer_ip}/32"
+            allowed_ips=f"{peer_ip}/32",
+            allow_lan=payload.allow_lan,
+            lan_subnet=lan_subnet
         )
     else:
         # 降级到配置文件
@@ -2199,6 +2253,26 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
     else:
         server_endpoint = f"YOUR_SERVER_IP:{listen_port}"
 
+    # 获取 peer 的 LAN 访问设置
+    allow_lan = peer.get("allow_lan", False)
+    lan_subnet = peer.get("lan_subnet", "")
+
+    # 只有当 allow_lan=True 且没有存储 lan_subnet 时才动态检测
+    # 当 allow_lan=False 时，不检测 LAN 子网（用户未请求 LAN 访问）
+    if allow_lan and not lan_subnet:
+        lan_subnet = detect_lan_subnet() or ""
+
+    # 生成 AllowedIPs
+    # - allow_lan=True + lan_subnet: 显式添加 LAN 网段，流量走 VPN，服务端路由 LAN 到 direct
+    # - allow_lan=True 但无 lan_subnet: 全部流量走 VPN
+    # - allow_lan=False: 全部流量走 VPN（默认行为）
+    if allow_lan and lan_subnet:
+        # 启用 LAN 访问：显式添加 LAN 网段，让用户清楚知道 LAN 访问已启用
+        allowed_ips = f"0.0.0.0/0, {lan_subnet}"
+    else:
+        # 默认：全部流量走 VPN
+        allowed_ips = "0.0.0.0/0"
+
     # 构建配置
     client_config = f"""[Interface]
 PrivateKey = {private_key or 'YOUR_PRIVATE_KEY'}
@@ -2208,7 +2282,7 @@ DNS = 1.1.1.1
 [Peer]
 PublicKey = {server_public_key}
 Endpoint = {server_endpoint}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = {allowed_ips}
 PersistentKeepalive = 25
 """
     return client_config
