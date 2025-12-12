@@ -515,8 +515,11 @@ export default function IngressManager() {
                   />
                   {t("ingress.allowLanAccess")}
                 </label>
+                <p className="text-xs text-slate-500 mt-1 ml-5">
+                  {t("ingress.allowLanAccessHint")}
+                </p>
                 {allowLan && detectedIps?.lan_ip && (
-                  <p className="text-xs text-slate-500 mt-1 ml-5">
+                  <p className="text-xs text-emerald-400 mt-1 ml-5">
                     {t("ingress.detectedLanSubnet")}: {detectedIps.lan_ip.split('.').slice(0, 3).join('.')}.0/24
                   </p>
                 )}

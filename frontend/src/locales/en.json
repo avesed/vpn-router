@@ -195,7 +195,8 @@
     "copied": "Copied!",
     "copyConfig": "Copy Config",
     "downloadConf": "Download .conf",
-    "allowLanAccess": "Allow LAN access",
+    "allowLanAccess": "Keep local LAN connection",
+    "allowLanAccessHint": "When enabled, local LAN traffic bypasses VPN (for RDP, etc.)",
     "detectedLanSubnet": "Detected LAN subnet",
     "cannotDetectLan": "Unable to detect LAN, please check server network configuration"
   },

@@ -195,7 +195,8 @@
     "copied": "已复制！",
     "copyConfig": "复制配置",
     "downloadConf": "下载 .conf",
-    "allowLanAccess": "允许访问本地局域网",
+    "allowLanAccess": "保留本地局域网连接",
+    "allowLanAccessHint": "启用后本地局域网流量不走 VPN，可正常使用远程桌面等",
     "detectedLanSubnet": "检测到局域网段",
     "cannotDetectLan": "无法检测局域网，请检查服务器网络配置"
   },

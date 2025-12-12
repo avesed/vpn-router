@@ -2263,12 +2263,13 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
         lan_subnet = detect_lan_subnet() or ""
 
     # 生成 AllowedIPs
-    # - allow_lan=True + lan_subnet: 显式添加 LAN 网段，流量走 VPN，服务端路由 LAN 到 direct
+    # - allow_lan=True + lan_subnet: Split Tunnel，排除本地 LAN（本地局域网流量不走 VPN）
     # - allow_lan=True 但无 lan_subnet: 全部流量走 VPN
     # - allow_lan=False: 全部流量走 VPN（默认行为）
     if allow_lan and lan_subnet:
-        # 启用 LAN 访问：显式添加 LAN 网段，让用户清楚知道 LAN 访问已启用
-        allowed_ips = f"0.0.0.0/0, {lan_subnet}"
+        # 启用保留局域网连接：Split Tunnel，排除本地 LAN 网段
+        # 本地局域网流量直接走本地网络，其他流量走 VPN
+        allowed_ips = calculate_allowed_ips_excluding_subnet(lan_subnet)
     else:
         # 默认：全部流量走 VPN
         allowed_ips = "0.0.0.0/0"
