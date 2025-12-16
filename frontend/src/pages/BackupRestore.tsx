@@ -87,11 +87,12 @@ export default function BackupRestore() {
           ? t('backup.exportedEncrypted')
           : t('backup.exportedPlaintext')
       );
-      setExportPassword("");
     } catch (err) {
       setError(err instanceof Error ? err.message : t('backup.exportFailed'));
     } finally {
       setExporting(false);
+      // 安全：使用后立即清除密码，无论成功或失败
+      setExportPassword("");
     }
   };
 
@@ -142,7 +143,6 @@ export default function BackupRestore() {
 
       setSuccessMessage(`${t('backup.imported')}: ${imported.join(", ")}`);
       setImportData("");
-      setImportPassword("");
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
@@ -151,6 +151,8 @@ export default function BackupRestore() {
       setError(err instanceof Error ? err.message : t('backup.importFailed'));
     } finally {
       setImporting(false);
+      // 安全：使用后立即清除密码，无论成功或失败
+      setImportPassword("");
     }
   };
 

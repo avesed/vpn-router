@@ -102,5 +102,9 @@ VOLUME ["/etc/sing-box"]
 
 EXPOSE 80 8000 36100/udp
 
+# Health check - 检查 API 服务是否响应
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sing-box", "run", "-c", "/etc/sing-box/sing-box.json"]

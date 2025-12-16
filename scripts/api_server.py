@@ -70,7 +70,7 @@ SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "/etc/sing-box/settings.jso
 ENTRY_DIR = Path("/usr/local/bin")
 
 # Port configuration from environment
-DEFAULT_WG_PORT = int(os.environ.get("WG_LISTEN_PORT", "DEFAULT_WG_PORT"))
+DEFAULT_WG_PORT = int(os.environ.get("WG_LISTEN_PORT", "36100"))
 DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "36000"))
 
 PIA_SERVERLIST_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
@@ -79,6 +79,78 @@ CONFIG_LOCK = threading.Lock()
 
 # 缓存 PIA 地区列表（有效期 1 小时）
 _pia_regions_cache: Dict[str, Any] = {"data": None, "timestamp": 0}
+
+# ============ 安全凭据存储 ============
+# 使用类变量存储凭据，避免暴露在 /proc/<pid>/environ
+class _CredentialStore:
+    """
+    安全的凭据存储类。
+
+    凭据存储在进程内存中，而不是环境变量，
+    避免通过 /proc/<pid>/environ 暴露。
+    """
+    _credentials: Dict[str, str] = {}
+    _lock = threading.Lock()
+
+    @classmethod
+    def set(cls, key: str, value: str) -> None:
+        """设置凭据"""
+        with cls._lock:
+            cls._credentials[key] = value
+
+    @classmethod
+    def get(cls, key: str, default: Optional[str] = None) -> Optional[str]:
+        """获取凭据"""
+        with cls._lock:
+            # 优先从内存存储获取，回退到环境变量（兼容容器启动时的环境变量）
+            return cls._credentials.get(key) or os.environ.get(key, default)
+
+    @classmethod
+    def delete(cls, key: str) -> None:
+        """删除凭据"""
+        with cls._lock:
+            cls._credentials.pop(key, None)
+
+    @classmethod
+    def clear(cls) -> None:
+        """清除所有凭据"""
+        with cls._lock:
+            cls._credentials.clear()
+
+    @classmethod
+    def has(cls, key: str) -> bool:
+        """检查凭据是否存在"""
+        with cls._lock:
+            return bool(cls._credentials.get(key) or os.environ.get(key))
+
+    @classmethod
+    def get_env_for_subprocess(cls) -> Dict[str, str]:
+        """
+        获取用于 subprocess 的环境变量字典。
+        将内存中的凭据合并到环境变量中供子进程使用。
+        """
+        env = os.environ.copy()
+        with cls._lock:
+            env.update(cls._credentials)
+        return env
+
+
+# 便捷访问函数
+def get_pia_credentials() -> tuple[Optional[str], Optional[str]]:
+    """获取 PIA 凭据"""
+    return _CredentialStore.get("PIA_USERNAME"), _CredentialStore.get("PIA_PASSWORD")
+
+
+def set_pia_credentials(username: str, password: str) -> None:
+    """设置 PIA 凭据"""
+    _CredentialStore.set("PIA_USERNAME", username)
+    _CredentialStore.set("PIA_PASSWORD", password)
+
+
+def has_pia_credentials() -> bool:
+    """检查是否有 PIA 凭据"""
+    username, password = get_pia_credentials()
+    return bool(username and password)
 
 # ============ 流量统计 ============
 # 累计流量统计（按出口分组）
@@ -382,6 +454,7 @@ def _get_all_outbounds() -> List[str]:
 def _update_traffic_stats():
     """后台线程：定期更新累计流量统计和实时速率"""
     import urllib.request
+    import urllib.error
     global _traffic_stats, _known_connections, _prev_traffic_stats, _traffic_rates, _rate_history
 
     while True:
@@ -464,8 +537,14 @@ def _update_traffic_stats():
                 cutoff = now - _MAX_HISTORY_SECONDS
                 _rate_history[:] = [p for p in _rate_history if p["timestamp"] > cutoff]
 
-        except Exception:
+        except urllib.error.URLError:
+            # clash_api 连接失败是预期的（sing-box 可能未启动或正在重启）
             pass
+        except json.JSONDecodeError as e:
+            print(f"[Traffic] JSON 解析错误: {e}")
+        except Exception as e:
+            # 记录未预期的异常，但不中断线程
+            print(f"[Traffic] 流量统计异常: {type(e).__name__}: {e}")
 
         time.sleep(_RATE_INTERVAL)
 
@@ -832,6 +911,49 @@ def parse_wireguard_conf(content: str) -> Dict[str, Any]:
     return result
 
 
+@app.get("/api/health")
+def api_health():
+    """健康检查端点 - 用于容器编排和负载均衡
+
+    返回:
+    - status: "healthy" | "degraded" | "unhealthy"
+    - sing_box: sing-box 进程是否运行
+    - database: 数据库是否可访问
+    - timestamp: 检查时间
+    """
+    checks = {
+        "sing_box": False,
+        "database": False,
+    }
+
+    # 检查 sing-box 进程
+    checks["sing_box"] = list_processes("sing-box")
+
+    # 检查数据库连接
+    try:
+        if HAS_DATABASE and USER_DB_PATH.exists():
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            # 简单查询验证数据库可用
+            db.get_setting("health_check", "ok")
+            checks["database"] = True
+    except Exception:
+        checks["database"] = False
+
+    # 判断整体状态
+    if all(checks.values()):
+        status = "healthy"
+    elif checks["sing_box"]:
+        status = "degraded"
+    else:
+        status = "unhealthy"
+
+    return {
+        "status": status,
+        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/api/status")
 def api_status():
     config_stat = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
@@ -1083,12 +1205,10 @@ def api_get_pia_regions():
 @app.get("/api/pia/credentials-status")
 def api_pia_credentials_status():
     """检查 PIA 凭证是否可用"""
-    username = os.environ.get("PIA_USERNAME")
-    password = os.environ.get("PIA_PASSWORD")
-    has_credentials = bool(username and password)
+    has_creds = has_pia_credentials()
     return {
-        "has_credentials": has_credentials,
-        "message": "已登录" if has_credentials else "未登录，需要重新登录 PIA"
+        "has_credentials": has_creds,
+        "message": "已登录" if has_creds else "未登录，需要重新登录 PIA"
     }
 
 
@@ -1156,16 +1276,13 @@ def api_create_profile(payload: ProfileCreateRequest):
     )
 
     # 如果有 PIA 凭证，自动配置新线路
-    username = os.environ.get("PIA_USERNAME")
-    password = os.environ.get("PIA_PASSWORD")
+    username, password = get_pia_credentials()
     provision_result = None
 
     if username and password:
-        env = os.environ.copy()
+        env = _CredentialStore.get_env_for_subprocess()
         generated_config = Path("/etc/sing-box/sing-box.generated.json")
         env.update({
-            "PIA_USERNAME": username,
-            "PIA_PASSWORD": password,
             "PIA_PROFILES_FILE": str(PIA_PROFILES_FILE),
             "PIA_PROFILES_OUTPUT": str(PIA_PROFILES_OUTPUT),
             "SING_BOX_BASE_CONFIG": str(CONFIG_PATH),
@@ -1488,9 +1605,8 @@ def api_pia_login(payload: PiaLoginRequest):
     except requests.RequestException as exc:
         raise HTTPException(status_code=500, detail=f"无法连接 PIA 服务器: {exc}") from exc
 
-    # 保存凭证到当前进程的环境变量
-    os.environ["PIA_USERNAME"] = payload.username
-    os.environ["PIA_PASSWORD"] = payload.password
+    # 保存凭证到安全存储（内存，不暴露在 /proc/<pid>/environ）
+    set_pia_credentials(payload.username, payload.password)
 
     # 检查是否有 profiles 配置（从数据库读取）
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -1504,12 +1620,10 @@ def api_pia_login(payload: PiaLoginRequest):
         }
 
     # 有 profiles，运行完整的 provision 流程
-    env = os.environ.copy()
+    env = _CredentialStore.get_env_for_subprocess()
     generated_config = Path("/etc/sing-box/sing-box.generated.json")
     env.update(
         {
-            "PIA_USERNAME": payload.username,
-            "PIA_PASSWORD": payload.password,
             "PIA_PROFILES_FILE": str(PIA_PROFILES_FILE),
             "PIA_PROFILES_OUTPUT": str(PIA_PROFILES_OUTPUT),
             "SING_BOX_BASE_CONFIG": str(CONFIG_PATH),
@@ -1651,12 +1765,10 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     """重新连接指定的 VPN 线路
 
     此 API 会为指定的 profile 重新生成 WireGuard 密钥并重新连接。
-    需要先登录 PIA（凭证存储在环境变量中或之前的会话中）。
+    需要先登录 PIA（凭证存储在安全存储中或之前的会话中）。
     """
-    # 检查环境变量中是否有 PIA 凭证
-    username = os.environ.get("PIA_USERNAME")
-    password = os.environ.get("PIA_PASSWORD")
-    if not username or not password:
+    # 检查安全存储中是否有 PIA 凭证
+    if not has_pia_credentials():
         raise HTTPException(status_code=400, detail="PIA 凭证未设置，请通过登录页面登录")
 
     # 动态映射 tag 到 profile key（tag 用 - 分隔，key 用 _ 分隔）
@@ -1671,11 +1783,9 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
 
     # 为了重新连接单个 profile，我们运行 provision 脚本
     # 但只更新指定的 profile
-    env = os.environ.copy()
+    env = _CredentialStore.get_env_for_subprocess()
     generated_config = Path("/etc/sing-box/sing-box.generated.json")
     env.update({
-        "PIA_USERNAME": username,
-        "PIA_PASSWORD": password,
         "PIA_PROFILES_FILE": str(PIA_PROFILES_FILE),
         "PIA_PROFILES_OUTPUT": str(PIA_PROFILES_OUTPUT),
         "SING_BOX_BASE_CONFIG": str(CONFIG_PATH),
@@ -3588,8 +3698,7 @@ def api_export_backup(payload: BackupExportRequest):
 
     # 5. 导出 PIA 凭证（如果存在且用户要求）
     if payload.include_pia_credentials:
-        pia_username = os.environ.get("PIA_USERNAME", "")
-        pia_password = os.environ.get("PIA_PASSWORD", "")
+        pia_username, pia_password = get_pia_credentials()
         if pia_username and pia_password:
             pia_creds = {"username": pia_username, "password": pia_password}
             backup_data["pia_credentials"] = encrypt_sensitive_data(
@@ -3788,8 +3897,7 @@ def api_import_backup(payload: BackupImportRequest):
             )
             creds = json.loads(creds_json)
             if creds.get("username") and creds.get("password"):
-                os.environ["PIA_USERNAME"] = creds["username"]
-                os.environ["PIA_PASSWORD"] = creds["password"]
+                set_pia_credentials(creds["username"], creds["password"])
                 results["pia_credentials"] = True
         except Exception as exc:
             print(f"[backup] 导入 PIA 凭证失败: {exc}")
@@ -3875,7 +3983,7 @@ def api_backup_status():
         "ingress_peer_count": len(ingress.get("peers", [])),
         "custom_egress_count": len(custom_egress),
         "pia_profile_count": len(pia_profiles),
-        "has_pia_credentials": bool(os.environ.get("PIA_USERNAME")),
+        "has_pia_credentials": has_pia_credentials(),
         "has_settings": bool(settings.get("server_endpoint")),
     }
 

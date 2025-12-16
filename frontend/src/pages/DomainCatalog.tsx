@@ -95,19 +95,28 @@ export default function DomainCatalog() {
       return;
     }
 
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         setSearching(true);
         const res = await api.searchDomainLists(searchQuery);
-        setSearchResults(res.results);
+        // 仅在组件未卸载时更新状态
+        if (!cancelled) {
+          setSearchResults(res.results);
+        }
       } catch {
         // ignore search errors
       } finally {
-        setSearching(false);
+        if (!cancelled) {
+          setSearching(false);
+        }
       }
     }, 300);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [searchQuery]);
 
   // IP Search with debounce
@@ -117,19 +126,28 @@ export default function DomainCatalog() {
       return;
     }
 
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         setIpSearching(true);
         const res = await api.searchCountries(ipSearchQuery);
-        setIpSearchResults(res.results);
+        // 仅在组件未卸载时更新状态
+        if (!cancelled) {
+          setIpSearchResults(res.results);
+        }
       } catch {
         // ignore search errors
       } finally {
-        setIpSearching(false);
+        if (!cancelled) {
+          setIpSearching(false);
+        }
       }
     }, 300);
 
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [ipSearchQuery]);
 
   const toggleCategory = (categoryId: string) => {
