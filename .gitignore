@@ -85,8 +85,15 @@ docker-compose.local.yml
 CLAUDE.md
 CODE_REVIEW_REPORT.md
 
-# Misc
+# Test artifacts
 coverage/
+htmlcov/
+.coverage
+.pytest_cache/
+*.cover
+*.py,cover
+
+# Misc
 .cache/
 tmp/
 
