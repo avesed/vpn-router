@@ -6,6 +6,7 @@
 - geoip-geodata.db: 只读的地理位置和域名数据（系统数据）
 - user-config.db: 用户的路由规则和出口配置（用户数据）
 """
+import json
 import sqlite3
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -1019,6 +1020,142 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ OpenVPN Egress 管理（通过 SOCKS5 桥接）============
+
+    OPENVPN_SOCKS_PORT_START = 37001  # SOCKS 端口起始值
+
+    def get_openvpn_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 OpenVPN 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM openvpn_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM openvpn_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            result = []
+            for row in rows:
+                item = dict(zip(columns, row))
+                # 解析 extra_options JSON
+                if item.get("extra_options"):
+                    try:
+                        item["extra_options"] = json.loads(item["extra_options"])
+                    except:
+                        item["extra_options"] = None
+                result.append(item)
+            return result
+
+    def get_openvpn_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 OpenVPN 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM openvpn_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            item = dict(zip(columns, row))
+            if item.get("extra_options"):
+                try:
+                    item["extra_options"] = json.loads(item["extra_options"])
+                except:
+                    item["extra_options"] = None
+            return item
+
+    def get_next_openvpn_socks_port(self) -> int:
+        """获取下一个可用的 SOCKS 端口（从 37001 开始）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(socks_port) FROM openvpn_egress"
+            ).fetchone()
+            max_port = row[0] if row and row[0] else None
+            if max_port is None:
+                return self.OPENVPN_SOCKS_PORT_START
+            return max_port + 1
+
+    def add_openvpn_egress(
+        self,
+        tag: str,
+        remote_host: str,
+        ca_cert: str,
+        description: str = "",
+        protocol: str = "udp",
+        remote_port: int = 1194,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        tls_auth: Optional[str] = None,
+        tls_crypt: Optional[str] = None,
+        auth_user: Optional[str] = None,
+        auth_pass: Optional[str] = None,
+        cipher: str = "AES-256-GCM",
+        auth: str = "SHA256",
+        compress: Optional[str] = None,
+        extra_options: Optional[List[str]] = None
+    ) -> int:
+        """添加 OpenVPN 出口
+
+        Returns:
+            新创建记录的 ID
+        """
+        socks_port = self.get_next_openvpn_socks_port()
+        extra_options_json = json.dumps(extra_options) if extra_options else None
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO openvpn_egress
+                (tag, description, protocol, remote_host, remote_port,
+                 ca_cert, client_cert, client_key, tls_auth, tls_crypt,
+                 auth_user, auth_pass, cipher, auth, compress, extra_options, socks_port)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, description, protocol, remote_host, remote_port,
+                  ca_cert, client_cert, client_key, tls_auth, tls_crypt,
+                  auth_user, auth_pass, cipher, auth, compress, extra_options_json, socks_port))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_openvpn_egress(self, tag: str, **kwargs) -> bool:
+        """更新 OpenVPN 出口"""
+        allowed_fields = {
+            "description", "protocol", "remote_host", "remote_port",
+            "ca_cert", "client_cert", "client_key", "tls_auth", "tls_crypt",
+            "auth_user", "auth_pass", "cipher", "auth", "compress",
+            "extra_options", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                if key == "extra_options":
+                    value = json.dumps(value) if value else None
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE openvpn_egress SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_openvpn_egress(self, tag: str) -> bool:
+        """删除 OpenVPN 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM openvpn_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
@@ -1233,6 +1370,47 @@ class DatabaseManager:
 
     def delete_direct_egress(self, tag: str) -> bool:
         return self.user.delete_direct_egress(tag)
+
+    # OpenVPN Egress
+    def get_openvpn_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_openvpn_egress_list(enabled_only)
+
+    def get_openvpn_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_openvpn_egress(tag)
+
+    def get_next_openvpn_socks_port(self) -> int:
+        return self.user.get_next_openvpn_socks_port()
+
+    def add_openvpn_egress(
+        self,
+        tag: str,
+        remote_host: str,
+        ca_cert: str,
+        description: str = "",
+        protocol: str = "udp",
+        remote_port: int = 1194,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        tls_auth: Optional[str] = None,
+        tls_crypt: Optional[str] = None,
+        auth_user: Optional[str] = None,
+        auth_pass: Optional[str] = None,
+        cipher: str = "AES-256-GCM",
+        auth: str = "SHA256",
+        compress: Optional[str] = None,
+        extra_options: Optional[List[str]] = None
+    ) -> int:
+        return self.user.add_openvpn_egress(
+            tag, remote_host, ca_cert, description, protocol, remote_port,
+            client_cert, client_key, tls_auth, tls_crypt, auth_user, auth_pass,
+            cipher, auth, compress, extra_options
+        )
+
+    def update_openvpn_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_openvpn_egress(tag, **kwargs)
+
+    def delete_openvpn_egress(self, tag: str) -> bool:
+        return self.user.delete_openvpn_egress(tag)
 
 
 # 全局缓存

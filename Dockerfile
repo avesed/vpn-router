@@ -28,6 +28,7 @@ RUN set -eux; \
         iptables \
         iputils-ping \
         jq \
+        openvpn \
         procps \
         python3 \
         python3-pip \
@@ -41,7 +42,8 @@ RUN set -eux; \
         wireguard-tools \
         nginx-light; \
     pip3 install --no-cache-dir --break-system-packages cryptography; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
 
 # Download sing-box from GitHub releases
 ARG SINGBOX_VERSION=1.11.0
@@ -86,11 +88,14 @@ COPY scripts/api_server.py /usr/local/bin/api_server.py
 COPY scripts/db_helper.py /usr/local/bin/db_helper.py
 COPY scripts/init_user_db.py /usr/local/bin/init_user_db.py
 COPY scripts/convert_adblock.py /usr/local/bin/convert_adblock.py
+COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
+COPY scripts/socks5_proxy.py /usr/local/bin/socks5_proxy.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
     /usr/local/bin/api_server.py /usr/local/bin/init_user_db.py \
-    /usr/local/bin/convert_adblock.py
+    /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
+    /usr/local/bin/socks5_proxy.py
 
 # Note: Databases and config are mounted via docker-compose volumes
 # - geoip-geodata.db is pre-built and volume-mounted (49 MB, read-only)

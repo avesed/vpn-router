@@ -36,6 +36,12 @@ import type {
   DirectEgressCreateRequest,
   DirectEgressUpdateRequest,
   DirectEgressListResponse,
+  OpenVPNEgress,
+  OpenVPNEgressCreateRequest,
+  OpenVPNEgressUpdateRequest,
+  OpenVPNEgressListResponse,
+  OpenVPNParseResult,
+  OpenVPNTunnelStatus,
   DashboardStats
 } from "../types";
 
@@ -224,6 +230,30 @@ export const api = {
     }),
   deleteDirectEgress: (tag: string) =>
     request<{ message: string }>(`/egress/direct/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+
+  // OpenVPN Egress Management (通过 SOCKS5 代理桥接)
+  getOpenVPNEgress: () => request<OpenVPNEgressListResponse>("/egress/openvpn"),
+  getOpenVPNEgressByTag: (tag: string) =>
+    request<OpenVPNEgress>(`/egress/openvpn/${encodeURIComponent(tag)}`),
+  createOpenVPNEgress: (data: OpenVPNEgressCreateRequest) =>
+    request<{ message: string; egress: OpenVPNEgress }>("/egress/openvpn", {
+      method: "POST",
+      body: data
+    }),
+  updateOpenVPNEgress: (tag: string, data: OpenVPNEgressUpdateRequest) =>
+    request<{ message: string; egress: OpenVPNEgress }>(`/egress/openvpn/${encodeURIComponent(tag)}`, {
+      method: "PUT",
+      body: data
+    }),
+  deleteOpenVPNEgress: (tag: string) =>
+    request<{ message: string }>(`/egress/openvpn/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+  parseOpenVPNConfig: (content: string) =>
+    request<OpenVPNParseResult>("/egress/openvpn/parse", {
+      method: "POST",
+      body: { content }
+    }),
+  getOpenVPNTunnelStatus: (tag: string) =>
+    request<OpenVPNTunnelStatus>(`/egress/openvpn/${encodeURIComponent(tag)}/status`),
 
   // Backup / Restore
   getBackupStatus: () => request<BackupStatus>("/backup/status"),

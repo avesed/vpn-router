@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress } from "../types";
+import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult } from "../types";
 import {
   PlusIcon,
   TrashIcon,
@@ -20,11 +20,13 @@ import {
   ChevronUpDownIcon,
   MagnifyingGlassIcon,
   KeyIcon,
-  SignalIcon
+  SignalIcon,
+  LockClosedIcon
 } from "@heroicons/react/24/outline";
 
-type TabType = "all" | "pia" | "custom" | "direct";
+type TabType = "all" | "pia" | "custom" | "direct" | "openvpn";
 type ImportMethod = "upload" | "paste" | "manual";
+type OpenVPNImportMethod = "upload" | "paste" | "manual";
 
 export default function EgressManager() {
   const { t } = useTranslation();
@@ -93,20 +95,50 @@ export default function EgressManager() {
   const [directFormInet4Address, setDirectFormInet4Address] = useState("");
   const [directFormInet6Address, setDirectFormInet6Address] = useState("");
 
+  // OpenVPN egress state
+  const [openvpnEgress, setOpenvpnEgress] = useState<OpenVPNEgress[]>([]);
+  const [showOpenvpnModal, setShowOpenvpnModal] = useState(false);
+  const [openvpnModalMode, setOpenvpnModalMode] = useState<"add" | "edit">("add");
+  const [editingOpenvpnEgress, setEditingOpenvpnEgress] = useState<OpenVPNEgress | null>(null);
+  const [openvpnImportMethod, setOpenvpnImportMethod] = useState<OpenVPNImportMethod>("upload");
+  const [openvpnPasteContent, setOpenvpnPasteContent] = useState("");
+  const [openvpnParsedConfig, setOpenvpnParsedConfig] = useState<OpenVPNParseResult | null>(null);
+  const [openvpnParseError, setOpenvpnParseError] = useState<string | null>(null);
+  const openvpnFileInputRef = useRef<HTMLInputElement>(null);
+  // OpenVPN form fields
+  const [openvpnFormTag, setOpenvpnFormTag] = useState("");
+  const [openvpnFormDescription, setOpenvpnFormDescription] = useState("");
+  const [openvpnFormProtocol, setOpenvpnFormProtocol] = useState<"udp" | "tcp">("udp");
+  const [openvpnFormRemoteHost, setOpenvpnFormRemoteHost] = useState("");
+  const [openvpnFormRemotePort, setOpenvpnFormRemotePort] = useState(1194);
+  const [openvpnFormCaCert, setOpenvpnFormCaCert] = useState("");
+  const [openvpnFormClientCert, setOpenvpnFormClientCert] = useState("");
+  const [openvpnFormClientKey, setOpenvpnFormClientKey] = useState("");
+  const [openvpnFormTlsAuth, setOpenvpnFormTlsAuth] = useState("");
+  const [openvpnFormTlsCrypt, setOpenvpnFormTlsCrypt] = useState("");
+  const [openvpnFormAuthUser, setOpenvpnFormAuthUser] = useState("");
+  const [openvpnFormAuthPass, setOpenvpnFormAuthPass] = useState("");
+  const [openvpnFormCipher, setOpenvpnFormCipher] = useState("AES-256-GCM");
+  const [openvpnFormAuth, setOpenvpnFormAuth] = useState("SHA256");
+  const [openvpnFormCompress, setOpenvpnFormCompress] = useState("");
+  const [openvpnFormExtraOptions, setOpenvpnFormExtraOptions] = useState("");
+
   const loadEgress = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const [allData, customData, profilesData, directData] = await Promise.all([
+      const [allData, customData, profilesData, directData, openvpnData] = await Promise.all([
         api.getAllEgress(),
         api.getCustomEgress(),
         api.getProfiles(),
-        api.getDirectEgress()
+        api.getDirectEgress(),
+        api.getOpenVPNEgress()
       ]);
       setPiaEgress(allData.pia);
       setCustomEgress(customData.egress);
       setPiaProfiles(profilesData.profiles);
       setDirectEgress(directData.egress);
+      setOpenvpnEgress(openvpnData.egress);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
@@ -173,6 +205,30 @@ export default function EgressManager() {
     setDirectFormInet4Address("");
     setDirectFormInet6Address("");
     setEditingDirectEgress(null);
+  };
+
+  const resetOpenvpnForm = () => {
+    setOpenvpnFormTag("");
+    setOpenvpnFormDescription("");
+    setOpenvpnFormProtocol("udp");
+    setOpenvpnFormRemoteHost("");
+    setOpenvpnFormRemotePort(1194);
+    setOpenvpnFormCaCert("");
+    setOpenvpnFormClientCert("");
+    setOpenvpnFormClientKey("");
+    setOpenvpnFormTlsAuth("");
+    setOpenvpnFormTlsCrypt("");
+    setOpenvpnFormAuthUser("");
+    setOpenvpnFormAuthPass("");
+    setOpenvpnFormCipher("AES-256-GCM");
+    setOpenvpnFormAuth("SHA256");
+    setOpenvpnFormCompress("");
+    setOpenvpnFormExtraOptions("");
+    setOpenvpnParsedConfig(null);
+    setOpenvpnPasteContent("");
+    setOpenvpnParseError(null);
+    setEditingOpenvpnEgress(null);
+    setOpenvpnImportMethod("upload");
   };
 
   // Close dropdown when clicking outside
@@ -544,12 +600,168 @@ export default function EgressManager() {
     }
   };
 
-  const filteredPia = activeTab === "custom" || activeTab === "direct" ? [] : piaProfiles;
-  const filteredCustom = activeTab === "pia" || activeTab === "direct" ? [] : customEgress;
-  const filteredDirect = activeTab === "pia" || activeTab === "custom" ? [] : directEgress;
-  const totalCount = piaProfiles.length + customEgress.length + directEgress.length;
+  // ============ OpenVPN Egress Management ============
 
-  if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length) {
+  const handleAddOpenvpnEgress = () => {
+    resetOpenvpnForm();
+    setOpenvpnModalMode("add");
+    setShowOpenvpnModal(true);
+  };
+
+  const handleEditOpenvpnEgress = (egress: OpenVPNEgress) => {
+    setEditingOpenvpnEgress(egress);
+    setOpenvpnFormTag(egress.tag);
+    setOpenvpnFormDescription(egress.description || "");
+    setOpenvpnFormProtocol(egress.protocol);
+    setOpenvpnFormRemoteHost(egress.remote_host);
+    setOpenvpnFormRemotePort(egress.remote_port);
+    setOpenvpnFormCaCert(egress.ca_cert);
+    setOpenvpnFormClientCert(egress.client_cert || "");
+    setOpenvpnFormClientKey(egress.client_key || "");
+    setOpenvpnFormTlsAuth(egress.tls_auth || "");
+    setOpenvpnFormTlsCrypt(egress.tls_crypt || "");
+    setOpenvpnFormAuthUser(egress.auth_user || "");
+    setOpenvpnFormAuthPass(egress.auth_pass || "");
+    setOpenvpnFormCipher(egress.cipher);
+    setOpenvpnFormAuth(egress.auth);
+    setOpenvpnFormCompress(egress.compress || "");
+    setOpenvpnFormExtraOptions(egress.extra_options || "");
+    setOpenvpnModalMode("edit");
+    setShowOpenvpnModal(true);
+  };
+
+  const handleOpenvpnFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const content = await file.text();
+      await parseOpenvpnConfig(content);
+      const baseName = file.name.replace(/\.(ovpn|conf)$/i, "").toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      setOpenvpnFormTag(baseName);
+    } catch (err) {
+      setOpenvpnParseError(err instanceof Error ? err.message : t('openvpnEgress.parseFailed'));
+    }
+  };
+
+  const parseOpenvpnConfig = async (content: string) => {
+    try {
+      setOpenvpnParseError(null);
+      const result = await api.parseOpenVPNConfig(content);
+      setOpenvpnParsedConfig(result);
+      if (result.protocol) setOpenvpnFormProtocol(result.protocol as "udp" | "tcp");
+      if (result.remote_host) setOpenvpnFormRemoteHost(result.remote_host);
+      if (result.remote_port) setOpenvpnFormRemotePort(result.remote_port);
+      if (result.ca_cert) setOpenvpnFormCaCert(result.ca_cert);
+      if (result.client_cert) setOpenvpnFormClientCert(result.client_cert);
+      if (result.client_key) setOpenvpnFormClientKey(result.client_key);
+      if (result.tls_auth) setOpenvpnFormTlsAuth(result.tls_auth);
+      if (result.tls_crypt) setOpenvpnFormTlsCrypt(result.tls_crypt);
+      if (result.cipher) setOpenvpnFormCipher(result.cipher);
+      if (result.auth) setOpenvpnFormAuth(result.auth);
+      if (result.compress) setOpenvpnFormCompress(result.compress);
+      setSuccessMessage(t('openvpnEgress.parseSuccess'));
+      setTimeout(() => setSuccessMessage(null), 2000);
+    } catch (err) {
+      setOpenvpnParseError(err instanceof Error ? err.message : t('openvpnEgress.parseFailed'));
+    }
+  };
+
+  const handleCreateOpenvpnEgress = async () => {
+    if (!openvpnFormTag || !openvpnFormRemoteHost || !openvpnFormCaCert) {
+      setError(t('openvpnEgress.fillRequiredFields'));
+      return;
+    }
+
+    setActionLoading("create-openvpn");
+    try {
+      await api.createOpenVPNEgress({
+        tag: openvpnFormTag,
+        description: openvpnFormDescription,
+        protocol: openvpnFormProtocol,
+        remote_host: openvpnFormRemoteHost,
+        remote_port: openvpnFormRemotePort,
+        ca_cert: openvpnFormCaCert,
+        client_cert: openvpnFormClientCert || undefined,
+        client_key: openvpnFormClientKey || undefined,
+        tls_auth: openvpnFormTlsAuth || undefined,
+        tls_crypt: openvpnFormTlsCrypt || undefined,
+        auth_user: openvpnFormAuthUser || undefined,
+        auth_pass: openvpnFormAuthPass || undefined,
+        cipher: openvpnFormCipher,
+        auth: openvpnFormAuth,
+        compress: openvpnFormCompress || undefined,
+        extra_options: openvpnFormExtraOptions || undefined
+      });
+      setSuccessMessage(t('openvpnEgress.createSuccess', { tag: openvpnFormTag }));
+      setShowOpenvpnModal(false);
+      resetOpenvpnForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.createFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleUpdateOpenvpnEgress = async () => {
+    if (!editingOpenvpnEgress) return;
+
+    setActionLoading("update-openvpn");
+    try {
+      await api.updateOpenVPNEgress(editingOpenvpnEgress.tag, {
+        description: openvpnFormDescription,
+        protocol: openvpnFormProtocol,
+        remote_host: openvpnFormRemoteHost,
+        remote_port: openvpnFormRemotePort,
+        ca_cert: openvpnFormCaCert,
+        client_cert: openvpnFormClientCert || undefined,
+        client_key: openvpnFormClientKey || undefined,
+        tls_auth: openvpnFormTlsAuth || undefined,
+        tls_crypt: openvpnFormTlsCrypt || undefined,
+        auth_user: openvpnFormAuthUser || undefined,
+        auth_pass: openvpnFormAuthPass || undefined,
+        cipher: openvpnFormCipher,
+        auth: openvpnFormAuth,
+        compress: openvpnFormCompress || undefined,
+        extra_options: openvpnFormExtraOptions || undefined
+      });
+      setSuccessMessage(t('openvpnEgress.updateSuccess', { tag: editingOpenvpnEgress.tag }));
+      setShowOpenvpnModal(false);
+      resetOpenvpnForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.updateFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDeleteOpenvpnEgress = async (tag: string) => {
+    if (!confirm(t('openvpnEgress.confirmDelete', { tag }))) return;
+
+    setActionLoading(`delete-openvpn-${tag}`);
+    try {
+      await api.deleteOpenVPNEgress(tag);
+      setSuccessMessage(t('openvpnEgress.deleteSuccess', { tag }));
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.deleteFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" ? [] : piaProfiles;
+  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" ? [] : customEgress;
+  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" ? [] : directEgress;
+  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" ? [] : openvpnEgress;
+  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + openvpnEgress.length;
+
+  if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length && !openvpnEgress.length) {
     return (
       <div className="flex items-center justify-center min-h-64">
         <div className="animate-spin rounded-full h-12 w-12 border-4 border-brand border-t-transparent" />
@@ -660,7 +872,8 @@ export default function EgressManager() {
           { key: "all", label: `${t('common.all')} (${totalCount})` },
           { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
           { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` },
-          { key: "direct", label: `Direct (${directEgress.length})` }
+          { key: "direct", label: `${t('egress.direct')} (${directEgress.length})` },
+          { key: "openvpn", label: `${t('egress.openvpn')} (${openvpnEgress.length})` }
         ].map((tab) => (
           <button
             key={tab.key}
@@ -677,11 +890,11 @@ export default function EgressManager() {
       </div>
 
       {/* Egress List */}
-      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 ? (
+      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 ? (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "direct" ? t('directEgress.noDirectEgress') : t('egress.noEgressFound')}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "direct" ? t('directEgress.noDirectEgress') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : t('egress.noEgressFound')}
           </p>
           {activeTab !== "all" && (
             <div className="mt-4">
@@ -707,6 +920,14 @@ export default function EgressManager() {
                   className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-600 text-white text-sm font-medium"
                 >
                   {t('directEgress.addDirectEgress')}
+                </button>
+              )}
+              {activeTab === "openvpn" && (
+                <button
+                  onClick={handleAddOpenvpnEgress}
+                  className="px-4 py-2 rounded-lg bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium"
+                >
+                  {t('openvpnEgress.addOpenvpnEgress')}
                 </button>
               )}
             </div>
@@ -957,6 +1178,84 @@ export default function EgressManager() {
                       {egress.inet6_bind_address && (
                         <p className="text-xs font-mono text-slate-400">
                           <span className="text-slate-500">IPv6:</span> {egress.inet6_bind_address}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* OpenVPN Egress */}
+          {filteredOpenvpn.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
+                  <LockClosedIcon className="h-4 w-4" />
+                  {t('openvpnEgress.title')} ({filteredOpenvpn.length})
+                </h3>
+                {activeTab === "openvpn" && (
+                  <button
+                    onClick={handleAddOpenvpnEgress}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-orange-500/20 hover:bg-orange-500/30 text-orange-400 text-xs font-medium transition-colors"
+                  >
+                    <PlusIcon className="h-3.5 w-3.5" />
+                    {t('openvpnEgress.addEgress')}
+                  </button>
+                )}
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {filteredOpenvpn.map((egress) => (
+                  <div
+                    key={egress.tag}
+                    className={`rounded-xl border p-4 ${egress.enabled ? "bg-orange-500/5 border-orange-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className={`p-2 rounded-lg ${egress.enabled ? "bg-orange-500/20" : "bg-white/10"}`}>
+                          <LockClosedIcon className={`h-5 w-5 ${egress.enabled ? "text-orange-400" : "text-slate-400"}`} />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-semibold text-white">{egress.tag}</h4>
+                            {egress.enabled ? (
+                              <CheckCircleIcon className="h-4 w-4 text-orange-400" />
+                            ) : (
+                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                            )}
+                          </div>
+                          <p className="text-xs text-slate-500">{egress.description || t('openvpnEgress.defaultDescription')}</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-1">
+                        <button
+                          onClick={() => handleEditOpenvpnEgress(egress)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                          title={t('common.edit')}
+                        >
+                          <PencilIcon className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteOpenvpnEgress(egress.tag)}
+                          disabled={actionLoading === `delete-openvpn-${egress.tag}`}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
+                          title={t('common.delete')}
+                        >
+                          <TrashIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('openvpnEgress.remoteHost')}:</span> {egress.remote_host}:{egress.remote_port}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('openvpnEgress.protocol')}:</span> {egress.protocol.toUpperCase()}
+                      </p>
+                      {egress.socks_port && (
+                        <p className="text-xs font-mono text-slate-400">
+                          <span className="text-slate-500">{t('openvpnEgress.socksPort')}:</span> {egress.socks_port}
                         </p>
                       )}
                     </div>
@@ -1656,6 +1955,341 @@ export default function EgressManager() {
                   <CheckIcon className="h-4 w-4" />
                 )}
                 {directModalMode === "add" ? t('common.add') : t('common.save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* OpenVPN Modal */}
+      {showOpenvpnModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
+          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl m-4">
+            <div className="p-6 border-b border-white/10">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold text-white">
+                  {openvpnModalMode === "add" ? t('openvpnEgress.addOpenvpnEgress') : t('openvpnEgress.editTitle')}
+                </h2>
+                <button
+                  onClick={() => {
+                    setShowOpenvpnModal(false);
+                    resetOpenvpnForm();
+                  }}
+                  className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                >
+                  <XMarkIcon className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
+              {/* Import Method (only for add mode) */}
+              {openvpnModalMode === "add" && (
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.importOvpn')}</label>
+                  <div className="flex gap-2">
+                    {["upload", "paste", "manual"].map((method) => (
+                      <button
+                        key={method}
+                        onClick={() => setOpenvpnImportMethod(method as OpenVPNImportMethod)}
+                        className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                          openvpnImportMethod === method
+                            ? "bg-orange-500/20 text-orange-400 border border-orange-500/30"
+                            : "bg-white/5 text-slate-400 border border-white/10 hover:bg-white/10"
+                        }`}
+                      >
+                        {method === "upload" ? t('openvpnEgress.uploadOvpn') : method === "paste" ? t('openvpnEgress.pasteOvpn') : t('customEgress.manualInput')}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Upload .ovpn file */}
+              {openvpnModalMode === "add" && openvpnImportMethod === "upload" && (
+                <div>
+                  <input
+                    type="file"
+                    ref={openvpnFileInputRef}
+                    accept=".ovpn,.conf"
+                    onChange={handleOpenvpnFileUpload}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => openvpnFileInputRef.current?.click()}
+                    className="w-full p-8 rounded-xl border-2 border-dashed border-white/20 hover:border-orange-500/50 transition-colors flex flex-col items-center gap-2"
+                  >
+                    <ArrowUpTrayIcon className="h-8 w-8 text-slate-400" />
+                    <span className="text-slate-400">{t('customEgress.clickToUpload')}</span>
+                    <span className="text-xs text-slate-500">{t('customEgress.uploadHint')}</span>
+                  </button>
+                  {openvpnParsedConfig && (
+                    <div className="mt-2 p-2 rounded bg-emerald-500/10 text-emerald-400 text-sm flex items-center gap-2">
+                      <CheckIcon className="h-4 w-4" />
+                      {t('openvpnEgress.parseSuccess')}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Paste config */}
+              {openvpnModalMode === "add" && openvpnImportMethod === "paste" && (
+                <div className="space-y-3">
+                  <textarea
+                    value={openvpnPasteContent}
+                    onChange={(e) => setOpenvpnPasteContent(e.target.value)}
+                    placeholder={t('openvpnEgress.pastePlaceholder')}
+                    className="w-full h-40 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-sm"
+                  />
+                  <button
+                    onClick={() => parseOpenvpnConfig(openvpnPasteContent)}
+                    disabled={!openvpnPasteContent.trim()}
+                    className="px-4 py-2 rounded-lg bg-orange-500/20 text-orange-400 text-sm font-medium disabled:opacity-50"
+                  >
+                    {t('openvpnEgress.parseConfig')}
+                  </button>
+                  {openvpnParseError && (
+                    <div className="p-2 rounded bg-red-500/10 text-red-400 text-sm">{openvpnParseError}</div>
+                  )}
+                </div>
+              )}
+
+              {/* Form fields */}
+              {(openvpnImportMethod === "manual" || openvpnParsedConfig || openvpnModalMode === "edit") && (
+                <div className="space-y-4">
+                  {/* Tag (only for add mode) */}
+                  {openvpnModalMode === "add" && (
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('openvpnEgress.tag')} <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={openvpnFormTag}
+                        onChange={(e) => setOpenvpnFormTag(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))}
+                        placeholder={t('openvpnEgress.tagPlaceholder')}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                      <p className="text-xs text-slate-500 mt-1">{t('openvpnEgress.tagHint')}</p>
+                    </div>
+                  )}
+
+                  {/* Description */}
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">{t('common.description')}</label>
+                    <input
+                      type="text"
+                      value={openvpnFormDescription}
+                      onChange={(e) => setOpenvpnFormDescription(e.target.value)}
+                      placeholder={t('openvpnEgress.descriptionPlaceholder')}
+                      className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                    />
+                  </div>
+
+                  {/* Server info row */}
+                  <div className="grid grid-cols-4 gap-3">
+                    <div className="col-span-2">
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('openvpnEgress.remoteHost')} <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={openvpnFormRemoteHost}
+                        onChange={(e) => setOpenvpnFormRemoteHost(e.target.value)}
+                        placeholder={t('openvpnEgress.remoteHostPlaceholder')}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.remotePort')}</label>
+                      <input
+                        type="number"
+                        value={openvpnFormRemotePort}
+                        onChange={(e) => setOpenvpnFormRemotePort(parseInt(e.target.value) || 1194)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.protocol')}</label>
+                      <select
+                        value={openvpnFormProtocol}
+                        onChange={(e) => setOpenvpnFormProtocol(e.target.value as "udp" | "tcp")}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                      >
+                        <option value="udp">{t('openvpnEgress.udp')}</option>
+                        <option value="tcp">{t('openvpnEgress.tcp')}</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* CA Certificate */}
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">
+                      {t('openvpnEgress.caCert')} <span className="text-red-400">*</span>
+                    </label>
+                    <textarea
+                      value={openvpnFormCaCert}
+                      onChange={(e) => setOpenvpnFormCaCert(e.target.value)}
+                      placeholder={t('openvpnEgress.caCertPlaceholder')}
+                      className="w-full h-24 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">{t('openvpnEgress.caCertHint')}</p>
+                  </div>
+
+                  {/* Client Certificate & Key row */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.clientCert')}</label>
+                      <textarea
+                        value={openvpnFormClientCert}
+                        onChange={(e) => setOpenvpnFormClientCert(e.target.value)}
+                        placeholder={t('openvpnEgress.clientCertPlaceholder')}
+                        className="w-full h-20 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.clientKey')}</label>
+                      <textarea
+                        value={openvpnFormClientKey}
+                        onChange={(e) => setOpenvpnFormClientKey(e.target.value)}
+                        placeholder={t('openvpnEgress.clientKeyPlaceholder')}
+                        className="w-full h-20 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  {/* TLS Auth/Crypt row */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.tlsAuth')}</label>
+                      <textarea
+                        value={openvpnFormTlsAuth}
+                        onChange={(e) => setOpenvpnFormTlsAuth(e.target.value)}
+                        placeholder={t('openvpnEgress.tlsAuthPlaceholder')}
+                        className="w-full h-20 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.tlsCrypt')}</label>
+                      <textarea
+                        value={openvpnFormTlsCrypt}
+                        onChange={(e) => setOpenvpnFormTlsCrypt(e.target.value)}
+                        placeholder={t('openvpnEgress.tlsCryptPlaceholder')}
+                        className="w-full h-20 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Auth User/Pass row */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.authUser')}</label>
+                      <input
+                        type="text"
+                        value={openvpnFormAuthUser}
+                        onChange={(e) => setOpenvpnFormAuthUser(e.target.value)}
+                        placeholder={t('openvpnEgress.authUserPlaceholder')}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.authPass')}</label>
+                      <input
+                        type="password"
+                        value={openvpnFormAuthPass}
+                        onChange={(e) => setOpenvpnFormAuthPass(e.target.value)}
+                        placeholder={t('openvpnEgress.authPassPlaceholder')}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Cipher/Auth/Compress row */}
+                  <div className="grid grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.cipher')}</label>
+                      <select
+                        value={openvpnFormCipher}
+                        onChange={(e) => setOpenvpnFormCipher(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                      >
+                        <option value="AES-256-GCM">AES-256-GCM</option>
+                        <option value="AES-128-GCM">AES-128-GCM</option>
+                        <option value="AES-256-CBC">AES-256-CBC</option>
+                        <option value="AES-128-CBC">AES-128-CBC</option>
+                        <option value="CHACHA20-POLY1305">CHACHA20-POLY1305</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.auth')}</label>
+                      <select
+                        value={openvpnFormAuth}
+                        onChange={(e) => setOpenvpnFormAuth(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                      >
+                        <option value="SHA256">SHA256</option>
+                        <option value="SHA512">SHA512</option>
+                        <option value="SHA1">SHA1</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.compress')}</label>
+                      <select
+                        value={openvpnFormCompress}
+                        onChange={(e) => setOpenvpnFormCompress(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                      >
+                        <option value="">{t('openvpnEgress.compressNone')}</option>
+                        <option value="lzo">LZO</option>
+                        <option value="lz4">LZ4</option>
+                        <option value="lz4-v2">LZ4-V2</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Extra Options */}
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.extraOptions')}</label>
+                    <textarea
+                      value={openvpnFormExtraOptions}
+                      onChange={(e) => setOpenvpnFormExtraOptions(e.target.value)}
+                      placeholder={t('openvpnEgress.extraOptionsPlaceholder')}
+                      className="w-full h-16 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">{t('openvpnEgress.extraOptionsHint')}</p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowOpenvpnModal(false);
+                  resetOpenvpnForm();
+                }}
+                className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={openvpnModalMode === "add" ? handleCreateOpenvpnEgress : handleUpdateOpenvpnEgress}
+                disabled={
+                  (openvpnModalMode === "add" ? actionLoading === "create-openvpn" : actionLoading === "update-openvpn") ||
+                  (openvpnModalMode === "add" && !openvpnFormTag) ||
+                  !openvpnFormRemoteHost ||
+                  !openvpnFormCaCert
+                }
+                className="px-4 py-2 rounded-lg bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+              >
+                {(actionLoading === "create-openvpn" || actionLoading === "update-openvpn") ? (
+                  <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                ) : openvpnModalMode === "add" ? (
+                  <PlusIcon className="h-4 w-4" />
+                ) : (
+                  <CheckIcon className="h-4 w-4" />
+                )}
+                {openvpnModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
           </div>

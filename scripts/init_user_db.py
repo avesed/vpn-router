@@ -141,6 +141,43 @@ CREATE TABLE IF NOT EXISTS direct_egress (
 );
 CREATE INDEX IF NOT EXISTS idx_direct_egress_tag ON direct_egress(tag);
 
+-- OpenVPN 出口表（通过 SOCKS5 代理桥接）
+CREATE TABLE IF NOT EXISTS openvpn_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+
+    -- 连接配置
+    protocol TEXT DEFAULT 'udp',      -- udp 或 tcp
+    remote_host TEXT NOT NULL,        -- 远程服务器地址
+    remote_port INTEGER DEFAULT 1194, -- 远程服务器端口
+
+    -- 证书和认证（PEM 格式）
+    ca_cert TEXT NOT NULL,            -- CA 证书
+    client_cert TEXT,                 -- 客户端证书（可选）
+    client_key TEXT,                  -- 客户端私钥（可选）
+    tls_auth TEXT,                    -- TLS Auth 密钥（可选）
+    tls_crypt TEXT,                   -- TLS Crypt 密钥（可选，与 tls_auth 二选一）
+    auth_user TEXT,                   -- 用户名认证（可选）
+    auth_pass TEXT,                   -- 密码认证（可选）
+
+    -- OpenVPN 选项
+    cipher TEXT DEFAULT 'AES-256-GCM',
+    auth TEXT DEFAULT 'SHA256',
+    compress TEXT,                    -- 压缩算法（lzo, lz4, etc.）
+    extra_options TEXT,               -- 额外的 OpenVPN 选项（JSON 数组）
+
+    -- SOCKS5 代理（自动分配端口）
+    socks_port INTEGER UNIQUE,        -- 本地 SOCKS5 代理端口
+
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_openvpn_egress_tag ON openvpn_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_openvpn_egress_enabled ON openvpn_egress(enabled);
+
 -- 远程规则集表（广告拦截等）
 CREATE TABLE IF NOT EXISTS remote_rule_sets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -435,6 +472,7 @@ def main():
         "pia_profiles": cursor.execute("SELECT COUNT(*) FROM pia_profiles").fetchone()[0],
         "custom_egress": cursor.execute("SELECT COUNT(*) FROM custom_egress").fetchone()[0],
         "direct_egress": cursor.execute("SELECT COUNT(*) FROM direct_egress").fetchone()[0],
+        "openvpn_egress": cursor.execute("SELECT COUNT(*) FROM openvpn_egress").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
     }
 
@@ -451,6 +489,7 @@ def main():
     print(f"PIA Profiles:     {stats['pia_profiles']:,}")
     print(f"自定义 WG 出口:   {stats['custom_egress']:,}")
     print(f"Direct 出口:      {stats['direct_egress']:,}")
+    print(f"OpenVPN 出口:     {stats['openvpn_egress']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

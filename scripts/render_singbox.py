@@ -412,6 +412,97 @@ def load_direct_egress() -> List[dict]:
         return []
 
 
+def load_openvpn_egress() -> List[dict]:
+    """从数据库加载 OpenVPN 出口配置"""
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress_list = db.get_openvpn_egress_list(enabled_only=True)
+        return egress_list
+    except Exception as e:
+        print(f"[render] 从数据库加载 OpenVPN 出口配置失败: {e}")
+        return []
+
+
+def ensure_openvpn_egress_outbounds(config: dict, openvpn_egress: List[dict]) -> List[str]:
+    """确保每个 OpenVPN 出口都有对应的 SOCKS5 outbound
+
+    OpenVPN 隧道通过 SOCKS5 代理桥接到 sing-box:
+    - 每个 OpenVPN 隧道运行独立进程
+    - 每个隧道有对应的 SOCKS5 代理（监听 127.0.0.1:socks_port）
+    - sing-box 通过 SOCKS outbound 连接到 OpenVPN 隧道
+
+    Args:
+        config: sing-box 配置
+        openvpn_egress: OpenVPN 出口列表
+
+    Returns:
+        所有 OpenVPN 出口的 tag 列表
+    """
+    if not openvpn_egress:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    openvpn_tags = []
+
+    for egress in openvpn_egress:
+        tag = egress.get("tag")
+        socks_port = egress.get("socks_port")
+
+        if not tag or not socks_port:
+            print(f"[render] 警告: OpenVPN 出口缺少 tag 或 socks_port，跳过")
+            continue
+
+        openvpn_tags.append(tag)
+
+        # 构建 SOCKS outbound
+        outbound = {
+            "type": "socks",
+            "tag": tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port
+        }
+
+        if tag in existing_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag and ob.get("type") == "socks":
+                    outbounds[i] = outbound
+                    break
+        else:
+            # 在 block 之前插入
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+            print(f"[render] 创建 OpenVPN 出口 (SOCKS): {tag} -> 127.0.0.1:{socks_port}")
+
+    return openvpn_tags
+
+
+def ensure_openvpn_dns_servers(config: dict, openvpn_tags: List[str]) -> None:
+    """为 OpenVPN 出口添加 DNS 服务器
+
+    由于 OpenVPN 隧道可能有自己的 DNS 服务器，
+    这里使用 Cloudflare DNS 通过 SOCKS 代理访问。
+    """
+    if not openvpn_tags:
+        return
+
+    dns = config.setdefault("dns", {})
+    servers = dns.setdefault("servers", [])
+    existing_tags = {s.get("tag") for s in servers}
+
+    for tag in openvpn_tags:
+        dns_tag = f"{tag}-dns"
+        if dns_tag not in existing_tags:
+            servers.append({
+                "tag": dns_tag,
+                "address": "tls://1.1.1.1",
+                "detour": tag
+            })
+
+
 def ensure_direct_egress_outbounds(config: dict, direct_egress: List[dict]) -> List[str]:
     """确保每个 direct 出口都有对应的 outbound
 
@@ -909,6 +1000,14 @@ def main() -> None:
         print(f"[render] 处理 {len(direct_egress)} 个 direct 出口")
         direct_tags = ensure_direct_egress_outbounds(config, direct_egress)
         all_egress_tags.extend(direct_tags)
+
+    # 加载并处理 OpenVPN 出口（通过 SOCKS5 代理桥接）
+    openvpn_egress = load_openvpn_egress()
+    if openvpn_egress:
+        print(f"[render] 处理 {len(openvpn_egress)} 个 OpenVPN 出口")
+        openvpn_tags = ensure_openvpn_egress_outbounds(config, openvpn_egress)
+        ensure_openvpn_dns_servers(config, openvpn_tags)
+        all_egress_tags.extend(openvpn_tags)
 
     # 清理不再存在于数据库中的旧端点
     cleanup_stale_endpoints(config, all_egress_tags)

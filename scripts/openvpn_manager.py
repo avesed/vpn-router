@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+OpenVPN 隧道管理器
+
+管理多个 OpenVPN 进程和对应的 SOCKS5 代理，支持：
+- 从数据库读取配置
+- 生成 OpenVPN 配置文件
+- 启动/停止 OpenVPN 进程
+- 启动/停止 SOCKS5 代理
+- 监控隧道状态
+
+使用方法:
+    python3 openvpn_manager.py start     # 启动所有启用的隧道
+    python3 openvpn_manager.py stop      # 停止所有隧道
+    python3 openvpn_manager.py reload    # 重载配置（停止已删除，启动新增）
+    python3 openvpn_manager.py status    # 显示所有隧道状态
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+# 添加脚本目录到 Python 路径
+sys.path.insert(0, str(Path(__file__).parent))
+
+from db_helper import get_db
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[openvpn-mgr] %(asctime)s %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# 配置路径
+OPENVPN_RUN_DIR = Path("/run/openvpn")
+OPENVPN_LOG_DIR = Path("/var/log/openvpn")
+GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
+USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
+
+
+@dataclass
+class TunnelProcess:
+    """存储隧道进程信息"""
+    tag: str
+    openvpn_pid: Optional[int] = None
+    socks_pid: Optional[int] = None
+    tun_device: Optional[str] = None
+    socks_port: int = 0
+    status: str = "stopped"  # stopped, starting, connected, error
+
+
+class OpenVPNManager:
+    """OpenVPN 隧道管理器"""
+
+    def __init__(self):
+        self.tunnels: Dict[str, TunnelProcess] = {}
+        self.db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        self._tun_counter = 0
+        self._running = False
+
+    def _get_next_tun_device(self) -> str:
+        """获取下一个可用的 tun 设备名"""
+        # 使用 tun10+ 避免与系统其他 tun 冲突
+        device = f"tun{10 + self._tun_counter}"
+        self._tun_counter += 1
+        return device
+
+    def _generate_config(self, egress: dict) -> Path:
+        """生成 OpenVPN 配置文件"""
+        tag = egress["tag"]
+        config_dir = OPENVPN_RUN_DIR / tag
+        config_dir.mkdir(parents=True, exist_ok=True)
+
+        # 分配 tun 设备
+        tun_device = self._get_next_tun_device()
+
+        # 生成配置文件
+        config_lines = [
+            "client",
+            f"dev {tun_device}",
+            "dev-type tun",
+            f"proto {egress.get('protocol', 'udp')}",
+            f"remote {egress['remote_host']} {egress.get('remote_port', 1194)}",
+            "resolv-retry infinite",
+            "nobind",
+            "persist-key",
+            "persist-tun",
+            "remote-cert-tls server",
+            f"cipher {egress.get('cipher', 'AES-256-GCM')}",
+            f"auth {egress.get('auth', 'SHA256')}",
+            "verb 3",
+            "mute 20",
+            # 重要：不要拉取服务器推送的路由，避免影响默认路由
+            "route-nopull",
+            # 日志
+            f"log {OPENVPN_LOG_DIR / tag}.log",
+            "status /dev/null",
+            # 脚本安全
+            "script-security 2",
+        ]
+
+        # 压缩
+        if egress.get("compress"):
+            config_lines.append(f"compress {egress['compress']}")
+
+        # 写入 CA 证书
+        ca_path = config_dir / "ca.crt"
+        ca_path.write_text(egress["ca_cert"])
+        config_lines.append(f"ca {ca_path}")
+
+        # 客户端证书（可选）
+        if egress.get("client_cert"):
+            cert_path = config_dir / "client.crt"
+            cert_path.write_text(egress["client_cert"])
+            config_lines.append(f"cert {cert_path}")
+
+        # 客户端私钥（可选）
+        if egress.get("client_key"):
+            key_path = config_dir / "client.key"
+            key_path.write_text(egress["client_key"])
+            os.chmod(key_path, 0o600)
+            config_lines.append(f"key {key_path}")
+
+        # TLS Auth（可选）
+        if egress.get("tls_auth"):
+            ta_path = config_dir / "ta.key"
+            ta_path.write_text(egress["tls_auth"])
+            os.chmod(ta_path, 0o600)
+            config_lines.append(f"tls-auth {ta_path} 1")
+
+        # TLS Crypt（可选，与 tls_auth 二选一）
+        if egress.get("tls_crypt") and not egress.get("tls_auth"):
+            tc_path = config_dir / "tls-crypt.key"
+            tc_path.write_text(egress["tls_crypt"])
+            os.chmod(tc_path, 0o600)
+            config_lines.append(f"tls-crypt {tc_path}")
+
+        # 用户名/密码认证（可选）
+        if egress.get("auth_user") and egress.get("auth_pass"):
+            auth_path = config_dir / "auth.txt"
+            auth_path.write_text(f"{egress['auth_user']}\n{egress['auth_pass']}\n")
+            os.chmod(auth_path, 0o600)
+            config_lines.append(f"auth-user-pass {auth_path}")
+
+        # 额外选项
+        if egress.get("extra_options"):
+            for opt in egress["extra_options"]:
+                config_lines.append(opt)
+
+        # 写入配置文件
+        config_path = config_dir / "client.conf"
+        config_path.write_text("\n".join(config_lines) + "\n")
+
+        # 记录 tun 设备
+        if tag in self.tunnels:
+            self.tunnels[tag].tun_device = tun_device
+        else:
+            self.tunnels[tag] = TunnelProcess(
+                tag=tag,
+                tun_device=tun_device,
+                socks_port=egress.get("socks_port", 0)
+            )
+
+        return config_path
+
+    async def start_tunnel(self, tag: str) -> bool:
+        """启动单个隧道（OpenVPN + SOCKS5）"""
+        egress = self.db.get_openvpn_egress(tag)
+        if not egress:
+            logger.error(f"[{tag}] OpenVPN 配置不存在")
+            return False
+
+        if not egress.get("enabled"):
+            logger.info(f"[{tag}] 已禁用，跳过")
+            return False
+
+        logger.info(f"[{tag}] 启动隧道...")
+
+        # 生成配置
+        try:
+            config_path = self._generate_config(egress)
+        except Exception as e:
+            logger.error(f"[{tag}] 生成配置失败: {e}")
+            return False
+
+        tunnel = self.tunnels[tag]
+        tunnel.status = "starting"
+
+        # 启动 OpenVPN
+        try:
+            openvpn_proc = subprocess.Popen(
+                ["openvpn", "--config", str(config_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            tunnel.openvpn_pid = openvpn_proc.pid
+            logger.info(f"[{tag}] OpenVPN 已启动 (PID: {openvpn_proc.pid}, tun: {tunnel.tun_device})")
+        except Exception as e:
+            logger.error(f"[{tag}] 启动 OpenVPN 失败: {e}")
+            tunnel.status = "error"
+            return False
+
+        # 等待 tun 设备就绪
+        await self._wait_for_tun(tunnel.tun_device, timeout=30)
+
+        # 启动 SOCKS5 代理
+        socks_port = egress.get("socks_port", 0)
+        if socks_port:
+            try:
+                socks_proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parent / "socks5_proxy.py"),
+                        "--host", "127.0.0.1",
+                        "--port", str(socks_port),
+                        "--bind-interface", tunnel.tun_device
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                tunnel.socks_pid = socks_proc.pid
+                tunnel.socks_port = socks_port
+                logger.info(f"[{tag}] SOCKS5 代理已启动 (PID: {socks_proc.pid}, 端口: {socks_port})")
+            except Exception as e:
+                logger.error(f"[{tag}] 启动 SOCKS5 代理失败: {e}")
+                # 不影响隧道整体状态
+
+        tunnel.status = "connected"
+        return True
+
+    async def _wait_for_tun(self, tun_device: str, timeout: int = 30):
+        """等待 tun 设备就绪"""
+        tun_path = Path(f"/sys/class/net/{tun_device}")
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            if tun_path.exists():
+                logger.debug(f"tun 设备 {tun_device} 已就绪")
+                return True
+            await asyncio.sleep(0.5)
+
+        logger.warning(f"等待 tun 设备 {tun_device} 超时")
+        return False
+
+    async def stop_tunnel(self, tag: str) -> bool:
+        """停止单个隧道"""
+        if tag not in self.tunnels:
+            return False
+
+        tunnel = self.tunnels[tag]
+        logger.info(f"[{tag}] 停止隧道...")
+
+        # 停止 SOCKS5 代理
+        if tunnel.socks_pid:
+            try:
+                os.kill(tunnel.socks_pid, signal.SIGTERM)
+                logger.debug(f"[{tag}] 已发送 SIGTERM 到 SOCKS5 (PID: {tunnel.socks_pid})")
+            except ProcessLookupError:
+                pass
+            tunnel.socks_pid = None
+
+        # 停止 OpenVPN
+        if tunnel.openvpn_pid:
+            try:
+                os.kill(tunnel.openvpn_pid, signal.SIGTERM)
+                logger.debug(f"[{tag}] 已发送 SIGTERM 到 OpenVPN (PID: {tunnel.openvpn_pid})")
+                # 等待进程退出
+                for _ in range(10):
+                    try:
+                        os.kill(tunnel.openvpn_pid, 0)
+                        await asyncio.sleep(0.5)
+                    except ProcessLookupError:
+                        break
+                else:
+                    # 强制杀死
+                    try:
+                        os.kill(tunnel.openvpn_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            except ProcessLookupError:
+                pass
+            tunnel.openvpn_pid = None
+
+        # 清理配置目录
+        config_dir = OPENVPN_RUN_DIR / tag
+        if config_dir.exists():
+            import shutil
+            shutil.rmtree(config_dir, ignore_errors=True)
+
+        tunnel.status = "stopped"
+        logger.info(f"[{tag}] 隧道已停止")
+        return True
+
+    async def start_all(self):
+        """启动所有启用的隧道"""
+        OPENVPN_RUN_DIR.mkdir(parents=True, exist_ok=True)
+        OPENVPN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+        egress_list = self.db.get_openvpn_egress_list(enabled_only=True)
+        if not egress_list:
+            logger.info("没有启用的 OpenVPN 出口")
+            return
+
+        logger.info(f"启动 {len(egress_list)} 个 OpenVPN 隧道...")
+
+        for egress in egress_list:
+            tag = egress["tag"]
+            try:
+                await self.start_tunnel(tag)
+            except Exception as e:
+                logger.error(f"[{tag}] 启动失败: {e}")
+
+    async def stop_all(self):
+        """停止所有隧道"""
+        tags = list(self.tunnels.keys())
+        for tag in tags:
+            try:
+                await self.stop_tunnel(tag)
+            except Exception as e:
+                logger.error(f"[{tag}] 停止失败: {e}")
+        self.tunnels.clear()
+
+    async def reload(self):
+        """重载配置（同步数据库状态）"""
+        logger.info("重载 OpenVPN 配置...")
+
+        # 获取当前数据库中启用的出口
+        enabled_egress = {e["tag"]: e for e in self.db.get_openvpn_egress_list(enabled_only=True)}
+        enabled_tags = set(enabled_egress.keys())
+        running_tags = set(self.tunnels.keys())
+
+        # 停止已删除或禁用的隧道
+        to_stop = running_tags - enabled_tags
+        for tag in to_stop:
+            logger.info(f"[{tag}] 配置已删除/禁用，停止隧道")
+            await self.stop_tunnel(tag)
+            del self.tunnels[tag]
+
+        # 启动新增的隧道
+        to_start = enabled_tags - running_tags
+        for tag in to_start:
+            logger.info(f"[{tag}] 新配置，启动隧道")
+            await self.start_tunnel(tag)
+
+        # 检查配置变更（简单重启）
+        for tag in enabled_tags & running_tags:
+            # 这里可以添加配置比对逻辑
+            # 目前简单处理：不重启正在运行的隧道
+            pass
+
+        logger.info("配置重载完成")
+
+    def get_status(self, tag: Optional[str] = None) -> Dict:
+        """获取隧道状态"""
+        if tag:
+            tunnel = self.tunnels.get(tag)
+            if not tunnel:
+                return {"tag": tag, "status": "not_found"}
+            return self._tunnel_to_dict(tunnel)
+        else:
+            return {tag: self._tunnel_to_dict(t) for tag, t in self.tunnels.items()}
+
+    def _tunnel_to_dict(self, tunnel: TunnelProcess) -> Dict:
+        """转换隧道信息为字典"""
+        # 检查进程是否存活
+        openvpn_alive = False
+        socks_alive = False
+
+        if tunnel.openvpn_pid:
+            try:
+                os.kill(tunnel.openvpn_pid, 0)
+                openvpn_alive = True
+            except ProcessLookupError:
+                pass
+
+        if tunnel.socks_pid:
+            try:
+                os.kill(tunnel.socks_pid, 0)
+                socks_alive = True
+            except ProcessLookupError:
+                pass
+
+        # 确定状态
+        if openvpn_alive and socks_alive:
+            status = "connected"
+        elif openvpn_alive:
+            status = "connecting"  # OpenVPN 运行但 SOCKS 未启动
+        elif tunnel.status == "starting":
+            status = "starting"
+        else:
+            status = "disconnected"
+
+        return {
+            "tag": tunnel.tag,
+            "status": status,
+            "openvpn_pid": tunnel.openvpn_pid if openvpn_alive else None,
+            "socks_pid": tunnel.socks_pid if socks_alive else None,
+            "tun_device": tunnel.tun_device,
+            "socks_port": tunnel.socks_port
+        }
+
+    async def run_daemon(self):
+        """以守护进程模式运行"""
+        self._running = True
+        logger.info("OpenVPN 管理器启动（守护模式）")
+
+        # 启动所有隧道
+        await self.start_all()
+
+        # 监控循环
+        while self._running:
+            await asyncio.sleep(10)
+
+            # 检查进程健康
+            for tag, tunnel in list(self.tunnels.items()):
+                if tunnel.status != "connected":
+                    continue
+
+                # 检查 OpenVPN 进程
+                if tunnel.openvpn_pid:
+                    try:
+                        os.kill(tunnel.openvpn_pid, 0)
+                    except ProcessLookupError:
+                        logger.warning(f"[{tag}] OpenVPN 进程已退出，尝试重启")
+                        await self.stop_tunnel(tag)
+                        await self.start_tunnel(tag)
+
+        # 清理
+        await self.stop_all()
+        logger.info("OpenVPN 管理器已停止")
+
+    def stop_daemon(self):
+        """停止守护进程"""
+        self._running = False
+
+
+async def main():
+    parser = argparse.ArgumentParser(description='OpenVPN 隧道管理器')
+    parser.add_argument('command', choices=['start', 'stop', 'reload', 'status', 'daemon'],
+                       help='操作命令')
+    parser.add_argument('--tag', help='指定隧道标签（用于 start/stop/status）')
+    parser.add_argument('--verbose', '-v', action='store_true', help='详细输出')
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    manager = OpenVPNManager()
+
+    if args.command == 'start':
+        if args.tag:
+            await manager.start_tunnel(args.tag)
+        else:
+            await manager.start_all()
+
+    elif args.command == 'stop':
+        if args.tag:
+            await manager.stop_tunnel(args.tag)
+        else:
+            await manager.stop_all()
+
+    elif args.command == 'reload':
+        await manager.reload()
+
+    elif args.command == 'status':
+        status = manager.get_status(args.tag)
+        print(json.dumps(status, indent=2, ensure_ascii=False))
+
+    elif args.command == 'daemon':
+        # 设置信号处理
+        loop = asyncio.get_event_loop()
+
+        def signal_handler():
+            logger.info("收到停止信号")
+            manager.stop_daemon()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, signal_handler)
+
+        await manager.run_daemon()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

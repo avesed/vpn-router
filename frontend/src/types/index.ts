@@ -273,7 +273,7 @@ export interface CustomEgressCreateRequest {
 export interface EgressItem {
   tag: string;
   description: string;
-  type: "pia" | "custom" | "direct";
+  type: "pia" | "custom" | "direct" | "openvpn";
   server?: string;
   port?: number;
   is_configured: boolean;
@@ -282,12 +282,17 @@ export interface EgressItem {
   inet4_bind_address?: string;
   inet6_bind_address?: string;
   enabled?: number;
+  // OpenVPN specific fields
+  protocol?: string;
+  socks_port?: number;
+  status?: "connected" | "connecting" | "disconnected" | "error";
 }
 
 export interface AllEgressResponse {
   pia: EgressItem[];
   custom: EgressItem[];
   direct: EgressItem[];
+  openvpn: EgressItem[];
 }
 
 // Direct Egress (绑定特定接口/IP 的直连出口)
@@ -321,6 +326,98 @@ export interface DirectEgressUpdateRequest {
 
 export interface DirectEgressListResponse {
   egress: DirectEgress[];
+}
+
+// OpenVPN Egress (通过 SOCKS5 代理桥接)
+export interface OpenVPNEgress {
+  id?: number;
+  tag: string;
+  description: string;
+  protocol: "udp" | "tcp";
+  remote_host: string;
+  remote_port: number;
+  ca_cert: string;
+  client_cert?: string;
+  client_key?: string;
+  tls_auth?: string;
+  tls_crypt?: string;
+  auth_user?: string;
+  auth_pass?: string;
+  cipher: string;
+  auth: string;
+  compress?: string;
+  extra_options?: string;
+  socks_port?: number;
+  enabled: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface OpenVPNEgressCreateRequest {
+  tag: string;
+  description?: string;
+  protocol?: "udp" | "tcp";
+  remote_host: string;
+  remote_port?: number;
+  ca_cert: string;
+  client_cert?: string;
+  client_key?: string;
+  tls_auth?: string;
+  tls_crypt?: string;
+  auth_user?: string;
+  auth_pass?: string;
+  cipher?: string;
+  auth?: string;
+  compress?: string;
+  extra_options?: string;
+}
+
+export interface OpenVPNEgressUpdateRequest {
+  description?: string;
+  protocol?: "udp" | "tcp";
+  remote_host?: string;
+  remote_port?: number;
+  ca_cert?: string;
+  client_cert?: string;
+  client_key?: string;
+  tls_auth?: string;
+  tls_crypt?: string;
+  auth_user?: string;
+  auth_pass?: string;
+  cipher?: string;
+  auth?: string;
+  compress?: string;
+  extra_options?: string;
+  enabled?: number;
+}
+
+export interface OpenVPNEgressListResponse {
+  egress: OpenVPNEgress[];
+}
+
+export interface OpenVPNParseResult {
+  protocol?: string;
+  remote_host?: string;
+  remote_port?: number;
+  ca_cert?: string;
+  client_cert?: string;
+  client_key?: string;
+  tls_auth?: string;
+  tls_crypt?: string;
+  auth_user?: string;
+  auth_pass?: string;
+  cipher?: string;
+  auth?: string;
+  compress?: string;
+}
+
+export interface OpenVPNTunnelStatus {
+  tag: string;
+  status: "connected" | "connecting" | "disconnected" | "error";
+  message?: string;
+  socks_port?: number;
+  openvpn_pid?: number;
+  socks_pid?: number;
 }
 
 export interface CustomEgressListResponse {

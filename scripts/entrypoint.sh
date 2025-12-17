@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cleanup() {
+  if [ -n "${OPENVPN_MGR_PID:-}" ] && kill -0 "${OPENVPN_MGR_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping OpenVPN manager (PID ${OPENVPN_MGR_PID})"
+    kill "${OPENVPN_MGR_PID}" >/dev/null 2>&1 || true
+  fi
   if [ -n "${NGINX_PID:-}" ] && kill -0 "${NGINX_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping nginx (PID ${NGINX_PID})"
     kill "${NGINX_PID}" >/dev/null 2>&1 || true
@@ -13,6 +17,7 @@ cleanup() {
 trap cleanup EXIT
 API_PID=""
 NGINX_PID=""
+OPENVPN_MGR_PID=""
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
@@ -90,6 +95,27 @@ start_api_server() {
   fi
 }
 
+start_openvpn_manager() {
+  # 检查是否有启用的 OpenVPN 配置
+  local count
+  count=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+print(len(db.get_openvpn_egress_list(enabled_only=True)))
+" 2>/dev/null || echo "0")
+
+  if [ "${count}" != "0" ] && [ "${count}" != "" ]; then
+    echo "[entrypoint] starting OpenVPN manager (${count} tunnels)"
+    python3 /usr/local/bin/openvpn_manager.py daemon >/var/log/openvpn-manager.log 2>&1 &
+    OPENVPN_MGR_PID=$!
+    echo "[entrypoint] OpenVPN manager started with PID ${OPENVPN_MGR_PID}"
+  else
+    echo "[entrypoint] no OpenVPN tunnels configured, skipping manager"
+  fi
+}
+
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
 
@@ -147,6 +173,7 @@ CONFIG_PATH="${GENERATED_CONFIG_PATH}"
 
 start_api_server
 start_nginx
+start_openvpn_manager
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -193,6 +220,12 @@ while true; do
   # Check API server
   if [ -n "${API_PID}" ] && ! kill -0 "${API_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: API server died" >&2
+  fi
+
+  # Check OpenVPN manager
+  if [ -n "${OPENVPN_MGR_PID}" ] && ! kill -0 "${OPENVPN_MGR_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: OpenVPN manager died, restarting..." >&2
+    start_openvpn_manager
   fi
 
   # Check sing-box

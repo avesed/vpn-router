@@ -295,6 +295,51 @@ class DirectEgressUpdateRequest(BaseModel):
     enabled: Optional[int] = Field(None, ge=0, le=1)
 
 
+class OpenVPNEgressCreateRequest(BaseModel):
+    """创建 OpenVPN 出口"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    description: str = Field("", description="描述")
+    protocol: str = Field("udp", description="协议 (udp/tcp)")
+    remote_host: str = Field(..., description="远程服务器地址")
+    remote_port: int = Field(1194, ge=1, le=65535, description="远程端口")
+    ca_cert: str = Field(..., description="CA 证书 (PEM 格式)")
+    client_cert: Optional[str] = Field(None, description="客户端证书 (PEM 格式)")
+    client_key: Optional[str] = Field(None, description="客户端私钥 (PEM 格式)")
+    tls_auth: Optional[str] = Field(None, description="TLS Auth 密钥")
+    tls_crypt: Optional[str] = Field(None, description="TLS Crypt 密钥 (与 tls_auth 二选一)")
+    auth_user: Optional[str] = Field(None, description="用户名 (用于用户名/密码认证)")
+    auth_pass: Optional[str] = Field(None, description="密码 (用于用户名/密码认证)")
+    cipher: str = Field("AES-256-GCM", description="加密算法")
+    auth: str = Field("SHA256", description="认证算法")
+    compress: Optional[str] = Field(None, description="压缩算法 (lzo/lz4)")
+    extra_options: Optional[List[str]] = Field(None, description="额外 OpenVPN 选项")
+
+
+class OpenVPNEgressUpdateRequest(BaseModel):
+    """更新 OpenVPN 出口"""
+    description: Optional[str] = None
+    protocol: Optional[str] = None
+    remote_host: Optional[str] = None
+    remote_port: Optional[int] = Field(None, ge=1, le=65535)
+    ca_cert: Optional[str] = None
+    client_cert: Optional[str] = None
+    client_key: Optional[str] = None
+    tls_auth: Optional[str] = None
+    tls_crypt: Optional[str] = None
+    auth_user: Optional[str] = None
+    auth_pass: Optional[str] = None
+    cipher: Optional[str] = None
+    auth: Optional[str] = None
+    compress: Optional[str] = None
+    extra_options: Optional[List[str]] = None
+    enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
+class OpenVPNParseRequest(BaseModel):
+    """解析 .ovpn 文件内容"""
+    content: str = Field(..., description=".ovpn 文件内容")
+
+
 class WireGuardConfParseRequest(BaseModel):
     """解析 WireGuard .conf 文件内容"""
     content: str = Field(..., description=".conf 文件内容")
@@ -1386,6 +1431,12 @@ def api_get_rules():
             # 从数据库读取 direct 出口
             direct_egress = db.get_direct_egress_list(enabled_only=True)
             for egress in direct_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+
+            # 从数据库读取 OpenVPN 出口
+            openvpn_egress = db.get_openvpn_egress_list(enabled_only=True)
+            for egress in openvpn_egress:
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
         except Exception:
@@ -2548,10 +2599,11 @@ def api_update_settings(payload: SettingsUpdateRequest):
 
 @app.get("/api/egress")
 def api_list_all_egress():
-    """列出所有出口（PIA + 自定义 + Direct）"""
+    """列出所有出口（PIA + 自定义 + Direct + OpenVPN）"""
     pia_result = []
     custom_result = []
     direct_result = []
+    openvpn_result = []
 
     # 从数据库获取 PIA profiles
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -2596,7 +2648,22 @@ def api_list_all_egress():
             "is_configured": True,  # direct 出口总是已配置
         })
 
-    return {"pia": pia_result, "custom": custom_result, "direct": direct_result}
+    # 获取 OpenVPN 出口
+    openvpn_egress = db.get_openvpn_egress_list()
+    for eg in openvpn_egress:
+        openvpn_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "openvpn",
+            "description": eg.get("description", ""),
+            "server": eg.get("remote_host", ""),
+            "port": eg.get("remote_port", 1194),
+            "protocol": eg.get("protocol", "udp"),
+            "socks_port": eg.get("socks_port"),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,
+        })
+
+    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result}
 
 
 @app.get("/api/egress/custom")
@@ -2893,6 +2960,257 @@ def api_delete_direct_egress(tag: str):
         reload_status = f"，重载失败: {exc}"
 
     return {"message": f"Direct 出口 '{tag}' 已删除{reload_status}"}
+
+
+# ============ OpenVPN Egress APIs ============
+
+def _parse_ovpn_content(content: str) -> dict:
+    """解析 .ovpn 文件内容，提取配置"""
+    import re
+
+    result = {
+        "protocol": "udp",
+        "remote_host": "",
+        "remote_port": 1194,
+        "ca_cert": "",
+        "client_cert": "",
+        "client_key": "",
+        "tls_auth": "",
+        "tls_crypt": "",
+        "cipher": "AES-256-GCM",
+        "auth": "SHA256",
+        "compress": None,
+        "extra_options": [],
+    }
+
+    # 提取 remote 指令
+    remote_match = re.search(r'^remote\s+(\S+)\s+(\d+)(?:\s+(\w+))?', content, re.MULTILINE)
+    if remote_match:
+        result["remote_host"] = remote_match.group(1)
+        result["remote_port"] = int(remote_match.group(2))
+        if remote_match.group(3):
+            result["protocol"] = remote_match.group(3)
+
+    # 提取协议
+    proto_match = re.search(r'^proto\s+(\S+)', content, re.MULTILINE)
+    if proto_match:
+        result["protocol"] = proto_match.group(1)
+
+    # 提取加密算法
+    cipher_match = re.search(r'^cipher\s+(\S+)', content, re.MULTILINE)
+    if cipher_match:
+        result["cipher"] = cipher_match.group(1)
+
+    # 提取认证算法
+    auth_match = re.search(r'^auth\s+(\S+)', content, re.MULTILINE)
+    if auth_match:
+        result["auth"] = auth_match.group(1)
+
+    # 提取压缩
+    compress_match = re.search(r'^compress\s+(\S+)', content, re.MULTILINE)
+    if compress_match:
+        result["compress"] = compress_match.group(1)
+
+    # 提取嵌入的证书/密钥
+    def extract_block(tag: str) -> str:
+        pattern = rf'<{tag}>(.*?)</{tag}>'
+        match = re.search(pattern, content, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    result["ca_cert"] = extract_block("ca")
+    result["client_cert"] = extract_block("cert")
+    result["client_key"] = extract_block("key")
+    result["tls_auth"] = extract_block("tls-auth")
+    result["tls_crypt"] = extract_block("tls-crypt")
+
+    return result
+
+
+@app.get("/api/egress/openvpn")
+def api_list_openvpn_egress():
+    """列出所有 OpenVPN 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress_list = db.get_openvpn_egress_list(enabled_only=False)
+    # 隐藏敏感信息
+    for egress in egress_list:
+        if egress.get("auth_pass"):
+            egress["auth_pass"] = "***"
+        if egress.get("client_key"):
+            egress["client_key"] = "[hidden]"
+    return {"egress": egress_list}
+
+
+@app.get("/api/egress/openvpn/{tag}")
+def api_get_openvpn_egress(tag: str):
+    """获取单个 OpenVPN 出口（包含完整配置）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_openvpn_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"OpenVPN 出口 '{tag}' 不存在")
+    return egress
+
+
+@app.post("/api/egress/openvpn")
+def api_create_openvpn_egress(payload: OpenVPNEgressCreateRequest):
+    """创建 OpenVPN 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查 tag 是否已存在
+    if db.get_openvpn_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"OpenVPN 出口 '{payload.tag}' 已存在")
+
+    # 检查是否与其他出口冲突
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与自定义 WireGuard 出口冲突")
+    if db.get_direct_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 Direct 出口冲突")
+
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
+    pia_tags = {p.get("name", "") for p in pia_profiles}
+    if payload.tag in pia_tags:
+        raise HTTPException(status_code=400, detail=f"出口 '{payload.tag}' 与 PIA 线路冲突")
+
+    # 验证 CA 证书
+    if not payload.ca_cert or not payload.ca_cert.strip():
+        raise HTTPException(status_code=400, detail="CA 证书不能为空")
+
+    # 添加到数据库
+    egress_id = db.add_openvpn_egress(
+        tag=payload.tag,
+        remote_host=payload.remote_host,
+        ca_cert=payload.ca_cert,
+        description=payload.description,
+        protocol=payload.protocol,
+        remote_port=payload.remote_port,
+        client_cert=payload.client_cert,
+        client_key=payload.client_key,
+        tls_auth=payload.tls_auth,
+        tls_crypt=payload.tls_crypt,
+        auth_user=payload.auth_user,
+        auth_pass=payload.auth_pass,
+        cipher=payload.cipher,
+        auth=payload.auth,
+        compress=payload.compress,
+        extra_options=payload.extra_options,
+    )
+
+    # 获取分配的 SOCKS 端口
+    egress = db.get_openvpn_egress(payload.tag)
+    socks_port = egress.get("socks_port") if egress else None
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "，已重载配置"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {
+        "message": f"OpenVPN 出口 '{payload.tag}' 已创建{reload_status}",
+        "tag": payload.tag,
+        "socks_port": socks_port,
+    }
+
+
+@app.post("/api/egress/openvpn/parse")
+def api_parse_openvpn_file(payload: OpenVPNParseRequest):
+    """解析 .ovpn 文件内容，返回提取的配置"""
+    try:
+        result = _parse_ovpn_content(payload.content)
+        return {"parsed": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"解析 .ovpn 文件失败: {e}")
+
+
+@app.put("/api/egress/openvpn/{tag}")
+def api_update_openvpn_egress(tag: str, payload: OpenVPNEgressUpdateRequest):
+    """更新 OpenVPN 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    if not db.get_openvpn_egress(tag):
+        raise HTTPException(status_code=404, detail=f"OpenVPN 出口 '{tag}' 不存在")
+
+    # 构建更新字段
+    updates = {}
+    for field in [
+        "description", "protocol", "remote_host", "remote_port",
+        "ca_cert", "client_cert", "client_key", "tls_auth", "tls_crypt",
+        "auth_user", "auth_pass", "cipher", "auth", "compress",
+        "extra_options", "enabled"
+    ]:
+        value = getattr(payload, field, None)
+        if value is not None:
+            updates[field] = value
+
+    if updates:
+        db.update_openvpn_egress(tag, **updates)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "，已重载配置"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {"message": f"OpenVPN 出口 '{tag}' 已更新{reload_status}"}
+
+
+@app.delete("/api/egress/openvpn/{tag}")
+def api_delete_openvpn_egress(tag: str):
+    """删除 OpenVPN 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    if not db.get_openvpn_egress(tag):
+        raise HTTPException(status_code=404, detail=f"OpenVPN 出口 '{tag}' 不存在")
+
+    # 删除
+    db.delete_openvpn_egress(tag)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = "，已重载配置"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {"message": f"OpenVPN 出口 '{tag}' 已删除{reload_status}"}
+
+
+@app.get("/api/egress/openvpn/{tag}/status")
+def api_get_openvpn_status(tag: str):
+    """获取 OpenVPN 隧道状态"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    egress = db.get_openvpn_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"OpenVPN 出口 '{tag}' 不存在")
+
+    # 检查进程状态
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/openvpn_manager.py", "status", "--tag", tag],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            import json as json_module
+            status_data = json_module.loads(result.stdout)
+            return {"status": status_data}
+        else:
+            return {"status": {"tag": tag, "status": "unknown", "error": result.stderr}}
+    except Exception as e:
+        return {"status": {"tag": tag, "status": "error", "error": str(e)}}
 
 
 # ============ Adblock Rule Sets APIs ============
