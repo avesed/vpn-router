@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS openvpn_egress (
     client_key TEXT,                  -- 客户端私钥（可选）
     tls_auth TEXT,                    -- TLS Auth 密钥（可选）
     tls_crypt TEXT,                   -- TLS Crypt 密钥（可选，与 tls_auth 二选一）
+    crl_verify TEXT,                  -- CRL 证书吊销列表（可选）
     auth_user TEXT,                   -- 用户名认证（可选）
     auth_pass TEXT,                   -- 密码认证（可选）
 
@@ -234,6 +235,28 @@ def migrate_wireguard_peers_lan_fields(conn: sqlite3.Connection):
         conn.commit()
     else:
         print("⊘ wireguard_peers LAN 字段已存在，跳过迁移")
+
+
+def migrate_openvpn_egress_crl_verify(conn: sqlite3.Connection):
+    """为现有 openvpn_egress 表添加 crl_verify 字段"""
+    cursor = conn.cursor()
+
+    # 检查 openvpn_egress 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='openvpn_egress'")
+    if not cursor.fetchone():
+        print("⊘ openvpn_egress 表不存在，跳过 crl_verify 迁移")
+        return
+
+    # 检查是否需要迁移（检查 crl_verify 列是否存在）
+    cursor.execute("PRAGMA table_info(openvpn_egress)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "crl_verify" not in columns:
+        cursor.execute("ALTER TABLE openvpn_egress ADD COLUMN crl_verify TEXT")
+        conn.commit()
+        print("✓ 添加 openvpn_egress.crl_verify 字段")
+    else:
+        print("⊘ openvpn_egress.crl_verify 字段已存在，跳过迁移")
 
 
 def generate_wireguard_private_key() -> str:
@@ -440,6 +463,7 @@ def main():
 
     # 迁移现有数据库（添加新字段）
     migrate_wireguard_peers_lan_fields(conn)
+    migrate_openvpn_egress_crl_verify(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

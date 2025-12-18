@@ -255,6 +255,22 @@ export const api = {
   getOpenVPNTunnelStatus: (tag: string) =>
     request<OpenVPNTunnelStatus>(`/egress/openvpn/${encodeURIComponent(tag)}/status`),
 
+  // Egress Connection Test
+  testEgress: (tag: string, timeout?: number) =>
+    request<{ success: boolean; delay: number; message: string }>(
+      `/test/egress/${encodeURIComponent(tag)}${timeout ? `?timeout=${timeout}` : ""}`
+    ),
+
+  // Egress Speed Test
+  testEgressSpeed: (tag: string, size?: number, timeout?: number) =>
+    request<{
+      success: boolean;
+      speed_mbps: number;
+      download_bytes?: number;
+      duration_sec?: number;
+      message: string;
+    }>(`/test/egress/${encodeURIComponent(tag)}/speed?size=${size || 10}&timeout=${timeout || 30}`),
+
   // Backup / Restore
   getBackupStatus: () => request<BackupStatus>("/backup/status"),
   exportBackup: (password?: string, includePiaCredentials = true) =>

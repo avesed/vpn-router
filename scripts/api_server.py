@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -307,6 +308,7 @@ class OpenVPNEgressCreateRequest(BaseModel):
     client_key: Optional[str] = Field(None, description="客户端私钥 (PEM 格式)")
     tls_auth: Optional[str] = Field(None, description="TLS Auth 密钥")
     tls_crypt: Optional[str] = Field(None, description="TLS Crypt 密钥 (与 tls_auth 二选一)")
+    crl_verify: Optional[str] = Field(None, description="CRL 证书吊销列表 (PEM 格式)")
     auth_user: Optional[str] = Field(None, description="用户名 (用于用户名/密码认证)")
     auth_pass: Optional[str] = Field(None, description="密码 (用于用户名/密码认证)")
     cipher: str = Field("AES-256-GCM", description="加密算法")
@@ -326,6 +328,7 @@ class OpenVPNEgressUpdateRequest(BaseModel):
     client_key: Optional[str] = None
     tls_auth: Optional[str] = None
     tls_crypt: Optional[str] = None
+    crl_verify: Optional[str] = None
     auth_user: Optional[str] = None
     auth_pass: Optional[str] = None
     cipher: Optional[str] = None
@@ -2991,25 +2994,34 @@ def _parse_ovpn_content(content: str) -> dict:
         if remote_match.group(3):
             result["protocol"] = remote_match.group(3)
 
+    # 使用 [^\S\n] 匹配水平空白（不包括换行符）以避免跨行匹配
+
     # 提取协议
-    proto_match = re.search(r'^proto\s+(\S+)', content, re.MULTILINE)
+    proto_match = re.search(r'^proto[^\S\n]+(\S+)[^\S\n]*$', content, re.MULTILINE)
     if proto_match:
         result["protocol"] = proto_match.group(1)
 
     # 提取加密算法
-    cipher_match = re.search(r'^cipher\s+(\S+)', content, re.MULTILINE)
+    cipher_match = re.search(r'^cipher[^\S\n]+(\S+)[^\S\n]*$', content, re.MULTILINE)
     if cipher_match:
         result["cipher"] = cipher_match.group(1)
 
-    # 提取认证算法
-    auth_match = re.search(r'^auth\s+(\S+)', content, re.MULTILINE)
-    if auth_match:
+    # 提取认证算法 (需要排除 auth-user-pass 等指令)
+    auth_match = re.search(r'^auth[^\S\n]+(\S+)[^\S\n]*$', content, re.MULTILINE)
+    if auth_match and not auth_match.group(1).startswith('-'):
         result["auth"] = auth_match.group(1)
 
-    # 提取压缩
-    compress_match = re.search(r'^compress\s+(\S+)', content, re.MULTILINE)
+    # 提取压缩 - 支持 "compress" 无参数或 "compress lzo/lz4" 有参数
+    compress_match = re.search(r'^compress(?:[^\S\n]+(\S+))?[^\S\n]*$', content, re.MULTILINE)
     if compress_match:
-        result["compress"] = compress_match.group(1)
+        if compress_match.group(1):
+            result["compress"] = compress_match.group(1)
+        else:
+            # compress 无参数等于 compress stub (不压缩发送，但接受压缩数据)
+            result["compress"] = "stub"
+    # 也检查 comp-lzo (旧格式)
+    if re.search(r'^comp-lzo', content, re.MULTILINE):
+        result["compress"] = "lzo"
 
     # 提取嵌入的证书/密钥
     def extract_block(tag: str) -> str:
@@ -3022,6 +3034,11 @@ def _parse_ovpn_content(content: str) -> dict:
     result["client_key"] = extract_block("key")
     result["tls_auth"] = extract_block("tls-auth")
     result["tls_crypt"] = extract_block("tls-crypt")
+    result["crl_verify"] = extract_block("crl-verify")
+
+    # 检测是否需要用户名/密码认证
+    if re.search(r'^auth-user-pass', content, re.MULTILINE):
+        result["requires_auth"] = True
 
     return result
 
@@ -3086,6 +3103,7 @@ def api_create_openvpn_egress(payload: OpenVPNEgressCreateRequest):
         client_key=payload.client_key,
         tls_auth=payload.tls_auth,
         tls_crypt=payload.tls_crypt,
+        crl_verify=payload.crl_verify,
         auth_user=payload.auth_user,
         auth_pass=payload.auth_pass,
         cipher=payload.cipher,
@@ -3119,7 +3137,7 @@ def api_parse_openvpn_file(payload: OpenVPNParseRequest):
     """解析 .ovpn 文件内容，返回提取的配置"""
     try:
         result = _parse_ovpn_content(payload.content)
-        return {"parsed": result}
+        return result  # 直接返回解析结果，不包装在 parsed 对象中
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"解析 .ovpn 文件失败: {e}")
 
@@ -3211,6 +3229,470 @@ def api_get_openvpn_status(tag: str):
             return {"status": {"tag": tag, "status": "unknown", "error": result.stderr}}
     except Exception as e:
         return {"status": {"tag": tag, "status": "error", "error": str(e)}}
+
+
+# ============ Egress Connection Test API ============
+
+@app.get("/api/test/egress/{tag}")
+def api_test_egress_connection(tag: str, timeout: int = 5000):
+    """测试出口连接延迟
+
+    根据出口类型选择不同的测试方法:
+    - direct/direct-*: 使用 subprocess curl 直接测试 (绕过 sing-box 路由)
+    - block/adblock: 不可测试
+    - WireGuard endpoints: 使用 clash_api 测试
+    - SOCKS outbounds: 使用 curl + SOCKS 代理测试
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    test_url = "http://cp.cloudflare.com/"  # Cloudflare 204 测试 (国内可访问)
+    timeout_sec = timeout / 1000
+
+    # 首先获取出口类型
+    proxy_type = None
+    try:
+        clash_proxy_url = f"http://127.0.0.1:9090/proxies/{urllib.parse.quote(tag)}"
+        with urllib.request.urlopen(clash_proxy_url, timeout=5) as resp:
+            proxy_info = json.loads(resp.read().decode())
+            proxy_type = proxy_info.get("type", "").lower()
+    except Exception:
+        pass
+
+    # block 类型不可测试
+    if tag in ("block", "adblock") or proxy_type == "reject":
+        return {"success": False, "delay": -1, "message": "Block egress, cannot test"}
+
+    # direct 类型使用 subprocess curl 直接测试
+    if tag == "direct" or tag.startswith("direct-") or proxy_type == "direct":
+        return _test_direct_connection(tag, test_url, timeout_sec)
+
+    # SOCKS 类型：尝试获取端口并使用 curl + SOCKS 代理
+    if proxy_type == "socks":
+        return _test_socks_connection(tag, test_url, timeout_sec)
+
+    # WireGuard 和其他类型：先检查活跃流量，再尝试 clash_api
+    return _test_wireguard_endpoint(tag, test_url, timeout)
+
+
+def _test_direct_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
+    """使用 subprocess curl 测试 direct 类型出口"""
+    try:
+        # 构建 curl 命令
+        curl_cmd = [
+            "curl", "-s", "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}",
+            "--max-time", str(int(timeout_sec + 1)),
+            test_url
+        ]
+
+        # 如果是 direct-* 类型，尝试获取绑定配置
+        if tag.startswith("direct-") and HAS_DATABASE:
+            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            direct_egress = db.get_direct_egress_by_tag(tag)
+            if direct_egress:
+                if direct_egress.get("bind_interface"):
+                    curl_cmd.extend(["--interface", direct_egress["bind_interface"]])
+                elif direct_egress.get("inet4_bind_address"):
+                    curl_cmd.extend(["--interface", direct_egress["inet4_bind_address"]])
+
+        start_time = time.time()
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|")
+            if len(parts) == 2:
+                http_code = parts[0]
+                time_total = float(parts[1])
+                delay_ms = int(time_total * 1000)
+
+                if http_code in ("200", "204", "301", "302"):
+                    return {"success": True, "delay": delay_ms, "message": f"{delay_ms}ms"}
+                else:
+                    return {"success": False, "delay": -1, "message": f"HTTP {http_code}"}
+
+        return {"success": False, "delay": -1, "message": "Connection failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "delay": -1, "message": "连接超时"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
+    """使用 curl + SOCKS 代理测试 SOCKS 类型出口"""
+    try:
+        # 从数据库获取 SOCKS 端口
+        socks_port = None
+        if HAS_DATABASE:
+            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            openvpn_egress = db.get_openvpn_egress(tag)
+            if openvpn_egress:
+                socks_port = openvpn_egress.get("socks_port")
+
+        if not socks_port:
+            # 回退到 clash_api 测试
+            return _test_via_clash_api(tag, test_url, int(timeout_sec * 1000))
+
+        # 使用 curl + SOCKS5 代理测试
+        curl_cmd = [
+            "curl", "-s", "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}",
+            "--max-time", str(int(timeout_sec + 1)),
+            "--proxy", f"socks5://127.0.0.1:{socks_port}",
+            test_url
+        ]
+
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|")
+            if len(parts) == 2:
+                http_code = parts[0]
+                time_total = float(parts[1])
+                delay_ms = int(time_total * 1000)
+
+                if http_code in ("200", "204", "301", "302"):
+                    return {"success": True, "delay": delay_ms, "message": f"{delay_ms}ms"}
+                else:
+                    return {"success": False, "delay": -1, "message": f"HTTP {http_code}"}
+
+        # SOCKS 代理连接失败
+        return {"success": False, "delay": -1, "message": "SOCKS proxy not connected"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
+    """测试 WireGuard 端点
+
+    WireGuard 隧道是惰性的，只有流量通过时才会建立连接。
+    clash_api 的延迟测试对 WireGuard 端点有时会失败，即使隧道正常工作。
+
+    策略:
+    1. 检查是否有活跃流量通过该端点
+    2. 如果有活跃流量，认为连接正常
+    3. 如果没有活跃流量，尝试 clash_api 延迟测试
+    4. 如果延迟测试失败，尝试 ping 服务器 (验证配置是否正确)
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    # 首先检查是否有活跃流量通过该端点
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            connections = data.get("connections", []) or []
+
+            # 统计通过该端点的活跃连接数和流量
+            active_count = 0
+            total_download = 0
+            total_upload = 0
+
+            for conn in connections:
+                chains = conn.get("chains", [])
+                # chains 可能是 ["us-stream", "direct"] 或类似格式
+                # 检查端点是否在链中
+                if tag in chains:
+                    active_count += 1
+                    total_download += conn.get("download", 0)
+                    total_upload += conn.get("upload", 0)
+
+            if active_count > 0:
+                # 有活跃流量，认为连接正常
+                total_kb = (total_download + total_upload) / 1024
+                if total_kb >= 1024:
+                    traffic_str = f"{total_kb/1024:.1f}MB"
+                else:
+                    traffic_str = f"{total_kb:.0f}KB"
+                return {
+                    "success": True,
+                    "delay": 0,  # 无法测量延迟，但确认有流量
+                    "message": f"✓ 活跃 ({active_count}连接, {traffic_str})"
+                }
+
+    except Exception as e:
+        # 无法检查连接，继续尝试延迟测试
+        pass
+
+    # 没有活跃流量，尝试 clash_api 延迟测试
+    result = _test_via_clash_api(tag, test_url, timeout)
+
+    # 如果延迟测试成功，直接返回
+    if result.get("success"):
+        return result
+
+    # 延迟测试失败，尝试 ping 服务器作为最后手段
+    # 这至少可以验证服务器是否可达
+    ping_result = _ping_wireguard_server(tag)
+    if ping_result:
+        return ping_result
+
+    # 都失败了，返回原始延迟测试结果
+    return result
+
+
+def _ping_wireguard_server(tag: str) -> Optional[dict]:
+    """尝试 ping WireGuard 端点的服务器地址
+
+    从 sing-box 配置读取服务器地址并进行 ping 测试。
+    成功则返回延迟结果，失败返回 None。
+    """
+    try:
+        # 读取 sing-box 配置获取服务器地址
+        config_path = os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json")
+        generated_path = config_path.replace(".json", ".generated.json")
+
+        with open(generated_path, "r") as f:
+            config = json.load(f)
+
+        # 查找匹配的端点
+        server_address = None
+        for endpoint in config.get("endpoints", []):
+            if endpoint.get("tag") == tag:
+                peers = endpoint.get("peers", [])
+                if peers:
+                    server_address = peers[0].get("address")
+                break
+
+        if not server_address:
+            return None
+
+        # 使用 ping 测试 (3次，超时3秒)
+        result = subprocess.run(
+            ["ping", "-c", "3", "-W", "3", server_address],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode == 0:
+            # 解析 ping 输出获取平均延迟
+            # 格式: rtt min/avg/max/mdev = 73.457/74.116/74.798/0.547 ms
+            import re
+            match = re.search(r"rtt.*?=.*?/([\d.]+)/", result.stdout)
+            if match:
+                avg_ms = int(float(match.group(1)))
+                return {
+                    "success": True,
+                    "delay": avg_ms,
+                    "message": f"✓ 服务器可达 ({avg_ms}ms)"
+                }
+            return {
+                "success": True,
+                "delay": 0,
+                "message": "✓ 服务器可达"
+            }
+
+    except Exception:
+        pass
+
+    return None
+
+
+def _test_via_clash_api(tag: str, test_url: str, timeout: int) -> dict:
+    """使用 clash_api 测试出口延迟"""
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    try:
+        clash_url = f"http://127.0.0.1:9090/proxies/{urllib.parse.quote(tag)}/delay?url={urllib.parse.quote(test_url)}&timeout={timeout}"
+        with urllib.request.urlopen(clash_url, timeout=timeout/1000 + 2) as resp:
+            data = json.loads(resp.read().decode())
+            delay = data.get("delay", -1)
+
+        if delay > 0:
+            return {"success": True, "delay": delay, "message": f"{delay}ms"}
+        else:
+            return {"success": False, "delay": -1, "message": "Connection timeout"}
+
+    except urllib.error.HTTPError as e:
+        if e.code == 504:
+            return {"success": False, "delay": -1, "message": "Connection timeout"}
+        elif e.code == 404:
+            return {"success": False, "delay": -1, "message": f"Egress '{tag}' not found"}
+        else:
+            return {"success": False, "delay": -1, "message": f"Test failed (HTTP {e.code})"}
+    except urllib.error.URLError:
+        return {"success": False, "delay": -1, "message": "sing-box not running"}
+    except socket.timeout:
+        return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+# ============ Egress Speed Test API ============
+
+def _get_speedtest_socks_port(tag: str) -> Optional[int]:
+    """获取 WireGuard 出口的测速 SOCKS 端口
+
+    从 sing-box.generated.json 配置中读取 speedtest-{tag} inbound 的端口
+    """
+    config_path = os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json")
+    generated_path = config_path.replace(".json", ".generated.json")
+
+    try:
+        with open(generated_path, "r") as f:
+            config = json.load(f)
+
+        for inbound in config.get("inbounds", []):
+            if inbound.get("tag") == f"speedtest-{tag}":
+                return inbound.get("listen_port")
+    except Exception:
+        pass
+
+    return None
+
+
+def _is_openvpn_egress(tag: str) -> bool:
+    """检查是否是 OpenVPN 出口"""
+    if not HAS_DATABASE:
+        return False
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress = db.get_openvpn_egress(tag)
+        return egress is not None
+    except Exception:
+        return False
+
+
+def _get_openvpn_socks_port(tag: str) -> Optional[int]:
+    """获取 OpenVPN 出口的 SOCKS 端口（仅当端口正在监听时返回）"""
+    if not HAS_DATABASE:
+        return None
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress = db.get_openvpn_egress(tag)
+        if egress:
+            socks_port = egress.get("socks_port")
+            if socks_port:
+                # 检查端口是否正在监听
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(("127.0.0.1", socks_port))
+                sock.close()
+                if result == 0:
+                    return socks_port
+    except Exception:
+        pass
+    return None
+
+
+def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -> dict:
+    """通过下载文件测速
+
+    Args:
+        tag: 出口标识
+        size_mb: 下载文件大小 (MB)
+        timeout_sec: 超时时间 (秒)
+
+    Returns:
+        测速结果字典
+    """
+    test_url = f"https://speed.cloudflare.com/__down?bytes={size_mb * 1024 * 1024}"
+
+    curl_cmd = [
+        "curl", "-s", "-o", "/dev/null",
+        "-w", "%{speed_download}",  # 输出下载速度 (bytes/sec)
+        "--max-time", str(int(timeout_sec)),
+    ]
+
+    # 根据出口类型添加代理参数
+    proxy_info = ""
+    if tag == "direct":
+        proxy_info = "直连"
+    elif tag.startswith("direct-"):
+        # Direct 出口：绑定接口
+        if HAS_DATABASE:
+            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            direct_egress = db.get_direct_egress_by_tag(tag)
+            if direct_egress:
+                if direct_egress.get("bind_interface"):
+                    curl_cmd.extend(["--interface", direct_egress["bind_interface"]])
+                    proxy_info = f"接口 {direct_egress['bind_interface']}"
+                elif direct_egress.get("inet4_bind_address"):
+                    curl_cmd.extend(["--interface", direct_egress["inet4_bind_address"]])
+                    proxy_info = f"IP {direct_egress['inet4_bind_address']}"
+    elif _is_openvpn_egress(tag):
+        # OpenVPN：使用已有 SOCKS 端口
+        socks_port = _get_openvpn_socks_port(tag)
+        if socks_port:
+            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
+            proxy_info = f"SOCKS5 :{socks_port}"
+        else:
+            return {"success": False, "speed_mbps": 0, "message": "OpenVPN tunnel not connected"}
+    elif tag in ("block", "adblock"):
+        return {"success": False, "speed_mbps": 0, "message": "Block egress, cannot test speed"}
+    else:
+        # WireGuard/PIA：使用测速专用 SOCKS 端口
+        socks_port = _get_speedtest_socks_port(tag)
+        if socks_port:
+            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
+            proxy_info = f"SOCKS5 :{socks_port}"
+        else:
+            return {"success": False, "speed_mbps": 0, "message": "Speed test port not configured, restart container"}
+
+    curl_cmd.append(test_url)
+
+    try:
+        start_time = time.time()
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 5)
+        elapsed = time.time() - start_time
+
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                bytes_per_sec = float(result.stdout.strip())
+                if bytes_per_sec > 0:
+                    mbps = (bytes_per_sec * 8) / 1_000_000
+                    return {
+                        "success": True,
+                        "speed_mbps": round(mbps, 2),
+                        "download_bytes": size_mb * 1024 * 1024,
+                        "duration_sec": round(elapsed, 2),
+                        "message": f"{mbps:.1f} Mbps"
+                    }
+            except ValueError:
+                pass
+
+        # curl 失败
+        stderr = result.stderr.strip() if result.stderr else ""
+        if "Connection refused" in stderr or "SOCKS" in stderr:
+            return {"success": False, "speed_mbps": 0, "message": "Proxy connection failed"}
+        elif "timed out" in stderr.lower() or "timeout" in stderr.lower():
+            return {"success": False, "speed_mbps": 0, "message": "Download timeout"}
+        else:
+            return {"success": False, "speed_mbps": 0, "message": f"Speed test failed: {stderr[:50]}"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "speed_mbps": 0, "message": "Download timeout"}
+    except Exception as e:
+        return {"success": False, "speed_mbps": 0, "message": str(e)[:50]}
+
+
+@app.get("/api/test/egress/{tag}/speed")
+def api_test_egress_speed(tag: str, size: int = 10, timeout: int = 30):
+    """测速端点 - 通过下载文件测量出口速度
+
+    Args:
+        tag: 出口标识
+        size: 下载文件大小 (MB)，默认 10
+        timeout: 超时时间 (秒)，默认 30
+
+    Returns:
+        测速结果
+    """
+    # 限制参数范围
+    size = max(1, min(100, size))  # 1-100 MB
+    timeout = max(10, min(120, timeout))  # 10-120 秒
+
+    return _test_speed_download(tag, size, timeout)
 
 
 # ============ Adblock Rule Sets APIs ============

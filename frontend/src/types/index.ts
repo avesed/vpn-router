@@ -341,6 +341,7 @@ export interface OpenVPNEgress {
   client_key?: string;
   tls_auth?: string;
   tls_crypt?: string;
+  crl_verify?: string;
   auth_user?: string;
   auth_pass?: string;
   cipher: string;
@@ -364,6 +365,7 @@ export interface OpenVPNEgressCreateRequest {
   client_key?: string;
   tls_auth?: string;
   tls_crypt?: string;
+  crl_verify?: string;
   auth_user?: string;
   auth_pass?: string;
   cipher?: string;
@@ -382,6 +384,7 @@ export interface OpenVPNEgressUpdateRequest {
   client_key?: string;
   tls_auth?: string;
   tls_crypt?: string;
+  crl_verify?: string;
   auth_user?: string;
   auth_pass?: string;
   cipher?: string;
@@ -404,11 +407,13 @@ export interface OpenVPNParseResult {
   client_key?: string;
   tls_auth?: string;
   tls_crypt?: string;
+  crl_verify?: string;
   auth_user?: string;
   auth_pass?: string;
   cipher?: string;
   auth?: string;
   compress?: string;
+  requires_auth?: boolean;
 }
 
 export interface OpenVPNTunnelStatus {
@@ -528,4 +533,20 @@ export interface DashboardStats {
   rate_history: RateHistoryPoint[];  // 24小时速率历史
   adblock_connections: number;
   active_connections: number;
+}
+
+// Egress Connection Test
+export interface EgressTestResponse {
+  success: boolean;
+  delay: number;
+  message: string;
+}
+
+// Egress Speed Test
+export interface SpeedTestResponse {
+  success: boolean;
+  speed_mbps: number;
+  download_bytes?: number;
+  duration_sec?: number;
+  message: string;
 }

@@ -952,6 +952,65 @@ def ensure_required_outbounds(config: dict) -> None:
             print(f"[render] 已添加缺失的 outbound: {outbound['tag']}")
 
 
+def ensure_speed_test_inbounds(config: dict, wg_tags: List[str]) -> None:
+    """为 WireGuard 出口添加测速用 SOCKS inbound
+
+    每个 WireGuard 出口（PIA + 自定义）都会获得一个专用的 SOCKS inbound，
+    用于测速时强制流量通过该出口。
+
+    端口映射:
+    - 第1个出口 -> socks://127.0.0.1:39001
+    - 第2个出口 -> socks://127.0.0.1:39002
+    - ...
+
+    Args:
+        config: sing-box 配置
+        wg_tags: WireGuard 出口 tag 列表
+    """
+    if not wg_tags:
+        return
+
+    inbounds = config.setdefault("inbounds", [])
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+
+    # 获取已存在的 inbound tags
+    existing_inbound_tags = {ib.get("tag") for ib in inbounds}
+
+    base_port = 39001  # 测速 SOCKS 端口起始
+    added_count = 0
+
+    for i, tag in enumerate(sorted(wg_tags)):
+        socks_port = base_port + i
+        inbound_tag = f"speedtest-{tag}"
+
+        # 跳过已存在的 inbound
+        if inbound_tag in existing_inbound_tags:
+            continue
+
+        # 添加 SOCKS inbound
+        inbound = {
+            "type": "socks",
+            "tag": inbound_tag,
+            "listen": "127.0.0.1",
+            "listen_port": socks_port
+        }
+        inbounds.append(inbound)
+
+        # 添加路由规则：从该 inbound 的流量直接走对应出口
+        # 这个规则需要高优先级，插入到 rules 的前面
+        route_rule = {
+            "inbound": inbound_tag,
+            "outbound": tag
+        }
+        rules.insert(0, route_rule)
+
+        added_count += 1
+
+    if added_count > 0:
+        print(f"[render] 已添加 {added_count} 个测速 SOCKS inbound (端口 {base_port}-{base_port + len(wg_tags) - 1})")
+
+
 def main() -> None:
     config = load_json(BASE_CONFIG)
 
@@ -1008,6 +1067,17 @@ def main() -> None:
         openvpn_tags = ensure_openvpn_egress_outbounds(config, openvpn_egress)
         ensure_openvpn_dns_servers(config, openvpn_tags)
         all_egress_tags.extend(openvpn_tags)
+
+    # 收集 WireGuard 出口 tags（PIA + 自定义 WireGuard，用于测速 SOCKS inbound）
+    wg_tags = []
+    if pia_profiles and pia_profiles.get("profiles"):
+        wg_tags.extend(pia_profiles["profiles"].keys())
+    if custom_egress:
+        wg_tags.extend([e.get("tag") for e in custom_egress if e.get("tag")])
+
+    # 为 WireGuard 出口添加测速 SOCKS inbound
+    if wg_tags:
+        ensure_speed_test_inbounds(config, wg_tags)
 
     # 清理不再存在于数据库中的旧端点
     cleanup_stale_endpoints(config, all_egress_tags)

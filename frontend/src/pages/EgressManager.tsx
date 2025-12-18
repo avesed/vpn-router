@@ -20,8 +20,9 @@ import {
   ChevronUpDownIcon,
   MagnifyingGlassIcon,
   KeyIcon,
-  SignalIcon,
-  LockClosedIcon
+  LockClosedIcon,
+  ExclamationTriangleIcon,
+  ChartBarIcon
 } from "@heroicons/react/24/outline";
 
 type TabType = "all" | "pia" | "custom" | "direct" | "openvpn";
@@ -40,6 +41,13 @@ export default function EgressManager() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>("all");
+
+  // Speed test state
+  const [speedTestStatus, setSpeedTestStatus] = useState<Record<string, {
+    loading: boolean;
+    result?: { success: boolean; speed_mbps: number; message: string };
+  }>>({});
+  const speedTestTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // Add custom modal
   const [showAddModal, setShowAddModal] = useState(false);
@@ -116,12 +124,16 @@ export default function EgressManager() {
   const [openvpnFormClientKey, setOpenvpnFormClientKey] = useState("");
   const [openvpnFormTlsAuth, setOpenvpnFormTlsAuth] = useState("");
   const [openvpnFormTlsCrypt, setOpenvpnFormTlsCrypt] = useState("");
+  const [openvpnFormCrlVerify, setOpenvpnFormCrlVerify] = useState("");
   const [openvpnFormAuthUser, setOpenvpnFormAuthUser] = useState("");
   const [openvpnFormAuthPass, setOpenvpnFormAuthPass] = useState("");
   const [openvpnFormCipher, setOpenvpnFormCipher] = useState("AES-256-GCM");
   const [openvpnFormAuth, setOpenvpnFormAuth] = useState("SHA256");
   const [openvpnFormCompress, setOpenvpnFormCompress] = useState("");
   const [openvpnFormExtraOptions, setOpenvpnFormExtraOptions] = useState("");
+  const [showAuthRequiredHint, setShowAuthRequiredHint] = useState(false);
+  const [authValidationError, setAuthValidationError] = useState(false);
+  const authFieldsRef = useRef<HTMLDivElement>(null);
 
   const loadEgress = useCallback(async () => {
     try {
@@ -159,6 +171,13 @@ export default function EgressManager() {
     loadEgress();
     loadPiaRegions();
   }, [loadEgress, loadPiaRegions]);
+
+  // 清理测速定时器
+  useEffect(() => {
+    return () => {
+      Object.values(speedTestTimers.current).forEach(timer => clearTimeout(timer));
+    };
+  }, []);
 
   // Group regions by country
   const regionsByCountry = piaRegions.reduce((acc, region) => {
@@ -218,6 +237,7 @@ export default function EgressManager() {
     setOpenvpnFormClientKey("");
     setOpenvpnFormTlsAuth("");
     setOpenvpnFormTlsCrypt("");
+    setOpenvpnFormCrlVerify("");
     setOpenvpnFormAuthUser("");
     setOpenvpnFormAuthPass("");
     setOpenvpnFormCipher("AES-256-GCM");
@@ -229,6 +249,8 @@ export default function EgressManager() {
     setOpenvpnParseError(null);
     setEditingOpenvpnEgress(null);
     setOpenvpnImportMethod("upload");
+    setShowAuthRequiredHint(false);
+    setAuthValidationError(false);
   };
 
   // Close dropdown when clicking outside
@@ -372,6 +394,57 @@ export default function EgressManager() {
       setError(err instanceof Error ? err.message : t('pia.loginFailed'));
     } finally {
       setLoginLoading(false);
+    }
+  };
+
+  // ============ Speed Test ============
+
+  const handleSpeedTest = async (tag: string) => {
+    // 取消之前的定时器
+    if (speedTestTimers.current[tag]) {
+      clearTimeout(speedTestTimers.current[tag]);
+      delete speedTestTimers.current[tag];
+    }
+
+    setSpeedTestStatus(prev => ({
+      ...prev,
+      [tag]: { loading: true }
+    }));
+
+    try {
+      const result = await api.testEgressSpeed(tag, 10, 30);
+      setSpeedTestStatus(prev => ({
+        ...prev,
+        [tag]: { loading: false, result }
+      }));
+
+      // 10秒后清除结果
+      speedTestTimers.current[tag] = setTimeout(() => {
+        setSpeedTestStatus(prev => {
+          const next = { ...prev };
+          delete next[tag];
+          return next;
+        });
+        delete speedTestTimers.current[tag];
+      }, 10000);
+    } catch (err) {
+      setSpeedTestStatus(prev => ({
+        ...prev,
+        [tag]: {
+          loading: false,
+          result: { success: false, speed_mbps: 0, message: err instanceof Error ? err.message : t('egress.speedTestFailed') }
+        }
+      }));
+
+      // 5秒后清除错误结果
+      speedTestTimers.current[tag] = setTimeout(() => {
+        setSpeedTestStatus(prev => {
+          const next = { ...prev };
+          delete next[tag];
+          return next;
+        });
+        delete speedTestTimers.current[tag];
+      }, 5000);
     }
   };
 
@@ -617,11 +690,14 @@ export default function EgressManager() {
     setOpenvpnFormRemotePort(egress.remote_port);
     setOpenvpnFormCaCert(egress.ca_cert);
     setOpenvpnFormClientCert(egress.client_cert || "");
-    setOpenvpnFormClientKey(egress.client_key || "");
+    // client_key 被 API 掩码为 [hidden]，不填充
+    setOpenvpnFormClientKey("");
     setOpenvpnFormTlsAuth(egress.tls_auth || "");
     setOpenvpnFormTlsCrypt(egress.tls_crypt || "");
+    setOpenvpnFormCrlVerify(egress.crl_verify || "");
     setOpenvpnFormAuthUser(egress.auth_user || "");
-    setOpenvpnFormAuthPass(egress.auth_pass || "");
+    // auth_pass 被 API 掩码为 ***，不填充，留空表示不修改
+    setOpenvpnFormAuthPass("");
     setOpenvpnFormCipher(egress.cipher);
     setOpenvpnFormAuth(egress.auth);
     setOpenvpnFormCompress(egress.compress || "");
@@ -657,9 +733,15 @@ export default function EgressManager() {
       if (result.client_key) setOpenvpnFormClientKey(result.client_key);
       if (result.tls_auth) setOpenvpnFormTlsAuth(result.tls_auth);
       if (result.tls_crypt) setOpenvpnFormTlsCrypt(result.tls_crypt);
-      if (result.cipher) setOpenvpnFormCipher(result.cipher);
-      if (result.auth) setOpenvpnFormAuth(result.auth);
+      if (result.crl_verify) setOpenvpnFormCrlVerify(result.crl_verify);
+      // cipher 和 auth 需要转换为大写以匹配下拉选项
+      if (result.cipher) setOpenvpnFormCipher(result.cipher.toUpperCase());
+      if (result.auth) setOpenvpnFormAuth(result.auth.toUpperCase());
       if (result.compress) setOpenvpnFormCompress(result.compress);
+      // 检测是否需要用户名/密码认证
+      setShowAuthRequiredHint(!!result.requires_auth);
+      // 解析成功后自动切换到手动输入模式，让用户可以看到并编辑解析后的数据
+      setOpenvpnImportMethod("manual");
       setSuccessMessage(t('openvpnEgress.parseSuccess'));
       setTimeout(() => setSuccessMessage(null), 2000);
     } catch (err) {
@@ -667,12 +749,21 @@ export default function EgressManager() {
     }
   };
 
-  const handleCreateOpenvpnEgress = async () => {
+  const handleCreateOpenvpnEgress = async (forceCreate = false) => {
     if (!openvpnFormTag || !openvpnFormRemoteHost || !openvpnFormCaCert) {
       setError(t('openvpnEgress.fillRequiredFields'));
       return;
     }
 
+    // 检查是否需要认证但未填写
+    if (showAuthRequiredHint && !forceCreate && (!openvpnFormAuthUser || !openvpnFormAuthPass)) {
+      setAuthValidationError(true);
+      // 滚动到认证字段
+      authFieldsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
+    setAuthValidationError(false);
     setActionLoading("create-openvpn");
     try {
       await api.createOpenVPNEgress({
@@ -686,6 +777,7 @@ export default function EgressManager() {
         client_key: openvpnFormClientKey || undefined,
         tls_auth: openvpnFormTlsAuth || undefined,
         tls_crypt: openvpnFormTlsCrypt || undefined,
+        crl_verify: openvpnFormCrlVerify || undefined,
         auth_user: openvpnFormAuthUser || undefined,
         auth_pass: openvpnFormAuthPass || undefined,
         cipher: openvpnFormCipher,
@@ -720,6 +812,7 @@ export default function EgressManager() {
         client_key: openvpnFormClientKey || undefined,
         tls_auth: openvpnFormTlsAuth || undefined,
         tls_crypt: openvpnFormTlsCrypt || undefined,
+        crl_verify: openvpnFormCrlVerify || undefined,
         auth_user: openvpnFormAuthUser || undefined,
         auth_pass: openvpnFormAuthPass || undefined,
         cipher: openvpnFormCipher,
@@ -980,7 +1073,7 @@ export default function EgressManager() {
                           <p className="text-xs text-slate-500">{profile.description}</p>
                         </div>
                       </div>
-                      <div className="flex gap-1">
+                      <div className="flex gap-1 flex-shrink-0">
                         <button
                           onClick={() => handleEditPiaProfile(profile)}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
@@ -1011,11 +1104,11 @@ export default function EgressManager() {
                       )}
                     </div>
 
-                    <div className="mt-3">
+                    <div className="mt-3 flex gap-2">
                       <button
                         onClick={() => handleReconnectPiaProfile(profile.tag)}
                         disabled={actionLoading === `reconnect-${profile.tag}`}
-                        className="w-full flex items-center justify-center gap-2 rounded-lg bg-slate-800/50 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
+                        className="flex-1 flex items-center justify-center gap-2 rounded-lg bg-slate-800/50 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-700 transition-colors"
                       >
                         {actionLoading === `reconnect-${profile.tag}` ? (
                           <>
@@ -1026,6 +1119,38 @@ export default function EgressManager() {
                           <>
                             <ArrowPathIcon className="h-3.5 w-3.5" />
                             {profile.is_connected ? t('egress.reconnect') : t('egress.connect')}
+                          </>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => handleSpeedTest(profile.tag)}
+                        disabled={speedTestStatus[profile.tag]?.loading}
+                        className={`flex-1 flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                          speedTestStatus[profile.tag]?.result
+                            ? speedTestStatus[profile.tag].result?.success
+                              ? "bg-emerald-500/20 text-emerald-400"
+                              : "bg-red-500/20 text-red-400"
+                            : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {speedTestStatus[profile.tag]?.loading ? (
+                          <>
+                            <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                            {t('egress.speedTesting')}
+                          </>
+                        ) : speedTestStatus[profile.tag]?.result ? (
+                          <>
+                            {speedTestStatus[profile.tag].result?.success ? (
+                              <CheckCircleIcon className="h-3.5 w-3.5" />
+                            ) : (
+                              <XCircleIcon className="h-3.5 w-3.5" />
+                            )}
+                            {speedTestStatus[profile.tag].result?.message}
+                          </>
+                        ) : (
+                          <>
+                            <ChartBarIcon className="h-3.5 w-3.5" />
+                            {t('egress.speedTest')}
                           </>
                         )}
                       </button>
@@ -1073,7 +1198,7 @@ export default function EgressManager() {
                           <p className="text-xs text-slate-500">{egress.description || t('customEgress.defaultDescription')}</p>
                         </div>
                       </div>
-                      <div className="flex gap-1">
+                      <div className="flex gap-1 flex-shrink-0">
                         <button
                           onClick={() => handleEditEgress(egress)}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
@@ -1091,6 +1216,7 @@ export default function EgressManager() {
                         </button>
                       </div>
                     </div>
+
                     <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
                       <p className="text-xs font-mono text-slate-400">
                         {egress.server}:{egress.port}
@@ -1098,6 +1224,41 @@ export default function EgressManager() {
                       <p className="text-xs text-slate-500">
                         {t('customEgress.addressLabel')}: {egress.address} | MTU: {egress.mtu}
                       </p>
+                    </div>
+
+                    <div className="mt-3">
+                      <button
+                        onClick={() => handleSpeedTest(egress.tag)}
+                        disabled={speedTestStatus[egress.tag]?.loading}
+                        className={`w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                          speedTestStatus[egress.tag]?.result
+                            ? speedTestStatus[egress.tag].result?.success
+                              ? "bg-emerald-500/20 text-emerald-400"
+                              : "bg-red-500/20 text-red-400"
+                            : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {speedTestStatus[egress.tag]?.loading ? (
+                          <>
+                            <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                            {t('egress.speedTesting')}
+                          </>
+                        ) : speedTestStatus[egress.tag]?.result ? (
+                          <>
+                            {speedTestStatus[egress.tag].result?.success ? (
+                              <CheckCircleIcon className="h-3.5 w-3.5" />
+                            ) : (
+                              <XCircleIcon className="h-3.5 w-3.5" />
+                            )}
+                            {speedTestStatus[egress.tag].result?.message}
+                          </>
+                        ) : (
+                          <>
+                            <ChartBarIcon className="h-3.5 w-3.5" />
+                            {t('egress.speedTest')}
+                          </>
+                        )}
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -1110,7 +1271,7 @@ export default function EgressManager() {
             <div>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
-                  <SignalIcon className="h-4 w-4" />
+                  <GlobeAltIcon className="h-4 w-4" />
                   {t('directEgress.title')} ({filteredDirect.length})
                 </h3>
                 {activeTab === "direct" && (
@@ -1132,7 +1293,7 @@ export default function EgressManager() {
                     <div className="flex items-start justify-between">
                       <div className="flex items-center gap-3">
                         <div className={`p-2 rounded-lg ${egress.enabled ? "bg-cyan-500/20" : "bg-white/10"}`}>
-                          <SignalIcon className={`h-5 w-5 ${egress.enabled ? "text-cyan-400" : "text-slate-400"}`} />
+                          <GlobeAltIcon className={`h-5 w-5 ${egress.enabled ? "text-cyan-400" : "text-slate-400"}`} />
                         </div>
                         <div>
                           <div className="flex items-center gap-2">
@@ -1146,7 +1307,7 @@ export default function EgressManager() {
                           <p className="text-xs text-slate-500">{egress.description || t('directEgress.defaultDescription')}</p>
                         </div>
                       </div>
-                      <div className="flex gap-1">
+                      <div className="flex gap-1 flex-shrink-0">
                         <button
                           onClick={() => handleEditDirectEgress(egress)}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
@@ -1164,6 +1325,7 @@ export default function EgressManager() {
                         </button>
                       </div>
                     </div>
+
                     <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
                       {egress.bind_interface && (
                         <p className="text-xs text-slate-400">
@@ -1180,6 +1342,41 @@ export default function EgressManager() {
                           <span className="text-slate-500">IPv6:</span> {egress.inet6_bind_address}
                         </p>
                       )}
+                    </div>
+
+                    <div className="mt-3">
+                      <button
+                        onClick={() => handleSpeedTest(egress.tag)}
+                        disabled={speedTestStatus[egress.tag]?.loading}
+                        className={`w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                          speedTestStatus[egress.tag]?.result
+                            ? speedTestStatus[egress.tag].result?.success
+                              ? "bg-emerald-500/20 text-emerald-400"
+                              : "bg-red-500/20 text-red-400"
+                            : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {speedTestStatus[egress.tag]?.loading ? (
+                          <>
+                            <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                            {t('egress.speedTesting')}
+                          </>
+                        ) : speedTestStatus[egress.tag]?.result ? (
+                          <>
+                            {speedTestStatus[egress.tag].result?.success ? (
+                              <CheckCircleIcon className="h-3.5 w-3.5" />
+                            ) : (
+                              <XCircleIcon className="h-3.5 w-3.5" />
+                            )}
+                            {speedTestStatus[egress.tag].result?.message}
+                          </>
+                        ) : (
+                          <>
+                            <ChartBarIcon className="h-3.5 w-3.5" />
+                            {t('egress.speedTest')}
+                          </>
+                        )}
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -1228,7 +1425,7 @@ export default function EgressManager() {
                           <p className="text-xs text-slate-500">{egress.description || t('openvpnEgress.defaultDescription')}</p>
                         </div>
                       </div>
-                      <div className="flex gap-1">
+                      <div className="flex gap-1 flex-shrink-0">
                         <button
                           onClick={() => handleEditOpenvpnEgress(egress)}
                           className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
@@ -1246,6 +1443,7 @@ export default function EgressManager() {
                         </button>
                       </div>
                     </div>
+
                     <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
                       <p className="text-xs text-slate-400">
                         <span className="text-slate-500">{t('openvpnEgress.remoteHost')}:</span> {egress.remote_host}:{egress.remote_port}
@@ -1258,6 +1456,41 @@ export default function EgressManager() {
                           <span className="text-slate-500">{t('openvpnEgress.socksPort')}:</span> {egress.socks_port}
                         </p>
                       )}
+                    </div>
+
+                    <div className="mt-3">
+                      <button
+                        onClick={() => handleSpeedTest(egress.tag)}
+                        disabled={speedTestStatus[egress.tag]?.loading}
+                        className={`w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                          speedTestStatus[egress.tag]?.result
+                            ? speedTestStatus[egress.tag].result?.success
+                              ? "bg-emerald-500/20 text-emerald-400"
+                              : "bg-red-500/20 text-red-400"
+                            : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {speedTestStatus[egress.tag]?.loading ? (
+                          <>
+                            <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                            {t('egress.speedTesting')}
+                          </>
+                        ) : speedTestStatus[egress.tag]?.result ? (
+                          <>
+                            {speedTestStatus[egress.tag].result?.success ? (
+                              <CheckCircleIcon className="h-3.5 w-3.5" />
+                            ) : (
+                              <XCircleIcon className="h-3.5 w-3.5" />
+                            )}
+                            {speedTestStatus[egress.tag].result?.message}
+                          </>
+                        ) : (
+                          <>
+                            <ChartBarIcon className="h-3.5 w-3.5" />
+                            {t('egress.speedTest')}
+                          </>
+                        )}
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -2020,8 +2253,8 @@ export default function EgressManager() {
                     className="w-full p-8 rounded-xl border-2 border-dashed border-white/20 hover:border-orange-500/50 transition-colors flex flex-col items-center gap-2"
                   >
                     <ArrowUpTrayIcon className="h-8 w-8 text-slate-400" />
-                    <span className="text-slate-400">{t('customEgress.clickToUpload')}</span>
-                    <span className="text-xs text-slate-500">{t('customEgress.uploadHint')}</span>
+                    <span className="text-slate-400">{t('openvpnEgress.clickToUpload')}</span>
+                    <span className="text-xs text-slate-500">{t('openvpnEgress.uploadHint')}</span>
                   </button>
                   {openvpnParsedConfig && (
                     <div className="mt-2 p-2 rounded bg-emerald-500/10 text-emerald-400 text-sm flex items-center gap-2">
@@ -2180,27 +2413,73 @@ export default function EgressManager() {
                     </div>
                   </div>
 
-                  {/* Auth User/Pass row */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.authUser')}</label>
-                      <input
-                        type="text"
-                        value={openvpnFormAuthUser}
-                        onChange={(e) => setOpenvpnFormAuthUser(e.target.value)}
-                        placeholder={t('openvpnEgress.authUserPlaceholder')}
-                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.authPass')}</label>
-                      <input
-                        type="password"
-                        value={openvpnFormAuthPass}
-                        onChange={(e) => setOpenvpnFormAuthPass(e.target.value)}
-                        placeholder={t('openvpnEgress.authPassPlaceholder')}
-                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
-                      />
+                  {/* CRL Verify */}
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">{t('openvpnEgress.crlVerify')}</label>
+                    <textarea
+                      value={openvpnFormCrlVerify}
+                      onChange={(e) => setOpenvpnFormCrlVerify(e.target.value)}
+                      placeholder={t('openvpnEgress.crlVerifyPlaceholder')}
+                      className="w-full h-20 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-xs"
+                    />
+                  </div>
+
+                  {/* Auth Required Hint / Validation Error */}
+                  <div ref={authFieldsRef}>
+                    {(showAuthRequiredHint || authValidationError) && (
+                      <div className={`p-3 rounded-lg text-sm flex items-center gap-2 ${
+                        authValidationError
+                          ? 'bg-red-500/20 border-2 border-red-500 text-red-400 animate-pulse'
+                          : 'bg-orange-500/10 border border-orange-500/30 text-orange-400'
+                      }`}>
+                        <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                        <span className="font-medium">
+                          {authValidationError
+                            ? t('openvpnEgress.authValidationError')
+                            : t('openvpnEgress.authRequiredHint')
+                          }
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Auth User/Pass row */}
+                    <div className={`grid grid-cols-2 gap-3 ${(showAuthRequiredHint || authValidationError) ? 'mt-3' : ''}`}>
+                      <div>
+                        <label className={`block text-sm font-medium mb-2 ${authValidationError ? 'text-red-400' : showAuthRequiredHint ? 'text-orange-400' : 'text-slate-400'}`}>
+                          {t('openvpnEgress.authUser')} {(showAuthRequiredHint || authValidationError) && <span className={authValidationError ? 'text-red-400' : 'text-orange-400'}>*</span>}
+                        </label>
+                        <input
+                          type="text"
+                          value={openvpnFormAuthUser}
+                          onChange={(e) => {
+                            setOpenvpnFormAuthUser(e.target.value);
+                            if (authValidationError) setAuthValidationError(false);
+                          }}
+                          placeholder={t('openvpnEgress.authUserPlaceholder')}
+                          className={`w-full px-3 py-2 rounded-lg bg-white/5 border text-white placeholder-slate-500 focus:outline-none focus:border-brand ${
+                            authValidationError ? 'border-red-500 border-2' : showAuthRequiredHint ? 'border-orange-500/50' : 'border-white/10'
+                          }`}
+                        />
+                      </div>
+                      <div>
+                        <label className={`block text-sm font-medium mb-2 ${authValidationError ? 'text-red-400' : showAuthRequiredHint ? 'text-orange-400' : 'text-slate-400'}`}>
+                          {t('openvpnEgress.authPass')} {(showAuthRequiredHint || authValidationError) && <span className={authValidationError ? 'text-red-400' : 'text-orange-400'}>*</span>}
+                        </label>
+                        <input
+                          type="password"
+                          value={openvpnFormAuthPass}
+                          onChange={(e) => {
+                            setOpenvpnFormAuthPass(e.target.value);
+                            if (authValidationError) setAuthValidationError(false);
+                          }}
+                          placeholder={openvpnModalMode === "edit" ? t('openvpnEgress.authPassKeepExisting') : t('openvpnEgress.authPassPlaceholder')}
+                          className={`w-full px-3 py-2 rounded-lg bg-white/5 border text-white placeholder-slate-500 focus:outline-none focus:border-brand ${
+                            authValidationError ? 'border-red-500 border-2' : showAuthRequiredHint ? 'border-orange-500/50' : 'border-white/10'
+                          }`}
+                        />
+                      </div>
                     </div>
                   </div>
 
@@ -2211,13 +2490,13 @@ export default function EgressManager() {
                       <select
                         value={openvpnFormCipher}
                         onChange={(e) => setOpenvpnFormCipher(e.target.value)}
-                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                        className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-white/10 text-white focus:outline-none focus:border-brand cursor-pointer"
                       >
-                        <option value="AES-256-GCM">AES-256-GCM</option>
-                        <option value="AES-128-GCM">AES-128-GCM</option>
-                        <option value="AES-256-CBC">AES-256-CBC</option>
-                        <option value="AES-128-CBC">AES-128-CBC</option>
-                        <option value="CHACHA20-POLY1305">CHACHA20-POLY1305</option>
+                        <option value="AES-256-GCM" className="bg-slate-800 text-white">AES-256-GCM</option>
+                        <option value="AES-128-GCM" className="bg-slate-800 text-white">AES-128-GCM</option>
+                        <option value="AES-256-CBC" className="bg-slate-800 text-white">AES-256-CBC</option>
+                        <option value="AES-128-CBC" className="bg-slate-800 text-white">AES-128-CBC</option>
+                        <option value="CHACHA20-POLY1305" className="bg-slate-800 text-white">CHACHA20-POLY1305</option>
                       </select>
                     </div>
                     <div>
@@ -2225,11 +2504,11 @@ export default function EgressManager() {
                       <select
                         value={openvpnFormAuth}
                         onChange={(e) => setOpenvpnFormAuth(e.target.value)}
-                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                        className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-white/10 text-white focus:outline-none focus:border-brand cursor-pointer"
                       >
-                        <option value="SHA256">SHA256</option>
-                        <option value="SHA512">SHA512</option>
-                        <option value="SHA1">SHA1</option>
+                        <option value="SHA256" className="bg-slate-800 text-white">SHA256</option>
+                        <option value="SHA512" className="bg-slate-800 text-white">SHA512</option>
+                        <option value="SHA1" className="bg-slate-800 text-white">SHA1</option>
                       </select>
                     </div>
                     <div>
@@ -2237,12 +2516,13 @@ export default function EgressManager() {
                       <select
                         value={openvpnFormCompress}
                         onChange={(e) => setOpenvpnFormCompress(e.target.value)}
-                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                        className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-white/10 text-white focus:outline-none focus:border-brand cursor-pointer"
                       >
-                        <option value="">{t('openvpnEgress.compressNone')}</option>
-                        <option value="lzo">LZO</option>
-                        <option value="lz4">LZ4</option>
-                        <option value="lz4-v2">LZ4-V2</option>
+                        <option value="" className="bg-slate-800 text-white">{t('openvpnEgress.compressNone')}</option>
+                        <option value="stub" className="bg-slate-800 text-white">{t('openvpnEgress.compressAdaptive')}</option>
+                        <option value="lzo" className="bg-slate-800 text-white">LZO</option>
+                        <option value="lz4" className="bg-slate-800 text-white">LZ4</option>
+                        <option value="lz4-v2" className="bg-slate-800 text-white">LZ4-V2</option>
                       </select>
                     </div>
                   </div>
@@ -2272,8 +2552,23 @@ export default function EgressManager() {
               >
                 {t('common.cancel')}
               </button>
+              {/* Force save button - only show when auth validation error */}
+              {authValidationError && openvpnModalMode === "add" && (
+                <button
+                  onClick={() => handleCreateOpenvpnEgress(true)}
+                  disabled={actionLoading === "create-openvpn"}
+                  className="px-4 py-2 rounded-lg bg-slate-600 hover:bg-slate-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {actionLoading === "create-openvpn" ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <ExclamationTriangleIcon className="h-4 w-4" />
+                  )}
+                  {t('openvpnEgress.forceSave')}
+                </button>
+              )}
               <button
-                onClick={openvpnModalMode === "add" ? handleCreateOpenvpnEgress : handleUpdateOpenvpnEgress}
+                onClick={() => openvpnModalMode === "add" ? handleCreateOpenvpnEgress() : handleUpdateOpenvpnEgress()}
                 disabled={
                   (openvpnModalMode === "add" ? actionLoading === "create-openvpn" : actionLoading === "update-openvpn") ||
                   (openvpnModalMode === "add" && !openvpnFormTag) ||

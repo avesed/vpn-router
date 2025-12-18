@@ -110,8 +110,15 @@ class OpenVPNManager:
         ]
 
         # 压缩
-        if egress.get("compress"):
-            config_lines.append(f"compress {egress['compress']}")
+        compress = egress.get("compress")
+        if compress:
+            # 修正无效的 compress 值
+            valid_compress = {"stub", "lzo", "lz4", "lz4-v2"}
+            if compress.lower() in valid_compress:
+                config_lines.append(f"compress {compress}")
+            elif compress.lower() == "yes":
+                # "yes" 不是有效的 compress 参数，转换为 stub
+                config_lines.append("compress stub")
 
         # 写入 CA 证书
         ca_path = config_dir / "ca.crt"

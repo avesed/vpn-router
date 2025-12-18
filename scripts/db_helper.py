@@ -1091,6 +1091,7 @@ class UserDatabase:
         client_key: Optional[str] = None,
         tls_auth: Optional[str] = None,
         tls_crypt: Optional[str] = None,
+        crl_verify: Optional[str] = None,
         auth_user: Optional[str] = None,
         auth_pass: Optional[str] = None,
         cipher: str = "AES-256-GCM",
@@ -1111,11 +1112,11 @@ class UserDatabase:
             cursor.execute("""
                 INSERT INTO openvpn_egress
                 (tag, description, protocol, remote_host, remote_port,
-                 ca_cert, client_cert, client_key, tls_auth, tls_crypt,
+                 ca_cert, client_cert, client_key, tls_auth, tls_crypt, crl_verify,
                  auth_user, auth_pass, cipher, auth, compress, extra_options, socks_port)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (tag, description, protocol, remote_host, remote_port,
-                  ca_cert, client_cert, client_key, tls_auth, tls_crypt,
+                  ca_cert, client_cert, client_key, tls_auth, tls_crypt, crl_verify,
                   auth_user, auth_pass, cipher, auth, compress, extra_options_json, socks_port))
             conn.commit()
             return cursor.lastrowid
@@ -1124,7 +1125,7 @@ class UserDatabase:
         """更新 OpenVPN 出口"""
         allowed_fields = {
             "description", "protocol", "remote_host", "remote_port",
-            "ca_cert", "client_cert", "client_key", "tls_auth", "tls_crypt",
+            "ca_cert", "client_cert", "client_key", "tls_auth", "tls_crypt", "crl_verify",
             "auth_user", "auth_pass", "cipher", "auth", "compress",
             "extra_options", "enabled"
         }
@@ -1393,6 +1394,7 @@ class DatabaseManager:
         client_key: Optional[str] = None,
         tls_auth: Optional[str] = None,
         tls_crypt: Optional[str] = None,
+        crl_verify: Optional[str] = None,
         auth_user: Optional[str] = None,
         auth_pass: Optional[str] = None,
         cipher: str = "AES-256-GCM",
@@ -1402,7 +1404,7 @@ class DatabaseManager:
     ) -> int:
         return self.user.add_openvpn_egress(
             tag, remote_host, ca_cert, description, protocol, remote_port,
-            client_cert, client_key, tls_auth, tls_crypt, auth_user, auth_pass,
+            client_cert, client_key, tls_auth, tls_crypt, crl_verify, auth_user, auth_pass,
             cipher, auth, compress, extra_options
         )
 
