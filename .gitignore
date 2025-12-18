@@ -28,8 +28,7 @@ vite.config.d.ts
 *-client.conf
 *.wg.conf
 
-# Domain catalog (generated from blackmatrix7)
-/config/domain-catalog.json
+# Domain catalog file
 /config/domain-catalog-new.json
 
 # GeoIP JSON files (generated from database)
