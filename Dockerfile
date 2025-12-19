@@ -1,5 +1,23 @@
 # ==========================================
-# Stage 1: Build Frontend
+# Stage 1: Build sing-box with v2ray_api
+# ==========================================
+FROM golang:1.23-bookworm AS singbox-builder
+
+ARG SINGBOX_VERSION=1.12.13
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN git clone --depth 1 --branch v${SINGBOX_VERSION} https://github.com/SagerNet/sing-box.git .
+
+# Build with all required tags including v2ray_api
+# CGO_ENABLED=0 for static linking
+RUN CGO_ENABLED=0 go build -v -trimpath -ldflags "-s -w -buildid=" \
+    -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api" \
+    -o /sing-box ./cmd/sing-box
+
+# ==========================================
+# Stage 2: Build Frontend
 # ==========================================
 FROM node:20-alpine AS frontend-builder
 
@@ -10,7 +28,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ==========================================
-# Stage 2: Production Runtime
+# Stage 3: Production Runtime
 # ==========================================
 FROM debian:12-slim
 
@@ -41,24 +59,13 @@ RUN set -eux; \
         python3-pil \
         wireguard-tools \
         nginx-light; \
-    pip3 install --no-cache-dir --break-system-packages cryptography; \
+    pip3 install --no-cache-dir --break-system-packages cryptography grpcio grpcio-tools; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
 
-# Download sing-box from GitHub releases
-ARG SINGBOX_VERSION=1.11.0
-RUN set -eux; \
-    ARCH=$(dpkg --print-architecture); \
-    case "$ARCH" in \
-        amd64) SINGBOX_ARCH="amd64" ;; \
-        arm64) SINGBOX_ARCH="arm64" ;; \
-        *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
-    esac; \
-    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}.tar.gz" | \
-    tar -xzf - -C /tmp; \
-    mv /tmp/sing-box-${SINGBOX_VERSION}-linux-${SINGBOX_ARCH}/sing-box /usr/local/bin/sing-box; \
-    chmod +x /usr/local/bin/sing-box; \
-    rm -rf /tmp/sing-box-*
+# Copy sing-box binary built from source (with v2ray_api support)
+COPY --from=singbox-builder /sing-box /usr/local/bin/sing-box
+RUN chmod +x /usr/local/bin/sing-box
 
 # Copy frontend build output
 COPY --from=frontend-builder /app/dist /var/www/html
@@ -90,6 +97,9 @@ COPY scripts/init_user_db.py /usr/local/bin/init_user_db.py
 COPY scripts/convert_adblock.py /usr/local/bin/convert_adblock.py
 COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
 COPY scripts/socks5_proxy.py /usr/local/bin/socks5_proxy.py
+COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
+COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
+COPY scripts/v2ray_stats_client.py /usr/local/bin/v2ray_stats_client.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \

@@ -76,6 +76,19 @@ DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "36000"))
 
 PIA_SERVERLIST_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
 
+# ============ 规则类型验证常量 ============
+# sing-box 支持的协议嗅探类型
+VALID_PROTOCOLS = {
+    "http", "tls", "quic", "bittorrent", "stun", "dtls", "ssh", "rdp", "dns", "ntp"
+}
+# sing-box 支持的网络类型
+VALID_NETWORKS = {"tcp", "udp"}
+# 支持的路由规则类型
+VALID_RULE_TYPES = {
+    "domain", "domain_keyword", "ip", "domain_list", "country",
+    "protocol", "network", "port", "port_range"  # 新增协议/端口规则
+}
+
 CONFIG_LOCK = threading.Lock()
 
 # 缓存 PIA 地区列表（有效期 1 小时）
@@ -154,19 +167,21 @@ def has_pia_credentials() -> bool:
     return bool(username and password)
 
 # ============ 流量统计 ============
-# 累计流量统计（按出口分组）
+# 累计流量统计（按出口分组）- 从 V2Ray API 获取精确数据
 _traffic_stats: Dict[str, Dict[str, int]] = {}  # {outbound: {download: int, upload: int}}
-# 已知连接的流量快照（用于计算增量）
-_known_connections: Dict[str, Dict[str, int]] = {}  # {conn_id: {download: int, upload: int, outbound: str}}
-# 上一次的流量快照（用于计算速率）
-_prev_traffic_stats: Dict[str, Dict[str, int]] = {}
 # 当前速率（bytes/s）
 _traffic_rates: Dict[str, Dict[str, float]] = {}  # {outbound: {download_rate: float, upload_rate: float}}
 # 速率历史记录（保留24小时）
 _rate_history: List[Dict[str, Any]] = []  # [{timestamp: int, rates: {outbound: rate_kb}}]
 _traffic_stats_lock = threading.Lock()
-_RATE_INTERVAL = 5  # 速率计算间隔（秒）
+_POLL_INTERVAL = 1  # 轮询间隔（秒）
+_RATE_WINDOW = 1  # 速率计算窗口（秒）- 1秒窗口更准确反映瞬时速率
+_HISTORY_INTERVAL = 1  # 历史记录间隔（秒）- 1秒更新，支持实时推进图表
 _MAX_HISTORY_SECONDS = 24 * 60 * 60  # 保留24小时历史
+_last_history_time = 0  # 上次记录历史的时间
+_rate_samples: List[Dict[str, Dict[str, int]]] = []  # 最近 N 个流量样本用于计算速率
+# V2Ray API 客户端（懒加载）
+_v2ray_client = None
 
 
 class WireGuardPeerModel(BaseModel):
@@ -213,6 +228,11 @@ class RouteRuleRequest(BaseModel):
     domains: Optional[List[str]] = Field(None, description="域名后缀列表")
     domain_keywords: Optional[List[str]] = Field(None, description="域名关键词列表")
     ip_cidrs: Optional[List[str]] = Field(None, description="IP CIDR 列表")
+    # 新增协议/端口匹配字段
+    protocols: Optional[List[str]] = Field(None, description="协议列表 (bittorrent, stun, ssh 等)")
+    network: Optional[str] = Field(None, description="网络类型 (tcp, udp)")
+    ports: Optional[List[int]] = Field(None, description="目标端口列表")
+    port_ranges: Optional[List[str]] = Field(None, description="端口范围列表 (如 '6881:6889')")
 
 
 class RouteRulesUpdateRequest(BaseModel):
@@ -229,6 +249,11 @@ class CustomRuleRequest(BaseModel):
     domains: Optional[List[str]] = Field(None, description="域名后缀列表")
     domain_keywords: Optional[List[str]] = Field(None, description="域名关键词列表")
     ip_cidrs: Optional[List[str]] = Field(None, description="IP CIDR 列表")
+    # 新增协议/端口匹配字段
+    protocols: Optional[List[str]] = Field(None, description="协议列表 (bittorrent, stun, ssh 等)")
+    network: Optional[str] = Field(None, description="网络类型 (tcp, udp)")
+    ports: Optional[List[int]] = Field(None, description="目标端口列表")
+    port_ranges: Optional[List[str]] = Field(None, description="端口范围列表 (如 '6881:6889')")
 
 
 class CustomCategoryItemRequest(BaseModel):
@@ -470,7 +495,8 @@ def load_catalogs():
 
 def _get_all_outbounds() -> List[str]:
     """获取所有配置的出口（用于图表显示）"""
-    outbounds = ["direct"]  # 始终包含 direct
+    # 始终包含标准出口
+    outbounds = ["direct", "block", "adblock"]
 
     if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
         try:
@@ -493,118 +519,123 @@ def _get_all_outbounds() -> List[str]:
                 tag = egress.get("tag")
                 if tag and tag not in outbounds:
                     outbounds.append(tag)
+
+            # OpenVPN egress
+            for egress in db.get_openvpn_egress_list(enabled_only=True):
+                tag = egress.get("tag")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+
+            # 从路由规则中获取出口（包括协议规则、端口规则等）
+            for rule in db.get_routing_rules():
+                outbound = rule.get("outbound")
+                if outbound and outbound not in outbounds:
+                    outbounds.append(outbound)
         except Exception:
             pass
 
     return outbounds
 
 
+def _get_v2ray_client():
+    """获取 V2Ray API 客户端（懒加载）"""
+    global _v2ray_client
+    if _v2ray_client is None:
+        try:
+            from v2ray_stats_client import V2RayStatsClient
+            _v2ray_client = V2RayStatsClient()
+        except ImportError:
+            print("[Traffic] V2Ray stats client not available, using fallback")
+            return None
+    return _v2ray_client
+
+
 def _update_traffic_stats():
-    """后台线程：定期更新累计流量统计和实时速率"""
-    import urllib.request
-    import urllib.error
-    global _traffic_stats, _known_connections, _prev_traffic_stats, _traffic_rates, _rate_history
+    """后台线程：定期更新累计流量统计和实时速率
+
+    使用 V2Ray API 获取精确的出口流量统计（100% 准确）
+    """
+    global _traffic_stats, _traffic_rates, _rate_history
+    global _last_history_time, _rate_samples
 
     while True:
         try:
-            with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=2) as resp:
-                data = json.loads(resp.read().decode())
+            client = _get_v2ray_client()
+            if client is None:
+                time.sleep(_POLL_INTERVAL)
+                continue
 
-            connections = data.get("connections", [])
-            current_conn_ids = set()
+            # 从 V2Ray API 获取精确的出口流量统计
+            outbound_stats = client.get_outbound_stats()
 
             with _traffic_stats_lock:
-                for conn in connections:
-                    conn_id = conn.get("id", "")
-                    if not conn_id:
-                        continue
-
-                    current_conn_ids.add(conn_id)
-                    download = conn.get("download", 0)
-                    upload = conn.get("upload", 0)
-                    chains = conn.get("chains", [])
-                    outbound = chains[-1] if chains else "unknown"
-
-                    # 初始化出口统计
-                    if outbound not in _traffic_stats:
-                        _traffic_stats[outbound] = {"download": 0, "upload": 0}
-
-                    if conn_id in _known_connections:
-                        # 已知连接：计算增量
-                        prev = _known_connections[conn_id]
-                        dl_delta = download - prev["download"]
-                        ul_delta = upload - prev["upload"]
-                        if dl_delta > 0:
-                            _traffic_stats[outbound]["download"] += dl_delta
-                        if ul_delta > 0:
-                            _traffic_stats[outbound]["upload"] += ul_delta
-                    else:
-                        # 新连接：累加全部流量
-                        _traffic_stats[outbound]["download"] += download
-                        _traffic_stats[outbound]["upload"] += upload
-
-                    # 更新快照
-                    _known_connections[conn_id] = {
-                        "download": download,
-                        "upload": upload,
-                        "outbound": outbound
+                # 更新累计流量（直接使用 V2Ray API 的精确数据）
+                for outbound, stats in outbound_stats.items():
+                    _traffic_stats[outbound] = {
+                        "download": stats["download"],
+                        "upload": stats["upload"]
                     }
 
-                # 清理已关闭的连接
-                closed_ids = set(_known_connections.keys()) - current_conn_ids
-                for conn_id in closed_ids:
-                    del _known_connections[conn_id]
+                # 保存当前流量样本用于速率计算
+                current_sample = {k: dict(v) for k, v in _traffic_stats.items()}
+                _rate_samples.append(current_sample)
+                max_samples = _RATE_WINDOW // _POLL_INTERVAL + 1
+                if len(_rate_samples) > max_samples:
+                    _rate_samples.pop(0)
 
-                # 计算速率（bytes/s）
-                for outbound, stats in _traffic_stats.items():
-                    prev = _prev_traffic_stats.get(outbound, {"download": 0, "upload": 0})
-                    dl_rate = (stats["download"] - prev["download"]) / _RATE_INTERVAL
-                    ul_rate = (stats["upload"] - prev["upload"]) / _RATE_INTERVAL
-                    _traffic_rates[outbound] = {
-                        "download_rate": max(0, dl_rate),
-                        "upload_rate": max(0, ul_rate)
-                    }
+                # 计算速率
+                if len(_rate_samples) >= 2:
+                    oldest = _rate_samples[0]
+                    newest = _rate_samples[-1]
+                    window_seconds = (len(_rate_samples) - 1) * _POLL_INTERVAL
 
-                # 保存当前流量作为下次计算的基准
-                _prev_traffic_stats = {k: dict(v) for k, v in _traffic_stats.items()}
+                    for outbound in set(list(oldest.keys()) + list(newest.keys())):
+                        old_dl = oldest.get(outbound, {}).get("download", 0)
+                        old_ul = oldest.get(outbound, {}).get("upload", 0)
+                        new_dl = newest.get(outbound, {}).get("download", 0)
+                        new_ul = newest.get(outbound, {}).get("upload", 0)
 
-                # 记录速率历史（KB/s）- 包含所有配置的出口
+                        dl_rate = (new_dl - old_dl) / window_seconds if window_seconds > 0 else 0
+                        ul_rate = (new_ul - old_ul) / window_seconds if window_seconds > 0 else 0
+                        _traffic_rates[outbound] = {
+                            "download_rate": max(0, dl_rate),
+                            "upload_rate": max(0, ul_rate)
+                        }
+
+                # 记录速率历史（KB/s）- 每 _HISTORY_INTERVAL 秒记录一次
                 now = int(time.time())
-                history_point = {"timestamp": now, "rates": {}}
-                all_outbounds = _get_all_outbounds()
-                for outbound in all_outbounds:
-                    if outbound in _traffic_rates:
-                        rates = _traffic_rates[outbound]
-                        total_rate = (rates["download_rate"] + rates["upload_rate"]) / 1024
-                        history_point["rates"][outbound] = round(total_rate, 1)
-                    else:
-                        history_point["rates"][outbound] = 0.0
-                _rate_history.append(history_point)
+                if now - _last_history_time >= _HISTORY_INTERVAL:
+                    _last_history_time = now
+                    history_point = {"timestamp": now, "rates": {}}
+                    all_outbounds = _get_all_outbounds()
+                    for outbound in all_outbounds:
+                        if outbound in _traffic_rates:
+                            rates = _traffic_rates[outbound]
+                            total_rate = (rates["download_rate"] + rates["upload_rate"]) / 1024
+                            history_point["rates"][outbound] = round(total_rate, 1)
+                        else:
+                            history_point["rates"][outbound] = 0.0
+                    _rate_history.append(history_point)
 
-                # 清理24小时前的历史数据
-                cutoff = now - _MAX_HISTORY_SECONDS
-                _rate_history[:] = [p for p in _rate_history if p["timestamp"] > cutoff]
+                    # 清理24小时前的历史数据
+                    cutoff = now - _MAX_HISTORY_SECONDS
+                    _rate_history[:] = [p for p in _rate_history if p["timestamp"] > cutoff]
 
-        except urllib.error.URLError:
-            # clash_api 连接失败是预期的（sing-box 可能未启动或正在重启）
-            pass
-        except json.JSONDecodeError as e:
-            print(f"[Traffic] JSON 解析错误: {e}")
         except Exception as e:
             # 记录未预期的异常，但不中断线程
-            print(f"[Traffic] 流量统计异常: {type(e).__name__}: {e}")
+            print(f"[Traffic] V2Ray API 统计异常: {type(e).__name__}: {e}")
 
-        time.sleep(_RATE_INTERVAL)
+        time.sleep(_POLL_INTERVAL)
 
 
 @app.on_event("startup")
 async def startup_event():
     """应用启动时加载数据"""
     load_catalogs()
-    # 启动流量统计后台线程
+    # 启动流量统计后台线程（使用 V2Ray API 精确统计）
     traffic_thread = threading.Thread(target=_update_traffic_stats, daemon=True)
     traffic_thread.start()
-    print("[Traffic] 流量统计后台线程已启动")
+    print("[Traffic] 流量统计后台线程已启动（V2Ray API 精确模式）")
 
 
 def load_json_config() -> dict:
@@ -1019,8 +1050,14 @@ def api_status():
 
 
 @app.get("/api/stats/dashboard")
-def api_stats_dashboard():
+def api_stats_dashboard(time_range: str = "1m"):
     """获取 Dashboard 可视化统计数据
+
+    参数：
+    - time_range: 时间范围 "1m" | "1h" | "24h"
+      - 1m: 最近 60 秒，1 秒间隔
+      - 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
+      - 24h: 最近 24 小时，1 小时间隔（24 个数据点）
 
     返回：
     - online_clients: 在线客户端数量（有活跃连接的 WireGuard peer）
@@ -1028,6 +1065,7 @@ def api_stats_dashboard():
     - traffic_by_outbound: 按出口分组的流量 {tag: {download, upload}}
     - adblock_connections: 匹配广告拦截规则的连接数
     - active_connections: 总活跃连接数
+    - rate_history: 速率历史（根据 time_range 聚合）
     """
     import urllib.request
 
@@ -1072,18 +1110,97 @@ def api_stats_dashboard():
 
     # 使用累计流量统计和实时速率（由后台线程更新）
     # 包含所有配置的出口，没有流量的显示为 0
+    # 排除阻止类出口（block, adblock）- 这些没有实际流量数据
     all_outbounds = _get_all_outbounds()
+    blocked_outbounds = {"block", "adblock"}  # 阻止类出口，不显示在图表中
+    chart_outbounds = [o for o in all_outbounds if o not in blocked_outbounds]
+
     with _traffic_stats_lock:
-        stats["traffic_by_outbound"] = {k: dict(v) for k, v in _traffic_stats.items()}
+        # 确保所有出口都有流量数据（没有流量的显示为 0）
+        traffic_by_outbound = {}
+        for outbound in chart_outbounds:
+            if outbound in _traffic_stats:
+                traffic_by_outbound[outbound] = dict(_traffic_stats[outbound])
+            else:
+                traffic_by_outbound[outbound] = {"download": 0, "upload": 0}
+        stats["traffic_by_outbound"] = traffic_by_outbound
         # 确保所有出口都有速率数据
         traffic_rates = {}
-        for outbound in all_outbounds:
+        for outbound in chart_outbounds:
             if outbound in _traffic_rates:
                 traffic_rates[outbound] = dict(_traffic_rates[outbound])
             else:
                 traffic_rates[outbound] = {"download_rate": 0.0, "upload_rate": 0.0}
         stats["traffic_rates"] = traffic_rates
-        stats["rate_history"] = list(_rate_history)  # 24小时速率历史
+
+        # 根据 time_range 聚合 rate_history
+        # 1m: 最近 60 秒，1 秒间隔（原始数据）
+        # 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
+        # 24h: 最近 24 小时，1 小时间隔（24 个数据点）
+        now = int(time.time())
+
+        if time_range == "1h":
+            # 最近 1 小时，每 10 分钟聚合一次（6 个数据点）
+            interval_seconds = 10 * 60  # 10 分钟
+            num_points = 6
+            cutoff = now - 60 * 60  # 1 小时前
+        elif time_range == "24h":
+            # 最近 24 小时，每 1 小时聚合一次（24 个数据点）
+            interval_seconds = 60 * 60  # 1 小时
+            num_points = 24
+            cutoff = now - 24 * 60 * 60  # 24 小时前
+        else:  # "1m" 默认
+            # 最近 60 秒，不聚合，直接返回原始数据
+            interval_seconds = 1
+            num_points = 60
+            cutoff = now - 60  # 60 秒前
+
+        # 过滤时间范围内的数据
+        filtered_data = [p for p in _rate_history if p["timestamp"] > cutoff]
+
+        if time_range == "1m":
+            # 1 分钟视图：直接返回最近 60 个数据点
+            filtered_history = []
+            for point in filtered_data[-60:]:
+                filtered_point = {
+                    "timestamp": point["timestamp"],
+                    "rates": {k: v for k, v in point["rates"].items() if k not in blocked_outbounds}
+                }
+                filtered_history.append(filtered_point)
+        else:
+            # 1h/24h 视图：按时间段聚合（取平均值）
+            filtered_history = []
+
+            for i in range(num_points):
+                # 计算这个时间段的起止时间
+                slot_end = now - i * interval_seconds
+                slot_start = slot_end - interval_seconds
+
+                # 找到这个时间段内的所有数据点
+                slot_points = [p for p in filtered_data if slot_start < p["timestamp"] <= slot_end]
+
+                if slot_points:
+                    # 计算每个出口的平均速率
+                    avg_rates = {}
+                    for outbound in chart_outbounds:
+                        rates = [p["rates"].get(outbound, 0) for p in slot_points]
+                        avg_rates[outbound] = round(sum(rates) / len(rates), 1) if rates else 0
+
+                    filtered_history.append({
+                        "timestamp": slot_end,
+                        "rates": avg_rates
+                    })
+                else:
+                    # 没有数据时填充 0
+                    filtered_history.append({
+                        "timestamp": slot_end,
+                        "rates": {o: 0 for o in chart_outbounds}
+                    })
+
+            # 反转顺序，使时间从旧到新
+            filtered_history.reverse()
+
+        stats["rate_history"] = filtered_history
 
     # 从 sing-box 日志文件统计广告拦截
     # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
@@ -1478,6 +1595,11 @@ def api_get_rules():
                     "domains": [],
                     "domain_keywords": [],
                     "ip_cidrs": [],
+                    # 新增协议/端口匹配字段
+                    "protocols": [],
+                    "network": None,
+                    "ports": [],
+                    "port_ranges": [],
                     "type": "custom"
                 }
 
@@ -1488,6 +1610,18 @@ def api_get_rules():
                 rules_by_tag[tag]["domain_keywords"].append(target)
             elif rule_type == "ip":
                 rules_by_tag[tag]["ip_cidrs"].append(target)
+            # 新增协议/端口规则类型
+            elif rule_type == "protocol":
+                rules_by_tag[tag]["protocols"].append(target)
+            elif rule_type == "network":
+                rules_by_tag[tag]["network"] = target
+            elif rule_type == "port":
+                try:
+                    rules_by_tag[tag]["ports"].append(int(target))
+                except ValueError:
+                    pass  # 忽略无效端口
+            elif rule_type == "port_range":
+                rules_by_tag[tag]["port_ranges"].append(target)
 
         rules = list(rules_by_tag.values())
     else:
@@ -1533,6 +1667,26 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
                 for cidr in rule.ip_cidrs:
                     batch_rules.append(("ip", cidr, rule.outbound, tag, 0))
 
+            # 收集协议规则
+            if rule.protocols:
+                for protocol in rule.protocols:
+                    if protocol in VALID_PROTOCOLS:
+                        batch_rules.append(("protocol", protocol, rule.outbound, tag, 0))
+
+            # 收集网络类型规则
+            if rule.network and rule.network in VALID_NETWORKS:
+                batch_rules.append(("network", rule.network, rule.outbound, tag, 0))
+
+            # 收集端口规则
+            if rule.ports:
+                for port in rule.ports:
+                    batch_rules.append(("port", str(port), rule.outbound, tag, 0))
+
+            # 收集端口范围规则
+            if rule.port_ranges:
+                for port_range in rule.port_ranges:
+                    batch_rules.append(("port_range", port_range, rule.outbound, tag, 0))
+
         # 批量插入所有规则（使用 executemany）
         added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
 
@@ -1567,8 +1721,29 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
 def api_add_custom_rule(payload: CustomRuleRequest):
     """添加自定义路由规则（数据库版本，使用批量操作优化性能）"""
     # 验证至少有一种匹配规则
-    if not payload.domains and not payload.domain_keywords and not payload.ip_cidrs:
-        raise HTTPException(status_code=400, detail="至少需要提供一种匹配规则（域名、关键词或 IP）")
+    has_domain_rules = payload.domains or payload.domain_keywords or payload.ip_cidrs
+    has_protocol_rules = payload.protocols or payload.network or payload.ports or payload.port_ranges
+    if not has_domain_rules and not has_protocol_rules:
+        raise HTTPException(
+            status_code=400,
+            detail="至少需要提供一种匹配规则（域名、关键词、IP、协议或端口）"
+        )
+
+    # 验证协议类型
+    if payload.protocols:
+        invalid_protocols = [p for p in payload.protocols if p not in VALID_PROTOCOLS]
+        if invalid_protocols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无效的协议类型: {', '.join(invalid_protocols)}。支持: {', '.join(VALID_PROTOCOLS)}"
+            )
+
+    # 验证网络类型
+    if payload.network and payload.network not in VALID_NETWORKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效的网络类型: {payload.network}。支持: tcp, udp"
+        )
 
     if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
@@ -1594,6 +1769,25 @@ def api_add_custom_rule(payload: CustomRuleRequest):
         if payload.ip_cidrs:
             for cidr in payload.ip_cidrs:
                 batch_rules.append(("ip", cidr, payload.outbound, payload.tag, 0))
+
+        # 收集协议规则
+        if payload.protocols:
+            for protocol in payload.protocols:
+                batch_rules.append(("protocol", protocol, payload.outbound, payload.tag, 0))
+
+        # 收集网络类型规则
+        if payload.network:
+            batch_rules.append(("network", payload.network, payload.outbound, payload.tag, 0))
+
+        # 收集端口规则
+        if payload.ports:
+            for port in payload.ports:
+                batch_rules.append(("port", str(port), payload.outbound, payload.tag, 0))
+
+        # 收集端口范围规则
+        if payload.port_ranges:
+            for port_range in payload.port_ranges:
+                batch_rules.append(("port_range", port_range, payload.outbound, payload.tag, 0))
 
         # 批量插入所有规则
         added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0

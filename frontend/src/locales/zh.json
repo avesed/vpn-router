@@ -122,7 +122,11 @@
     "collectingData": "正在收集数据...",
     "download": "下载",
     "upload": "上传",
-    "total": "总计"
+    "total": "总计",
+    "timeRange1M": "1分钟",
+    "timeRange1H": "1小时",
+    "timeRange24H": "24小时",
+    "now": "现在"
   },
   "ingress": {
     "title": "客户端管理",
@@ -279,11 +283,22 @@
     "saveAndApply": "保存并应用规则",
     "rulesSaved": "路由规则已保存，sing-box 配置已更新",
     "confirmDeleteRule": "确定要删除规则 {{name}} 吗？",
+    "protocolMatching": "协议/端口匹配 (流量嗅探)",
+    "protocols": "协议类型",
+    "protocolsHint": "选择要匹配的流量协议",
+    "network": "网络类型",
+    "anyNetwork": "不限",
+    "ports": "目标端口",
+    "portsHint": "逗号分隔",
+    "portRanges": "端口范围",
+    "portRangesHint": "如 6881:6889",
     "ruleExplanation": "规则说明",
     "ruleExplanationItems": {
       "domainSuffix": "域名后缀：匹配以指定后缀结尾的域名，如 netflix.com 会匹配 www.netflix.com",
       "domainKeyword": "域名关键词：匹配包含指定关键词的域名，如 youtube 会匹配 www.youtube.com",
       "ipCidr": "IP 段：匹配 CIDR 格式的 IP 地址段，如 8.8.8.0/24",
+      "protocol": "协议类型：匹配流量协议，如 BitTorrent (种子下载)、STUN (VoIP)、SSH 等",
+      "port": "端口：匹配目标端口号或端口范围，如 80, 443 或 6881:6889",
       "order": "规则按顺序匹配，第一条匹配的规则生效",
       "default": "未匹配任何规则的流量使用默认出口"
     }

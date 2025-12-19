@@ -137,14 +137,21 @@ def ensure_wireguard_server_endpoint(config: dict) -> bool:
 
 
 def ensure_sniff_action(config: dict) -> None:
-    """确保路由规则中有 sniff 动作和 DNS 劫持，支持域名匹配"""
+    """确保路由规则中有 sniff 动作和 DNS 劫持，支持域名匹配和协议检测
+
+    支持的嗅探器:
+    - tls, http, quic: 域名检测 (TLS SNI, HTTP Host, QUIC SNI)
+    - bittorrent: 种子下载流量检测
+    - stun: VoIP/WebRTC 流量检测
+    - dtls: 安全 UDP 流量检测
+    """
     route = config.setdefault("route", {})
     rules = route.setdefault("rules", [])
 
-    # sniff 规则 - 从 TLS/HTTP/QUIC 中检测域名
+    # sniff 规则 - 支持域名检测和协议检测
     sniff_rule = {
         "action": "sniff",
-        "sniffer": ["tls", "http", "quic"],
+        "sniffer": ["tls", "http", "quic", "bittorrent", "stun", "dtls"],
         "timeout": "300ms"
     }
 
@@ -354,6 +361,8 @@ def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
 
     使用 PIA 的私有 DNS 服务器 10.0.0.241 (DNS+Streaming+MACE)
     这些 DNS 必须通过 VPN 隧道访问，可以防止 DNS 泄露
+
+    sing-box 1.12+ 使用新的 DNS 服务器格式（type + server）
     """
     dns = config.setdefault("dns", {})
     servers = dns.setdefault("servers", [])
@@ -367,10 +376,11 @@ def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
         # 移除旧的同名 DNS 服务器
         servers[:] = [s for s in servers if s.get("tag") != dns_tag]
 
-        # 添加使用 PIA 私有 DNS 的服务器
+        # sing-box 1.12+ 新格式
         servers.append({
             "tag": dns_tag,
-            "address": f"udp://{PIA_DNS}",
+            "type": "udp",
+            "server": PIA_DNS,
             "detour": tag
         })
 
@@ -485,6 +495,8 @@ def ensure_openvpn_dns_servers(config: dict, openvpn_tags: List[str]) -> None:
 
     由于 OpenVPN 隧道可能有自己的 DNS 服务器，
     这里使用 Cloudflare DNS 通过 SOCKS 代理访问。
+
+    sing-box 1.12+ 使用新的 DNS 服务器格式（type + server）
     """
     if not openvpn_tags:
         return
@@ -496,9 +508,11 @@ def ensure_openvpn_dns_servers(config: dict, openvpn_tags: List[str]) -> None:
     for tag in openvpn_tags:
         dns_tag = f"{tag}-dns"
         if dns_tag not in existing_tags:
+            # sing-box 1.12+ 新格式
             servers.append({
                 "tag": dns_tag,
-                "address": "tls://1.1.1.1",
+                "type": "tls",
+                "server": "1.1.1.1",
                 "detour": tag
             })
 
@@ -637,7 +651,10 @@ def ensure_custom_egress_endpoints(config: dict, custom_egress: List[dict]) -> L
 
 
 def ensure_custom_dns_servers(config: dict, custom_tags: List[str]) -> None:
-    """为自定义出口添加 DNS 服务器"""
+    """为自定义出口添加 DNS 服务器
+
+    sing-box 1.12+ 使用新的 DNS 服务器格式（type + server）
+    """
     if not custom_tags:
         return
 
@@ -648,9 +665,11 @@ def ensure_custom_dns_servers(config: dict, custom_tags: List[str]) -> None:
     for tag in custom_tags:
         dns_tag = f"{tag}-dns"
         if dns_tag not in existing_tags:
+            # sing-box 1.12+ 新格式
             servers.append({
                 "tag": dns_tag,
-                "address": "tls://1.1.1.1",
+                "type": "tls",
+                "server": "1.1.1.1",
                 "detour": tag
             })
 
@@ -790,7 +809,15 @@ def generate_adblock_rule_sets() -> Tuple[List[Dict], List[Dict]]:
 
 
 def load_custom_rules() -> Dict[str, Any]:
-    """从数据库加载自定义路由规则和默认出口"""
+    """从数据库加载自定义路由规则和默认出口
+
+    支持的规则类型:
+    - domain, domain_keyword, ip: 传统域名/IP 规则
+    - protocol: 协议匹配 (bittorrent, stun, ssh, etc.)
+    - network: 网络类型 (tcp, udp)
+    - port: 端口匹配
+    - port_range: 端口范围匹配
+    """
     result = {"rules": [], "default_outbound": "direct"}
 
     if not HAS_DATABASE:
@@ -818,7 +845,12 @@ def load_custom_rules() -> Dict[str, Any]:
                     "outbound": rule["outbound"],
                     "domains": [],
                     "domain_keywords": [],
-                    "ip_cidrs": []
+                    "ip_cidrs": [],
+                    # 新增类型
+                    "protocols": [],
+                    "network": None,
+                    "ports": [],
+                    "port_ranges": []
                 }
 
             rule_type = rule["rule_type"]
@@ -830,6 +862,18 @@ def load_custom_rules() -> Dict[str, Any]:
                 rules_by_tag[tag]["domain_keywords"].append(target)
             elif rule_type == "ip":
                 rules_by_tag[tag]["ip_cidrs"].append(target)
+            # 新增规则类型
+            elif rule_type == "protocol":
+                rules_by_tag[tag]["protocols"].append(target)
+            elif rule_type == "network":
+                rules_by_tag[tag]["network"] = target
+            elif rule_type == "port":
+                try:
+                    rules_by_tag[tag]["ports"].append(int(target))
+                except ValueError:
+                    print(f"[render] 警告: 无效端口值 '{target}'，跳过")
+            elif rule_type == "port_range":
+                rules_by_tag[tag]["port_ranges"].append(target)
 
         result["rules"] = list(rules_by_tag.values())
         return result
@@ -845,6 +889,10 @@ def load_custom_rules() -> Dict[str, Any]:
 def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outbounds: List[str]) -> None:
     """应用自定义路由规则到配置
 
+    支持的规则类型:
+    - domain/domain_keyword/ip: 使用 rule_set
+    - protocol/network/port/port_range: 直接添加路由规则
+
     Args:
         config: sing-box 配置
         custom_rules: 自定义规则配置
@@ -854,8 +902,8 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
     rule_set = route.setdefault("rule_set", [])
     rules = route.setdefault("rules", [])
 
-    # 始终有效的出口：direct 和 block
-    always_valid = {"direct", "block"}
+    # 始终有效的出口：direct, block, adblock
+    always_valid = {"direct", "block", "adblock"}
     all_valid = always_valid | set(valid_outbounds)
 
     # 获取现有的 custom rule_set tags
@@ -864,22 +912,28 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
         if rs.get("tag", "").startswith("custom-"):
             existing_custom_tags.add(rs.get("tag"))
 
-    # 移除旧的 custom 规则
+    # 移除旧的 custom 规则（包括 rule_set 和直接规则）
     rule_set[:] = [rs for rs in rule_set if not rs.get("tag", "").startswith("custom-")]
     rules[:] = [r for r in rules if not any(
         t.startswith("custom-") for t in r.get("rule_set", [])
-    )]
+    ) and not r.get("_custom_tag", "").startswith("custom-")]
 
     # 添加新的自定义规则
     skipped_rules = []
     for custom_rule in custom_rules.get("rules", []):
         rule_tag = custom_rule.get("tag", "")
-        if not rule_tag.startswith("custom-"):
+        if not rule_tag.startswith("custom-") and not rule_tag.startswith("__adblock__"):
             rule_tag = f"custom-{rule_tag}"
 
         domains = custom_rule.get("domains", [])
         domain_keywords = custom_rule.get("domain_keywords", [])
         ip_cidrs = custom_rule.get("ip_cidrs", [])
+        # 新增类型
+        protocols = custom_rule.get("protocols", [])
+        network = custom_rule.get("network")
+        ports = custom_rule.get("ports", [])
+        port_ranges = custom_rule.get("port_ranges", [])
+
         outbound = custom_rule.get("outbound", "direct")
 
         # 过滤掉指向不存在出口的规则
@@ -887,8 +941,14 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
             skipped_rules.append(f"{rule_tag} -> {outbound}")
             continue
 
-        if domains or domain_keywords or ip_cidrs:
-            # 创建 inline rule_set
+        # 检查是否有域名/IP 类规则（使用 rule_set）
+        has_domain_ip_rules = domains or domain_keywords or ip_cidrs
+
+        # 检查是否有协议/端口类规则（直接路由规则）
+        has_protocol_port_rules = protocols or network or ports or port_ranges
+
+        # 处理域名/IP 规则（使用 inline rule_set）
+        if has_domain_ip_rules:
             inline_rules = []
             if domains:
                 inline_rules.append({"domain_suffix": domains})
@@ -908,6 +968,27 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
                 "rule_set": [rule_tag],
                 "outbound": outbound
             })
+
+        # 处理协议/端口规则（直接添加路由规则）
+        if has_protocol_port_rules:
+            protocol_rule = {"outbound": outbound, "_custom_tag": rule_tag}
+
+            if protocols:
+                protocol_rule["protocol"] = protocols
+            if network:
+                protocol_rule["network"] = network
+            if ports:
+                protocol_rule["port"] = ports
+            if port_ranges:
+                protocol_rule["port_range"] = port_ranges
+
+            # 协议/端口规则优先级较低，插入到列表后面（在 domain 规则之后）
+            rules.append(protocol_rule)
+
+    # 清理临时标记字段（sing-box 不认识 _custom_tag）
+    for r in rules:
+        if "_custom_tag" in r:
+            del r["_custom_tag"]
 
     # 输出跳过的规则警告
     if skipped_rules:
@@ -1123,10 +1204,20 @@ def main() -> None:
     generate_lan_access_rules(config)
 
     # 添加 experimental API 用于获取连接状态
+    # 收集所有需要统计的出口（包括 direct, block, adblock 和所有 egress）
+    stats_outbounds = ["direct", "block", "adblock"] + all_egress_tags
+
     config["experimental"] = {
         "clash_api": {
             "external_controller": "127.0.0.1:9090",
             "secret": ""
+        },
+        "v2ray_api": {
+            "listen": "127.0.0.1:10085",
+            "stats": {
+                "enabled": True,
+                "outbounds": stats_outbounds
+            }
         },
         "cache_file": {
             "enabled": True,
@@ -1134,6 +1225,7 @@ def main() -> None:
         }
     }
     print("[render] 已启用 clash_api (127.0.0.1:9090)")
+    print(f"[render] 已启用 v2ray_api (127.0.0.1:10085) 统计 {len(stats_outbounds)} 个出口")
 
     OUTPUT.write_text(json.dumps(config, indent=2))
     print(f"[sing-box] 已写入 {OUTPUT}")

@@ -93,8 +93,34 @@ export interface RouteRule {
   domains?: string[];
   domain_keywords?: string[];
   ip_cidrs?: string[];
-  type?: "custom" | "geosite" | "geoip";
+  // 协议/端口匹配字段 (sing-box 流量类型嗅探)
+  protocols?: string[];      // bittorrent, stun, ssh, rdp, etc.
+  network?: string;          // tcp, udp
+  ports?: number[];          // 单个端口 [80, 443]
+  port_ranges?: string[];    // 端口范围 ["6881:6889", "51413"]
+  type?: "custom" | "geosite" | "geoip" | "protocol";
 }
+
+// sing-box 协议嗅探选项
+export const PROTOCOL_OPTIONS = [
+  { value: "bittorrent", label: "BitTorrent", description: "种子下载流量" },
+  { value: "stun", label: "STUN", description: "VoIP/WebRTC 流量" },
+  { value: "dtls", label: "DTLS", description: "安全 UDP 流量" },
+  { value: "ssh", label: "SSH", description: "SSH 远程连接" },
+  { value: "rdp", label: "RDP", description: "远程桌面" },
+  { value: "dns", label: "DNS", description: "DNS 查询" },
+  { value: "ntp", label: "NTP", description: "时间同步" },
+  { value: "http", label: "HTTP", description: "HTTP 明文流量" },
+  { value: "tls", label: "TLS", description: "HTTPS/SSL 流量" },
+  { value: "quic", label: "QUIC", description: "HTTP/3 流量" },
+] as const;
+
+// 网络类型选项
+export const NETWORK_OPTIONS = [
+  { value: "", label: "不限", description: "匹配所有网络类型" },
+  { value: "tcp", label: "TCP", description: "仅匹配 TCP 流量" },
+  { value: "udp", label: "UDP", description: "仅匹配 UDP 流量" },
+] as const;
 
 export interface RouteRulesResponse {
   rules: RouteRule[];

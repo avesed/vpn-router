@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useEffect, useState, useMemo, useRef, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import StatsCard from "../components/StatsCard";
 import { api } from "../api/client";
@@ -13,8 +13,15 @@ import {
 } from "@heroicons/react/24/outline";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip, LineChart, Line, XAxis, YAxis } from "recharts";
 
-// 图表显示的最大数据点数
-const MAX_DISPLAY_POINTS = 60;
+// 数据刷新间隔（毫秒）- 与后端 _HISTORY_INTERVAL 匹配
+const REFRESH_INTERVAL = 1000;
+
+// 时间范围配置
+const TIME_RANGE_CONFIG = {
+  "1m": { maxPoints: 60, intervalSec: 1, unit: "s", labelInterval: 10 },
+  "1h": { maxPoints: 6, intervalSec: 600, unit: "m", labelInterval: 1 },
+  "24h": { maxPoints: 24, intervalSec: 3600, unit: "h", labelInterval: 4 }
+} as const;
 
 // 出口流量饼图颜色
 const CHART_COLORS = [
@@ -46,18 +53,107 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // 时间范围选择
+  const [timeRange, setTimeRange] = useState<"1m" | "1h" | "24h">("1m");
+
+  // 本地维护的图表数据（实现平滑推进效果）
+  const [localChartData, setLocalChartData] = useState<Record<string, number | string>[]>([]);
+  const lastTimestampRef = useRef<number>(0);
+
+  // 生成相对时间标签
+  const generateRelativeTimeLabel = useCallback((index: number, total: number, range: "1m" | "1h" | "24h", t: (key: string) => string): string => {
+    const config = TIME_RANGE_CONFIG[range];
+    const pointsFromEnd = total - 1 - index;
+
+    if (pointsFromEnd === 0) {
+      return t('dashboard.now');
+    }
+
+    // 计算相对时间值
+    const timeValue = pointsFromEnd * config.intervalSec;
+    let displayValue: number;
+    let unit: string;
+
+    if (range === "1m") {
+      displayValue = timeValue;
+      unit = "s";
+    } else if (range === "1h") {
+      displayValue = timeValue / 60;
+      unit = "m";
+    } else {
+      displayValue = timeValue / 3600;
+      unit = "h";
+    }
+
+    return `-${displayValue}${unit}`;
+  }, []);
+
+  // 转换数据点数组为图表格式（带相对时间）
+  const convertToChartData = useCallback((points: Array<{ timestamp: number; rates: Record<string, number> }>, range: "1m" | "1h" | "24h", t: (key: string) => string) => {
+    return points.map((point, index) => {
+      const chartPoint: Record<string, number | string> = {
+        time: generateRelativeTimeLabel(index, points.length, range, t),
+        _ts: point.timestamp
+      };
+      for (const [outbound, rate] of Object.entries(point.rates)) {
+        chartPoint[outbound] = rate;
+      }
+      return chartPoint;
+    });
+  }, [generateRelativeTimeLabel]);
+
+  // 当 timeRange 变化时，重置图表数据
+  useEffect(() => {
+    setLocalChartData([]);
+    lastTimestampRef.current = 0;
+  }, [timeRange]);
+
   useEffect(() => {
     let mounted = true;
+    const config = TIME_RANGE_CONFIG[timeRange];
+
     const fetchData = async () => {
       try {
         const [statusData, statsData] = await Promise.all([
           api.getStatus(),
-          api.getDashboardStats()
+          api.getDashboardStats(timeRange)
         ]);
         if (mounted) {
           setStatus(statusData);
           setDashboardStats(statsData);
           setError(null);
+
+          // 更新图表数据
+          if (statsData?.rate_history?.length) {
+            if (timeRange === "1m") {
+              // 1分钟模式：增量更新实现平滑推进效果
+              const newPoints = statsData.rate_history.filter(
+                (p: { timestamp: number }) => p.timestamp > lastTimestampRef.current
+              );
+
+              if (newPoints.length > 0) {
+                lastTimestampRef.current = Math.max(...newPoints.map((p: { timestamp: number }) => p.timestamp));
+
+                setLocalChartData(prev => {
+                  const allPoints = [...prev.map(p => ({
+                    timestamp: p._ts as number,
+                    rates: Object.fromEntries(
+                      Object.entries(p).filter(([k]) => k !== 'time' && k !== '_ts')
+                    ) as Record<string, number>
+                  })), ...newPoints];
+                  const trimmed = allPoints.slice(-config.maxPoints);
+                  return convertToChartData(trimmed, timeRange, t);
+                });
+              }
+            } else {
+              // 1小时/24小时模式：直接替换数据
+              const latestTimestamp = Math.max(...statsData.rate_history.map((p: { timestamp: number }) => p.timestamp));
+              if (latestTimestamp > lastTimestampRef.current) {
+                lastTimestampRef.current = latestTimestamp;
+                setLocalChartData(convertToChartData(statsData.rate_history, timeRange, t));
+              }
+            }
+          }
         }
       } catch (err: any) {
         if (mounted) {
@@ -67,48 +163,39 @@ export default function Dashboard() {
         if (mounted) setLoading(false);
       }
     };
+
     fetchData();
-    const interval = setInterval(fetchData, 5000); // 每 5 秒更新一次
+    const interval = setInterval(fetchData, REFRESH_INTERVAL);
     return () => {
       mounted = false;
       clearInterval(interval);
     };
-  }, []);
+  }, [timeRange, convertToChartData, t]);
 
-  // 从后端历史数据转换为图表格式（取最近 N 个点）
-  const { rateHistory, outbounds } = useMemo(() => {
-    if (!dashboardStats?.rate_history?.length) {
-      return { rateHistory: [], outbounds: [] };
+  // 收集所有出口名称并排序
+  const outbounds = useMemo(() => {
+    if (!localChartData.length) {
+      return [];
     }
-
-    // 取最近 N 个点用于显示
-    const recentHistory = dashboardStats.rate_history.slice(-MAX_DISPLAY_POINTS);
-
-    // 收集所有出口名称并排序（确保颜色分配一致）
     const outboundSet = new Set<string>();
-    recentHistory.forEach(point => {
-      Object.keys(point.rates).forEach(name => outboundSet.add(name));
+    localChartData.forEach(point => {
+      Object.keys(point).forEach(key => {
+        if (key !== 'time' && key !== '_ts') {
+          outboundSet.add(key);
+        }
+      });
     });
-    // 排序：direct 在最前，其他按字母顺序
-    const outbounds = Array.from(outboundSet).sort((a, b) => {
+    return Array.from(outboundSet).sort((a, b) => {
       if (a === 'direct') return -1;
       if (b === 'direct') return 1;
       return a.localeCompare(b);
     });
+  }, [localChartData]);
 
-    // 转换为图表数据格式
-    const rateHistory = recentHistory.map(point => {
-      const date = new Date(point.timestamp * 1000);
-      const timeStr = date.toLocaleTimeString('en-US', { hour12: false, minute: '2-digit', second: '2-digit' });
-      const chartPoint: Record<string, number | string> = { time: timeStr };
-      for (const [outbound, rate] of Object.entries(point.rates)) {
-        chartPoint[outbound] = rate;
-      }
-      return chartPoint;
-    });
-
-    return { rateHistory, outbounds };
-  }, [dashboardStats?.rate_history]);
+  // 用于显示的图表数据（去掉内部字段）
+  const rateHistory = useMemo(() => {
+    return localChartData.map(({ _ts, ...rest }) => rest);
+  }, [localChartData]);
 
   const locale = i18n.language === 'zh' ? 'zh-CN' : 'en-US';
 
@@ -333,9 +420,26 @@ export default function Dashboard() {
 
             {/* 实时网速图表 */}
             <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold text-white">{t('dashboard.networkSpeed')}</h3>
-                <p className="mt-1 text-sm text-slate-400">{t('dashboard.networkSpeedDesc')}</p>
+              <div className="mb-4 flex items-start justify-between">
+                <div>
+                  <h3 className="text-lg font-semibold text-white">{t('dashboard.networkSpeed')}</h3>
+                  <p className="mt-1 text-sm text-slate-400">{t('dashboard.networkSpeedDesc')}</p>
+                </div>
+                <div className="flex gap-1">
+                  {(["1m", "1h", "24h"] as const).map((range) => (
+                    <button
+                      key={range}
+                      onClick={() => setTimeRange(range)}
+                      className={`px-2 py-1 text-xs rounded transition-colors ${
+                        timeRange === range
+                          ? "bg-blue-500 text-white"
+                          : "bg-slate-700/50 text-slate-400 hover:bg-slate-600/50"
+                      }`}
+                    >
+                      {t(`dashboard.timeRange${range.toUpperCase()}`)}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               {rateHistory.length > 1 ? (
@@ -377,6 +481,7 @@ export default function Dashboard() {
                           strokeWidth={2}
                           dot={false}
                           name={outbound}
+                          isAnimationActive={false}
                         />
                       ))}
                     </LineChart>

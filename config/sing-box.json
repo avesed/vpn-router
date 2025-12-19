@@ -8,7 +8,7 @@
     "servers": [
       {
         "tag": "direct-dns",
-        "address": "local"
+        "type": "local"
       }
     ],
     "strategy": "ipv4_only"

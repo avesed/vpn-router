@@ -73,7 +73,8 @@ async function request<T>(path: string, options: { method?: HttpMethod; body?: u
 export const api = {
   // Status
   getStatus: () => request<GatewayStatus>("/status"),
-  getDashboardStats: () => request<DashboardStats>("/stats/dashboard"),
+  getDashboardStats: (timeRange: "1m" | "1h" | "24h" = "1m") =>
+    request<DashboardStats>(`/stats/dashboard?time_range=${timeRange}`),
   getEndpoints: () => request<{ endpoints: Endpoint[] }>("/endpoints"),
   updateEndpoint: (tag: string, payload: Partial<Endpoint>) =>
     request(`/endpoints/${tag}`, { method: "PUT", body: payload }),

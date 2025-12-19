@@ -62,6 +62,7 @@ vite.config.d.ts
 /test-wg/
 /test-client/
 /test-egress/
+test-wg-client/
 
 # IDE & editor
 .idea/

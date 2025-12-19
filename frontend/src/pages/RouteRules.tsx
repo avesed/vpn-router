@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { RouteRule, VpnProfile } from "../types";
+import { PROTOCOL_OPTIONS, NETWORK_OPTIONS } from "../types";
 import {
   PlusIcon,
   TrashIcon,
@@ -9,7 +10,9 @@ import {
   GlobeAltIcon,
   ServerStackIcon,
   TagIcon,
-  CheckCircleIcon
+  CheckCircleIcon,
+  SignalIcon,
+  ServerIcon
 } from "@heroicons/react/24/outline";
 
 interface RuleFormData {
@@ -18,6 +21,11 @@ interface RuleFormData {
   domains: string;
   domain_keywords: string;
   ip_cidrs: string;
+  // 协议/端口匹配字段
+  protocols: string[];
+  network: string;
+  ports: string;
+  port_ranges: string;
 }
 
 const emptyRule: RuleFormData = {
@@ -25,7 +33,11 @@ const emptyRule: RuleFormData = {
   outbound: "direct",
   domains: "",
   domain_keywords: "",
-  ip_cidrs: ""
+  ip_cidrs: "",
+  protocols: [],
+  network: "",
+  ports: "",
+  port_ranges: ""
 };
 
 export default function RouteRules() {
@@ -82,8 +94,19 @@ export default function RouteRules() {
       .filter((s) => s.length > 0);
   };
 
+  const parsePorts = (str: string): number[] => {
+    return str
+      .split(/[,\n]/)
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => !isNaN(n) && n > 0 && n <= 65535);
+  };
+
   const formatList = (arr?: string[]): string => {
     return arr?.join("\n") || "";
+  };
+
+  const formatPorts = (arr?: number[]): string => {
+    return arr?.map(String).join(", ") || "";
   };
 
   const handleAddRule = () => {
@@ -95,7 +118,12 @@ export default function RouteRules() {
       domains: parseList(newRule.domains),
       domain_keywords: parseList(newRule.domain_keywords),
       ip_cidrs: parseList(newRule.ip_cidrs),
-      type: "custom"
+      // 协议/端口匹配字段
+      protocols: newRule.protocols.length > 0 ? newRule.protocols : undefined,
+      network: newRule.network || undefined,
+      ports: parsePorts(newRule.ports).length > 0 ? parsePorts(newRule.ports) : undefined,
+      port_ranges: parseList(newRule.port_ranges).length > 0 ? parseList(newRule.port_ranges) : undefined,
+      type: newRule.protocols.length > 0 || newRule.network || newRule.ports || newRule.port_ranges ? "protocol" : "custom"
     };
 
     setRules([...rules, rule]);
@@ -117,7 +145,12 @@ export default function RouteRules() {
       outbound: rule.outbound,
       domains: formatList(rule.domains),
       domain_keywords: formatList(rule.domain_keywords),
-      ip_cidrs: formatList(rule.ip_cidrs)
+      ip_cidrs: formatList(rule.ip_cidrs),
+      // 协议/端口匹配字段
+      protocols: rule.protocols || [],
+      network: rule.network || "",
+      ports: formatPorts(rule.ports),
+      port_ranges: formatList(rule.port_ranges)
     });
   };
 
@@ -131,7 +164,12 @@ export default function RouteRules() {
       domains: parseList(editRule.domains),
       domain_keywords: parseList(editRule.domain_keywords),
       ip_cidrs: parseList(editRule.ip_cidrs),
-      type: "custom"
+      // 协议/端口匹配字段
+      protocols: editRule.protocols.length > 0 ? editRule.protocols : undefined,
+      network: editRule.network || undefined,
+      ports: parsePorts(editRule.ports).length > 0 ? parsePorts(editRule.ports) : undefined,
+      port_ranges: parseList(editRule.port_ranges).length > 0 ? parseList(editRule.port_ranges) : undefined,
+      type: editRule.protocols.length > 0 || editRule.network || editRule.ports || editRule.port_ranges ? "protocol" : "custom"
     };
     setRules(updatedRules);
     setEditingIndex(null);
@@ -301,6 +339,92 @@ export default function RouteRules() {
                 placeholder="8.8.8.0/24&#10;1.1.1.0/24"
               />
             </div>
+
+            {/* 协议/端口匹配 - 流量类型嗅探 */}
+            <div className="border-t border-white/10 pt-4 mt-2">
+              <div className="flex items-center gap-2 mb-3">
+                <SignalIcon className="h-4 w-4 text-purple-400" />
+                <span className="text-sm font-medium text-purple-300">{t('rules.protocolMatching')}</span>
+              </div>
+
+              {/* 协议类型 (多选) */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-slate-400 mb-2">
+                  {t('rules.protocols')} ({t('rules.protocolsHint')})
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {PROTOCOL_OPTIONS.map((opt) => (
+                    <label
+                      key={opt.value}
+                      className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs cursor-pointer transition ${
+                        newRule.protocols.includes(opt.value)
+                          ? "bg-purple-500/30 text-purple-200 border border-purple-500/50"
+                          : "bg-slate-800/60 text-slate-400 border border-transparent hover:bg-slate-800"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={newRule.protocols.includes(opt.value)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setNewRule({ ...newRule, protocols: [...newRule.protocols, opt.value] });
+                          } else {
+                            setNewRule({ ...newRule, protocols: newRule.protocols.filter(p => p !== opt.value) });
+                          }
+                        }}
+                        className="sr-only"
+                      />
+                      <span>{opt.label}</span>
+                      <span className="text-slate-500">({opt.description})</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {/* 网络类型 */}
+              <div className="mb-4">
+                <label className="block text-xs font-medium text-slate-400 mb-1">
+                  {t('rules.network')}
+                </label>
+                <select
+                  value={newRule.network}
+                  onChange={(e) => setNewRule({ ...newRule, network: e.target.value })}
+                  className="w-full md:w-48 rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white"
+                >
+                  {NETWORK_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label} - {opt.description}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* 端口 */}
+              <div className="grid gap-4 md:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">
+                    {t('rules.ports')} ({t('rules.portsHint')})
+                  </label>
+                  <input
+                    value={newRule.ports}
+                    onChange={(e) => setNewRule({ ...newRule, ports: e.target.value })}
+                    className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white font-mono"
+                    placeholder="80, 443, 8080"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">
+                    {t('rules.portRanges')} ({t('rules.portRangesHint')})
+                  </label>
+                  <input
+                    value={newRule.port_ranges}
+                    onChange={(e) => setNewRule({ ...newRule, port_ranges: e.target.value })}
+                    className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white font-mono"
+                    placeholder="6881:6889, 51413"
+                  />
+                </div>
+              </div>
+            </div>
           </div>
           <div className="mt-4 flex gap-3">
             <button
@@ -412,6 +536,92 @@ export default function RouteRules() {
                       rows={2}
                     />
                   </div>
+
+                  {/* 协议/端口匹配 - 编辑模式 */}
+                  <div className="border-t border-white/10 pt-4">
+                    <div className="flex items-center gap-2 mb-3">
+                      <SignalIcon className="h-4 w-4 text-purple-400" />
+                      <span className="text-sm font-medium text-purple-300">{t('rules.protocolMatching')}</span>
+                    </div>
+
+                    {/* 协议类型 (多选) */}
+                    <div className="mb-4">
+                      <label className="block text-xs font-medium text-slate-400 mb-2">
+                        {t('rules.protocols')}
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        {PROTOCOL_OPTIONS.map((opt) => (
+                          <label
+                            key={opt.value}
+                            className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs cursor-pointer transition ${
+                              editRule.protocols.includes(opt.value)
+                                ? "bg-purple-500/30 text-purple-200 border border-purple-500/50"
+                                : "bg-slate-800/60 text-slate-400 border border-transparent hover:bg-slate-800"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={editRule.protocols.includes(opt.value)}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setEditRule({ ...editRule, protocols: [...editRule.protocols, opt.value] });
+                                } else {
+                                  setEditRule({ ...editRule, protocols: editRule.protocols.filter(p => p !== opt.value) });
+                                }
+                              }}
+                              className="sr-only"
+                            />
+                            <span>{opt.label}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* 网络类型 */}
+                    <div className="mb-4">
+                      <label className="block text-xs font-medium text-slate-400 mb-1">
+                        {t('rules.network')}
+                      </label>
+                      <select
+                        value={editRule.network}
+                        onChange={(e) => setEditRule({ ...editRule, network: e.target.value })}
+                        className="w-full md:w-48 rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white"
+                      >
+                        {NETWORK_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* 端口 */}
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-400 mb-1">
+                          {t('rules.ports')}
+                        </label>
+                        <input
+                          value={editRule.ports}
+                          onChange={(e) => setEditRule({ ...editRule, ports: e.target.value })}
+                          className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white font-mono"
+                          placeholder="80, 443"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-400 mb-1">
+                          {t('rules.portRanges')}
+                        </label>
+                        <input
+                          value={editRule.port_ranges}
+                          onChange={(e) => setEditRule({ ...editRule, port_ranges: e.target.value })}
+                          className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white font-mono"
+                          placeholder="6881:6889"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="flex gap-3">
                     <button
                       onClick={handleSaveEdit}
@@ -520,6 +730,66 @@ export default function RouteRules() {
                         </div>
                       </div>
                     )}
+                    {/* 协议类型显示 */}
+                    {rule.protocols && rule.protocols.length > 0 && (
+                      <div className="rounded-lg bg-black/20 p-3">
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.protocols')}</p>
+                        <div className="flex flex-wrap gap-1">
+                          {rule.protocols.map((p) => (
+                            <span
+                              key={p}
+                              className="rounded bg-purple-500/20 px-2 py-0.5 text-xs text-purple-300 font-mono"
+                            >
+                              {p}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {/* 网络类型显示 */}
+                    {rule.network && (
+                      <div className="rounded-lg bg-black/20 p-3">
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.network')}</p>
+                        <span className="rounded bg-cyan-500/20 px-2 py-0.5 text-xs text-cyan-300 font-mono uppercase">
+                          {rule.network}
+                        </span>
+                      </div>
+                    )}
+                    {/* 端口显示 */}
+                    {rule.ports && rule.ports.length > 0 && (
+                      <div className="rounded-lg bg-black/20 p-3">
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.ports')}</p>
+                        <div className="flex flex-wrap gap-1">
+                          {rule.ports.slice(0, 5).map((port) => (
+                            <span
+                              key={port}
+                              className="rounded bg-orange-500/20 px-2 py-0.5 text-xs text-orange-300 font-mono"
+                            >
+                              {port}
+                            </span>
+                          ))}
+                          {rule.ports.length > 5 && (
+                            <span className="text-xs text-slate-500">+{rule.ports.length - 5}</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {/* 端口范围显示 */}
+                    {rule.port_ranges && rule.port_ranges.length > 0 && (
+                      <div className="rounded-lg bg-black/20 p-3">
+                        <p className="text-xs font-medium text-slate-500 mb-1">{t('rules.portRanges')}</p>
+                        <div className="flex flex-wrap gap-1">
+                          {rule.port_ranges.map((range) => (
+                            <span
+                              key={range}
+                              className="rounded bg-orange-500/20 px-2 py-0.5 text-xs text-orange-300 font-mono"
+                            >
+                              {range}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </>
               )}
@@ -556,6 +826,8 @@ export default function RouteRules() {
           <li>• {t('rules.ruleExplanationItems.domainSuffix')}</li>
           <li>• {t('rules.ruleExplanationItems.domainKeyword')}</li>
           <li>• {t('rules.ruleExplanationItems.ipCidr')}</li>
+          <li>• {t('rules.ruleExplanationItems.protocol')}</li>
+          <li>• {t('rules.ruleExplanationItems.port')}</li>
           <li>• {t('rules.ruleExplanationItems.order')}</li>
           <li>• {t('rules.ruleExplanationItems.default')}</li>
         </ul>

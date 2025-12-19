@@ -122,7 +122,11 @@
     "collectingData": "Collecting data...",
     "download": "Download",
     "upload": "Upload",
-    "total": "Total"
+    "total": "Total",
+    "timeRange1M": "1 min",
+    "timeRange1H": "1 hour",
+    "timeRange24H": "24 hours",
+    "now": "now"
   },
   "ingress": {
     "title": "Client Management",
@@ -279,11 +283,22 @@
     "saveAndApply": "Save and Apply Rules",
     "rulesSaved": "Routing rules saved, sing-box config updated",
     "confirmDeleteRule": "Are you sure you want to delete rule {{name}}?",
+    "protocolMatching": "Protocol/Port Matching (Traffic Sniffing)",
+    "protocols": "Protocol Type",
+    "protocolsHint": "Select traffic protocols to match",
+    "network": "Network Type",
+    "anyNetwork": "Any",
+    "ports": "Destination Ports",
+    "portsHint": "Comma separated",
+    "portRanges": "Port Ranges",
+    "portRangesHint": "e.g., 6881:6889",
     "ruleExplanation": "Rule Explanation",
     "ruleExplanationItems": {
       "domainSuffix": "Domain Suffix: Matches domains ending with the specified suffix, e.g., netflix.com matches www.netflix.com",
       "domainKeyword": "Domain Keyword: Matches domains containing the specified keyword, e.g., youtube matches www.youtube.com",
       "ipCidr": "IP CIDR: Matches IP address ranges in CIDR format, e.g., 8.8.8.0/24",
+      "protocol": "Protocol Type: Matches traffic protocol, e.g., BitTorrent (torrents), STUN (VoIP), SSH, etc.",
+      "port": "Port: Matches destination port numbers or ranges, e.g., 80, 443 or 6881:6889",
       "order": "Rules are matched in order, the first matching rule takes effect",
       "default": "Traffic that doesn't match any rule uses the default outbound"
     }
