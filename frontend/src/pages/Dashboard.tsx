@@ -60,39 +60,36 @@ export default function Dashboard() {
   const [localChartData, setLocalChartData] = useState<Record<string, number | string>[]>([]);
   const lastTimestampRef = useRef<number>(0);
 
-  // 生成相对时间标签
-  const generateRelativeTimeLabel = useCallback((index: number, total: number, range: "1m" | "1h" | "24h", t: (key: string) => string): string => {
-    const config = TIME_RANGE_CONFIG[range];
-    const pointsFromEnd = total - 1 - index;
+  // 生成 X 轴刻度标签（基于固定位置，与数据数量无关）
+  const formatXAxisTick = useCallback((index: number): string => {
+    const config = TIME_RANGE_CONFIG[timeRange];
+    const maxPoints = config.maxPoints;
+    const pointsFromEnd = maxPoints - 1 - index;
 
     if (pointsFromEnd === 0) {
       return t('dashboard.now');
     }
 
-    // 计算相对时间值
     const timeValue = pointsFromEnd * config.intervalSec;
-    let displayValue: number;
-    let unit: string;
-
-    if (range === "1m") {
-      displayValue = timeValue;
-      unit = "s";
-    } else if (range === "1h") {
-      displayValue = timeValue / 60;
-      unit = "m";
+    if (timeRange === "1m") {
+      return `-${timeValue}s`;
+    } else if (timeRange === "1h") {
+      return `-${timeValue / 60}m`;
     } else {
-      displayValue = timeValue / 3600;
-      unit = "h";
+      return `-${timeValue / 3600}h`;
     }
+  }, [timeRange, t]);
 
-    return `-${displayValue}${unit}`;
-  }, []);
+  // 转换数据点数组为图表格式（使用索引作为 X 轴键）
+  const convertToChartData = useCallback((points: Array<{ timestamp: number; rates: Record<string, number> }>, range: "1m" | "1h" | "24h") => {
+    const config = TIME_RANGE_CONFIG[range];
+    const maxPoints = config.maxPoints;
+    // 计算起始索引，使数据右对齐（最新数据在最右边）
+    const startIndex = maxPoints - points.length;
 
-  // 转换数据点数组为图表格式（带相对时间）
-  const convertToChartData = useCallback((points: Array<{ timestamp: number; rates: Record<string, number> }>, range: "1m" | "1h" | "24h", t: (key: string) => string) => {
-    return points.map((point, index) => {
+    return points.map((point, i) => {
       const chartPoint: Record<string, number | string> = {
-        time: generateRelativeTimeLabel(index, points.length, range, t),
+        index: startIndex + i,  // 固定位置索引
         _ts: point.timestamp
       };
       for (const [outbound, rate] of Object.entries(point.rates)) {
@@ -100,7 +97,7 @@ export default function Dashboard() {
       }
       return chartPoint;
     });
-  }, [generateRelativeTimeLabel]);
+  }, []);
 
   // 当 timeRange 变化时，重置图表数据
   useEffect(() => {
@@ -138,11 +135,11 @@ export default function Dashboard() {
                   const allPoints = [...prev.map(p => ({
                     timestamp: p._ts as number,
                     rates: Object.fromEntries(
-                      Object.entries(p).filter(([k]) => k !== 'time' && k !== '_ts')
+                      Object.entries(p).filter(([k]) => k !== 'index' && k !== '_ts')
                     ) as Record<string, number>
                   })), ...newPoints];
                   const trimmed = allPoints.slice(-config.maxPoints);
-                  return convertToChartData(trimmed, timeRange, t);
+                  return convertToChartData(trimmed, timeRange);
                 });
               }
             } else {
@@ -150,7 +147,7 @@ export default function Dashboard() {
               const latestTimestamp = Math.max(...statsData.rate_history.map((p: { timestamp: number }) => p.timestamp));
               if (latestTimestamp > lastTimestampRef.current) {
                 lastTimestampRef.current = latestTimestamp;
-                setLocalChartData(convertToChartData(statsData.rate_history, timeRange, t));
+                setLocalChartData(convertToChartData(statsData.rate_history, timeRange));
               }
             }
           }
@@ -447,11 +444,15 @@ export default function Dashboard() {
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={rateHistory}>
                       <XAxis
-                        dataKey="time"
+                        dataKey="index"
+                        type="number"
+                        domain={[0, TIME_RANGE_CONFIG[timeRange].maxPoints - 1]}
                         stroke="#64748b"
                         fontSize={10}
                         tickLine={false}
                         axisLine={false}
+                        tickFormatter={formatXAxisTick}
+                        interval="preserveStartEnd"
                       />
                       <YAxis
                         stroke="#64748b"
