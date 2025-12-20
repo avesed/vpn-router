@@ -46,6 +46,9 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
+// 保留字段名（不应作为出口名显示）
+const RESERVED_KEYS = new Set(['index', '_ts', 'timestamp', 'name', 'value']);
+
 export default function Dashboard() {
   const { t, i18n } = useTranslation();
   const [status, setStatus] = useState<GatewayStatus | null>(null);
@@ -169,7 +172,7 @@ export default function Dashboard() {
     };
   }, [timeRange, convertToChartData, t]);
 
-  // 收集所有出口名称并排序
+  // 收集所有出口名称并排序（过滤保留字段）
   const outbounds = useMemo(() => {
     if (!localChartData.length) {
       return [];
@@ -177,7 +180,7 @@ export default function Dashboard() {
     const outboundSet = new Set<string>();
     localChartData.forEach(point => {
       Object.keys(point).forEach(key => {
-        if (key !== 'time' && key !== '_ts') {
+        if (!RESERVED_KEYS.has(key)) {
           outboundSet.add(key);
         }
       });
@@ -189,7 +192,7 @@ export default function Dashboard() {
     });
   }, [localChartData]);
 
-  // 用于显示的图表数据（去掉内部字段）
+  // 用于显示的图表数据（只去掉 _ts，保留 index 供 XAxis 使用）
   const rateHistory = useMemo(() => {
     return localChartData.map(({ _ts, ...rest }) => rest);
   }, [localChartData]);
@@ -261,9 +264,10 @@ export default function Dashboard() {
     }
   ];
 
-  // 准备饼图数据
+  // 准备饼图数据（过滤保留字段）
   const trafficData = dashboardStats?.traffic_by_outbound
     ? Object.entries(dashboardStats.traffic_by_outbound)
+        .filter(([name]) => !RESERVED_KEYS.has(name))
         .map(([name, { download, upload }]) => ({
           name,
           value: download + upload,

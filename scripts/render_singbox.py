@@ -999,9 +999,26 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
     if default_outbound:
         if default_outbound in all_valid:
             route["final"] = default_outbound
+            # 同时设置 DNS final，使用对应的 DNS 服务器
+            dns = config.setdefault("dns", {})
+            dns_servers = dns.get("servers", [])
+            dns_tag = f"{default_outbound}-dns"
+            # 检查对应的 DNS 服务器是否存在
+            if any(s.get("tag") == dns_tag for s in dns_servers):
+                dns["final"] = dns_tag
+                print(f"[render] DNS final 设置为: {dns_tag}")
+            elif default_outbound == "direct":
+                dns["final"] = "direct-dns"
+                print(f"[render] DNS final 设置为: direct-dns")
+            else:
+                # 如果没有对应的 DNS 服务器，使用 direct-dns
+                dns["final"] = "direct-dns"
+                print(f"[render] 警告: 未找到 {dns_tag}，DNS final 使用 direct-dns")
         else:
             print(f"[render] 警告: 默认出口 '{default_outbound}' 无效，使用 'direct'")
             route["final"] = "direct"
+            dns = config.setdefault("dns", {})
+            dns["final"] = "direct-dns"
 
 
 def ensure_log_config(config: dict) -> None:
