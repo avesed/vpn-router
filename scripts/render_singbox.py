@@ -85,38 +85,38 @@ def load_wireguard_server_config() -> dict | None:
     }
 
 
-def create_wireguard_server_endpoint(wg_config: dict) -> dict:
-    """创建 WireGuard 服务器端点（接受客户端连接）"""
-    server = wg_config["server"]
-    peers = wg_config["peers"]
+def create_tproxy_inbound(wg_config: dict) -> dict:
+    """创建 TPROXY 入口，接收来自内核 WireGuard 的转发流量
 
-    # 使用环境变量作为默认端口
-    default_wg_port = int(os.environ.get("WG_LISTEN_PORT", "36100"))
-    endpoint = {
-        "type": "wireguard",
-        "tag": "wg-server",
-        "system": False,
-        "mtu": server.get("mtu", 1420),
-        "address": [server.get("address", "10.23.0.1/24")],
-        "private_key": server.get("private_key", ""),
-        "listen_port": server.get("listen_port", default_wg_port),
-        "peers": []
+    内核 WireGuard (wg-ingress) 解密流量后，通过 iptables TPROXY 规则
+    透明代理到此端口，然后进入 sing-box 路由引擎进行分流。
+
+    流量路径:
+    Client -> kernel WireGuard (wg-ingress:36100) -> iptables TPROXY -> sing-box tproxy -> routing
+
+    TPROXY 优势（相比 TUN）:
+    - 专为转发流量设计（TUN 主要用于本地流量）
+    - 不修改源/目标地址
+    - 更高效的内核集成
+    """
+    server = wg_config["server"]
+
+    # TPROXY 入口配置
+    # 监听 TCP 和 UDP 流量
+    tproxy_inbound = {
+        "type": "tproxy",
+        "tag": "tproxy-in",
+        "listen": "::",
+        "listen_port": 7893,  # TPROXY 监听端口
+        "sniff": True,
+        "sniff_override_destination": False
     }
 
-    for peer in peers:
-        peer_config = {
-            "public_key": peer.get("public_key", ""),
-            "allowed_ips": [peer.get("allowed_ips", "10.23.0.2/32")]
-        }
-        if peer.get("preshared_key"):
-            peer_config["pre_shared_key"] = peer["preshared_key"]
-        endpoint["peers"].append(peer_config)
-
-    return endpoint
+    return tproxy_inbound
 
 
-def ensure_wireguard_server_endpoint(config: dict) -> bool:
-    """确保 WireGuard 服务器端点存在
+def ensure_tproxy_inbound(config: dict) -> bool:
+    """确保 TPROXY 入口存在，用于接收内核 WireGuard 转发流量
 
     返回 True 如果成功添加/更新，False 如果无配置
     """
@@ -124,16 +124,41 @@ def ensure_wireguard_server_endpoint(config: dict) -> bool:
     if not wg_config:
         return False
 
-    endpoints = config.setdefault("endpoints", [])
+    inbounds = config.setdefault("inbounds", [])
+    endpoints = config.get("endpoints", [])
 
-    # 移除旧的 wg-server endpoint
+    # 移除旧的 tproxy-in / tun-in inbound (如果存在)
+    inbounds[:] = [ib for ib in inbounds if ib.get("tag") not in ("tproxy-in", "tun-in")]
+
+    # 移除旧的 wg-server endpoint (迁移: userspace -> kernel)
     endpoints[:] = [ep for ep in endpoints if ep.get("tag") != "wg-server"]
 
-    # 创建新的 wg-server endpoint
-    wg_endpoint = create_wireguard_server_endpoint(wg_config)
-    endpoints.insert(0, wg_endpoint)  # 放在列表开头
-    print(f"[render] 创建 WireGuard 服务器端点: wg-server ({len(wg_config['peers'])} 个客户端)")
+    # 创建 TPROXY inbound
+    tproxy_inbound = create_tproxy_inbound(wg_config)
+    inbounds.insert(0, tproxy_inbound)
+    print(f"[render] 创建 TPROXY 入口: tproxy-in (内核 WireGuard -> iptables TPROXY)")
     return True
+
+
+# 保留旧函数名作为别名，兼容可能的外部调用
+def create_tun_inbound(wg_config: dict) -> dict:
+    """[已弃用] 使用 create_tproxy_inbound 替代"""
+    return create_tproxy_inbound(wg_config)
+
+
+def ensure_tun_inbound(config: dict) -> bool:
+    """[已弃用] 使用 ensure_tproxy_inbound 替代"""
+    return ensure_tproxy_inbound(config)
+
+
+def create_wireguard_server_endpoint(wg_config: dict) -> dict:
+    """[已弃用] 使用 create_tproxy_inbound 替代"""
+    return create_tproxy_inbound(wg_config)
+
+
+def ensure_wireguard_server_endpoint(config: dict) -> bool:
+    """[已弃用] 使用 ensure_tproxy_inbound 替代"""
+    return ensure_tproxy_inbound(config)
 
 
 def ensure_sniff_action(config: dict) -> None:
@@ -1120,9 +1145,9 @@ def main() -> None:
 
     all_egress_tags = []
 
-    # 确保 WireGuard 服务器端点存在（用于接受客户端连接）
-    if ensure_wireguard_server_endpoint(config):
-        print("[render] WireGuard 服务器端点已配置")
+    # 确保 TPROXY 入口存在（接收内核 WireGuard 转发流量）
+    if ensure_tproxy_inbound(config):
+        print("[render] TPROXY 入口已配置 (内核 WireGuard 模式)")
 
     # 从数据库加载 PIA profiles
     pia_profiles = load_pia_profiles_from_db()

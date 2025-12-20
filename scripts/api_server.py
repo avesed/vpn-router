@@ -183,6 +183,12 @@ _rate_samples: List[Dict[str, Dict[str, int]]] = []  # 最近 N 个流量样本�
 # V2Ray API 客户端（懒加载）
 _v2ray_client = None
 
+# Peer activity cache: {ip: {"last_seen": timestamp, "rx": bytes, "tx": bytes}}
+# Used to track peer online status even when no active connections exist
+_peer_activity_cache: Dict[str, Dict[str, Any]] = {}
+_peer_activity_lock = threading.Lock()
+_PEER_ONLINE_GRACE_PERIOD = 120  # Consider peer online for 120s after last activity
+
 
 class WireGuardPeerModel(BaseModel):
     address: str
@@ -620,6 +626,13 @@ def _update_traffic_stats():
                     # 清理24小时前的历史数据
                     cutoff = now - _MAX_HISTORY_SECONDS
                     _rate_history[:] = [p for p in _rate_history if p["timestamp"] > cutoff]
+
+            # Update peer activity cache by polling clash_api
+            # This ensures peer online status is tracked even without API queries
+            try:
+                get_peer_status_from_clash_api()
+            except Exception:
+                pass  # Silently ignore errors in cache update
 
         except Exception as e:
             # 记录未预期的异常，但不中断线程
@@ -2229,7 +2242,12 @@ def get_ingress_public_key(config: dict) -> str:
 
 
 def get_peer_status_from_clash_api() -> dict:
-    """从 sing-box clash_api 获取 peer 连接状态"""
+    """从 sing-box clash_api 获取 peer 连接状态
+
+    Updates global _peer_activity_cache with last_seen timestamps for each peer IP.
+    This cache is used to determine online status even when no active connections exist.
+    """
+    global _peer_activity_cache
     import time
     peer_status = {}  # ip -> {"active": bool, "last_seen": timestamp, "rx": int, "tx": int}
 
@@ -2269,6 +2287,18 @@ def get_peer_status_from_clash_api() -> dict:
             peer_status[src_ip]["tx"] += upload
             peer_status[src_ip]["connections"] += 1
 
+        # Update global peer activity cache with current activity
+        with _peer_activity_lock:
+            for ip, status in peer_status.items():
+                if ip not in _peer_activity_cache:
+                    _peer_activity_cache[ip] = {"last_seen": 0, "rx": 0, "tx": 0}
+
+                # Update last_seen timestamp when we see new activity
+                if status["rx"] > 0 or status["tx"] > 0:
+                    _peer_activity_cache[ip]["last_seen"] = now
+                    _peer_activity_cache[ip]["rx"] = status["rx"]
+                    _peer_activity_cache[ip]["tx"] = status["tx"]
+
     except Exception as e:
         # clash_api 不可用时静默失败
         pass
@@ -2276,75 +2306,156 @@ def get_peer_status_from_clash_api() -> dict:
     return peer_status
 
 
-def get_peer_handshake_info() -> dict:
-    """获取 peer 握手状态（从 clash_api 活跃连接推断）"""
+def get_wg_show_info() -> dict:
+    """从内核 WireGuard 获取接口和 peer 状态
+
+    使用 wg show 命令获取真实的 WireGuard 状态，包括:
+    - 握手时间 (latest handshake)
+    - 流量统计 (transfer)
+    - 端点信息 (endpoint)
+    """
     import time
-    handshakes = {}
+    interface = os.environ.get("WG_INTERFACE", "wg-ingress")
 
-    # 从 clash_api 获取连接状态
-    peer_status = get_peer_status_from_clash_api()
+    result = {"interface": {}, "peers": {}}
 
-    # 加载 peer 配置以获取 allowed_ips 到 public_key 的映射
-    config = load_ingress_config()
-    peers = config.get("peers", [])
+    try:
+        proc = subprocess.run(
+            ["wg", "show", interface],
+            capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            return result
+
+        current_peer = None
+        for line in proc.stdout.strip().split('\n'):
+            line = line.rstrip()
+
+            if line.startswith('interface:'):
+                result["interface"]["name"] = line.split(':', 1)[1].strip()
+            elif line.startswith('  public key:'):
+                result["interface"]["public_key"] = line.split(':', 1)[1].strip()
+            elif line.startswith('  listening port:'):
+                result["interface"]["listen_port"] = int(line.split(':', 1)[1].strip())
+            elif line.startswith('peer:'):
+                current_peer = line.split(':', 1)[1].strip()
+                result["peers"][current_peer] = {
+                    "public_key": current_peer,
+                    "endpoint": None,
+                    "allowed_ips": None,
+                    "latest_handshake": 0,
+                    "rx_bytes": 0,
+                    "tx_bytes": 0
+                }
+            elif current_peer:
+                if line.startswith('  endpoint:'):
+                    result["peers"][current_peer]["endpoint"] = line.split(':', 1)[1].strip()
+                elif line.startswith('  allowed ips:'):
+                    result["peers"][current_peer]["allowed_ips"] = line.split(':', 1)[1].strip()
+                elif line.startswith('  latest handshake:'):
+                    # Parse "X seconds/minutes/hours ago" or "never"
+                    handshake_str = line.split(':', 1)[1].strip()
+                    if handshake_str != "(none)":
+                        # Convert to timestamp
+                        result["peers"][current_peer]["latest_handshake"] = _parse_handshake_time(handshake_str)
+                elif line.startswith('  transfer:'):
+                    # Parse "X received, Y sent"
+                    transfer_str = line.split(':', 1)[1].strip()
+                    rx, tx = _parse_transfer(transfer_str)
+                    result["peers"][current_peer]["rx_bytes"] = rx
+                    result["peers"][current_peer]["tx_bytes"] = tx
+
+    except Exception as e:
+        print(f"[api] wg show failed: {e}")
+
+    return result
+
+
+def _parse_handshake_time(handshake_str: str) -> int:
+    """解析 wg show 的握手时间字符串，返回 Unix 时间戳"""
+    import time
+    import re
+
+    if not handshake_str or handshake_str == "(none)":
+        return 0
 
     now = int(time.time())
 
-    for peer in peers:
-        pubkey = peer.get("public_key", "")
-        allowed_ips = peer.get("allowed_ips", [])
+    # Match patterns like "47 seconds ago", "2 minutes, 30 seconds ago"
+    total_seconds = 0
 
-        # 处理 allowed_ips（可能是字符串或列表）
-        if isinstance(allowed_ips, str):
-            allowed_ips = [allowed_ips]
+    # Extract all time components
+    patterns = [
+        (r'(\d+)\s*second', 1),
+        (r'(\d+)\s*minute', 60),
+        (r'(\d+)\s*hour', 3600),
+        (r'(\d+)\s*day', 86400),
+    ]
 
-        # 检查该 peer 的任意 IP 是否有活跃连接
-        is_active = False
-        for ip_cidr in allowed_ips:
-            # 提取 IP（去掉 CIDR 后缀）
-            ip = ip_cidr.split("/")[0] if "/" in ip_cidr else ip_cidr
-            if ip in peer_status and peer_status[ip]["active"]:
-                is_active = True
-                break
+    for pattern, multiplier in patterns:
+        match = re.search(pattern, handshake_str)
+        if match:
+            total_seconds += int(match.group(1)) * multiplier
 
-        # 如果有活跃连接，设置 last_handshake 为当前时间
-        # 这样 is_online 检查（180秒内）会返回 True
-        if is_active:
-            handshakes[pubkey] = now
-        else:
-            handshakes[pubkey] = 0
+    if total_seconds > 0:
+        return now - total_seconds
+
+    return 0
+
+
+def _parse_transfer(transfer_str: str) -> tuple:
+    """解析 wg show 的流量字符串，返回 (rx_bytes, tx_bytes)"""
+    import re
+
+    rx_bytes = 0
+    tx_bytes = 0
+
+    # Match patterns like "47.71 KiB received, 176.50 KiB sent"
+    # or "1.23 MiB received, 456.78 KiB sent"
+    units = {'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3, 'TiB': 1024**4}
+
+    rx_match = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s*received', transfer_str)
+    tx_match = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s*sent', transfer_str)
+
+    if rx_match:
+        rx_bytes = int(float(rx_match.group(1)) * units.get(rx_match.group(2), 1))
+    if tx_match:
+        tx_bytes = int(float(tx_match.group(1)) * units.get(tx_match.group(2), 1))
+
+    return rx_bytes, tx_bytes
+
+
+def get_peer_handshake_info() -> dict:
+    """获取 peer 握手状态（从内核 WireGuard）
+
+    使用 wg show 命令获取真实的握手时间，比 clash_api 推断更准确。
+    """
+    handshakes = {}
+
+    # 从内核 WireGuard 获取状态
+    wg_info = get_wg_show_info()
+
+    for pubkey, peer_info in wg_info.get("peers", {}).items():
+        handshakes[pubkey] = peer_info.get("latest_handshake", 0)
 
     return handshakes
 
 
 def get_peer_transfer_info() -> dict:
-    """获取 peer 流量统计（从 clash_api）"""
+    """获取 peer 流量统计（从内核 WireGuard）
+
+    使用 wg show 命令获取真实的流量统计。
+    """
     transfers = {}
 
-    # 从 clash_api 获取连接状态
-    peer_status = get_peer_status_from_clash_api()
+    # 从内核 WireGuard 获取状态
+    wg_info = get_wg_show_info()
 
-    # 加载 peer 配置
-    config = load_ingress_config()
-    peers = config.get("peers", [])
-
-    for peer in peers:
-        pubkey = peer.get("public_key", "")
-        allowed_ips = peer.get("allowed_ips", [])
-
-        if isinstance(allowed_ips, str):
-            allowed_ips = [allowed_ips]
-
-        total_rx = 0
-        total_tx = 0
-
-        for ip_cidr in allowed_ips:
-            ip = ip_cidr.split("/")[0] if "/" in ip_cidr else ip_cidr
-            if ip in peer_status:
-                total_rx += peer_status[ip]["rx"]
-                total_tx += peer_status[ip]["tx"]
-
-        transfers[pubkey] = {"rx": total_rx, "tx": total_tx}
+    for pubkey, peer_info in wg_info.get("peers", {}).items():
+        transfers[pubkey] = {
+            "rx": peer_info.get("rx_bytes", 0),
+            "tx": peer_info.get("tx_bytes", 0)
+        }
 
     return transfers
 
@@ -2352,32 +2463,68 @@ def get_peer_transfer_info() -> dict:
 def apply_ingress_config(config: dict) -> dict:
     """应用入口 WireGuard 配置到系统
 
-    sing-box 1.12+ 使用 userspace WireGuard endpoint，因此主要通过
-    regenerate sing-box config 和 reload sing-box 来应用配置。
+    使用内核 WireGuard 模式：通过 wg set 命令直接管理 peer，
+    无需重载 sing-box（流量通过 TUN 入口，与 peer 管理解耦）。
     """
     try:
-        # 重新生成 sing-box 配置（包含 wg-server endpoint 和 peers）
-        render_script = ENTRY_DIR / "render_singbox.py"
+        interface = os.environ.get("WG_INTERFACE", "wg-ingress")
+        peers = config.get("peers", [])
+
+        # 获取当前内核 WireGuard peers
         result = subprocess.run(
-            ["python3", str(render_script)],
-            capture_output=True,
-            text=True,
+            ["wg", "show", interface, "peers"],
+            capture_output=True, text=True
         )
-        if result.returncode != 0:
-            error_msg = f"配置生成失败: {result.stderr.strip() or result.stdout.strip()}"
-            print(f"[api] render_singbox.py 失败: {result.stderr}")
-            return {"success": False, "message": error_msg}
+        current_peers = set()
+        if result.returncode == 0 and result.stdout.strip():
+            current_peers = set(line.strip() for line in result.stdout.strip().split('\n') if line.strip())
 
-        print(f"[api] render_singbox.py 成功: {result.stdout.strip()}")
+        # 计算期望的 peers
+        desired_peers = {p.get("public_key") for p in peers if p.get("public_key")}
 
-        # 重载 sing-box 使配置生效
-        reload_result = reload_singbox()
-        if not reload_result.get("success", False):
-            return {"success": False, "message": f"重载失败: {reload_result.get('message', 'unknown error')}"}
+        # 删除不在期望列表中的 peers
+        for pubkey in current_peers - desired_peers:
+            if pubkey:
+                subprocess.run(
+                    ["wg", "set", interface, "peer", pubkey, "remove"],
+                    check=True
+                )
+                print(f"[api] Removed peer: {pubkey[:20]}...")
 
-        return {"success": True, "message": "配置已应用", "reload": reload_result}
+        # 添加或更新 peers
+        for peer in peers:
+            pubkey = peer.get("public_key")
+            if not pubkey:
+                continue
+
+            allowed_ips = peer.get("allowed_ips", "10.23.0.2/32")
+            # allowed_ips can be a list or string, wg set expects comma-separated string
+            if isinstance(allowed_ips, list):
+                allowed_ips = ",".join(allowed_ips)
+
+            cmd = ["wg", "set", interface, "peer", pubkey, "allowed-ips", allowed_ips]
+
+            # 处理 preshared key
+            psk_file = None
+            if peer.get("preshared_key"):
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.psk') as f:
+                    f.write(peer["preshared_key"])
+                    psk_file = f.name
+                cmd.extend(["preshared-key", psk_file])
+
+            try:
+                subprocess.run(cmd, check=True)
+                action = "Updated" if pubkey in current_peers else "Added"
+                print(f"[api] {action} peer: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
+            finally:
+                if psk_file:
+                    os.unlink(psk_file)
+
+        return {"success": True, "message": f"Peers synced via wg set ({len(peers)} peers)"}
+
     except subprocess.CalledProcessError as exc:
-        return {"success": False, "message": f"应用配置失败: {exc}"}
+        return {"success": False, "message": f"wg set failed: {exc}"}
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
@@ -2402,10 +2549,10 @@ def api_get_ingress():
         last_handshake = handshakes.get(pubkey, 0)
         transfer = transfers.get(pubkey, {"rx": 0, "tx": 0})
 
-        # 判断是否在线（最近 3 分钟有握手）
+        # 判断是否在线（在 grace period 内有活动）
         import time
         now = int(time.time())
-        is_online = last_handshake > 0 and (now - last_handshake) < 180
+        is_online = last_handshake > 0 and (now - last_handshake) < _PEER_ONLINE_GRACE_PERIOD
 
         peers.append({
             "name": peer.get("name", "unknown"),
@@ -2456,22 +2603,25 @@ def detect_lan_subnet() -> Optional[str]:
 
 
 def calculate_allowed_ips_excluding_subnet(exclude_subnet: str) -> str:
-    """计算排除指定子网后的 AllowedIPs（真正的 Split Tunnel）
+    """计算 Split Tunnel 的 AllowedIPs
+
+    排除所有 RFC1918 私有地址范围 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)，
+    使本地局域网流量不走 VPN。包含 1.1.1.1/32 确保 DNS 查询走 VPN。
 
     Args:
-        exclude_subnet: 要排除的子网，如 "192.168.1.0/24"
+        exclude_subnet: 要排除的子网（用于日志记录）
 
     Returns:
-        排除该子网后的 CIDR 列表，用逗号分隔
+        Split Tunnel 的 CIDR 列表
     """
-    import ipaddress
-    try:
-        base = ipaddress.ip_network("0.0.0.0/0")
-        exclude = ipaddress.ip_network(exclude_subnet)
-        result = list(base.address_exclude(exclude))
-        return ", ".join(str(net) for net in result)
-    except Exception:
-        return "0.0.0.0/0"  # fallback
+    # 精确排除 RFC1918 私有地址，覆盖所有公网 IP + Cloudflare DNS
+    return ("1.0.0.0/8, 2.0.0.0/8, 3.0.0.0/8, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, "
+            "12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, "
+            "160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, "
+            "172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, "
+            "192.128.0.0/11, 192.160.0.0/13, 192.169.0.0/16, 192.170.0.0/15, "
+            "192.172.0.0/14, 192.176.0.0/12, 192.192.0.0/10, 193.0.0.0/8, "
+            "194.0.0.0/7, 196.0.0.0/6, 200.0.0.0/5, 208.0.0.0/4, 1.1.1.1/32")
 
 
 @app.post("/api/ingress/peers")

@@ -82,8 +82,99 @@ fi
 
 /usr/local/bin/fetch-geodata.sh "${RULESET_DIR}" "${GEO_DATA_READY_FLAG}"
 
-# Note: WireGuard server is now handled by sing-box endpoint (wg-server)
-# setup-wg.sh is no longer needed - sing-box binds to listen_port directly
+# === Kernel WireGuard Setup ===
+# Creates wg-ingress interface and configures TPROXY to sing-box
+
+WG_INTERFACE="${WG_INTERFACE:-wg-ingress}"
+WG_SUBNET="${WG_SUBNET:-10.23.0.0/24}"
+TPROXY_PORT="${TPROXY_PORT:-7893}"
+TPROXY_MARK="1"
+TPROXY_TABLE="100"
+
+setup_kernel_wireguard() {
+  echo "[entrypoint] setting up kernel WireGuard interface"
+
+  # Create WireGuard interface if not exists
+  if ! ip link show "${WG_INTERFACE}" >/dev/null 2>&1; then
+    echo "[entrypoint] creating ${WG_INTERFACE} interface"
+    ip link add "${WG_INTERFACE}" type wireguard
+  fi
+
+  # Apply WireGuard config from database
+  if ! python3 /usr/local/bin/setup_kernel_wg.py --interface "${WG_INTERFACE}"; then
+    echo "[entrypoint] failed to setup kernel WireGuard" >&2
+    return 1
+  fi
+
+  # Get WireGuard server subnet from database
+  WG_SUBNET=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+import os
+db = get_db(
+    os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
+    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+)
+server = db.get_wireguard_server()
+if server:
+    addr = server.get('address', '10.23.0.1/24')
+    # Convert address to subnet (e.g., 10.23.0.1/24 -> 10.23.0.0/24)
+    import ipaddress
+    net = ipaddress.ip_network(addr, strict=False)
+    print(str(net))
+else:
+    print('10.23.0.0/24')
+" 2>/dev/null || echo "10.23.0.0/24")
+
+  echo "[entrypoint] WireGuard subnet: ${WG_SUBNET}"
+  echo "[entrypoint] kernel WireGuard interface ready"
+}
+
+setup_tproxy_routing() {
+  # Setup TPROXY for transparent proxying of WireGuard traffic to sing-box
+  echo "[entrypoint] setting up TPROXY routing for WireGuard traffic"
+
+  # Enable ip_nonlocal_bind for TPROXY to work correctly
+  # This allows sing-box to send responses with non-local source IPs
+  sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
+
+  # Setup routing table for TPROXY marked packets
+  # Marked packets go to local (loopback) for TPROXY processing
+  if ! grep -q "^${TPROXY_TABLE}[[:space:]]" /etc/iproute2/rt_tables 2>/dev/null; then
+    echo "${TPROXY_TABLE} tproxy" >> /etc/iproute2/rt_tables
+    echo "[entrypoint] added routing table tproxy (${TPROXY_TABLE})"
+  fi
+
+  # Clear existing rules (including any stale 'from' rules that might break routing)
+  ip rule del fwmark ${TPROXY_MARK} lookup ${TPROXY_TABLE} 2>/dev/null || true
+  ip rule del from ${WG_SUBNET} lookup ${TPROXY_TABLE} 2>/dev/null || true
+  ip route flush table ${TPROXY_TABLE} 2>/dev/null || true
+
+  # Add policy routing: marked packets -> local delivery
+  ip rule add fwmark ${TPROXY_MARK} lookup ${TPROXY_TABLE}
+  ip route add local 0.0.0.0/0 dev lo table ${TPROXY_TABLE}
+
+  # Clear existing TPROXY iptables rules
+  iptables -t mangle -F PREROUTING 2>/dev/null || true
+
+  # Skip traffic to WireGuard server itself (local subnet)
+  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN
+
+  # TPROXY TCP traffic from WireGuard interface to sing-box
+  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p tcp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
+
+  # TPROXY UDP traffic from WireGuard interface to sing-box
+  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p udp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
+
+  echo "[entrypoint] TPROXY configured: ${WG_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
+}
+
+# Setup kernel WireGuard before other services
+setup_kernel_wireguard
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
@@ -210,8 +301,59 @@ trap handle_signals SIGTERM SIGINT
 
 start_singbox "${CONFIG_PATH}"
 
+# Setup TPROXY routing for WireGuard traffic (no need to wait for sing-box)
+setup_tproxy_routing
+
+# Log rotation configuration
+LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"  # 10 MB default
+LOG_ROTATE_COUNT=0
+
+rotate_logs() {
+  # Only check every 60 seconds
+  LOG_ROTATE_COUNT=$((LOG_ROTATE_COUNT + 1))
+  if [ $((LOG_ROTATE_COUNT % 60)) -ne 0 ]; then
+    return
+  fi
+
+  # Rotate sing-box log
+  local log_file="/var/log/sing-box.log"
+  if [ -f "${log_file}" ]; then
+    local size
+    size=$(stat -c%s "${log_file}" 2>/dev/null || echo 0)
+    if [ "${size}" -gt "${LOG_MAX_SIZE}" ]; then
+      echo "[entrypoint] rotating ${log_file} (${size} bytes > ${LOG_MAX_SIZE})"
+      # Keep last 1000 lines and truncate
+      tail -n 1000 "${log_file}" > "${log_file}.tmp" && mv "${log_file}.tmp" "${log_file}"
+    fi
+  fi
+
+  # Rotate API server log
+  log_file="/var/log/api-server.log"
+  if [ -f "${log_file}" ]; then
+    local size
+    size=$(stat -c%s "${log_file}" 2>/dev/null || echo 0)
+    if [ "${size}" -gt "${LOG_MAX_SIZE}" ]; then
+      echo "[entrypoint] rotating ${log_file} (${size} bytes)"
+      tail -n 1000 "${log_file}" > "${log_file}.tmp" && mv "${log_file}.tmp" "${log_file}"
+    fi
+  fi
+
+  # Rotate nginx logs
+  for log_file in /var/log/nginx/*.log; do
+    if [ -f "${log_file}" ]; then
+      local size
+      size=$(stat -c%s "${log_file}" 2>/dev/null || echo 0)
+      if [ "${size}" -gt "${LOG_MAX_SIZE}" ]; then
+        echo "[entrypoint] rotating ${log_file} (${size} bytes)"
+        tail -n 1000 "${log_file}" > "${log_file}.tmp" && mv "${log_file}.tmp" "${log_file}"
+      fi
+    fi
+  done
+}
+
 # 主循环：监控 nginx, API 和 sing-box 进程
 while true; do
+  rotate_logs
   # Check nginx
   if [ -n "${NGINX_PID}" ] && ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: nginx died" >&2

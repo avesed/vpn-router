@@ -346,7 +346,7 @@ def init_remote_rule_sets(conn: sqlite3.Connection):
     preset_rules = [
         # === 通用规则 ===
         ("easylist", "EasyList", "国际通用广告拦截列表",
-         "https://easylist.to/easylist/easylist.txt", "adblock", "general", None, 1),
+         "https://easylist.to/easylist/easylist.txt", "adblock", "general", None, 0),
         ("easyprivacy", "EasyPrivacy", "隐私追踪拦截列表",
          "https://easylist.to/easylist/easyprivacy.txt", "adblock", "privacy", None, 0),
         ("adguard-dns", "AdGuard DNS", "AdGuard DNS 过滤规则",
@@ -354,7 +354,7 @@ def init_remote_rule_sets(conn: sqlite3.Connection):
 
         # === 地区规则 ===
         ("easylist-china", "EasyList China", "中国区广告拦截",
-         "https://easylist-downloads.adblockplus.org/easylistchina.txt", "adblock", "regional", "cn", 1),
+         "https://easylist-downloads.adblockplus.org/easylistchina.txt", "adblock", "regional", "cn", 0),
         ("easylist-germany", "EasyList Germany", "德国区广告拦截",
          "https://easylist.to/easylistgermany/easylistgermany.txt", "adblock", "regional", "de", 0),
         ("easylist-france", "Liste FR", "法国区广告拦截",
