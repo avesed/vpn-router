@@ -103,10 +103,11 @@ def create_tproxy_inbound(wg_config: dict) -> dict:
 
     # TPROXY 入口配置
     # 监听 TCP 和 UDP 流量
+    # 使用 0.0.0.0 而不是 :: 确保 IPv4 TPROXY 流量正确接收
     tproxy_inbound = {
         "type": "tproxy",
         "tag": "tproxy-in",
-        "listen": "::",
+        "listen": "0.0.0.0",
         "listen_port": 7893,  # TPROXY 监听端口
         "sniff": True,
         "sniff_override_destination": False
