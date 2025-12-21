@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { IngressResponse, IngressPeer } from "../types";
@@ -143,7 +144,7 @@ export default function IngressManager() {
         useCustomKey ? newPeerPublicKey.trim() : undefined,
         allowLan
       );
-      setSuccessMessage(result.message);
+      setSuccessMessage(t("ingress.clientAdded", { name: newPeerName.trim() }));
       setShowAddModal(false);
       setNewPeerName("");
       setNewPeerPublicKey("");
@@ -394,9 +395,10 @@ export default function IngressManager() {
       </div>
 
       {/* Add Peer Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
+      {showAddModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">{t("ingress.addClient")}</h2>
@@ -506,7 +508,6 @@ export default function IngressManager() {
                     checked={allowLan}
                     onChange={(e) => {
                       setAllowLan(e.target.checked);
-                      // 如果勾选了，自动检测 IP 以显示 LAN 子网
                       if (e.target.checked && !detectedIps) {
                         detectIp();
                       }
@@ -577,17 +578,20 @@ export default function IngressManager() {
                 {t("ingress.add")}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Config Modal */}
-      {showConfigModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
-            <div className="p-6 border-b border-white/10">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">{t("ingress.clientConfig")} - {configPeerName}</h2>
+      {showConfigModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">{t("ingress.clientConfig")} - {configPeerName}</h2>
                 <button
                   onClick={() => {
                     setShowConfigModal(false);
@@ -665,15 +669,18 @@ export default function IngressManager() {
                 <ArrowDownTrayIcon className="h-4 w-4" />
                 {t("ingress.downloadConf")}
               </button>
+              </div>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Settings Modal */}
-      {showSettingsModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
+      {showSettingsModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">{t("ingress.ingressSettings")}</h2>
@@ -795,8 +802,10 @@ export default function IngressManager() {
                 {t("common.save")}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

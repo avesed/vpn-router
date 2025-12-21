@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { DomainCategory, DomainListResponse, TypeBreakdownItem, CountryIpInfo, IpCatalogResponse } from "../types";
@@ -78,7 +79,7 @@ export default function DomainCatalog() {
         setSelectedOutbound(rulesRes.available_outbounds[0]);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load catalog");
+      setError(err instanceof Error ? err.message : t("common.loadFailed"));
     } finally {
       setLoading(false);
     }
@@ -237,14 +238,14 @@ export default function DomainCatalog() {
         selectedOutbound,
         customTag || undefined
       );
-      setSuccessMessage(res.message);
+      setSuccessMessage(t("catalog.ruleCreated", { count: selectedLists.size }));
       setSelectedLists(new Set());
       setCustomTag("");
 
       // Clear success message after 3 seconds
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create rule");
+      setError(err instanceof Error ? err.message : t("common.createFailed"));
     } finally {
       setCreating(false);
     }
@@ -293,13 +294,13 @@ export default function DomainCatalog() {
         selectedOutbound,
         ipCustomTag || undefined
       );
-      setSuccessMessage(res.message);
+      setSuccessMessage(t("catalog.ipRuleCreated", { count: selectedCountries.size }));
       setSelectedCountries(new Set());
       setIpCustomTag("");
 
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create rule");
+      setError(err instanceof Error ? err.message : t("common.createFailed"));
     } finally {
       setCreatingIpRule(false);
     }
@@ -337,13 +338,13 @@ export default function DomainCatalog() {
     try {
       setAddingItem(true);
       setError(null);
-      const res = await api.addCategoryItem(addItemCategoryId, addItemName.trim(), domains);
-      setSuccessMessage(res.message);
+      await api.addCategoryItem(addItemCategoryId, addItemName.trim(), domains);
+      setSuccessMessage(t("catalog.itemAdded", { name: addItemName.trim() }));
       setShowAddItemModal(false);
       loadCatalog();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "添加失败");
+      setError(err instanceof Error ? err.message : t("catalog.addFailed"));
     } finally {
       setAddingItem(false);
     }
@@ -355,11 +356,11 @@ export default function DomainCatalog() {
     try {
       setError(null);
       await api.deleteCategoryItem(categoryId, itemId);
-      setSuccessMessage("已删除");
+      setSuccessMessage(t("catalog.deleted"));
       loadCatalog();
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
+      setError(err instanceof Error ? err.message : t("catalog.deleteFailed"));
     }
   };
 
@@ -983,76 +984,79 @@ export default function DomainCatalog() {
       )}
 
       {/* Add Item to Category Modal */}
-      {showAddItemModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
-            <div className="p-6 border-b border-white/10">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-white">
-                  {t('catalog.addItemTo', { name: addItemCategoryName })}
-                </h2>
+      {showAddItemModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">
+                    {t('catalog.addItemTo', { name: addItemCategoryName })}
+                  </h2>
+                  <button
+                    onClick={() => setShowAddItemModal(false)}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('catalog.listName')} <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={addItemName}
+                    onChange={(e) => setAddItemName(e.target.value)}
+                    placeholder={t('catalog.listNamePlaceholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('catalog.domainList')} <span className="text-red-400">*</span>
+                  </label>
+                  <textarea
+                    value={addItemDomains}
+                    onChange={(e) => setAddItemDomains(e.target.value)}
+                    placeholder={t('catalog.domainListPlaceholder')}
+                    rows={6}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-sm"
+                  />
+                  <p className="text-xs text-slate-500 mt-1">
+                    {t('catalog.addedDomainsNote', { name: addItemCategoryName })}
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
                 <button
                   onClick={() => setShowAddItemModal(false)}
-                  className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
                 >
-                  <XMarkIcon className="h-5 w-5" />
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={addItemToCategory}
+                  disabled={addingItem}
+                  className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {addingItem ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <PlusIcon className="h-4 w-4" />
+                  )}
+                  {t('common.add')}
                 </button>
               </div>
             </div>
-
-            <div className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">
-                  {t('catalog.listName')} <span className="text-red-400">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={addItemName}
-                  onChange={(e) => setAddItemName(e.target.value)}
-                  placeholder="例如: my-streaming-sites"
-                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">
-                  {t('catalog.domainList')} <span className="text-red-400">*</span>
-                </label>
-                <textarea
-                  value={addItemDomains}
-                  onChange={(e) => setAddItemDomains(e.target.value)}
-                  placeholder="每行一个或用逗号分隔&#10;例如:&#10;example.com&#10;test.org"
-                  rows={6}
-                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono text-sm"
-                />
-                <p className="text-xs text-slate-500 mt-1">
-                  添加的域名将作为独立列表归入"{addItemCategoryName}"分类
-                </p>
-              </div>
-            </div>
-
-            <div className="p-6 border-t border-white/10 flex justify-end gap-3">
-              <button
-                onClick={() => setShowAddItemModal(false)}
-                className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
-              >
-                {t('common.cancel')}
-              </button>
-              <button
-                onClick={addItemToCategory}
-                disabled={addingItem}
-                className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
-              >
-                {addingItem ? (
-                  <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-                ) : (
-                  <PlusIcon className="h-4 w-4" />
-                )}
-                {t('common.add')}
-              </button>
-            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );

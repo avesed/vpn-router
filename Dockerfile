@@ -1,5 +1,25 @@
 # ==========================================
-# Stage 1: Build sing-box with v2ray_api
+# Stage 1: Download Xray binary
+# ==========================================
+FROM debian:12-slim AS xray-downloader
+
+ARG XRAY_VERSION=25.12.8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and extract Xray
+RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip \
+    && cd /tmp \
+    && unzip xray.zip \
+    && chmod +x xray \
+    && mv xray /usr/local/bin/xray
+
+# ==========================================
+# Stage 2: Build sing-box with v2ray_api
 # ==========================================
 FROM golang:1.23-bookworm AS singbox-builder
 
@@ -17,7 +37,7 @@ RUN CGO_ENABLED=0 go build -v -trimpath -ldflags "-s -w -buildid=" \
     -o /sing-box ./cmd/sing-box
 
 # ==========================================
-# Stage 2: Build Frontend
+# Stage 3: Build Frontend
 # ==========================================
 FROM node:20-alpine AS frontend-builder
 
@@ -28,7 +48,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ==========================================
-# Stage 3: Production Runtime
+# Stage 4: Production Runtime
 # ==========================================
 FROM debian:12-slim
 
@@ -67,6 +87,10 @@ RUN set -eux; \
 COPY --from=singbox-builder /sing-box /usr/local/bin/sing-box
 RUN chmod +x /usr/local/bin/sing-box
 
+# Copy Xray binary for V2Ray ingress (XTLS-Vision, REALITY support)
+COPY --from=xray-downloader /usr/local/bin/xray /usr/local/bin/xray
+RUN chmod +x /usr/local/bin/xray
+
 # Copy frontend build output
 COPY --from=frontend-builder /app/dist /var/www/html
 
@@ -97,16 +121,19 @@ COPY scripts/init_user_db.py /usr/local/bin/init_user_db.py
 COPY scripts/convert_adblock.py /usr/local/bin/convert_adblock.py
 COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
 COPY scripts/socks5_proxy.py /usr/local/bin/socks5_proxy.py
+COPY scripts/xray_manager.py /usr/local/bin/xray_manager.py
 COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
 COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
 COPY scripts/v2ray_stats_client.py /usr/local/bin/v2ray_stats_client.py
+COPY scripts/v2ray_uri_parser.py /usr/local/bin/v2ray_uri_parser.py
 COPY scripts/setup_kernel_wg.py /usr/local/bin/setup_kernel_wg.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
     /usr/local/bin/api_server.py /usr/local/bin/init_user_db.py \
     /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
-    /usr/local/bin/socks5_proxy.py /usr/local/bin/setup_kernel_wg.py
+    /usr/local/bin/socks5_proxy.py /usr/local/bin/setup_kernel_wg.py \
+    /usr/local/bin/xray_manager.py
 
 # Note: Databases and config are mounted via docker-compose volumes
 # - geoip-geodata.db is pre-built and volume-mounted (49 MB, read-only)

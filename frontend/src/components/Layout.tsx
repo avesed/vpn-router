@@ -41,7 +41,8 @@ const navGroups: NavGroup[] = [
     labelKey: "nav.ingress",
     icon: ArrowLeftEndOnRectangleIcon,
     items: [
-      { labelKey: "nav.ingressClient", path: "/ingress", icon: UsersIcon, descriptionKey: "nav.ingressClientDesc" }
+      { labelKey: "nav.ingressClient", path: "/ingress", icon: UsersIcon, descriptionKey: "nav.ingressClientDesc" },
+      { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: ServerIcon, descriptionKey: "nav.v2rayIngressDesc" }
     ]
   },
   {
@@ -76,7 +77,11 @@ export default function Layout({ children, currentPath }: LayoutProps) {
   const getInitialExpanded = () => {
     const expanded: Set<string> = new Set();
     navGroups.forEach((group) => {
-      if (group.items.some((item) => currentPath === item.path || (item.path !== "/" && currentPath.startsWith(item.path)))) {
+      if (group.items.some((item) => {
+        if (currentPath === item.path) return true;
+        if (item.path === "/") return false;
+        return currentPath.startsWith(item.path + "/");
+      })) {
         expanded.add(group.labelKey);
       }
     });
@@ -102,7 +107,10 @@ export default function Layout({ children, currentPath }: LayoutProps) {
   };
 
   const isItemActive = (item: NavItem) => {
-    return currentPath === item.path || (item.path !== "/" && currentPath.startsWith(item.path));
+    if (currentPath === item.path) return true;
+    if (item.path === "/") return false;
+    // Add trailing slash to prevent /ingress matching /ingress-v2ray
+    return currentPath.startsWith(item.path + "/");
   };
 
   return (

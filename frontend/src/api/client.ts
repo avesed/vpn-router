@@ -42,7 +42,23 @@ import type {
   OpenVPNEgressListResponse,
   OpenVPNParseResult,
   OpenVPNTunnelStatus,
-  DashboardStats
+  DashboardStats,
+  // V2Ray types
+  V2RayEgress,
+  V2RayEgressCreateRequest,
+  V2RayEgressUpdateRequest,
+  V2RayEgressListResponse,
+  V2RayURIParseResult,
+  V2RayInboundConfig,
+  V2RayInboundUpdateRequest,
+  V2RayUser,
+  V2RayUserCreateRequest,
+  V2RayUserUpdateRequest,
+  V2RayInboundResponse,
+  V2RayUserShareResponse,
+  // Xray types
+  XrayStatus,
+  RealityKeyPair
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -305,5 +321,62 @@ export const api = {
   deleteAdBlockRule: (tag: string) =>
     request<{ message: string }>(`/adblock/rules/${encodeURIComponent(tag)}`, { method: "DELETE" }),
   applyAdBlockRules: () =>
-    request<{ message: string; status: string }>("/adblock/apply", { method: "POST" })
+    request<{ message: string; status: string }>("/adblock/apply", { method: "POST" }),
+
+  // ============ V2Ray Egress Management ============
+  getV2RayEgress: () => request<V2RayEgressListResponse>("/egress/v2ray"),
+  getV2RayEgressByTag: (tag: string) =>
+    request<V2RayEgress>(`/egress/v2ray/${encodeURIComponent(tag)}`),
+  createV2RayEgress: (data: V2RayEgressCreateRequest) =>
+    request<{ message: string; tag: string; id: number }>("/egress/v2ray", {
+      method: "POST",
+      body: data
+    }),
+  updateV2RayEgress: (tag: string, data: V2RayEgressUpdateRequest) =>
+    request<{ message: string }>(`/egress/v2ray/${encodeURIComponent(tag)}`, {
+      method: "PUT",
+      body: data
+    }),
+  deleteV2RayEgress: (tag: string) =>
+    request<{ message: string }>(`/egress/v2ray/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+  parseV2RayURI: (uri: string) =>
+    request<V2RayURIParseResult>("/egress/v2ray/parse", {
+      method: "POST",
+      body: { uri }
+    }),
+
+  // ============ V2Ray Inbound Management ============
+  getV2RayInbound: () => request<V2RayInboundResponse>("/ingress/v2ray"),
+  updateV2RayInbound: (data: V2RayInboundUpdateRequest) =>
+    request<{ message: string }>("/ingress/v2ray", {
+      method: "PUT",
+      body: data
+    }),
+
+  // V2Ray User Management
+  addV2RayUser: (data: V2RayUserCreateRequest) =>
+    request<{ message: string; id: number; uuid: string }>("/ingress/v2ray/users", {
+      method: "POST",
+      body: data
+    }),
+  updateV2RayUser: (userId: number, data: V2RayUserUpdateRequest) =>
+    request<{ message: string }>(`/ingress/v2ray/users/${userId}`, {
+      method: "PUT",
+      body: data
+    }),
+  deleteV2RayUser: (userId: number) =>
+    request<{ message: string }>(`/ingress/v2ray/users/${userId}`, { method: "DELETE" }),
+  getV2RayUserShareUri: (userId: number) =>
+    request<V2RayUserShareResponse>(`/ingress/v2ray/users/${userId}/share`),
+  getV2RayUserQRCodeUrl: (userId: number) =>
+    `${API_BASE}/ingress/v2ray/users/${userId}/qrcode`,
+
+  // ============ Xray Control (V2Ray Inbound via Xray) ============
+  getXrayStatus: () => request<XrayStatus>("/ingress/v2ray/xray/status"),
+  restartXray: () =>
+    request<{ message: string; status: XrayStatus }>("/ingress/v2ray/xray/restart", { method: "POST" }),
+  reloadXray: () =>
+    request<{ message: string; status: XrayStatus }>("/ingress/v2ray/xray/reload", { method: "POST" }),
+  generateRealityKeys: () =>
+    request<RealityKeyPair>("/ingress/v2ray/reality/generate-keys", { method: "POST" })
 };

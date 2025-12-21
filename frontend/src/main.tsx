@@ -10,6 +10,7 @@ import RouteRules from "./pages/RouteRules";
 import DomainCatalog from "./pages/DomainCatalog";
 import IpCatalog from "./pages/IpCatalog";
 import IngressManager from "./pages/IngressManager";
+import V2RayIngressManager from "./pages/V2RayIngressManager";
 import BackupRestore from "./pages/BackupRestore";
 import AdBlock from "./pages/AdBlock";
 import "./index.css";
@@ -22,6 +23,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Dashboard /> },
       { path: "ingress", element: <IngressManager /> },
+      { path: "ingress-v2ray", element: <V2RayIngressManager /> },
       { path: "egress", element: <EgressManager /> },
       { path: "profiles", element: <Navigate to="/egress" replace /> },
       { path: "rules", element: <RouteRules /> },

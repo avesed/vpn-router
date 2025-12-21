@@ -1157,6 +1157,369 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ V2Ray Egress 管理（支持 VMess, VLESS, Trojan）============
+
+    def get_v2ray_egress_list(self, enabled_only: bool = False, protocol: Optional[str] = None) -> List[Dict]:
+        """获取所有 V2Ray 出口
+
+        Args:
+            enabled_only: 只返回启用的出口
+            protocol: 过滤协议类型 (vmess, vless, trojan)
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM v2ray_egress"
+            conditions = []
+            params = []
+
+            if enabled_only:
+                conditions.append("enabled = 1")
+            if protocol:
+                conditions.append("protocol = ?")
+                params.append(protocol)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY tag"
+
+            rows = cursor.execute(query, params).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            result = []
+            for row in rows:
+                item = dict(zip(columns, row))
+                # 解析 JSON 字段
+                for json_field in ["tls_alpn", "transport_config"]:
+                    if item.get(json_field):
+                        try:
+                            item[json_field] = json.loads(item[json_field])
+                        except:
+                            pass
+                result.append(item)
+            return result
+
+    def get_v2ray_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 V2Ray 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM v2ray_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            item = dict(zip(columns, row))
+            # 解析 JSON 字段
+            for json_field in ["tls_alpn", "transport_config"]:
+                if item.get(json_field):
+                    try:
+                        item[json_field] = json.loads(item[json_field])
+                    except:
+                        pass
+            return item
+
+    def add_v2ray_egress(
+        self,
+        tag: str,
+        protocol: str,
+        server: str,
+        server_port: int = 443,
+        description: str = "",
+        # Auth
+        uuid: Optional[str] = None,
+        password: Optional[str] = None,
+        # VMess specific
+        security: str = "auto",
+        alter_id: int = 0,
+        # VLESS specific
+        flow: Optional[str] = None,
+        # TLS
+        tls_enabled: bool = True,
+        tls_sni: Optional[str] = None,
+        tls_alpn: Optional[List[str]] = None,
+        tls_allow_insecure: bool = False,
+        tls_fingerprint: Optional[str] = None,
+        # REALITY
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        # Transport
+        transport_type: str = "tcp",
+        transport_config: Optional[Dict] = None,
+        # Multiplex
+        multiplex_enabled: bool = False,
+        multiplex_protocol: Optional[str] = None,
+        multiplex_max_connections: Optional[int] = None,
+        multiplex_min_streams: Optional[int] = None,
+        multiplex_max_streams: Optional[int] = None
+    ) -> int:
+        """添加 V2Ray 出口
+
+        Returns:
+            新创建记录的 ID
+        """
+        tls_alpn_json = json.dumps(tls_alpn) if tls_alpn else None
+        transport_config_json = json.dumps(transport_config) if transport_config else None
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO v2ray_egress
+                (tag, description, protocol, server, server_port,
+                 uuid, password, security, alter_id, flow,
+                 tls_enabled, tls_sni, tls_alpn, tls_allow_insecure, tls_fingerprint,
+                 reality_enabled, reality_public_key, reality_short_id,
+                 transport_type, transport_config,
+                 multiplex_enabled, multiplex_protocol, multiplex_max_connections,
+                 multiplex_min_streams, multiplex_max_streams)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, description, protocol, server, server_port,
+                  uuid, password, security, alter_id, flow,
+                  1 if tls_enabled else 0, tls_sni, tls_alpn_json,
+                  1 if tls_allow_insecure else 0, tls_fingerprint,
+                  1 if reality_enabled else 0, reality_public_key, reality_short_id,
+                  transport_type, transport_config_json,
+                  1 if multiplex_enabled else 0, multiplex_protocol, multiplex_max_connections,
+                  multiplex_min_streams, multiplex_max_streams))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_v2ray_egress(self, tag: str, **kwargs) -> bool:
+        """更新 V2Ray 出口"""
+        allowed_fields = {
+            "description", "protocol", "server", "server_port",
+            "uuid", "password", "security", "alter_id", "flow",
+            "tls_enabled", "tls_sni", "tls_alpn", "tls_allow_insecure", "tls_fingerprint",
+            "reality_enabled", "reality_public_key", "reality_short_id",
+            "transport_type", "transport_config",
+            "multiplex_enabled", "multiplex_protocol", "multiplex_max_connections",
+            "multiplex_min_streams", "multiplex_max_streams", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                if key in ["tls_alpn", "transport_config"]:
+                    value = json.dumps(value) if value else None
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE v2ray_egress SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_v2ray_egress(self, tag: str) -> bool:
+        """删除 V2Ray 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM v2ray_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ V2Ray Inbound 配置 ============
+
+    def get_v2ray_inbound_config(self) -> Optional[Dict]:
+        """获取 V2Ray 入口配置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM v2ray_inbound_config WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            item = dict(zip(columns, row))
+            # 解析 JSON 字段
+            if item.get("transport_config"):
+                try:
+                    item["transport_config"] = json.loads(item["transport_config"])
+                except:
+                    pass
+            return item
+
+    def set_v2ray_inbound_config(
+        self,
+        protocol: str,
+        listen_port: int = 443,
+        listen_address: str = "0.0.0.0",
+        tls_enabled: bool = True,
+        tls_cert_path: Optional[str] = None,
+        tls_key_path: Optional[str] = None,
+        tls_cert_content: Optional[str] = None,
+        tls_key_content: Optional[str] = None,
+        xtls_vision_enabled: int = 0,
+        reality_enabled: int = 0,
+        reality_private_key: Optional[str] = None,
+        reality_public_key: Optional[str] = None,
+        reality_short_ids: Optional[str] = None,
+        reality_dest: Optional[str] = None,
+        reality_server_names: Optional[str] = None,
+        transport_type: str = "tcp",
+        transport_config: Optional[Dict] = None,
+        fallback_server: Optional[str] = None,
+        fallback_port: Optional[int] = None,
+        tun_device: str = "xray-tun0",
+        tun_subnet: str = "10.24.0.0/24",
+        enabled: bool = False
+    ) -> bool:
+        """设置 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
+        transport_config_json = json.dumps(transport_config) if transport_config else None
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 UPSERT (INSERT OR REPLACE)
+            cursor.execute("""
+                INSERT OR REPLACE INTO v2ray_inbound_config
+                (id, protocol, listen_address, listen_port,
+                 tls_enabled, tls_cert_path, tls_key_path, tls_cert_content, tls_key_content,
+                 xtls_vision_enabled, reality_enabled, reality_private_key, reality_public_key,
+                 reality_short_ids, reality_dest, reality_server_names,
+                 transport_type, transport_config, fallback_server, fallback_port,
+                 tun_device, tun_subnet, enabled,
+                 updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (protocol, listen_address, listen_port,
+                  1 if tls_enabled else 0, tls_cert_path, tls_key_path,
+                  tls_cert_content, tls_key_content,
+                  xtls_vision_enabled, reality_enabled, reality_private_key, reality_public_key,
+                  reality_short_ids, reality_dest, reality_server_names,
+                  transport_type, transport_config_json,
+                  fallback_server, fallback_port,
+                  tun_device, tun_subnet, 1 if enabled else 0))
+            conn.commit()
+            return True
+
+    def update_v2ray_inbound_config(self, **kwargs) -> bool:
+        """更新 V2Ray 入口配置的特定字段"""
+        allowed_fields = {
+            "protocol", "listen_address", "listen_port",
+            "tls_enabled", "tls_cert_path", "tls_key_path",
+            "tls_cert_content", "tls_key_content",
+            "xtls_vision_enabled", "reality_enabled",
+            "reality_private_key", "reality_public_key",
+            "reality_short_ids", "reality_dest", "reality_server_names",
+            "transport_type", "transport_config",
+            "fallback_server", "fallback_port",
+            "tun_device", "tun_subnet", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                if key == "transport_config":
+                    value = json.dumps(value) if value else None
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE v2ray_inbound_config SET {", ".join(updates)} WHERE id = 1
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ V2Ray 用户管理 ============
+
+    def get_v2ray_users(self, enabled_only: bool = True) -> List[Dict]:
+        """获取所有 V2Ray 用户"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM v2ray_users WHERE enabled = 1 ORDER BY name"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM v2ray_users ORDER BY name"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_v2ray_user(self, user_id: int) -> Optional[Dict]:
+        """根据 ID 获取 V2Ray 用户"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM v2ray_users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def get_v2ray_user_by_name(self, name: str) -> Optional[Dict]:
+        """根据名称获取 V2Ray 用户"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM v2ray_users WHERE name = ?", (name,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_v2ray_user(
+        self,
+        name: str,
+        uuid: Optional[str] = None,
+        password: Optional[str] = None,
+        email: Optional[str] = None,
+        alter_id: int = 0,
+        flow: Optional[str] = None
+    ) -> int:
+        """添加 V2Ray 用户
+
+        Returns:
+            新创建记录的 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO v2ray_users (name, uuid, password, email, alter_id, flow)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (name, uuid, password, email, alter_id, flow))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_v2ray_user(self, user_id: int, **kwargs) -> bool:
+        """更新 V2Ray 用户"""
+        allowed_fields = {"name", "uuid", "password", "email", "alter_id", "flow", "enabled"}
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(user_id)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE v2ray_users SET {", ".join(updates)} WHERE id = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_v2ray_user(self, user_id: int) -> bool:
+        """删除 V2Ray 用户"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM v2ray_users WHERE id = ?", (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
 
 class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
@@ -1413,6 +1776,125 @@ class DatabaseManager:
 
     def delete_openvpn_egress(self, tag: str) -> bool:
         return self.user.delete_openvpn_egress(tag)
+
+    # V2Ray Egress
+    def get_v2ray_egress_list(self, enabled_only: bool = False, protocol: Optional[str] = None) -> List[Dict]:
+        return self.user.get_v2ray_egress_list(enabled_only, protocol)
+
+    def get_v2ray_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_v2ray_egress(tag)
+
+    def add_v2ray_egress(
+        self,
+        tag: str,
+        protocol: str,
+        server: str,
+        server_port: int = 443,
+        description: str = "",
+        uuid: Optional[str] = None,
+        password: Optional[str] = None,
+        security: str = "auto",
+        alter_id: int = 0,
+        flow: Optional[str] = None,
+        tls_enabled: bool = True,
+        tls_sni: Optional[str] = None,
+        tls_alpn: Optional[List[str]] = None,
+        tls_allow_insecure: bool = False,
+        tls_fingerprint: Optional[str] = None,
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        transport_type: str = "tcp",
+        transport_config: Optional[Dict] = None,
+        multiplex_enabled: bool = False,
+        multiplex_protocol: Optional[str] = None,
+        multiplex_max_connections: Optional[int] = None,
+        multiplex_min_streams: Optional[int] = None,
+        multiplex_max_streams: Optional[int] = None
+    ) -> int:
+        return self.user.add_v2ray_egress(
+            tag, protocol, server, server_port, description,
+            uuid, password, security, alter_id, flow,
+            tls_enabled, tls_sni, tls_alpn, tls_allow_insecure, tls_fingerprint,
+            reality_enabled, reality_public_key, reality_short_id,
+            transport_type, transport_config,
+            multiplex_enabled, multiplex_protocol, multiplex_max_connections,
+            multiplex_min_streams, multiplex_max_streams
+        )
+
+    def update_v2ray_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_v2ray_egress(tag, **kwargs)
+
+    def delete_v2ray_egress(self, tag: str) -> bool:
+        return self.user.delete_v2ray_egress(tag)
+
+    # V2Ray Inbound
+    def get_v2ray_inbound_config(self) -> Optional[Dict]:
+        return self.user.get_v2ray_inbound_config()
+
+    def set_v2ray_inbound_config(
+        self,
+        protocol: str,
+        listen_port: int = 443,
+        listen_address: str = "0.0.0.0",
+        tls_enabled: bool = True,
+        tls_cert_path: Optional[str] = None,
+        tls_key_path: Optional[str] = None,
+        tls_cert_content: Optional[str] = None,
+        tls_key_content: Optional[str] = None,
+        xtls_vision_enabled: int = 0,
+        reality_enabled: int = 0,
+        reality_private_key: Optional[str] = None,
+        reality_public_key: Optional[str] = None,
+        reality_short_ids: Optional[str] = None,
+        reality_dest: Optional[str] = None,
+        reality_server_names: Optional[str] = None,
+        transport_type: str = "tcp",
+        transport_config: Optional[Dict] = None,
+        fallback_server: Optional[str] = None,
+        fallback_port: Optional[int] = None,
+        tun_device: str = "xray-tun0",
+        tun_subnet: str = "10.24.0.0/24",
+        enabled: bool = False
+    ) -> bool:
+        return self.user.set_v2ray_inbound_config(
+            protocol, listen_port, listen_address,
+            tls_enabled, tls_cert_path, tls_key_path, tls_cert_content, tls_key_content,
+            xtls_vision_enabled, reality_enabled, reality_private_key, reality_public_key,
+            reality_short_ids, reality_dest, reality_server_names,
+            transport_type, transport_config, fallback_server, fallback_port,
+            tun_device, tun_subnet, enabled
+        )
+
+    def update_v2ray_inbound_config(self, **kwargs) -> bool:
+        return self.user.update_v2ray_inbound_config(**kwargs)
+
+    # V2Ray Users
+    def get_v2ray_users(self, enabled_only: bool = True) -> List[Dict]:
+        return self.user.get_v2ray_users(enabled_only)
+
+    def get_v2ray_user(self, user_id: int) -> Optional[Dict]:
+        return self.user.get_v2ray_user(user_id)
+
+    def get_v2ray_user_by_name(self, name: str) -> Optional[Dict]:
+        return self.user.get_v2ray_user_by_name(name)
+
+    def add_v2ray_user(
+        self,
+        name: str,
+        uuid: Optional[str] = None,
+        password: Optional[str] = None,
+        email: Optional[str] = None,
+        alter_id: int = 0,
+        flow: Optional[str] = None
+    ) -> int:
+        return self.user.add_v2ray_user(name, uuid, password, email, alter_id, flow)
+
+    def update_v2ray_user(self, user_id: int, **kwargs) -> bool:
+        return self.user.update_v2ray_user(user_id, **kwargs)
+
+    def delete_v2ray_user(self, user_id: int) -> bool:
+        return self.user.delete_v2ray_user(user_id)
 
 
 # 全局缓存

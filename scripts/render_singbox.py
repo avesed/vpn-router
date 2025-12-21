@@ -13,7 +13,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import yaml
 
@@ -160,6 +160,38 @@ def create_wireguard_server_endpoint(wg_config: dict) -> dict:
 def ensure_wireguard_server_endpoint(config: dict) -> bool:
     """[已弃用] 使用 ensure_tproxy_inbound 替代"""
     return ensure_tproxy_inbound(config)
+
+
+# Xray SOCKS5 入站端口 (Xray 通过此端口连接 sing-box)
+XRAY_SOCKS_PORT = 7891
+
+
+def ensure_xray_socks_inbound(config: dict) -> bool:
+    """确保 Xray 专用的 SOCKS5 入口存在
+
+    Xray 通过 SOCKS5 连接到 sing-box，避免 WireGuard 路由问题。
+    架构: V2Ray Client -> Xray -> SOCKS5 (127.0.0.1:7891) -> sing-box 路由
+    """
+    inbounds = config.setdefault("inbounds", [])
+
+    # 检查是否已存在
+    existing = [ib for ib in inbounds if ib.get("tag") == "xray-socks-in"]
+    if existing:
+        return True
+
+    # 创建 SOCKS5 入站
+    socks_inbound = {
+        "type": "socks",
+        "tag": "xray-socks-in",
+        "listen": "127.0.0.1",
+        "listen_port": XRAY_SOCKS_PORT,
+        "sniff": True,
+        "sniff_override_destination": False,
+        "udp_timeout": "5m"
+    }
+    inbounds.append(socks_inbound)
+    print(f"[render] 创建 Xray SOCKS5 入口: xray-socks-in (127.0.0.1:{XRAY_SOCKS_PORT})")
+    return True
 
 
 def ensure_sniff_action(config: dict) -> None:
@@ -700,6 +732,271 @@ def ensure_custom_dns_servers(config: dict, custom_tags: List[str]) -> None:
             })
 
 
+# ============ V2Ray Egress 支持 ============
+
+
+def load_v2ray_egress() -> List[dict]:
+    """从数据库加载 V2Ray 出口配置"""
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        egress_list = db.get_v2ray_egress_list(enabled_only=True)
+        return egress_list
+    except Exception as e:
+        print(f"[render] 从数据库加载 V2Ray 出口配置失败: {e}")
+        return []
+
+
+def _build_v2ray_outbound(egress: dict) -> dict:
+    """构建 V2Ray outbound 配置（支持 VMess, VLESS, Trojan）"""
+    protocol = egress.get("protocol")
+    tag = egress.get("tag")
+
+    outbound = {
+        "type": protocol,
+        "tag": tag,
+        "server": egress.get("server"),
+        "server_port": egress.get("server_port", 443),
+    }
+
+    # Protocol-specific auth
+    if protocol == "vmess":
+        outbound["uuid"] = egress.get("uuid")
+        outbound["security"] = egress.get("security", "auto")
+        if egress.get("alter_id"):
+            outbound["alter_id"] = egress.get("alter_id")
+    elif protocol == "vless":
+        outbound["uuid"] = egress.get("uuid")
+        if egress.get("flow"):
+            outbound["flow"] = egress.get("flow")
+    elif protocol == "trojan":
+        outbound["password"] = egress.get("password")
+
+    # TLS configuration
+    if egress.get("tls_enabled"):
+        tls_config = {"enabled": True}
+        if egress.get("tls_sni"):
+            tls_config["server_name"] = egress.get("tls_sni")
+        if egress.get("tls_alpn"):
+            alpn = egress.get("tls_alpn")
+            if isinstance(alpn, str):
+                alpn = [a.strip() for a in alpn.split(",")]
+            tls_config["alpn"] = alpn
+        if egress.get("tls_allow_insecure"):
+            tls_config["insecure"] = True
+        if egress.get("tls_fingerprint"):
+            tls_config["utls"] = {"enabled": True, "fingerprint": egress.get("tls_fingerprint")}
+
+        # REALITY (VLESS only)
+        if egress.get("reality_enabled") and protocol == "vless":
+            tls_config["reality"] = {
+                "enabled": True,
+                "public_key": egress.get("reality_public_key"),
+                "short_id": egress.get("reality_short_id")
+            }
+
+        outbound["tls"] = tls_config
+
+    # Transport configuration
+    transport_type = egress.get("transport_type", "tcp")
+    transport_config = egress.get("transport_config")
+    if transport_type and transport_type != "tcp":
+        transport = {"type": transport_type}
+        if transport_config:
+            if isinstance(transport_config, str):
+                import json
+                transport_config = json.loads(transport_config)
+            transport.update(transport_config)
+        outbound["transport"] = transport
+
+    # Multiplex
+    if egress.get("multiplex_enabled"):
+        multiplex = {"enabled": True}
+        if egress.get("multiplex_protocol"):
+            multiplex["protocol"] = egress.get("multiplex_protocol")
+        if egress.get("multiplex_max_connections"):
+            multiplex["max_connections"] = egress.get("multiplex_max_connections")
+        if egress.get("multiplex_min_streams"):
+            multiplex["min_streams"] = egress.get("multiplex_min_streams")
+        if egress.get("multiplex_max_streams"):
+            multiplex["max_streams"] = egress.get("multiplex_max_streams")
+        outbound["multiplex"] = multiplex
+
+    return outbound
+
+
+def ensure_v2ray_egress_outbounds(config: dict, v2ray_egress: List[dict]) -> List[str]:
+    """确保每个 V2Ray 出口都有对应的 outbound
+
+    Returns:
+        所有 V2Ray 出口的 tag 列表
+    """
+    if not v2ray_egress:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    v2ray_tags = []
+
+    for egress in v2ray_egress:
+        tag = egress.get("tag")
+        if not tag:
+            continue
+
+        v2ray_tags.append(tag)
+        outbound = _build_v2ray_outbound(egress)
+
+        if tag in existing_tags:
+            # Update existing
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = outbound
+                    break
+        else:
+            # Insert before block
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+            print(f"[render] 创建 V2Ray 出口 ({egress.get('protocol')}): {tag}")
+
+    return v2ray_tags
+
+
+def ensure_v2ray_dns_servers(config: dict, v2ray_tags: List[str]) -> None:
+    """为 V2Ray 出口添加 DNS 服务器"""
+    if not v2ray_tags:
+        return
+
+    dns = config.setdefault("dns", {})
+    servers = dns.setdefault("servers", [])
+    existing_tags = {s.get("tag") for s in servers}
+
+    for tag in v2ray_tags:
+        dns_tag = f"{tag}-dns"
+        if dns_tag not in existing_tags:
+            servers.append({
+                "tag": dns_tag,
+                "type": "tls",
+                "server": "1.1.1.1",
+                "detour": tag
+            })
+
+
+# ============ V2Ray Inbound 支持 ============
+
+
+def load_v2ray_inbound_config() -> Optional[dict]:
+    """从数据库加载 V2Ray 入口配置"""
+    if not HAS_DATABASE:
+        return None
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        config = db.get_v2ray_inbound_config()
+        if not config or not config.get("enabled"):
+            return None
+
+        users = db.get_v2ray_users(enabled_only=True)
+        if not users:
+            print("[render] 警告: V2Ray 入口没有配置用户")
+            return None
+
+        return {"config": config, "users": users}
+    except Exception as e:
+        print(f"[render] 从数据库加载 V2Ray 入口配置失败: {e}")
+        return None
+
+
+def ensure_v2ray_inbound(config: dict) -> bool:
+    """确保 V2Ray 入口存在
+
+    注意: 当启用 Xray 模式（V2Ray 入口配置已启用）时，
+    V2Ray 流量由独立的 Xray 进程处理，不需要在 sing-box 中创建 inbound。
+    Xray 通过 TUN 设备将解密后的流量发送到 sing-box 的 TPROXY 入口。
+
+    Returns:
+        True if V2Ray inbound was created, False otherwise
+    """
+    v2ray_config = load_v2ray_inbound_config()
+    if not v2ray_config:
+        return False
+
+    cfg = v2ray_config["config"]
+
+    # 当 V2Ray 入口启用时，Xray 进程会处理 V2Ray 流量
+    # 不需要在 sing-box 中创建 V2Ray inbound
+    # Xray 解密后的流量通过 TUN + TPROXY 进入 sing-box
+    if cfg.get("enabled"):
+        print(f"[render] V2Ray 入口由 Xray 进程处理 (TUN + TPROXY 模式)")
+        # 移除任何旧的 v2ray-in inbound
+        inbounds = config.setdefault("inbounds", [])
+        inbounds[:] = [ib for ib in inbounds if ib.get("tag") != "v2ray-in"]
+        return False
+
+    # 以下是旧的 sing-box 内置 V2Ray 支持（保留供参考但不再使用）
+    inbounds = config.setdefault("inbounds", [])
+    users = v2ray_config["users"]
+    protocol = cfg.get("protocol")
+
+    # Build users list
+    users_config = []
+    for user in users:
+        user_cfg = {"name": user.get("name")}
+        if protocol in ("vmess", "vless"):
+            user_cfg["uuid"] = user.get("uuid")
+        elif protocol == "trojan":
+            user_cfg["password"] = user.get("password")
+        if protocol == "vmess" and user.get("alter_id"):
+            user_cfg["alter_id"] = user.get("alter_id")
+        if protocol == "vless" and user.get("flow"):
+            user_cfg["flow"] = user.get("flow")
+        users_config.append(user_cfg)
+
+    inbound = {
+        "type": protocol,
+        "tag": "v2ray-in",
+        "listen": cfg.get("listen_address", "0.0.0.0"),
+        "listen_port": cfg.get("listen_port", 443),
+        "users": users_config
+    }
+
+    # TLS
+    if cfg.get("tls_enabled"):
+        tls = {"enabled": True}
+        if cfg.get("tls_cert_content"):
+            tls["certificate"] = cfg.get("tls_cert_content")
+            tls["key"] = cfg.get("tls_key_content")
+        elif cfg.get("tls_cert_path"):
+            tls["certificate_path"] = cfg.get("tls_cert_path")
+            tls["key_path"] = cfg.get("tls_key_path")
+        inbound["tls"] = tls
+
+    # Transport
+    transport_type = cfg.get("transport_type", "tcp")
+    if transport_type != "tcp":
+        transport = {"type": transport_type}
+        transport_config = cfg.get("transport_config")
+        if transport_config:
+            if isinstance(transport_config, str):
+                import json
+                transport_config = json.loads(transport_config)
+            transport.update(transport_config)
+        inbound["transport"] = transport
+
+    # VLESS fallback
+    if protocol == "vless" and cfg.get("fallback_server"):
+        inbound["fallback"] = {
+            "server": cfg.get("fallback_server"),
+            "server_port": cfg.get("fallback_port", 80)
+        }
+
+    # Remove old v2ray-in
+    inbounds[:] = [ib for ib in inbounds if ib.get("tag") != "v2ray-in"]
+    inbounds.insert(0, inbound)
+
+    print(f"[render] 创建 V2Ray 入口: {protocol} (端口 {cfg.get('listen_port')})")
+    return True
+
+
 def cleanup_stale_endpoints(config: dict, valid_tags: List[str]) -> None:
     """移除不再存在于数据库中的旧端点
 
@@ -1056,7 +1353,7 @@ def ensure_log_config(config: dict) -> None:
     if "timestamp" not in log_config:
         log_config["timestamp"] = True
     if "level" not in log_config:
-        log_config["level"] = "info"
+        log_config["level"] = "debug"  # 临时调试
 
 
 def ensure_required_outbounds(config: dict) -> None:
@@ -1076,10 +1373,52 @@ def ensure_required_outbounds(config: dict) -> None:
             print(f"[render] 已添加缺失的 outbound: {outbound['tag']}")
 
 
-def ensure_speed_test_inbounds(config: dict, wg_tags: List[str]) -> None:
-    """为 WireGuard 出口添加测速用 SOCKS inbound
+def ensure_xray_socks_inbound(config: dict) -> bool:
+    """为 Xray 流量添加 SOCKS5 入口
 
-    每个 WireGuard 出口（PIA + 自定义）都会获得一个专用的 SOCKS inbound，
+    当 V2Ray 入口启用时，Xray 需要一个方式将解密后的流量发送到 sing-box。
+    这个 SOCKS5 入口允许 Xray 使用 SOCKS 协议连接到 sing-box，
+    比 TUN + TPROXY 方式更简单可靠。
+
+    端口: 38001 (固定)
+
+    Returns:
+        True if inbound was added, False otherwise
+    """
+    v2ray_config = load_v2ray_inbound_config()
+    if not v2ray_config:
+        return False
+
+    cfg = v2ray_config.get("config", {})
+    if not cfg.get("enabled"):
+        return False
+
+    inbounds = config.setdefault("inbounds", [])
+
+    # 检查是否已存在
+    for ib in inbounds:
+        if ib.get("tag") == "xray-in":
+            return False
+
+    # 添加 SOCKS5 入口
+    inbound = {
+        "type": "socks",
+        "tag": "xray-in",
+        "listen": "127.0.0.1",
+        "listen_port": 38001,
+        # 启用流量嗅探以支持域名路由
+        "sniff": True,
+        "sniff_override_destination": False
+    }
+    inbounds.append(inbound)
+    print("[render] 已添加 Xray SOCKS 入口 (127.0.0.1:38001, sniff=true)")
+    return True
+
+
+def ensure_speed_test_inbounds(config: dict, egress_tags: List[str]) -> None:
+    """为 WireGuard/V2Ray 出口添加测速用 SOCKS inbound
+
+    每个出口（PIA WireGuard + 自定义 WireGuard + V2Ray）都会获得一个专用的 SOCKS inbound，
     用于测速时强制流量通过该出口。
 
     端口映射:
@@ -1089,9 +1428,9 @@ def ensure_speed_test_inbounds(config: dict, wg_tags: List[str]) -> None:
 
     Args:
         config: sing-box 配置
-        wg_tags: WireGuard 出口 tag 列表
+        egress_tags: 出口 tag 列表 (WireGuard + V2Ray)
     """
-    if not wg_tags:
+    if not egress_tags:
         return
 
     inbounds = config.setdefault("inbounds", [])
@@ -1104,7 +1443,7 @@ def ensure_speed_test_inbounds(config: dict, wg_tags: List[str]) -> None:
     base_port = 39001  # 测速 SOCKS 端口起始
     added_count = 0
 
-    for i, tag in enumerate(sorted(wg_tags)):
+    for i, tag in enumerate(sorted(egress_tags)):
         socks_port = base_port + i
         inbound_tag = f"speedtest-{tag}"
 
@@ -1132,7 +1471,7 @@ def ensure_speed_test_inbounds(config: dict, wg_tags: List[str]) -> None:
         added_count += 1
 
     if added_count > 0:
-        print(f"[render] 已添加 {added_count} 个测速 SOCKS inbound (端口 {base_port}-{base_port + len(wg_tags) - 1})")
+        print(f"[render] 已添加 {added_count} 个测速 SOCKS inbound (端口 {base_port}-{base_port + len(egress_tags) - 1})")
 
 
 def main() -> None:
@@ -1149,6 +1488,14 @@ def main() -> None:
     # 确保 TPROXY 入口存在（接收内核 WireGuard 转发流量）
     if ensure_tproxy_inbound(config):
         print("[render] TPROXY 入口已配置 (内核 WireGuard 模式)")
+
+    # 确保 V2Ray 入口存在（如果配置启用）
+    if ensure_v2ray_inbound(config):
+        pass  # 日志已在函数内打印
+
+    # 确保 Xray SOCKS5 入口存在（Xray 通过 SOCKS5 连接 sing-box）
+    # 使用 SOCKS5 代替 WireGuard，避免复杂的路由问题
+    ensure_xray_socks_inbound(config)
 
     # 从数据库加载 PIA profiles
     pia_profiles = load_pia_profiles_from_db()
@@ -1192,16 +1539,26 @@ def main() -> None:
         ensure_openvpn_dns_servers(config, openvpn_tags)
         all_egress_tags.extend(openvpn_tags)
 
-    # 收集 WireGuard 出口 tags（PIA + 自定义 WireGuard，用于测速 SOCKS inbound）
-    wg_tags = []
-    if pia_profiles and pia_profiles.get("profiles"):
-        wg_tags.extend(pia_profiles["profiles"].keys())
-    if custom_egress:
-        wg_tags.extend([e.get("tag") for e in custom_egress if e.get("tag")])
+    # 加载并处理 V2Ray 出口（支持 VMess, VLESS, Trojan）
+    v2ray_egress = load_v2ray_egress()
+    if v2ray_egress:
+        print(f"[render] 处理 {len(v2ray_egress)} 个 V2Ray 出口")
+        v2ray_tags = ensure_v2ray_egress_outbounds(config, v2ray_egress)
+        ensure_v2ray_dns_servers(config, v2ray_tags)
+        all_egress_tags.extend(v2ray_tags)
 
-    # 为 WireGuard 出口添加测速 SOCKS inbound
-    if wg_tags:
-        ensure_speed_test_inbounds(config, wg_tags)
+    # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + V2Ray）
+    speedtest_tags = []
+    if pia_profiles and pia_profiles.get("profiles"):
+        speedtest_tags.extend(pia_profiles["profiles"].keys())
+    if custom_egress:
+        speedtest_tags.extend([e.get("tag") for e in custom_egress if e.get("tag")])
+    if v2ray_egress:
+        speedtest_tags.extend([e.get("tag") for e in v2ray_egress if e.get("tag") and e.get("enabled", 1)])
+
+    # 为 WireGuard/V2Ray 出口添加测速 SOCKS inbound
+    if speedtest_tags:
+        ensure_speed_test_inbounds(config, speedtest_tags)
 
     # 清理不再存在于数据库中的旧端点
     cleanup_stale_endpoints(config, all_egress_tags)

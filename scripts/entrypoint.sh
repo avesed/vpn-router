@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cleanup() {
+  if [ -n "${XRAY_MGR_PID:-}" ] && kill -0 "${XRAY_MGR_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping Xray manager (PID ${XRAY_MGR_PID})"
+    kill "${XRAY_MGR_PID}" >/dev/null 2>&1 || true
+  fi
   if [ -n "${OPENVPN_MGR_PID:-}" ] && kill -0 "${OPENVPN_MGR_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping OpenVPN manager (PID ${OPENVPN_MGR_PID})"
     kill "${OPENVPN_MGR_PID}" >/dev/null 2>&1 || true
@@ -18,6 +22,7 @@ trap cleanup EXIT
 API_PID=""
 NGINX_PID=""
 OPENVPN_MGR_PID=""
+XRAY_MGR_PID=""
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
@@ -207,6 +212,86 @@ print(len(db.get_openvpn_egress_list(enabled_only=True)))
   fi
 }
 
+# === Xray TUN + TPROXY Setup ===
+# Xray for V2Ray ingress uses TUN interface similar to WireGuard
+
+XRAY_INTERFACE="${XRAY_INTERFACE:-xray-tun0}"
+XRAY_SUBNET="${XRAY_SUBNET:-10.24.0.0/24}"
+
+setup_xray_tproxy() {
+  # Get Xray TUN configuration from database
+  local xray_config
+  xray_config=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+import os
+import json
+db = get_db(
+    os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
+    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+)
+config = db.get_v2ray_inbound_config()
+if config and config.get('enabled'):
+    print(json.dumps({
+        'enabled': True,
+        'tun_device': config.get('tun_device', 'xray-tun0'),
+        'tun_subnet': config.get('tun_subnet', '10.24.0.0/24')
+    }))
+else:
+    print(json.dumps({'enabled': False}))
+" 2>/dev/null || echo '{"enabled": false}')
+
+  local enabled
+  enabled=$(echo "${xray_config}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('enabled', False))")
+
+  if [ "${enabled}" != "True" ]; then
+    echo "[entrypoint] Xray V2Ray ingress is disabled, skipping TPROXY setup"
+    return 0
+  fi
+
+  XRAY_INTERFACE=$(echo "${xray_config}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('tun_device', 'xray-tun0'))")
+  XRAY_SUBNET=$(echo "${xray_config}" | python3 -c "import sys, json; print(json.load(sys.stdin).get('tun_subnet', '10.24.0.0/24'))")
+
+  echo "[entrypoint] setting up TPROXY routing for Xray traffic"
+  echo "[entrypoint] Xray TUN interface: ${XRAY_INTERFACE}, subnet: ${XRAY_SUBNET}"
+
+  # Skip traffic to Xray server subnet (local subnet)
+  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN 2>/dev/null || true
+
+  # TPROXY TCP traffic from Xray TUN interface to sing-box
+  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
+
+  # TPROXY UDP traffic from Xray TUN interface to sing-box
+  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p udp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
+
+  echo "[entrypoint] Xray TPROXY configured: ${XRAY_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
+}
+
+start_xray_manager() {
+  # 检查 V2Ray 入口是否启用
+  local enabled
+  enabled=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+config = db.get_v2ray_inbound_config()
+print('1' if config and config.get('enabled') else '0')
+" 2>/dev/null || echo "0")
+
+  if [ "${enabled}" = "1" ]; then
+    echo "[entrypoint] starting Xray manager for V2Ray ingress"
+    python3 /usr/local/bin/xray_manager.py daemon >/var/log/xray-manager.log 2>&1 &
+    XRAY_MGR_PID=$!
+    echo "[entrypoint] Xray manager started with PID ${XRAY_MGR_PID}"
+  else
+    echo "[entrypoint] V2Ray ingress not enabled, skipping Xray manager"
+  fi
+}
+
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
 
@@ -265,6 +350,7 @@ CONFIG_PATH="${GENERATED_CONFIG_PATH}"
 start_api_server
 start_nginx
 start_openvpn_manager
+start_xray_manager
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -303,6 +389,9 @@ start_singbox "${CONFIG_PATH}"
 
 # Setup TPROXY routing for WireGuard traffic (no need to wait for sing-box)
 setup_tproxy_routing
+
+# Setup TPROXY routing for Xray V2Ray ingress traffic
+setup_xray_tproxy
 
 # Log rotation configuration
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"  # 10 MB default
@@ -368,6 +457,12 @@ while true; do
   if [ -n "${OPENVPN_MGR_PID}" ] && ! kill -0 "${OPENVPN_MGR_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: OpenVPN manager died, restarting..." >&2
     start_openvpn_manager
+  fi
+
+  # Check Xray manager
+  if [ -n "${XRAY_MGR_PID}" ] && ! kill -0 "${XRAY_MGR_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: Xray manager died, restarting..." >&2
+    start_xray_manager
   fi
 
   # Check sing-box

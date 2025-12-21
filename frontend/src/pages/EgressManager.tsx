@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult } from "../types";
+import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult, V2RayEgress, V2RayURIParseResult, V2RayProtocol, V2RayTransport } from "../types";
+import { V2RAY_PROTOCOLS, V2RAY_TRANSPORTS, V2RAY_SECURITY_OPTIONS, V2RAY_TLS_FINGERPRINTS, VLESS_FLOW_OPTIONS } from "../types";
 import {
   PlusIcon,
   TrashIcon,
@@ -25,7 +27,8 @@ import {
   ChartBarIcon
 } from "@heroicons/react/24/outline";
 
-type TabType = "all" | "pia" | "custom" | "direct" | "openvpn";
+type TabType = "all" | "pia" | "custom" | "direct" | "openvpn" | "v2ray";
+type V2RayImportMethod = "uri" | "manual";
 type ImportMethod = "upload" | "paste" | "manual";
 type OpenVPNImportMethod = "upload" | "paste" | "manual";
 
@@ -135,22 +138,53 @@ export default function EgressManager() {
   const [authValidationError, setAuthValidationError] = useState(false);
   const authFieldsRef = useRef<HTMLDivElement>(null);
 
+  // V2Ray egress state
+  const [v2rayEgress, setV2rayEgress] = useState<V2RayEgress[]>([]);
+  const [showV2rayModal, setShowV2rayModal] = useState(false);
+  const [v2rayModalMode, setV2rayModalMode] = useState<"add" | "edit">("add");
+  const [editingV2rayEgress, setEditingV2rayEgress] = useState<V2RayEgress | null>(null);
+  const [v2rayImportMethod, setV2rayImportMethod] = useState<V2RayImportMethod>("uri");
+  const [v2rayUriInput, setV2rayUriInput] = useState("");
+  const [v2rayParsedConfig, setV2rayParsedConfig] = useState<V2RayURIParseResult | null>(null);
+  const [v2rayParseError, setV2rayParseError] = useState<string | null>(null);
+  // V2Ray form fields
+  const [v2rayFormTag, setV2rayFormTag] = useState("");
+  const [v2rayFormDescription, setV2rayFormDescription] = useState("");
+  const [v2rayFormProtocol, setV2rayFormProtocol] = useState<V2RayProtocol>("vless");
+  const [v2rayFormServer, setV2rayFormServer] = useState("");
+  const [v2rayFormPort, setV2rayFormPort] = useState(443);
+  const [v2rayFormUuid, setV2rayFormUuid] = useState("");
+  const [v2rayFormPassword, setV2rayFormPassword] = useState("");
+  const [v2rayFormSecurity, setV2rayFormSecurity] = useState("auto");
+  const [v2rayFormAlterId, setV2rayFormAlterId] = useState(0);
+  const [v2rayFormFlow, setV2rayFormFlow] = useState("");
+  const [v2rayFormTlsEnabled, setV2rayFormTlsEnabled] = useState(true);
+  const [v2rayFormTlsSni, setV2rayFormTlsSni] = useState("");
+  const [v2rayFormTlsFingerprint, setV2rayFormTlsFingerprint] = useState("");
+  const [v2rayFormTlsAllowInsecure, setV2rayFormTlsAllowInsecure] = useState(false);
+  const [v2rayFormTransportType, setV2rayFormTransportType] = useState<V2RayTransport>("tcp");
+  const [v2rayFormTransportPath, setV2rayFormTransportPath] = useState("");
+  const [v2rayFormTransportHost, setV2rayFormTransportHost] = useState("");
+  const [v2rayFormTransportServiceName, setV2rayFormTransportServiceName] = useState("");
+
   const loadEgress = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const [allData, customData, profilesData, directData, openvpnData] = await Promise.all([
+      const [allData, customData, profilesData, directData, openvpnData, v2rayData] = await Promise.all([
         api.getAllEgress(),
         api.getCustomEgress(),
         api.getProfiles(),
         api.getDirectEgress(),
-        api.getOpenVPNEgress()
+        api.getOpenVPNEgress(),
+        api.getV2RayEgress()
       ]);
       setPiaEgress(allData.pia);
       setCustomEgress(customData.egress);
       setPiaProfiles(profilesData.profiles);
       setDirectEgress(directData.egress);
       setOpenvpnEgress(openvpnData.egress);
+      setV2rayEgress(v2rayData.egress);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
@@ -251,6 +285,32 @@ export default function EgressManager() {
     setOpenvpnImportMethod("upload");
     setShowAuthRequiredHint(false);
     setAuthValidationError(false);
+  };
+
+  const resetV2rayForm = () => {
+    setV2rayFormTag("");
+    setV2rayFormDescription("");
+    setV2rayFormProtocol("vless");
+    setV2rayFormServer("");
+    setV2rayFormPort(443);
+    setV2rayFormUuid("");
+    setV2rayFormPassword("");
+    setV2rayFormSecurity("auto");
+    setV2rayFormAlterId(0);
+    setV2rayFormFlow("");
+    setV2rayFormTlsEnabled(true);
+    setV2rayFormTlsSni("");
+    setV2rayFormTlsFingerprint("");
+    setV2rayFormTlsAllowInsecure(false);
+    setV2rayFormTransportType("tcp");
+    setV2rayFormTransportPath("");
+    setV2rayFormTransportHost("");
+    setV2rayFormTransportServiceName("");
+    setV2rayParsedConfig(null);
+    setV2rayUriInput("");
+    setV2rayParseError(null);
+    setEditingV2rayEgress(null);
+    setV2rayImportMethod("uri");
   };
 
   // Close dropdown when clicking outside
@@ -848,11 +908,212 @@ export default function EgressManager() {
     }
   };
 
-  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" ? [] : piaProfiles;
-  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" ? [] : customEgress;
-  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" ? [] : directEgress;
-  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" ? [] : openvpnEgress;
-  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + openvpnEgress.length;
+  // ============ V2Ray Egress Management ============
+
+  const handleAddV2rayEgress = () => {
+    resetV2rayForm();
+    setV2rayModalMode("add");
+    setShowV2rayModal(true);
+  };
+
+  const handleEditV2rayEgress = (egress: V2RayEgress) => {
+    setEditingV2rayEgress(egress);
+    setV2rayFormTag(egress.tag);
+    setV2rayFormDescription(egress.description || "");
+    setV2rayFormProtocol(egress.protocol);
+    setV2rayFormServer(egress.server);
+    setV2rayFormPort(egress.server_port);
+    setV2rayFormUuid(egress.uuid || "");
+    // password is masked as *** by API, don't populate
+    setV2rayFormPassword("");
+    setV2rayFormSecurity(egress.security || "auto");
+    setV2rayFormAlterId(egress.alter_id || 0);
+    setV2rayFormFlow(egress.flow || "");
+    setV2rayFormTlsEnabled(egress.tls_enabled === 1);
+    setV2rayFormTlsSni(egress.tls_sni || "");
+    setV2rayFormTlsFingerprint(egress.tls_fingerprint || "");
+    setV2rayFormTlsAllowInsecure(egress.tls_allow_insecure === 1);
+    setV2rayFormTransportType(egress.transport_type);
+    // Parse transport config if available
+    if (egress.transport_config) {
+      try {
+        const config = typeof egress.transport_config === "string"
+          ? JSON.parse(egress.transport_config)
+          : egress.transport_config;
+        setV2rayFormTransportPath(config.path || "");
+        setV2rayFormTransportHost(config.host || "");
+        setV2rayFormTransportServiceName(config.service_name || "");
+      } catch {
+        // ignore parse errors
+      }
+    }
+    setV2rayModalMode("edit");
+    setShowV2rayModal(true);
+  };
+
+  const parseV2rayUri = async (uri: string) => {
+    try {
+      setV2rayParseError(null);
+      const result = await api.parseV2RayURI(uri);
+      setV2rayParsedConfig(result);
+      // Populate form fields from parsed result
+      if (result.protocol) setV2rayFormProtocol(result.protocol);
+      if (result.server) setV2rayFormServer(result.server);
+      if (result.server_port) setV2rayFormPort(result.server_port);
+      if (result.uuid) setV2rayFormUuid(result.uuid);
+      if (result.password) setV2rayFormPassword(result.password);
+      if (result.security) setV2rayFormSecurity(result.security);
+      if (result.alter_id !== undefined) setV2rayFormAlterId(result.alter_id);
+      if (result.flow) setV2rayFormFlow(result.flow);
+      if (result.tls_enabled !== undefined) setV2rayFormTlsEnabled(result.tls_enabled);
+      if (result.tls_sni) setV2rayFormTlsSni(result.tls_sni);
+      if (result.tls_fingerprint) setV2rayFormTlsFingerprint(result.tls_fingerprint);
+      if (result.tls_allow_insecure !== undefined) setV2rayFormTlsAllowInsecure(result.tls_allow_insecure);
+      if (result.transport_type) setV2rayFormTransportType(result.transport_type);
+      if (result.transport_config?.path) setV2rayFormTransportPath(result.transport_config.path);
+      if (result.transport_config?.host) setV2rayFormTransportHost(result.transport_config.host);
+      if (result.transport_config?.service_name) setV2rayFormTransportServiceName(result.transport_config.service_name);
+      // Generate tag from remark or server
+      if (result.remark) {
+        setV2rayFormTag(result.remark.toLowerCase().replace(/[^a-z0-9-]/g, "-"));
+      } else if (result.server) {
+        setV2rayFormTag(result.server.split(".")[0].toLowerCase().replace(/[^a-z0-9-]/g, "-"));
+      }
+      // Switch to manual mode to show parsed data
+      setV2rayImportMethod("manual");
+      setSuccessMessage(t('v2rayEgress.parseSuccess'));
+      setTimeout(() => setSuccessMessage(null), 2000);
+    } catch (err) {
+      setV2rayParseError(err instanceof Error ? err.message : t('v2rayEgress.parseFailed'));
+    }
+  };
+
+  const handleCreateV2rayEgress = async () => {
+    if (!v2rayFormTag || !v2rayFormServer) {
+      setError(t('v2rayEgress.fillRequiredFields'));
+      return;
+    }
+
+    // Validate auth based on protocol
+    if (v2rayFormProtocol === "trojan" && !v2rayFormPassword) {
+      setError(t('v2rayEgress.passwordRequired'));
+      return;
+    }
+    if ((v2rayFormProtocol === "vmess" || v2rayFormProtocol === "vless") && !v2rayFormUuid) {
+      setError(t('v2rayEgress.uuidRequired'));
+      return;
+    }
+
+    setActionLoading("create-v2ray");
+    try {
+      // Build transport config
+      const transportConfig: Record<string, string> = {};
+      if (v2rayFormTransportPath) transportConfig.path = v2rayFormTransportPath;
+      if (v2rayFormTransportHost) transportConfig.host = v2rayFormTransportHost;
+      if (v2rayFormTransportServiceName) transportConfig.service_name = v2rayFormTransportServiceName;
+
+      await api.createV2RayEgress({
+        tag: v2rayFormTag,
+        description: v2rayFormDescription,
+        protocol: v2rayFormProtocol,
+        server: v2rayFormServer,
+        server_port: v2rayFormPort,
+        uuid: v2rayFormUuid || undefined,
+        password: v2rayFormPassword || undefined,
+        security: v2rayFormSecurity,
+        alter_id: v2rayFormAlterId,
+        flow: v2rayFormFlow || undefined,
+        tls_enabled: v2rayFormTlsEnabled,
+        tls_sni: v2rayFormTlsSni || undefined,
+        tls_fingerprint: v2rayFormTlsFingerprint || undefined,
+        tls_allow_insecure: v2rayFormTlsAllowInsecure,
+        transport_type: v2rayFormTransportType,
+        transport_config: Object.keys(transportConfig).length > 0 ? transportConfig : undefined
+      });
+      setSuccessMessage(t('v2rayEgress.createSuccess', { tag: v2rayFormTag }));
+      setShowV2rayModal(false);
+      resetV2rayForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.createFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleUpdateV2rayEgress = async () => {
+    if (!editingV2rayEgress) return;
+
+    setActionLoading("update-v2ray");
+    try {
+      // Build transport config
+      const transportConfig: Record<string, string> = {};
+      if (v2rayFormTransportPath) transportConfig.path = v2rayFormTransportPath;
+      if (v2rayFormTransportHost) transportConfig.host = v2rayFormTransportHost;
+      if (v2rayFormTransportServiceName) transportConfig.service_name = v2rayFormTransportServiceName;
+
+      await api.updateV2RayEgress(editingV2rayEgress.tag, {
+        description: v2rayFormDescription,
+        protocol: v2rayFormProtocol,
+        server: v2rayFormServer,
+        server_port: v2rayFormPort,
+        uuid: v2rayFormUuid || undefined,
+        password: v2rayFormPassword || undefined,
+        security: v2rayFormSecurity,
+        alter_id: v2rayFormAlterId,
+        flow: v2rayFormFlow || undefined,
+        tls_enabled: v2rayFormTlsEnabled,
+        tls_sni: v2rayFormTlsSni || undefined,
+        tls_fingerprint: v2rayFormTlsFingerprint || undefined,
+        tls_allow_insecure: v2rayFormTlsAllowInsecure,
+        transport_type: v2rayFormTransportType,
+        transport_config: Object.keys(transportConfig).length > 0 ? transportConfig : undefined
+      });
+      setSuccessMessage(t('v2rayEgress.updateSuccess', { tag: editingV2rayEgress.tag }));
+      setShowV2rayModal(false);
+      resetV2rayForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.updateFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDeleteV2rayEgress = async (tag: string) => {
+    if (!confirm(t('v2rayEgress.confirmDelete', { tag }))) return;
+
+    setActionLoading(`delete-v2ray-${tag}`);
+    try {
+      await api.deleteV2RayEgress(tag);
+      setSuccessMessage(t('v2rayEgress.deleteSuccess', { tag }));
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.deleteFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const getV2rayProtocolLabel = (protocol: V2RayProtocol) => {
+    const p = V2RAY_PROTOCOLS.find(p => p.value === protocol);
+    return p ? p.label : protocol.toUpperCase();
+  };
+
+  const getV2rayTransportLabel = (transport: V2RayTransport) => {
+    const t = V2RAY_TRANSPORTS.find(t => t.value === transport);
+    return t ? t.label : transport.toUpperCase();
+  };
+
+  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : piaProfiles;
+  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : customEgress;
+  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : directEgress;
+  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "v2ray" ? [] : openvpnEgress;
+  const filteredV2ray = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" ? [] : v2rayEgress;
+  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + openvpnEgress.length + v2rayEgress.length;
 
   if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length && !openvpnEgress.length) {
     return (
@@ -899,9 +1160,10 @@ export default function EgressManager() {
       )}
 
       {/* Login Modal */}
-      {showLoginModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
+      {showLoginModal && createPortal(
+        <div className="fixed inset-0 bg-black/60 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
             <div className="flex items-center gap-3 mb-6">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand/20">
                 <KeyIcon className="h-5 w-5 text-brand" />
@@ -955,8 +1217,10 @@ export default function EgressManager() {
                 {t('common.cancel')}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Tabs */}
@@ -966,7 +1230,8 @@ export default function EgressManager() {
           { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
           { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` },
           { key: "direct", label: `${t('egress.direct')} (${directEgress.length})` },
-          { key: "openvpn", label: `${t('egress.openvpn')} (${openvpnEgress.length})` }
+          { key: "openvpn", label: `${t('egress.openvpn')} (${openvpnEgress.length})` },
+          { key: "v2ray", label: `V2Ray (${v2rayEgress.length})` }
         ].map((tab) => (
           <button
             key={tab.key}
@@ -983,11 +1248,11 @@ export default function EgressManager() {
       </div>
 
       {/* Egress List */}
-      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 ? (
+      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 ? (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "direct" ? t('directEgress.noDirectEgress') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : t('egress.noEgressFound')}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "direct" ? t('directEgress.noDirectEgress') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : t('egress.noEgressFound')}
           </p>
           {activeTab !== "all" && (
             <div className="mt-4">
@@ -1021,6 +1286,14 @@ export default function EgressManager() {
                   className="px-4 py-2 rounded-lg bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium"
                 >
                   {t('openvpnEgress.addOpenvpnEgress')}
+                </button>
+              )}
+              {activeTab === "v2ray" && (
+                <button
+                  onClick={handleAddV2rayEgress}
+                  className="px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm font-medium"
+                >
+                  {t('v2rayEgress.addV2rayEgress')}
                 </button>
               )}
             </div>
@@ -1498,13 +1771,127 @@ export default function EgressManager() {
             </div>
           )}
 
+          {/* V2Ray Egress */}
+          {filteredV2ray.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
+                  <ServerIcon className="h-4 w-4" />
+                  V2Ray ({filteredV2ray.length})
+                </h3>
+                {activeTab === "v2ray" && (
+                  <button
+                    onClick={handleAddV2rayEgress}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-violet-500/20 hover:bg-violet-500/30 text-violet-400 text-xs font-medium transition-colors"
+                  >
+                    <PlusIcon className="h-3.5 w-3.5" />
+                    {t('v2rayEgress.addEgress')}
+                  </button>
+                )}
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {filteredV2ray.map((egress) => (
+                  <div
+                    key={egress.tag}
+                    className={`rounded-xl border p-4 ${egress.enabled ? "bg-violet-500/5 border-violet-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className={`p-2 rounded-lg ${egress.enabled ? "bg-violet-500/20" : "bg-white/10"}`}>
+                          <ServerIcon className={`h-5 w-5 ${egress.enabled ? "text-violet-400" : "text-slate-400"}`} />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-semibold text-white">{egress.tag}</h4>
+                            {egress.enabled ? (
+                              <CheckCircleIcon className="h-4 w-4 text-violet-400" />
+                            ) : (
+                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                            )}
+                          </div>
+                          <p className="text-xs text-slate-500">{egress.description || t('v2rayEgress.defaultDescription')}</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-1 flex-shrink-0">
+                        <button
+                          onClick={() => handleEditV2rayEgress(egress)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                          title={t('common.edit')}
+                        >
+                          <PencilIcon className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteV2rayEgress(egress.tag)}
+                          disabled={actionLoading === `delete-v2ray-${egress.tag}`}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
+                          title={t('common.delete')}
+                        >
+                          <TrashIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('v2rayEgress.protocol')}:</span> {getV2rayProtocolLabel(egress.protocol)}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('v2rayEgress.server')}:</span> {egress.server}:{egress.server_port}
+                      </p>
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('v2rayEgress.transport')}:</span> {getV2rayTransportLabel(egress.transport_type)}
+                        {egress.tls_enabled === 1 && " + TLS"}
+                      </p>
+                    </div>
+
+                    <div className="mt-3">
+                      <button
+                        onClick={() => handleSpeedTest(egress.tag)}
+                        disabled={speedTestStatus[egress.tag]?.loading}
+                        className={`w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                          speedTestStatus[egress.tag]?.result
+                            ? speedTestStatus[egress.tag].result?.success
+                              ? "bg-emerald-500/20 text-emerald-400"
+                              : "bg-red-500/20 text-red-400"
+                            : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {speedTestStatus[egress.tag]?.loading ? (
+                          <>
+                            <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                            {t('egress.speedTesting')}
+                          </>
+                        ) : speedTestStatus[egress.tag]?.result ? (
+                          <>
+                            {speedTestStatus[egress.tag].result?.success ? (
+                              <CheckCircleIcon className="h-3.5 w-3.5" />
+                            ) : (
+                              <XCircleIcon className="h-3.5 w-3.5" />
+                            )}
+                            {speedTestStatus[egress.tag].result?.message}
+                          </>
+                        ) : (
+                          <>
+                            <ChartBarIcon className="h-3.5 w-3.5" />
+                            {t('egress.speedTest')}
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
         </div>
       )}
 
       {/* PIA Modal */}
-      {showPiaModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg m-4">
+      {showPiaModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">
@@ -1667,14 +2054,17 @@ export default function EgressManager() {
                 {piaModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Add Custom Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl m-4">
+      {showAddModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">{t('egress.addCustomEgress')}</h2>
@@ -1920,14 +2310,17 @@ export default function EgressManager() {
                 {t('common.add')}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Edit Custom Modal */}
-      {showEditModal && editingEgress && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl m-4">
+      {showEditModal && editingEgress && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">{t('customEgress.editTitle', { tag: editingEgress.tag })}</h2>
@@ -2062,14 +2455,17 @@ export default function EgressManager() {
                 {t('common.save')}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Direct Egress Modal */}
-      {showDirectModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg m-4">
+      {showDirectModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">
@@ -2190,14 +2586,17 @@ export default function EgressManager() {
                 {directModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* OpenVPN Modal */}
-      {showOpenvpnModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl m-4">
+      {showOpenvpnModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">
@@ -2587,8 +2986,450 @@ export default function EgressManager() {
                 {openvpnModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
+      )}
+
+      {/* V2Ray Modal */}
+      {showV2rayModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl">
+            <div className="p-6 border-b border-white/10">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold text-white">
+                  {v2rayModalMode === "add" ? t('v2rayEgress.addV2rayEgress') : t('v2rayEgress.editV2rayEgress', { tag: editingV2rayEgress?.tag })}
+                </h2>
+                <button
+                  onClick={() => {
+                    setShowV2rayModal(false);
+                    resetV2rayForm();
+                  }}
+                  className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                >
+                  <XMarkIcon className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 max-h-[70vh] overflow-y-auto space-y-6">
+              {/* Import Method Tabs (only for add mode) */}
+              {v2rayModalMode === "add" && (
+                <div className="flex gap-2 mb-4">
+                  <button
+                    onClick={() => setV2rayImportMethod("uri")}
+                    className={`px-4 py-2 text-sm rounded-lg transition-colors ${
+                      v2rayImportMethod === "uri"
+                        ? "bg-violet-500 text-white"
+                        : "bg-white/5 text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    {t('v2rayEgress.importUri')}
+                  </button>
+                  <button
+                    onClick={() => setV2rayImportMethod("manual")}
+                    className={`px-4 py-2 text-sm rounded-lg transition-colors ${
+                      v2rayImportMethod === "manual"
+                        ? "bg-violet-500 text-white"
+                        : "bg-white/5 text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    {t('v2rayEgress.manualConfig')}
+                  </button>
+                </div>
+              )}
+
+              {/* URI Import */}
+              {v2rayModalMode === "add" && v2rayImportMethod === "uri" && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">
+                      {t('v2rayEgress.pasteUri')}
+                    </label>
+                    <textarea
+                      value={v2rayUriInput}
+                      onChange={(e) => setV2rayUriInput(e.target.value)}
+                      placeholder="vmess://... 或 vless://... 或 trojan://..."
+                      className="w-full h-32 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 font-mono text-sm resize-none"
+                    />
+                  </div>
+                  {v2rayParseError && (
+                    <div className="flex items-center gap-2 text-red-400 text-sm">
+                      <ExclamationTriangleIcon className="h-4 w-4" />
+                      {v2rayParseError}
+                    </div>
+                  )}
+                  <button
+                    onClick={() => parseV2rayUri(v2rayUriInput)}
+                    disabled={!v2rayUriInput.trim()}
+                    className="px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm font-medium disabled:opacity-50"
+                  >
+                    {t('v2rayEgress.parseUri')}
+                  </button>
+                </div>
+              )}
+
+              {/* Manual Configuration */}
+              {(v2rayModalMode === "edit" || v2rayImportMethod === "manual") && (
+                <div className="space-y-4">
+                  {/* Basic Info */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('v2rayEgress.tag')} <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={v2rayFormTag}
+                        onChange={(e) => setV2rayFormTag(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))}
+                        placeholder={t('v2rayEgress.tagPlaceholder')}
+                        disabled={v2rayModalMode === "edit"}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('common.description')}
+                      </label>
+                      <input
+                        type="text"
+                        value={v2rayFormDescription}
+                        onChange={(e) => setV2rayFormDescription(e.target.value)}
+                        placeholder={t('v2rayEgress.descriptionPlaceholder')}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Protocol Selection */}
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">
+                      {t('v2rayEgress.protocol')} <span className="text-red-400">*</span>
+                    </label>
+                    <div className="flex gap-2">
+                      {V2RAY_PROTOCOLS.map((p) => (
+                        <button
+                          key={p.value}
+                          onClick={() => setV2rayFormProtocol(p.value)}
+                          className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                            v2rayFormProtocol === p.value
+                              ? "bg-violet-500 text-white"
+                              : "bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
+                          }`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Server Settings */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('v2rayEgress.server')} <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={v2rayFormServer}
+                        onChange={(e) => setV2rayFormServer(e.target.value)}
+                        placeholder="example.com"
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('v2rayEgress.port')}
+                      </label>
+                      <input
+                        type="number"
+                        value={v2rayFormPort}
+                        onChange={(e) => setV2rayFormPort(parseInt(e.target.value) || 443)}
+                        min={1}
+                        max={65535}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Authentication (based on protocol) */}
+                  {(v2rayFormProtocol === "vmess" || v2rayFormProtocol === "vless") && (
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        UUID <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={v2rayFormUuid}
+                        onChange={(e) => setV2rayFormUuid(e.target.value)}
+                        placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 font-mono text-sm"
+                      />
+                    </div>
+                  )}
+
+                  {v2rayFormProtocol === "trojan" && (
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t('v2rayEgress.password')} <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="password"
+                        value={v2rayFormPassword}
+                        onChange={(e) => setV2rayFormPassword(e.target.value)}
+                        placeholder={v2rayModalMode === "edit" ? t('v2rayEgress.passwordPlaceholder') : ""}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                      />
+                    </div>
+                  )}
+
+                  {/* VMess specific options */}
+                  {v2rayFormProtocol === "vmess" && (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm font-medium text-slate-400 mb-2">
+                          {t('v2rayEgress.security')}
+                        </label>
+                        <select
+                          value={v2rayFormSecurity}
+                          onChange={(e) => setV2rayFormSecurity(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500"
+                        >
+                          {V2RAY_SECURITY_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-slate-400 mb-2">
+                          Alter ID
+                        </label>
+                        <input
+                          type="number"
+                          value={v2rayFormAlterId}
+                          onChange={(e) => setV2rayFormAlterId(parseInt(e.target.value) || 0)}
+                          min={0}
+                          className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* VLESS specific options */}
+                  {v2rayFormProtocol === "vless" && (
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        Flow ({t('v2rayEgress.optional')})
+                      </label>
+                      <select
+                        value={v2rayFormFlow}
+                        onChange={(e) => setV2rayFormFlow(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500"
+                      >
+                        {VLESS_FLOW_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-slate-500 mt-1">{t('v2rayEgress.flowHint')}</p>
+                    </div>
+                  )}
+
+                  {/* TLS Settings */}
+                  <div className="border-t border-white/10 pt-4">
+                    <div className="flex items-center gap-3 mb-4">
+                      <input
+                        type="checkbox"
+                        id="v2ray-tls-enabled"
+                        checked={v2rayFormTlsEnabled}
+                        onChange={(e) => setV2rayFormTlsEnabled(e.target.checked)}
+                        className="w-4 h-4 rounded border-white/20 bg-white/5 text-violet-500 focus:ring-violet-500"
+                      />
+                      <label htmlFor="v2ray-tls-enabled" className="text-sm font-medium text-white">
+                        {t('v2rayEgress.enableTls')}
+                      </label>
+                    </div>
+
+                    {v2rayFormTlsEnabled && (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-slate-400 mb-2">
+                            SNI ({t('v2rayEgress.optional')})
+                          </label>
+                          <input
+                            type="text"
+                            value={v2rayFormTlsSni}
+                            onChange={(e) => setV2rayFormTlsSni(e.target.value)}
+                            placeholder={v2rayFormServer || "example.com"}
+                            className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-slate-400 mb-2">
+                            {t('v2rayEgress.fingerprint')}
+                          </label>
+                          <select
+                            value={v2rayFormTlsFingerprint}
+                            onChange={(e) => setV2rayFormTlsFingerprint(e.target.value)}
+                            className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500"
+                          >
+                            {V2RAY_TLS_FINGERPRINTS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="col-span-2 flex items-center gap-3">
+                          <input
+                            type="checkbox"
+                            id="v2ray-tls-insecure"
+                            checked={v2rayFormTlsAllowInsecure}
+                            onChange={(e) => setV2rayFormTlsAllowInsecure(e.target.checked)}
+                            className="w-4 h-4 rounded border-white/20 bg-white/5 text-violet-500 focus:ring-violet-500"
+                          />
+                          <label htmlFor="v2ray-tls-insecure" className="text-sm text-slate-400">
+                            {t('v2rayEgress.allowInsecure')}
+                          </label>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Transport Settings */}
+                  <div className="border-t border-white/10 pt-4">
+                    <label className="block text-sm font-medium text-slate-400 mb-2">
+                      {t('v2rayEgress.transport')}
+                    </label>
+                    <div className="flex flex-wrap gap-2 mb-4">
+                      {V2RAY_TRANSPORTS.map((t) => (
+                        <button
+                          key={t.value}
+                          onClick={() => setV2rayFormTransportType(t.value)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                            v2rayFormTransportType === t.value
+                              ? "bg-violet-500 text-white"
+                              : "bg-white/5 text-slate-400 hover:text-white hover:bg-white/10"
+                          }`}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Transport-specific options */}
+                    {(v2rayFormTransportType === "ws" || v2rayFormTransportType === "httpupgrade") && (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-slate-400 mb-2">
+                            Path
+                          </label>
+                          <input
+                            type="text"
+                            value={v2rayFormTransportPath}
+                            onChange={(e) => setV2rayFormTransportPath(e.target.value)}
+                            placeholder="/"
+                            className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-slate-400 mb-2">
+                            Host
+                          </label>
+                          <input
+                            type="text"
+                            value={v2rayFormTransportHost}
+                            onChange={(e) => setV2rayFormTransportHost(e.target.value)}
+                            placeholder={v2rayFormServer}
+                            className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {v2rayFormTransportType === "grpc" && (
+                      <div>
+                        <label className="block text-sm font-medium text-slate-400 mb-2">
+                          Service Name
+                        </label>
+                        <input
+                          type="text"
+                          value={v2rayFormTransportServiceName}
+                          onChange={(e) => setV2rayFormTransportServiceName(e.target.value)}
+                          placeholder="grpc"
+                          className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                        />
+                      </div>
+                    )}
+
+                    {v2rayFormTransportType === "h2" && (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-slate-400 mb-2">
+                            Path
+                          </label>
+                          <input
+                            type="text"
+                            value={v2rayFormTransportPath}
+                            onChange={(e) => setV2rayFormTransportPath(e.target.value)}
+                            placeholder="/"
+                            className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-slate-400 mb-2">
+                            Host
+                          </label>
+                          <input
+                            type="text"
+                            value={v2rayFormTransportHost}
+                            onChange={(e) => setV2rayFormTransportHost(e.target.value)}
+                            placeholder={v2rayFormServer}
+                            className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowV2rayModal(false);
+                  resetV2rayForm();
+                }}
+                className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm transition-colors"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={() => v2rayModalMode === "add" ? handleCreateV2rayEgress() : handleUpdateV2rayEgress()}
+                disabled={
+                  (v2rayModalMode === "add" ? actionLoading === "create-v2ray" : actionLoading === "update-v2ray") ||
+                  (v2rayModalMode === "add" && !v2rayFormTag) ||
+                  !v2rayFormServer ||
+                  ((v2rayFormProtocol === "vmess" || v2rayFormProtocol === "vless") && !v2rayFormUuid) ||
+                  (v2rayFormProtocol === "trojan" && !v2rayFormPassword && v2rayModalMode === "add")
+                }
+                className="px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+              >
+                {(actionLoading === "create-v2ray" || actionLoading === "update-v2ray") ? (
+                  <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                ) : v2rayModalMode === "add" ? (
+                  <PlusIcon className="h-4 w-4" />
+                ) : (
+                  <CheckIcon className="h-4 w-4" />
+                )}
+                {v2rayModalMode === "add" ? t('common.add') : t('common.save')}
+              </button>
+            </div>
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
     </div>
   );

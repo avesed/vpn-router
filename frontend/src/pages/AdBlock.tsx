@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { AdBlockRuleSet, AdBlockRuleSetCreateRequest } from "../types";
@@ -394,9 +395,10 @@ export default function AdBlock() {
       )}
 
       {/* Add Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg m-4">
+      {showAddModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">{t("adblock.addRule")}</h2>
@@ -531,14 +533,17 @@ export default function AdBlock() {
                 {t("common.add")}
               </button>
             </div>
+            </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Edit Modal */}
-      {showEditModal && editingRule && (
-        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg m-4">
+      {showEditModal && editingRule && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
             <div className="p-6 border-b border-white/10">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-white">{t("adblock.editRule")}</h2>
@@ -668,7 +673,9 @@ export default function AdBlock() {
               </button>
             </div>
           </div>
-        </div>
+          </div>
+        </div>,
+        document.body
       )}
     </div>
   );

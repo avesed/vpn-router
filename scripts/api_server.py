@@ -48,6 +48,13 @@ except ImportError:
     HAS_DATABASE = False
     print("WARNING: Database helper not available, falling back to JSON storage")
 
+try:
+    from v2ray_uri_parser import parse_v2ray_uri, generate_vmess_uri, generate_vless_uri, generate_trojan_uri
+    HAS_V2RAY_PARSER = True
+except ImportError:
+    HAS_V2RAY_PARSER = False
+    print("WARNING: V2Ray URI parser not available")
+
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
 GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = Path(os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db"))
@@ -392,6 +399,129 @@ class BackupImportRequest(BaseModel):
     merge_mode: str = Field("replace", description="合并模式: replace(替换) 或 merge(合并)")
 
 
+# ============ V2Ray Egress/Inbound Models ============
+
+class V2RayEgressCreateRequest(BaseModel):
+    """创建 V2Ray 出口 (VMess/VLESS/Trojan)"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    description: str = Field("", description="描述")
+    protocol: str = Field(..., description="协议 (vmess/vless/trojan)")
+    server: str = Field(..., description="服务器地址")
+    server_port: int = Field(443, ge=1, le=65535, description="服务器端口")
+    # Auth
+    uuid: Optional[str] = Field(None, description="UUID (VMess/VLESS)")
+    password: Optional[str] = Field(None, description="密码 (Trojan)")
+    # VMess specific
+    security: str = Field("auto", description="VMess 加密方式")
+    alter_id: int = Field(0, ge=0, description="VMess alterId")
+    # VLESS specific
+    flow: Optional[str] = Field(None, description="VLESS flow (xtls-rprx-vision)")
+    # TLS
+    tls_enabled: bool = Field(True, description="启用 TLS")
+    tls_sni: Optional[str] = Field(None, description="TLS SNI")
+    tls_alpn: Optional[List[str]] = Field(None, description="TLS ALPN")
+    tls_allow_insecure: bool = Field(False, description="允许不安全证书")
+    tls_fingerprint: Optional[str] = Field(None, description="uTLS 指纹")
+    # REALITY
+    reality_enabled: bool = Field(False, description="启用 REALITY")
+    reality_public_key: Optional[str] = Field(None, description="REALITY 公钥")
+    reality_short_id: Optional[str] = Field(None, description="REALITY short ID")
+    # Transport
+    transport_type: str = Field("tcp", description="传输类型 (tcp/ws/grpc/h2/quic/httpupgrade)")
+    transport_config: Optional[Dict[str, Any]] = Field(None, description="传输配置 (JSON)")
+    # Multiplex
+    multiplex_enabled: bool = Field(False, description="启用多路复用")
+    multiplex_protocol: Optional[str] = Field(None, description="多路复用协议 (smux/yamux/h2mux)")
+    multiplex_max_connections: Optional[int] = Field(None, description="最大连接数")
+    multiplex_min_streams: Optional[int] = Field(None, description="最小流数")
+    multiplex_max_streams: Optional[int] = Field(None, description="最大流数")
+
+
+class V2RayEgressUpdateRequest(BaseModel):
+    """更新 V2Ray 出口"""
+    description: Optional[str] = None
+    protocol: Optional[str] = None
+    server: Optional[str] = None
+    server_port: Optional[int] = Field(None, ge=1, le=65535)
+    uuid: Optional[str] = None
+    password: Optional[str] = None
+    security: Optional[str] = None
+    alter_id: Optional[int] = Field(None, ge=0)
+    flow: Optional[str] = None
+    tls_enabled: Optional[bool] = None
+    tls_sni: Optional[str] = None
+    tls_alpn: Optional[List[str]] = None
+    tls_allow_insecure: Optional[bool] = None
+    tls_fingerprint: Optional[str] = None
+    reality_enabled: Optional[bool] = None
+    reality_public_key: Optional[str] = None
+    reality_short_id: Optional[str] = None
+    transport_type: Optional[str] = None
+    transport_config: Optional[Dict[str, Any]] = None
+    multiplex_enabled: Optional[bool] = None
+    multiplex_protocol: Optional[str] = None
+    multiplex_max_connections: Optional[int] = None
+    multiplex_min_streams: Optional[int] = None
+    multiplex_max_streams: Optional[int] = None
+    enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
+class V2RayURIParseRequest(BaseModel):
+    """解析 V2Ray URI (vmess://, vless://, trojan://)"""
+    uri: str = Field(..., description="V2Ray 分享链接")
+
+
+class V2RayInboundUpdateRequest(BaseModel):
+    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
+    protocol: str = Field("vless", description="协议 (vmess/vless/trojan)")
+    listen_address: str = Field("0.0.0.0", description="监听地址")
+    listen_port: int = Field(443, ge=1, le=65535, description="监听端口")
+    tls_enabled: bool = Field(True, description="启用 TLS")
+    tls_cert_path: Optional[str] = Field(None, description="TLS 证书路径")
+    tls_key_path: Optional[str] = Field(None, description="TLS 私钥路径")
+    tls_cert_content: Optional[str] = Field(None, description="TLS 证书内容 (PEM)")
+    tls_key_content: Optional[str] = Field(None, description="TLS 私钥内容 (PEM)")
+    # XTLS-Vision (VLESS only)
+    xtls_vision_enabled: bool = Field(False, description="启用 XTLS-Vision (VLESS 专用)")
+    # REALITY (Xray only, no certificate needed)
+    reality_enabled: bool = Field(False, description="启用 REALITY (无需证书)")
+    reality_private_key: Optional[str] = Field(None, description="REALITY 私钥")
+    reality_public_key: Optional[str] = Field(None, description="REALITY 公钥")
+    reality_short_ids: Optional[List[str]] = Field(None, description="REALITY Short ID 列表")
+    reality_dest: Optional[str] = Field(None, description="REALITY 目标服务器")
+    reality_server_names: Optional[List[str]] = Field(None, description="REALITY SNI 列表")
+    # Transport
+    transport_type: str = Field("tcp", description="传输类型")
+    transport_config: Optional[Dict[str, Any]] = Field(None, description="传输配置")
+    fallback_server: Optional[str] = Field(None, description="回落服务器")
+    fallback_port: Optional[int] = Field(None, ge=1, le=65535, description="回落端口")
+    # TUN config
+    tun_device: str = Field("xray-tun0", description="TUN 设备名")
+    tun_subnet: str = Field("10.24.0.0/24", description="TUN 子网")
+    # Enable
+    enabled: bool = Field(False, description="启用入口")
+
+
+class V2RayUserCreateRequest(BaseModel):
+    """创建 V2Ray 用户"""
+    name: str = Field(..., pattern=r"^[a-zA-Z][a-zA-Z0-9_-]*$", description="用户名")
+    email: Optional[str] = Field(None, description="邮箱")
+    uuid: Optional[str] = Field(None, description="UUID (VMess/VLESS，不填自动生成)")
+    password: Optional[str] = Field(None, description="密码 (Trojan)")
+    alter_id: int = Field(0, ge=0, description="VMess alterId")
+    flow: Optional[str] = Field(None, description="VLESS flow")
+
+
+class V2RayUserUpdateRequest(BaseModel):
+    """更新 V2Ray 用户"""
+    email: Optional[str] = None
+    uuid: Optional[str] = None
+    password: Optional[str] = None
+    alter_id: Optional[int] = Field(None, ge=0)
+    flow: Optional[str] = None
+    enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
 # ============ 加密/解密工具 ============
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -440,6 +570,20 @@ def decrypt_sensitive_data(encrypted_obj: dict, password: str) -> str:
         return decrypted.decode()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"解密失败，密码可能不正确: {exc}") from exc
+
+
+def _detect_public_ip() -> Optional[str]:
+    """检测服务器公网 IP 地址"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as response:
+            return response.read().decode().strip()
+    except Exception:
+        try:
+            with urllib.request.urlopen("https://ifconfig.me/ip", timeout=5) as response:
+                return response.read().decode().strip()
+        except Exception:
+            return None
 
 
 app = FastAPI(title="VPN Gateway API", version="0.1.0")
@@ -1570,6 +1714,12 @@ def api_get_rules():
             # 从数据库读取 OpenVPN 出口
             openvpn_egress = db.get_openvpn_egress_list(enabled_only=True)
             for egress in openvpn_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+
+            # 从数据库读取 V2Ray 出口
+            v2ray_egress = db.get_v2ray_egress_list(enabled_only=True)
+            for egress in v2ray_egress:
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
         except Exception:
@@ -2946,11 +3096,12 @@ def api_update_settings(payload: SettingsUpdateRequest):
 
 @app.get("/api/egress")
 def api_list_all_egress():
-    """列出所有出口（PIA + 自定义 + Direct + OpenVPN）"""
+    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray）"""
     pia_result = []
     custom_result = []
     direct_result = []
     openvpn_result = []
+    v2ray_result = []
 
     # 从数据库获取 PIA profiles
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -3010,7 +3161,23 @@ def api_list_all_egress():
             "is_configured": True,
         })
 
-    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result}
+    # 获取 V2Ray 出口
+    v2ray_egress = db.get_v2ray_egress_list()
+    for eg in v2ray_egress:
+        v2ray_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "v2ray",
+            "description": eg.get("description", ""),
+            "protocol": eg.get("protocol", ""),
+            "server": eg.get("server", ""),
+            "port": eg.get("server_port", 443),
+            "transport": eg.get("transport_type", "tcp"),
+            "tls_enabled": eg.get("tls_enabled", 1),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,
+        })
+
+    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result}
 
 
 @app.get("/api/egress/custom")
@@ -3573,6 +3740,675 @@ def api_get_openvpn_status(tag: str):
             return {"status": {"tag": tag, "status": "unknown", "error": result.stderr}}
     except Exception as e:
         return {"status": {"tag": tag, "status": "error", "error": str(e)}}
+
+
+# ============ V2Ray Egress APIs ============
+
+@app.get("/api/egress/v2ray")
+def api_list_v2ray_egress():
+    """列出所有 V2Ray 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress_list = db.get_v2ray_egress_list(enabled_only=False)
+    # 隐藏敏感信息
+    for egress in egress_list:
+        if egress.get("password"):
+            egress["password"] = "***"
+    return {"egress": egress_list}
+
+
+@app.get("/api/egress/v2ray/{tag}")
+def api_get_v2ray_egress(tag: str):
+    """获取单个 V2Ray 出口（包含完整配置）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_v2ray_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"V2Ray egress '{tag}' not found")
+    return egress
+
+
+@app.post("/api/egress/v2ray")
+def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
+    """创建 V2Ray 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 验证协议
+    if payload.protocol not in ("vmess", "vless", "trojan"):
+        raise HTTPException(status_code=400, detail=f"Invalid protocol: {payload.protocol}")
+
+    # 检查 tag 是否已存在
+    if db.get_v2ray_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"V2Ray egress '{payload.tag}' already exists")
+
+    # 检查是否与其他出口冲突
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with custom WireGuard egress")
+    if db.get_direct_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with Direct egress")
+    if db.get_openvpn_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with OpenVPN egress")
+
+    pia_profiles = db.get_pia_profiles(enabled_only=False)
+    pia_tags = {p.get("name", "") for p in pia_profiles}
+    if payload.tag in pia_tags:
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with PIA profile")
+
+    # 验证认证信息
+    if payload.protocol in ("vmess", "vless") and not payload.uuid:
+        raise HTTPException(status_code=400, detail=f"{payload.protocol.upper()} requires UUID")
+    if payload.protocol == "trojan" and not payload.password:
+        raise HTTPException(status_code=400, detail="Trojan requires password")
+
+    # 构建 transport_config JSON
+    transport_config_json = json.dumps(payload.transport_config) if payload.transport_config else None
+    tls_alpn_json = json.dumps(payload.tls_alpn) if payload.tls_alpn else None
+
+    # 添加到数据库
+    egress_id = db.add_v2ray_egress(
+        tag=payload.tag,
+        protocol=payload.protocol,
+        server=payload.server,
+        server_port=payload.server_port,
+        description=payload.description,
+        uuid=payload.uuid,
+        password=payload.password,
+        security=payload.security,
+        alter_id=payload.alter_id,
+        flow=payload.flow,
+        tls_enabled=1 if payload.tls_enabled else 0,
+        tls_sni=payload.tls_sni,
+        tls_alpn=tls_alpn_json,
+        tls_allow_insecure=1 if payload.tls_allow_insecure else 0,
+        tls_fingerprint=payload.tls_fingerprint,
+        reality_enabled=1 if payload.reality_enabled else 0,
+        reality_public_key=payload.reality_public_key,
+        reality_short_id=payload.reality_short_id,
+        transport_type=payload.transport_type,
+        transport_config=transport_config_json,
+        multiplex_enabled=1 if payload.multiplex_enabled else 0,
+        multiplex_protocol=payload.multiplex_protocol,
+        multiplex_max_connections=payload.multiplex_max_connections,
+        multiplex_min_streams=payload.multiplex_min_streams,
+        multiplex_max_streams=payload.multiplex_max_streams,
+    )
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "message": f"V2Ray egress '{payload.tag}' created{reload_status}",
+        "tag": payload.tag,
+        "id": egress_id,
+    }
+
+
+@app.post("/api/egress/v2ray/parse")
+def api_parse_v2ray_uri(payload: V2RayURIParseRequest):
+    """解析 V2Ray 分享链接（vmess://, vless://, trojan://）"""
+    if not HAS_V2RAY_PARSER:
+        raise HTTPException(status_code=500, detail="V2Ray URI parser not available")
+
+    try:
+        result = parse_v2ray_uri(payload.uri)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse V2Ray URI: {e}")
+
+
+@app.put("/api/egress/v2ray/{tag}")
+def api_update_v2ray_egress(tag: str, payload: V2RayEgressUpdateRequest):
+    """更新 V2Ray 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    if not db.get_v2ray_egress(tag):
+        raise HTTPException(status_code=404, detail=f"V2Ray egress '{tag}' not found")
+
+    # 构建更新字段
+    updates = {}
+    for field in [
+        "description", "protocol", "server", "server_port",
+        "uuid", "password", "security", "alter_id", "flow",
+        "tls_enabled", "tls_sni", "tls_alpn", "tls_allow_insecure", "tls_fingerprint",
+        "reality_enabled", "reality_public_key", "reality_short_id",
+        "transport_type", "transport_config",
+        "multiplex_enabled", "multiplex_protocol",
+        "multiplex_max_connections", "multiplex_min_streams", "multiplex_max_streams",
+        "enabled"
+    ]:
+        value = getattr(payload, field, None)
+        if value is not None:
+            # 处理布尔值转整数
+            if field in ("tls_enabled", "tls_allow_insecure", "reality_enabled", "multiplex_enabled"):
+                updates[field] = 1 if value else 0
+            # 处理 JSON 字段
+            elif field in ("tls_alpn", "transport_config"):
+                updates[field] = json.dumps(value) if value else None
+            else:
+                updates[field] = value
+
+    if updates:
+        db.update_v2ray_egress(tag, **updates)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {"message": f"V2Ray egress '{tag}' updated{reload_status}"}
+
+
+@app.delete("/api/egress/v2ray/{tag}")
+def api_delete_v2ray_egress(tag: str):
+    """删除 V2Ray 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查出口是否存在
+    if not db.get_v2ray_egress(tag):
+        raise HTTPException(status_code=404, detail=f"V2Ray egress '{tag}' not found")
+
+    # 删除
+    db.delete_v2ray_egress(tag)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {"message": f"V2Ray egress '{tag}' deleted{reload_status}"}
+
+
+# ============ V2Ray Inbound APIs ============
+
+@app.get("/api/ingress/v2ray")
+def api_get_v2ray_inbound():
+    """获取 V2Ray 入口配置和用户列表"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    config = db.get_v2ray_inbound_config()
+    users = db.get_v2ray_users(enabled_only=False)
+
+    # 隐藏用户密码
+    for user in users:
+        if user.get("password"):
+            user["password"] = "***"
+
+    # 解析 JSON 字段
+    if config:
+        if config.get("reality_short_ids"):
+            try:
+                config["reality_short_ids"] = json.loads(config["reality_short_ids"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if config.get("reality_server_names"):
+            try:
+                config["reality_server_names"] = json.loads(config["reality_server_names"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return {
+        "config": config or {
+            "protocol": "vless",
+            "listen_address": "0.0.0.0",
+            "listen_port": 443,
+            "tls_enabled": 1,
+            "xtls_vision_enabled": 0,
+            "reality_enabled": 0,
+            "reality_private_key": None,
+            "reality_public_key": None,
+            "reality_short_ids": None,
+            "reality_dest": None,
+            "reality_server_names": None,
+            "transport_type": "tcp",
+            "tun_device": "xray-tun0",
+            "tun_subnet": "10.24.0.0/24",
+            "enabled": 0,
+        },
+        "users": users,
+    }
+
+
+@app.put("/api/ingress/v2ray")
+def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
+    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 验证协议
+    if payload.protocol not in ("vmess", "vless", "trojan"):
+        raise HTTPException(status_code=400, detail=f"Invalid protocol: {payload.protocol}")
+
+    # XTLS-Vision 只支持 VLESS
+    if payload.xtls_vision_enabled and payload.protocol != "vless":
+        raise HTTPException(status_code=400, detail="XTLS-Vision is only available for VLESS protocol")
+
+    # REALITY 只支持 VLESS
+    if payload.reality_enabled and payload.protocol != "vless":
+        raise HTTPException(status_code=400, detail="REALITY is only available for VLESS protocol")
+
+    # REALITY 需要密钥和目标服务器
+    if payload.reality_enabled:
+        if not payload.reality_private_key or not payload.reality_public_key:
+            raise HTTPException(status_code=400, detail="REALITY requires private and public keys")
+        if not payload.reality_dest:
+            raise HTTPException(status_code=400, detail="REALITY requires destination server")
+        if not payload.reality_server_names:
+            raise HTTPException(status_code=400, detail="REALITY requires server names (SNI)")
+
+    # 构建 transport_config JSON
+    transport_config_json = json.dumps(payload.transport_config) if payload.transport_config else None
+
+    # 构建 REALITY 字段 JSON
+    reality_short_ids_json = json.dumps(payload.reality_short_ids) if payload.reality_short_ids else None
+    reality_server_names_json = json.dumps(payload.reality_server_names) if payload.reality_server_names else None
+
+    # 更新配置
+    db.set_v2ray_inbound_config(
+        protocol=payload.protocol,
+        listen_address=payload.listen_address,
+        listen_port=payload.listen_port,
+        tls_enabled=1 if payload.tls_enabled else 0,
+        tls_cert_path=payload.tls_cert_path,
+        tls_key_path=payload.tls_key_path,
+        tls_cert_content=payload.tls_cert_content,
+        tls_key_content=payload.tls_key_content,
+        xtls_vision_enabled=1 if payload.xtls_vision_enabled else 0,
+        reality_enabled=1 if payload.reality_enabled else 0,
+        reality_private_key=payload.reality_private_key,
+        reality_public_key=payload.reality_public_key,
+        reality_short_ids=reality_short_ids_json,
+        reality_dest=payload.reality_dest,
+        reality_server_names=reality_server_names_json,
+        transport_type=payload.transport_type,
+        transport_config=transport_config_json,
+        fallback_server=payload.fallback_server,
+        fallback_port=payload.fallback_port,
+        tun_device=payload.tun_device,
+        tun_subnet=payload.tun_subnet,
+        enabled=1 if payload.enabled else 0,
+    )
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    # 如果启用了 V2Ray 入口，需要重启 Xray 进程
+    if payload.enabled:
+        try:
+            import subprocess
+            subprocess.run(
+                ["python3", "/usr/local/bin/xray_manager.py", "reload"],
+                capture_output=True, timeout=10
+            )
+            reload_status += ", Xray reloaded"
+        except Exception as exc:
+            print(f"[api] Xray reload failed: {exc}")
+            reload_status += f", Xray reload failed: {exc}"
+
+    return {"message": f"V2Ray inbound config updated{reload_status}"}
+
+
+@app.post("/api/ingress/v2ray/users")
+def api_add_v2ray_user(payload: V2RayUserCreateRequest):
+    """添加 V2Ray 用户"""
+    import uuid as uuid_module
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查用户名是否已存在
+    if db.get_v2ray_user_by_name(payload.name):
+        raise HTTPException(status_code=400, detail=f"User '{payload.name}' already exists")
+
+    # 如果未提供 UUID，自动生成
+    user_uuid = payload.uuid or str(uuid_module.uuid4())
+
+    # 添加用户
+    user_id = db.add_v2ray_user(
+        name=payload.name,
+        email=payload.email,
+        uuid=user_uuid,
+        password=payload.password,
+        alter_id=payload.alter_id,
+        flow=payload.flow,
+    )
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "message": f"V2Ray user '{payload.name}' created{reload_status}",
+        "id": user_id,
+        "uuid": user_uuid,
+    }
+
+
+@app.put("/api/ingress/v2ray/users/{user_id}")
+def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
+    """更新 V2Ray 用户"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查用户是否存在
+    user = db.get_v2ray_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+
+    # 构建更新字段
+    updates = {}
+    for field in ["email", "uuid", "password", "alter_id", "flow", "enabled"]:
+        value = getattr(payload, field, None)
+        if value is not None:
+            updates[field] = value
+
+    if updates:
+        db.update_v2ray_user(user_id, **updates)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {"message": f"V2Ray user updated{reload_status}"}
+
+
+@app.delete("/api/ingress/v2ray/users/{user_id}")
+def api_delete_v2ray_user(user_id: int):
+    """删除 V2Ray 用户"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查用户是否存在
+    user = db.get_v2ray_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+
+    # 删除用户
+    db.delete_v2ray_user(user_id)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {"message": f"V2Ray user deleted{reload_status}"}
+
+
+def _parse_reality_short_id(short_ids_raw: str) -> str:
+    """Parse REALITY short_ids from database (may be JSON array or comma-separated)"""
+    if not short_ids_raw:
+        return ""
+    try:
+        # Try JSON array first
+        short_ids = json.loads(short_ids_raw)
+        if isinstance(short_ids, list) and len(short_ids) > 0:
+            return str(short_ids[0]).strip()
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Fallback to comma-separated
+    return short_ids_raw.split(",")[0].strip()
+
+
+@app.get("/api/ingress/v2ray/users/{user_id}/share")
+def api_get_v2ray_user_share_uri(user_id: int):
+    """获取 V2Ray 用户的分享链接"""
+    if not HAS_V2RAY_PARSER:
+        raise HTTPException(status_code=500, detail="V2Ray URI generator not available")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 获取用户
+    user = db.get_v2ray_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+
+    # 获取入口配置
+    config = db.get_v2ray_inbound_config()
+    if not config:
+        raise HTTPException(status_code=400, detail="V2Ray inbound not configured")
+    if not config.get("enabled"):
+        raise HTTPException(status_code=400, detail="V2Ray inbound is disabled")
+
+    # 获取服务器公网地址
+    server_settings = db.get_all_settings() or {}
+    public_endpoint = server_settings.get("public_endpoint", "")
+    if not public_endpoint:
+        # 尝试检测
+        detected_ip = _detect_public_ip()
+        public_endpoint = detected_ip or "your-server-ip"
+
+    protocol = config.get("protocol", "vless")
+    port = config.get("listen_port", 443)
+    transport_type = config.get("transport_type", "tcp")
+    transport_config_raw = config.get("transport_config")
+    transport_config = json.loads(transport_config_raw) if transport_config_raw else {}
+    tls_enabled = config.get("tls_enabled", 1)
+    tls_sni = config.get("tls_sni") or public_endpoint
+    reality_enabled = config.get("reality_enabled", 0)
+
+    remark = user.get("name", f"user-{user_id}")
+
+    # 对于 REALITY，SNI 应该是伪装目标服务器名称
+    if reality_enabled:
+        reality_server_names = config.get("reality_server_names")
+        if reality_server_names:
+            try:
+                names = json.loads(reality_server_names)
+                if isinstance(names, list) and len(names) > 0:
+                    tls_sni = names[0]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # 构建分享配置字典
+    share_config = {
+        "server": public_endpoint,
+        "server_port": port,
+        "description": remark,
+        "transport_type": transport_type,
+        "transport_config": transport_config,
+        "tls_enabled": tls_enabled,
+        "tls_sni": tls_sni,
+        "reality_enabled": reality_enabled,
+        "reality_public_key": config.get("reality_public_key", ""),
+        "reality_short_id": _parse_reality_short_id(config.get("reality_short_ids")),
+    }
+
+    # REALITY 需要指纹伪装
+    if reality_enabled:
+        share_config["tls_fingerprint"] = "chrome"
+
+    # XTLS-Vision flow 从服务端配置获取（仅 TCP 传输支持）
+    xtls_vision_enabled = config.get("xtls_vision_enabled", 0)
+    if xtls_vision_enabled and transport_type == "tcp":
+        server_flow = "xtls-rprx-vision"
+    else:
+        server_flow = ""
+
+    # 构建分享链接
+    if protocol == "vmess":
+        share_config["uuid"] = user.get("uuid")
+        share_config["alter_id"] = user.get("alter_id", 0)
+        share_config["security"] = user.get("security", "auto")
+        uri = generate_vmess_uri(share_config)
+    elif protocol == "vless":
+        share_config["uuid"] = user.get("uuid")
+        # Flow 从服务端配置获取，不再从用户配置获取
+        share_config["flow"] = server_flow
+        uri = generate_vless_uri(share_config)
+    elif protocol == "trojan":
+        share_config["password"] = user.get("password")
+        uri = generate_trojan_uri(share_config)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported protocol: {protocol}")
+
+    return {"uri": uri, "protocol": protocol, "user": user.get("name")}
+
+
+@app.get("/api/ingress/v2ray/users/{user_id}/qrcode")
+def api_get_v2ray_user_qrcode(user_id: int):
+    """获取 V2Ray 用户分享链接的二维码"""
+    if not HAS_QRCODE:
+        raise HTTPException(status_code=501, detail="QR code feature not available, please install qrcode library")
+
+    # 复用分享链接生成逻辑
+    share_result = api_get_v2ray_user_share_uri(user_id)
+    uri = share_result["uri"]
+
+    # 生成二维码
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    # 转换为 PNG 字节
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ============ Xray Control APIs ============
+
+@app.get("/api/ingress/v2ray/xray/status")
+def api_get_xray_status():
+    """获取 Xray 进程状态"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "status"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            status = json.loads(result.stdout)
+            # 转换为前端期望的格式
+            # 获取 V2Ray 配置以补充 REALITY/XTLS 状态
+            _db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            v2ray_config = _db.get_v2ray_inbound_config()
+            config = v2ray_config.get("config", {}) if v2ray_config else {}
+            return {
+                "running": status.get("status") == "running",
+                "enabled": config.get("enabled", 0) == 1,
+                "pid": status.get("pid"),
+                "tun_device": status.get("tun_device"),
+                "tun_configured": bool(status.get("tun_device")),
+                "reality_enabled": config.get("reality_enabled", 0) == 1,
+                "xtls_vision_enabled": config.get("xtls_vision_enabled", 0) == 1,
+                "listen_port": status.get("listen_port"),
+            }
+        else:
+            return {"running": False, "enabled": False, "tun_configured": False,
+                    "reality_enabled": False, "xtls_vision_enabled": False,
+                    "message": result.stderr}
+    except subprocess.TimeoutExpired:
+        return {"running": False, "enabled": False, "tun_configured": False,
+                "reality_enabled": False, "xtls_vision_enabled": False,
+                "message": "Timeout"}
+    except Exception as e:
+        return {"running": False, "enabled": False, "tun_configured": False,
+                "reality_enabled": False, "xtls_vision_enabled": False,
+                "message": str(e)}
+
+
+@app.post("/api/ingress/v2ray/xray/restart")
+def api_restart_xray():
+    """重启 Xray 进程"""
+    import subprocess
+    try:
+        # 先停止
+        subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "stop"],
+            capture_output=True, timeout=10
+        )
+        # 再启动
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "start"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return {"message": "Xray restarted successfully"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to start Xray: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Xray restart timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ingress/v2ray/xray/reload")
+def api_reload_xray():
+    """重载 Xray 配置"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return {"message": "Xray config reloaded successfully"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to reload Xray: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Xray reload timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ingress/v2ray/reality/generate-keys")
+def api_generate_reality_keys():
+    """生成 REALITY 密钥对"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "generate-keys"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            keys = json.loads(result.stdout)
+            return keys
+        else:
+            # 尝试解析错误信息
+            try:
+                error = json.loads(result.stderr)
+                raise HTTPException(status_code=500, detail=error.get("error", "Unknown error"))
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=500, detail=f"Failed to generate keys: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Key generation timeout")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============ Egress Connection Test API ============
@@ -4888,6 +5724,96 @@ def api_export_backup(payload: BackupExportRequest):
         custom_rules = load_custom_rules()
         backup_data["custom_rules"] = custom_rules
 
+    # 7. 导出 V2Ray 出口配置
+    v2ray_egress_list = db.get_v2ray_egress_list(enabled_only=False)
+    v2ray_egress_public = []
+    v2ray_egress_sensitive = []
+    for eg in v2ray_egress_list:
+        v2ray_egress_public.append({
+            "tag": eg.get("tag", ""),
+            "description": eg.get("description", ""),
+            "protocol": eg.get("protocol", ""),
+            "server": eg.get("server", ""),
+            "server_port": eg.get("server_port", 443),
+            "security": eg.get("security", "auto"),
+            "alter_id": eg.get("alter_id", 0),
+            "flow": eg.get("flow"),
+            "tls_enabled": eg.get("tls_enabled", 1),
+            "tls_sni": eg.get("tls_sni"),
+            "tls_alpn": eg.get("tls_alpn"),
+            "tls_allow_insecure": eg.get("tls_allow_insecure", 0),
+            "tls_fingerprint": eg.get("tls_fingerprint"),
+            "reality_enabled": eg.get("reality_enabled", 0),
+            "reality_public_key": eg.get("reality_public_key"),
+            "reality_short_id": eg.get("reality_short_id"),
+            "transport_type": eg.get("transport_type", "tcp"),
+            "transport_config": eg.get("transport_config"),
+            "multiplex_enabled": eg.get("multiplex_enabled", 0),
+            "multiplex_protocol": eg.get("multiplex_protocol"),
+            "multiplex_max_connections": eg.get("multiplex_max_connections"),
+            "multiplex_min_streams": eg.get("multiplex_min_streams"),
+            "multiplex_max_streams": eg.get("multiplex_max_streams"),
+            "enabled": eg.get("enabled", 1),
+        })
+        v2ray_egress_sensitive.append({
+            "tag": eg.get("tag", ""),
+            "uuid": eg.get("uuid", ""),
+            "password": eg.get("password", ""),
+        })
+
+    backup_data["v2ray_egress"] = v2ray_egress_public
+    backup_data["v2ray_egress_sensitive"] = encrypt_sensitive_data(
+        json.dumps(v2ray_egress_sensitive), payload.password
+    )
+
+    # 8. 导出 V2Ray 入口配置和用户
+    v2ray_inbound = db.get_v2ray_inbound_config()
+    v2ray_users = db.get_v2ray_users(enabled_only=False)
+
+    if v2ray_inbound:
+        v2ray_inbound_public = {
+            "protocol": v2ray_inbound.get("protocol", "vless"),
+            "listen_address": v2ray_inbound.get("listen_address", "0.0.0.0"),
+            "listen_port": v2ray_inbound.get("listen_port", 443),
+            "tls_enabled": v2ray_inbound.get("tls_enabled", 1),
+            "tls_cert_path": v2ray_inbound.get("tls_cert_path"),
+            "tls_key_path": v2ray_inbound.get("tls_key_path"),
+            "transport_type": v2ray_inbound.get("transport_type", "tcp"),
+            "transport_config": v2ray_inbound.get("transport_config"),
+            "fallback_server": v2ray_inbound.get("fallback_server"),
+            "fallback_port": v2ray_inbound.get("fallback_port"),
+            "enabled": v2ray_inbound.get("enabled", 0),
+        }
+        v2ray_inbound_sensitive = {
+            "tls_cert_content": v2ray_inbound.get("tls_cert_content", ""),
+            "tls_key_content": v2ray_inbound.get("tls_key_content", ""),
+        }
+        backup_data["v2ray_inbound"] = v2ray_inbound_public
+        backup_data["v2ray_inbound_sensitive"] = encrypt_sensitive_data(
+            json.dumps(v2ray_inbound_sensitive), payload.password
+        )
+
+    v2ray_users_public = []
+    v2ray_users_sensitive = []
+    for user in v2ray_users:
+        v2ray_users_public.append({
+            "name": user.get("name", ""),
+            "email": user.get("email"),
+            "alter_id": user.get("alter_id", 0),
+            "flow": user.get("flow"),
+            "enabled": user.get("enabled", 1),
+        })
+        v2ray_users_sensitive.append({
+            "name": user.get("name", ""),
+            "uuid": user.get("uuid", ""),
+            "password": user.get("password", ""),
+        })
+
+    backup_data["v2ray_users"] = v2ray_users_public
+    backup_data["v2ray_users_sensitive"] = encrypt_sensitive_data(
+        json.dumps(v2ray_users_sensitive), payload.password
+    )
+
     return {
         "message": "备份已生成",
         "backup": backup_data,
@@ -4918,6 +5844,9 @@ def api_import_backup(payload: BackupImportRequest):
         "pia_profiles": False,
         "pia_credentials": False,
         "custom_rules": False,
+        "v2ray_egress": False,
+        "v2ray_inbound": False,
+        "v2ray_users": False,
     }
 
     # 1. 导入设置
@@ -5093,6 +6022,129 @@ def api_import_backup(payload: BackupImportRequest):
                 results["custom_rules"] = True
         except Exception as exc:
             print(f"[backup] 导入路由规则失败: {exc}")
+
+    # 7. 导入 V2Ray 出口配置
+    if "v2ray_egress" in backup_data and "v2ray_egress_sensitive" in backup_data:
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+            # 解密敏感数据
+            sensitive_json = decrypt_sensitive_data(
+                backup_data["v2ray_egress_sensitive"], payload.password
+            )
+            sensitive_list = json.loads(sensitive_json)
+            sensitive_by_tag = {s["tag"]: s for s in sensitive_list}
+
+            if payload.merge_mode == "replace":
+                # 删除所有现有 V2Ray 出口
+                existing = db.get_v2ray_egress_list(enabled_only=False)
+                for eg in existing:
+                    db.delete_v2ray_egress(eg["tag"])
+
+            existing_tags = {eg["tag"] for eg in db.get_v2ray_egress_list(enabled_only=False)}
+            for eg in backup_data["v2ray_egress"]:
+                tag = eg.get("tag", "")
+                if tag and tag not in existing_tags:
+                    sens = sensitive_by_tag.get(tag, {})
+                    db.add_v2ray_egress(
+                        tag=tag,
+                        protocol=eg.get("protocol", "vless"),
+                        server=eg.get("server", ""),
+                        server_port=eg.get("server_port", 443),
+                        description=eg.get("description", ""),
+                        uuid=sens.get("uuid"),
+                        password=sens.get("password"),
+                        security=eg.get("security", "auto"),
+                        alter_id=eg.get("alter_id", 0),
+                        flow=eg.get("flow"),
+                        tls_enabled=eg.get("tls_enabled", 1),
+                        tls_sni=eg.get("tls_sni"),
+                        tls_alpn=eg.get("tls_alpn"),
+                        tls_allow_insecure=eg.get("tls_allow_insecure", 0),
+                        tls_fingerprint=eg.get("tls_fingerprint"),
+                        reality_enabled=eg.get("reality_enabled", 0),
+                        reality_public_key=eg.get("reality_public_key"),
+                        reality_short_id=eg.get("reality_short_id"),
+                        transport_type=eg.get("transport_type", "tcp"),
+                        transport_config=eg.get("transport_config"),
+                        multiplex_enabled=eg.get("multiplex_enabled", 0),
+                        multiplex_protocol=eg.get("multiplex_protocol"),
+                        multiplex_max_connections=eg.get("multiplex_max_connections"),
+                        multiplex_min_streams=eg.get("multiplex_min_streams"),
+                        multiplex_max_streams=eg.get("multiplex_max_streams"),
+                        enabled=eg.get("enabled", 1),
+                    )
+            results["v2ray_egress"] = True
+        except Exception as exc:
+            print(f"[backup] 导入 V2Ray 出口失败: {exc}")
+
+    # 8. 导入 V2Ray 入口配置
+    if "v2ray_inbound" in backup_data:
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            inbound_public = backup_data["v2ray_inbound"]
+
+            inbound_sensitive = {}
+            if "v2ray_inbound_sensitive" in backup_data:
+                sensitive_json = decrypt_sensitive_data(
+                    backup_data["v2ray_inbound_sensitive"], payload.password
+                )
+                inbound_sensitive = json.loads(sensitive_json)
+
+            db.set_v2ray_inbound_config(
+                protocol=inbound_public.get("protocol", "vless"),
+                listen_address=inbound_public.get("listen_address", "0.0.0.0"),
+                listen_port=inbound_public.get("listen_port", 443),
+                tls_enabled=inbound_public.get("tls_enabled", 1),
+                tls_cert_path=inbound_public.get("tls_cert_path"),
+                tls_key_path=inbound_public.get("tls_key_path"),
+                tls_cert_content=inbound_sensitive.get("tls_cert_content"),
+                tls_key_content=inbound_sensitive.get("tls_key_content"),
+                transport_type=inbound_public.get("transport_type", "tcp"),
+                transport_config=inbound_public.get("transport_config"),
+                fallback_server=inbound_public.get("fallback_server"),
+                fallback_port=inbound_public.get("fallback_port"),
+                enabled=inbound_public.get("enabled", 0),
+            )
+            results["v2ray_inbound"] = True
+        except Exception as exc:
+            print(f"[backup] 导入 V2Ray 入口配置失败: {exc}")
+
+    # 9. 导入 V2Ray 用户
+    if "v2ray_users" in backup_data and "v2ray_users_sensitive" in backup_data:
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+            # 解密敏感数据
+            sensitive_json = decrypt_sensitive_data(
+                backup_data["v2ray_users_sensitive"], payload.password
+            )
+            sensitive_list = json.loads(sensitive_json)
+            sensitive_by_name = {s["name"]: s for s in sensitive_list}
+
+            if payload.merge_mode == "replace":
+                # 删除所有现有用户
+                existing = db.get_v2ray_users(enabled_only=False)
+                for user in existing:
+                    db.delete_v2ray_user(user["id"])
+
+            existing_names = {u["name"] for u in db.get_v2ray_users(enabled_only=False)}
+            for user in backup_data["v2ray_users"]:
+                name = user.get("name", "")
+                if name and name not in existing_names:
+                    sens = sensitive_by_name.get(name, {})
+                    db.add_v2ray_user(
+                        name=name,
+                        email=user.get("email"),
+                        uuid=sens.get("uuid"),
+                        password=sens.get("password"),
+                        alter_id=user.get("alter_id", 0),
+                        flow=user.get("flow"),
+                        enabled=user.get("enabled", 1),
+                    )
+            results["v2ray_users"] = True
+        except Exception as exc:
+            print(f"[backup] 导入 V2Ray 用户失败: {exc}")
 
     # 重新生成配置
     reload_status = ""

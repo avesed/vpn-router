@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
 import type { CountryIpInfo, IpCatalogResponse } from "../types";
 import {
@@ -13,6 +14,7 @@ import {
 } from "@heroicons/react/24/outline";
 
 export default function IpCatalog() {
+  const { t } = useTranslation();
   const [catalog, setCatalog] = useState<IpCatalogResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -43,11 +45,11 @@ export default function IpCatalog() {
         setSelectedOutbound(rulesRes.available_outbounds[0]);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load IP catalog");
+      setError(err instanceof Error ? err.message : t("common.loadFailed"));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     loadCatalog();
@@ -126,13 +128,13 @@ export default function IpCatalog() {
         selectedOutbound,
         customTag || undefined
       );
-      setSuccessMessage(res.message);
+      setSuccessMessage(t("catalog.ipRuleCreated", { count: selectedCountries.size }));
       setSelectedCountries(new Set());
       setCustomTag("");
 
       setTimeout(() => setSuccessMessage(null), 3000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create rule");
+      setError(err instanceof Error ? err.message : t("common.createFailed"));
     } finally {
       setCreating(false);
     }
@@ -157,12 +159,12 @@ export default function IpCatalog() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-white">IP 规则库</h1>
+          <h1 className="text-2xl font-bold text-white">{t("ipCatalog.title")}</h1>
           <p className="text-slate-400 mt-1">
-            按国家/地区创建 IP 路由规则
+            {t("ipCatalog.subtitle")}
             {catalog && (
               <span className="ml-2 text-slate-500">
-                ({catalog.stats.total_countries} 个国家/地区)
+                ({t("catalog.countriesCount", { count: catalog.stats.total_countries })})
               </span>
             )}
           </p>
@@ -170,7 +172,7 @@ export default function IpCatalog() {
         <button
           onClick={loadCatalog}
           className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
-          title="刷新"
+          title={t("common.refresh")}
         >
           <ArrowPathIcon className="h-5 w-5 text-slate-400" />
         </button>
@@ -196,7 +198,7 @@ export default function IpCatalog() {
           type="text"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="搜索国家/地区... (如: cn, 中国, us, japan)"
+          placeholder={t("catalog.searchCountries")}
           className="w-full pl-12 pr-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand/50 focus:ring-1 focus:ring-brand/50"
         />
         {searching && (
@@ -209,7 +211,7 @@ export default function IpCatalog() {
       {/* Search Results */}
       {searchResults.length > 0 && (
         <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-          <h3 className="text-sm font-semibold text-slate-400 mb-3">搜索结果</h3>
+          <h3 className="text-sm font-semibold text-slate-400 mb-3">{t("common.searchResults")}</h3>
           <div className="flex flex-wrap gap-2">
             {searchResults.map((result) => (
               <button
@@ -235,7 +237,7 @@ export default function IpCatalog() {
           <div className="flex items-start justify-between gap-4">
             <div className="flex-1">
               <h3 className="text-sm font-semibold text-white mb-2">
-                已选择 {selectedCountries.size} 个国家/地区
+                {t("catalog.selectedCountries", { count: selectedCountries.size })}
               </h3>
               <div className="flex flex-wrap gap-2 mb-4">
                 {Array.from(selectedCountries).map((cc) => (
@@ -269,7 +271,7 @@ export default function IpCatalog() {
                   type="text"
                   value={customTag}
                   onChange={(e) => setCustomTag(e.target.value)}
-                  placeholder="自定义规则名称 (可选)"
+                  placeholder={t("catalog.customRuleName")}
                   className="px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
                 />
                 <button
@@ -282,7 +284,7 @@ export default function IpCatalog() {
                   ) : (
                     <PlusIcon className="h-4 w-4" />
                   )}
-                  创建 IP 规则
+                  {t("catalog.createIpRule")}
                 </button>
               </div>
             </div>
@@ -353,12 +355,12 @@ export default function IpCatalog() {
                 {loadingDetails ? (
                   <div className="flex items-center gap-2 text-slate-400 py-2">
                     <div className="animate-spin h-4 w-4 border-2 border-brand border-t-transparent rounded-full" />
-                    加载中...
+                    {t("common.loading")}
                   </div>
                 ) : countryDetails ? (
                   <div className="space-y-2 pt-3">
                     <div className="flex items-center justify-between text-xs text-slate-400">
-                      <span>推荐出口: {countryDetails.recommended_exit}</span>
+                      <span>{t("catalog.recommendedExit")}: {countryDetails.recommended_exit}</span>
                     </div>
                     <div className="max-h-32 overflow-y-auto">
                       <div className="flex flex-wrap gap-1">
@@ -372,7 +374,7 @@ export default function IpCatalog() {
                         ))}
                         {(countryDetails.ipv4_cidrs?.length || 0) > 50 && (
                           <span className="px-2 py-0.5 text-xs text-slate-500">
-                            ... 还有 {(countryDetails.ipv4_cidrs?.length || 0) - 50} 个
+                            ... {t("catalog.moreItems", { count: (countryDetails.ipv4_cidrs?.length || 0) - 50 })}
                           </span>
                         )}
                       </div>

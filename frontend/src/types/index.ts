@@ -299,7 +299,7 @@ export interface CustomEgressCreateRequest {
 export interface EgressItem {
   tag: string;
   description: string;
-  type: "pia" | "custom" | "direct" | "openvpn";
+  type: "pia" | "custom" | "direct" | "openvpn" | "v2ray";
   server?: string;
   port?: number;
   is_configured: boolean;
@@ -312,6 +312,9 @@ export interface EgressItem {
   protocol?: string;
   socks_port?: number;
   status?: "connected" | "connecting" | "disconnected" | "error";
+  // V2Ray specific fields
+  transport?: string;
+  tls_enabled?: number;
 }
 
 export interface AllEgressResponse {
@@ -319,6 +322,7 @@ export interface AllEgressResponse {
   custom: EgressItem[];
   direct: EgressItem[];
   openvpn: EgressItem[];
+  v2ray: EgressItem[];
 }
 
 // Direct Egress (绑定特定接口/IP 的直连出口)
@@ -576,3 +580,308 @@ export interface SpeedTestResponse {
   duration_sec?: number;
   message: string;
 }
+
+// ============ V2Ray Egress Types ============
+
+export type V2RayProtocol = "vmess" | "vless" | "trojan";
+export type V2RayTransport = "tcp" | "ws" | "grpc" | "h2" | "quic" | "httpupgrade" | "xhttp";
+
+export interface V2RayTransportConfig {
+  path?: string;
+  host?: string;
+  service_name?: string;
+  headers?: Record<string, string>;
+  early_data_header_name?: string;
+  max_early_data?: number;
+  // XHTTP specific
+  mode?: "auto" | "packet-up" | "stream-up" | "stream-one";
+}
+
+export interface V2RayEgress {
+  id?: number;
+  tag: string;
+  description: string;
+  protocol: V2RayProtocol;
+  server: string;
+  server_port: number;
+  // Auth
+  uuid?: string;
+  password?: string;
+  // VMess specific
+  security?: string;
+  alter_id?: number;
+  // VLESS specific
+  flow?: string;
+  // TLS
+  tls_enabled: number;
+  tls_sni?: string;
+  tls_alpn?: string;  // JSON array string
+  tls_allow_insecure: number;
+  tls_fingerprint?: string;
+  // REALITY (VLESS)
+  reality_enabled: number;
+  reality_public_key?: string;
+  reality_short_id?: string;
+  // Transport
+  transport_type: V2RayTransport;
+  transport_config?: string;  // JSON string
+  // Multiplex
+  multiplex_enabled: number;
+  multiplex_protocol?: string;
+  multiplex_max_connections?: number;
+  multiplex_min_streams?: number;
+  multiplex_max_streams?: number;
+  // Other
+  enabled: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface V2RayEgressCreateRequest {
+  tag: string;
+  description?: string;
+  protocol: V2RayProtocol;
+  server: string;
+  server_port?: number;
+  uuid?: string;
+  password?: string;
+  security?: string;
+  alter_id?: number;
+  flow?: string;
+  tls_enabled?: boolean;
+  tls_sni?: string;
+  tls_alpn?: string[];
+  tls_allow_insecure?: boolean;
+  tls_fingerprint?: string;
+  reality_enabled?: boolean;
+  reality_public_key?: string;
+  reality_short_id?: string;
+  transport_type?: V2RayTransport;
+  transport_config?: V2RayTransportConfig;
+  multiplex_enabled?: boolean;
+  multiplex_protocol?: string;
+  multiplex_max_connections?: number;
+  multiplex_min_streams?: number;
+  multiplex_max_streams?: number;
+}
+
+export interface V2RayEgressUpdateRequest {
+  description?: string;
+  protocol?: V2RayProtocol;
+  server?: string;
+  server_port?: number;
+  uuid?: string;
+  password?: string;
+  security?: string;
+  alter_id?: number;
+  flow?: string;
+  tls_enabled?: boolean;
+  tls_sni?: string;
+  tls_alpn?: string[];
+  tls_allow_insecure?: boolean;
+  tls_fingerprint?: string;
+  reality_enabled?: boolean;
+  reality_public_key?: string;
+  reality_short_id?: string;
+  transport_type?: V2RayTransport;
+  transport_config?: V2RayTransportConfig;
+  multiplex_enabled?: boolean;
+  multiplex_protocol?: string;
+  multiplex_max_connections?: number;
+  multiplex_min_streams?: number;
+  multiplex_max_streams?: number;
+  enabled?: number;
+}
+
+export interface V2RayEgressListResponse {
+  egress: V2RayEgress[];
+}
+
+export interface V2RayURIParseResult {
+  protocol: V2RayProtocol;
+  remark?: string;
+  description?: string;
+  server: string;
+  server_port: number;
+  uuid?: string;
+  password?: string;
+  security?: string;
+  alter_id?: number;
+  flow?: string;
+  tls_enabled?: boolean;
+  tls_sni?: string;
+  tls_alpn?: string[];
+  tls_fingerprint?: string;
+  tls_allow_insecure?: boolean;
+  reality_enabled?: boolean;
+  reality_public_key?: string;
+  reality_short_id?: string;
+  transport_type?: V2RayTransport;
+  transport_config?: V2RayTransportConfig;
+}
+
+// ============ V2Ray Inbound Types ============
+
+export interface V2RayInboundConfig {
+  id?: number;
+  protocol: V2RayProtocol;
+  listen_address: string;
+  listen_port: number;
+  tls_enabled: number;
+  tls_cert_path?: string;
+  tls_key_path?: string;
+  tls_cert_content?: string;
+  tls_key_content?: string;
+  transport_type: V2RayTransport;
+  transport_config?: string;  // JSON string
+  fallback_server?: string;
+  fallback_port?: number;
+  // Xray/REALITY specific fields
+  xtls_vision_enabled: number;
+  reality_enabled: number;
+  reality_private_key?: string;
+  reality_public_key?: string;
+  reality_short_ids?: string[];  // Parsed from JSON
+  reality_dest?: string;
+  reality_server_names?: string[];  // Parsed from JSON
+  tun_device?: string;
+  tun_subnet?: string;
+  enabled: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface V2RayInboundUpdateRequest {
+  protocol?: V2RayProtocol;
+  listen_address?: string;
+  listen_port?: number;
+  tls_enabled?: boolean;
+  tls_cert_path?: string;
+  tls_key_path?: string;
+  tls_cert_content?: string;
+  tls_key_content?: string;
+  transport_type?: V2RayTransport;
+  transport_config?: V2RayTransportConfig;
+  fallback_server?: string;
+  fallback_port?: number;
+  // Xray/REALITY specific fields
+  xtls_vision_enabled?: boolean;
+  reality_enabled?: boolean;
+  reality_private_key?: string;
+  reality_public_key?: string;
+  reality_short_ids?: string[];
+  reality_dest?: string;
+  reality_server_names?: string[];
+  tun_device?: string;
+  tun_subnet?: string;
+  enabled?: boolean;
+}
+
+export interface V2RayUser {
+  id: number;
+  name: string;
+  email?: string;
+  uuid?: string;
+  password?: string;
+  alter_id?: number;
+  flow?: string;
+  enabled: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface V2RayUserCreateRequest {
+  name: string;
+  email?: string;
+  uuid?: string;
+  password?: string;
+  alter_id?: number;
+  flow?: string;
+}
+
+export interface V2RayUserUpdateRequest {
+  email?: string;
+  uuid?: string;
+  password?: string;
+  alter_id?: number;
+  flow?: string;
+  enabled?: number;
+}
+
+export interface V2RayInboundResponse {
+  config: V2RayInboundConfig;
+  users: V2RayUser[];
+}
+
+export interface V2RayUserShareResponse {
+  uri: string;
+  protocol: V2RayProtocol;
+  user: string;
+}
+
+// Xray status and control types
+export interface XrayStatus {
+  running: boolean;
+  enabled: boolean;
+  pid?: number;
+  uptime?: number;
+  tun_device?: string;
+  tun_configured: boolean;
+  reality_enabled: boolean;
+  xtls_vision_enabled: boolean;
+  listen_port?: number;
+  message?: string;
+}
+
+export interface RealityKeyPair {
+  private_key: string;
+  public_key: string;
+}
+
+// V2Ray protocol options for UI
+export const V2RAY_PROTOCOLS = [
+  { value: "vmess", label: "VMess", description: "VMess 协议" },
+  { value: "vless", label: "VLESS", description: "VLESS 协议 (推荐)" },
+  { value: "trojan", label: "Trojan", description: "Trojan 协议" },
+] as const;
+
+export const V2RAY_TRANSPORTS = [
+  { value: "tcp", label: "TCP", description: "原始 TCP" },
+  { value: "ws", label: "WebSocket", description: "WebSocket 传输" },
+  { value: "grpc", label: "gRPC", description: "gRPC 传输" },
+  { value: "h2", label: "HTTP/2", description: "HTTP/2 传输" },
+  { value: "quic", label: "QUIC", description: "QUIC 传输" },
+  { value: "httpupgrade", label: "HTTPUpgrade", description: "HTTP 升级" },
+  { value: "xhttp", label: "XHTTP", description: "XHTTP 传输 (Xray)" },
+] as const;
+
+export const V2RAY_SECURITY_OPTIONS = [
+  { value: "auto", label: "Auto", description: "自动选择" },
+  { value: "aes-128-gcm", label: "AES-128-GCM", description: "AES-128-GCM" },
+  { value: "chacha20-poly1305", label: "ChaCha20-Poly1305", description: "ChaCha20-Poly1305" },
+  { value: "none", label: "None", description: "不加密" },
+  { value: "zero", label: "Zero", description: "零加密" },
+] as const;
+
+export const V2RAY_TLS_FINGERPRINTS = [
+  { value: "", label: "Default", description: "默认" },
+  { value: "chrome", label: "Chrome", description: "Chrome 浏览器" },
+  { value: "firefox", label: "Firefox", description: "Firefox 浏览器" },
+  { value: "safari", label: "Safari", description: "Safari 浏览器" },
+  { value: "edge", label: "Edge", description: "Edge 浏览器" },
+  { value: "ios", label: "iOS", description: "iOS 系统" },
+  { value: "android", label: "Android", description: "Android 系统" },
+  { value: "random", label: "Random", description: "随机" },
+  { value: "randomized", label: "Randomized", description: "完全随机化" },
+] as const;
+
+export const V2RAY_MULTIPLEX_PROTOCOLS = [
+  { value: "smux", label: "smux", description: "smux 协议" },
+  { value: "yamux", label: "yamux", description: "yamux 协议" },
+  { value: "h2mux", label: "h2mux", description: "HTTP/2 多路复用" },
+] as const;
+
+export const VLESS_FLOW_OPTIONS = [
+  { value: "", label: "None", description: "无流控" },
+  { value: "xtls-rprx-vision", label: "xtls-rprx-vision", description: "XTLS Vision 流控" },
+] as const;

@@ -179,6 +179,132 @@ CREATE TABLE IF NOT EXISTS openvpn_egress (
 CREATE INDEX IF NOT EXISTS idx_openvpn_egress_tag ON openvpn_egress(tag);
 CREATE INDEX IF NOT EXISTS idx_openvpn_egress_enabled ON openvpn_egress(enabled);
 
+-- V2Ray 出口表（支持 VMess, VLESS, Trojan）
+CREATE TABLE IF NOT EXISTS v2ray_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+
+    -- 协议类型
+    protocol TEXT NOT NULL CHECK(protocol IN ('vmess', 'vless', 'trojan')),
+
+    -- 连接配置
+    server TEXT NOT NULL,
+    server_port INTEGER NOT NULL DEFAULT 443,
+
+    -- 认证（根据协议使用不同字段）
+    uuid TEXT,                            -- VMess/VLESS 的 UUID
+    password TEXT,                        -- Trojan 的密码
+
+    -- VMess 特定
+    security TEXT DEFAULT 'auto',         -- auto, aes-128-gcm, chacha20-poly1305, none
+    alter_id INTEGER DEFAULT 0,           -- 0 = AEAD (推荐)
+
+    -- VLESS 特定
+    flow TEXT,                            -- xtls-rprx-vision 等
+
+    -- TLS 配置
+    tls_enabled INTEGER DEFAULT 1,
+    tls_sni TEXT,                         -- Server Name Indication
+    tls_alpn TEXT,                        -- JSON 数组格式，如 ["h2", "http/1.1"]
+    tls_allow_insecure INTEGER DEFAULT 0,
+    tls_fingerprint TEXT,                 -- uTLS 指纹（chrome, firefox, safari 等）
+
+    -- REALITY 配置（VLESS 专用）
+    reality_enabled INTEGER DEFAULT 0,
+    reality_public_key TEXT,
+    reality_short_id TEXT,
+
+    -- 传输层配置 (JSON 存储完整配置)
+    transport_type TEXT DEFAULT 'tcp',    -- tcp, ws, grpc, h2, http, quic, httpupgrade
+    transport_config TEXT,                -- JSON 格式的传输层配置
+
+    -- 多路复用
+    multiplex_enabled INTEGER DEFAULT 0,
+    multiplex_protocol TEXT,              -- smux, yamux, h2mux
+    multiplex_max_connections INTEGER,
+    multiplex_min_streams INTEGER,
+    multiplex_max_streams INTEGER,
+
+    -- 其他
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_v2ray_egress_tag ON v2ray_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_v2ray_egress_protocol ON v2ray_egress(protocol);
+CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
+
+-- V2Ray 入口服务器配置表（单行，类似 wireguard_server）
+-- 使用独立的 Xray 进程 + TUN + TPROXY 架构
+CREATE TABLE IF NOT EXISTS v2ray_inbound_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+
+    -- 协议类型
+    protocol TEXT NOT NULL DEFAULT 'vless' CHECK(protocol IN ('vmess', 'vless', 'trojan')),
+
+    -- 监听配置
+    listen_address TEXT DEFAULT '0.0.0.0',
+    listen_port INTEGER NOT NULL DEFAULT 443,
+
+    -- TLS 配置（传统 TLS，当 reality_enabled=0 时使用）
+    tls_enabled INTEGER DEFAULT 1,
+    tls_cert_path TEXT,           -- 证书路径
+    tls_key_path TEXT,            -- 私钥路径
+    tls_cert_content TEXT,        -- 证书内容（PEM 格式）
+    tls_key_content TEXT,         -- 私钥内容（PEM 格式）
+
+    -- XTLS-Vision 配置（VLESS 专用，高性能）
+    xtls_vision_enabled INTEGER DEFAULT 0,
+
+    -- REALITY 配置（Xray 专有，无需证书）
+    reality_enabled INTEGER DEFAULT 0,
+    reality_private_key TEXT,     -- REALITY 服务器私钥
+    reality_public_key TEXT,      -- REALITY 服务器公钥（用于客户端配置）
+    reality_short_ids TEXT,       -- REALITY Short ID 列表（JSON 数组）
+    reality_dest TEXT,            -- REALITY 目标服务器（如 www.microsoft.com:443）
+    reality_server_names TEXT,    -- REALITY SNI 列表（JSON 数组）
+
+    -- 传输层配置
+    transport_type TEXT DEFAULT 'tcp',
+    transport_config TEXT,        -- JSON 格式
+
+    -- VLESS 特定
+    fallback_server TEXT,         -- 回落服务器地址
+    fallback_port INTEGER,        -- 回落端口
+
+    -- Xray TUN 配置
+    tun_device TEXT DEFAULT 'xray-tun0',  -- TUN 设备名
+    tun_subnet TEXT DEFAULT '10.24.0.0/24',  -- TUN 子网
+
+    enabled INTEGER DEFAULT 0,    -- 默认禁用
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- V2Ray 用户表（类似 wireguard_peers）
+CREATE TABLE IF NOT EXISTS v2ray_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    email TEXT,                   -- 用于日志标识
+
+    -- 认证信息（根据入口协议使用）
+    uuid TEXT,                    -- VMess/VLESS 用户 UUID
+    password TEXT,                -- Trojan 密码
+
+    -- VMess 特定
+    alter_id INTEGER DEFAULT 0,
+
+    -- VLESS 特定
+    flow TEXT,
+
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_v2ray_users_uuid ON v2ray_users(uuid);
+CREATE INDEX IF NOT EXISTS idx_v2ray_users_enabled ON v2ray_users(enabled);
+
 -- 远程规则集表（广告拦截等）
 CREATE TABLE IF NOT EXISTS remote_rule_sets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,6 +383,47 @@ def migrate_openvpn_egress_crl_verify(conn: sqlite3.Connection):
         print("✓ 添加 openvpn_egress.crl_verify 字段")
     else:
         print("⊘ openvpn_egress.crl_verify 字段已存在，跳过迁移")
+
+
+def migrate_v2ray_inbound_xray_fields(conn: sqlite3.Connection):
+    """为现有 v2ray_inbound_config 表添加 Xray/REALITY 相关字段"""
+    cursor = conn.cursor()
+
+    # 检查 v2ray_inbound_config 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='v2ray_inbound_config'")
+    if not cursor.fetchone():
+        print("⊘ v2ray_inbound_config 表不存在，跳过 Xray 字段迁移")
+        return
+
+    # 检查现有列
+    cursor.execute("PRAGMA table_info(v2ray_inbound_config)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    migrations_done = 0
+
+    # 新增字段列表
+    new_fields = [
+        ("xtls_vision_enabled", "INTEGER DEFAULT 0"),
+        ("reality_enabled", "INTEGER DEFAULT 0"),
+        ("reality_private_key", "TEXT"),
+        ("reality_public_key", "TEXT"),
+        ("reality_short_ids", "TEXT"),
+        ("reality_dest", "TEXT"),
+        ("reality_server_names", "TEXT"),
+        ("tun_device", "TEXT DEFAULT 'xray-tun0'"),
+        ("tun_subnet", "TEXT DEFAULT '10.24.0.0/24'"),
+    ]
+
+    for field_name, field_type in new_fields:
+        if field_name not in columns:
+            cursor.execute(f"ALTER TABLE v2ray_inbound_config ADD COLUMN {field_name} {field_type}")
+            migrations_done += 1
+            print(f"✓ 添加 v2ray_inbound_config.{field_name} 字段")
+
+    if migrations_done > 0:
+        conn.commit()
+    else:
+        print("⊘ v2ray_inbound_config Xray 字段已存在，跳过迁移")
 
 
 def generate_wireguard_private_key() -> str:
@@ -464,6 +631,7 @@ def main():
     # 迁移现有数据库（添加新字段）
     migrate_wireguard_peers_lan_fields(conn)
     migrate_openvpn_egress_crl_verify(conn)
+    migrate_v2ray_inbound_xray_fields(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)
@@ -497,6 +665,8 @@ def main():
         "custom_egress": cursor.execute("SELECT COUNT(*) FROM custom_egress").fetchone()[0],
         "direct_egress": cursor.execute("SELECT COUNT(*) FROM direct_egress").fetchone()[0],
         "openvpn_egress": cursor.execute("SELECT COUNT(*) FROM openvpn_egress").fetchone()[0],
+        "v2ray_egress": cursor.execute("SELECT COUNT(*) FROM v2ray_egress").fetchone()[0],
+        "v2ray_users": cursor.execute("SELECT COUNT(*) FROM v2ray_users").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
     }
 
@@ -514,6 +684,8 @@ def main():
     print(f"自定义 WG 出口:   {stats['custom_egress']:,}")
     print(f"Direct 出口:      {stats['direct_egress']:,}")
     print(f"OpenVPN 出口:     {stats['openvpn_egress']:,}")
+    print(f"V2Ray 出口:       {stats['v2ray_egress']:,}")
+    print(f"V2Ray 用户:       {stats['v2ray_users']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

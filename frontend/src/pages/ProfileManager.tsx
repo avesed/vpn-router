@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { api } from "../api/client";
 import type { PiaRegion, VpnProfile } from "../types";
 import {
@@ -208,64 +209,67 @@ export default function ProfileManager() {
       )}
 
       {/* Login Modal */}
-      {showLoginModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand/20">
-                <KeyIcon className="h-5 w-5 text-brand" />
+      {showLoginModal && createPortal(
+        <div className="fixed inset-0 bg-black/60 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
+              <div className="flex items-center gap-3 mb-6">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand/20">
+                  <KeyIcon className="h-5 w-5 text-brand" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-white">登录 PIA</h3>
+                  <p className="text-sm text-slate-400">需要登录后才能重新连接</p>
+                </div>
               </div>
-              <div>
-                <h3 className="text-lg font-semibold text-white">登录 PIA</h3>
-                <p className="text-sm text-slate-400">需要登录后才能重新连接</p>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">用户名</label>
+                  <input
+                    type="text"
+                    value={loginUsername}
+                    onChange={(e) => setLoginUsername(e.target.value)}
+                    className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
+                    placeholder="PIA 用户名"
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-400 mb-1">密码</label>
+                  <input
+                    type="password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
+                    placeholder="PIA 密码"
+                    onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                  />
+                </div>
               </div>
-            </div>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">用户名</label>
-                <input
-                  type="text"
-                  value={loginUsername}
-                  onChange={(e) => setLoginUsername(e.target.value)}
-                  className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
-                  placeholder="PIA 用户名"
-                  autoFocus
-                />
+              <div className="mt-6 flex gap-3">
+                <button
+                  onClick={handleLogin}
+                  disabled={!loginUsername || !loginPassword || loginLoading}
+                  className="flex-1 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+                >
+                  {loginLoading ? "登录中..." : "登录并连接"}
+                </button>
+                <button
+                  onClick={() => {
+                    setShowLoginModal(false);
+                    setPendingReconnectTag(null);
+                    setLoginUsername("");
+                    setLoginPassword("");
+                  }}
+                  className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-300 hover:bg-white/20"
+                >
+                  取消
+                </button>
               </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-400 mb-1">密码</label>
-                <input
-                  type="password"
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  className="w-full rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-sm text-white focus:border-brand focus:outline-none"
-                  placeholder="PIA 密码"
-                  onKeyDown={(e) => e.key === "Enter" && handleLogin()}
-                />
-              </div>
-            </div>
-            <div className="mt-6 flex gap-3">
-              <button
-                onClick={handleLogin}
-                disabled={!loginUsername || !loginPassword || loginLoading}
-                className="flex-1 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
-              >
-                {loginLoading ? "登录中..." : "登录并连接"}
-              </button>
-              <button
-                onClick={() => {
-                  setShowLoginModal(false);
-                  setPendingReconnectTag(null);
-                  setLoginUsername("");
-                  setLoginPassword("");
-                }}
-                className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-300 hover:bg-white/20"
-              >
-                取消
-              </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* New Profile Form */}
