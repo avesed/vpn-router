@@ -110,6 +110,38 @@ class V2RayStatsClient:
 
         return result
 
+    def get_user_stats(self, reset: bool = False) -> Dict[str, Dict[str, int]]:
+        """
+        获取所有用户的流量统计
+
+        Args:
+            reset: 是否在读取后重置计数器
+
+        Returns:
+            {用户email: {"download": bytes, "upload": bytes}}
+        """
+        # 查询所有 user 统计
+        all_stats = self.query_stats("user>>>", reset=reset)
+
+        # 解析统计结果
+        result: Dict[str, Dict[str, int]] = {}
+        for name, value in all_stats.items():
+            # 格式: user>>>EMAIL>>>traffic>>>downlink/uplink
+            parts = name.split(">>>")
+            if len(parts) >= 4 and parts[0] == "user" and parts[2] == "traffic":
+                email = parts[1]
+                direction = parts[3]
+
+                if email not in result:
+                    result[email] = {"download": 0, "upload": 0}
+
+                if direction == "downlink":
+                    result[email]["download"] = value
+                elif direction == "uplink":
+                    result[email]["upload"] = value
+
+        return result
+
     def get_sys_stats(self) -> Dict[str, int]:
         """
         获取系统统计信息

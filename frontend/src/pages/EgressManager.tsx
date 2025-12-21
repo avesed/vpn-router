@@ -162,6 +162,10 @@ export default function EgressManager() {
   const [v2rayFormTlsSni, setV2rayFormTlsSni] = useState("");
   const [v2rayFormTlsFingerprint, setV2rayFormTlsFingerprint] = useState("");
   const [v2rayFormTlsAllowInsecure, setV2rayFormTlsAllowInsecure] = useState(false);
+  // REALITY
+  const [v2rayFormRealityEnabled, setV2rayFormRealityEnabled] = useState(false);
+  const [v2rayFormRealityPublicKey, setV2rayFormRealityPublicKey] = useState("");
+  const [v2rayFormRealityShortId, setV2rayFormRealityShortId] = useState("");
   const [v2rayFormTransportType, setV2rayFormTransportType] = useState<V2RayTransport>("tcp");
   const [v2rayFormTransportPath, setV2rayFormTransportPath] = useState("");
   const [v2rayFormTransportHost, setV2rayFormTransportHost] = useState("");
@@ -302,6 +306,10 @@ export default function EgressManager() {
     setV2rayFormTlsSni("");
     setV2rayFormTlsFingerprint("");
     setV2rayFormTlsAllowInsecure(false);
+    // REALITY
+    setV2rayFormRealityEnabled(false);
+    setV2rayFormRealityPublicKey("");
+    setV2rayFormRealityShortId("");
     setV2rayFormTransportType("tcp");
     setV2rayFormTransportPath("");
     setV2rayFormTransportHost("");
@@ -933,6 +941,10 @@ export default function EgressManager() {
     setV2rayFormTlsSni(egress.tls_sni || "");
     setV2rayFormTlsFingerprint(egress.tls_fingerprint || "");
     setV2rayFormTlsAllowInsecure(egress.tls_allow_insecure === 1);
+    // REALITY
+    setV2rayFormRealityEnabled(egress.reality_enabled === 1);
+    setV2rayFormRealityPublicKey(egress.reality_public_key || "");
+    setV2rayFormRealityShortId(egress.reality_short_id || "");
     setV2rayFormTransportType(egress.transport_type);
     // Parse transport config if available
     if (egress.transport_config) {
@@ -969,6 +981,10 @@ export default function EgressManager() {
       if (result.tls_sni) setV2rayFormTlsSni(result.tls_sni);
       if (result.tls_fingerprint) setV2rayFormTlsFingerprint(result.tls_fingerprint);
       if (result.tls_allow_insecure !== undefined) setV2rayFormTlsAllowInsecure(result.tls_allow_insecure);
+      // REALITY
+      if (result.reality_enabled !== undefined) setV2rayFormRealityEnabled(result.reality_enabled);
+      if (result.reality_public_key) setV2rayFormRealityPublicKey(result.reality_public_key);
+      if (result.reality_short_id) setV2rayFormRealityShortId(result.reality_short_id);
       if (result.transport_type) setV2rayFormTransportType(result.transport_type);
       if (result.transport_config?.path) setV2rayFormTransportPath(result.transport_config.path);
       if (result.transport_config?.host) setV2rayFormTransportHost(result.transport_config.host);
@@ -1027,6 +1043,10 @@ export default function EgressManager() {
         tls_sni: v2rayFormTlsSni || undefined,
         tls_fingerprint: v2rayFormTlsFingerprint || undefined,
         tls_allow_insecure: v2rayFormTlsAllowInsecure,
+        // REALITY
+        reality_enabled: v2rayFormRealityEnabled,
+        reality_public_key: v2rayFormRealityPublicKey || undefined,
+        reality_short_id: v2rayFormRealityShortId || undefined,
         transport_type: v2rayFormTransportType,
         transport_config: Object.keys(transportConfig).length > 0 ? transportConfig : undefined
       });
@@ -1067,6 +1087,10 @@ export default function EgressManager() {
         tls_sni: v2rayFormTlsSni || undefined,
         tls_fingerprint: v2rayFormTlsFingerprint || undefined,
         tls_allow_insecure: v2rayFormTlsAllowInsecure,
+        // REALITY
+        reality_enabled: v2rayFormRealityEnabled,
+        reality_public_key: v2rayFormRealityPublicKey || undefined,
+        reality_short_id: v2rayFormRealityShortId || undefined,
         transport_type: v2rayFormTransportType,
         transport_config: Object.keys(transportConfig).length > 0 ? transportConfig : undefined
       });
@@ -3236,7 +3260,8 @@ export default function EgressManager() {
                     </div>
                   )}
 
-                  {/* TLS Settings */}
+                  {/* TLS Settings (hidden when REALITY is enabled) */}
+                  {!v2rayFormRealityEnabled && (
                   <div className="border-t border-white/10 pt-4">
                     <div className="flex items-center gap-3 mb-4">
                       <input
@@ -3294,6 +3319,87 @@ export default function EgressManager() {
                       </div>
                     )}
                   </div>
+                  )}
+
+                  {/* REALITY Settings (VLESS only) */}
+                  {v2rayFormProtocol === "vless" && (
+                    <div className="border-t border-white/10 pt-4">
+                      <div className="flex items-center gap-3 mb-4">
+                        <input
+                          type="checkbox"
+                          id="v2ray-reality-enabled"
+                          checked={v2rayFormRealityEnabled}
+                          onChange={(e) => {
+                            setV2rayFormRealityEnabled(e.target.checked);
+                            // REALITY replaces TLS
+                            if (e.target.checked) {
+                              setV2rayFormTlsEnabled(false);
+                            }
+                          }}
+                          className="w-4 h-4 rounded border-white/20 bg-white/5 text-violet-500 focus:ring-violet-500"
+                        />
+                        <label htmlFor="v2ray-reality-enabled" className="text-sm font-medium text-white">
+                          {t('v2rayEgress.enableReality')}
+                        </label>
+                        <span className="text-xs text-slate-500 ml-2">({t('v2rayEgress.realityHint')})</span>
+                      </div>
+
+                      {v2rayFormRealityEnabled && (
+                        <div className="grid grid-cols-2 gap-4">
+                          <div className="col-span-2">
+                            <label className="block text-sm font-medium text-slate-400 mb-2">
+                              {t('v2rayEgress.realityPublicKey')} <span className="text-red-400">*</span>
+                            </label>
+                            <input
+                              type="text"
+                              value={v2rayFormRealityPublicKey}
+                              onChange={(e) => setV2rayFormRealityPublicKey(e.target.value)}
+                              placeholder="Server public key (base64)"
+                              className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 font-mono text-sm"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-slate-400 mb-2">
+                              {t('v2rayEgress.realityShortId')}
+                            </label>
+                            <input
+                              type="text"
+                              value={v2rayFormRealityShortId}
+                              onChange={(e) => setV2rayFormRealityShortId(e.target.value)}
+                              placeholder="Short ID (hex)"
+                              className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 font-mono text-sm"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-slate-400 mb-2">
+                              SNI ({t('v2rayEgress.optional')})
+                            </label>
+                            <input
+                              type="text"
+                              value={v2rayFormTlsSni}
+                              onChange={(e) => setV2rayFormTlsSni(e.target.value)}
+                              placeholder="www.microsoft.com"
+                              className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                            />
+                          </div>
+                          <div className="col-span-2">
+                            <label className="block text-sm font-medium text-slate-400 mb-2">
+                              {t('v2rayEgress.fingerprint')}
+                            </label>
+                            <select
+                              value={v2rayFormTlsFingerprint}
+                              onChange={(e) => setV2rayFormTlsFingerprint(e.target.value)}
+                              className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500"
+                            >
+                              {V2RAY_TLS_FINGERPRINTS.map((opt) => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {/* Transport Settings */}
                   <div className="border-t border-white/10 pt-4">

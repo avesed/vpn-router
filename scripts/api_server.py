@@ -189,6 +189,20 @@ _last_history_time = 0  # 上次记录历史的时间
 _rate_samples: List[Dict[str, Dict[str, int]]] = []  # 最近 N 个流量样本用于计算速率
 # V2Ray API 客户端（懒加载）
 _v2ray_client = None
+# Xray 出站 V2Ray API 客户端（懒加载，用于获取 V2Ray 出口的流量统计）
+_xray_egress_client = None
+# Xray 出站 API 端口
+XRAY_EGRESS_API_PORT = 10086
+# Xray 入站 V2Ray API 客户端（懒加载，用于获取 V2Ray 入口用户的流量统计）
+_xray_ingress_client = None
+# Xray 入站 API 端口
+XRAY_INGRESS_API_PORT = 10087
+
+# V2Ray 用户活跃度缓存: {email: {"last_seen": timestamp, "upload": bytes, "download": bytes}}
+# 用于跟踪用户在线状态
+_v2ray_user_activity: Dict[str, Dict[str, Any]] = {}
+_v2ray_user_activity_lock = threading.Lock()
+_V2RAY_USER_ONLINE_TIMEOUT = 60  # 60 秒无流量变化视为离线
 
 # Peer activity cache: {ip: {"last_seen": timestamp, "rx": bytes, "tx": bytes}}
 # Used to track peer online status even when no active connections exist
@@ -676,6 +690,12 @@ def _get_all_outbounds() -> List[str]:
                 if tag and tag not in outbounds:
                     outbounds.append(tag)
 
+            # V2Ray/Xray egress
+            for egress in db.get_v2ray_egress_list(enabled_only=True):
+                tag = egress.get("tag")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+
             # 从路由规则中获取出口（包括协议规则、端口规则等）
             for rule in db.get_routing_rules():
                 outbound = rule.get("outbound")
@@ -700,6 +720,128 @@ def _get_v2ray_client():
     return _v2ray_client
 
 
+def _get_xray_egress_client():
+    """获取 Xray 出站 V2Ray API 客户端（懒加载）
+
+    仅当有启用的 V2Ray 出口时才初始化客户端。
+    Xray 出站 API 使用端口 10086（与 sing-box 的 10085 区分）。
+    """
+    global _xray_egress_client
+    if _xray_egress_client is None:
+        try:
+            # 检查是否有启用的 V2Ray 出口
+            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            v2ray_egress = db.get_v2ray_egress_list(enabled_only=True)
+            if not v2ray_egress:
+                return None
+
+            from v2ray_stats_client import V2RayStatsClient
+            _xray_egress_client = V2RayStatsClient(f"127.0.0.1:{XRAY_EGRESS_API_PORT}")
+        except ImportError:
+            return None
+        except Exception as e:
+            print(f"[Traffic] Xray egress stats client init failed: {e}")
+            return None
+    return _xray_egress_client
+
+
+def _reset_xray_egress_client():
+    """重置 Xray 出站统计客户端
+
+    在 V2Ray 出口配置改变后调用，以便重新初始化客户端。
+    """
+    global _xray_egress_client
+    if _xray_egress_client is not None:
+        try:
+            _xray_egress_client.close()
+        except Exception:
+            pass
+    _xray_egress_client = None
+
+
+def _get_xray_ingress_client():
+    """获取 Xray 入站 V2Ray API 客户端（懒加载）
+
+    仅当 V2Ray 入口已配置且启用时才初始化客户端。
+    Xray 入站 API 使用端口 10087。
+    """
+    global _xray_ingress_client
+    if _xray_ingress_client is None:
+        try:
+            # 检查 V2Ray 入口是否已配置且启用
+            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            config = db.get_v2ray_inbound_config()
+            if not config or not config.get("enabled"):
+                return None
+
+            from v2ray_stats_client import V2RayStatsClient
+            _xray_ingress_client = V2RayStatsClient(f"127.0.0.1:{XRAY_INGRESS_API_PORT}")
+        except ImportError:
+            return None
+        except Exception as e:
+            print(f"[Traffic] Xray ingress stats client init failed: {e}")
+            return None
+    return _xray_ingress_client
+
+
+def _reset_xray_ingress_client():
+    """重置 Xray 入站统计客户端
+
+    在 V2Ray 入口配置改变后调用，以便重新初始化客户端。
+    """
+    global _xray_ingress_client
+    if _xray_ingress_client is not None:
+        try:
+            _xray_ingress_client.close()
+        except Exception:
+            pass
+    _xray_ingress_client = None
+
+
+def _update_v2ray_user_activity():
+    """更新 V2Ray 用户活跃度缓存
+
+    从 Xray 入站 API 获取每用户流量统计，检测流量变化来判断用户是否在线。
+    """
+    global _v2ray_user_activity
+
+    ingress_client = _get_xray_ingress_client()
+    if not ingress_client:
+        return
+
+    try:
+        # 获取用户流量统计 (格式: user>>>email>>>traffic>>>uplink/downlink)
+        user_stats = ingress_client.get_user_stats()
+        now = time.time()
+
+        with _v2ray_user_activity_lock:
+            for email, stats in user_stats.items():
+                upload = stats.get("upload", 0)
+                download = stats.get("download", 0)
+
+                if email in _v2ray_user_activity:
+                    # 检测流量是否有变化
+                    prev = _v2ray_user_activity[email]
+                    if upload != prev.get("upload", 0) or download != prev.get("download", 0):
+                        # 流量有变化，更新 last_seen
+                        _v2ray_user_activity[email] = {
+                            "last_seen": now,
+                            "upload": upload,
+                            "download": download
+                        }
+                    # 如果流量无变化，保持 last_seen 不变
+                else:
+                    # 新用户，记录初始状态
+                    _v2ray_user_activity[email] = {
+                        "last_seen": now,
+                        "upload": upload,
+                        "download": download
+                    }
+    except Exception as e:
+        # 静默忽略错误（Xray 可能未启动）
+        pass
+
+
 def _update_traffic_stats():
     """后台线程：定期更新累计流量统计和实时速率
 
@@ -715,11 +857,25 @@ def _update_traffic_stats():
                 time.sleep(_POLL_INTERVAL)
                 continue
 
-            # 从 V2Ray API 获取精确的出口流量统计
+            # 从 sing-box V2Ray API 获取精确的出口流量统计
             outbound_stats = client.get_outbound_stats()
 
+            # 从 Xray 出站获取 V2Ray 出口的流量统计
+            xray_client = _get_xray_egress_client()
+            if xray_client:
+                try:
+                    xray_stats = xray_client.get_outbound_stats()
+                    # 合并 Xray 统计：Xray 出口的统计替换 sing-box 中对应的 SOCKS 出站统计
+                    # 因为 sing-box 只看到到 SOCKS 代理的流量，而 Xray 看到的是实际出口流量
+                    for tag, stats in xray_stats.items():
+                        if tag not in ("api", "freedom"):  # 排除内部 tag
+                            outbound_stats[tag] = stats
+                except Exception as e:
+                    # Xray 可能还未启动或已停止，静默忽略
+                    pass
+
             with _traffic_stats_lock:
-                # 更新累计流量（直接使用 V2Ray API 的精确数据）
+                # 更新累计流量（使用合并后的精确数据）
                 for outbound, stats in outbound_stats.items():
                     _traffic_stats[outbound] = {
                         "download": stats["download"],
@@ -777,6 +933,12 @@ def _update_traffic_stats():
                 get_peer_status_from_clash_api()
             except Exception:
                 pass  # Silently ignore errors in cache update
+
+            # Update V2Ray user activity for online status tracking
+            try:
+                _update_v2ray_user_activity()
+            except Exception:
+                pass  # Silently ignore errors in user activity update
 
         except Exception as e:
             # 记录未预期的异常，但不中断线程
@@ -4178,6 +4340,49 @@ def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
     return {"message": f"V2Ray inbound config updated{reload_status}"}
 
 
+@app.get("/api/ingress/v2ray/users/online")
+def api_get_v2ray_users_online():
+    """获取 V2Ray 用户在线状态
+
+    返回每个用户的在线状态，基于流量活动检测。
+    如果用户在过去 60 秒内有流量变化，则认为在线。
+
+    Returns:
+        {email: {"online": bool, "last_seen": timestamp, "upload": bytes, "download": bytes}}
+    """
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    users = db.get_v2ray_users(enabled_only=True)
+
+    now = time.time()
+    result = {}
+
+    with _v2ray_user_activity_lock:
+        for user in users:
+            # 用户的 email 字段用于统计标识（如果为空则使用 name）
+            email = user.get("email") or user.get("name") or "user"
+            activity = _v2ray_user_activity.get(email)
+
+            if activity:
+                last_seen = activity.get("last_seen", 0)
+                online = (now - last_seen) < _V2RAY_USER_ONLINE_TIMEOUT
+                result[email] = {
+                    "online": online,
+                    "last_seen": last_seen,
+                    "upload": activity.get("upload", 0),
+                    "download": activity.get("download", 0),
+                }
+            else:
+                # 用户未有任何流量记录
+                result[email] = {
+                    "online": False,
+                    "last_seen": 0,
+                    "upload": 0,
+                    "download": 0,
+                }
+
+    return result
+
+
 @app.post("/api/ingress/v2ray/users")
 def api_add_v2ray_user(payload: V2RayUserCreateRequest):
     """添加 V2Ray 用户"""
@@ -5249,6 +5454,8 @@ def _reload_xray_egress() -> str:
         )
         if result.returncode == 0:
             print("[api] Xray egress reloaded")
+            # 重置统计客户端，以便重新连接到新的 Xray 进程
+            _reset_xray_egress_client()
             return ", Xray egress reloaded"
         else:
             # 可能没有运行，不算错误

@@ -48,6 +48,10 @@ XRAY_RUN_DIR = Path("/run/xray")
 XRAY_LOG_DIR = Path("/var/log")
 XRAY_CONFIG_PATH = XRAY_RUN_DIR / "config.json"
 XRAY_PID_FILE = XRAY_RUN_DIR / "xray.pid"
+
+# Xray 入站 V2Ray API 端口 (gRPC StatsService)
+# 用于查询 per-user 流量统计和在线检测
+XRAY_INGRESS_API_PORT = 10087
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 
@@ -318,9 +322,53 @@ class XrayManager:
                 "access": str(XRAY_LOG_DIR / "xray-access.log"),
                 "error": str(XRAY_LOG_DIR / "xray-error.log")
             },
+            # 启用统计功能（用于客户端在线检测）
+            "stats": {},
+            # V2Ray API 用于查询 per-user 统计数据
+            "api": {
+                "tag": "api",
+                "services": ["StatsService"]
+            },
+            # 策略配置：启用入站/出站统计和 per-user 统计
+            "policy": {
+                "levels": {
+                    "0": {
+                        "statsUserUplink": True,
+                        "statsUserDownlink": True
+                    }
+                },
+                "system": {
+                    "statsInboundUplink": True,
+                    "statsInboundDownlink": True,
+                    "statsOutboundUplink": True,
+                    "statsOutboundDownlink": True
+                }
+            },
             # DNS 由 sing-box 处理（通过 SOCKS5 UDP 转发）
-            "inbounds": [],
-            "outbounds": []
+            "inbounds": [
+                # API 入站 (gRPC 端口)
+                {
+                    "tag": "api",
+                    "port": XRAY_INGRESS_API_PORT,
+                    "listen": "127.0.0.1",
+                    "protocol": "dokodemo-door",
+                    "settings": {
+                        "address": "127.0.0.1"
+                    }
+                }
+            ],
+            "outbounds": [],
+            "routing": {
+                "domainStrategy": "AsIs",
+                "rules": [
+                    # API 路由规则
+                    {
+                        "type": "field",
+                        "inboundTag": ["api"],
+                        "outboundTag": "api"
+                    }
+                ]
+            }
         }
 
         # 构建入站配置
@@ -336,9 +384,13 @@ class XrayManager:
         if protocol == "vless":
             clients = []
             for user in users:
+                # email 用于 V2Ray API 统计和在线检测
+                # 优先使用 email，否则用 name，再否则用 "user"
+                email = user.get("email") or user.get("name") or "user"
                 client = {
                     "id": user.get("uuid"),
-                    "email": user.get("email", user.get("name", "user"))
+                    "email": email,
+                    "level": 0  # 关联到 policy.levels.0 以启用 per-user 统计
                 }
                 # XTLS-Vision flow - 只在 TCP 传输时启用 (不支持 ws/grpc/h2 等)
                 transport_type = config.get("transport_type", "tcp")
@@ -354,19 +406,23 @@ class XrayManager:
         elif protocol == "vmess":
             clients = []
             for user in users:
+                email = user.get("email") or user.get("name") or "user"
                 clients.append({
                     "id": user.get("uuid"),
                     "alterId": user.get("alter_id", 0),
-                    "email": user.get("email", user.get("name", "user"))
+                    "email": email,
+                    "level": 0  # 关联到 policy.levels.0 以启用 per-user 统计
                 })
             inbound["settings"] = {"clients": clients}
 
         elif protocol == "trojan":
             clients = []
             for user in users:
+                email = user.get("email") or user.get("name") or "user"
                 clients.append({
                     "password": user.get("password"),
-                    "email": user.get("email", user.get("name", "user"))
+                    "email": email,
+                    "level": 0  # 关联到 policy.levels.0 以启用 per-user 统计
                 })
             inbound["settings"] = {"clients": clients}
 
@@ -494,11 +550,9 @@ class XrayManager:
         })
 
         # 路由配置
-        # 所有流量通过 SOCKS5 到 sing-box 路由引擎
-        xray_config["routing"] = {
-            "domainStrategy": "AsIs",
-            "rules": []  # 无特殊规则，默认走第一个 outbound (socks-out)
-        }
+        # 保留 API 路由规则，其他流量通过 SOCKS5 到 sing-box 路由引擎
+        # 注意: routing 已在基础配置中定义，包含 API 路由规则
+        # 无需添加其他规则，默认走第一个 outbound (socks-out)
 
         return xray_config
 

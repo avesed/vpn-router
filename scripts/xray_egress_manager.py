@@ -53,6 +53,10 @@ XRAY_EGRESS_PID_FILE = XRAY_EGRESS_RUN_DIR / "xray-egress.pid"
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 
+# Xray 出站 V2Ray API 端口 (gRPC StatsService)
+# 用于查询各出口的流量统计，与 sing-box 的 10085 区分
+XRAY_EGRESS_API_PORT = 10086
+
 
 @dataclass
 class XrayEgressProcess:
@@ -270,11 +274,45 @@ class XrayEgressManager:
                 "access": str(XRAY_EGRESS_LOG_DIR / "xray-egress-access.log"),
                 "error": str(XRAY_EGRESS_LOG_DIR / "xray-egress-error.log")
             },
-            "inbounds": [],
+            # 启用统计功能
+            "stats": {},
+            # V2Ray API 用于查询统计数据
+            "api": {
+                "tag": "api",
+                "services": ["StatsService"]
+            },
+            # 策略配置：启用入站/出站统计
+            "policy": {
+                "system": {
+                    "statsInboundUplink": True,
+                    "statsInboundDownlink": True,
+                    "statsOutboundUplink": True,
+                    "statsOutboundDownlink": True
+                }
+            },
+            "inbounds": [
+                # API 入站 (gRPC 端口)
+                {
+                    "tag": "api",
+                    "port": XRAY_EGRESS_API_PORT,
+                    "listen": "127.0.0.1",
+                    "protocol": "dokodemo-door",
+                    "settings": {
+                        "address": "127.0.0.1"
+                    }
+                }
+            ],
             "outbounds": [],
             "routing": {
                 "domainStrategy": "AsIs",
-                "rules": []
+                "rules": [
+                    # API 路由规则
+                    {
+                        "type": "field",
+                        "inboundTag": ["api"],
+                        "outboundTag": "api"
+                    }
+                ]
             }
         }
 

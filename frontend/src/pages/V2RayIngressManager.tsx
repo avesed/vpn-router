@@ -69,6 +69,8 @@ export default function V2RayIngressManager() {
   const [shareUri, setShareUri] = useState<string | null>(null);
   const [shareUriUser, setShareUriUser] = useState<string | null>(null);
   const [shareQrCodeUrl, setShareQrCodeUrl] = useState<string | null>(null);
+  // User online status: {email: online}
+  const [userOnlineStatus, setUserOnlineStatus] = useState<Record<string, boolean>>({});
 
   const loadV2rayInbound = useCallback(async () => {
     try {
@@ -93,10 +95,30 @@ export default function V2RayIngressManager() {
     }
   }, []);
 
+  const loadUserOnlineStatus = useCallback(async () => {
+    try {
+      const status = await api.getV2RayUsersOnline();
+      const onlineMap: Record<string, boolean> = {};
+      for (const [email, data] of Object.entries(status)) {
+        onlineMap[email] = data.online;
+      }
+      setUserOnlineStatus(onlineMap);
+    } catch {
+      // Ignore errors
+    }
+  }, []);
+
   useEffect(() => {
     loadV2rayInbound();
     loadXrayStatus();
   }, [loadV2rayInbound, loadXrayStatus]);
+
+  // Poll user online status every 5 seconds
+  useEffect(() => {
+    loadUserOnlineStatus();
+    const interval = setInterval(loadUserOnlineStatus, 5000);
+    return () => clearInterval(interval);
+  }, [loadUserOnlineStatus]);
 
   // V2Ray handlers
   const handleOpenV2rayConfig = () => {
@@ -652,7 +674,17 @@ export default function V2RayIngressManager() {
                     >
                       <div className="flex items-start justify-between">
                         <div>
-                          <h4 className="font-semibold text-white">{user.name}</h4>
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-semibold text-white">{user.name}</h4>
+                            <span
+                              className={`w-2 h-2 rounded-full ${
+                                userOnlineStatus[user.email || user.name]
+                                  ? "bg-green-500"
+                                  : "bg-slate-600"
+                              }`}
+                              title={userOnlineStatus[user.email || user.name] ? t("v2rayIngress.online") : t("v2rayIngress.offline")}
+                            />
+                          </div>
                           {user.email && <p className="text-xs text-slate-500">{user.email}</p>}
                           <p className="text-xs font-mono text-slate-400 mt-1 truncate" title={user.uuid}>
                             {user.uuid?.substring(0, 8)}...{user.uuid?.substring(user.uuid.length - 8)}

@@ -370,6 +370,10 @@ export const api = {
     request<V2RayUserShareResponse>(`/ingress/v2ray/users/${userId}/share`),
   getV2RayUserQRCodeUrl: (userId: number) =>
     `${API_BASE}/ingress/v2ray/users/${userId}/qrcode`,
+  getV2RayUsersOnline: () =>
+    request<Record<string, { online: boolean; last_seen: number; upload: number; download: number }>>(
+      "/ingress/v2ray/users/online"
+    ),
 
   // ============ Xray Control (V2Ray Inbound via Xray) ============
   getXrayStatus: () => request<XrayStatus>("/ingress/v2ray/xray/status"),
