@@ -1,5 +1,5 @@
 import { PropsWithChildren, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   ChartBarIcon,
@@ -12,12 +12,14 @@ import {
   ChevronDownIcon,
   ArrowRightStartOnRectangleIcon,
   ArrowLeftEndOnRectangleIcon,
+  ArrowRightOnRectangleIcon,
   WrenchScrewdriverIcon,
   UsersIcon,
   ServerIcon,
   CloudArrowUpIcon
 } from "@heroicons/react/24/outline";
 import LanguageSwitcher from "./LanguageSwitcher";
+import { useAuth } from "../contexts/AuthContext";
 
 interface NavItem {
   labelKey: string;
@@ -72,6 +74,13 @@ interface LayoutProps extends PropsWithChildren {
 
 export default function Layout({ children, currentPath }: LayoutProps) {
   const { t } = useTranslation();
+  const { logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = () => {
+    logout();
+    navigate("/login");
+  };
 
   // Initialize expanded groups based on current path
   const getInitialExpanded = () => {
@@ -235,13 +244,22 @@ export default function Layout({ children, currentPath }: LayoutProps) {
 
             {/* Footer Info */}
             <div className="mt-8 pt-6 border-t border-white/5">
-              <div className="rounded-xl bg-white/5 p-3">
+              <div className="rounded-xl bg-white/5 p-3 mb-3">
                 <div className="flex items-center gap-2 mb-1">
                   <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
                   <span className="text-xs font-semibold text-slate-300">{t('nav.systemOnline')}</span>
                 </div>
                 <p className="text-xs text-slate-500">{t('nav.poweredBy')}</p>
               </div>
+
+              {/* Logout Button */}
+              <button
+                onClick={handleLogout}
+                className="w-full flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white hover:bg-white/5 transition-all duration-200"
+              >
+                <ArrowRightOnRectangleIcon className="h-4 w-4" />
+                <span>{t('auth.logout')}</span>
+              </button>
             </div>
           </div>
         </aside>

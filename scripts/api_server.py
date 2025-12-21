@@ -27,10 +27,15 @@ except ImportError:
 
 import requests
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# JWT 和密码哈希支持
+import bcrypt
+import jwt
 
 try:
     import qrcode
@@ -210,6 +215,27 @@ _peer_activity_cache: Dict[str, Dict[str, Any]] = {}
 _peer_activity_lock = threading.Lock()
 _PEER_ONLINE_GRACE_PERIOD = 120  # Consider peer online for 120s after last activity
 
+
+# ============ 认证相关模型 ============
+
+class SetupRequest(BaseModel):
+    """首次设置管理员密码"""
+    password: str = Field(..., min_length=8, description="Admin password (min 8 chars)")
+
+
+class LoginRequest(BaseModel):
+    """登录请求"""
+    password: str = Field(..., description="Admin password")
+
+
+class TokenResponse(BaseModel):
+    """JWT token 响应"""
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+# ============ 其他模型 ============
 
 class WireGuardPeerModel(BaseModel):
     address: str
@@ -608,6 +634,104 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============ 认证配置 ============
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+
+# 公开端点（不需要认证）
+PUBLIC_PATHS = {
+    "/api/auth/status",
+    "/api/auth/setup",
+    "/api/auth/login",
+    "/api/health",
+}
+
+
+def _hash_password(password: str) -> str:
+    """使用 bcrypt 哈希密码"""
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    """验证密码"""
+    return bcrypt.checkpw(password.encode(), password_hash.encode())
+
+
+def _create_token(secret: str) -> tuple:
+    """创建 JWT token，返回 (token, expires_in_seconds)"""
+    from datetime import timedelta
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
+    payload = {
+        "sub": "admin",
+        "exp": expires_at,
+        "iat": datetime.now(timezone.utc)
+    }
+    token = jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
+    expires_in = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+    return token, expires_in
+
+
+def _verify_token(token: str, secret: str) -> bool:
+    """验证 JWT token"""
+    try:
+        jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+        return True
+    except jwt.ExpiredSignatureError:
+        return False
+    except jwt.InvalidTokenError:
+        return False
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """认证中间件：保护 API 端点"""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # 公开端点不需要认证
+        if path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        # 非 API 端点（前端静态文件）不需要认证
+        if not path.startswith("/api/"):
+            return await call_next(request)
+
+        # 检查是否已设置密码，未设置则允许访问
+        try:
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            if not db.user.is_admin_setup():
+                return await call_next(request)
+        except Exception:
+            # 数据库错误时允许访问（避免锁死）
+            return await call_next(request)
+
+        # 检查 Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return Response(
+                content='{"detail":"Not authenticated"}',
+                status_code=401,
+                media_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
+        token = auth_header.split(" ")[1]
+        secret = db.user.get_or_create_jwt_secret()
+
+        if not _verify_token(token, secret):
+            return Response(
+                content='{"detail":"Invalid or expired token"}',
+                status_code=401,
+                media_type="application/json",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
+        return await call_next(request)
+
+
+# 添加认证中间件（在 CORS 之后）
+app.add_middleware(AuthMiddleware)
 
 
 def load_catalogs():
@@ -1308,6 +1432,115 @@ def parse_wireguard_conf(content: str) -> Dict[str, Any]:
 
     return result
 
+
+# ============ 认证 API 端点 ============
+
+@app.get("/api/auth/status")
+def api_auth_status():
+    """检查认证状态：是否已设置密码
+
+    此端点始终公开，用于确定显示登录页还是设置页
+    """
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        is_setup = db.user.is_admin_setup()
+    except Exception:
+        is_setup = False
+
+    return {
+        "is_setup": is_setup,
+        "requires_auth": True
+    }
+
+
+@app.post("/api/auth/setup")
+def api_auth_setup(request: SetupRequest):
+    """首次设置：创建管理员密码
+
+    仅在密码未设置时可用
+    """
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    if db.user.is_admin_setup():
+        raise HTTPException(
+            status_code=400,
+            detail="Admin password already set"
+        )
+
+    if len(request.password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters"
+        )
+
+    password_hash = _hash_password(request.password)
+    db.user.set_admin_password(password_hash)
+
+    # 创建并返回 token
+    secret = db.user.get_or_create_jwt_secret()
+    token, expires_in = _create_token(secret)
+
+    return {
+        "message": "Admin password set successfully",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in
+    }
+
+
+@app.post("/api/auth/login")
+def api_auth_login(request: LoginRequest):
+    """登录获取 JWT token"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    if not db.user.is_admin_setup():
+        raise HTTPException(
+            status_code=400,
+            detail="Admin password not set, use /api/auth/setup first"
+        )
+
+    password_hash = db.user.get_admin_password_hash()
+    if not password_hash or not _verify_password(request.password, password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials"
+        )
+
+    secret = db.user.get_or_create_jwt_secret()
+    token, expires_in = _create_token(secret)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in
+    }
+
+
+@app.post("/api/auth/refresh")
+def api_auth_refresh(request: Request):
+    """刷新 JWT token（延长会话）"""
+    # 验证当前 token（由中间件完成）
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    secret = db.user.get_or_create_jwt_secret()
+    token, expires_in = _create_token(secret)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in
+    }
+
+
+@app.get("/api/auth/me")
+def api_auth_me():
+    """获取当前用户信息（验证 token 有效性）"""
+    return {
+        "username": "admin",
+        "role": "admin"
+    }
+
+
+# ============ 系统状态端点 ============
 
 @app.get("/api/health")
 def api_health():

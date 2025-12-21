@@ -909,5 +909,25 @@
       "phishing-army": "Phishing website blocking",
       "peter-lowe": "Compact ad server list"
     }
+  },
+  "auth": {
+    "loginTitle": "Sign In",
+    "loginSubtitle": "Enter your admin password to continue",
+    "setupTitle": "Create Admin Password",
+    "setupSubtitle": "Set up your gateway admin password",
+    "setupHint": "This password will be used to access the VPN Gateway console. Please choose a strong password and store it safely.",
+    "password": "Password",
+    "passwordPlaceholder": "Enter password",
+    "confirmPassword": "Confirm Password",
+    "confirmPasswordPlaceholder": "Re-enter password",
+    "passwordRequirement": "Minimum 8 characters",
+    "passwordTooShort": "Password must be at least 8 characters",
+    "passwordMismatch": "Passwords do not match",
+    "login": "Sign In",
+    "createPassword": "Create Password",
+    "loginFailed": "Login failed",
+    "setupFailed": "Setup failed",
+    "sessionExpired": "Session expired, please login again",
+    "logout": "Sign Out"
   }
 }

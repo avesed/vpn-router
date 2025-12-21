@@ -1,6 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { RouterProvider, createBrowserRouter, Navigate } from "react-router-dom";
+import { AuthProvider } from "./contexts/AuthContext";
+import ProtectedRoute from "./components/ProtectedRoute";
 import App from "./App";
 import Dashboard from "./pages/Dashboard";
 import Endpoints from "./pages/Endpoints";
@@ -13,13 +15,24 @@ import IngressManager from "./pages/IngressManager";
 import V2RayIngressManager from "./pages/V2RayIngressManager";
 import BackupRestore from "./pages/BackupRestore";
 import AdBlock from "./pages/AdBlock";
+import Login from "./pages/Login";
+import Setup from "./pages/Setup";
 import "./index.css";
 import "./i18n";
 
 const router = createBrowserRouter([
+  // Public routes
+  { path: "/login", element: <Login /> },
+  { path: "/setup", element: <Setup /> },
+
+  // Protected routes
   {
     path: "/",
-    element: <App />,
+    element: (
+      <ProtectedRoute>
+        <App />
+      </ProtectedRoute>
+    ),
     children: [
       { index: true, element: <Dashboard /> },
       { path: "ingress", element: <IngressManager /> },
@@ -39,6 +52,8 @@ const router = createBrowserRouter([
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <RouterProvider router={router} />
+    <AuthProvider>
+      <RouterProvider router={router} />
+    </AuthProvider>
   </React.StrictMode>
 );

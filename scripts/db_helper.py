@@ -783,6 +783,47 @@ class UserDatabase:
             rows = cursor.execute("SELECT key, value FROM settings").fetchall()
             return {row[0]: row[1] for row in rows}
 
+    # ============ 管理员认证 ============
+
+    def is_admin_setup(self) -> bool:
+        """检查管理员密码是否已设置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT id FROM admin_auth WHERE id = 1"
+            ).fetchone()
+            return row is not None
+
+    def set_admin_password(self, password_hash: str) -> bool:
+        """设置或更新管理员密码哈希"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO admin_auth
+                (id, password_hash, updated_at)
+                VALUES (1, ?, CURRENT_TIMESTAMP)
+            """, (password_hash,))
+            conn.commit()
+            return True
+
+    def get_admin_password_hash(self) -> Optional[str]:
+        """获取管理员密码哈希"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT password_hash FROM admin_auth WHERE id = 1"
+            ).fetchone()
+            return row[0] if row else None
+
+    def get_or_create_jwt_secret(self) -> str:
+        """获取 JWT 密钥，不存在则创建"""
+        import secrets as sec
+        secret = self.get_setting("jwt_secret_key")
+        if not secret:
+            secret = sec.token_urlsafe(32)
+            self.set_setting("jwt_secret_key", secret)
+        return secret
+
     # ============ Custom Egress 方法 ============
 
     def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:

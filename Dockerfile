@@ -79,7 +79,7 @@ RUN set -eux; \
         python3-pil \
         wireguard-tools \
         nginx-light; \
-    pip3 install --no-cache-dir --break-system-packages cryptography grpcio grpcio-tools; \
+    pip3 install --no-cache-dir --break-system-packages cryptography grpcio grpcio-tools bcrypt pyjwt; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
 

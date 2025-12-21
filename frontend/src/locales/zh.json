@@ -909,5 +909,25 @@
       "phishing-army": "钓鱼网站拦截",
       "peter-lowe": "精简广告服务器列表"
     }
+  },
+  "auth": {
+    "loginTitle": "登录",
+    "loginSubtitle": "输入管理员密码以继续",
+    "setupTitle": "创建管理员密码",
+    "setupSubtitle": "设置网关管理员密码",
+    "setupHint": "此密码将用于访问 VPN 网关控制台。请选择一个强密码并妥善保管。",
+    "password": "密码",
+    "passwordPlaceholder": "输入密码",
+    "confirmPassword": "确认密码",
+    "confirmPasswordPlaceholder": "再次输入密码",
+    "passwordRequirement": "至少 8 个字符",
+    "passwordTooShort": "密码长度至少为 8 个字符",
+    "passwordMismatch": "两次输入的密码不一致",
+    "login": "登录",
+    "createPassword": "创建密码",
+    "loginFailed": "登录失败",
+    "setupFailed": "设置失败",
+    "sessionExpired": "会话已过期，请重新登录",
+    "logout": "退出登录"
   }
 }

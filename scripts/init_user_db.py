@@ -328,6 +328,14 @@ CREATE TABLE IF NOT EXISTS remote_rule_sets (
 );
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_enabled ON remote_rule_sets(enabled);
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_category ON remote_rule_sets(category);
+
+-- 管理员认证表（单行）
+CREATE TABLE IF NOT EXISTS admin_auth (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -451,6 +459,29 @@ def migrate_v2ray_egress_socks_port(conn: sqlite3.Connection):
         print("✓ 添加 v2ray_egress.socks_port 字段")
     else:
         print("⊘ v2ray_egress.socks_port 字段已存在，跳过迁移")
+
+
+def migrate_admin_auth(conn: sqlite3.Connection):
+    """确保 admin_auth 表存在（用于现有数据库迁移）"""
+    cursor = conn.cursor()
+
+    # 检查 admin_auth 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_auth'")
+    if cursor.fetchone():
+        print("⊘ admin_auth 表已存在，跳过迁移")
+        return
+
+    # 创建表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admin_auth (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    print("✓ 创建 admin_auth 表")
 
 
 def generate_wireguard_private_key() -> str:
@@ -660,6 +691,7 @@ def main():
     migrate_openvpn_egress_crl_verify(conn)
     migrate_v2ray_inbound_xray_fields(conn)
     migrate_v2ray_egress_socks_port(conn)
+    migrate_admin_auth(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

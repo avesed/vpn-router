@@ -62,17 +62,33 @@ import type {
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
+const TOKEN_KEY = "vpn_gateway_token";
 
 type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
 async function request<T>(path: string, options: { method?: HttpMethod; body?: unknown } = {}): Promise<T> {
+  const token = localStorage.getItem(TOKEN_KEY);
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
   const response = await fetch(`${API_BASE}${path}`, {
     method: options.method ?? "GET",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
   });
+
+  // 401 Unauthorized - 清除 token 并跳转到登录页
+  if (response.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    window.location.href = "/login";
+    throw new Error("Session expired");
+  }
 
   if (!response.ok) {
     const text = await response.text();

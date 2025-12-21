@@ -23,6 +23,7 @@ API_PID=""
 NGINX_PID=""
 OPENVPN_MGR_PID=""
 XRAY_MGR_PID=""
+XRAY_EGRESS_MGR_PID=""
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
