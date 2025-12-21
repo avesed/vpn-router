@@ -106,7 +106,8 @@ COPY config /etc/sing-box/
 
 # Copy default config to a separate location (not affected by volume mount)
 # This allows first-run initialization of geodata database and catalogs
-COPY config/geoip-geodata.db /opt/default-config/geoip-geodata.db
+# Note: geoip-geodata.db moved to geodata/ to avoid duplication in COPY config /etc/sing-box/
+COPY geodata/geoip-geodata.db /opt/default-config/geoip-geodata.db
 COPY config/sing-box.json /opt/default-config/sing-box.json
 COPY config/domain-catalog.json /opt/default-config/domain-catalog.json
 

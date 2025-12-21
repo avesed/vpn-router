@@ -2,21 +2,23 @@ services:
   vpn-gateway:
     container_name: vpn-gateway
     image: ghcr.io/avesed/vpn-router:latest
+    privileged: true
+    network_mode: host
     # Required for kernel WireGuard + TPROXY
     # security_opt disables seccomp/apparmor restrictions needed for TPROXY
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    security_opt:
-      - seccomp:unconfined
-      - apparmor:unconfined
-    sysctls:
-      - net.ipv4.ip_forward=1
-      - net.ipv4.conf.all.src_valid_mark=1
-      - net.ipv4.ip_nonlocal_bind=1
-      - net.ipv4.conf.all.rp_filter=0
-      - net.ipv4.conf.default.rp_filter=0
-      - net.ipv4.conf.lo.rp_filter=0
+    #cap_add:
+    #  - NET_ADMIN
+    #  - NET_RAW
+    #security_opt:
+    #  - seccomp:unconfined
+    #  - apparmor:unconfined
+    #sysctls:
+    #  - net.ipv4.ip_forward=1
+    #  - net.ipv4.conf.all.src_valid_mark=1
+    #  - net.ipv4.ip_nonlocal_bind=1
+    #  - net.ipv4.conf.all.rp_filter=0
+    #  - net.ipv4.conf.default.rp_filter=0
+    #  - net.ipv4.conf.lo.rp_filter=0
     environment:
       - TZ=America/New_York
       - DISABLE_IPV6=1
@@ -25,9 +27,9 @@ services:
       - WG_SERVER_ENDPOINT=${WG_SERVER_ENDPOINT:-}
       - WEB_PORT=${WEB_PORT:-36000}
       - WG_LISTEN_PORT=${WG_LISTEN_PORT:-36100}
-    ports:
-      - "${WEB_PORT:-36000}:${WEB_PORT:-36000}"           # Web UI
-      - "${WG_LISTEN_PORT:-36100}:${WG_LISTEN_PORT:-36100}/udp"  # WireGuard
+    #ports:
+    #  - "${WEB_PORT:-36000}:${WEB_PORT:-36000}"           # Web UI
+    #  - "${WG_LISTEN_PORT:-36100}:${WG_LISTEN_PORT:-36100}/udp"  # WireGuard
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
