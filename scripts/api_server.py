@@ -3180,6 +3180,111 @@ def api_list_all_egress():
     return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result}
 
 
+# ============ Kernel WireGuard Egress Interface APIs ============
+
+@app.get("/api/egress/wg/interfaces")
+def api_list_wg_egress_interfaces():
+    """List all kernel WireGuard egress interfaces status
+
+    Shows status of wg-pia-* and wg-eg-* interfaces created for PIA and custom WireGuard egress.
+    """
+    try:
+        from setup_kernel_wg_egress import get_all_egress_status, get_existing_egress_interfaces
+        interfaces = get_existing_egress_interfaces()
+        statuses = get_all_egress_status()
+
+        result = []
+        for iface in interfaces:
+            status = statuses.get(iface, {})
+            # Extract peer info
+            peers = status.get("peers", [])
+            peer_info = None
+            if peers:
+                peer = peers[0]
+                peer_info = {
+                    "endpoint": peer.get("endpoint"),
+                    "allowed_ips": peer.get("allowed_ips"),
+                    "latest_handshake": peer.get("latest_handshake"),
+                    "transfer": {
+                        "rx": peer.get("rx"),
+                        "tx": peer.get("tx")
+                    }
+                }
+
+            result.append({
+                "interface": iface,
+                "public_key": status.get("interface", {}).get("public_key"),
+                "listen_port": status.get("interface", {}).get("listen_port"),
+                "peer": peer_info
+            })
+
+        return {"interfaces": result}
+    except ImportError:
+        raise HTTPException(status_code=500, detail="setup_kernel_wg_egress module not available")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/egress/wg/sync")
+def api_sync_wg_egress_interfaces():
+    """Sync kernel WireGuard egress interfaces with database
+
+    Creates missing interfaces and removes stale ones.
+    """
+    try:
+        from setup_kernel_wg_egress import setup_all_egress_interfaces
+        result = setup_all_egress_interfaces()
+
+        if result.get("success"):
+            # Regenerate sing-box config to update direct outbounds
+            _regenerate_and_reload()
+
+        return {
+            "success": result.get("success"),
+            "interfaces": result.get("interfaces", []),
+            "created": result.get("created", 0),
+            "updated": result.get("updated", 0),
+            "removed": result.get("removed", 0),
+            "failed": result.get("failed", 0)
+        }
+    except ImportError:
+        raise HTTPException(status_code=500, detail="setup_kernel_wg_egress module not available")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/egress/wg/interface/{interface}")
+def api_get_wg_egress_interface(interface: str):
+    """Get status of a specific kernel WireGuard egress interface"""
+    import subprocess
+
+    # Validate interface name (must start with wg-pia- or wg-eg-)
+    if not interface.startswith("wg-pia-") and not interface.startswith("wg-eg-"):
+        raise HTTPException(status_code=400, detail="Invalid interface name. Must start with wg-pia- or wg-eg-")
+
+    try:
+        result = subprocess.run(
+            ["wg", "show", interface],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(status_code=404, detail=f"Interface {interface} not found")
+
+        # Parse wg show output
+        from setup_kernel_wg_egress import parse_wg_show_output
+        status = parse_wg_show_output(result.stdout)
+
+        return {"interface": interface, "status": status}
+    except ImportError:
+        # Fallback: return raw output
+        return {"interface": interface, "raw_output": result.stdout}
+    except subprocess.SubprocessError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to query interface: {e}")
+
+
 @app.get("/api/egress/custom")
 def api_list_custom_egress():
     """列出所有自定义出口"""
@@ -3831,11 +3936,13 @@ def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
         multiplex_max_streams=payload.multiplex_max_streams,
     )
 
-    # 重新渲染配置并重载
+    # 重新渲染配置并重载 sing-box 和 Xray egress
     reload_status = ""
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
+        # 重载 Xray egress manager（启动新的出口）
+        reload_status += _reload_xray_egress()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -3897,11 +4004,13 @@ def api_update_v2ray_egress(tag: str, payload: V2RayEgressUpdateRequest):
     if updates:
         db.update_v2ray_egress(tag, **updates)
 
-    # 重新渲染配置并重载
+    # 重新渲染配置并重载 sing-box 和 Xray egress
     reload_status = ""
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
+        # 重载 Xray egress manager（更新出口配置）
+        reload_status += _reload_xray_egress()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -3921,11 +4030,13 @@ def api_delete_v2ray_egress(tag: str):
     # 删除
     db.delete_v2ray_egress(tag)
 
-    # 重新渲染配置并重载
+    # 重新渲染配置并重载 sing-box 和 Xray egress
     reload_status = ""
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
+        # 重载 Xray egress manager（移除出口）
+        reload_status += _reload_xray_egress()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -4407,6 +4518,80 @@ def api_generate_reality_keys():
         raise HTTPException(status_code=500, detail="Key generation timeout")
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ Xray Egress Control APIs ============
+
+@app.get("/api/egress/xray/status")
+def api_get_xray_egress_status():
+    """获取 Xray 出站进程状态"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_egress_manager.py", "status"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            status = json.loads(result.stdout)
+            return {
+                "running": status.get("status") == "running",
+                "pid": status.get("pid"),
+                "egress_count": status.get("egress_count", 0),
+                "socks_ports": status.get("socks_ports", [])
+            }
+        else:
+            return {"running": False, "egress_count": 0, "socks_ports": [],
+                    "message": result.stderr}
+    except subprocess.TimeoutExpired:
+        return {"running": False, "egress_count": 0, "socks_ports": [],
+                "message": "Timeout"}
+    except Exception as e:
+        return {"running": False, "egress_count": 0, "socks_ports": [],
+                "message": str(e)}
+
+
+@app.post("/api/egress/xray/restart")
+def api_restart_xray_egress():
+    """重启 Xray 出站进程"""
+    import subprocess
+    try:
+        # 先停止
+        subprocess.run(
+            ["python3", "/usr/local/bin/xray_egress_manager.py", "stop"],
+            capture_output=True, timeout=10
+        )
+        # 再启动
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_egress_manager.py", "start"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return {"message": "Xray egress restarted successfully"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to start Xray egress: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Xray egress restart timeout")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/egress/xray/reload")
+def api_reload_xray_egress():
+    """重载 Xray 出站配置"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return {"message": "Xray egress config reloaded successfully"}
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to reload Xray egress: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Xray egress reload timeout")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5049,6 +5234,32 @@ def _regenerate_and_reload():
     if not reload_result.get("success"):
         error_msg = reload_result.get("message", "未知错误")
         raise RuntimeError(f"配置重载失败: {error_msg}")
+
+
+def _reload_xray_egress() -> str:
+    """重载 Xray 出站进程（如果正在运行）
+
+    Returns:
+        状态消息
+    """
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            print("[api] Xray egress reloaded")
+            return ", Xray egress reloaded"
+        else:
+            # 可能没有运行，不算错误
+            print(f"[api] Xray egress reload: {result.stderr.strip()}")
+            return ""
+    except subprocess.TimeoutExpired:
+        print("[api] Xray egress reload timeout")
+        return ", Xray egress reload timeout"
+    except Exception as e:
+        print(f"[api] Xray egress reload error: {e}")
+        return ""
 
 
 # ============ Domain List Catalog APIs ============

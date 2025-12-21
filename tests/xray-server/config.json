@@ -1,0 +1,40 @@
+{
+  "log": {
+    "loglevel": "info",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "vless-reality",
+      "port": 20443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "2a62b031-d799-4673-8ff9-55e6c6a5b45c",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "www.microsoft.com:443",
+          "serverNames": ["www.microsoft.com"],
+          "privateKey": "SAxuD6WUnQ0LQNGFZ100q9fB5EnR2jSylgBBORcJVnc",
+          "shortIds": ["abcd1234"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}

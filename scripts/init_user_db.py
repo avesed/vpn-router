@@ -226,6 +226,9 @@ CREATE TABLE IF NOT EXISTS v2ray_egress (
     multiplex_min_streams INTEGER,
     multiplex_max_streams INTEGER,
 
+    -- SOCKS5 代理（由 Xray 提供，sing-box 连接）
+    socks_port INTEGER UNIQUE,            -- 本地 SOCKS5 代理端口 (37101, 37102, ...)
+
     -- 其他
     enabled INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -424,6 +427,30 @@ def migrate_v2ray_inbound_xray_fields(conn: sqlite3.Connection):
         conn.commit()
     else:
         print("⊘ v2ray_inbound_config Xray 字段已存在，跳过迁移")
+
+
+def migrate_v2ray_egress_socks_port(conn: sqlite3.Connection):
+    """为现有 v2ray_egress 表添加 socks_port 字段"""
+    cursor = conn.cursor()
+
+    # 检查 v2ray_egress 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='v2ray_egress'")
+    if not cursor.fetchone():
+        print("⊘ v2ray_egress 表不存在，跳过 socks_port 迁移")
+        return
+
+    # 检查是否需要迁移（检查 socks_port 列是否存在）
+    cursor.execute("PRAGMA table_info(v2ray_egress)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "socks_port" not in columns:
+        # 注意: SQLite 的 ALTER TABLE 不支持 UNIQUE 约束，只能添加普通列
+        # 端口唯一性由 db_helper.get_next_v2ray_egress_socks_port() 保证
+        cursor.execute("ALTER TABLE v2ray_egress ADD COLUMN socks_port INTEGER")
+        conn.commit()
+        print("✓ 添加 v2ray_egress.socks_port 字段")
+    else:
+        print("⊘ v2ray_egress.socks_port 字段已存在，跳过迁移")
 
 
 def generate_wireguard_private_key() -> str:
@@ -632,6 +659,7 @@ def main():
     migrate_wireguard_peers_lan_fields(conn)
     migrate_openvpn_egress_crl_verify(conn)
     migrate_v2ray_inbound_xray_fields(conn)
+    migrate_v2ray_egress_socks_port(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

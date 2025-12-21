@@ -178,8 +178,27 @@ setup_tproxy_routing() {
   echo "[entrypoint] TPROXY configured: ${WG_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
 }
 
-# Setup kernel WireGuard before other services
+# Setup kernel WireGuard ingress before other services
 setup_kernel_wireguard
+
+# === Kernel WireGuard Egress Setup ===
+# Creates wg-pia-* and wg-eg-* interfaces for outbound traffic
+
+setup_kernel_wireguard_egress() {
+  echo "[entrypoint] setting up kernel WireGuard egress interfaces"
+
+  # Apply WireGuard egress config from database
+  if ! python3 /usr/local/bin/setup_kernel_wg_egress.py; then
+    echo "[entrypoint] warning: failed to setup kernel WireGuard egress" >&2
+    # Don't fail the container, just log the warning
+    return 0
+  fi
+
+  echo "[entrypoint] kernel WireGuard egress interfaces ready"
+}
+
+# Setup kernel WireGuard egress interfaces (PIA + custom)
+setup_kernel_wireguard_egress
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
@@ -292,6 +311,28 @@ print('1' if config and config.get('enabled') else '0')
   fi
 }
 
+start_xray_egress_manager() {
+  # 检查是否有启用的 V2Ray 出口
+  local egress_count
+  egress_count=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+egress_list = db.get_v2ray_egress_list(enabled_only=True)
+print(len(egress_list))
+" 2>/dev/null || echo "0")
+
+  if [ "${egress_count}" -gt "0" ]; then
+    echo "[entrypoint] starting Xray egress manager for ${egress_count} V2Ray egress"
+    python3 /usr/local/bin/xray_egress_manager.py daemon >/var/log/xray-egress-manager.log 2>&1 &
+    XRAY_EGRESS_MGR_PID=$!
+    echo "[entrypoint] Xray egress manager started with PID ${XRAY_EGRESS_MGR_PID}"
+  else
+    echo "[entrypoint] No V2Ray egress configured, skipping Xray egress manager"
+  fi
+}
+
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
 
@@ -351,6 +392,7 @@ start_api_server
 start_nginx
 start_openvpn_manager
 start_xray_manager
+start_xray_egress_manager
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -459,10 +501,16 @@ while true; do
     start_openvpn_manager
   fi
 
-  # Check Xray manager
+  # Check Xray manager (ingress)
   if [ -n "${XRAY_MGR_PID}" ] && ! kill -0 "${XRAY_MGR_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: Xray manager died, restarting..." >&2
     start_xray_manager
+  fi
+
+  # Check Xray egress manager
+  if [ -n "${XRAY_EGRESS_MGR_PID}" ] && ! kill -0 "${XRAY_EGRESS_MGR_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: Xray egress manager died, restarting..." >&2
+    start_xray_egress_manager
   fi
 
   # Check sing-box

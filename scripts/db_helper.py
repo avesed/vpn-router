@@ -13,6 +13,31 @@ from typing import List, Dict, Optional, Any
 from contextlib import contextmanager
 
 
+# WireGuard egress interface naming constants
+WG_PIA_PREFIX = "wg-pia-"     # 8 chars, leaves 7 for tag
+WG_CUSTOM_PREFIX = "wg-eg-"   # 6 chars, leaves 9 for tag
+WG_MAX_IFACE_LEN = 15         # Linux interface name limit
+
+
+def get_egress_interface_name(tag: str, is_pia: bool) -> str:
+    """Generate kernel WireGuard interface name for egress
+
+    Naming convention:
+    - PIA profiles: wg-pia-{tag} (e.g., wg-pia-new_york)
+    - Custom egress: wg-eg-{tag} (e.g., wg-eg-cn2-la)
+
+    Args:
+        tag: The egress profile tag/name
+        is_pia: True for PIA profiles, False for custom egress
+
+    Returns:
+        Interface name, max 15 characters (Linux limit)
+    """
+    prefix = WG_PIA_PREFIX if is_pia else WG_CUSTOM_PREFIX
+    max_tag_len = WG_MAX_IFACE_LEN - len(prefix)
+    return f"{prefix}{tag[:max_tag_len]}"
+
+
 class GeodataDatabase:
     """地理位置和域名数据库（只读）"""
 
@@ -1159,6 +1184,20 @@ class UserDatabase:
 
     # ============ V2Ray Egress 管理（支持 VMess, VLESS, Trojan）============
 
+    V2RAY_EGRESS_SOCKS_PORT_START = 37101  # SOCKS 端口起始值（与 OpenVPN 37001 错开）
+
+    def get_next_v2ray_egress_socks_port(self) -> int:
+        """获取下一个可用的 SOCKS 端口（从 37101 开始）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(socks_port) FROM v2ray_egress"
+            ).fetchone()
+            max_port = row[0] if row and row[0] else None
+            if max_port is None:
+                return self.V2RAY_EGRESS_SOCKS_PORT_START
+            return max_port + 1
+
     def get_v2ray_egress_list(self, enabled_only: bool = False, protocol: Optional[str] = None) -> List[Dict]:
         """获取所有 V2Ray 出口
 
@@ -1257,6 +1296,8 @@ class UserDatabase:
         Returns:
             新创建记录的 ID
         """
+        # 自动分配 SOCKS 端口
+        socks_port = self.get_next_v2ray_egress_socks_port()
         tls_alpn_json = json.dumps(tls_alpn) if tls_alpn else None
         transport_config_json = json.dumps(transport_config) if transport_config else None
 
@@ -1270,8 +1311,8 @@ class UserDatabase:
                  reality_enabled, reality_public_key, reality_short_id,
                  transport_type, transport_config,
                  multiplex_enabled, multiplex_protocol, multiplex_max_connections,
-                 multiplex_min_streams, multiplex_max_streams)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 multiplex_min_streams, multiplex_max_streams, socks_port)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (tag, description, protocol, server, server_port,
                   uuid, password, security, alter_id, flow,
                   1 if tls_enabled else 0, tls_sni, tls_alpn_json,
@@ -1279,7 +1320,7 @@ class UserDatabase:
                   1 if reality_enabled else 0, reality_public_key, reality_short_id,
                   transport_type, transport_config_json,
                   1 if multiplex_enabled else 0, multiplex_protocol, multiplex_max_connections,
-                  multiplex_min_streams, multiplex_max_streams))
+                  multiplex_min_streams, multiplex_max_streams, socks_port))
             conn.commit()
             return cursor.lastrowid
 
@@ -1292,7 +1333,7 @@ class UserDatabase:
             "reality_enabled", "reality_public_key", "reality_short_id",
             "transport_type", "transport_config",
             "multiplex_enabled", "multiplex_protocol", "multiplex_max_connections",
-            "multiplex_min_streams", "multiplex_max_streams", "enabled"
+            "multiplex_min_streams", "multiplex_max_streams", "socks_port", "enabled"
         }
         updates = []
         values = []
@@ -1783,6 +1824,9 @@ class DatabaseManager:
 
     def get_v2ray_egress(self, tag: str) -> Optional[Dict]:
         return self.user.get_v2ray_egress(tag)
+
+    def get_next_v2ray_egress_socks_port(self) -> int:
+        return self.user.get_next_v2ray_egress_socks_port()
 
     def add_v2ray_egress(
         self,

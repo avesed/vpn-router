@@ -20,10 +20,15 @@ import yaml
 # 尝试导入数据库模块（如果可用）
 try:
     sys.path.insert(0, '/usr/local/bin')
-    from db_helper import get_db
+    from db_helper import get_db, get_egress_interface_name
     HAS_DATABASE = True
 except ImportError:
     HAS_DATABASE = False
+
+    # Fallback if db_helper not available
+    def get_egress_interface_name(tag: str, is_pia: bool) -> str:
+        prefix = "wg-pia-" if is_pia else "wg-eg-"
+        return f"{prefix}{tag[:15 - len(prefix)]}"
 
 # 尝试导入 ABP 转换模块
 try:
@@ -412,6 +417,196 @@ def ensure_endpoints(config: dict, pia_profiles: dict, profile_map: Dict[str, st
             new_ep = _create_wireguard_endpoint(tag, profile, idx)
             endpoints.append(new_ep)
             print(f"[render] 创建新 endpoint: {tag}")
+
+
+# ============ 内核 WireGuard 出口 (Kernel WireGuard Egress) ============
+#
+# 使用内核 WireGuard 模块而不是 sing-box 用户空间实现：
+# - 更好的性能（内核 vs 用户空间）
+# - wg show 可用于调试
+# - 标准 WireGuard 工具支持
+# - 与入站架构一致
+#
+# 架构：
+# sing-box routing → direct outbound (bind_interface: wg-pia-xxx) → 内核 WireGuard → 远程服务器
+
+
+def ensure_kernel_wg_egress_outbounds(config: dict, pia_profiles: dict, custom_egress: List[dict]) -> List[str]:
+    """为 PIA 和自定义 WireGuard 出口创建 direct outbound（绑定到内核接口）
+
+    替代之前的 sing-box WireGuard endpoints，现在使用：
+    - 内核 WireGuard 接口由 setup_kernel_wg_egress.py 创建
+    - sing-box 使用 direct outbound + bind_interface 将流量发送到内核接口
+
+    Args:
+        config: sing-box 配置
+        pia_profiles: PIA profiles 配置（从数据库加载）
+        custom_egress: 自定义 WireGuard 出口列表
+
+    Returns:
+        所有创建的出口 tag 列表
+    """
+    outbounds = config.setdefault("outbounds", [])
+    endpoints = config.get("endpoints", [])
+    all_tags = []
+
+    # 获取现有的 outbound tags
+    existing_outbound_tags = {ob.get("tag") for ob in outbounds}
+
+    # 获取所有将要创建的 WireGuard 出口 tags
+    wg_egress_tags = set()
+
+    # 处理 PIA profiles
+    profiles_data = pia_profiles.get("profiles", {}) if pia_profiles else {}
+    for name, profile in profiles_data.items():
+        if not profile.get("private_key"):
+            continue  # 跳过没有凭证的 profile
+
+        tag = name  # PIA profile 使用 name 作为 tag
+        interface = get_egress_interface_name(tag, is_pia=True)
+        wg_egress_tags.add(tag)
+        all_tags.append(tag)
+
+        if tag in existing_outbound_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = {
+                        "type": "direct",
+                        "tag": tag,
+                        "bind_interface": interface
+                    }
+                    break
+        else:
+            # 创建新 outbound（在 block/adblock 之前插入）
+            block_idx = next(
+                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
+                len(outbounds)
+            )
+            outbounds.insert(block_idx, {
+                "type": "direct",
+                "tag": tag,
+                "bind_interface": interface
+            })
+            print(f"[render] 创建内核 WireGuard 出口: {tag} (接口: {interface})")
+
+    # 处理自定义 WireGuard 出口
+    for egress in custom_egress:
+        tag = egress.get("tag")
+        if not tag:
+            continue
+
+        interface = get_egress_interface_name(tag, is_pia=False)
+        wg_egress_tags.add(tag)
+        all_tags.append(tag)
+
+        if tag in existing_outbound_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = {
+                        "type": "direct",
+                        "tag": tag,
+                        "bind_interface": interface
+                    }
+                    break
+        else:
+            # 创建新 outbound
+            block_idx = next(
+                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
+                len(outbounds)
+            )
+            outbounds.insert(block_idx, {
+                "type": "direct",
+                "tag": tag,
+                "bind_interface": interface
+            })
+            print(f"[render] 创建内核 WireGuard 出口: {tag} (接口: {interface})")
+
+    # 移除旧的 WireGuard endpoints（如果有的话）
+    # 这些是从旧架构遗留的，现在使用 direct outbound + bind_interface
+    if endpoints:
+        old_count = len(endpoints)
+        config["endpoints"] = [
+            ep for ep in endpoints
+            if ep.get("tag") not in wg_egress_tags or ep.get("type") != "wireguard"
+        ]
+        removed = old_count - len(config.get("endpoints", []))
+        if removed > 0:
+            print(f"[render] 移除了 {removed} 个旧的 WireGuard endpoints（已迁移到内核 WireGuard）")
+
+    # 同时移除旧的 WireGuard outbounds（类型为 wireguard 的）
+    old_count = len(outbounds)
+    config["outbounds"] = [
+        ob for ob in outbounds
+        if ob.get("tag") not in wg_egress_tags or ob.get("type") != "wireguard"
+    ]
+    removed = old_count - len(config["outbounds"])
+    if removed > 0:
+        print(f"[render] 移除了 {removed} 个旧的 WireGuard outbounds（已迁移到内核 WireGuard）")
+
+    return all_tags
+
+
+# ========== Xray V2Ray 出站（SOCKS5 → Xray → 远程 V2Ray 服务器）==========
+# 架构：
+# sing-box routing → SOCKS5 outbound (127.0.0.1:37101) → Xray → 远程 V2Ray 服务器
+#
+# Xray 提供 sing-box 不支持的功能：
+# - XHTTP 传输
+# - REALITY 客户端
+# - XTLS-Vision
+
+
+def ensure_xray_egress_outbounds(config: dict, v2ray_egress: List[dict]) -> List[str]:
+    """为 V2Ray 出口创建 SOCKS5 outbound（连接到 Xray 管理的 SOCKS5 入站）
+
+    Args:
+        config: sing-box 配置
+        v2ray_egress: V2Ray 出口列表（从数据库加载，包含 socks_port）
+
+    Returns:
+        所有创建的出口 tag 列表
+    """
+    outbounds = config.setdefault("outbounds", [])
+    all_tags = []
+
+    # 获取现有的 outbound tags
+    existing_outbound_tags = {ob.get("tag") for ob in outbounds}
+
+    for egress in v2ray_egress:
+        tag = egress.get("tag")
+        socks_port = egress.get("socks_port")
+
+        if not tag or not socks_port:
+            print(f"[render] 跳过无效 V2Ray 出口: {egress}")
+            continue
+
+        all_tags.append(tag)
+
+        socks_outbound = {
+            "type": "socks",
+            "tag": tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port
+        }
+
+        if tag in existing_outbound_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = socks_outbound
+                    break
+        else:
+            # 创建新 outbound（在 block/adblock 之前插入）
+            block_idx = next(
+                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
+                len(outbounds)
+            )
+            outbounds.insert(block_idx, socks_outbound)
+            print(f"[render] 创建 Xray 出口: {tag} (SOCKS5 127.0.0.1:{socks_port})")
+
+    return all_tags
 
 
 def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
@@ -1497,32 +1692,28 @@ def main() -> None:
     # 使用 SOCKS5 代替 WireGuard，避免复杂的路由问题
     ensure_xray_socks_inbound(config)
 
-    # 从数据库加载 PIA profiles
+    # 从数据库加载 PIA profiles 和自定义 WireGuard 出口
     pia_profiles = load_pia_profiles_from_db()
-
-    if pia_profiles and pia_profiles.get("profiles"):
-        # 从数据库构建 profile_map (tag -> name)，保持名称一致
-        profile_map = {}
-        for name in pia_profiles["profiles"].keys():
-            profile_map[name] = name
-
-        print(f"[render] 处理 {len(profile_map)} 个 PIA profiles: {list(profile_map.keys())}")
-
-        # 确保 PIA endpoints 存在
-        ensure_endpoints(config, pia_profiles, profile_map)
-
-        # 确保 PIA DNS 服务器存在
-        ensure_dns_servers(config, profile_map)
-
-        all_egress_tags.extend(profile_map.keys())
-
-    # 加载并处理自定义出口
     custom_egress = load_custom_egress()
-    if custom_egress:
-        print(f"[render] 处理 {len(custom_egress)} 个自定义出口")
-        custom_tags = ensure_custom_egress_endpoints(config, custom_egress)
-        ensure_custom_dns_servers(config, custom_tags)
-        all_egress_tags.extend(custom_tags)
+
+    # 使用内核 WireGuard 模块处理所有 WireGuard 出口
+    # 这些接口由 setup_kernel_wg_egress.py 在容器启动时创建
+    # sing-box 使用 direct outbound + bind_interface 将流量发送到内核接口
+    wg_egress_tags = ensure_kernel_wg_egress_outbounds(config, pia_profiles, custom_egress)
+
+    if wg_egress_tags:
+        print(f"[render] 内核 WireGuard 出口: {wg_egress_tags}")
+        all_egress_tags.extend(wg_egress_tags)
+
+        # 确保 DNS 服务器存在
+        if pia_profiles and pia_profiles.get("profiles"):
+            profile_map = {name: name for name in pia_profiles["profiles"].keys()
+                          if pia_profiles["profiles"][name].get("private_key")}
+            ensure_dns_servers(config, profile_map)
+
+        if custom_egress:
+            custom_tags = [e.get("tag") for e in custom_egress if e.get("tag")]
+            ensure_custom_dns_servers(config, custom_tags)
 
     # 加载并处理 direct 出口（绑定特定接口/IP）
     direct_egress = load_direct_egress()
@@ -1540,19 +1731,18 @@ def main() -> None:
         all_egress_tags.extend(openvpn_tags)
 
     # 加载并处理 V2Ray 出口（支持 VMess, VLESS, Trojan）
+    # 使用 Xray 进程处理所有 V2Ray 出口，通过 SOCKS5 代理桥接
+    # Xray 提供 sing-box 不支持的功能：XHTTP, REALITY, XTLS-Vision
     v2ray_egress = load_v2ray_egress()
     if v2ray_egress:
-        print(f"[render] 处理 {len(v2ray_egress)} 个 V2Ray 出口")
-        v2ray_tags = ensure_v2ray_egress_outbounds(config, v2ray_egress)
+        print(f"[render] 处理 {len(v2ray_egress)} 个 V2Ray 出口 (通过 Xray SOCKS5)")
+        v2ray_tags = ensure_xray_egress_outbounds(config, v2ray_egress)
         ensure_v2ray_dns_servers(config, v2ray_tags)
         all_egress_tags.extend(v2ray_tags)
 
     # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + V2Ray）
-    speedtest_tags = []
-    if pia_profiles and pia_profiles.get("profiles"):
-        speedtest_tags.extend(pia_profiles["profiles"].keys())
-    if custom_egress:
-        speedtest_tags.extend([e.get("tag") for e in custom_egress if e.get("tag")])
+    # wg_egress_tags 已包含 PIA 和自定义 WireGuard 出口
+    speedtest_tags = list(wg_egress_tags) if wg_egress_tags else []
     if v2ray_egress:
         speedtest_tags.extend([e.get("tag") for e in v2ray_egress if e.get("tag") and e.get("enabled", 1)])
 
