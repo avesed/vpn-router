@@ -167,38 +167,6 @@ def ensure_wireguard_server_endpoint(config: dict) -> bool:
     return ensure_tproxy_inbound(config)
 
 
-# Xray SOCKS5 入站端口 (Xray 通过此端口连接 sing-box)
-XRAY_SOCKS_PORT = 7891
-
-
-def ensure_xray_socks_inbound(config: dict) -> bool:
-    """确保 Xray 专用的 SOCKS5 入口存在
-
-    Xray 通过 SOCKS5 连接到 sing-box，避免 WireGuard 路由问题。
-    架构: V2Ray Client -> Xray -> SOCKS5 (127.0.0.1:7891) -> sing-box 路由
-    """
-    inbounds = config.setdefault("inbounds", [])
-
-    # 检查是否已存在
-    existing = [ib for ib in inbounds if ib.get("tag") == "xray-socks-in"]
-    if existing:
-        return True
-
-    # 创建 SOCKS5 入站
-    socks_inbound = {
-        "type": "socks",
-        "tag": "xray-socks-in",
-        "listen": "127.0.0.1",
-        "listen_port": XRAY_SOCKS_PORT,
-        "sniff": True,
-        "sniff_override_destination": False,
-        "udp_timeout": "5m"
-    }
-    inbounds.append(socks_inbound)
-    print(f"[render] 创建 Xray SOCKS5 入口: xray-socks-in (127.0.0.1:{XRAY_SOCKS_PORT})")
-    return True
-
-
 def ensure_sniff_action(config: dict) -> None:
     """确保路由规则中有 sniff 动作和 DNS 劫持，支持域名匹配和协议检测
 

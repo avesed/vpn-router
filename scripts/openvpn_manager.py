@@ -152,6 +152,12 @@ class OpenVPNManager:
             os.chmod(tc_path, 0o600)
             config_lines.append(f"tls-crypt {tc_path}")
 
+        # CRL 验证（可选）
+        if egress.get("crl_verify"):
+            crl_path = config_dir / "crl.pem"
+            crl_path.write_text(egress["crl_verify"])
+            config_lines.append(f"crl-verify {crl_path}")
+
         # 用户名/密码认证（可选）
         if egress.get("auth_user") and egress.get("auth_pass"):
             auth_path = config_dir / "auth.txt"

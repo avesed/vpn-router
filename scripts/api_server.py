@@ -702,9 +702,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
             db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
             if not db.user.is_admin_setup():
                 return await call_next(request)
-        except Exception:
-            # 数据库错误时允许访问（避免锁死）
-            return await call_next(request)
+        except Exception as e:
+            # 数据库错误时拒绝访问（安全优先，fail-closed）
+            print(f"[AUTH] Database error in auth middleware: {e}")
+            return Response(
+                content='{"error":"Service temporarily unavailable"}',
+                status_code=503,
+                media_type="application/json"
+            )
 
         # 检查 Authorization header
         auth_header = request.headers.get("Authorization")
@@ -2010,9 +2015,11 @@ def api_create_profile(payload: ProfileCreateRequest):
 
         try:
             run_command(["python3", str(provision_script)], env=env)
+            # 同步内核 WireGuard 接口
+            wg_sync_status = _sync_kernel_wg_egress()
             run_command(["python3", str(render_script)], env=env)
             reload_result = reload_singbox()
-            provision_result = {"success": True, "reload": reload_result}
+            provision_result = {"success": True, "reload": reload_result, "wg_sync": wg_sync_status}
         except Exception as exc:
             provision_result = {"success": False, "error": str(exc)}
 
@@ -2067,7 +2074,18 @@ def api_delete_profile(tag: str):
 
     # 从数据库删除
     db.delete_pia_profile(profile["id"])
-    return {"message": f"线路 {tag} 已删除"}
+
+    # 同步内核 WireGuard 接口（清理已删除的接口）并重新渲染配置
+    reload_status = ""
+    try:
+        wg_sync_status = _sync_kernel_wg_egress()
+        _regenerate_and_reload()
+        reload_status = f"，已重载配置{wg_sync_status}"
+    except Exception as exc:
+        print(f"[api] 重载配置失败: {exc}")
+        reload_status = f"，重载失败: {exc}"
+
+    return {"message": f"线路 {tag} 已删除{reload_status}"}
 
 
 # ============ Route Rules Management APIs ============
@@ -3732,11 +3750,12 @@ def api_create_custom_egress(payload: CustomEgressCreateRequest):
         reserved=payload.reserved,
     )
 
-    # 重新渲染配置并重载
+    # 同步内核 WireGuard 接口并重新渲染配置
     reload_status = ""
     try:
+        wg_sync_status = _sync_kernel_wg_egress()
         _regenerate_and_reload()
-        reload_status = "，已重载配置"
+        reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
@@ -3809,11 +3828,12 @@ def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
 
     db.update_custom_egress(tag, **updates)
 
-    # 重新渲染配置并重载
+    # 同步内核 WireGuard 接口并重新渲染配置
     reload_status = ""
     try:
+        wg_sync_status = _sync_kernel_wg_egress()
         _regenerate_and_reload()
-        reload_status = "，已重载配置"
+        reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
@@ -3833,11 +3853,12 @@ def api_delete_custom_egress(tag: str):
     # 删除
     db.delete_custom_egress(tag)
 
-    # 重新渲染配置并重载
+    # 同步内核 WireGuard 接口（清理已删除的接口）并重新渲染配置
     reload_status = ""
     try:
+        wg_sync_status = _sync_kernel_wg_egress()
         _regenerate_and_reload()
-        reload_status = "，已重载配置"
+        reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
@@ -4132,6 +4153,8 @@ def api_create_openvpn_egress(payload: OpenVPNEgressCreateRequest):
     try:
         _regenerate_and_reload()
         reload_status = "，已重载配置"
+        # 重载 OpenVPN 管理器以启动新隧道
+        reload_status += _reload_openvpn_manager()
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
@@ -4167,7 +4190,7 @@ def api_update_openvpn_egress(tag: str, payload: OpenVPNEgressUpdateRequest):
     for field in [
         "description", "protocol", "remote_host", "remote_port",
         "ca_cert", "client_cert", "client_key", "tls_auth", "tls_crypt",
-        "auth_user", "auth_pass", "cipher", "auth", "compress",
+        "crl_verify", "auth_user", "auth_pass", "cipher", "auth", "compress",
         "extra_options", "enabled"
     ]:
         value = getattr(payload, field, None)
@@ -4182,6 +4205,8 @@ def api_update_openvpn_egress(tag: str, payload: OpenVPNEgressUpdateRequest):
     try:
         _regenerate_and_reload()
         reload_status = "，已重载配置"
+        # 重载 OpenVPN 管理器以应用新配置
+        reload_status += _reload_openvpn_manager()
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
@@ -4206,6 +4231,8 @@ def api_delete_openvpn_egress(tag: str):
     try:
         _regenerate_and_reload()
         reload_status = "，已重载配置"
+        # 重载 OpenVPN 管理器以停止已删除的隧道
+        reload_status += _reload_openvpn_manager()
     except Exception as exc:
         print(f"[api] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
@@ -5699,6 +5726,60 @@ def _reload_xray_egress() -> str:
         return ", Xray egress reload timeout"
     except Exception as e:
         print(f"[api] Xray egress reload error: {e}")
+        return ""
+
+
+def _reload_openvpn_manager() -> str:
+    """重载 OpenVPN 管理器守护进程（同步数据库变更）
+
+    Returns:
+        状态消息
+    """
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/openvpn_manager.py", "reload"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            print("[api] OpenVPN manager reloaded")
+            return ", OpenVPN manager reloaded"
+        else:
+            # 可能没有运行，不算错误
+            print(f"[api] OpenVPN manager reload: {result.stderr.strip()}")
+            return ""
+    except subprocess.TimeoutExpired:
+        print("[api] OpenVPN manager reload timeout")
+        return ", OpenVPN manager reload timeout"
+    except Exception as e:
+        print(f"[api] OpenVPN manager reload error: {e}")
+        return ""
+
+
+def _sync_kernel_wg_egress() -> str:
+    """同步内核 WireGuard 出口接口与数据库
+
+    创建/更新/删除 PIA 或自定义出口后调用此函数，
+    确保内核 WireGuard 接口与数据库保持同步。
+
+    Returns:
+        状态消息
+    """
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/setup_kernel_wg_egress.py"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print("[api] Kernel WireGuard egress interfaces synced")
+            return ", WireGuard interfaces synced"
+        else:
+            print(f"[api] WireGuard sync failed: {result.stderr.strip()}")
+            return ", WireGuard sync failed"
+    except subprocess.TimeoutExpired:
+        print("[api] WireGuard sync timeout")
+        return ", WireGuard sync timeout"
+    except Exception as e:
+        print(f"[api] WireGuard sync error: {e}")
         return ""
 
 
