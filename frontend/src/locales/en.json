@@ -80,8 +80,6 @@
     "system": "System",
     "piaLogin": "PIA Login",
     "piaLoginDesc": "Credential management",
-    "endpoints": "Exit Endpoints",
-    "endpointsDesc": "Exit parameters",
     "backup": "Backup",
     "backupDesc": "Import/Export config",
     "systemOnline": "System Online",
@@ -380,16 +378,6 @@
       "settingsDesc": "Server public address and other settings"
     }
   },
-  "endpoints": {
-    "title": "Exit Endpoints",
-    "subtitle": "View and adjust VPN exit underlying parameters (MTU, keys, etc.)",
-    "noEndpoints": "No exit endpoints found",
-    "checkConfig": "Please add PIA or custom egress in Egress Manager first",
-    "loadingEndpoints": "Loading endpoint configuration...",
-    "restartNote": "After modifying endpoint configuration, restart sing-box service for changes to take effect",
-    "endpoint": "Endpoint",
-    "wireguard": "WIREGUARD"
-  },
   "catalog": {
     "title": "Rule Catalog",
     "subtitle": "Quickly create routing rules from preset rules",
@@ -624,6 +612,17 @@
     "updateSuccess": "Direct egress '{{tag}}' updated",
     "deleteSuccess": "Direct egress '{{tag}}' deleted",
     "confirmDelete": "Are you sure you want to delete direct egress '{{tag}}'?"
+  },
+  "directDefault": {
+    "default": "Default",
+    "description": "Default direct outbound (no binding)",
+    "editTitle": "Edit Default Direct DNS",
+    "dnsServers": "DNS Servers",
+    "dnsPlaceholder": "1.1.1.1, 8.8.8.8",
+    "dnsHint": "Multiple DNS servers separated by comma or space",
+    "dnsNote": "This DNS is used for all traffic through the default direct outbound. Config regeneration required after changes.",
+    "dnsRequired": "Please specify at least one DNS server",
+    "saveSuccess": "DNS settings saved, config regenerated"
   },
   "openvpnEgress": {
     "title": "OpenVPN Egress",

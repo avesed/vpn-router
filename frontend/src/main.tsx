@@ -5,7 +5,6 @@ import { AuthProvider } from "./contexts/AuthContext";
 import ProtectedRoute from "./components/ProtectedRoute";
 import App from "./App";
 import Dashboard from "./pages/Dashboard";
-import Endpoints from "./pages/Endpoints";
 import PiaLogin from "./pages/PiaLogin";
 import EgressManager from "./pages/EgressManager";
 import RouteRules from "./pages/RouteRules";
@@ -43,7 +42,6 @@ const router = createBrowserRouter([
       { path: "domain-catalog", element: <DomainCatalog /> },
       { path: "ip-catalog", element: <IpCatalog /> },
       { path: "adblock", element: <AdBlock /> },
-      { path: "endpoints", element: <Endpoints /> },
       { path: "pia", element: <PiaLogin /> },
       { path: "backup", element: <BackupRestore /> }
     ]

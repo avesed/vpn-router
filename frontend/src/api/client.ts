@@ -295,6 +295,14 @@ export const api = {
   deleteDirectEgress: (tag: string) =>
     request<{ message: string }>(`/egress/direct/${encodeURIComponent(tag)}`, { method: "DELETE" }),
 
+  // Direct Default (默认直连出口 DNS 配置)
+  getDirectDefault: () => request<{ tag: string; type: string; description: string; dns_servers: string[]; is_default: boolean }>("/egress/direct-default"),
+  updateDirectDefault: (dns_servers: string[]) =>
+    request<{ success: boolean; message: string; dns_servers: string[] }>("/egress/direct-default", {
+      method: "PUT",
+      body: { dns_servers }
+    }),
+
   // OpenVPN Egress Management (通过 SOCKS5 代理桥接)
   getOpenVPNEgress: () => request<OpenVPNEgressListResponse>("/egress/openvpn"),
   getOpenVPNEgressByTag: (tag: string) =>

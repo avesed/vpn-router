@@ -1877,7 +1877,10 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
             updates["mtu"] = payload.mtu
         if updates:
             db.update_wireguard_server(**updates)
-        return {"message": f"endpoint {tag} updated"}
+            # 同步内核 WireGuard 入口接口
+            sync_msg = _sync_kernel_wg_ingress()
+            return {"message": f"endpoint {tag} updated{sync_msg}"}
+        return {"message": f"endpoint {tag} updated (no changes)"}
 
     # 检查是否是 PIA profile
     pia_profiles = db.get_pia_profiles(enabled_only=False)
@@ -1901,7 +1904,14 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
                 updates["mtu"] = payload.mtu
             if updates:
                 db.update_custom_egress(tag, **updates)
-            return {"message": f"endpoint {tag} updated"}
+                # 同步内核 WireGuard 出口接口并重载 sing-box
+                wg_sync_msg = _sync_kernel_wg_egress()
+                try:
+                    _regenerate_and_reload()
+                    return {"message": f"endpoint {tag} updated{wg_sync_msg}, config reloaded"}
+                except Exception as e:
+                    return {"message": f"endpoint {tag} updated{wg_sync_msg}, reload failed: {e}"}
+            return {"message": f"endpoint {tag} updated (no changes)"}
 
     raise HTTPException(status_code=404, detail=f"endpoint {tag} not found")
 
@@ -3595,6 +3605,100 @@ def api_list_all_egress():
         })
 
     return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result}
+
+
+# ============ Default Direct Outbound DNS APIs ============
+
+@app.get("/api/egress/direct-default")
+def api_get_direct_default():
+    """获取默认 direct 出口的配置（包括 DNS 设置）"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 从 settings 表读取 DNS 配置
+    dns_servers_json = db.get_setting("direct_dns_servers", "[]")
+    try:
+        dns_servers = json.loads(dns_servers_json)
+    except json.JSONDecodeError:
+        dns_servers = []
+
+    # 如果没有配置，返回默认值
+    if not dns_servers:
+        dns_servers = ["1.1.1.1"]
+
+    return {
+        "tag": "direct",
+        "type": "direct",
+        "description": "Default direct outbound",
+        "dns_servers": dns_servers,
+        "is_default": True
+    }
+
+
+class DirectDefaultUpdate(BaseModel):
+    dns_servers: List[str]
+
+
+@app.put("/api/egress/direct-default")
+def api_update_direct_default(data: DirectDefaultUpdate):
+    """更新默认 direct 出口的 DNS 设置
+
+    支持的格式:
+    - IP 地址: 8.8.8.8, 2001:4860:4860::8888
+    - 域名: dns.google
+    - DoH: https://dns.google/dns-query
+    - DoT: tls://dns.google
+    - DoQ: quic://dns.adguard.com
+    - DoH3: h3://dns.google/dns-query
+    """
+    if not data.dns_servers:
+        raise HTTPException(status_code=400, detail="At least one DNS server is required")
+
+    import re
+    import ipaddress
+    from urllib.parse import urlparse
+
+    # 支持的 DNS URL 协议
+    DNS_URL_SCHEMES = {'https', 'tls', 'quic', 'h3'}
+    domain_pattern = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
+
+    for server in data.dns_servers:
+        # 检查 DNS URL 格式（DoH/DoT/DoQ）
+        if '://' in server:
+            parsed = urlparse(server)
+            if parsed.scheme not in DNS_URL_SCHEMES:
+                raise HTTPException(status_code=400, detail=f"Unsupported DNS scheme: {parsed.scheme}")
+            if not parsed.netloc:
+                raise HTTPException(status_code=400, detail=f"Invalid DNS URL: {server}")
+            continue  # 有效的 DNS URL
+
+        # 检查 IP 地址（IPv4/IPv6）
+        try:
+            ipaddress.ip_address(server)
+            continue  # 有效的 IP 地址
+        except ValueError:
+            pass
+
+        # 检查域名格式
+        if not domain_pattern.match(server):
+            raise HTTPException(status_code=400, detail=f"Invalid DNS server format: {server}")
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db.set_setting("direct_dns_servers", json.dumps(data.dns_servers))
+
+    # 重新生成配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Direct default DNS reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "success": True,
+        "message": f"Direct DNS updated{reload_status}",
+        "dns_servers": data.dns_servers
+    }
 
 
 # ============ Kernel WireGuard Egress Interface APIs ============
@@ -5824,6 +5928,37 @@ def _sync_kernel_wg_egress() -> str:
         return ", WireGuard sync timeout"
     except Exception as e:
         print(f"[api] WireGuard sync error: {e}")
+        return ""
+
+
+def _sync_kernel_wg_ingress() -> str:
+    """同步内核 WireGuard 入口接口与数据库
+
+    更新 WireGuard 服务器配置后调用此函数，
+    确保内核 wg-ingress 接口与数据库保持同步。
+
+    注意: 不使用 --sync-only，因为需要应用服务器配置更改
+    (private_key, listen_port, address, mtu)
+
+    Returns:
+        状态消息
+    """
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/setup_kernel_wg.py"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print("[api] Kernel WireGuard ingress interface synced")
+            return ", WireGuard ingress synced"
+        else:
+            print(f"[api] WireGuard ingress sync failed: {result.stderr.strip()}")
+            return ", WireGuard ingress sync failed"
+    except subprocess.TimeoutExpired:
+        print("[api] WireGuard ingress sync timeout")
+        return ", WireGuard ingress sync timeout"
+    except Exception as e:
+        print(f"[api] WireGuard ingress sync error: {e}")
         return ""
 
 

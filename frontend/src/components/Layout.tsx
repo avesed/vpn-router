@@ -3,7 +3,6 @@ import { Link, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   ChartBarIcon,
-  CogIcon,
   LockClosedIcon,
   ShieldCheckIcon,
   ShieldExclamationIcon,
@@ -62,7 +61,6 @@ const navGroups: NavGroup[] = [
     icon: WrenchScrewdriverIcon,
     items: [
       { labelKey: "nav.piaLogin", path: "/pia", icon: LockClosedIcon, descriptionKey: "nav.piaLoginDesc" },
-      { labelKey: "nav.endpoints", path: "/endpoints", icon: CogIcon, descriptionKey: "nav.endpointsDesc" },
       { labelKey: "nav.backup", path: "/backup", icon: CloudArrowUpIcon, descriptionKey: "nav.backupDesc" }
     ]
   }

@@ -80,8 +80,6 @@
     "system": "系统设置",
     "piaLogin": "PIA 登录",
     "piaLoginDesc": "凭证管理",
-    "endpoints": "出口端点",
-    "endpointsDesc": "出口参数配置",
     "backup": "备份恢复",
     "backupDesc": "配置导入导出",
     "systemOnline": "系统在线",
@@ -380,16 +378,6 @@
       "settingsDesc": "服务器公网地址等设置"
     }
   },
-  "endpoints": {
-    "title": "出口端点",
-    "subtitle": "查看和调整 VPN 出口的底层参数（MTU、密钥等）",
-    "noEndpoints": "未找到出口端点",
-    "checkConfig": "请先在出口管理中添加 PIA 或自定义出口",
-    "loadingEndpoints": "加载端点配置中...",
-    "restartNote": "修改端点配置后，建议重启 sing-box 服务以使更改生效",
-    "endpoint": "端点",
-    "wireguard": "WIREGUARD"
-  },
   "catalog": {
     "title": "规则库",
     "subtitle": "从预置规则快速创建路由规则",
@@ -624,6 +612,17 @@
     "updateSuccess": "Direct 出口 '{{tag}}' 已更新",
     "deleteSuccess": "Direct 出口 '{{tag}}' 已删除",
     "confirmDelete": "确定要删除 Direct 出口 '{{tag}}' 吗？"
+  },
+  "directDefault": {
+    "default": "默认",
+    "description": "默认直连出口（无绑定）",
+    "editTitle": "编辑默认直连 DNS",
+    "dnsServers": "DNS 服务器",
+    "dnsPlaceholder": "223.5.5.5, 114.114.114.114",
+    "dnsHint": "多个 DNS 服务器用逗号或空格分隔",
+    "dnsNote": "此 DNS 用于所有通过默认 direct 出口的流量。修改后需要重新生成配置。",
+    "dnsRequired": "请至少指定一个 DNS 服务器",
+    "saveSuccess": "DNS 设置已保存，配置已重新生成"
   },
   "openvpnEgress": {
     "title": "OpenVPN 出口",

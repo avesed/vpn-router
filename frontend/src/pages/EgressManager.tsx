@@ -106,6 +106,11 @@ export default function EgressManager() {
   const [directFormInet4Address, setDirectFormInet4Address] = useState("");
   const [directFormInet6Address, setDirectFormInet6Address] = useState("");
 
+  // Direct default (默认直连出口 DNS 配置)
+  const [directDefaultDns, setDirectDefaultDns] = useState<string[]>(["1.1.1.1"]);
+  const [showDirectDefaultModal, setShowDirectDefaultModal] = useState(false);
+  const [directDefaultFormDns, setDirectDefaultFormDns] = useState("");
+
   // OpenVPN egress state
   const [openvpnEgress, setOpenvpnEgress] = useState<OpenVPNEgress[]>([]);
   const [showOpenvpnModal, setShowOpenvpnModal] = useState(false);
@@ -175,13 +180,14 @@ export default function EgressManager() {
     try {
       setLoading(true);
       setError(null);
-      const [allData, customData, profilesData, directData, openvpnData, v2rayData] = await Promise.all([
+      const [allData, customData, profilesData, directData, openvpnData, v2rayData, directDefaultData] = await Promise.all([
         api.getAllEgress(),
         api.getCustomEgress(),
         api.getProfiles(),
         api.getDirectEgress(),
         api.getOpenVPNEgress(),
-        api.getV2RayEgress()
+        api.getV2RayEgress(),
+        api.getDirectDefault()
       ]);
       setPiaEgress(allData.pia);
       setCustomEgress(customData.egress);
@@ -189,6 +195,7 @@ export default function EgressManager() {
       setDirectEgress(directData.egress);
       setOpenvpnEgress(openvpnData.egress);
       setV2rayEgress(v2rayData.egress);
+      setDirectDefaultDns(directDefaultData.dns_servers);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
@@ -741,6 +748,38 @@ export default function EgressManager() {
     }
   };
 
+  // ============ Direct Default DNS Management ============
+
+  const handleEditDirectDefault = () => {
+    setDirectDefaultFormDns(directDefaultDns.join(", "));
+    setShowDirectDefaultModal(true);
+  };
+
+  const handleSaveDirectDefault = async () => {
+    const dnsServers = directDefaultFormDns
+      .split(/[,\s]+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+
+    if (dnsServers.length === 0) {
+      setError(t('directDefault.dnsRequired'));
+      return;
+    }
+
+    setActionLoading("save-direct-default");
+    try {
+      await api.updateDirectDefault(dnsServers);
+      setDirectDefaultDns(dnsServers);
+      setSuccessMessage(t('directDefault.saveSuccess'));
+      setShowDirectDefaultModal(false);
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.saveFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   // ============ OpenVPN Egress Management ============
 
   const handleAddOpenvpnEgress = () => {
@@ -1137,7 +1176,7 @@ export default function EgressManager() {
   const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : directEgress;
   const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "v2ray" ? [] : openvpnEgress;
   const filteredV2ray = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" ? [] : v2rayEgress;
-  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + openvpnEgress.length + v2rayEgress.length;
+  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + 1 + openvpnEgress.length + v2rayEgress.length; // +1 for default direct
 
   if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length && !openvpnEgress.length) {
     return (
@@ -1253,7 +1292,7 @@ export default function EgressManager() {
           { key: "all", label: `${t('common.all')} (${totalCount})` },
           { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
           { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` },
-          { key: "direct", label: `${t('egress.direct')} (${directEgress.length})` },
+          { key: "direct", label: `${t('egress.direct')} (${directEgress.length + 1})` },
           { key: "openvpn", label: `${t('egress.openvpn')} (${openvpnEgress.length})` },
           { key: "v2ray", label: `V2Ray (${v2rayEgress.length})` }
         ].map((tab) => (
@@ -1272,15 +1311,15 @@ export default function EgressManager() {
       </div>
 
       {/* Egress List */}
-      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 ? (
+      {/* Empty state - exclude "all" and "direct" tabs since they always have the default direct card */}
+      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 && activeTab !== "all" && activeTab !== "direct" ? (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "direct" ? t('directEgress.noDirectEgress') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : t('egress.noEgressFound')}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : t('egress.noEgressFound')}
           </p>
-          {activeTab !== "all" && (
-            <div className="mt-4">
-              {activeTab === "pia" && (
+          <div className="mt-4">
+            {activeTab === "pia" && (
                 <button
                   onClick={handleAddPiaProfile}
                   className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium"
@@ -1294,14 +1333,6 @@ export default function EgressManager() {
                   className="px-4 py-2 rounded-lg bg-brand text-white text-sm font-medium"
                 >
                   {t('egress.addCustomEgress')}
-                </button>
-              )}
-              {activeTab === "direct" && (
-                <button
-                  onClick={handleAddDirectEgress}
-                  className="px-4 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-600 text-white text-sm font-medium"
-                >
-                  {t('directEgress.addDirectEgress')}
                 </button>
               )}
               {activeTab === "openvpn" && (
@@ -1320,8 +1351,7 @@ export default function EgressManager() {
                   {t('v2rayEgress.addV2rayEgress')}
                 </button>
               )}
-            </div>
-          )}
+          </div>
         </div>
       ) : (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-6 space-y-6 overflow-y-auto">
@@ -1564,12 +1594,12 @@ export default function EgressManager() {
           )}
 
           {/* Direct Egress */}
-          {filteredDirect.length > 0 && (
+          {(activeTab === "all" || activeTab === "direct") && (
             <div>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
                   <GlobeAltIcon className="h-4 w-4" />
-                  {t('directEgress.title')} ({filteredDirect.length})
+                  {t('directEgress.title')} ({filteredDirect.length + 1})
                 </h3>
                 {activeTab === "direct" && (
                   <button
@@ -1582,6 +1612,76 @@ export default function EgressManager() {
                 )}
               </div>
               <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {/* Default Direct Egress Card */}
+                <div className="rounded-xl border p-4 bg-emerald-500/5 border-emerald-500/20">
+                  <div className="flex items-start justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 rounded-lg bg-emerald-500/20">
+                        <GlobeAltIcon className="h-5 w-5 text-emerald-400" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h4 className="font-semibold text-white">direct</h4>
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/20 text-emerald-400">
+                            {t('directDefault.default')}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-500">{t('directDefault.description')}</p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleEditDirectDefault}
+                      className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                      title={t('common.edit')}
+                    >
+                      <PencilIcon className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                    <p className="text-xs text-slate-400">
+                      <span className="text-slate-500">DNS:</span>{" "}
+                      <span className="font-mono">{directDefaultDns.join(", ")}</span>
+                    </p>
+                  </div>
+
+                  <div className="mt-3">
+                    <button
+                      onClick={() => handleSpeedTest("direct")}
+                      disabled={speedTestStatus["direct"]?.loading}
+                      className={`w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                        speedTestStatus["direct"]?.result
+                          ? speedTestStatus["direct"].result?.success
+                            ? "bg-emerald-500/20 text-emerald-400"
+                            : "bg-red-500/20 text-red-400"
+                          : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                      }`}
+                    >
+                      {speedTestStatus["direct"]?.loading ? (
+                        <>
+                          <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                          {t('egress.speedTesting')}
+                        </>
+                      ) : speedTestStatus["direct"]?.result ? (
+                        <>
+                          {speedTestStatus["direct"].result?.success ? (
+                            <CheckCircleIcon className="h-3.5 w-3.5" />
+                          ) : (
+                            <XCircleIcon className="h-3.5 w-3.5" />
+                          )}
+                          {speedTestStatus["direct"].result?.message}
+                        </>
+                      ) : (
+                        <>
+                          <ChartBarIcon className="h-3.5 w-3.5" />
+                          {t('egress.speedTest')}
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Custom Direct Egress Cards */}
                 {filteredDirect.map((egress) => (
                   <div
                     key={egress.tag}
@@ -2610,6 +2710,69 @@ export default function EgressManager() {
                 {directModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Direct Default DNS Modal */}
+      {showDirectDefaultModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">{t('directDefault.editTitle')}</h2>
+                  <button
+                    onClick={() => setShowDirectDefaultModal(false)}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('directDefault.dnsServers')} <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={directDefaultFormDns}
+                    onChange={(e) => setDirectDefaultFormDns(e.target.value)}
+                    placeholder={t('directDefault.dnsPlaceholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand font-mono"
+                  />
+                  <p className="text-xs text-slate-500 mt-1">{t('directDefault.dnsHint')}</p>
+                </div>
+
+                <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3">
+                  <p className="text-xs text-emerald-300">{t('directDefault.dnsNote')}</p>
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+                <button
+                  onClick={() => setShowDirectDefaultModal(false)}
+                  className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={handleSaveDirectDefault}
+                  disabled={actionLoading === "save-direct-default" || !directDefaultFormDns.trim()}
+                  className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {actionLoading === "save-direct-default" ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <CheckIcon className="h-4 w-4" />
+                  )}
+                  {t('common.save')}
+                </button>
+              </div>
             </div>
           </div>
         </div>,

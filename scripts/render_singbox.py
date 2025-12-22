@@ -577,6 +577,88 @@ def ensure_xray_egress_outbounds(config: dict, v2ray_egress: List[dict]) -> List
     return all_tags
 
 
+def _parse_dns_server(server: str) -> tuple:
+    """解析 DNS 服务器配置，返回 (type, server_address)
+
+    sing-box DNS 配置规则:
+    - DoH: type=https, server 保留完整 URL
+    - DoT: type=tls, server 仅保留 host（去掉 tls://）
+    - DoQ: type=quic, server 仅保留 host（去掉 quic:// 或 h3://）
+    - UDP: type=udp, server 保留原值
+
+    Examples:
+    - "8.8.8.8" → ("udp", "8.8.8.8")
+    - "dns.google" → ("udp", "dns.google")
+    - "https://dns.google/dns-query" → ("https", "https://dns.google/dns-query")
+    - "tls://dns.google" → ("tls", "dns.google")
+    - "quic://dns.adguard.com" → ("quic", "dns.adguard.com")
+    - "h3://dns.google/dns-query" → ("quic", "dns.google/dns-query")
+    """
+    if server.startswith('https://'):
+        return ('https', server)  # DoH 保留完整 URL
+    elif server.startswith('tls://'):
+        return ('tls', server[6:])  # 去掉 "tls://"
+    elif server.startswith('quic://'):
+        return ('quic', server[7:])  # 去掉 "quic://"
+    elif server.startswith('h3://'):
+        return ('quic', server[5:])  # 去掉 "h3://"
+    else:
+        return ('udp', server)
+
+
+def ensure_direct_dns_config(config: dict) -> None:
+    """根据数据库设置更新 direct-dns 服务器配置
+
+    从数据库 settings 表读取 direct_dns_servers 设置，
+    更新 sing-box 配置中的 direct-dns 服务器。
+    """
+    if not HAS_DATABASE or not Path(USER_DB_PATH).exists():
+        print("[render] 数据库不可用，使用默认 DNS 配置")
+        return
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 从 settings 表读取 DNS 配置
+    dns_servers_json = db.get_setting("direct_dns_servers", "[]")
+    try:
+        dns_servers = json.loads(dns_servers_json)
+    except json.JSONDecodeError:
+        dns_servers = []
+
+    # 如果没有配置，使用默认值
+    if not dns_servers:
+        return  # 使用模板中的默认配置
+
+    dns = config.setdefault("dns", {})
+    servers = dns.setdefault("servers", [])
+
+    # sing-box DNS 不支持每个 tag 多个服务器，仅使用第一个
+    # 其余服务器会被忽略（记录警告日志）
+    primary_dns = dns_servers[0]
+    dns_type, server_addr = _parse_dns_server(primary_dns)
+
+    # 查找并更新 direct-dns 服务器
+    found = False
+    for server in servers:
+        if server.get("tag") == "direct-dns":
+            server["type"] = dns_type
+            server["server"] = server_addr
+            found = True
+            break
+
+    # 如果没有找到，添加新的 direct-dns 服务器
+    if not found:
+        servers.insert(0, {
+            "tag": "direct-dns",
+            "type": dns_type,
+            "server": server_addr
+        })
+
+    print(f"[render] direct-dns 已配置: {primary_dns} (type={dns_type})")
+    if len(dns_servers) > 1:
+        print(f"[render] 注意: sing-box 不支持 DNS 回退，仅使用第一个服务器，其余 {len(dns_servers)-1} 个被忽略")
+
+
 def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
     """确保每个 profile 都有对应的 DNS 服务器
 
@@ -1645,6 +1727,9 @@ def main() -> None:
 
     # 确保必需的 outbounds 存在（direct, block, adblock）
     ensure_required_outbounds(config)
+
+    # 根据数据库设置更新 direct-dns 配置
+    ensure_direct_dns_config(config)
 
     all_egress_tags = []
 
