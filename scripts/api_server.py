@@ -3659,9 +3659,15 @@ def api_update_direct_default(data: DirectDefaultUpdate):
 
     # 支持的 DNS URL 协议
     DNS_URL_SCHEMES = {'https', 'tls', 'quic', 'h3'}
+    # 特殊关键字（不需要 server 字段）
+    DNS_SPECIAL_KEYWORDS = {'local'}
     domain_pattern = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
 
     for server in data.dns_servers:
+        # 检查特殊关键字
+        if server.lower() in DNS_SPECIAL_KEYWORDS:
+            continue  # 有效的特殊关键字
+
         # 检查 DNS URL 格式（DoH/DoT/DoQ）
         if '://' in server:
             parsed = urlparse(server)

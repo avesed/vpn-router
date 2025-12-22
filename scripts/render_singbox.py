@@ -577,33 +577,76 @@ def ensure_xray_egress_outbounds(config: dict, v2ray_egress: List[dict]) -> List
     return all_tags
 
 
-def _parse_dns_server(server: str) -> tuple:
-    """解析 DNS 服务器配置，返回 (type, server_address)
+def _parse_dns_server(server: str) -> dict:
+    """解析 DNS 服务器配置，返回 sing-box DNS server 配置字典
 
-    sing-box DNS 配置规则:
-    - DoH: type=https, server 保留完整 URL
-    - DoT: type=tls, server 仅保留 host（去掉 tls://）
-    - DoQ: type=quic, server 仅保留 host（去掉 quic:// 或 h3://）
-    - UDP: type=udp, server 保留原值
+    sing-box 1.12+ DNS 配置规则:
+    - local: type=local（使用系统 DNS，无 server 字段）
+    - UDP: type=udp, server=IP或域名
+    - DoT: type=tls, server=域名（不含 tls://）
+    - DoH: type=https, server=域名, path=/dns-query
+    - DoQ: type=quic, server=域名
+    - H3:  type=h3, server=域名, path=/dns-query
 
     Examples:
-    - "8.8.8.8" → ("udp", "8.8.8.8")
-    - "dns.google" → ("udp", "dns.google")
-    - "https://dns.google/dns-query" → ("https", "https://dns.google/dns-query")
-    - "tls://dns.google" → ("tls", "dns.google")
-    - "quic://dns.adguard.com" → ("quic", "dns.adguard.com")
-    - "h3://dns.google/dns-query" → ("quic", "dns.google/dns-query")
+    - "local" → {"type": "local"}
+    - "8.8.8.8" → {"type": "udp", "server": "8.8.8.8"}
+    - "dns.google" → {"type": "udp", "server": "dns.google"}
+    - "https://dns.google/dns-query" → {"type": "https", "server": "dns.google", "path": "/dns-query"}
+    - "tls://dns.google" → {"type": "tls", "server": "dns.google"}
+    - "quic://dns.adguard.com" → {"type": "quic", "server": "dns.adguard.com"}
+    - "h3://dns.google/dns-query" → {"type": "h3", "server": "dns.google", "path": "/dns-query"}
     """
+    from urllib.parse import urlparse
+
+    # 特殊关键字: local 使用系统 DNS
+    if server.lower() == 'local':
+        return {"type": "local"}
+
     if server.startswith('https://'):
-        return ('https', server)  # DoH 保留完整 URL
+        parsed = urlparse(server)
+        result = {
+            "type": "https",
+            "server": parsed.hostname or parsed.netloc,
+        }
+        if parsed.path and parsed.path != '/':
+            result["path"] = parsed.path
+        if parsed.port:
+            result["server_port"] = parsed.port
+        return result
+
     elif server.startswith('tls://'):
-        return ('tls', server[6:])  # 去掉 "tls://"
+        # tls://host:port 格式
+        rest = server[6:]
+        if ':' in rest:
+            host, port = rest.rsplit(':', 1)
+            return {"type": "tls", "server": host, "server_port": int(port)}
+        return {"type": "tls", "server": rest}
+
     elif server.startswith('quic://'):
-        return ('quic', server[7:])  # 去掉 "quic://"
+        # quic://host:port 格式
+        rest = server[7:]
+        if ':' in rest:
+            host, port = rest.rsplit(':', 1)
+            return {"type": "quic", "server": host, "server_port": int(port)}
+        return {"type": "quic", "server": rest}
+
     elif server.startswith('h3://'):
-        return ('quic', server[5:])  # 去掉 "h3://"
+        # h3://host:port/path 格式 (HTTP/3 DNS)
+        parsed = urlparse(server)
+        result = {
+            "type": "h3",
+            "server": parsed.hostname or parsed.netloc,
+        }
+        if parsed.path and parsed.path != '/':
+            result["path"] = parsed.path
+        if parsed.port:
+            result["server_port"] = parsed.port
+        return result
+
     else:
-        return ('udp', server)
+        # 普通 UDP DNS（IP 或域名）
+        return {"type": "udp", "server": server}
 
 
 def ensure_direct_dns_config(config: dict) -> None:
@@ -635,26 +678,28 @@ def ensure_direct_dns_config(config: dict) -> None:
     # sing-box DNS 不支持每个 tag 多个服务器，仅使用第一个
     # 其余服务器会被忽略（记录警告日志）
     primary_dns = dns_servers[0]
-    dns_type, server_addr = _parse_dns_server(primary_dns)
+    dns_config = _parse_dns_server(primary_dns)
 
     # 查找并更新 direct-dns 服务器
     found = False
     for server in servers:
         if server.get("tag") == "direct-dns":
-            server["type"] = dns_type
-            server["server"] = server_addr
+            # 清除旧字段，避免残留
+            keys_to_remove = [k for k in server if k not in ("tag",)]
+            for k in keys_to_remove:
+                del server[k]
+            # 应用新配置
+            server.update(dns_config)
             found = True
             break
 
     # 如果没有找到，添加新的 direct-dns 服务器
     if not found:
-        servers.insert(0, {
-            "tag": "direct-dns",
-            "type": dns_type,
-            "server": server_addr
-        })
+        new_server = {"tag": "direct-dns"}
+        new_server.update(dns_config)
+        servers.insert(0, new_server)
 
-    print(f"[render] direct-dns 已配置: {primary_dns} (type={dns_type})")
+    print(f"[render] direct-dns 已配置: {primary_dns} (type={dns_config['type']})")
     if len(dns_servers) > 1:
         print(f"[render] 注意: sing-box 不支持 DNS 回退，仅使用第一个服务器，其余 {len(dns_servers)-1} 个被忽略")
 
