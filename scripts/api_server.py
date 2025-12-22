@@ -6238,20 +6238,15 @@ def api_create_quick_rule(payload: QuickRuleRequest):
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
-    # 收集所有域名
+    # 收集所有域名 - 从内存中的 _DOMAIN_CATALOG 读取
     all_domains = []
+    lists = _DOMAIN_CATALOG.get("lists", {})
     for list_id in payload.list_ids:
-        # 直接从数据库读取域名
-        try:
-            domains = db.geodata.get_domains_by_list(list_id, limit=100000)
+        if list_id in lists:
+            domains = lists[list_id].get("domains", [])
             all_domains.extend(domains)
-        except Exception as e:
-            # 如果数据库中找不到，尝试从文件解析
-            try:
-                data = parse_domain_list_file(list_id)
-                all_domains.extend(data.get("domains", []))
-            except Exception:
-                print(f"跳过列表 {list_id}: {e}")
+        else:
+            print(f"[QuickRule] 跳过未找到的列表: {list_id}")
 
     if not all_domains:
         raise HTTPException(status_code=400, detail="没有找到任何域名")
