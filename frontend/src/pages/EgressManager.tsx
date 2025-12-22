@@ -559,7 +559,7 @@ export default function EgressManager() {
   };
 
   const handlePasteConfig = async () => {
-    if (!pasteContent.trim()) {
+    if (!(pasteContent || "").trim()) {
       setParseError(t('customEgress.pasteContentError'));
       return;
     }
@@ -571,7 +571,7 @@ export default function EgressManager() {
   };
 
   const handleCreateEgress = async () => {
-    if (!formTag.trim() || !formServer.trim() || !formPrivateKey.trim() || !formPublicKey.trim() || !formAddress.trim()) {
+    if (!(formTag || "").trim() || !(formServer || "").trim() || !(formPrivateKey || "").trim() || !(formPublicKey || "").trim() || !(formAddress || "").trim()) {
       setError(t('customEgress.fillAllFieldsError'));
       return;
     }
@@ -579,16 +579,16 @@ export default function EgressManager() {
     setActionLoading("create");
     try {
       await api.createCustomEgress({
-        tag: formTag.trim(),
-        description: formDescription.trim(),
-        server: formServer.trim(),
+        tag: (formTag || "").trim(),
+        description: (formDescription || "").trim(),
+        server: (formServer || "").trim(),
         port: formPort,
-        private_key: formPrivateKey.trim(),
-        public_key: formPublicKey.trim(),
-        address: formAddress.trim(),
+        private_key: (formPrivateKey || "").trim(),
+        public_key: (formPublicKey || "").trim(),
+        address: (formAddress || "").trim(),
         mtu: formMtu,
-        dns: formDns.trim(),
-        pre_shared_key: formPreSharedKey.trim() || undefined
+        dns: (formDns || "").trim(),
+        pre_shared_key: (formPreSharedKey || "").trim() || undefined
       });
       setSuccessMessage(t('customEgress.addSuccess'));
       setShowAddModal(false);
@@ -604,15 +604,15 @@ export default function EgressManager() {
 
   const handleEditEgress = (egress: CustomEgress) => {
     setEditingEgress(egress);
-    setFormTag(egress.tag);
-    setFormDescription(egress.description);
-    setFormServer(egress.server);
-    setFormPort(egress.port);
-    setFormPrivateKey(egress.private_key);
-    setFormPublicKey(egress.public_key);
-    setFormAddress(egress.address);
-    setFormMtu(egress.mtu);
-    setFormDns(egress.dns);
+    setFormTag(egress.tag || "");
+    setFormDescription(egress.description || "");
+    setFormServer(egress.server || "");
+    setFormPort(egress.port || 51820);
+    setFormPrivateKey(egress.private_key || "");
+    setFormPublicKey(egress.public_key || "");
+    setFormAddress(egress.address || "");
+    setFormMtu(egress.mtu || 1420);
+    setFormDns(egress.dns || "");
     setFormPreSharedKey(egress.pre_shared_key || "");
     setShowEditModal(true);
   };
@@ -623,15 +623,15 @@ export default function EgressManager() {
     setActionLoading("update");
     try {
       await api.updateCustomEgress(editingEgress.tag, {
-        description: formDescription.trim(),
-        server: formServer.trim(),
+        description: (formDescription || "").trim(),
+        server: (formServer || "").trim(),
         port: formPort,
-        private_key: formPrivateKey.trim(),
-        public_key: formPublicKey.trim(),
-        address: formAddress.trim(),
+        private_key: (formPrivateKey || "").trim(),
+        public_key: (formPublicKey || "").trim(),
+        address: (formAddress || "").trim(),
         mtu: formMtu,
-        dns: formDns.trim(),
-        pre_shared_key: formPreSharedKey.trim() || undefined
+        dns: (formDns || "").trim(),
+        pre_shared_key: (formPreSharedKey || "").trim() || undefined
       });
       setSuccessMessage(t('customEgress.updateSuccess'));
       setShowEditModal(false);
@@ -756,9 +756,9 @@ export default function EgressManager() {
   };
 
   const handleSaveDirectDefault = async () => {
-    const dnsServers = directDefaultFormDns
+    const dnsServers = (directDefaultFormDns || "")
       .split(/[,\s]+/)
-      .map(s => s.trim())
+      .map(s => (s || "").trim())
       .filter(s => s.length > 0);
 
     if (dnsServers.length === 0) {
@@ -2762,7 +2762,7 @@ export default function EgressManager() {
                 </button>
                 <button
                   onClick={handleSaveDirectDefault}
-                  disabled={actionLoading === "save-direct-default" || !directDefaultFormDns.trim()}
+                  disabled={actionLoading === "save-direct-default" || !(directDefaultFormDns || "").trim()}
                   className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
                 >
                   {actionLoading === "save-direct-default" ? (
@@ -2862,7 +2862,7 @@ export default function EgressManager() {
                   />
                   <button
                     onClick={() => parseOpenvpnConfig(openvpnPasteContent)}
-                    disabled={!openvpnPasteContent.trim()}
+                    disabled={!(openvpnPasteContent || "").trim()}
                     className="px-4 py-2 rounded-lg bg-orange-500/20 text-orange-400 text-sm font-medium disabled:opacity-50"
                   >
                     {t('openvpnEgress.parseConfig')}
@@ -3250,7 +3250,7 @@ export default function EgressManager() {
                   )}
                   <button
                     onClick={() => parseV2rayUri(v2rayUriInput)}
-                    disabled={!v2rayUriInput.trim()}
+                    disabled={!(v2rayUriInput || "").trim()}
                     className="px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm font-medium disabled:opacity-50"
                   >
                     {t('v2rayEgress.parseUri')}

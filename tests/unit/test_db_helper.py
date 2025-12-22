@@ -6,18 +6,26 @@ import pytest
 from pathlib import Path
 
 
+@pytest.fixture(autouse=True)
+def reset_db_singleton():
+    """Reset the db_helper singleton between tests."""
+    import db_helper
+    db_helper._db_manager = None
+    yield
+    db_helper._db_manager = None
+
+
 class TestUserDatabase:
     """Tests for UserDatabase class."""
 
-    def test_get_user_stats_empty_db(self, initialized_user_db, mock_geodata_db):
+    def test_get_statistics_empty_db(self, initialized_user_db, mock_geodata_db):
         """Test getting stats from an empty database."""
         from db_helper import get_db
 
         db = get_db(str(mock_geodata_db), str(initialized_user_db))
-        stats = db.get_user_stats()
+        stats = db.get_statistics()
 
         assert stats["routing_rules_count"] == 0
-        assert stats["outbounds_count"] >= 0  # May have defaults
         assert stats["wireguard_peers_count"] == 0
 
     def test_add_routing_rule(self, initialized_user_db, mock_geodata_db, sample_routing_rule):
@@ -41,10 +49,11 @@ class TestUserDatabase:
         from db_helper import get_db
 
         db = get_db(str(mock_geodata_db), str(initialized_user_db))
+        # Format: (rule_type, target, outbound, tag, priority)
         rules = [
-            {"rule_type": "domain_suffix", "target": "google.com", "outbound": "direct", "tag": "test1", "priority": 100},
-            {"rule_type": "domain_suffix", "target": "facebook.com", "outbound": "direct", "tag": "test2", "priority": 101},
-            {"rule_type": "ip_cidr", "target": "8.8.8.0/24", "outbound": "direct", "tag": "test3", "priority": 102},
+            ("domain_suffix", "google.com", "direct", "test1", 100),
+            ("domain_suffix", "facebook.com", "direct", "test2", 101),
+            ("ip_cidr", "8.8.8.0/24", "direct", "test3", 102),
         ]
 
         count = db.add_routing_rules_batch(rules)
@@ -147,22 +156,22 @@ class TestGeodataDatabase:
 
         assert country is None
 
-    def test_get_ip_ranges(self, initialized_user_db, mock_geodata_db):
+    def test_get_country_ips(self, initialized_user_db, mock_geodata_db):
         """Test getting IP ranges for a country."""
         from db_helper import get_db
 
         db = get_db(str(mock_geodata_db), str(initialized_user_db))
-        ranges = db.get_ip_ranges("us")
+        ranges = db.get_country_ips("US", ip_version=4)
 
         assert len(ranges) == 1
         assert ranges[0] == "8.8.8.0/24"
 
-    def test_get_geodata_stats(self, initialized_user_db, mock_geodata_db):
-        """Test getting geodata statistics."""
+    def test_get_statistics_with_geodata(self, initialized_user_db, mock_geodata_db):
+        """Test getting combined statistics."""
         from db_helper import get_db
 
         db = get_db(str(mock_geodata_db), str(initialized_user_db))
-        stats = db.get_geodata_stats()
+        stats = db.get_statistics()
 
         assert stats["countries_count"] == 2
         assert stats["ip_ranges_count"] == 1

@@ -1250,7 +1250,7 @@ def save_custom_rules(data: Dict[str, Any]) -> None:
 
 def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
     """从数据库生成 sing-box 路由规则"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         return []
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -1264,6 +1264,10 @@ def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
     # 按规则类型和出口分组
     domain_rules = {}  # outbound -> [domains]
     ip_rules = {}      # outbound -> [cidrs]
+    protocol_rules = {}  # outbound -> [protocols]
+    network_rules = {}   # outbound -> network (tcp/udp)
+    port_rules = {}      # outbound -> [ports]
+    port_range_rules = {}  # outbound -> [port_ranges]
 
     for rule in rules_db:
         rule_type = rule["rule_type"]
@@ -1298,6 +1302,27 @@ def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
                 "outbound": outbound
             })
 
+        elif rule_type == "protocol":
+            if outbound not in protocol_rules:
+                protocol_rules[outbound] = []
+            protocol_rules[outbound].append(target)
+
+        elif rule_type == "network":
+            network_rules[outbound] = target  # tcp or udp
+
+        elif rule_type == "port":
+            if outbound not in port_rules:
+                port_rules[outbound] = []
+            try:
+                port_rules[outbound].append(int(target))
+            except ValueError:
+                pass
+
+        elif rule_type == "port_range":
+            if outbound not in port_range_rules:
+                port_range_rules[outbound] = []
+            port_range_rules[outbound].append(target)
+
     # 合并同出口的域名规则
     for outbound, domains in domain_rules.items():
         if domains:
@@ -1313,6 +1338,30 @@ def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
                 "ip_cidr": cidrs,
                 "outbound": outbound
             })
+
+    # 合并同出口的协议/端口规则
+    # 收集所有有协议/网络/端口规则的出口
+    protocol_port_outbounds = set(protocol_rules.keys()) | set(network_rules.keys()) | \
+                              set(port_rules.keys()) | set(port_range_rules.keys())
+
+    for outbound in protocol_port_outbounds:
+        rule = {"outbound": outbound}
+
+        if outbound in protocol_rules and protocol_rules[outbound]:
+            rule["protocol"] = protocol_rules[outbound]
+
+        if outbound in network_rules:
+            rule["network"] = network_rules[outbound]
+
+        if outbound in port_rules and port_rules[outbound]:
+            rule["port"] = port_rules[outbound]
+
+        if outbound in port_range_rules and port_range_rules[outbound]:
+            rule["port_range"] = port_range_rules[outbound]
+
+        # 只有至少有一个规则条件才添加
+        if len(rule) > 1:
+            singbox_rules.append(rule)
 
     return singbox_rules
 
@@ -3917,24 +3966,25 @@ def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
     if not db.get_custom_egress(tag):
         raise HTTPException(status_code=404, detail=f"出口 '{tag}' 不存在")
 
-    # 构建更新字段
+    # 构建更新字段（空字符串不更新，防止覆盖现有值）
     updates = {}
-    if payload.description is not None:
+    if payload.description is not None and payload.description.strip():
         updates["description"] = payload.description
-    if payload.server is not None:
+    if payload.server is not None and payload.server.strip():
         updates["server"] = payload.server
     if payload.port is not None:
         updates["port"] = payload.port
-    if payload.private_key is not None:
+    if payload.private_key is not None and payload.private_key.strip():
         updates["private_key"] = payload.private_key
-    if payload.public_key is not None:
+    if payload.public_key is not None and payload.public_key.strip():
         updates["public_key"] = payload.public_key
-    if payload.address is not None:
+    if payload.address is not None and payload.address.strip():
         updates["address"] = payload.address
     if payload.mtu is not None:
         updates["mtu"] = payload.mtu
-    if payload.dns is not None:
+    if payload.dns is not None and payload.dns.strip():
         updates["dns"] = payload.dns
+    # pre_shared_key 允许清空（设为空字符串）
     if payload.pre_shared_key is not None:
         updates["pre_shared_key"] = payload.pre_shared_key
     if payload.reserved is not None:
@@ -4059,10 +4109,11 @@ def api_update_direct_egress(tag: str, payload: DirectEgressUpdateRequest):
     if not db.get_direct_egress(tag):
         raise HTTPException(status_code=404, detail=f"Direct 出口 '{tag}' 不存在")
 
-    # 构建更新字段
+    # 构建更新字段（空字符串不更新，防止覆盖现有值）
     updates = {}
-    if payload.description is not None:
+    if payload.description is not None and payload.description.strip():
         updates["description"] = payload.description
+    # 绑定字段允许清空（从接口绑定切换到IP绑定时需要）
     if payload.bind_interface is not None:
         updates["bind_interface"] = payload.bind_interface
     if payload.inet4_bind_address is not None:
@@ -4299,17 +4350,24 @@ def api_update_openvpn_egress(tag: str, payload: OpenVPNEgressUpdateRequest):
     if not db.get_openvpn_egress(tag):
         raise HTTPException(status_code=404, detail=f"OpenVPN 出口 '{tag}' 不存在")
 
-    # 构建更新字段
+    # 构建更新字段（空字符串不更新，防止覆盖现有值）
     updates = {}
-    for field in [
-        "description", "protocol", "remote_host", "remote_port",
+    # 字符串字段：空字符串不更新
+    string_fields = {
+        "description", "protocol", "remote_host",
         "ca_cert", "client_cert", "client_key", "tls_auth", "tls_crypt",
         "crl_verify", "auth_user", "auth_pass", "cipher", "auth", "compress",
-        "extra_options", "enabled"
-    ]:
+        "extra_options"
+    }
+    for field in string_fields:
         value = getattr(payload, field, None)
-        if value is not None:
+        if value is not None and isinstance(value, str) and value.strip():
             updates[field] = value
+    # 数字/布尔字段：直接更新
+    if payload.remote_port is not None:
+        updates["remote_port"] = payload.remote_port
+    if payload.enabled is not None:
+        updates["enabled"] = payload.enabled
 
     if updates:
         db.update_openvpn_egress(tag, **updates)
@@ -4514,26 +4572,36 @@ def api_update_v2ray_egress(tag: str, payload: V2RayEgressUpdateRequest):
     if not db.get_v2ray_egress(tag):
         raise HTTPException(status_code=404, detail=f"V2Ray egress '{tag}' not found")
 
-    # 构建更新字段
+    # 构建更新字段（空字符串不更新，防止覆盖现有值）
     updates = {}
-    for field in [
-        "description", "protocol", "server", "server_port",
-        "uuid", "password", "security", "alter_id", "flow",
-        "tls_enabled", "tls_sni", "tls_alpn", "tls_allow_insecure", "tls_fingerprint",
-        "reality_enabled", "reality_public_key", "reality_short_id",
-        "transport_type", "transport_config",
-        "multiplex_enabled", "multiplex_protocol",
-        "multiplex_max_connections", "multiplex_min_streams", "multiplex_max_streams",
-        "enabled"
-    ]:
+    # 字符串字段：空字符串不更新
+    string_fields = {
+        "description", "protocol", "server", "uuid", "password", "security", "flow",
+        "tls_sni", "tls_fingerprint", "reality_public_key", "reality_short_id",
+        "transport_type", "multiplex_protocol"
+    }
+    # 布尔字段：转为整数
+    bool_fields = {"tls_enabled", "tls_allow_insecure", "reality_enabled", "multiplex_enabled", "enabled"}
+    # JSON 字段
+    json_fields = {"tls_alpn", "transport_config"}
+    # 数字字段
+    numeric_fields = {"server_port", "alter_id", "multiplex_max_connections", "multiplex_min_streams", "multiplex_max_streams"}
+
+    for field in string_fields | bool_fields | json_fields | numeric_fields:
         value = getattr(payload, field, None)
         if value is not None:
-            # 处理布尔值转整数
-            if field in ("tls_enabled", "tls_allow_insecure", "reality_enabled", "multiplex_enabled"):
+            # 字符串字段：空字符串不更新
+            if field in string_fields:
+                if isinstance(value, str) and not value.strip():
+                    continue  # 跳过空字符串
+                updates[field] = value
+            # 布尔字段：转为整数
+            elif field in bool_fields:
                 updates[field] = 1 if value else 0
-            # 处理 JSON 字段
-            elif field in ("tls_alpn", "transport_config"):
+            # JSON 字段
+            elif field in json_fields:
                 updates[field] = json.dumps(value) if value else None
+            # 数字字段：直接更新
             else:
                 updates[field] = value
 
@@ -6165,8 +6233,8 @@ def is_adblock_list(list_id: str) -> bool:
 def api_create_quick_rule(payload: QuickRuleRequest):
     """从域名列表快速创建路由规则"""
     # 使用数据库存储
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
@@ -6394,7 +6462,7 @@ def get_country_ip_info(country_code: str) -> dict:
     # 如果 JSON 不存在或为空，从 SQLite 加载
     if not ipv4_cidrs and not ipv6_cidrs:
         try:
-            db = get_db()
+            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
             ipv4_cidrs = db.get_country_ips(cc.upper(), ip_version=4)
             ipv6_cidrs = db.get_country_ips(cc.upper(), ip_version=6)
         except Exception:
@@ -7227,8 +7295,8 @@ def api_get_domain_list(list_id: str, include_domains: bool = False):
 @app.post("/api/config/regenerate")
 def api_regenerate_config():
     """重新生成 sing-box 配置（包含数据库规则）"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
     try:
         # 从数据库获取规则

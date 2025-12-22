@@ -43,6 +43,8 @@ CUSTOM_RULES_FILE = Path(os.environ.get("CUSTOM_RULES_FILE", "/etc/sing-box/cust
 OUTPUT = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
+# RULESETS_DIR is for adblock rule_set JSON files (subdirectory of config)
+# Note: RULESET_DIR (in Dockerfile/entrypoint) is different - it's the base config directory
 RULESETS_DIR = Path(os.environ.get("RULESETS_DIR", "/etc/sing-box/rulesets"))
 
 
@@ -78,11 +80,11 @@ def load_wireguard_server_config() -> dict | None:
     if not server or not server.get("private_key"):
         return None
 
-    # 获取对等端列表
+    # 获取对等端列表（可以为空，不影响 TPROXY 入口创建）
     peers = db.get_wireguard_peers()
     if not peers:
-        print("[render] 警告: 没有配置 WireGuard 客户端对等端")
-        return None
+        print("[render] 警告: 没有配置 WireGuard 客户端对等端（仍创建 TPROXY 入口）")
+        peers = []
 
     return {
         "server": server,
@@ -1593,7 +1595,9 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
             if ports:
                 protocol_rule["port"] = ports
             if port_ranges:
-                protocol_rule["port_range"] = port_ranges
+                # sing-box 需要 "start:end" 格式，转换 "start-end" 格式
+                converted_ranges = [pr.replace("-", ":") for pr in port_ranges]
+                protocol_rule["port_range"] = converted_ranges
 
             # 协议/端口规则优先级较低，插入到列表后面（在 domain 规则之后）
             rules.append(protocol_rule)

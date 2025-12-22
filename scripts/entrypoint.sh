@@ -177,6 +177,12 @@ setup_tproxy_routing() {
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   echo "[entrypoint] TPROXY configured: ${WG_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
+
+  # NAT/MASQUERADE for WireGuard ingress traffic going to internet
+  # Without this, responses from internet can't route back to private WG IPs
+  iptables -t nat -D POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE 2>/dev/null || true
+  iptables -t nat -A POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE
+  echo "[entrypoint] NAT configured: ${WG_SUBNET} -> MASQUERADE (for internet access)"
 }
 
 # Setup kernel WireGuard ingress before other services
@@ -288,6 +294,11 @@ else:
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
 
   echo "[entrypoint] Xray TPROXY configured: ${XRAY_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
+
+  # NAT/MASQUERADE for Xray V2Ray ingress traffic going to internet
+  iptables -t nat -D POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE 2>/dev/null || true
+  iptables -t nat -A POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE
+  echo "[entrypoint] NAT configured: ${XRAY_SUBNET} -> MASQUERADE (for internet access)"
 }
 
 start_xray_manager() {

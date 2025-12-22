@@ -103,10 +103,9 @@ async function request<T>(path: string, options: { method?: HttpMethod; body?: u
 }
 
 /**
- * Fetch image (e.g., QR code) with authentication and return as blob URL
- * Browser's img src doesn't send Authorization header, so we need to fetch manually
+ * Fetch with authentication helper
  */
-async function fetchImageAsBlob(path: string): Promise<string> {
+async function fetchWithAuth(path: string): Promise<Response> {
   const token = localStorage.getItem(TOKEN_KEY);
 
   const headers: Record<string, string> = {};
@@ -125,12 +124,35 @@ async function fetchImageAsBlob(path: string): Promise<string> {
     throw new Error("Session expired");
   }
 
+  return response;
+}
+
+/**
+ * Fetch image (e.g., QR code) with authentication and return as blob URL
+ * Browser's img src doesn't send Authorization header, so we need to fetch manually
+ */
+async function fetchImageAsBlob(path: string): Promise<string> {
+  const response = await fetchWithAuth(path);
+
   if (!response.ok) {
     throw new Error(`Failed to fetch image: ${response.status}`);
   }
 
   const blob = await response.blob();
   return URL.createObjectURL(blob);
+}
+
+/**
+ * Fetch text content with authentication (e.g., config files)
+ */
+async function fetchTextWithAuth(path: string): Promise<string> {
+  const response = await fetchWithAuth(path);
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch: ${response.status}`);
+  }
+
+  return response.text();
 }
 
 export const api = {
@@ -239,9 +261,9 @@ export const api = {
     }),
   deleteIngressPeer: (name: string) =>
     request<{ message: string }>(`/ingress/peers/${encodeURIComponent(name)}`, { method: "DELETE" }),
-  getIngressPeerConfigUrl: (name: string, privateKey?: string) => {
+  getIngressPeerConfig: (name: string, privateKey?: string) => {
     const params = privateKey ? `?private_key=${encodeURIComponent(privateKey)}` : "";
-    return `${API_BASE}/ingress/peers/${encodeURIComponent(name)}/config${params}`;
+    return fetchTextWithAuth(`/ingress/peers/${encodeURIComponent(name)}/config${params}`);
   },
   getIngressPeerQrcode: (name: string, privateKey?: string) => {
     const params = privateKey ? `?private_key=${encodeURIComponent(privateKey)}` : "";

@@ -236,10 +236,8 @@ export default function IngressManager() {
   }, [showConfigModal, configPeerName, configPrivateKey]);
 
   const handleCopyConfig = async () => {
-    const configUrl = api.getIngressPeerConfigUrl(configPeerName, configPrivateKey || undefined);
     try {
-      const response = await fetch(configUrl);
-      const text = await response.text();
+      const text = await api.getIngressPeerConfig(configPeerName, configPrivateKey || undefined);
       await navigator.clipboard.writeText(text);
       setConfigCopied(true);
       setTimeout(() => setConfigCopied(false), 2000);
@@ -248,12 +246,19 @@ export default function IngressManager() {
     }
   };
 
-  const handleDownloadConfig = () => {
-    const configUrl = api.getIngressPeerConfigUrl(configPeerName, configPrivateKey || undefined);
-    const link = document.createElement("a");
-    link.href = configUrl;
-    link.download = `${configPeerName}.conf`;
-    link.click();
+  const handleDownloadConfig = async () => {
+    try {
+      const text = await api.getIngressPeerConfig(configPeerName, configPrivateKey || undefined);
+      const blob = new Blob([text], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${configPeerName}.conf`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError(t("common.downloadFailed"));
+    }
   };
 
   const getPeerIcon = (name: string) => {

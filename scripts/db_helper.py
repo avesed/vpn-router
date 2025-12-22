@@ -1607,6 +1607,8 @@ class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
 
     def __init__(self, geodata_path: str, user_path: str):
+        self.geodata_path = geodata_path
+        self.user_path = user_path
         self.geodata = GeodataDatabase(geodata_path)
         self.user = UserDatabase(user_path)
 
@@ -1988,10 +1990,19 @@ _db_manager: Optional[DatabaseManager] = None
 
 def get_db(geodata_path: str = "/etc/sing-box/geoip-geodata.db",
            user_path: str = "/etc/sing-box/user-config.db") -> DatabaseManager:
-    """获取数据库管理器（单例模式）"""
+    """获取数据库管理器（单例模式）
+
+    注意: 首次调用的路径会被缓存，后续调用如果使用不同路径会打印警告。
+    """
     global _db_manager
     if _db_manager is None:
         _db_manager = DatabaseManager(geodata_path, user_path)
+    else:
+        # 检查路径是否与缓存的一致
+        if _db_manager.geodata_path != geodata_path or _db_manager.user_path != user_path:
+            print(f"[db] Warning: get_db called with different paths, using cached manager. "
+                  f"Requested: geodata={geodata_path}, user={user_path}. "
+                  f"Cached: geodata={_db_manager.geodata_path}, user={_db_manager.user_path}")
     return _db_manager
 
 
