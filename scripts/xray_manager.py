@@ -630,6 +630,12 @@ class XrayManager:
             logger.info("V2Ray 入口已禁用")
             return False
 
+        # 检查是否已有进程在运行
+        if self._is_process_alive():
+            existing_pid = self.process.pid or self._read_pid_from_file()
+            logger.info(f"Xray 已在运行 (PID: {existing_pid})，先停止现有进程")
+            await self.stop()
+
         users = self._get_v2ray_users()
         if not users:
             logger.warning("没有启用的 V2Ray 用户")
@@ -701,33 +707,41 @@ class XrayManager:
         """停止 Xray"""
         logger.info("停止 Xray...")
 
+        # 获取 PID（优先使用实例变量，否则从文件读取）
+        pid = self.process.pid or self._read_pid_from_file()
+
         # 停止 Xray 进程
-        if self.process.pid:
+        if pid:
             try:
-                os.kill(self.process.pid, signal.SIGTERM)
-                logger.debug(f"已发送 SIGTERM 到 Xray (PID: {self.process.pid})")
+                os.kill(pid, signal.SIGTERM)
+                logger.debug(f"已发送 SIGTERM 到 Xray (PID: {pid})")
 
                 # 等待进程退出
                 for _ in range(10):
                     try:
-                        os.kill(self.process.pid, 0)
+                        os.kill(pid, 0)
                         await asyncio.sleep(0.5)
                     except ProcessLookupError:
                         break
                 else:
                     # 强制杀死
                     try:
-                        os.kill(self.process.pid, signal.SIGKILL)
+                        os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
             except ProcessLookupError:
                 pass
 
-            self.process.pid = None
+        self.process.pid = None
 
-        # 清理 TUN 设备
-        if self.process.tun_device:
-            self._cleanup_tun_device(self.process.tun_device)
+        # 清理 TUN 设备（从实例变量或数据库配置获取设备名）
+        tun_device = self.process.tun_device
+        if not tun_device:
+            config = self._get_v2ray_inbound_config()
+            if config:
+                tun_device = config.get("tun_device", DEFAULT_TUN_DEVICE)
+        if tun_device:
+            self._cleanup_tun_device(tun_device)
 
         # 清理配置文件
         if XRAY_CONFIG_PATH.exists():
@@ -864,10 +878,14 @@ def generate_reality_keys() -> Dict[str, str]:
         public_key = ""
 
         for line in lines:
-            if line.startswith("Private key:"):
-                private_key = line.split(":")[1].strip()
-            elif line.startswith("Public key:"):
-                public_key = line.split(":")[1].strip()
+            # 新版 Xray 格式: PrivateKey: xxx / Password: xxx (public key)
+            # 旧版 Xray 格式: Private key: xxx / Public key: xxx
+            line_lower = line.lower()
+            if line_lower.startswith("privatekey:") or line_lower.startswith("private key:"):
+                private_key = line.split(":", 1)[1].strip()
+            elif line_lower.startswith("password:") or line_lower.startswith("public key:"):
+                # 新版 Xray 称 public key 为 "Password"
+                public_key = line.split(":", 1)[1].strip()
 
         if private_key and public_key:
             return {
@@ -875,7 +893,8 @@ def generate_reality_keys() -> Dict[str, str]:
                 "public_key": public_key
             }
         else:
-            raise ValueError("无法解析 xray x25519 输出")
+            logger.error(f"xray x25519 输出解析失败，原始输出: {output}")
+            raise ValueError(f"无法解析 xray x25519 输出: {output}")
 
     except subprocess.CalledProcessError as e:
         logger.error(f"生成 REALITY 密钥失败: {e}")

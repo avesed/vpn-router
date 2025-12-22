@@ -102,6 +102,37 @@ async function request<T>(path: string, options: { method?: HttpMethod; body?: u
   return response.json();
 }
 
+/**
+ * Fetch image (e.g., QR code) with authentication and return as blob URL
+ * Browser's img src doesn't send Authorization header, so we need to fetch manually
+ */
+async function fetchImageAsBlob(path: string): Promise<string> {
+  const token = localStorage.getItem(TOKEN_KEY);
+
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "GET",
+    headers,
+  });
+
+  if (response.status === 401) {
+    localStorage.removeItem(TOKEN_KEY);
+    window.location.href = "/login";
+    throw new Error("Session expired");
+  }
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch image: ${response.status}`);
+  }
+
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}
+
 export const api = {
   // Status
   getStatus: () => request<GatewayStatus>("/status"),
@@ -212,9 +243,9 @@ export const api = {
     const params = privateKey ? `?private_key=${encodeURIComponent(privateKey)}` : "";
     return `${API_BASE}/ingress/peers/${encodeURIComponent(name)}/config${params}`;
   },
-  getIngressPeerQrcodeUrl: (name: string, privateKey?: string) => {
+  getIngressPeerQrcode: (name: string, privateKey?: string) => {
     const params = privateKey ? `?private_key=${encodeURIComponent(privateKey)}` : "";
-    return `${API_BASE}/ingress/peers/${encodeURIComponent(name)}/qrcode${params}`;
+    return fetchImageAsBlob(`/ingress/peers/${encodeURIComponent(name)}/qrcode${params}`);
   },
 
   // Settings
@@ -384,8 +415,8 @@ export const api = {
     request<{ message: string }>(`/ingress/v2ray/users/${userId}`, { method: "DELETE" }),
   getV2RayUserShareUri: (userId: number) =>
     request<V2RayUserShareResponse>(`/ingress/v2ray/users/${userId}/share`),
-  getV2RayUserQRCodeUrl: (userId: number) =>
-    `${API_BASE}/ingress/v2ray/users/${userId}/qrcode`,
+  getV2RayUserQRCode: (userId: number) =>
+    fetchImageAsBlob(`/ingress/v2ray/users/${userId}/qrcode`),
   getV2RayUsersOnline: () =>
     request<Record<string, { online: boolean; last_seen: number; upload: number; download: number }>>(
       "/ingress/v2ray/users/online"

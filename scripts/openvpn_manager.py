@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 # 配置路径
 OPENVPN_RUN_DIR = Path("/run/openvpn")
 OPENVPN_LOG_DIR = Path("/var/log/openvpn")
+OPENVPN_PID_FILE = Path("/run/openvpn-manager.pid")
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 
@@ -425,7 +426,12 @@ class OpenVPNManager:
     async def run_daemon(self):
         """以守护进程模式运行"""
         self._running = True
+        self._reload_requested = False
         logger.info("OpenVPN 管理器启动（守护模式）")
+
+        # 写入 PID 文件
+        OPENVPN_PID_FILE.write_text(str(os.getpid()))
+        logger.info(f"PID 文件写入: {OPENVPN_PID_FILE}")
 
         # 启动所有隧道
         await self.start_all()
@@ -433,6 +439,12 @@ class OpenVPNManager:
         # 监控循环
         while self._running:
             await asyncio.sleep(10)
+
+            # 检查是否需要重载
+            if self._reload_requested:
+                self._reload_requested = False
+                logger.info("执行配置重载...")
+                await self.reload()
 
             # 检查进程健康
             for tag, tunnel in list(self.tunnels.items()):
@@ -450,7 +462,15 @@ class OpenVPNManager:
 
         # 清理
         await self.stop_all()
+        # 删除 PID 文件
+        if OPENVPN_PID_FILE.exists():
+            OPENVPN_PID_FILE.unlink()
         logger.info("OpenVPN 管理器已停止")
+
+    def request_reload(self):
+        """请求重载配置（由 SIGHUP 信号触发）"""
+        logger.info("收到重载请求 (SIGHUP)")
+        self._reload_requested = True
 
     def stop_daemon(self):
         """停止守护进程"""
@@ -483,6 +503,18 @@ async def main():
             await manager.stop_all()
 
     elif args.command == 'reload':
+        # 优先使用信号通知运行中的守护进程
+        if OPENVPN_PID_FILE.exists():
+            try:
+                daemon_pid = int(OPENVPN_PID_FILE.read_text().strip())
+                os.kill(daemon_pid, signal.SIGHUP)
+                logger.info(f"已发送 SIGHUP 到守护进程 (PID: {daemon_pid})")
+                return
+            except (ValueError, ProcessLookupError, PermissionError) as e:
+                logger.warning(f"无法通知守护进程: {e}，执行本地重载")
+                # PID 文件无效，删除它
+                OPENVPN_PID_FILE.unlink(missing_ok=True)
+        # 没有守护进程运行，执行本地重载
         await manager.reload()
 
     elif args.command == 'status':
@@ -490,15 +522,30 @@ async def main():
         print(json.dumps(status, indent=2, ensure_ascii=False))
 
     elif args.command == 'daemon':
+        # 检查是否已有守护进程运行
+        if OPENVPN_PID_FILE.exists():
+            try:
+                existing_pid = int(OPENVPN_PID_FILE.read_text().strip())
+                os.kill(existing_pid, 0)  # 检查进程是否存在
+                logger.error(f"守护进程已在运行 (PID: {existing_pid})")
+                sys.exit(1)
+            except (ValueError, ProcessLookupError):
+                # PID 文件无效，删除它
+                OPENVPN_PID_FILE.unlink(missing_ok=True)
+
         # 设置信号处理
         loop = asyncio.get_event_loop()
 
-        def signal_handler():
+        def stop_handler():
             logger.info("收到停止信号")
             manager.stop_daemon()
 
+        def reload_handler():
+            manager.request_reload()
+
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
+            loop.add_signal_handler(sig, stop_handler)
+        loop.add_signal_handler(signal.SIGHUP, reload_handler)
 
         await manager.run_daemon()
 

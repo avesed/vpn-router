@@ -2462,8 +2462,10 @@ def api_pia_login(payload: PiaLoginRequest):
         run_command(["python3", str(render_script)], env=env)
         # 自动重载 sing-box 使配置生效
         reload_result = reload_singbox()
+        # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
+        wg_sync_msg = _sync_kernel_wg_egress()
         return {
-            "message": "PIA 登录成功，配置已生成并重载",
+            "message": f"PIA 登录成功，配置已生成并重载{wg_sync_msg}",
             "has_profiles": True,
             "reload": reload_result
         }
@@ -2623,8 +2625,10 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
         run_command(["python3", str(provision_script)], env=env)
         run_command(["python3", str(render_script)], env=env)
         reload_result = reload_singbox()
+        # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
+        wg_sync_msg = _sync_kernel_wg_egress()
         return {
-            "message": f"已重新连接 {payload.profile_tag}",
+            "message": f"已重新连接 {payload.profile_tag}{wg_sync_msg}",
             "reload": reload_result
         }
     except HTTPException:
@@ -5702,54 +5706,94 @@ def _regenerate_and_reload():
 
 
 def _reload_xray_egress() -> str:
-    """重载 Xray 出站进程（如果正在运行）
+    """重载或启动 Xray 出站进程
+
+    如果守护进程没有运行，则启动它；如果已运行则重载配置。
 
     Returns:
         状态消息
     """
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
+        # 先检查状态
+        status_result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_egress_manager.py", "status"],
+            capture_output=True, text=True, timeout=5
         )
-        if result.returncode == 0:
-            print("[api] Xray egress reloaded")
-            # 重置统计客户端，以便重新连接到新的 Xray 进程
-            _reset_xray_egress_client()
-            return ", Xray egress reloaded"
+        is_running = False
+        if status_result.returncode == 0:
+            try:
+                status = json.loads(status_result.stdout)
+                is_running = status.get("status") == "running"
+            except json.JSONDecodeError:
+                pass
+
+        # 根据状态决定操作
+        if is_running:
+            # 已运行，使用 reload
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                print("[api] Xray egress reloaded")
+                _reset_xray_egress_client()
+                return ", Xray egress reloaded"
+            else:
+                print(f"[api] Xray egress reload failed: {result.stderr.strip()}")
+                return ", Xray egress reload failed"
         else:
-            # 可能没有运行，不算错误
-            print(f"[api] Xray egress reload: {result.stderr.strip()}")
-            return ""
+            # 未运行，使用 start
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/xray_egress_manager.py", "start"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                print("[api] Xray egress started")
+                _reset_xray_egress_client()
+                return ", Xray egress started"
+            else:
+                print(f"[api] Xray egress start failed: {result.stderr.strip()}")
+                return ", Xray egress start failed"
+
     except subprocess.TimeoutExpired:
-        print("[api] Xray egress reload timeout")
-        return ", Xray egress reload timeout"
+        print("[api] Xray egress operation timeout")
+        return ", Xray egress timeout"
     except Exception as e:
-        print(f"[api] Xray egress reload error: {e}")
+        print(f"[api] Xray egress error: {e}")
         return ""
 
 
 def _reload_openvpn_manager() -> str:
     """重载 OpenVPN 管理器守护进程（同步数据库变更）
 
+    通过 SIGHUP 信号通知守护进程重载配置，避免创建新进程导致状态丢失。
+
     Returns:
         状态消息
     """
+    import signal as sig_module
+
+    pid_file = Path("/run/openvpn-manager.pid")
+
+    if not pid_file.exists():
+        print("[api] OpenVPN manager not running (no PID file)")
+        return ""
+
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/openvpn_manager.py", "reload"],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            print("[api] OpenVPN manager reloaded")
-            return ", OpenVPN manager reloaded"
-        else:
-            # 可能没有运行，不算错误
-            print(f"[api] OpenVPN manager reload: {result.stderr.strip()}")
-            return ""
-    except subprocess.TimeoutExpired:
-        print("[api] OpenVPN manager reload timeout")
-        return ", OpenVPN manager reload timeout"
+        daemon_pid = int(pid_file.read_text().strip())
+        os.kill(daemon_pid, sig_module.SIGHUP)
+        print(f"[api] Sent SIGHUP to OpenVPN manager (PID: {daemon_pid})")
+        return ", OpenVPN manager reloaded"
+    except ValueError:
+        print("[api] Invalid PID file content")
+        return ""
+    except ProcessLookupError:
+        print("[api] OpenVPN manager process not found, removing stale PID file")
+        pid_file.unlink(missing_ok=True)
+        return ""
+    except PermissionError:
+        print("[api] Permission denied sending signal to OpenVPN manager")
+        return ""
     except Exception as e:
         print(f"[api] OpenVPN manager reload error: {e}")
         return ""

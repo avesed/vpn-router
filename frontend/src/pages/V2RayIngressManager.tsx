@@ -303,13 +303,24 @@ export default function V2RayIngressManager() {
       const result = await api.getV2RayUserShareUri(userId);
       setShareUri(result.uri);
       setShareUriUser(userName);
-      // 设置二维码 URL
-      setShareQrCodeUrl(api.getV2RayUserQRCodeUrl(userId));
+      // 异步获取二维码 blob URL（带认证）
+      const qrBlobUrl = await api.getV2RayUserQRCode(userId);
+      setShareQrCodeUrl(qrBlobUrl);
     } catch (err) {
       setError(err instanceof Error ? err.message : t("v2rayIngress.shareFailed"));
     } finally {
       setActionLoading(null);
     }
+  };
+
+  // 关闭分享弹窗时清理 blob URL
+  const handleCloseShareModal = () => {
+    if (shareQrCodeUrl) {
+      URL.revokeObjectURL(shareQrCodeUrl);
+    }
+    setShareUri(null);
+    setShareUriUser(null);
+    setShareQrCodeUrl(null);
   };
 
   // Generate random hex string for REALITY Short ID
@@ -733,7 +744,7 @@ export default function V2RayIngressManager() {
                     {t("v2rayIngress.shareUriTitle", { name: shareUriUser })}
                   </h2>
                   <button
-                    onClick={() => { setShareUri(null); setShareUriUser(null); setShareQrCodeUrl(null); }}
+                    onClick={handleCloseShareModal}
                     className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
                   >
                     <XMarkIcon className="h-5 w-5" />
@@ -749,9 +760,6 @@ export default function V2RayIngressManager() {
                         src={shareQrCodeUrl}
                         alt="QR Code"
                         className="w-48 h-48"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).style.display = 'none';
-                        }}
                       />
                     </div>
                     <p className="text-xs text-slate-500">{t("v2rayIngress.scanQrCode")}</p>
@@ -769,7 +777,7 @@ export default function V2RayIngressManager() {
                 </div>
                 <div className="flex justify-end gap-3">
                   <button
-                    onClick={() => { setShareUri(null); setShareUriUser(null); setShareQrCodeUrl(null); }}
+                    onClick={handleCloseShareModal}
                     className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm"
                   >
                     {t("common.close")}

@@ -56,6 +56,7 @@ export default function IngressManager() {
   const [configPeerName, setConfigPeerName] = useState("");
   const [configPrivateKey, setConfigPrivateKey] = useState("");
   const [configCopied, setConfigCopied] = useState(false);
+  const [configQrCodeUrl, setConfigQrCodeUrl] = useState<string | null>(null);
 
   // Settings
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -188,6 +189,51 @@ export default function IngressManager() {
     setConfigPrivateKey("");
     setShowConfigModal(true);
   };
+
+  // 关闭 config modal 并清理 blob URL
+  const handleCloseConfigModal = () => {
+    if (configQrCodeUrl) {
+      URL.revokeObjectURL(configQrCodeUrl);
+    }
+    setShowConfigModal(false);
+    setConfigPeerName("");
+    setConfigPrivateKey("");
+    setConfigQrCodeUrl(null);
+  };
+
+  // 当 config modal 显示时或私钥改变时，异步获取二维码
+  useEffect(() => {
+    if (!showConfigModal || !configPeerName) {
+      return;
+    }
+
+    let cancelled = false;
+    const fetchQrCode = async () => {
+      try {
+        // 先清理旧的 blob URL
+        if (configQrCodeUrl) {
+          URL.revokeObjectURL(configQrCodeUrl);
+        }
+        const blobUrl = await api.getIngressPeerQrcode(configPeerName, configPrivateKey || undefined);
+        if (!cancelled) {
+          setConfigQrCodeUrl(blobUrl);
+        } else {
+          URL.revokeObjectURL(blobUrl);
+        }
+      } catch {
+        // 二维码获取失败，不显示
+        if (!cancelled) {
+          setConfigQrCodeUrl(null);
+        }
+      }
+    };
+
+    fetchQrCode();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showConfigModal, configPeerName, configPrivateKey]);
 
   const handleCopyConfig = async () => {
     const configUrl = api.getIngressPeerConfigUrl(configPeerName, configPrivateKey || undefined);
@@ -593,10 +639,7 @@ export default function IngressManager() {
                 <div className="flex items-center justify-between">
                   <h2 className="text-xl font-bold text-white">{t("ingress.clientConfig")} - {configPeerName}</h2>
                 <button
-                  onClick={() => {
-                    setShowConfigModal(false);
-                    setConfigPrivateKey("");
-                  }}
+                  onClick={handleCloseConfigModal}
                   className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
                 >
                   <XMarkIcon className="h-5 w-5" />
@@ -627,18 +670,17 @@ export default function IngressManager() {
               </div>
 
               {/* QR Code */}
-              <div className="flex justify-center py-4">
-                <div className="bg-white p-2 rounded-lg">
-                  <img
-                    src={api.getIngressPeerQrcodeUrl(configPeerName, configPrivateKey || undefined)}
-                    alt={t("ingress.qrCodeAlt")}
-                    className="w-48 h-48"
-                    onError={(e) => {
-                      (e.target as HTMLImageElement).style.display = "none";
-                    }}
-                  />
+              {configQrCodeUrl && (
+                <div className="flex justify-center py-4">
+                  <div className="bg-white p-2 rounded-lg">
+                    <img
+                      src={configQrCodeUrl}
+                      alt={t("ingress.qrCodeAlt")}
+                      className="w-48 h-48"
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
 
               <p className="text-xs text-slate-500 text-center">
                 {t("ingress.qrCodeHint")}

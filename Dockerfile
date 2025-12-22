@@ -4,6 +4,7 @@
 FROM debian:12-slim AS xray-downloader
 
 ARG XRAY_VERSION=25.12.8
+ARG TARGETARCH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -11,8 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and extract Xray
-RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip \
+# Download and extract Xray (multi-arch support)
+# amd64 -> Xray-linux-64.zip
+# arm64 -> Xray-linux-arm64-v8a.zip
+RUN XRAY_ARCH="" && \
+    if [ "$TARGETARCH" = "amd64" ]; then XRAY_ARCH="64"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then XRAY_ARCH="arm64-v8a"; \
+    else echo "Unsupported architecture: $TARGETARCH" && exit 1; fi && \
+    curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip" -o /tmp/xray.zip \
     && cd /tmp \
     && unzip xray.zip \
     && chmod +x xray \

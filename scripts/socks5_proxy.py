@@ -57,7 +57,8 @@ UDP_FRAG_NONE = 0x00
 # DNS constants
 DNS_PORT = 53
 DNS_TIMEOUT = 5.0
-DNS_SERVERS = ['8.8.8.8', '1.1.1.1', '8.8.4.4']
+# Default fallback DNS servers (only used if no provider DNS configured)
+DEFAULT_DNS_SERVERS = ['8.8.8.8', '1.1.1.1', '8.8.4.4']
 
 
 class TunnelDNSResolver:
@@ -67,13 +68,30 @@ class TunnelDNSResolver:
         self,
         bind_interface: Optional[str] = None,
         bind_ip: Optional[str] = None,
-        dns_servers: Optional[List[str]] = None
+        dns_servers: Optional[List[str]] = None,
+        fallback_dns: bool = True
     ):
         self.bind_interface = bind_interface
         self.bind_ip = bind_ip
-        self.dns_servers = dns_servers or DNS_SERVERS
+        # Primary DNS servers (provider or custom)
+        self.dns_servers = dns_servers if dns_servers else []
+        # Whether to fall back to default DNS if primary fails
+        self.fallback_dns = fallback_dns
         self._cache: Dict[str, Tuple[List[str], float]] = {}
         self._cache_ttl = 300  # 5 minutes
+
+    def _get_dns_servers_to_try(self) -> List[str]:
+        """Get list of DNS servers to try, with fallback if enabled."""
+        servers = list(self.dns_servers)
+        if self.fallback_dns:
+            # Add default DNS servers as fallback (avoiding duplicates)
+            for server in DEFAULT_DNS_SERVERS:
+                if server not in servers:
+                    servers.append(server)
+        # If no servers configured and no fallback, use defaults
+        if not servers:
+            servers = DEFAULT_DNS_SERVERS.copy()
+        return servers
 
     async def resolve(self, hostname: str) -> List[str]:
         """
@@ -89,8 +107,9 @@ class TunnelDNSResolver:
         loop = asyncio.get_event_loop()
         ips = []
 
-        # Try each DNS server
-        for dns_server in self.dns_servers:
+        # Try each DNS server (including fallback if enabled)
+        dns_servers = self._get_dns_servers_to_try()
+        for dns_server in dns_servers:
             sock = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -480,7 +499,9 @@ class SOCKS5Server:
         listen_host: str = '127.0.0.1',
         listen_port: int = 1080,
         bind_interface: Optional[str] = None,
-        bind_ip: Optional[str] = None
+        bind_ip: Optional[str] = None,
+        dns_servers: Optional[List[str]] = None,
+        dns_fallback: bool = True
     ):
         self.listen_host = listen_host
         self.listen_port = listen_port
@@ -489,7 +510,11 @@ class SOCKS5Server:
         self.server: Optional[asyncio.Server] = None
         self.running = False
         self.connections = 0
-        self.dns_resolver = TunnelDNSResolver(bind_interface, bind_ip)
+        self.dns_resolver = TunnelDNSResolver(
+            bind_interface, bind_ip,
+            dns_servers=dns_servers,
+            fallback_dns=dns_fallback
+        )
         self.udp_sessions: Dict[int, UDPSession] = {}
         self.udp_timeout = 300.0  # 5 minutes
 
@@ -861,6 +886,8 @@ async def main():
     parser.add_argument('--port', type=int, required=True, help='Listen port')
     parser.add_argument('--bind-interface', help='Bind outgoing connections to interface (e.g., tun0)')
     parser.add_argument('--bind-ip', help='Bind outgoing connections to IP address')
+    parser.add_argument('--dns-servers', help='Comma-separated list of DNS servers (e.g., 10.0.0.1,10.0.0.2)')
+    parser.add_argument('--no-dns-fallback', action='store_true', help='Disable fallback to public DNS servers')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     args = parser.parse_args()
 
@@ -870,11 +897,19 @@ async def main():
     if not args.bind_interface and not args.bind_ip:
         logger.warning("No --bind-interface or --bind-ip specified, using default routing")
 
+    # Parse DNS servers
+    dns_servers = None
+    if args.dns_servers:
+        dns_servers = [s.strip() for s in args.dns_servers.split(',') if s.strip()]
+        logger.info(f"Using DNS servers: {dns_servers}")
+
     server = SOCKS5Server(
         listen_host=args.host,
         listen_port=args.port,
         bind_interface=args.bind_interface,
-        bind_ip=args.bind_ip
+        bind_ip=args.bind_ip,
+        dns_servers=dns_servers,
+        dns_fallback=not args.no_dns_fallback
     )
 
     # Handle signals
