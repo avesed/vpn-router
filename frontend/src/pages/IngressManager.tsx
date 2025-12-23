@@ -278,12 +278,12 @@ export default function IngressManager() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 md:space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-white">{t("ingress.title")}</h1>
-          <p className="text-slate-400 mt-1">{t("ingress.subtitle")}</p>
+          <h1 className="text-xl md:text-2xl font-bold text-white">{t("ingress.title")}</h1>
+          <p className="text-xs md:text-sm text-slate-400 mt-1">{t("ingress.subtitle")}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -303,10 +303,11 @@ export default function IngressManager() {
           </button>
           <button
             onClick={() => setShowAddModal(true)}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white font-medium transition-colors"
+            className="flex items-center gap-2 px-3 md:px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm md:text-base font-medium transition-colors"
           >
             <PlusIcon className="h-5 w-5" />
-            {t("ingress.addClient")}
+            <span className="hidden sm:inline">{t("ingress.addClient")}</span>
+            <span className="sm:hidden">{t("common.add")}</span>
           </button>
         </div>
       </div>
@@ -329,9 +330,9 @@ export default function IngressManager() {
 
       {/* Interface Info */}
       {ingress && (
-        <div className="rounded-xl bg-white/5 border border-white/10 p-5">
-          <h3 className="text-sm font-semibold text-slate-400 mb-3">{t("ingress.ingressInterface")}</h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="rounded-xl bg-white/5 border border-white/10 p-4 md:p-5">
+          <h3 className="text-xs md:text-sm font-semibold text-slate-400 mb-3">{t("ingress.ingressInterface")}</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
             <div>
               <p className="text-xs text-slate-500">{t("ingress.interfaceName")}</p>
               <p className="font-mono text-white">{ingress.interface.name}</p>

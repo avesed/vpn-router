@@ -1189,10 +1189,10 @@ export default function EgressManager() {
   return (
     <div className="flex flex-col min-h-[calc(100vh-12rem)]">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 md:mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-white">{t('egress.title')}</h1>
-          <p className="text-slate-400 mt-1">{t('egress.subtitle')}</p>
+          <h1 className="text-xl md:text-2xl font-bold text-white">{t('egress.title')}</h1>
+          <p className="text-xs md:text-sm text-slate-400 mt-1">{t('egress.subtitle')}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -1286,8 +1286,8 @@ export default function EgressManager() {
         document.body
       )}
 
-      {/* Tabs */}
-      <div className="flex gap-2 border-b border-white/10 pb-2 mb-6">
+      {/* Tabs - Horizontal scroll on mobile */}
+      <div className="flex gap-2 border-b border-white/10 pb-2 mb-4 md:mb-6 overflow-x-auto scrollbar-hide">
         {[
           { key: "all", label: `${t('common.all')} (${totalCount})` },
           { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
@@ -1299,7 +1299,7 @@ export default function EgressManager() {
           <button
             key={tab.key}
             onClick={() => setActiveTab(tab.key as TabType)}
-            className={`px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+            className={`px-3 md:px-4 py-2 text-xs md:text-sm font-medium rounded-lg transition-colors whitespace-nowrap flex-shrink-0 ${
               activeTab === tab.key
                 ? "bg-brand text-white"
                 : "text-slate-400 hover:text-white hover:bg-white/5"
@@ -1354,7 +1354,7 @@ export default function EgressManager() {
           </div>
         </div>
       ) : (
-        <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-6 space-y-6 overflow-y-auto">
+        <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-4 md:p-6 space-y-4 md:space-y-6 overflow-y-auto">
           {/* PIA Egress */}
           {filteredPia.length > 0 && (
             <div>

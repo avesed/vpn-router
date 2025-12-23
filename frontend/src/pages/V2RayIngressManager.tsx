@@ -424,12 +424,12 @@ export default function V2RayIngressManager() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 md:space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-white">{t("v2rayIngress.inbound")}</h1>
-          <p className="text-slate-400 mt-1">{t("nav.v2rayIngressDesc")}</p>
+          <h1 className="text-xl md:text-2xl font-bold text-white">{t("v2rayIngress.inbound")}</h1>
+          <p className="text-xs md:text-sm text-slate-400 mt-1">{t("nav.v2rayIngressDesc")}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -450,10 +450,11 @@ export default function V2RayIngressManager() {
           {v2rayConfig?.enabled === 1 && (
             <button
               onClick={() => setShowAddV2rayUserModal(true)}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white font-medium transition-colors"
+              className="flex items-center gap-2 px-3 md:px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm md:text-base font-medium transition-colors"
             >
               <UserPlusIcon className="h-5 w-5" />
-              {t("v2rayIngress.addUser")}
+              <span className="hidden sm:inline">{t("v2rayIngress.addUser")}</span>
+              <span className="sm:hidden">{t("common.add")}</span>
             </button>
           )}
         </div>
@@ -623,8 +624,8 @@ export default function V2RayIngressManager() {
         ) : (
           <>
             {/* V2Ray Config Info */}
-            <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 text-sm">
+            <div className="rounded-xl bg-white/5 border border-white/10 p-3 md:p-4">
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 md:gap-4 text-sm">
                 <div>
                   <p className="text-xs text-slate-500">{t("v2rayIngress.protocol")}</p>
                   <p className="font-medium text-white">

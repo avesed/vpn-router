@@ -455,12 +455,12 @@ export default function DomainCatalog() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 md:space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-white">{t('catalog.title')}</h1>
-          <p className="text-slate-400 mt-1">
+          <h1 className="text-xl md:text-2xl font-bold text-white">{t('catalog.title')}</h1>
+          <p className="text-xs md:text-sm text-slate-400 mt-1">
             {t('catalog.subtitle')}
             {activeTab === "ip" && ipCatalog && (
               <span className="ml-2 text-slate-500">

@@ -318,15 +318,15 @@ export default function Dashboard() {
   };
 
   return (
-    <div className="space-y-8">
-      <div className="flex items-center justify-between">
+    <div className="space-y-6 md:space-y-8">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h2 className="text-3xl font-bold text-white">{t('dashboard.title')}</h2>
-          <p className="mt-1 text-sm text-slate-400">{t('dashboard.subtitle')}</p>
+          <h2 className="text-2xl md:text-3xl font-bold text-white">{t('dashboard.title')}</h2>
+          <p className="mt-1 text-xs md:text-sm text-slate-400">{t('dashboard.subtitle')}</p>
         </div>
-        <div className="flex items-center gap-2 rounded-full bg-white/5 px-4 py-2">
+        <div className="flex items-center gap-2 rounded-full bg-white/5 px-3 py-1.5 md:px-4 md:py-2 self-start sm:self-auto">
           <div className={`h-2 w-2 rounded-full ${status?.sing_box_running ? 'bg-emerald-400 animate-pulse' : 'bg-rose-400'}`} />
-          <span className="text-sm text-slate-300">{status?.sing_box_running ? t('dashboard.serviceRunning') : t('dashboard.serviceStopped')}</span>
+          <span className="text-xs md:text-sm text-slate-300">{status?.sing_box_running ? t('dashboard.serviceRunning') : t('dashboard.serviceStopped')}</span>
         </div>
       </div>
 
@@ -356,26 +356,26 @@ export default function Dashboard() {
       ) : (
         <>
           {/* 主要状态卡片 */}
-          <div className="grid gap-5 md:grid-cols-3">
+          <div className="grid gap-3 md:gap-5 grid-cols-1 sm:grid-cols-2 md:grid-cols-3">
             {mainStats.map((card) => (
               <StatsCard key={card.title} {...card} />
             ))}
           </div>
 
           {/* 实时统计卡片 */}
-          <div className="grid gap-5 md:grid-cols-3">
+          <div className="grid gap-3 md:gap-5 grid-cols-1 sm:grid-cols-2 md:grid-cols-3">
             {liveStats.map((card) => (
               <StatsCard key={card.title} {...card} />
             ))}
           </div>
 
           {/* 图表区域 */}
-          <div className="grid gap-5 lg:grid-cols-2">
+          <div className="grid gap-4 md:gap-5 lg:grid-cols-2">
             {/* 出口流量分布饼图 */}
-            <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold text-white">{t('dashboard.trafficDistribution')}</h3>
-                <p className="mt-1 text-sm text-slate-400">{t('dashboard.trafficDistributionDesc')}</p>
+            <section className="rounded-2xl md:rounded-3xl border border-white/5 bg-slate-900/40 p-4 md:p-6 shadow-inner shadow-black/40">
+              <div className="mb-3 md:mb-4">
+                <h3 className="text-base md:text-lg font-semibold text-white">{t('dashboard.trafficDistribution')}</h3>
+                <p className="mt-1 text-xs md:text-sm text-slate-400">{t('dashboard.trafficDistributionDesc')}</p>
               </div>
 
               {trafficData.length > 0 ? (
@@ -420,18 +420,18 @@ export default function Dashboard() {
             </section>
 
             {/* 实时网速图表 */}
-            <section className="rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-inner shadow-black/40">
-              <div className="mb-4 flex items-start justify-between">
+            <section className="rounded-2xl md:rounded-3xl border border-white/5 bg-slate-900/40 p-4 md:p-6 shadow-inner shadow-black/40">
+              <div className="mb-3 md:mb-4 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
                 <div>
-                  <h3 className="text-lg font-semibold text-white">{t('dashboard.networkSpeed')}</h3>
-                  <p className="mt-1 text-sm text-slate-400">{t('dashboard.networkSpeedDesc')}</p>
+                  <h3 className="text-base md:text-lg font-semibold text-white">{t('dashboard.networkSpeed')}</h3>
+                  <p className="mt-1 text-xs md:text-sm text-slate-400">{t('dashboard.networkSpeedDesc')}</p>
                 </div>
                 <div className="flex gap-1">
                   {(["1m", "1h", "24h"] as const).map((range) => (
                     <button
                       key={range}
                       onClick={() => setTimeRange(range)}
-                      className={`px-2 py-1 text-xs rounded transition-colors ${
+                      className={`px-2.5 py-1.5 md:px-2 md:py-1 text-xs rounded transition-colors touch-target ${
                         timeRange === range
                           ? "bg-blue-500 text-white"
                           : "bg-slate-700/50 text-slate-400 hover:bg-slate-600/50"

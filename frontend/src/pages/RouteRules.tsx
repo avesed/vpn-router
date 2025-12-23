@@ -203,29 +203,30 @@ export default function RouteRules() {
   });
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
+    <div className="space-y-4 md:space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h2 className="text-3xl font-bold text-white">{t('rules.title')}</h2>
-          <p className="mt-1 text-sm text-slate-400">
+          <h2 className="text-xl md:text-2xl font-bold text-white">{t('rules.title')}</h2>
+          <p className="mt-1 text-xs md:text-sm text-slate-400">
             {t('rules.subtitle')}
           </p>
         </div>
-        <div className="flex gap-3">
+        <div className="flex gap-2">
           <button
             onClick={fetchData}
             disabled={loading}
-            className="flex items-center gap-2 rounded-xl bg-white/5 px-4 py-2 text-sm text-slate-300 transition hover:bg-white/10 disabled:opacity-50"
+            className="p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50"
+            title={t('common.refresh')}
           >
-            <ArrowPathIcon className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-            {t('common.refresh')}
+            <ArrowPathIcon className={`h-5 w-5 text-slate-400 ${loading ? "animate-spin" : ""}`} />
           </button>
           <button
             onClick={() => setShowNewForm(true)}
-            className="flex items-center gap-2 rounded-xl bg-brand px-4 py-2 text-sm font-medium text-white transition hover:bg-brand/90"
+            className="flex items-center gap-2 px-3 md:px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm md:text-base font-medium transition-colors"
           >
-            <PlusIcon className="h-4 w-4" />
-            {t('rules.addRule')}
+            <PlusIcon className="h-5 w-5" />
+            <span className="hidden sm:inline">{t('rules.addRule')}</span>
+            <span className="sm:hidden">{t('common.add')}</span>
           </button>
         </div>
       </div>
@@ -244,13 +245,13 @@ export default function RouteRules() {
       )}
 
       {/* Default Outbound */}
-      <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-5">
-        <div className="flex items-center gap-3 mb-4">
+      <div className="rounded-xl md:rounded-2xl border border-white/10 bg-slate-900/40 p-4 md:p-5">
+        <div className="flex items-center gap-3 mb-3 md:mb-4">
           <div className="rounded-lg bg-blue-500/20 p-2">
             <ServerStackIcon className="h-5 w-5 text-blue-400" />
           </div>
           <div>
-            <h3 className="font-semibold text-white">{t('rules.defaultOutbound')}</h3>
+            <h3 className="font-semibold text-white text-sm md:text-base">{t('rules.defaultOutbound')}</h3>
             <p className="text-xs text-slate-400">{t('rules.defaultOutboundDesc')}</p>
           </div>
         </div>
@@ -269,8 +270,8 @@ export default function RouteRules() {
 
       {/* New Rule Form */}
       {showNewForm && (
-        <div className="rounded-2xl border border-brand/30 bg-brand/5 p-6">
-          <h3 className="text-lg font-semibold text-white mb-4">{t('rules.addNewRule')}</h3>
+        <div className="rounded-xl md:rounded-2xl border border-brand/30 bg-brand/5 p-4 md:p-6">
+          <h3 className="text-base md:text-lg font-semibold text-white mb-3 md:mb-4">{t('rules.addNewRule')}</h3>
           <div className="grid gap-4">
             <div className="grid gap-4 md:grid-cols-2">
               <div>
@@ -453,10 +454,10 @@ export default function RouteRules() {
           <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-700 border-t-blue-500" />
         </div>
       ) : rules.length === 0 ? (
-        <div className="rounded-2xl border border-white/5 bg-slate-900/40 p-12 text-center">
-          <GlobeAltIcon className="mx-auto h-12 w-12 text-slate-600" />
-          <p className="mt-4 text-slate-400">{t('rules.noRulesConfigured')}</p>
-          <p className="mt-2 text-sm text-slate-500">{t('rules.allTrafficDefault')}</p>
+        <div className="rounded-xl md:rounded-2xl border border-white/5 bg-slate-900/40 p-8 md:p-12 text-center">
+          <GlobeAltIcon className="mx-auto h-10 w-10 md:h-12 md:w-12 text-slate-600" />
+          <p className="mt-3 md:mt-4 text-slate-400 text-sm md:text-base">{t('rules.noRulesConfigured')}</p>
+          <p className="mt-2 text-xs md:text-sm text-slate-500">{t('rules.allTrafficDefault')}</p>
           <button
             onClick={() => setShowNewForm(true)}
             className="mt-4 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white"
@@ -465,11 +466,11 @@ export default function RouteRules() {
           </button>
         </div>
       ) : (
-        <div className="space-y-4">
+        <div className="space-y-3 md:space-y-4">
           {rules.map((rule, index) => (
             <div
               key={rule.tag}
-              className="rounded-2xl border border-white/5 bg-slate-900/40 p-5"
+              className="rounded-xl md:rounded-2xl border border-white/5 bg-slate-900/40 p-4 md:p-5"
             >
               {editingIndex === index ? (
                 // Edit mode
@@ -820,8 +821,8 @@ export default function RouteRules() {
       </div>
 
       {/* Help Info */}
-      <div className="rounded-2xl border border-blue-500/20 bg-blue-500/5 p-5">
-        <h4 className="font-semibold text-blue-200 mb-2">{t('rules.ruleExplanation')}</h4>
+      <div className="rounded-xl md:rounded-2xl border border-blue-500/20 bg-blue-500/5 p-4 md:p-5">
+        <h4 className="font-semibold text-blue-200 text-sm md:text-base mb-2">{t('rules.ruleExplanation')}</h4>
         <ul className="text-xs text-blue-300/80 space-y-1">
           <li>• {t('rules.ruleExplanationItems.domainSuffix')}</li>
           <li>• {t('rules.ruleExplanationItems.domainKeyword')}</li>

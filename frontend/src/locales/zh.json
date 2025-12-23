@@ -84,7 +84,8 @@
     "backup": "备份恢复",
     "backupDesc": "配置导入导出",
     "systemOnline": "系统在线",
-    "poweredBy": "基于 sing-box"
+    "poweredBy": "基于 sing-box",
+    "more": "更多"
   },
   "dashboard": {
     "title": "实时概览",

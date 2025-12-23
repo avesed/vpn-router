@@ -84,7 +84,8 @@
     "backup": "Backup",
     "backupDesc": "Import/Export config",
     "systemOnline": "System Online",
-    "poweredBy": "Powered by sing-box"
+    "poweredBy": "Powered by sing-box",
+    "more": "More"
   },
   "dashboard": {
     "title": "Overview",

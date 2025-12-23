@@ -155,12 +155,12 @@ export default function IpCatalog() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4 md:space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-white">{t("ipCatalog.title")}</h1>
-          <p className="text-slate-400 mt-1">
+          <h1 className="text-xl md:text-2xl font-bold text-white">{t("ipCatalog.title")}</h1>
+          <p className="text-xs md:text-sm text-slate-400 mt-1">
             {t("ipCatalog.subtitle")}
             {catalog && (
               <span className="ml-2 text-slate-500">

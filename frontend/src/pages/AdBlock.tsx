@@ -203,16 +203,16 @@ export default function AdBlock() {
   return (
     <div className="flex flex-col min-h-[calc(100vh-12rem)]">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 md:mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-white">{t("adblock.title")}</h1>
-          <p className="text-slate-400 mt-1">{t("adblock.subtitle")}</p>
+          <h1 className="text-xl md:text-2xl font-bold text-white">{t("adblock.title")}</h1>
+          <p className="text-xs md:text-sm text-slate-400 mt-1">{t("adblock.subtitle")}</p>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={handleApply}
             disabled={actionLoading === "apply" || enabledCount === 0}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium transition-colors disabled:opacity-50"
+            className="flex items-center gap-2 px-3 md:px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-medium transition-colors disabled:opacity-50"
             title={t("adblock.applyTooltip")}
           >
             {actionLoading === "apply" ? (
@@ -220,17 +220,17 @@ export default function AdBlock() {
             ) : (
               <PlayIcon className="h-4 w-4" />
             )}
-            {t("adblock.apply")}
+            <span className="hidden sm:inline">{t("adblock.apply")}</span>
           </button>
           <button
             onClick={() => {
               resetForm();
               setShowAddModal(true);
             }}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors"
+            className="flex items-center gap-2 px-3 md:px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors"
           >
             <PlusIcon className="h-4 w-4" />
-            {t("adblock.addRule")}
+            <span className="hidden sm:inline">{t("adblock.addRule")}</span>
           </button>
           <button
             onClick={loadRules}
@@ -260,23 +260,23 @@ export default function AdBlock() {
       )}
 
       {/* Stats Bar */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        <div className="rounded-xl bg-white/5 border border-white/10 p-4">
-          <div className="text-sm text-slate-400">{t("adblock.totalRules")}</div>
-          <div className="text-2xl font-bold text-white">{rules.length}</div>
+      <div className="grid grid-cols-3 gap-2 md:gap-4 mb-4 md:mb-6">
+        <div className="rounded-xl bg-white/5 border border-white/10 p-3 md:p-4">
+          <div className="text-xs md:text-sm text-slate-400">{t("adblock.totalRules")}</div>
+          <div className="text-lg md:text-2xl font-bold text-white">{rules.length}</div>
         </div>
-        <div className="rounded-xl bg-emerald-500/10 border border-emerald-500/20 p-4">
-          <div className="text-sm text-emerald-400">{t("adblock.enabledRules")}</div>
-          <div className="text-2xl font-bold text-emerald-400">{enabledCount}</div>
+        <div className="rounded-xl bg-emerald-500/10 border border-emerald-500/20 p-3 md:p-4">
+          <div className="text-xs md:text-sm text-emerald-400">{t("adblock.enabledRules")}</div>
+          <div className="text-lg md:text-2xl font-bold text-emerald-400">{enabledCount}</div>
         </div>
-        <div className="rounded-xl bg-slate-500/10 border border-slate-500/20 p-4">
-          <div className="text-sm text-slate-400">{t("adblock.disabledRules")}</div>
-          <div className="text-2xl font-bold text-slate-400">{rules.length - enabledCount}</div>
+        <div className="rounded-xl bg-slate-500/10 border border-slate-500/20 p-3 md:p-4">
+          <div className="text-xs md:text-sm text-slate-400">{t("adblock.disabledRules")}</div>
+          <div className="text-lg md:text-2xl font-bold text-slate-400">{rules.length - enabledCount}</div>
         </div>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-2 border-b border-white/10 pb-2 mb-6">
+      <div className="flex gap-2 border-b border-white/10 pb-2 mb-4 md:mb-6 overflow-x-auto scrollbar-hide">
         {[
           { key: "all", label: `${t("common.all")} (${rules.length})` },
           { key: "general", label: `${t("adblock.categories.general")} (${categoryCount("general")})` },
@@ -287,7 +287,7 @@ export default function AdBlock() {
           <button
             key={tab.key}
             onClick={() => setActiveTab(tab.key as TabType)}
-            className={`px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+            className={`px-3 md:px-4 py-2 text-xs md:text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${
               activeTab === tab.key
                 ? "bg-brand text-white"
                 : "text-slate-400 hover:text-white hover:bg-white/5"
@@ -327,13 +327,13 @@ export default function AdBlock() {
                       : "bg-white/5 border-white/10 opacity-60"
                   }`}
                 >
-                  <div className="flex items-start justify-between">
-                    <div className="flex items-center gap-3">
-                      <div className={`p-2 rounded-lg ${rule.enabled ? "bg-emerald-500/20" : "bg-white/10"}`}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-3 min-w-0 flex-1">
+                      <div className={`p-2 rounded-lg flex-shrink-0 ${rule.enabled ? "bg-emerald-500/20" : "bg-white/10"}`}>
                         <ShieldExclamationIcon className={`h-5 w-5 ${rule.enabled ? "text-emerald-400" : "text-slate-400"}`} />
                       </div>
-                      <div>
-                        <div className="flex items-center gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <h4 className="font-semibold text-white">{rule.name}</h4>
                           <span className={`px-2 py-0.5 rounded text-xs bg-${catInfo.color}-500/20 text-${catInfo.color}-400`}>
                             {t(`adblock.categories.${rule.category}`)}
@@ -348,10 +348,10 @@ export default function AdBlock() {
                         <p className="text-xs text-slate-500 mt-0.5">
                           {t(`adblock.descriptions.${rule.tag}`, { defaultValue: rule.description })}
                         </p>
-                        <p className="text-xs text-slate-600 mt-1 font-mono truncate max-w-md">{rule.url}</p>
+                        <p className="text-xs text-slate-600 mt-1 font-mono truncate">{rule.url}</p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-shrink-0">
                       {/* Toggle Switch */}
                       <button
                         onClick={() => handleToggle(rule.tag)}
