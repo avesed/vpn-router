@@ -1383,21 +1383,21 @@ export default function EgressManager() {
                         : "bg-white/5 border-white/10"
                     }`}
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className={`p-2 rounded-lg ${profile.is_connected ? "bg-emerald-500/20" : "bg-white/10"}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className={`p-2 rounded-lg flex-shrink-0 ${profile.is_connected ? "bg-emerald-500/20" : "bg-white/10"}`}>
                           <ShieldCheckIcon className={`h-5 w-5 ${profile.is_connected ? "text-emerald-400" : "text-slate-400"}`} />
                         </div>
-                        <div>
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
-                            <h4 className="font-semibold text-white">{profile.tag}</h4>
+                            <h4 className="font-semibold text-white truncate">{profile.tag}</h4>
                             {profile.is_connected ? (
-                              <CheckCircleIcon className="h-4 w-4 text-emerald-400" />
+                              <CheckCircleIcon className="h-4 w-4 flex-shrink-0 text-emerald-400" />
                             ) : (
-                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                              <XCircleIcon className="h-4 w-4 flex-shrink-0 text-slate-500" />
                             )}
                           </div>
-                          <p className="text-xs text-slate-500">{profile.description}</p>
+                          <p className="text-xs text-slate-500 truncate">{profile.description}</p>
                         </div>
                       </div>
                       <div className="flex gap-1 flex-shrink-0">
@@ -1515,14 +1515,14 @@ export default function EgressManager() {
                     key={egress.tag}
                     className="rounded-xl border bg-blue-500/5 border-blue-500/20 p-4"
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2 rounded-lg bg-blue-500/20">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className="p-2 rounded-lg bg-blue-500/20 flex-shrink-0">
                           <ServerIcon className="h-5 w-5 text-blue-400" />
                         </div>
-                        <div>
-                          <h4 className="font-semibold text-white">{egress.tag}</h4>
-                          <p className="text-xs text-slate-500">{egress.description || t('customEgress.defaultDescription')}</p>
+                        <div className="min-w-0 flex-1">
+                          <h4 className="font-semibold text-white truncate">{egress.tag}</h4>
+                          <p className="text-xs text-slate-500 truncate">{egress.description || t('customEgress.defaultDescription')}</p>
                         </div>
                       </div>
                       <div className="flex gap-1 flex-shrink-0">
@@ -1545,10 +1545,10 @@ export default function EgressManager() {
                     </div>
 
                     <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
-                      <p className="text-xs font-mono text-slate-400">
+                      <p className="text-xs font-mono text-slate-400 truncate">
                         {egress.server}:{egress.port}
                       </p>
-                      <p className="text-xs text-slate-500">
+                      <p className="text-xs text-slate-500 truncate">
                         {t('customEgress.addressLabel')}: {egress.address} | MTU: {egress.mtu}
                       </p>
                     </div>
@@ -1687,21 +1687,21 @@ export default function EgressManager() {
                     key={egress.tag}
                     className={`rounded-xl border p-4 ${egress.enabled ? "bg-cyan-500/5 border-cyan-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className={`p-2 rounded-lg ${egress.enabled ? "bg-cyan-500/20" : "bg-white/10"}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className={`p-2 rounded-lg flex-shrink-0 ${egress.enabled ? "bg-cyan-500/20" : "bg-white/10"}`}>
                           <GlobeAltIcon className={`h-5 w-5 ${egress.enabled ? "text-cyan-400" : "text-slate-400"}`} />
                         </div>
-                        <div>
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
-                            <h4 className="font-semibold text-white">{egress.tag}</h4>
+                            <h4 className="font-semibold text-white truncate">{egress.tag}</h4>
                             {egress.enabled ? (
-                              <CheckCircleIcon className="h-4 w-4 text-cyan-400" />
+                              <CheckCircleIcon className="h-4 w-4 flex-shrink-0 text-cyan-400" />
                             ) : (
-                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                              <XCircleIcon className="h-4 w-4 flex-shrink-0 text-slate-500" />
                             )}
                           </div>
-                          <p className="text-xs text-slate-500">{egress.description || t('directEgress.defaultDescription')}</p>
+                          <p className="text-xs text-slate-500 truncate">{egress.description || t('directEgress.defaultDescription')}</p>
                         </div>
                       </div>
                       <div className="flex gap-1 flex-shrink-0">
@@ -1805,21 +1805,21 @@ export default function EgressManager() {
                     key={egress.tag}
                     className={`rounded-xl border p-4 ${egress.enabled ? "bg-orange-500/5 border-orange-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className={`p-2 rounded-lg ${egress.enabled ? "bg-orange-500/20" : "bg-white/10"}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className={`p-2 rounded-lg flex-shrink-0 ${egress.enabled ? "bg-orange-500/20" : "bg-white/10"}`}>
                           <LockClosedIcon className={`h-5 w-5 ${egress.enabled ? "text-orange-400" : "text-slate-400"}`} />
                         </div>
-                        <div>
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
-                            <h4 className="font-semibold text-white">{egress.tag}</h4>
+                            <h4 className="font-semibold text-white truncate">{egress.tag}</h4>
                             {egress.enabled ? (
-                              <CheckCircleIcon className="h-4 w-4 text-orange-400" />
+                              <CheckCircleIcon className="h-4 w-4 flex-shrink-0 text-orange-400" />
                             ) : (
-                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                              <XCircleIcon className="h-4 w-4 flex-shrink-0 text-slate-500" />
                             )}
                           </div>
-                          <p className="text-xs text-slate-500">{egress.description || t('openvpnEgress.defaultDescription')}</p>
+                          <p className="text-xs text-slate-500 truncate">{egress.description || t('openvpnEgress.defaultDescription')}</p>
                         </div>
                       </div>
                       <div className="flex gap-1 flex-shrink-0">
@@ -1842,7 +1842,7 @@ export default function EgressManager() {
                     </div>
 
                     <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
-                      <p className="text-xs text-slate-400">
+                      <p className="text-xs text-slate-400 truncate">
                         <span className="text-slate-500">{t('openvpnEgress.remoteHost')}:</span> {egress.remote_host}:{egress.remote_port}
                       </p>
                       <p className="text-xs text-slate-400">
@@ -1919,21 +1919,21 @@ export default function EgressManager() {
                     key={egress.tag}
                     className={`rounded-xl border p-4 ${egress.enabled ? "bg-violet-500/5 border-violet-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className={`p-2 rounded-lg ${egress.enabled ? "bg-violet-500/20" : "bg-white/10"}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className={`p-2 rounded-lg flex-shrink-0 ${egress.enabled ? "bg-violet-500/20" : "bg-white/10"}`}>
                           <ServerIcon className={`h-5 w-5 ${egress.enabled ? "text-violet-400" : "text-slate-400"}`} />
                         </div>
-                        <div>
+                        <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
-                            <h4 className="font-semibold text-white">{egress.tag}</h4>
+                            <h4 className="font-semibold text-white truncate">{egress.tag}</h4>
                             {egress.enabled ? (
-                              <CheckCircleIcon className="h-4 w-4 text-violet-400" />
+                              <CheckCircleIcon className="h-4 w-4 flex-shrink-0 text-violet-400" />
                             ) : (
-                              <XCircleIcon className="h-4 w-4 text-slate-500" />
+                              <XCircleIcon className="h-4 w-4 flex-shrink-0 text-slate-500" />
                             )}
                           </div>
-                          <p className="text-xs text-slate-500">{egress.description || t('v2rayEgress.defaultDescription')}</p>
+                          <p className="text-xs text-slate-500 truncate">{egress.description || t('v2rayEgress.defaultDescription')}</p>
                         </div>
                       </div>
                       <div className="flex gap-1 flex-shrink-0">
@@ -1959,7 +1959,7 @@ export default function EgressManager() {
                       <p className="text-xs text-slate-400">
                         <span className="text-slate-500">{t('v2rayEgress.protocol')}:</span> {getV2rayProtocolLabel(egress.protocol)}
                       </p>
-                      <p className="text-xs text-slate-400">
+                      <p className="text-xs text-slate-400 truncate">
                         <span className="text-slate-500">{t('v2rayEgress.server')}:</span> {egress.server}:{egress.server_port}
                       </p>
                       <p className="text-xs text-slate-400">
