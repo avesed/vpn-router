@@ -206,7 +206,15 @@
     "allowLanAccess": "Keep local LAN connection",
     "allowLanAccessHint": "When enabled, local LAN traffic bypasses VPN (for RDP, etc.)",
     "detectedLanSubnet": "Detected LAN subnet",
-    "cannotDetectLan": "Unable to detect LAN, please check server network configuration"
+    "cannotDetectLan": "Unable to detect LAN, please check server network configuration",
+    "subnetAddress": "Ingress Subnet Address",
+    "subnetHint": "Internal address range for WireGuard ingress clients. WireGuard interface restart required after change.",
+    "subnetSaved": "Subnet configuration saved",
+    "pleaseEnterSubnet": "Please enter a subnet address",
+    "migratePeers": "Auto-migrate {{count}} existing client(s) to new subnet",
+    "migratePeersHint": "When enabled, all client IP addresses will be updated automatically",
+    "peersMigrated": "{{count}} client(s) migrated",
+    "subnetConflictWarning": "IP conflicts detected with egress endpoints"
   },
   "egress": {
     "title": "Egress Manager",

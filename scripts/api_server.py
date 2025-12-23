@@ -82,9 +82,23 @@ CUSTOM_CATEGORY_ITEMS_FILE = Path(os.environ.get("CUSTOM_CATEGORY_ITEMS_FILE", "
 SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "/etc/sing-box/settings.json"))
 ENTRY_DIR = Path("/usr/local/bin")
 
-# Port configuration from environment
+# Port and subnet configuration from environment
 DEFAULT_WG_PORT = int(os.environ.get("WG_LISTEN_PORT", "36100"))
 DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "36000"))
+DEFAULT_WG_SUBNET = os.environ.get("WG_INGRESS_SUBNET", "10.25.0.1/24")
+
+def get_subnet_prefix(subnet_address: str = None) -> str:
+    """从子网地址提取前缀（如 10.25.0.1/24 -> 10.25.0.）
+
+    如果未提供地址，使用 DEFAULT_WG_SUBNET
+    """
+    addr = (subnet_address or DEFAULT_WG_SUBNET).split("/")[0]
+    return addr.rsplit(".", 1)[0] + "."
+
+def get_default_peer_ip() -> str:
+    """获取默认的 peer IP（基于 DEFAULT_WG_SUBNET）"""
+    prefix = get_subnet_prefix(DEFAULT_WG_SUBNET)
+    return f"{prefix}2/32"
 
 PIA_SERVERLIST_URL = "https://serverlist.piaservers.net/vpninfo/servers/v6"
 
@@ -1684,11 +1698,17 @@ def api_stats_dashboard(time_range: str = "1m"):
         "active_connections": 0,
     }
 
-    # 获取总客户端数量（从数据库）
+    # 获取总客户端数量和子网配置（从数据库）
+    wg_subnet_prefix = get_subnet_prefix()  # 默认值
     try:
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         peers = db.get_wireguard_peers()
         stats["total_clients"] = len(peers) if peers else 0
+
+        # 获取当前子网前缀
+        server = db.get_wireguard_server()
+        if server and server.get("address"):
+            wg_subnet_prefix = get_subnet_prefix(server.get("address"))
     except Exception:
         pass
 
@@ -1705,7 +1725,7 @@ def api_stats_dashboard(time_range: str = "1m"):
         for conn in connections:
             metadata = conn.get("metadata", {})
             src_ip = metadata.get("sourceIP", "")
-            if src_ip.startswith("10.23.0."):
+            if src_ip.startswith(wg_subnet_prefix):
                 online_ips.add(src_ip)
 
         stats["online_clients"] = len(online_ips)
@@ -1841,13 +1861,13 @@ def api_list_endpoints():
             "tag": "wg-server",
             "system": False,
             "mtu": server.get("mtu", 1420),
-            "address": [server.get("address", "10.23.0.1/24")],
+            "address": [server.get("address", DEFAULT_WG_SUBNET)],
             "private_key": server.get("private_key", ""),
             "listen_port": server.get("listen_port", DEFAULT_WG_PORT),
             "peers": [
                 {
                     "public_key": p.get("public_key", ""),
-                    "allowed_ips": [p.get("allowed_ips", "10.23.0.2/32")]
+                    "allowed_ips": [p.get("allowed_ips", get_default_peer_ip())]
                 }
                 for p in peers
             ] if peers else []
@@ -2714,7 +2734,7 @@ def load_ingress_config() -> dict:
             return {
                 "interface": {
                     "name": "wg-ingress",
-                    "address": "10.23.0.1/24",
+                    "address": DEFAULT_WG_SUBNET,
                     "listen_port": DEFAULT_WG_PORT,
                     "mtu": 1420,
                     "private_key": ""
@@ -2738,7 +2758,7 @@ def load_ingress_config() -> dict:
             ).stdout.strip()
             db.set_wireguard_server(
                 interface_name="wg-ingress",
-                address="10.23.0.1/24",
+                address=DEFAULT_WG_SUBNET,
                 listen_port=DEFAULT_WG_PORT,
                 mtu=1420,
                 private_key=private_key
@@ -2750,7 +2770,7 @@ def load_ingress_config() -> dict:
 
     interface_data = {
         "name": server.get("interface_name", "wg-ingress") if server else "wg-ingress",
-        "address": server.get("address", "10.23.0.1/24") if server else "10.23.0.1/24",
+        "address": server.get("address", DEFAULT_WG_SUBNET) if server else DEFAULT_WG_SUBNET,
         "listen_port": server.get("listen_port", DEFAULT_WG_PORT) if server else DEFAULT_WG_PORT,
         "mtu": server.get("mtu", 1420) if server else 1420,
         "private_key": server.get("private_key", "") if server else ""
@@ -2791,7 +2811,7 @@ def save_ingress_config(data: dict) -> None:
     interface = data.get("interface", {})
     db.set_wireguard_server(
         interface_name=interface.get("name", "wg-ingress"),
-        address=interface.get("address", "10.23.0.1/24"),
+        address=interface.get("address", DEFAULT_WG_SUBNET),
         listen_port=interface.get("listen_port", DEFAULT_WG_PORT),
         mtu=interface.get("mtu", 1420),
         private_key=interface.get("private_key", "")
@@ -2823,8 +2843,8 @@ def generate_wireguard_keypair() -> tuple:
 
 
 def get_next_peer_ip(config: dict) -> str:
-    """获取下一个可用的 peer IP"""
-    interface_addr = config.get("interface", {}).get("address", "10.23.0.1/24")
+    """获取下一个可用的 peer IP（避开出口端点使用的 IP）"""
+    interface_addr = config.get("interface", {}).get("address", DEFAULT_WG_SUBNET)
     # 解析网段
     base_ip = interface_addr.split("/")[0]
     parts = base_ip.rsplit(".", 1)
@@ -2832,6 +2852,8 @@ def get_next_peer_ip(config: dict) -> str:
 
     # 收集已用的 IP
     used_ips = {1}  # 1 是网关自己
+
+    # 1. 已有的入口客户端
     for peer in config.get("peers", []):
         allowed_ips = peer.get("allowed_ips", [])
         # 处理数据库中的字符串格式和列表格式
@@ -2842,6 +2864,37 @@ def get_next_peer_ip(config: dict) -> str:
             if ip.startswith(base):
                 last_octet = int(ip.rsplit(".", 1)[1])
                 used_ips.add(last_octet)
+
+    # 2. 检查出口端点使用的 IP（避免冲突）
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+        # 2a. Custom WireGuard 出口
+        for egress in db.get_custom_egress_list():
+            addr = egress.get("address", "")
+            if addr:
+                ip = addr.split("/")[0]
+                if ip.startswith(base):
+                    try:
+                        last_octet = int(ip.rsplit(".", 1)[1])
+                        used_ips.add(last_octet)
+                    except (ValueError, IndexError):
+                        pass
+
+        # 2b. PIA 出口
+        for profile in db.get_pia_profiles(enabled_only=False):
+            peer_ip = profile.get("peer_ip", "")
+            if peer_ip:
+                ip = peer_ip.split("/")[0]
+                if ip.startswith(base):
+                    try:
+                        last_octet = int(ip.rsplit(".", 1)[1])
+                        used_ips.add(last_octet)
+                    except (ValueError, IndexError):
+                        pass
+    except Exception as e:
+        # 数据库错误时仍然继续，只是不检查出口冲突
+        print(f"[WARN] 检查出口 IP 冲突时出错: {e}")
 
     # 找到下一个可用的
     for i in range(2, 255):
@@ -2877,6 +2930,16 @@ def get_peer_status_from_clash_api() -> dict:
     import time
     peer_status = {}  # ip -> {"active": bool, "last_seen": timestamp, "rx": int, "tx": int}
 
+    # 获取当前子网前缀
+    wg_subnet_prefix = get_subnet_prefix()  # 默认值
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        server = db.get_wireguard_server()
+        if server and server.get("address"):
+            wg_subnet_prefix = get_subnet_prefix(server.get("address"))
+    except Exception:
+        pass
+
     try:
         # 查询 sing-box clash_api 获取活跃连接
         import urllib.request
@@ -2891,8 +2954,8 @@ def get_peer_status_from_clash_api() -> dict:
             metadata = conn.get("metadata", {})
             src_ip = metadata.get("sourceIP", "")
 
-            # 只处理来自 WireGuard 网段的连接 (10.23.0.x)
-            if not src_ip.startswith("10.23.0."):
+            # 只处理来自 WireGuard 网段的连接
+            if not src_ip.startswith(wg_subnet_prefix):
                 continue
 
             # 提取流量数据
@@ -3123,7 +3186,7 @@ def apply_ingress_config(config: dict) -> dict:
             if not pubkey:
                 continue
 
-            allowed_ips = peer.get("allowed_ips", "10.23.0.2/32")
+            allowed_ips = peer.get("allowed_ips", get_default_peer_ip())
             # allowed_ips can be a list or string, wg set expects comma-separated string
             if isinstance(allowed_ips, list):
                 allowed_ips = ",".join(allowed_ips)
@@ -3375,7 +3438,7 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
         raise HTTPException(status_code=500, detail="服务端公钥不可用")
 
     # 客户端 IP
-    client_ip = peer.get("allowed_ips", ["10.23.0.2/32"])[0]
+    client_ip = peer.get("allowed_ips", [get_default_peer_ip()])[0]
 
     # 服务端地址（优先使用设置文件，其次使用环境变量）
     settings = load_settings()
@@ -3455,6 +3518,137 @@ def api_apply_ingress_config():
     if not result.get("success"):
         raise HTTPException(status_code=500, detail=result.get("message"))
     return result
+
+
+class SubnetUpdateRequest(BaseModel):
+    """更新入口子网"""
+    address: str = Field(..., description="新的子网地址，如 10.25.0.1/24")
+    migrate_peers: bool = Field(True, description="是否自动迁移现有客户端 IP 到新子网")
+
+
+@app.get("/api/ingress/subnet")
+def api_get_ingress_subnet():
+    """获取入口子网配置"""
+    import ipaddress
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    server = db.get_wireguard_server()
+    address = server.get("address", DEFAULT_WG_SUBNET) if server else DEFAULT_WG_SUBNET
+
+    # 检查是否与出口地址冲突
+    conflicts = []
+    try:
+        network = ipaddress.ip_network(address, strict=False)
+
+        for egress in db.get_custom_egress_list():
+            addr = egress.get("address", "")
+            if addr:
+                try:
+                    egress_ip = ipaddress.ip_address(addr.split("/")[0])
+                    if egress_ip in network:
+                        conflicts.append({
+                            "type": "custom_egress",
+                            "tag": egress.get("tag"),
+                            "address": addr
+                        })
+                except ValueError:
+                    pass
+
+        for profile in db.get_pia_profiles(enabled_only=False):
+            peer_ip = profile.get("peer_ip", "")
+            if peer_ip:
+                try:
+                    profile_ip = ipaddress.ip_address(peer_ip.split("/")[0])
+                    if profile_ip in network:
+                        conflicts.append({
+                            "type": "pia_profile",
+                            "tag": profile.get("name"),
+                            "address": peer_ip
+                        })
+                except ValueError:
+                    pass
+    except ValueError:
+        pass
+
+    return {
+        "address": address,
+        "conflicts": conflicts
+    }
+
+
+@app.put("/api/ingress/subnet")
+def api_update_ingress_subnet(payload: SubnetUpdateRequest):
+    """更新入口子网（可选自动迁移客户端 IP）"""
+    import ipaddress
+
+    # 1. 验证格式
+    try:
+        network = ipaddress.ip_network(payload.address, strict=False)
+        gateway_ip = ipaddress.ip_address(payload.address.split("/")[0])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid subnet format: {e}")
+
+    # 2. 检查与出口地址的冲突
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    conflicts = []
+
+    for egress in db.get_custom_egress_list():
+        addr = egress.get("address", "")
+        if addr:
+            try:
+                egress_ip = ipaddress.ip_address(addr.split("/")[0])
+                if egress_ip in network:
+                    conflicts.append(f"Custom egress '{egress.get('tag')}' uses {addr}")
+            except ValueError:
+                pass
+
+    for profile in db.get_pia_profiles(enabled_only=False):
+        peer_ip = profile.get("peer_ip", "")
+        if peer_ip:
+            try:
+                profile_ip = ipaddress.ip_address(peer_ip.split("/")[0])
+                if profile_ip in network:
+                    conflicts.append(f"PIA profile '{profile.get('name')}' uses {peer_ip}")
+            except ValueError:
+                pass
+
+    if conflicts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subnet conflicts with egress addresses: {', '.join(conflicts)}"
+        )
+
+    # 3. 如果需要迁移客户端 IP
+    migrated_count = 0
+    if payload.migrate_peers:
+        peers = db.get_wireguard_peers(enabled_only=False)
+        new_base = str(network.network_address).rsplit(".", 1)[0]
+        for i, peer in enumerate(peers, start=2):
+            new_ip = f"{new_base}.{i}/32"
+            db.update_wireguard_peer(peer["id"], allowed_ips=new_ip)
+            migrated_count += 1
+
+    # 4. 更新服务器地址
+    server = db.get_wireguard_server()
+    db.set_wireguard_server(
+        interface_name=server.get("interface_name", "wg-ingress") if server else "wg-ingress",
+        address=payload.address,
+        listen_port=server.get("listen_port", DEFAULT_WG_PORT) if server else DEFAULT_WG_PORT,
+        mtu=server.get("mtu", 1420) if server else 1420,
+        private_key=server.get("private_key", "") if server else ""
+    )
+
+    # 5. 重新生成配置并应用
+    _regenerate_and_reload()
+
+    # 6. 同步内核 WireGuard 接口（更新地址和 peer allowed_ips）
+    wg_sync_result = _sync_kernel_wg_ingress()
+
+    return {
+        "success": True,
+        "message": f"Subnet updated to {payload.address}{wg_sync_result}",
+        "address": payload.address,
+        "migrated_peers": migrated_count
+    }
 
 
 # ============ Settings APIs ============
@@ -6601,7 +6795,7 @@ def api_export_backup(payload: BackupExportRequest):
     ingress_public = {
         "interface": {
             "name": ingress_config.get("interface", {}).get("name", "wg-ingress"),
-            "address": ingress_config.get("interface", {}).get("address", "10.23.0.1/24"),
+            "address": ingress_config.get("interface", {}).get("address", DEFAULT_WG_SUBNET),
             "listen_port": ingress_config.get("interface", {}).get("listen_port", DEFAULT_WG_PORT),
             "mtu": ingress_config.get("interface", {}).get("mtu", 1420),
         },
@@ -6851,7 +7045,7 @@ def api_import_backup(payload: BackupImportRequest):
             ingress_config = {
                 "interface": {
                     "name": ingress_public.get("interface", {}).get("name", "wg-ingress"),
-                    "address": ingress_public.get("interface", {}).get("address", "10.23.0.1/24"),
+                    "address": ingress_public.get("interface", {}).get("address", DEFAULT_WG_SUBNET),
                     "listen_port": ingress_public.get("interface", {}).get("listen_port", DEFAULT_WG_PORT),
                     "mtu": ingress_public.get("interface", {}).get("mtu", 1420),
                     "private_key": sensitive.get("interface_private_key", ""),

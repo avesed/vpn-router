@@ -61,7 +61,7 @@ DEFAULT_TUN_SUBNET = "10.24.0.0/24"
 DEFAULT_TUN_ADDRESS = "10.24.0.1"
 
 # Xray WireGuard 出站配置
-# 注意: 使用不同的子网 (10.23.1.x) 避免与 wg-ingress 的 10.23.0.x 冲突
+# 注意: 使用不同的子网 (10.23.1.x) 避免与 wg-ingress 的 10.25.0.x 冲突
 # 这是因为 Xray 的 WireGuard 会在本地创建一个 TUN 接口，该接口的 IP 会被内核
 # 注册为本地地址。如果使用相同子网，响应包会被路由到 loopback 而不是 wg-ingress
 XRAY_WG_PEER_NAME = "__xray_internal__"

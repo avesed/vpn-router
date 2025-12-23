@@ -20,6 +20,8 @@ import type {
   IpQuickRuleResponse,
   IngressResponse,
   IngressPeerCreateResponse,
+  SubnetInfo,
+  SubnetUpdateResponse,
   AllEgressResponse,
   CustomEgressListResponse,
   CustomEgress,
@@ -269,6 +271,14 @@ export const api = {
     const params = privateKey ? `?private_key=${encodeURIComponent(privateKey)}` : "";
     return fetchImageAsBlob(`/ingress/peers/${encodeURIComponent(name)}/qrcode${params}`);
   },
+
+  // Ingress Subnet Configuration
+  getIngressSubnet: () => request<SubnetInfo>("/ingress/subnet"),
+  updateIngressSubnet: (address: string, migratePeers: boolean = true) =>
+    request<SubnetUpdateResponse>("/ingress/subnet", {
+      method: "PUT",
+      body: { address, migrate_peers: migratePeers }
+    }),
 
   // Settings
   getSettings: () => request<{ server_endpoint: string; listen_port: number }>("/settings"),

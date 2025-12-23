@@ -92,7 +92,7 @@ fi
 # Creates wg-ingress interface and configures TPROXY to sing-box
 
 WG_INTERFACE="${WG_INTERFACE:-wg-ingress}"
-WG_SUBNET="${WG_SUBNET:-10.23.0.0/24}"
+WG_SUBNET="${WG_SUBNET:-10.25.0.0/24}"
 TPROXY_PORT="${TPROXY_PORT:-7893}"
 TPROXY_MARK="1"
 TPROXY_TABLE="100"
@@ -124,14 +124,14 @@ db = get_db(
 )
 server = db.get_wireguard_server()
 if server:
-    addr = server.get('address', '10.23.0.1/24')
-    # Convert address to subnet (e.g., 10.23.0.1/24 -> 10.23.0.0/24)
+    addr = server.get('address', '10.25.0.1/24')
+    # Convert address to subnet (e.g., 10.25.0.1/24 -> 10.25.0.0/24)
     import ipaddress
     net = ipaddress.ip_network(addr, strict=False)
     print(str(net))
 else:
-    print('10.23.0.0/24')
-" 2>/dev/null || echo "10.23.0.0/24")
+    print('10.25.0.0/24')
+" 2>/dev/null || echo "10.25.0.0/24")
 
   echo "[entrypoint] WireGuard subnet: ${WG_SUBNET}"
   echo "[entrypoint] kernel WireGuard interface ready"

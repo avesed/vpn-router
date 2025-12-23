@@ -516,11 +516,13 @@ def init_wireguard_server(conn: sqlite3.Connection):
         return
 
     # 插入默认配置（使用环境变量或默认端口）
+    # 默认子网使用 10.25.0.0/24，避免与远程 vpn-router 服务器（通常使用 10.23.0.0/24）冲突
     wg_listen_port = int(os.environ.get("WG_LISTEN_PORT", "36100"))
+    default_subnet = os.environ.get("WG_INGRESS_SUBNET", "10.25.0.1/24")
     cursor.execute("""
         INSERT INTO wireguard_server (id, interface_name, address, listen_port, mtu, private_key)
-        VALUES (1, 'wg-ingress', '10.23.0.1/24', ?, 1420, ?)
-    """, (wg_listen_port, private_key))
+        VALUES (1, 'wg-ingress', ?, ?, 1420, ?)
+    """, (default_subnet, wg_listen_port, private_key))
 
     conn.commit()
     print("✓ 初始化 WireGuard 服务器配置（已生成私钥）")

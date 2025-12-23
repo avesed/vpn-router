@@ -25,6 +25,13 @@ from db_helper import get_db
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 DEFAULT_INTERFACE = "wg-ingress"
+DEFAULT_WG_SUBNET = os.environ.get("WG_INGRESS_SUBNET", "10.25.0.1/24")
+
+def get_default_peer_ip() -> str:
+    """获取默认的 peer IP（基于 DEFAULT_WG_SUBNET）"""
+    addr = DEFAULT_WG_SUBNET.split("/")[0]
+    prefix = addr.rsplit(".", 1)[0]
+    return f"{prefix}.2/32"
 
 
 def run_cmd(cmd: list, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
@@ -72,7 +79,7 @@ def sync_peers(interface: str, desired_peers: list, current_peers: set) -> None:
     # Add or update peers
     for peer in desired_peers:
         pubkey = peer["public_key"]
-        allowed_ips = peer.get("allowed_ips", "10.23.0.2/32")
+        allowed_ips = peer.get("allowed_ips", get_default_peer_ip())
 
         # Build command
         cmd = ["wg", "set", interface, "peer", pubkey, "allowed-ips", allowed_ips]
@@ -112,7 +119,7 @@ def setup_wireguard_interface(interface: str = DEFAULT_INTERFACE, sync_only: boo
 
     # Get configuration values
     listen_port = server.get("listen_port", int(os.environ.get("WG_LISTEN_PORT", "36100")))
-    address = server.get("address", "10.23.0.1/24")
+    address = server.get("address", DEFAULT_WG_SUBNET)
     private_key = server.get("private_key")
     mtu = server.get("mtu", 1420)
 

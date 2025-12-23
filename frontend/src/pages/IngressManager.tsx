@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { IngressResponse, IngressPeer } from "../types";
+import type { IngressResponse, IngressPeer, SubnetConflict } from "../types";
 import {
   PlusIcon,
   TrashIcon,
@@ -15,7 +15,8 @@ import {
   WifiIcon,
   ComputerDesktopIcon,
   DevicePhoneMobileIcon,
-  Cog6ToothIcon
+  Cog6ToothIcon,
+  ExclamationTriangleIcon
 } from "@heroicons/react/24/outline";
 
 function formatBytes(bytes: number): string {
@@ -66,6 +67,13 @@ export default function IngressManager() {
   const [detectedIps, setDetectedIps] = useState<{ public_ip: string | null; lan_ip: string | null } | null>(null);
   const [detectingIp, setDetectingIp] = useState(false);
 
+  // Subnet configuration
+  const [subnetAddress, setSubnetAddress] = useState("");
+  const [subnetAddressSaved, setSubnetAddressSaved] = useState("");
+  const [subnetConflicts, setSubnetConflicts] = useState<SubnetConflict[]>([]);
+  const [migratePeers, setMigratePeers] = useState(true);
+  const [savingSubnet, setSavingSubnet] = useState(false);
+
   const detectIp = useCallback(async () => {
     setDetectingIp(true);
     try {
@@ -90,6 +98,17 @@ export default function IngressManager() {
     }
   }, []);
 
+  const loadSubnet = useCallback(async () => {
+    try {
+      const subnetInfo = await api.getIngressSubnet();
+      setSubnetAddress(subnetInfo.address || "");
+      setSubnetAddressSaved(subnetInfo.address || "");
+      setSubnetConflicts(subnetInfo.conflicts || []);
+    } catch {
+      // Ignore errors
+    }
+  }, []);
+
   const loadIngress = useCallback(async () => {
     try {
       setLoading(true);
@@ -106,9 +125,10 @@ export default function IngressManager() {
   useEffect(() => {
     loadIngress();
     loadSettings();
+    loadSubnet();
     const interval = setInterval(loadIngress, 30000);
     return () => clearInterval(interval);
-  }, [loadIngress, loadSettings]);
+  }, [loadIngress, loadSettings, loadSubnet]);
 
   const handleSaveSettings = async () => {
     setSavingSettings(true);
@@ -123,6 +143,35 @@ export default function IngressManager() {
       setError(err instanceof Error ? err.message : t("common.saveFailed"));
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const handleSaveSubnet = async () => {
+    if (!subnetAddress.trim()) {
+      setError(t("ingress.pleaseEnterSubnet"));
+      return;
+    }
+
+    setSavingSubnet(true);
+    try {
+      const result = await api.updateIngressSubnet(subnetAddress.trim(), migratePeers);
+      setSubnetAddressSaved(result.address);
+      setSubnetAddress(result.address);
+
+      let message = t("ingress.subnetSaved");
+      if (result.migrated_peers && result.migrated_peers > 0) {
+        message += ` (${t("ingress.peersMigrated", { count: result.migrated_peers })})`;
+      }
+      setSuccessMessage(message);
+      setTimeout(() => setSuccessMessage(null), 3000);
+
+      // Reload ingress to get updated peer IPs
+      loadIngress();
+      loadSubnet();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("common.saveFailed"));
+    } finally {
+      setSavingSubnet(false);
     }
   };
 
@@ -736,6 +785,7 @@ export default function IngressManager() {
                   onClick={() => {
                     setShowSettingsModal(false);
                     setServerEndpoint(serverEndpointSaved);
+                    setSubnetAddress(subnetAddressSaved);
                     setDetectedIps(null);
                   }}
                   className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
@@ -824,6 +874,91 @@ export default function IngressManager() {
                   </p>
                 </div>
               )}
+
+              {/* Subnet Configuration */}
+              <div className="pt-4 border-t border-white/10">
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t("ingress.subnetAddress")}
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={subnetAddress}
+                    onChange={(e) => setSubnetAddress(e.target.value)}
+                    placeholder="10.25.0.1/24"
+                    className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
+                  />
+                  <button
+                    onClick={handleSaveSubnet}
+                    disabled={savingSubnet || !subnetAddress.trim() || subnetAddress === subnetAddressSaved}
+                    className="px-3 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {savingSubnet ? (
+                      <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                    ) : (
+                      <CheckIcon className="h-4 w-4" />
+                    )}
+                    {t("common.save")}
+                  </button>
+                </div>
+                <p className="text-xs text-slate-500 mt-2">
+                  {t("ingress.subnetHint")}
+                </p>
+
+                {/* Quick subnet suggestions */}
+                <div className="flex flex-wrap gap-2 mt-3">
+                  {["10.25.0.1/24", "10.23.0.1/24", "10.0.0.1/24", "172.16.0.1/24", "192.168.100.1/24"].map((subnet) => (
+                    <button
+                      key={subnet}
+                      onClick={() => setSubnetAddress(subnet)}
+                      className={`px-2 py-1 rounded text-xs transition-colors ${
+                        subnetAddress === subnet
+                          ? "bg-brand/30 border border-brand text-brand"
+                          : "bg-white/5 border border-white/10 text-slate-400 hover:bg-white/10"
+                      }`}
+                    >
+                      {subnet}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Migrate peers checkbox */}
+                {subnetAddress !== subnetAddressSaved && ingress && ingress.peer_count > 0 && (
+                  <div className="mt-3">
+                    <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={migratePeers}
+                        onChange={(e) => setMigratePeers(e.target.checked)}
+                        className="rounded border-slate-600"
+                      />
+                      {t("ingress.migratePeers", { count: ingress.peer_count })}
+                    </label>
+                    <p className="text-xs text-slate-500 mt-1 ml-5">
+                      {t("ingress.migratePeersHint")}
+                    </p>
+                  </div>
+                )}
+
+                {/* Conflict warnings */}
+                {subnetConflicts.length > 0 && (
+                  <div className="mt-3 rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
+                    <div className="flex items-center gap-2 mb-2">
+                      <ExclamationTriangleIcon className="h-4 w-4 text-amber-400" />
+                      <span className="text-sm font-medium text-amber-300">
+                        {t("ingress.subnetConflictWarning")}
+                      </span>
+                    </div>
+                    <ul className="text-xs text-amber-200/80 space-y-1 ml-6">
+                      {subnetConflicts.map((conflict, idx) => (
+                        <li key={idx}>
+                          {conflict.address} - {conflict.tag} ({conflict.type === "pia_profile" ? "PIA" : "WireGuard"})
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="p-6 border-t border-white/10 flex justify-end gap-3">
@@ -831,23 +966,12 @@ export default function IngressManager() {
                 onClick={() => {
                   setShowSettingsModal(false);
                   setServerEndpoint(serverEndpointSaved);
+                  setSubnetAddress(subnetAddressSaved);
                   setDetectedIps(null);
                 }}
                 className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
               >
-                {t("common.cancel")}
-              </button>
-              <button
-                onClick={handleSaveSettings}
-                disabled={savingSettings || !serverEndpoint.trim()}
-                className="px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
-              >
-                {savingSettings ? (
-                  <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-                ) : (
-                  <CheckIcon className="h-4 w-4" />
-                )}
-                {t("common.save")}
+                {t("common.close")}
               </button>
             </div>
             </div>

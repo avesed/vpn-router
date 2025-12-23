@@ -267,6 +267,33 @@ export interface IngressPeerCreateResponse {
   };
 }
 
+// Subnet Configuration
+export interface SubnetConflict {
+  type: string;      // "custom_egress" | "pia_profile"
+  tag: string;       // egress tag/name
+  address: string;   // conflicting IP address
+}
+
+export interface SubnetInfo {
+  address: string;
+  conflicts: SubnetConflict[];
+}
+
+export interface SubnetUpdateRequest {
+  address: string;
+  migrate_peers: boolean;
+}
+
+export interface SubnetUpdateResponse {
+  message: string;
+  address: string;
+  migrated_peers?: number;
+  reload_status?: {
+    success: boolean;
+    message: string;
+  };
+}
+
 // Custom Egress
 export interface CustomEgress {
   tag: string;
