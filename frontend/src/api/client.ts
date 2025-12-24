@@ -66,24 +66,57 @@ import type {
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 const TOKEN_KEY = "vpn_gateway_token";
 
+// M8: 默认请求超时时间 (30秒)
+const DEFAULT_TIMEOUT = 30000;
+
 type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
 
-async function request<T>(path: string, options: { method?: HttpMethod; body?: unknown } = {}): Promise<T> {
+interface RequestOptions {
+  method?: HttpMethod;
+  body?: unknown;
+  timeout?: number;
+}
+
+// L15 修复: JWT 格式验证正则 (header.payload.signature)
+const JWT_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const token = localStorage.getItem(TOKEN_KEY);
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
 
-  if (token) {
+  // L15 修复: 验证 token 格式后再发送
+  if (token && JWT_PATTERN.test(token)) {
     headers["Authorization"] = `Bearer ${token}`;
+  } else if (token) {
+    // Token 格式无效，清除并记录
+    console.warn("Invalid token format detected, clearing token");
+    localStorage.removeItem(TOKEN_KEY);
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: options.method ?? "GET",
-    headers,
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
+  // M8: 使用 AbortController 实现请求超时
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), options.timeout ?? DEFAULT_TIMEOUT);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method: options.method ?? "GET",
+      headers,
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Request timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   // 401 Unauthorized - 清除 token 并跳转到登录页
   if (response.status === 401) {
@@ -94,7 +127,21 @@ async function request<T>(path: string, options: { method?: HttpMethod; body?: u
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `API request failed: ${response.status}`);
+    // M21 修复: 安全处理错误信息，避免暴露服务器内部堆栈
+    let safeMessage: string;
+    if (response.status >= 500) {
+      // 服务器错误 - 不暴露内部详情
+      console.error(`Server error ${response.status}:`, text);
+      safeMessage = "Server error, please try again later";
+    } else if (response.status === 404) {
+      safeMessage = "Resource not found";
+    } else if (response.status === 403) {
+      safeMessage = "Access denied";
+    } else {
+      // 4xx 客户端错误 - 可以显示后端消息（但限制长度）
+      safeMessage = text?.slice(0, 200) || `Request failed: ${response.status}`;
+    }
+    throw new Error(safeMessage);
   }
 
   if (response.status === 204) {
@@ -105,9 +152,9 @@ async function request<T>(path: string, options: { method?: HttpMethod; body?: u
 }
 
 /**
- * Fetch with authentication helper
+ * Fetch with authentication helper (M8: with timeout)
  */
-async function fetchWithAuth(path: string): Promise<Response> {
+async function fetchWithAuth(path: string, timeout: number = DEFAULT_TIMEOUT): Promise<Response> {
   const token = localStorage.getItem(TOKEN_KEY);
 
   const headers: Record<string, string> = {};
@@ -115,10 +162,26 @@ async function fetchWithAuth(path: string): Promise<Response> {
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: "GET",
-    headers,
-  });
+  // M8: 使用 AbortController 实现请求超时
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Request timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (response.status === 401) {
     localStorage.removeItem(TOKEN_KEY);

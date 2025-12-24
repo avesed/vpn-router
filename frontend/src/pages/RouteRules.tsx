@@ -77,7 +77,8 @@ export default function RouteRules() {
       setProfiles(profilesData.profiles);
       setError(null);
     } catch (err: unknown) {
-      setError((err as Error).message);
+      // L13 修复: 类型安全的错误处理
+      setError(err instanceof Error ? err.message : "Failed to load data");
     } finally {
       setLoading(false);
     }
@@ -186,7 +187,8 @@ export default function RouteRules() {
       setSuccess(t('rules.rulesSaved'));
       setTimeout(() => setSuccess(null), 3000);
     } catch (err: unknown) {
-      setError((err as Error).message);
+      // L13 修复: 类型安全的错误处理
+      setError(err instanceof Error ? err.message : "Failed to save rules");
     } finally {
       setSaving(false);
     }

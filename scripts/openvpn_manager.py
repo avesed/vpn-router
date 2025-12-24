@@ -18,6 +18,7 @@ OpenVPN 隧道管理器
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -34,6 +35,141 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from db_helper import get_db
 
+# C2 修复: OpenVPN extra_options 白名单验证
+# 只允许安全的、不会导致命令执行或文件访问的选项
+ALLOWED_OPENVPN_OPTIONS = frozenset({
+    # 连接相关
+    "ping", "ping-restart", "ping-exit", "ping-timer-rem",
+    "keepalive", "connect-retry", "connect-retry-max", "connect-timeout",
+    "resolv-retry", "float", "remote-random", "remote-random-hostname",
+    # 持久化
+    "persist-tun", "persist-key", "persist-local-ip", "persist-remote-ip",
+    # 日志和调试
+    "mute", "mute-replay-warnings", "verb", "suppress-timestamps",
+    # 缓冲区
+    "sndbuf", "rcvbuf", "tcp-queue-limit", "bcast-buffers",
+    # MTU 相关
+    "mtu-disc", "mtu-test", "link-mtu", "tun-mtu", "tun-mtu-extra",
+    "fragment", "mssfix",
+    # 路由相关（安全的选项）
+    "route-delay", "route-method", "route-metric",
+    # 重放保护
+    "replay-window", "no-replay", "replay-persist",
+    # 安全选项
+    "auth-nocache", "remote-cert-tls", "verify-x509-name",
+    "tls-timeout", "tls-version-min", "tls-version-max",
+    "hand-window", "tran-window", "reneg-sec", "reneg-bytes", "reneg-pkts",
+    # 其他安全选项
+    "single-session", "tls-exit", "opt-verify",
+    # 性能选项
+    "fast-io", "nice", "txqueuelen",
+})
+
+# 危险选项（绝对禁止）- 用于日志警告
+DANGEROUS_OPENVPN_OPTIONS = frozenset({
+    "up", "down", "ipchange", "route-up", "route-pre-down",  # 脚本执行
+    "client-connect", "client-disconnect", "learn-address",  # 脚本执行
+    "auth-user-pass-verify", "tls-verify",  # 脚本/程序执行
+    "config", "cd",  # 文件访问
+    "writepid", "log", "log-append", "status",  # 文件写入（由管理器控制）
+    "plugin", "setenv", "setenv-safe",  # 插件/环境变量
+    "script-security", "daemon", "syslog",  # 系统级
+    "iproute", "ifconfig", "route",  # 网络配置
+    "user", "group", "chroot",  # 权限相关
+    "dev", "dev-type", "dev-node",  # 设备（由管理器控制）
+    "management", "management-query-passwords",  # 管理接口
+})
+
+
+def write_secure_file(path: Path, content: str, mode: int = 0o600) -> None:
+    """
+    C4 修复: 原子创建具有正确权限的敏感文件
+
+    使用 os.open() 以指定权限创建文件，避免先创建再 chmod 的竞态条件。
+
+    Args:
+        path: 文件路径
+        content: 文件内容
+        mode: 文件权限 (默认 0o600 = rw-------)
+    """
+    path_str = str(path)
+    # 如果文件已存在，先删除（避免 O_EXCL 失败）
+    if path.exists():
+        path.unlink()
+
+    # 使用 O_CREAT | O_EXCL | O_WRONLY 确保原子创建
+    # O_EXCL: 如果文件存在则失败（我们已经删除了，但这是额外的安全保证）
+    fd = os.open(path_str, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.write(fd, content.encode('utf-8'))
+    finally:
+        os.close(fd)
+
+
+def sanitize_auth_string(value: str) -> str:
+    """
+    M3 修复: 清理 OpenVPN 认证字符串（用户名/密码）
+
+    OpenVPN auth-user-pass 文件格式为每行一个值，
+    因此必须移除换行符和其他可能破坏格式的字符。
+
+    Args:
+        value: 原始用户名或密码
+
+    Returns:
+        清理后的字符串
+    """
+    if not value:
+        return ""
+    # 移除换行符（可能破坏文件格式）
+    sanitized = value.replace('\r', '').replace('\n', '')
+    # 移除 null 字节
+    sanitized = sanitized.replace('\x00', '')
+    return sanitized
+
+
+def validate_extra_options(options: list) -> list:
+    """
+    验证 OpenVPN extra_options，只允许白名单中的安全选项
+
+    Args:
+        options: 原始选项列表
+
+    Returns:
+        验证通过的选项列表
+    """
+    if not options:
+        return []
+
+    validated = []
+    for opt in options:
+        if not isinstance(opt, str):
+            logging.warning(f"[extra_options] 跳过非字符串选项: {type(opt)}")
+            continue
+
+        # 去除前导空格和破折号，获取指令名
+        opt_stripped = opt.strip()
+        if not opt_stripped:
+            continue
+
+        # 提取指令名（第一个空格前的部分，去除前导破折号）
+        parts = opt_stripped.split(None, 1)
+        directive = parts[0].lstrip("-").lower()
+
+        # 检查是否在危险列表中
+        if directive in DANGEROUS_OPENVPN_OPTIONS:
+            logging.warning(f"[extra_options] 阻止危险选项: {opt_stripped}")
+            continue
+
+        # 检查是否在白名单中
+        if directive in ALLOWED_OPENVPN_OPTIONS:
+            validated.append(opt_stripped)
+        else:
+            logging.warning(f"[extra_options] 跳过未知选项: {opt_stripped}")
+
+    return validated
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='[openvpn-mgr] %(asctime)s %(levelname)s: %(message)s',
@@ -47,6 +183,44 @@ OPENVPN_LOG_DIR = Path("/var/log/openvpn")
 OPENVPN_PID_FILE = Path("/run/openvpn-manager.pid")
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
+
+
+def write_pid_file_atomic(pid_path: Path, pid: int) -> None:
+    """
+    原子写入 PID 文件，使用文件锁防止竞态条件 (H6)
+    """
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = pid_path.with_suffix(".lock")
+
+    with open(lock_path, 'w') as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            tmp_path = pid_path.with_suffix(".tmp")
+            tmp_path.write_text(str(pid))
+            tmp_path.rename(pid_path)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def cleanup_stale_pid_file(pid_path: Path) -> None:
+    """
+    清理无效的 PID 文件 (H6)
+    """
+    if not pid_path.exists():
+        return
+
+    try:
+        pid_str = pid_path.read_text().strip()
+        pid = int(pid_str)
+        os.kill(pid, 0)  # 检查进程是否存在
+    except (ValueError, ProcessLookupError, PermissionError):
+        try:
+            pid_path.unlink()
+            logger.debug(f"已清理无效 PID 文件: {pid_path}")
+        except Exception as e:
+            logger.warning(f"清理 PID 文件失败: {e}")
+    except Exception as e:
+        logger.warning(f"检查 PID 文件时出错: {e}")
 
 
 @dataclass
@@ -132,25 +306,22 @@ class OpenVPNManager:
             cert_path.write_text(egress["client_cert"])
             config_lines.append(f"cert {cert_path}")
 
-        # 客户端私钥（可选）
+        # 客户端私钥（可选）- C4 修复: 使用安全写入
         if egress.get("client_key"):
             key_path = config_dir / "client.key"
-            key_path.write_text(egress["client_key"])
-            os.chmod(key_path, 0o600)
+            write_secure_file(key_path, egress["client_key"])
             config_lines.append(f"key {key_path}")
 
-        # TLS Auth（可选）
+        # TLS Auth（可选）- C4 修复: 使用安全写入
         if egress.get("tls_auth"):
             ta_path = config_dir / "ta.key"
-            ta_path.write_text(egress["tls_auth"])
-            os.chmod(ta_path, 0o600)
+            write_secure_file(ta_path, egress["tls_auth"])
             config_lines.append(f"tls-auth {ta_path} 1")
 
-        # TLS Crypt（可选，与 tls_auth 二选一）
+        # TLS Crypt（可选，与 tls_auth 二选一）- C4 修复: 使用安全写入
         if egress.get("tls_crypt") and not egress.get("tls_auth"):
             tc_path = config_dir / "tls-crypt.key"
-            tc_path.write_text(egress["tls_crypt"])
-            os.chmod(tc_path, 0o600)
+            write_secure_file(tc_path, egress["tls_crypt"])
             config_lines.append(f"tls-crypt {tc_path}")
 
         # CRL 验证（可选）
@@ -159,16 +330,18 @@ class OpenVPNManager:
             crl_path.write_text(egress["crl_verify"])
             config_lines.append(f"crl-verify {crl_path}")
 
-        # 用户名/密码认证（可选）
+        # 用户名/密码认证（可选）- C4 修复: 使用安全写入, M3 修复: 清理特殊字符
         if egress.get("auth_user") and egress.get("auth_pass"):
             auth_path = config_dir / "auth.txt"
-            auth_path.write_text(f"{egress['auth_user']}\n{egress['auth_pass']}\n")
-            os.chmod(auth_path, 0o600)
+            safe_user = sanitize_auth_string(egress['auth_user'])
+            safe_pass = sanitize_auth_string(egress['auth_pass'])
+            write_secure_file(auth_path, f"{safe_user}\n{safe_pass}\n")
             config_lines.append(f"auth-user-pass {auth_path}")
 
-        # 额外选项
+        # 额外选项 - 使用白名单验证 (C2 修复)
         if egress.get("extra_options"):
-            for opt in egress["extra_options"]:
+            validated_options = validate_extra_options(egress["extra_options"])
+            for opt in validated_options:
                 config_lines.append(opt)
 
         # 写入配置文件
@@ -429,8 +602,8 @@ class OpenVPNManager:
         self._reload_requested = False
         logger.info("OpenVPN 管理器启动（守护模式）")
 
-        # 写入 PID 文件
-        OPENVPN_PID_FILE.write_text(str(os.getpid()))
+        # 写入 PID 文件 (H6: 使用原子写入)
+        write_pid_file_atomic(OPENVPN_PID_FILE, os.getpid())
         logger.info(f"PID 文件写入: {OPENVPN_PID_FILE}")
 
         # 启动所有隧道

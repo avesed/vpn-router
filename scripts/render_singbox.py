@@ -10,7 +10,9 @@
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -25,10 +27,16 @@ try:
 except ImportError:
     HAS_DATABASE = False
 
-    # Fallback if db_helper not available
+    # Fallback if db_helper not available (H12: with hash for uniqueness)
     def get_egress_interface_name(tag: str, is_pia: bool) -> str:
+        import hashlib
         prefix = "wg-pia-" if is_pia else "wg-eg-"
-        return f"{prefix}{tag[:15 - len(prefix)]}"
+        max_tag_len = 15 - len(prefix)
+        if len(tag) <= max_tag_len:
+            return f"{prefix}{tag}"
+        else:
+            tag_hash = hashlib.md5(tag.encode('utf-8')).hexdigest()[:max_tag_len]
+            return f"{prefix}{tag_hash}"
 
 # 尝试导入 ABP 转换模块
 try:
@@ -1919,8 +1927,19 @@ def main() -> None:
     print("[render] 已启用 clash_api (127.0.0.1:9090)")
     print(f"[render] 已启用 v2ray_api (127.0.0.1:10085) 统计 {len(stats_outbounds)} 个出口")
 
-    OUTPUT.write_text(json.dumps(config, indent=2))
-    print(f"[sing-box] 已写入 {OUTPUT}")
+    # H7: 原子写入配置文件，防止 sing-box 读取到不完整配置
+    config_json = json.dumps(config, indent=2)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=OUTPUT.parent, suffix=".tmp")
+    try:
+        os.write(tmp_fd, config_json.encode('utf-8'))
+        os.close(tmp_fd)
+        shutil.move(tmp_path, OUTPUT)
+        print(f"[sing-box] 已写入 {OUTPUT} (原子写入)")
+    except Exception as e:
+        os.close(tmp_fd)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise e
 
 
 if __name__ == "__main__":

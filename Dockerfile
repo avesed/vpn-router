@@ -12,18 +12,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and extract Xray (multi-arch support)
+# Download and extract Xray with checksum verification (C5 security fix)
 # amd64 -> Xray-linux-64.zip
 # arm64 -> Xray-linux-arm64-v8a.zip
+# SHA256 checksums from official Xray release
 RUN XRAY_ARCH="" && \
     if [ "$TARGETARCH" = "amd64" ]; then XRAY_ARCH="64"; \
     elif [ "$TARGETARCH" = "arm64" ]; then XRAY_ARCH="arm64-v8a"; \
     else echo "Unsupported architecture: $TARGETARCH" && exit 1; fi && \
-    curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip" -o /tmp/xray.zip \
-    && cd /tmp \
-    && unzip xray.zip \
-    && chmod +x xray \
-    && mv xray /usr/local/bin/xray
+    XRAY_ZIP="Xray-linux-${XRAY_ARCH}.zip" && \
+    XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${XRAY_ZIP}" && \
+    CHECKSUM_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${XRAY_ZIP}.dgst" && \
+    curl -fsSL -o /tmp/xray.zip "${XRAY_URL}" && \
+    curl -fsSL -o /tmp/xray.zip.dgst "${CHECKSUM_URL}" && \
+    cd /tmp && \
+    EXPECTED_SHA256=$(grep "SHA2-256" xray.zip.dgst | awk '{print $2}') && \
+    ACTUAL_SHA256=$(sha256sum xray.zip | awk '{print $1}') && \
+    if [ "${EXPECTED_SHA256}" != "${ACTUAL_SHA256}" ]; then \
+        echo "Xray checksum verification FAILED!" && \
+        echo "Expected: ${EXPECTED_SHA256}" && \
+        echo "Actual:   ${ACTUAL_SHA256}" && \
+        exit 1; \
+    fi && \
+    echo "Xray checksum verified successfully" && \
+    unzip xray.zip && \
+    chmod +x xray && \
+    mv xray /usr/local/bin/xray
 
 # ==========================================
 # Stage 2: Build sing-box with v2ray_api
@@ -86,9 +100,13 @@ RUN set -eux; \
         python3-pil \
         wireguard-tools \
         nginx-light; \
-    pip3 install --no-cache-dir --break-system-packages cryptography grpcio grpcio-tools bcrypt pyjwt; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
+
+# Copy and install pinned Python dependencies (C8: version pinning)
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
 
 # Copy sing-box binary built from source (with v2ray_api support)
 COPY --from=singbox-builder /sing-box /usr/local/bin/sing-box
@@ -112,11 +130,12 @@ RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default &&
 COPY config /etc/sing-box/
 
 # Copy default config to a separate location (not affected by volume mount)
-# This allows first-run initialization of geodata database and catalogs
-# Note: geoip-geodata.db moved to geodata/ to avoid duplication in COPY config /etc/sing-box/
-COPY geodata/geoip-geodata.db /opt/default-config/geoip-geodata.db
+# This allows first-run initialization of catalogs
+# Note: GeoIP data now uses JSON files instead of SQLite database (12 MB vs 49 MB)
 COPY config/sing-box.json /opt/default-config/sing-box.json
 COPY config/domain-catalog.json /opt/default-config/domain-catalog.json
+COPY config/geoip-catalog.json /opt/default-config/geoip-catalog.json
+COPY config/geoip /opt/default-config/geoip
 
 RUN mkdir -p /opt/pia/ca
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -146,9 +165,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/setup_kernel_wg_egress.py /usr/local/bin/xray_manager.py \
     /usr/local/bin/xray_egress_manager.py
 
-# Note: Databases and config are mounted via docker-compose volumes
-# - geoip-geodata.db is pre-built and volume-mounted (49 MB, read-only)
+# Note: Config is mounted via docker-compose volumes
 # - user-config.db is auto-created on first run by init_user_db.py
+# - GeoIP data uses JSON files: geoip-catalog.json + geoip/*.json (~12 MB)
 # - All config files are accessed via: ./config:/etc/sing-box
 
 WORKDIR /etc/sing-box

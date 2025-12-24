@@ -226,7 +226,7 @@ export default function EgressManager() {
 
   // Group regions by country
   const regionsByCountry = piaRegions.reduce((acc, region) => {
-    const country = ["CN", "HK", "TW"].includes(region.country) ? "中国" : region.country;
+    const country = ["CN", "HK", "TW"].includes(region.country) ? t("profile.chinaGroup") : region.country;
     if (!acc[country]) acc[country] = [];
     acc[country].push(region);
     return acc;
@@ -525,9 +525,18 @@ export default function EgressManager() {
 
   // ============ Custom Egress Management ============
 
+  // M9: 文件大小限制 (2MB)
+  const MAX_FILE_SIZE = 2 * 1024 * 1024;
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    // M9: 文件大小验证
+    if (file.size > MAX_FILE_SIZE) {
+      setParseError(t('common.fileTooLarge'));
+      return;
+    }
 
     try {
       const content = await file.text();
@@ -816,6 +825,12 @@ export default function EgressManager() {
   const handleOpenvpnFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    // M9: 文件大小验证
+    if (file.size > MAX_FILE_SIZE) {
+      setOpenvpnParseError(t('common.fileTooLarge'));
+      return;
+    }
 
     try {
       const content = await file.text();
@@ -3238,7 +3253,7 @@ export default function EgressManager() {
                     <textarea
                       value={v2rayUriInput}
                       onChange={(e) => setV2rayUriInput(e.target.value)}
-                      placeholder="vmess://... 或 vless://... 或 trojan://..."
+                      placeholder={t("v2rayEgress.uriPlaceholder")}
                       className="w-full h-32 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-violet-500 font-mono text-sm resize-none"
                     />
                   </div>

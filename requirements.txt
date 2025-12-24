@@ -1,0 +1,16 @@
+# Python dependencies with pinned versions for production stability
+# Generated: 2024-12
+# C8: Lock pip package versions to prevent breaking changes
+
+# Cryptography for key generation and encryption
+cryptography==42.0.8
+
+# gRPC for V2Ray stats API communication
+grpcio==1.60.1
+grpcio-tools==1.60.1
+
+# Password hashing
+bcrypt==4.1.2
+
+# JWT token handling
+pyjwt==2.8.0

@@ -19,6 +19,7 @@ Xray 进程管理器
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -70,6 +71,49 @@ XRAY_WG_SUBNET = "10.23.1.0/24"  # Xray WireGuard 客户端子网
 XRAY_WG_KEY_FILE = Path("/etc/sing-box/xray-wg-key.json")
 
 
+def write_pid_file_atomic(pid_path: Path, pid: int) -> None:
+    """
+    原子写入 PID 文件，使用文件锁防止竞态条件 (H6)
+    """
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = pid_path.with_suffix(".lock")
+
+    # 获取独占锁
+    with open(lock_path, 'w') as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            # 写入临时文件
+            tmp_path = pid_path.with_suffix(".tmp")
+            tmp_path.write_text(str(pid))
+            # 原子重命名
+            tmp_path.rename(pid_path)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def cleanup_stale_pid_file(pid_path: Path) -> None:
+    """
+    清理无效的 PID 文件 (H6: L18 修复)
+    """
+    if not pid_path.exists():
+        return
+
+    try:
+        pid_str = pid_path.read_text().strip()
+        pid = int(pid_str)
+        # 检查进程是否存在
+        os.kill(pid, 0)
+    except (ValueError, ProcessLookupError, PermissionError):
+        # PID 无效或进程不存在，清理文件
+        try:
+            pid_path.unlink()
+            logger.debug(f"已清理无效 PID 文件: {pid_path}")
+        except Exception as e:
+            logger.warning(f"清理 PID 文件失败: {e}")
+    except Exception as e:
+        logger.warning(f"检查 PID 文件时出错: {e}")
+
+
 @dataclass
 class XrayProcess:
     """存储 Xray 进程信息"""
@@ -88,6 +132,8 @@ class XrayManager:
         self.process = XrayProcess()
         self.db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
         self._running = False
+        # H6: 清理可能存在的无效 PID 文件
+        cleanup_stale_pid_file(XRAY_PID_FILE)
 
     def _get_v2ray_inbound_config(self) -> Optional[Dict]:
         """从数据库读取 V2Ray 入口配置"""
@@ -689,9 +735,9 @@ class XrayManager:
         # 检查进程是否仍在运行
         if self._is_process_alive():
             self.process.status = "running"
-            # 写入 PID 文件
+            # 写入 PID 文件 (H6: 使用原子写入)
             try:
-                XRAY_PID_FILE.write_text(str(self.process.pid))
+                write_pid_file_atomic(XRAY_PID_FILE, self.process.pid)
                 logger.debug(f"PID 文件已写入: {XRAY_PID_FILE}")
             except Exception as e:
                 logger.warning(f"写入 PID 文件失败: {e}")

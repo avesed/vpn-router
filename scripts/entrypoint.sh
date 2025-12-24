@@ -31,26 +31,11 @@ WG_CONFIG_PATH="${WG_CONFIG_PATH:-/etc/sing-box/wireguard/server.json}"
 RULESET_DIR="${RULESET_DIR:-/etc/sing-box}"
 GEO_DATA_READY_FLAG="${RULESET_DIR}/.geodata-ready"
 USER_DB_PATH="${USER_DB_PATH:-/etc/sing-box/user-config.db}"
-GEODATA_DB_PATH="${GEODATA_DB_PATH:-/etc/sing-box/geoip-geodata.db}"
 DEFAULT_CONFIG_DIR="/opt/default-config"
-GEODATA_RELEASE_URL="https://github.com/avesed/vpn-router/releases/download/geodata/geoip-geodata.db"
 
 # Port configuration
 export WEB_PORT="${WEB_PORT:-36000}"
 export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
-
-# 首次启动初始化：下载或复制 geodata 数据库
-if [ ! -f "${GEODATA_DB_PATH}" ]; then
-  echo "[entrypoint] geodata database not found, attempting to download..."
-  if curl -fsSL -o "${GEODATA_DB_PATH}" "${GEODATA_RELEASE_URL}"; then
-    echo "[entrypoint] geodata database downloaded successfully"
-  elif [ -f "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" ]; then
-    echo "[entrypoint] download failed, using default config"
-    cp "${DEFAULT_CONFIG_DIR}/geoip-geodata.db" "${GEODATA_DB_PATH}"
-  else
-    echo "[entrypoint] WARNING: geodata database not available, some features may be limited"
-  fi
-fi
 
 if [ ! -f "${BASE_CONFIG_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/sing-box.json" ]; then
   echo "[entrypoint] initializing sing-box config from default config"
@@ -62,6 +47,18 @@ DOMAIN_CATALOG="${RULESET_DIR}/domain-catalog.json"
 if [ ! -f "${DOMAIN_CATALOG}" ] && [ -f "${DEFAULT_CONFIG_DIR}/domain-catalog.json" ]; then
   echo "[entrypoint] initializing domain catalog from default config"
   cp "${DEFAULT_CONFIG_DIR}/domain-catalog.json" "${DOMAIN_CATALOG}"
+fi
+
+# 初始化 GeoIP catalog 和 IP 数据文件 (JSON 格式，替代 49MB SQLite 数据库)
+GEOIP_CATALOG="${RULESET_DIR}/geoip-catalog.json"
+GEOIP_DIR="${RULESET_DIR}/geoip"
+if [ ! -f "${GEOIP_CATALOG}" ] && [ -f "${DEFAULT_CONFIG_DIR}/geoip-catalog.json" ]; then
+  echo "[entrypoint] initializing GeoIP catalog from default config"
+  cp "${DEFAULT_CONFIG_DIR}/geoip-catalog.json" "${GEOIP_CATALOG}"
+fi
+if [ ! -d "${GEOIP_DIR}" ] && [ -d "${DEFAULT_CONFIG_DIR}/geoip" ]; then
+  echo "[entrypoint] initializing GeoIP data directory from default config"
+  cp -r "${DEFAULT_CONFIG_DIR}/geoip" "${GEOIP_DIR}"
 fi
 
 if [ ! -f "${BASE_CONFIG_PATH}" ]; then
@@ -162,17 +159,20 @@ setup_tproxy_routing() {
   ip rule add fwmark ${TPROXY_MARK} lookup ${TPROXY_TABLE}
   ip route add local 0.0.0.0/0 dev lo table ${TPROXY_TABLE}
 
-  # Clear existing TPROXY iptables rules
-  iptables -t mangle -F PREROUTING 2>/dev/null || true
-
+  # M12: 幂等的 iptables 规则设置 - 先删除再添加，避免重复
   # Skip traffic to WireGuard server itself (local subnet)
+  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN 2>/dev/null || true
   iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN
 
   # TPROXY TCP traffic from WireGuard interface to sing-box
+  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p tcp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
   iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p tcp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   # TPROXY UDP traffic from WireGuard interface to sing-box
+  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p udp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
   iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p udp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
@@ -282,16 +282,22 @@ else:
   echo "[entrypoint] setting up TPROXY routing for Xray traffic"
   echo "[entrypoint] Xray TUN interface: ${XRAY_INTERFACE}, subnet: ${XRAY_SUBNET}"
 
+  # M12: 幂等的 iptables 规则设置 - 先删除再添加，避免重复
   # Skip traffic to Xray server subnet (local subnet)
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN 2>/dev/null || true
+  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN
 
   # TPROXY TCP traffic from Xray TUN interface to sing-box
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
+  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
+  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   # TPROXY UDP traffic from Xray TUN interface to sing-box
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p udp \
+  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p udp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
+  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p udp \
+    -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   echo "[entrypoint] Xray TPROXY configured: ${XRAY_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
 

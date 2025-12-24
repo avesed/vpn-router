@@ -33,10 +33,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!state.token) return;
 
-    // 每 12 小时刷新一次 token
+    // H2: 每 30 分钟刷新一次 token (从 12 小时缩短)
     const interval = setInterval(() => {
       refreshToken().catch(console.error);
-    }, 12 * 60 * 60 * 1000);
+    }, 30 * 60 * 1000);
 
     return () => clearInterval(interval);
   }, [state.token]);
@@ -92,6 +92,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     if (!response.ok) {
       const error = await response.json();
+      // L16 修复: 记录认证失败（不记录密码）
+      console.error(`Login failed: ${response.status}`, error.detail || "Unknown error");
       throw new Error(error.detail || "Login failed");
     }
 
@@ -114,6 +116,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     if (!response.ok) {
       const error = await response.json();
+      // L16 修复: 记录设置失败
+      console.error(`Setup failed: ${response.status}`, error.detail || "Unknown error");
       throw new Error(error.detail || "Setup failed");
     }
 
@@ -150,6 +154,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       localStorage.setItem(TOKEN_KEY, data.access_token);
       setState((prev) => ({ ...prev, token: data.access_token }));
     } else {
+      // L16 修复: 记录 token 刷新失败
+      console.warn(`Token refresh failed: ${response.status}, logging out`);
       logout();
     }
   }

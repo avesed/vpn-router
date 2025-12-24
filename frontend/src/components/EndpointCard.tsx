@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { Endpoint, WireGuardPeer } from "../types";
 import {
   ChevronDownIcon,
@@ -14,6 +15,7 @@ interface Props {
 }
 
 export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
+  const { t } = useTranslation();
   const [form, setForm] = useState({
     address: endpoint.address?.[0] ?? "",
     privateKey: endpoint.private_key ?? "",
@@ -45,14 +47,16 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
         private_key: form.privateKey,
         peers: [peer]
       });
-      setStatus("保存成功");
+      setStatus(t("common.success"));
       setIsSuccess(true);
       setTimeout(() => {
         setStatus(null);
         setIsSuccess(false);
       }, 3000);
-    } catch (error: any) {
-      setStatus(error.message || "保存失败");
+    } catch (error: unknown) {
+      // M7 修复: 使用 unknown 类型
+      const message = error instanceof Error ? error.message : t("common.saveFailed");
+      setStatus(message);
       setIsSuccess(false);
     }
   };
@@ -66,7 +70,7 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
           <div className="flex items-center gap-3">
             <div className={`h-3 w-3 rounded-full ${isConfigured ? 'bg-emerald-400 shadow-lg shadow-emerald-400/50' : 'bg-slate-500'}`} />
             <div>
-              <p className="text-xs uppercase tracking-widest text-slate-400">端点</p>
+              <p className="text-xs uppercase tracking-widest text-slate-400">{t("endpoint.endpoint")}</p>
               <h3 className="text-xl font-bold text-white">{endpoint.tag}</h3>
             </div>
           </div>
@@ -101,7 +105,7 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
         <div className="mt-5 space-y-4 border-t border-white/5 pt-5">
           <div>
             <label className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-              本地地址
+              {t("endpoint.localAddress")}
             </label>
             <input
               className="mt-2 w-full rounded-xl border border-white/10 bg-slate-900/60 px-4 py-2.5 text-sm text-white placeholder-slate-500 transition focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
@@ -113,7 +117,7 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
 
           <div>
             <label className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-              私钥
+              {t("endpoint.privateKey")}
             </label>
             <input
               type="password"
@@ -126,13 +130,13 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
 
           <div className="rounded-xl bg-white/5 p-4">
             <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-slate-400">
-              Peer 配置
+              {t("endpoint.peerConfig")}
             </p>
 
             <div className="space-y-3">
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="text-xs font-medium text-slate-400">地址</label>
+                  <label className="text-xs font-medium text-slate-400">{t("common.address")}</label>
                   <input
                     className="mt-1.5 w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white placeholder-slate-500 transition focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
                     value={form.peerAddress}
@@ -141,7 +145,7 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
                   />
                 </div>
                 <div>
-                  <label className="text-xs font-medium text-slate-400">端口</label>
+                  <label className="text-xs font-medium text-slate-400">{t("common.port")}</label>
                   <input
                     type="number"
                     className="mt-1.5 w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white placeholder-slate-500 transition focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
@@ -153,7 +157,7 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
               </div>
 
               <div>
-                <label className="text-xs font-medium text-slate-400">公钥</label>
+                <label className="text-xs font-medium text-slate-400">{t("endpoint.publicKey")}</label>
                 <input
                   className="mt-1.5 w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm font-mono text-white placeholder-slate-500 transition focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
                   value={form.peerKey}
@@ -189,10 +193,10 @@ export default function EndpointCard({ endpoint, isSaving, onUpdate }: Props) {
             {isSaving ? (
               <>
                 <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                保存中...
+                {t("common.saving")}
               </>
             ) : (
-              "保存修改"
+              t("endpoint.saveChanges")
             )}
           </button>
         </div>

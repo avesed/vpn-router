@@ -155,9 +155,11 @@ export default function Dashboard() {
             }
           }
         }
-      } catch (err: any) {
+      } catch (err: unknown) {
+        // M7 修复: 使用 unknown 类型并正确处理
         if (mounted) {
-          setError(err.message);
+          const message = err instanceof Error ? err.message : String(err);
+          setError(message);
         }
       } finally {
         if (mounted) setLoading(false);

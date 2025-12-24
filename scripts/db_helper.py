@@ -6,11 +6,83 @@
 - geoip-geodata.db: 只读的地理位置和域名数据（系统数据）
 - user-config.db: 用户的路由规则和出口配置（用户数据）
 """
+import hashlib
 import json
+import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from contextlib import contextmanager
+
+# C3 修复: 添加日志记录器
+logger = logging.getLogger(__name__)
+
+
+# ============ M13 修复: JSON Schema 验证辅助函数 ============
+
+def validate_reserved_bytes(data: Any) -> Optional[List[int]]:
+    """验证 WireGuard reserved bytes (3 个 0-255 整数)
+
+    Args:
+        data: 解析后的 JSON 数据
+
+    Returns:
+        验证通过返回原数据，否则返回 None
+    """
+    if data is None:
+        return None
+    if not isinstance(data, list):
+        logger.warning(f"reserved bytes should be a list, got {type(data).__name__}")
+        return None
+    if len(data) != 3:
+        logger.warning(f"reserved bytes should have 3 elements, got {len(data)}")
+        return None
+    for i, val in enumerate(data):
+        if not isinstance(val, int) or val < 0 or val > 255:
+            logger.warning(f"reserved byte[{i}] should be 0-255 integer, got {val}")
+            return None
+    return data
+
+
+def validate_string_list(data: Any, field_name: str = "field") -> Optional[List[str]]:
+    """验证字符串列表
+
+    Args:
+        data: 解析后的 JSON 数据
+        field_name: 字段名（用于日志）
+
+    Returns:
+        验证通过返回原数据，否则返回 None
+    """
+    if data is None:
+        return None
+    if not isinstance(data, list):
+        logger.warning(f"{field_name} should be a list, got {type(data).__name__}")
+        return None
+    for i, val in enumerate(data):
+        if not isinstance(val, str):
+            logger.warning(f"{field_name}[{i}] should be string, got {type(val).__name__}")
+            return None
+    return data
+
+
+def validate_dict(data: Any, field_name: str = "field") -> Optional[Dict]:
+    """验证 JSON 对象/字典
+
+    Args:
+        data: 解析后的 JSON 数据
+        field_name: 字段名（用于日志）
+
+    Returns:
+        验证通过返回原数据，否则返回 None
+    """
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        logger.warning(f"{field_name} should be a dict, got {type(data).__name__}")
+        return None
+    return data
 
 
 # WireGuard egress interface naming constants
@@ -22,20 +94,34 @@ WG_MAX_IFACE_LEN = 15         # Linux interface name limit
 def get_egress_interface_name(tag: str, is_pia: bool) -> str:
     """Generate kernel WireGuard interface name for egress
 
+    H12 修复: 使用 hash 确保唯一性，避免长标签截断冲突
+
     Naming convention:
     - PIA profiles: wg-pia-{tag} (e.g., wg-pia-new_york)
     - Custom egress: wg-eg-{tag} (e.g., wg-eg-cn2-la)
+
+    For tags that would be truncated, we use a hash-based suffix to ensure uniqueness:
+    - If tag fits: wg-pia-hk (full tag)
+    - If tag would truncate: wg-pia-ab12c34 (hash of full tag)
 
     Args:
         tag: The egress profile tag/name
         is_pia: True for PIA profiles, False for custom egress
 
     Returns:
-        Interface name, max 15 characters (Linux limit)
+        Interface name, max 15 characters (Linux limit), guaranteed unique per tag
     """
     prefix = WG_PIA_PREFIX if is_pia else WG_CUSTOM_PREFIX
     max_tag_len = WG_MAX_IFACE_LEN - len(prefix)
-    return f"{prefix}{tag[:max_tag_len]}"
+
+    if len(tag) <= max_tag_len:
+        # 标签足够短，直接使用
+        return f"{prefix}{tag}"
+    else:
+        # H12: 标签过长，使用 hash 确保唯一性
+        # 使用 MD5 hash 的前 max_tag_len 个字符
+        tag_hash = hashlib.md5(tag.encode('utf-8')).hexdigest()[:max_tag_len]
+        return f"{prefix}{tag_hash}"
 
 
 class GeodataDatabase:
@@ -242,6 +328,33 @@ class UserDatabase:
         finally:
             conn.close()
 
+    @contextmanager
+    def _transaction(self):
+        """
+        M4 修复: 事务上下文管理器，支持自动回滚
+
+        在发生异常时自动回滚未提交的更改，防止数据不一致。
+        成功完成时自动提交。
+
+        Usage:
+            with db._transaction() as (conn, cursor):
+                cursor.execute("INSERT ...")
+                cursor.execute("UPDATE ...")
+                # 自动提交
+            # 如果发生异常，自动回滚
+        """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        try:
+            yield conn, cursor
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def get_statistics(self) -> Dict[str, int]:
         """获取用户数据库统计信息"""
         with self._get_conn() as conn:
@@ -291,23 +404,25 @@ class UserDatabase:
             return cursor.lastrowid
 
     def add_routing_rules_batch(self, rules: List[tuple]) -> int:
-        """批量添加路由规则
+        """批量添加路由规则（使用事务确保原子性）
 
         Args:
             rules: [(rule_type, target, outbound, tag, priority), ...]
 
         Returns:
             成功插入的数量
+
+        Raises:
+            Exception: 如果插入失败，所有更改都会被回滚
         """
         if not rules:
             return 0
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
+        # M4 修复: 使用事务确保批量操作的原子性
+        with self._transaction() as (conn, cursor):
             cursor.executemany("""
                 INSERT OR IGNORE INTO routing_rules (rule_type, target, outbound, tag, priority)
                 VALUES (?, ?, ?, ?, ?)
             """, rules)
-            conn.commit()
             return cursor.rowcount
 
     def update_routing_rule(
@@ -702,8 +817,13 @@ class UserDatabase:
             for row in rows:
                 row_dict = dict(row)
                 cat_id = row_dict['category_id']
-                # 解析 JSON 域名列表
-                row_dict['domains'] = json.loads(row_dict['domains'])
+                # 解析 JSON 域名列表 - M13 修复: 添加 schema 验证
+                try:
+                    parsed = json.loads(row_dict['domains'])
+                    row_dict['domains'] = validate_string_list(parsed, "domains") or []
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse domains JSON for {row_dict.get('item_id', 'unknown')}: {e}")
+                    row_dict['domains'] = []
                 row_dict['sample_domains'] = row_dict['domains'][:5]
 
                 if cat_id not in items_by_category:
@@ -749,7 +869,13 @@ class UserDatabase:
             if row:
                 import json
                 row_dict = dict(row)
-                row_dict['domains'] = json.loads(row_dict['domains'])
+                # M13 修复: 添加 schema 验证
+                try:
+                    parsed = json.loads(row_dict['domains'])
+                    row_dict['domains'] = validate_string_list(parsed, "domains") or []
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse domains JSON for {row_dict.get('item_id', 'unknown')}: {e}")
+                    row_dict['domains'] = []
                 return row_dict
             return None
 
@@ -816,8 +942,16 @@ class UserDatabase:
             return row[0] if row else None
 
     def get_or_create_jwt_secret(self) -> str:
-        """获取 JWT 密钥，不存在则创建"""
+        """获取 JWT 密钥，不存在则创建
+
+        M16 修复: 优先使用环境变量 JWT_SECRET_KEY，回退到数据库存储
+        """
         import secrets as sec
+        # 优先使用环境变量（更安全，不存储在数据库）
+        env_secret = os.environ.get("JWT_SECRET_KEY")
+        if env_secret:
+            return env_secret
+        # 回退到数据库存储
         secret = self.get_setting("jwt_secret_key")
         if not secret:
             secret = sec.token_urlsafe(32)
@@ -842,11 +976,14 @@ class UserDatabase:
             result = []
             for row in rows:
                 item = dict(zip(columns, row))
-                # 解析 reserved JSON
+                # 解析 reserved JSON - C3 修复: 使用具体异常类型
+                # M13 修复: 添加 schema 验证
                 if item.get("reserved"):
                     try:
-                        item["reserved"] = json.loads(item["reserved"])
-                    except:
+                        parsed = json.loads(item["reserved"])
+                        item["reserved"] = validate_reserved_bytes(parsed)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"Failed to parse reserved JSON for {item.get('tag', 'unknown')}: {e}")
                         item["reserved"] = None
                 result.append(item)
             return result
@@ -862,10 +999,14 @@ class UserDatabase:
                 return None
             columns = [desc[0] for desc in cursor.description]
             item = dict(zip(columns, row))
+            # C3 修复: 使用具体异常类型
+            # M13 修复: 添加 schema 验证
             if item.get("reserved"):
                 try:
-                    item["reserved"] = json.loads(item["reserved"])
-                except:
+                    parsed = json.loads(item["reserved"])
+                    item["reserved"] = validate_reserved_bytes(parsed)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse reserved JSON for {tag}: {e}")
                     item["reserved"] = None
             return item
 
@@ -1106,11 +1247,14 @@ class UserDatabase:
             result = []
             for row in rows:
                 item = dict(zip(columns, row))
-                # 解析 extra_options JSON
+                # 解析 extra_options JSON - C3 修复: 使用具体异常类型
+                # M13 修复: 添加 schema 验证
                 if item.get("extra_options"):
                     try:
-                        item["extra_options"] = json.loads(item["extra_options"])
-                    except:
+                        parsed = json.loads(item["extra_options"])
+                        item["extra_options"] = validate_string_list(parsed, "extra_options")
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"Failed to parse extra_options JSON for {item.get('tag', 'unknown')}: {e}")
                         item["extra_options"] = None
                 result.append(item)
             return result
@@ -1126,10 +1270,14 @@ class UserDatabase:
                 return None
             columns = [desc[0] for desc in cursor.description]
             item = dict(zip(columns, row))
+            # C3 修复: 使用具体异常类型
+            # M13 修复: 添加 schema 验证
             if item.get("extra_options"):
                 try:
-                    item["extra_options"] = json.loads(item["extra_options"])
-                except:
+                    parsed = json.loads(item["extra_options"])
+                    item["extra_options"] = validate_string_list(parsed, "extra_options")
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse extra_options JSON for {tag}: {e}")
                     item["extra_options"] = None
             return item
 
@@ -1143,7 +1291,11 @@ class UserDatabase:
             max_port = row[0] if row and row[0] else None
             if max_port is None:
                 return self.OPENVPN_SOCKS_PORT_START
-            return max_port + 1
+            next_port = max_port + 1
+            # H10: 端口边界检查
+            if next_port > 65535:
+                raise ValueError("No available SOCKS ports (exceeded 65535)")
+            return next_port
 
     def add_openvpn_egress(
         self,
@@ -1237,7 +1389,11 @@ class UserDatabase:
             max_port = row[0] if row and row[0] else None
             if max_port is None:
                 return self.V2RAY_EGRESS_SOCKS_PORT_START
-            return max_port + 1
+            next_port = max_port + 1
+            # H10: 端口边界检查
+            if next_port > 65535:
+                raise ValueError("No available SOCKS ports (exceeded 65535)")
+            return next_port
 
     def get_v2ray_egress_list(self, enabled_only: bool = False, protocol: Optional[str] = None) -> List[Dict]:
         """获取所有 V2Ray 出口
@@ -1267,13 +1423,18 @@ class UserDatabase:
             result = []
             for row in rows:
                 item = dict(zip(columns, row))
-                # 解析 JSON 字段
+                # 解析 JSON 字段 - C3 修复: 使用具体异常类型
+                # M13 修复: 添加 schema 验证
                 for json_field in ["tls_alpn", "transport_config"]:
                     if item.get(json_field):
                         try:
-                            item[json_field] = json.loads(item[json_field])
-                        except:
-                            pass
+                            parsed = json.loads(item[json_field])
+                            if json_field == "tls_alpn":
+                                item[json_field] = validate_string_list(parsed, "tls_alpn")
+                            elif json_field == "transport_config":
+                                item[json_field] = validate_dict(parsed, "transport_config")
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logger.warning(f"Failed to parse {json_field} JSON for {item.get('tag', 'unknown')}: {e}")
                 result.append(item)
             return result
 
@@ -1288,13 +1449,18 @@ class UserDatabase:
                 return None
             columns = [desc[0] for desc in cursor.description]
             item = dict(zip(columns, row))
-            # 解析 JSON 字段
+            # 解析 JSON 字段 - C3 修复: 使用具体异常类型
+            # M13 修复: 添加 schema 验证
             for json_field in ["tls_alpn", "transport_config"]:
                 if item.get(json_field):
                     try:
-                        item[json_field] = json.loads(item[json_field])
-                    except:
-                        pass
+                        parsed = json.loads(item[json_field])
+                        if json_field == "tls_alpn":
+                            item[json_field] = validate_string_list(parsed, "tls_alpn")
+                        elif json_field == "transport_config":
+                            item[json_field] = validate_dict(parsed, "transport_config")
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"Failed to parse {json_field} JSON for {tag}: {e}")
             return item
 
     def add_v2ray_egress(
@@ -1418,11 +1584,13 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             item = dict(zip(columns, row))
             # 解析 JSON 字段
+            # M13 修复: 添加 schema 验证
             if item.get("transport_config"):
                 try:
-                    item["transport_config"] = json.loads(item["transport_config"])
-                except:
-                    pass
+                    parsed = json.loads(item["transport_config"])
+                    item["transport_config"] = validate_dict(parsed, "transport_config")
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Failed to parse transport_config JSON: {e}")
             return item
 
     def set_v2ray_inbound_config(

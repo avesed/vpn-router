@@ -101,25 +101,25 @@ export interface RouteRule {
   type?: "custom" | "geosite" | "geoip" | "protocol";
 }
 
-// sing-box 协议嗅探选项
+// sing-box protocol sniffing options
 export const PROTOCOL_OPTIONS = [
-  { value: "bittorrent", label: "BitTorrent", description: "种子下载流量" },
-  { value: "stun", label: "STUN", description: "VoIP/WebRTC 流量" },
-  { value: "dtls", label: "DTLS", description: "安全 UDP 流量" },
-  { value: "ssh", label: "SSH", description: "SSH 远程连接" },
-  { value: "rdp", label: "RDP", description: "远程桌面" },
-  { value: "dns", label: "DNS", description: "DNS 查询" },
-  { value: "ntp", label: "NTP", description: "时间同步" },
-  { value: "http", label: "HTTP", description: "HTTP 明文流量" },
-  { value: "tls", label: "TLS", description: "HTTPS/SSL 流量" },
-  { value: "quic", label: "QUIC", description: "HTTP/3 流量" },
+  { value: "bittorrent", label: "BitTorrent", description: "Torrent traffic" },
+  { value: "stun", label: "STUN", description: "VoIP/WebRTC traffic" },
+  { value: "dtls", label: "DTLS", description: "Secure UDP traffic" },
+  { value: "ssh", label: "SSH", description: "SSH connections" },
+  { value: "rdp", label: "RDP", description: "Remote Desktop" },
+  { value: "dns", label: "DNS", description: "DNS queries" },
+  { value: "ntp", label: "NTP", description: "Time sync" },
+  { value: "http", label: "HTTP", description: "HTTP traffic" },
+  { value: "tls", label: "TLS", description: "HTTPS/SSL traffic" },
+  { value: "quic", label: "QUIC", description: "HTTP/3 traffic" },
 ] as const;
 
-// 网络类型选项
+// Network type options
 export const NETWORK_OPTIONS = [
-  { value: "", label: "不限", description: "匹配所有网络类型" },
-  { value: "tcp", label: "TCP", description: "仅匹配 TCP 流量" },
-  { value: "udp", label: "UDP", description: "仅匹配 UDP 流量" },
+  { value: "", label: "Any", description: "Match all network types" },
+  { value: "tcp", label: "TCP", description: "TCP traffic only" },
+  { value: "udp", label: "UDP", description: "UDP traffic only" },
 ] as const;
 
 export interface RouteRulesResponse {
@@ -867,48 +867,48 @@ export interface RealityKeyPair {
 
 // V2Ray protocol options for UI
 export const V2RAY_PROTOCOLS = [
-  { value: "vmess", label: "VMess", description: "VMess 协议" },
-  { value: "vless", label: "VLESS", description: "VLESS 协议 (推荐)" },
-  { value: "trojan", label: "Trojan", description: "Trojan 协议" },
+  { value: "vmess", label: "VMess", description: "VMess protocol" },
+  { value: "vless", label: "VLESS", description: "VLESS protocol (recommended)" },
+  { value: "trojan", label: "Trojan", description: "Trojan protocol" },
 ] as const;
 
 export const V2RAY_TRANSPORTS = [
-  { value: "tcp", label: "TCP", description: "原始 TCP" },
-  { value: "ws", label: "WebSocket", description: "WebSocket 传输" },
-  { value: "grpc", label: "gRPC", description: "gRPC 传输" },
-  { value: "h2", label: "HTTP/2", description: "HTTP/2 传输" },
-  { value: "quic", label: "QUIC", description: "QUIC 传输" },
-  { value: "httpupgrade", label: "HTTPUpgrade", description: "HTTP 升级" },
-  { value: "xhttp", label: "XHTTP", description: "XHTTP 传输 (Xray)" },
+  { value: "tcp", label: "TCP", description: "Raw TCP" },
+  { value: "ws", label: "WebSocket", description: "WebSocket transport" },
+  { value: "grpc", label: "gRPC", description: "gRPC transport" },
+  { value: "h2", label: "HTTP/2", description: "HTTP/2 transport" },
+  { value: "quic", label: "QUIC", description: "QUIC transport" },
+  { value: "httpupgrade", label: "HTTPUpgrade", description: "HTTP upgrade" },
+  { value: "xhttp", label: "XHTTP", description: "XHTTP transport (Xray)" },
 ] as const;
 
 export const V2RAY_SECURITY_OPTIONS = [
-  { value: "auto", label: "Auto", description: "自动选择" },
+  { value: "auto", label: "Auto", description: "Auto select" },
   { value: "aes-128-gcm", label: "AES-128-GCM", description: "AES-128-GCM" },
   { value: "chacha20-poly1305", label: "ChaCha20-Poly1305", description: "ChaCha20-Poly1305" },
-  { value: "none", label: "None", description: "不加密" },
-  { value: "zero", label: "Zero", description: "零加密" },
+  { value: "none", label: "None", description: "No encryption" },
+  { value: "zero", label: "Zero", description: "Zero encryption" },
 ] as const;
 
 export const V2RAY_TLS_FINGERPRINTS = [
-  { value: "", label: "Default", description: "默认" },
-  { value: "chrome", label: "Chrome", description: "Chrome 浏览器" },
-  { value: "firefox", label: "Firefox", description: "Firefox 浏览器" },
-  { value: "safari", label: "Safari", description: "Safari 浏览器" },
-  { value: "edge", label: "Edge", description: "Edge 浏览器" },
-  { value: "ios", label: "iOS", description: "iOS 系统" },
-  { value: "android", label: "Android", description: "Android 系统" },
-  { value: "random", label: "Random", description: "随机" },
-  { value: "randomized", label: "Randomized", description: "完全随机化" },
+  { value: "", label: "Default", description: "Default" },
+  { value: "chrome", label: "Chrome", description: "Chrome browser" },
+  { value: "firefox", label: "Firefox", description: "Firefox browser" },
+  { value: "safari", label: "Safari", description: "Safari browser" },
+  { value: "edge", label: "Edge", description: "Edge browser" },
+  { value: "ios", label: "iOS", description: "iOS system" },
+  { value: "android", label: "Android", description: "Android system" },
+  { value: "random", label: "Random", description: "Random" },
+  { value: "randomized", label: "Randomized", description: "Fully randomized" },
 ] as const;
 
 export const V2RAY_MULTIPLEX_PROTOCOLS = [
-  { value: "smux", label: "smux", description: "smux 协议" },
-  { value: "yamux", label: "yamux", description: "yamux 协议" },
-  { value: "h2mux", label: "h2mux", description: "HTTP/2 多路复用" },
+  { value: "smux", label: "smux", description: "smux protocol" },
+  { value: "yamux", label: "yamux", description: "yamux protocol" },
+  { value: "h2mux", label: "h2mux", description: "HTTP/2 multiplexing" },
 ] as const;
 
 export const VLESS_FLOW_OPTIONS = [
-  { value: "", label: "None", description: "无流控" },
-  { value: "xtls-rprx-vision", label: "xtls-rprx-vision", description: "XTLS Vision 流控" },
+  { value: "", label: "None", description: "No flow control" },
+  { value: "xtls-rprx-vision", label: "xtls-rprx-vision", description: "XTLS Vision flow control" },
 ] as const;

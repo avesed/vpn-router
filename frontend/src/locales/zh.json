@@ -16,6 +16,7 @@
     "importing": "导入中...",
     "error": "错误",
     "success": "成功",
+    "fileTooLarge": "文件大小超过限制 (最大 2MB)",
     "online": "在线",
     "offline": "离线",
     "running": "运行中",
@@ -131,6 +132,21 @@
     "timeRange1H": "1小时",
     "timeRange24H": "24小时",
     "now": "现在"
+  },
+  "profile": {
+    "title": "线路管理",
+    "subtitle": "添加、编辑或删除 VPN 线路，选择连接到哪个地区",
+    "chinaGroup": "中国",
+    "addFirstLine": "添加第一条线路",
+    "availableRegions": "可用地区"
+  },
+  "endpoint": {
+    "endpoint": "端点",
+    "localAddress": "本地地址",
+    "privateKey": "私钥",
+    "publicKey": "公钥",
+    "peerConfig": "Peer 配置",
+    "saveChanges": "保存修改"
   },
   "ingress": {
     "title": "客户端管理",
@@ -749,6 +765,7 @@
     "importUri": "导入链接",
     "manualConfig": "手动配置",
     "pasteUri": "粘贴分享链接",
+    "uriPlaceholder": "vmess://... or vless://... or trojan://...",
     "parseUri": "解析链接",
     "parseSuccess": "链接解析成功！",
     "parseFailed": "解析 V2Ray 链接失败",
@@ -930,7 +947,11 @@
     "confirmPassword": "确认密码",
     "confirmPasswordPlaceholder": "再次输入密码",
     "passwordRequirement": "至少 8 个字符",
+    "passwordRequirementComplex": "至少 8 个字符，需包含大小写字母和数字",
     "passwordTooShort": "密码长度至少为 8 个字符",
+    "passwordNeedsUppercase": "密码需要包含至少一个大写字母",
+    "passwordNeedsLowercase": "密码需要包含至少一个小写字母",
+    "passwordNeedsNumber": "密码需要包含至少一个数字",
     "passwordMismatch": "两次输入的密码不一致",
     "login": "登录",
     "createPassword": "创建密码",

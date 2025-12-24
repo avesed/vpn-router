@@ -28,12 +28,8 @@ vite.config.d.ts
 *-client.conf
 *.wg.conf
 
-# Domain catalog file
+# Domain catalog file (temporary)
 /config/domain-catalog-new.json
-
-# GeoIP JSON files (generated from database)
-/config/geoip-catalog.json
-/config/geoip/
 
 # Old database files (migrated to separated databases)
 /config/routing.db
@@ -62,7 +58,8 @@ vite.config.d.ts
 /test-wg/
 /test-client/
 /test-egress/
-test-wg-client/
+/test-wg-client/
+/xray-client-debug/
 
 # IDE & editor
 .idea/
@@ -96,5 +93,3 @@ htmlcov/
 # Misc
 .cache/
 tmp/
-
-logs/

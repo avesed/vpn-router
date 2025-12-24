@@ -58,6 +58,29 @@ USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 XRAY_EGRESS_API_PORT = 10086
 
 
+def cleanup_stale_pid_file(pid_path: Path) -> None:
+    """
+    清理无效的 PID 文件 (L18 修复)
+    """
+    if not pid_path.exists():
+        return
+
+    try:
+        pid_str = pid_path.read_text().strip()
+        pid = int(pid_str)
+        # 检查进程是否存在
+        os.kill(pid, 0)
+    except (ValueError, ProcessLookupError, PermissionError):
+        # PID 无效或进程不存在，清理文件
+        try:
+            pid_path.unlink()
+            logger.debug(f"已清理无效 PID 文件: {pid_path}")
+        except Exception as e:
+            logger.warning(f"清理 PID 文件失败: {e}")
+    except Exception as e:
+        logger.warning(f"检查 PID 文件时出错: {e}")
+
+
 @dataclass
 class XrayEgressProcess:
     """存储 Xray 出站进程信息"""
@@ -75,6 +98,8 @@ class XrayEgressManager:
         self.process = XrayEgressProcess()
         self.db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
         self._running = False
+        # L18: 清理可能存在的无效 PID 文件
+        cleanup_stale_pid_file(XRAY_EGRESS_PID_FILE)
 
     def _get_v2ray_egress_list(self) -> List[Dict]:
         """从数据库读取启用的 V2Ray 出口列表"""

@@ -41,6 +41,8 @@ MAX_IFACE_LEN = 15         # Linux interface name limit
 def get_egress_interface_name(tag: str, is_pia: bool) -> str:
     """Generate kernel WireGuard interface name for egress
 
+    H12 修复: 使用 hash 确保唯一性，避免长标签截断冲突
+
     Naming convention:
     - PIA profiles: wg-pia-{tag}
     - Custom egress: wg-eg-{tag}
@@ -48,10 +50,18 @@ def get_egress_interface_name(tag: str, is_pia: bool) -> str:
     Examples:
     - wg-pia-new_york (PIA New York exit)
     - wg-eg-cn2-la (custom CN2 LA exit)
+    - wg-pia-ab12c34 (hash of long tag)
     """
+    import hashlib
     prefix = PIA_PREFIX if is_pia else CUSTOM_PREFIX
     max_tag_len = MAX_IFACE_LEN - len(prefix)
-    return f"{prefix}{tag[:max_tag_len]}"
+
+    if len(tag) <= max_tag_len:
+        return f"{prefix}{tag}"
+    else:
+        # H12: 使用 hash 确保唯一性
+        tag_hash = hashlib.md5(tag.encode('utf-8')).hexdigest()[:max_tag_len]
+        return f"{prefix}{tag_hash}"
 
 
 def run_cmd(cmd: list, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:

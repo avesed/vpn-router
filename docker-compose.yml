@@ -34,4 +34,10 @@ services:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./config:/etc/sing-box
+    # H5: 生产日志配置 - 防止日志无限增长
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
     restart: unless-stopped

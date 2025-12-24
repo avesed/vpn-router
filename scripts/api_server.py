@@ -91,9 +91,27 @@ def get_subnet_prefix(subnet_address: str = None) -> str:
     """从子网地址提取前缀（如 10.25.0.1/24 -> 10.25.0.）
 
     如果未提供地址，使用 DEFAULT_WG_SUBNET
+    M19 修复: 添加输入验证，防止格式错误导致异常
     """
-    addr = (subnet_address or DEFAULT_WG_SUBNET).split("/")[0]
-    return addr.rsplit(".", 1)[0] + "."
+    addr_str = subnet_address or DEFAULT_WG_SUBNET
+
+    # 验证基本格式: 需要包含 "/" 和至少一个 "."
+    if "/" not in addr_str or "." not in addr_str.split("/")[0]:
+        logging.warning(f"Invalid subnet format: {addr_str}, using default")
+        addr_str = DEFAULT_WG_SUBNET
+
+    try:
+        ip_part = addr_str.split("/")[0]
+        octets = ip_part.split(".")
+        # 验证是否有 4 个八位组
+        if len(octets) != 4:
+            logging.warning(f"Invalid IP format: {ip_part}, using default")
+            ip_part = DEFAULT_WG_SUBNET.split("/")[0]
+            octets = ip_part.split(".")
+        return ".".join(octets[:3]) + "."
+    except Exception as e:
+        logging.warning(f"Error parsing subnet {addr_str}: {e}, using default")
+        return DEFAULT_WG_SUBNET.split("/")[0].rsplit(".", 1)[0] + "."
 
 def get_default_peer_ip() -> str:
     """获取默认的 peer IP（基于 DEFAULT_WG_SUBNET）"""
@@ -119,6 +137,27 @@ CONFIG_LOCK = threading.Lock()
 
 # 缓存 PIA 地区列表（有效期 1 小时）
 _pia_regions_cache: Dict[str, Any] = {"data": None, "timestamp": 0}
+
+# 缓存 WireGuard 子网前缀（避免频繁数据库查询）
+_cached_wg_subnet_prefix: str = get_subnet_prefix(DEFAULT_WG_SUBNET)
+
+def refresh_wg_subnet_cache() -> str:
+    """刷新 WireGuard 子网前缀缓存，从数据库读取当前配置"""
+    global _cached_wg_subnet_prefix
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        server = db.get_wireguard_server()
+        if server and server.get("address"):
+            _cached_wg_subnet_prefix = get_subnet_prefix(server.get("address"))
+        else:
+            _cached_wg_subnet_prefix = get_subnet_prefix(DEFAULT_WG_SUBNET)
+    except Exception:
+        _cached_wg_subnet_prefix = get_subnet_prefix(DEFAULT_WG_SUBNET)
+    return _cached_wg_subnet_prefix
+
+def get_cached_wg_subnet_prefix() -> str:
+    """获取缓存的 WireGuard 子网前缀"""
+    return _cached_wg_subnet_prefix
 
 # ============ 安全凭据存储 ============
 # 使用类变量存储凭据，避免暴露在 /proc/<pid>/environ
@@ -192,6 +231,69 @@ def has_pia_credentials() -> bool:
     username, password = get_pia_credentials()
     return bool(username and password)
 
+
+# ============ API 速率限制 (H3) ============
+# 简单的内存速率限制器，无需额外依赖
+_rate_limit_data: Dict[str, List[float]] = {}  # {client_ip: [timestamp1, timestamp2, ...]}
+_rate_limit_lock = threading.Lock()
+# 速率限制配置
+_RATE_LIMIT_GENERAL = 60  # 一般 API: 每分钟 60 次
+_RATE_LIMIT_LOGIN = 5  # 登录 API: 每分钟 5 次
+_RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
+
+
+def _get_client_ip(request: Request) -> str:
+    """获取客户端 IP 地址"""
+    # 优先使用 X-Forwarded-For（nginx 代理设置）
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    # 其次使用 X-Real-IP
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip
+    # 最后使用直连 IP
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(client_ip: str, limit: int = _RATE_LIMIT_GENERAL) -> bool:
+    """
+    检查是否超过速率限制
+    返回 True 表示允许请求，False 表示超限
+    """
+    now = time.time()
+    cutoff = now - _RATE_LIMIT_WINDOW
+
+    with _rate_limit_lock:
+        if client_ip not in _rate_limit_data:
+            _rate_limit_data[client_ip] = []
+
+        # 清理过期记录
+        _rate_limit_data[client_ip] = [
+            ts for ts in _rate_limit_data[client_ip] if ts > cutoff
+        ]
+
+        # 检查是否超限
+        if len(_rate_limit_data[client_ip]) >= limit:
+            return False
+
+        # 记录本次请求
+        _rate_limit_data[client_ip].append(now)
+
+        # 清理长时间不活跃的 IP（防止内存泄漏）
+        if len(_rate_limit_data) > 10000:
+            # 保留最近活跃的 5000 个 IP
+            sorted_ips = sorted(
+                _rate_limit_data.keys(),
+                key=lambda ip: max(_rate_limit_data[ip]) if _rate_limit_data[ip] else 0,
+                reverse=True
+            )
+            for ip in sorted_ips[5000:]:
+                del _rate_limit_data[ip]
+
+        return True
+
+
 # ============ 流量统计 ============
 # 累计流量统计（按出口分组）- 从 V2Ray API 获取精确数据
 _traffic_stats: Dict[str, Dict[str, int]] = {}  # {outbound: {download: int, upload: int}}
@@ -204,6 +306,7 @@ _POLL_INTERVAL = 1  # 轮询间隔（秒）
 _RATE_WINDOW = 1  # 速率计算窗口（秒）- 1秒窗口更准确反映瞬时速率
 _HISTORY_INTERVAL = 1  # 历史记录间隔（秒）- 1秒更新，支持实时推进图表
 _MAX_HISTORY_SECONDS = 24 * 60 * 60  # 保留24小时历史
+_MAX_HISTORY_ENTRIES = 90000  # 最大条目数 (C9: 内存泄漏防护, ~86400 for 24h + buffer)
 _last_history_time = 0  # 上次记录历史的时间
 _rate_samples: List[Dict[str, Dict[str, int]]] = []  # 最近 N 个流量样本用于计算速率
 # V2Ray API 客户端（懒加载）
@@ -623,7 +726,8 @@ def decrypt_sensitive_data(encrypted_obj: dict, password: str) -> str:
         decrypted = f.decrypt(base64.b64decode(encrypted_obj["data"]))
         return decrypted.decode()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"解密失败，密码可能不正确: {exc}") from exc
+        logging.warning(f"Decryption failed: {exc}")
+        raise HTTPException(status_code=400, detail="Decryption failed, password may be incorrect") from exc
 
 
 def _detect_public_ip() -> Optional[str]:
@@ -698,10 +802,27 @@ def _verify_token(token: str, secret: str) -> bool:
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """认证中间件：保护 API 端点"""
+    """认证中间件：保护 API 端点 + 速率限制 (H3)"""
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+
+        # API 速率限制 (H3)
+        if path.startswith("/api/"):
+            client_ip = _get_client_ip(request)
+            # 登录端点使用更严格的限制
+            if path == "/api/auth/login":
+                limit = _RATE_LIMIT_LOGIN
+            else:
+                limit = _RATE_LIMIT_GENERAL
+
+            if not _check_rate_limit(client_ip, limit):
+                return Response(
+                    content='{"detail":"Too many requests, please try again later"}',
+                    status_code=429,
+                    media_type="application/json",
+                    headers={"Retry-After": "60"}
+                )
 
         # 公开端点不需要认证
         if path in PUBLIC_PATHS:
@@ -782,22 +903,8 @@ def load_catalogs():
             print(f"[Catalog] 加载 GeoIP 目录失败: {e}")
             _GEOIP_CATALOG = {"countries": []}
     else:
-        # 从 SQLite 加载国家列表
-        print(f"[Catalog] GeoIP JSON 不存在，从 SQLite 加载...")
-        try:
-            db = get_db()
-            countries = db.get_countries(limit=500)
-            _GEOIP_CATALOG = {
-                "countries": countries,
-                "total_countries": len(countries),
-                "total_ipv4_ranges": sum(c.get("ipv4_count", 0) for c in countries),
-                "total_ipv6_ranges": sum(c.get("ipv6_count", 0) for c in countries),
-                "source": "sqlite"
-            }
-            print(f"[Catalog] 已加载 GeoIP 目录: {len(countries)} 国家 (SQLite)")
-        except Exception as e:
-            print(f"[Catalog] 加载 GeoIP 目录失败: {e}")
-            _GEOIP_CATALOG = {"countries": []}
+        print(f"[Catalog] GeoIP 目录文件不存在: {GEOIP_CATALOG_FILE}")
+        _GEOIP_CATALOG = {"countries": []}
 
 
 def _get_all_outbounds() -> List[str]:
@@ -805,7 +912,7 @@ def _get_all_outbounds() -> List[str]:
     # 始终包含标准出口
     outbounds = ["direct", "block", "adblock"]
 
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         try:
             db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
@@ -1014,8 +1121,8 @@ def _update_traffic_stats():
                         if tag not in ("api", "freedom"):  # 排除内部 tag
                             outbound_stats[tag] = stats
                 except Exception as e:
-                    # Xray 可能还未启动或已停止，静默忽略
-                    pass
+                    # M5 修复: 记录 Xray 统计错误（可能还未启动或已停止）
+                    logging.debug(f"Xray egress stats unavailable: {type(e).__name__}: {e}")
 
             with _traffic_stats_lock:
                 # 更新累计流量（使用合并后的精确数据）
@@ -1066,26 +1173,31 @@ def _update_traffic_stats():
                             history_point["rates"][outbound] = 0.0
                     _rate_history.append(history_point)
 
-                    # 清理24小时前的历史数据
+                    # 清理24小时前的历史数据 (C9: 双重防护机制)
                     cutoff = now - _MAX_HISTORY_SECONDS
                     _rate_history[:] = [p for p in _rate_history if p["timestamp"] > cutoff]
+                    # 二次防护：限制最大条目数，防止时间戳异常导致的内存泄漏
+                    if len(_rate_history) > _MAX_HISTORY_ENTRIES:
+                        _rate_history[:] = _rate_history[-_MAX_HISTORY_ENTRIES:]
 
             # Update peer activity cache by polling clash_api
             # This ensures peer online status is tracked even without API queries
             try:
                 get_peer_status_from_clash_api()
-            except Exception:
-                pass  # Silently ignore errors in cache update
+            except Exception as e:
+                # M5 修复: 记录缓存更新错误而不是静默忽略
+                logging.debug(f"Peer status cache update failed: {type(e).__name__}: {e}")
 
             # Update V2Ray user activity for online status tracking
             try:
                 _update_v2ray_user_activity()
-            except Exception:
-                pass  # Silently ignore errors in user activity update
+            except Exception as e:
+                # M5 修复: 记录用户活动更新错误
+                logging.debug(f"V2Ray user activity update failed: {type(e).__name__}: {e}")
 
         except Exception as e:
-            # 记录未预期的异常，但不中断线程
-            print(f"[Traffic] V2Ray API 统计异常: {type(e).__name__}: {e}")
+            # M5 修复: 使用 logging 而不是 print，记录完整异常信息
+            logging.exception(f"Traffic stats thread error: {type(e).__name__}: {e}")
 
         time.sleep(_POLL_INTERVAL)
 
@@ -1094,6 +1206,9 @@ def _update_traffic_stats():
 async def startup_event():
     """应用启动时加载数据"""
     load_catalogs()
+    # 刷新 WireGuard 子网缓存
+    refresh_wg_subnet_cache()
+    print(f"[WireGuard] 子网前缀缓存已初始化: {get_cached_wg_subnet_prefix()}")
     # 启动流量统计后台线程（使用 V2Ray API 精确统计）
     traffic_thread = threading.Thread(target=_update_traffic_stats, daemon=True)
     traffic_thread.start()
@@ -1217,7 +1332,8 @@ def fetch_pia_regions() -> List[Dict[str, Any]]:
         # 如果有旧缓存，返回旧数据
         if _pia_regions_cache["data"]:
             return _pia_regions_cache["data"]
-        raise HTTPException(status_code=500, detail=f"获取 PIA 地区列表失败: {exc}") from exc
+        logging.error(f"Failed to fetch PIA regions: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to fetch PIA region list") from exc
 
 
 def save_pia_profiles_yaml(profiles: List[Dict[str, Any]]) -> None:
@@ -1229,7 +1345,7 @@ def save_pia_profiles_yaml(profiles: List[Dict[str, Any]]) -> None:
 
 def load_custom_rules() -> Dict[str, Any]:
     """加载自定义路由规则（数据库优先，降级到 JSON）"""
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         # 从数据库加载
         try:
             db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -1382,7 +1498,7 @@ def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
 
 def load_custom_category_items() -> Dict[str, List[Dict]]:
     """加载分类自定义项目（数据库优先，降级到 JSON）"""
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         try:
             db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
             return db.get_custom_category_items()
@@ -1698,19 +1814,16 @@ def api_stats_dashboard(time_range: str = "1m"):
         "active_connections": 0,
     }
 
-    # 获取总客户端数量和子网配置（从数据库）
-    wg_subnet_prefix = get_subnet_prefix()  # 默认值
+    # 获取总客户端数量（从数据库）
     try:
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         peers = db.get_wireguard_peers()
         stats["total_clients"] = len(peers) if peers else 0
-
-        # 获取当前子网前缀
-        server = db.get_wireguard_server()
-        if server and server.get("address"):
-            wg_subnet_prefix = get_subnet_prefix(server.get("address"))
     except Exception:
         pass
+
+    # 使用缓存的子网前缀（避免频繁数据库查询）
+    wg_subnet_prefix = get_cached_wg_subnet_prefix()
 
     # 从 clash_api 获取活跃连接数和在线客户端
     try:
@@ -2180,7 +2293,7 @@ def api_get_rules():
     default_outbound = "direct"
 
     # 从数据库读取默认出口设置和所有出口
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         try:
             db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
             default_outbound = db.get_setting("default_outbound", "direct")
@@ -2230,7 +2343,7 @@ def api_get_rules():
                         available_outbounds.append(tag)
 
     # 从数据库读取自定义规则
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         db_rules = db.get_routing_rules(enabled_only=True)
 
@@ -2294,7 +2407,7 @@ def api_get_rules():
 @app.put("/api/rules")
 def api_update_rules(payload: RouteRulesUpdateRequest):
     """更新路由规则（数据库版本，使用批量操作优化性能）"""
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         # 使用数据库存储（方案 B）
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
@@ -2400,7 +2513,7 @@ def api_add_custom_rule(payload: CustomRuleRequest):
             detail=f"无效的网络类型: {payload.network}。支持: tcp, udp"
         )
 
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -2460,7 +2573,7 @@ def api_add_custom_rule(payload: CustomRuleRequest):
 @app.delete("/api/rules/custom/{rule_id}")
 def api_delete_custom_rule(rule_id: int):
     """删除自定义路由规则（数据库版本）"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -2477,7 +2590,7 @@ def api_delete_custom_rule_by_tag(tag: str):
     """删除自定义路由规则（通过 tag，兼容旧接口）
     注意：此端点已废弃，建议使用 DELETE /api/rules/custom/{rule_id}
     """
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
     # 由于数据库中没有直接存储 tag，我们无法通过 tag 删除
@@ -2498,15 +2611,17 @@ def api_pia_login(payload: PiaLoginRequest):
             timeout=10
         )
         if token_resp.status_code != 200:
+            logging.warning(f"PIA login failed: status={token_resp.status_code}")
             raise HTTPException(
                 status_code=401,
-                detail=f"PIA 登录失败: {token_resp.text}"
+                detail="PIA login failed, please check your credentials"
             )
         token_data = token_resp.json()
         if not token_data.get("token"):
-            raise HTTPException(status_code=401, detail="PIA 登录失败: 无效的响应")
+            raise HTTPException(status_code=401, detail="PIA login failed: invalid response")
     except requests.RequestException as exc:
-        raise HTTPException(status_code=500, detail=f"无法连接 PIA 服务器: {exc}") from exc
+        logging.error(f"Cannot connect to PIA server: {exc}")
+        raise HTTPException(status_code=500, detail="Cannot connect to PIA server") from exc
 
     # 保存凭证到安全存储（内存，不暴露在 /proc/<pid>/environ）
     set_pia_credentials(payload.username, payload.password)
@@ -2930,15 +3045,8 @@ def get_peer_status_from_clash_api() -> dict:
     import time
     peer_status = {}  # ip -> {"active": bool, "last_seen": timestamp, "rx": int, "tx": int}
 
-    # 获取当前子网前缀
-    wg_subnet_prefix = get_subnet_prefix()  # 默认值
-    try:
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-        server = db.get_wireguard_server()
-        if server and server.get("address"):
-            wg_subnet_prefix = get_subnet_prefix(server.get("address"))
-    except Exception:
-        pass
+    # 使用缓存的子网前缀（避免频繁数据库查询）
+    wg_subnet_prefix = get_cached_wg_subnet_prefix()
 
     try:
         # 查询 sing-box clash_api 获取活跃连接
@@ -3637,6 +3745,9 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
         private_key=server.get("private_key", "") if server else ""
     )
 
+    # 4.5. 刷新子网缓存
+    refresh_wg_subnet_cache()
+
     # 5. 重新生成配置并应用
     _regenerate_and_reload()
 
@@ -4052,7 +4163,8 @@ def api_get_wg_egress_interface(interface: str):
         # Fallback: return raw output
         return {"interface": interface, "raw_output": result.stdout}
     except subprocess.SubprocessError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to query interface: {e}")
+        logging.error(f"Failed to query WireGuard interface {interface}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to query interface")
 
 
 @app.get("/api/egress/custom")
@@ -6045,8 +6157,8 @@ def api_apply_adblock_rules():
         _regenerate_and_reload()
         reload_status = "配置已重新生成并重载"
     except Exception as exc:
-        print(f"[api] 应用广告拦截规则失败: {exc}")
-        raise HTTPException(status_code=500, detail=f"应用失败: {exc}")
+        logging.error(f"Failed to apply adblock rules: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to apply configuration")
 
     return {"message": reload_status, "status": "success"}
 
@@ -6492,7 +6604,7 @@ def api_add_custom_category_item(category_id: str, payload: CustomCategoryItemRe
     item_id = f"custom-{category_id}-{payload.name}"
 
     # 使用数据库存储
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
         # 检查是否已存在
@@ -6540,7 +6652,7 @@ def api_add_custom_category_item(category_id: str, payload: CustomCategoryItemRe
 def api_delete_custom_category_item(category_id: str, item_id: str):
     """删除分类中的自定义域名列表项"""
     # 使用数据库删除
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
         # 删除项目
@@ -6648,15 +6760,6 @@ def get_country_ip_info(country_code: str) -> dict:
         except Exception:
             pass
 
-    # 如果 JSON 不存在或为空，从 SQLite 加载
-    if not ipv4_cidrs and not ipv6_cidrs:
-        try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-            ipv4_cidrs = db.get_country_ips(cc.upper(), ip_version=4)
-            ipv6_cidrs = db.get_country_ips(cc.upper(), ip_version=6)
-        except Exception:
-            pass
-
     return {
         "country_code": cc.upper(),
         "country_name": country_info["name"],
@@ -6739,7 +6842,7 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
         tag = f"ip-{'-'.join(payload.country_codes[:3])}"
 
     # 使用数据库存储
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -6860,7 +6963,7 @@ def api_export_backup(payload: BackupExportRequest):
             )
 
     # 6. 导出路由规则（从数据库）
-    if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if HAS_DATABASE and USER_DB_PATH.exists():
         db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
         db_rules = db.get_routing_rules(enabled_only=False)
 
@@ -7155,7 +7258,7 @@ def api_import_backup(payload: BackupImportRequest):
             rules_data = backup_data["custom_rules"]
             rules_list = rules_data.get("rules", [])
 
-            if HAS_DATABASE and USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+            if HAS_DATABASE and USER_DB_PATH.exists():
                 db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
 
                 # 如果是替换模式，先批量删除所有规则（但保留广告拦截规则）
@@ -7363,7 +7466,7 @@ def api_backup_status():
 @app.get("/api/db/stats")
 def api_get_db_stats():
     """获取数据库统计信息"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -7373,7 +7476,7 @@ def api_get_db_stats():
 @app.get("/api/db/rules")
 def api_get_db_rules(enabled_only: bool = True):
     """获取数据库中的所有路由规则"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -7389,7 +7492,7 @@ def api_update_db_rule(
     enabled: Optional[bool] = None
 ):
     """更新路由规则"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
@@ -7401,84 +7504,8 @@ def api_update_db_rule(
     return {"message": f"规则 ID {rule_id} 已更新"}
 
 
-@app.get("/api/db/countries")
-def api_get_countries(limit: int = 100):
-    """获取国家列表"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
-
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-    countries = db.get_countries(limit=limit)
-    return {"countries": countries, "count": len(countries)}
-
-
-@app.get("/api/db/countries/{country_code}")
-def api_get_country(country_code: str):
-    """获取国家详情"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
-
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-    country = db.get_country(country_code)
-
-    if not country:
-        raise HTTPException(status_code=404, detail=f"国家 {country_code} 不存在")
-
-    return country
-
-
-@app.get("/api/db/countries/{country_code}/ips")
-def api_get_country_ips(
-    country_code: str,
-    ip_version: Optional[int] = None,
-    limit: int = 1000
-):
-    """获取国家的 IP 范围"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
-
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-    country = db.get_country(country_code)
-
-    if not country:
-        raise HTTPException(status_code=404, detail=f"国家 {country_code} 不存在")
-
-    ips = db.get_country_ips(country_code, ip_version=ip_version, limit=limit)
-    return {
-        "country": country,
-        "ip_count": len(ips),
-        "ips": ips
-    }
-
-
-@app.get("/api/db/domain-categories")
-def api_get_domain_categories(group_type: Optional[str] = None):
-    """获取域名分类"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
-
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-    categories = db.get_domain_categories(group_type=group_type)
-    return {"categories": categories, "count": len(categories)}
-
-
-@app.get("/api/db/domain-lists/{list_id}")
-def api_get_domain_list(list_id: str, include_domains: bool = False):
-    """获取域名列表详情"""
-    if not HAS_DATABASE or not USER_DB_PATH.exists() and GEODATA_DB_PATH.exists():
-        raise HTTPException(status_code=503, detail="数据库不可用")
-
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
-
-    if include_domains:
-        list_data = db.get_domain_list_with_domains(list_id, limit=5000)
-    else:
-        list_data = db.get_domain_list(list_id)
-
-    if not list_data:
-        raise HTTPException(status_code=404, detail=f"域名列表 {list_id} 不存在")
-
-    return list_data
+# Legacy /api/db/* endpoints removed - GeoIP data now served from JSON catalogs via /api/ip-catalog
+# Domain data served from JSON catalog via /api/domain-catalog
 
 
 @app.post("/api/config/regenerate")

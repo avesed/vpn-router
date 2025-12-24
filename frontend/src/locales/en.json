@@ -16,6 +16,7 @@
     "importing": "Importing...",
     "error": "Error",
     "success": "Success",
+    "fileTooLarge": "File size exceeds limit (max 2MB)",
     "online": "Online",
     "offline": "Offline",
     "running": "Running",
@@ -131,6 +132,21 @@
     "timeRange1H": "1 hour",
     "timeRange24H": "24 hours",
     "now": "now"
+  },
+  "profile": {
+    "title": "Profile Manager",
+    "subtitle": "Add, edit or delete VPN profiles, select which region to connect",
+    "chinaGroup": "China",
+    "addFirstLine": "Add your first profile",
+    "availableRegions": "Available Regions"
+  },
+  "endpoint": {
+    "endpoint": "Endpoint",
+    "localAddress": "Local Address",
+    "privateKey": "Private Key",
+    "publicKey": "Public Key",
+    "peerConfig": "Peer Config",
+    "saveChanges": "Save Changes"
   },
   "ingress": {
     "title": "Client Management",
@@ -749,6 +765,7 @@
     "importUri": "Import URI",
     "manualConfig": "Manual Config",
     "pasteUri": "Paste Share URI",
+    "uriPlaceholder": "vmess://... or vless://... or trojan://...",
     "parseUri": "Parse URI",
     "parseSuccess": "URI parsed successfully!",
     "parseFailed": "Failed to parse V2Ray URI",
@@ -930,7 +947,11 @@
     "confirmPassword": "Confirm Password",
     "confirmPasswordPlaceholder": "Re-enter password",
     "passwordRequirement": "Minimum 8 characters",
+    "passwordRequirementComplex": "Minimum 8 characters, must include uppercase, lowercase, and numbers",
     "passwordTooShort": "Password must be at least 8 characters",
+    "passwordNeedsUppercase": "Password must contain at least one uppercase letter",
+    "passwordNeedsLowercase": "Password must contain at least one lowercase letter",
+    "passwordNeedsNumber": "Password must contain at least one number",
     "passwordMismatch": "Passwords do not match",
     "login": "Sign In",
     "createPassword": "Create Password",

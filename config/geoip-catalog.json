@@ -1,0 +1,2008 @@
+{
+  "version": 1,
+  "total_countries": 250,
+  "total_ipv4_ranges": 621620,
+  "total_ipv6_ranges": 0,
+  "countries": [
+    {
+      "code": "af",
+      "name": "Afghanistan",
+      "display_name": "Afghanistan",
+      "ipv4_count": 229,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "al",
+      "name": "Albania",
+      "display_name": "Albania",
+      "ipv4_count": 436,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "dz",
+      "name": "Algeria",
+      "display_name": "Algeria",
+      "ipv4_count": 242,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "as",
+      "name": "American Samoa",
+      "display_name": "American Samoa",
+      "ipv4_count": 95,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ad",
+      "name": "Andorra",
+      "display_name": "Andorra",
+      "ipv4_count": 231,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ao",
+      "name": "Angola",
+      "display_name": "Angola",
+      "ipv4_count": 304,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ai",
+      "name": "Anguilla",
+      "display_name": "Anguilla",
+      "ipv4_count": 94,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "aq",
+      "name": "Antarctica",
+      "display_name": "Antarctica",
+      "ipv4_count": 48,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ag",
+      "name": "Antigua and Barbuda",
+      "display_name": "Antigua and Barbuda",
+      "ipv4_count": 134,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "am",
+      "name": "Armenia",
+      "display_name": "Armenia",
+      "ipv4_count": 336,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "aw",
+      "name": "Aruba",
+      "display_name": "Aruba",
+      "ipv4_count": 102,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "az",
+      "name": "Azerbaijan",
+      "display_name": "Azerbaijan",
+      "ipv4_count": 458,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bs",
+      "name": "Bahamas",
+      "display_name": "Bahamas",
+      "ipv4_count": 174,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bh",
+      "name": "Bahrain",
+      "display_name": "Bahrain",
+      "ipv4_count": 268,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bb",
+      "name": "Barbados",
+      "display_name": "Barbados",
+      "ipv4_count": 214,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "by",
+      "name": "Belarus",
+      "display_name": "Belarus",
+      "ipv4_count": 397,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bz",
+      "name": "Belize",
+      "display_name": "Belize",
+      "ipv4_count": 211,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bj",
+      "name": "Benin",
+      "display_name": "Benin",
+      "ipv4_count": 121,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bm",
+      "name": "Bermuda",
+      "display_name": "Bermuda",
+      "ipv4_count": 158,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bt",
+      "name": "Bhutan",
+      "display_name": "Bhutan",
+      "ipv4_count": 130,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bo",
+      "name": "Bolivia",
+      "display_name": "Bolivia",
+      "ipv4_count": 401,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bq",
+      "name": "Bonaire, Sint Eustatius, and Saba",
+      "display_name": "Bonaire, Sint Eustatius, and Saba",
+      "ipv4_count": 67,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ba",
+      "name": "Bosnia and Herzegovina",
+      "display_name": "Bosnia and Herzegovina",
+      "ipv4_count": 312,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bw",
+      "name": "Botswana",
+      "display_name": "Botswana",
+      "ipv4_count": 161,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bv",
+      "name": "Bouvet Island",
+      "display_name": "Bouvet Island",
+      "ipv4_count": 15,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "io",
+      "name": "British Indian Ocean Territory",
+      "display_name": "British Indian Ocean Territory",
+      "ipv4_count": 39,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "vg",
+      "name": "British Virgin Islands",
+      "display_name": "British Virgin Islands",
+      "ipv4_count": 228,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bn",
+      "name": "Brunei",
+      "display_name": "Brunei",
+      "ipv4_count": 128,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bg",
+      "name": "Bulgaria",
+      "display_name": "Bulgaria",
+      "ipv4_count": 2300,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bf",
+      "name": "Burkina Faso",
+      "display_name": "Burkina Faso",
+      "ipv4_count": 145,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bi",
+      "name": "Burundi",
+      "display_name": "Burundi",
+      "ipv4_count": 85,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cv",
+      "name": "Cabo Verde",
+      "display_name": "Cabo Verde",
+      "ipv4_count": 108,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kh",
+      "name": "Cambodia",
+      "display_name": "Cambodia",
+      "ipv4_count": 545,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cm",
+      "name": "Cameroon",
+      "display_name": "Cameroon",
+      "ipv4_count": 199,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ky",
+      "name": "Cayman Islands",
+      "display_name": "Cayman Islands",
+      "ipv4_count": 184,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cf",
+      "name": "Central African Republic",
+      "display_name": "Central African Republic",
+      "ipv4_count": 69,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "td",
+      "name": "Chad",
+      "display_name": "Chad",
+      "ipv4_count": 114,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cx",
+      "name": "Christmas Island",
+      "display_name": "Christmas Island",
+      "ipv4_count": 30,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cc",
+      "name": "Cocos (Keeling) Islands",
+      "display_name": "Cocos (Keeling) Islands",
+      "ipv4_count": 32,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "co",
+      "name": "Colombia",
+      "display_name": "Colombia",
+      "ipv4_count": 2150,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "km",
+      "name": "Comoros",
+      "display_name": "Comoros",
+      "ipv4_count": 70,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cg",
+      "name": "Congo Republic",
+      "display_name": "Congo Republic",
+      "ipv4_count": 100,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ck",
+      "name": "Cook Islands",
+      "display_name": "Cook Islands",
+      "ipv4_count": 61,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cr",
+      "name": "Costa Rica",
+      "display_name": "Costa Rica",
+      "ipv4_count": 597,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "hr",
+      "name": "Croatia",
+      "display_name": "Croatia",
+      "ipv4_count": 837,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cu",
+      "name": "Cuba",
+      "display_name": "Cuba",
+      "ipv4_count": 93,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cw",
+      "name": "Curaçao",
+      "display_name": "Curaçao",
+      "ipv4_count": 118,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cy",
+      "name": "Cyprus",
+      "display_name": "Cyprus",
+      "ipv4_count": 753,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cd",
+      "name": "DR Congo",
+      "display_name": "DR Congo",
+      "ipv4_count": 257,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "dj",
+      "name": "Djibouti",
+      "display_name": "Djibouti",
+      "ipv4_count": 87,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "dm",
+      "name": "Dominica",
+      "display_name": "Dominica",
+      "ipv4_count": 112,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "do",
+      "name": "Dominican Republic",
+      "display_name": "Dominican Republic",
+      "ipv4_count": 603,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ec",
+      "name": "Ecuador",
+      "display_name": "Ecuador",
+      "ipv4_count": 776,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sv",
+      "name": "El Salvador",
+      "display_name": "El Salvador",
+      "ipv4_count": 304,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gq",
+      "name": "Equatorial Guinea",
+      "display_name": "Equatorial Guinea",
+      "ipv4_count": 78,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "er",
+      "name": "Eritrea",
+      "display_name": "Eritrea",
+      "ipv4_count": 77,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ee",
+      "name": "Estonia",
+      "display_name": "Estonia",
+      "ipv4_count": 1022,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sz",
+      "name": "Eswatini",
+      "display_name": "Eswatini",
+      "ipv4_count": 91,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "et",
+      "name": "Ethiopia",
+      "display_name": "Ethiopia",
+      "ipv4_count": 114,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "fk",
+      "name": "Falkland Islands",
+      "display_name": "Falkland Islands",
+      "ipv4_count": 44,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "fo",
+      "name": "Faroe Islands",
+      "display_name": "Faroe Islands",
+      "ipv4_count": 73,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "fm",
+      "name": "Federated States of Micronesia",
+      "display_name": "Federated States of Micronesia",
+      "ipv4_count": 98,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "fj",
+      "name": "Fiji",
+      "display_name": "Fiji",
+      "ipv4_count": 135,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gf",
+      "name": "French Guiana",
+      "display_name": "French Guiana",
+      "ipv4_count": 125,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pf",
+      "name": "French Polynesia",
+      "display_name": "French Polynesia",
+      "ipv4_count": 126,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tf",
+      "name": "French Southern Territories",
+      "display_name": "French Southern Territories",
+      "ipv4_count": 16,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ga",
+      "name": "Gabon",
+      "display_name": "Gabon",
+      "ipv4_count": 94,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gm",
+      "name": "Gambia",
+      "display_name": "Gambia",
+      "ipv4_count": 96,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ge",
+      "name": "Georgia",
+      "display_name": "Georgia",
+      "ipv4_count": 463,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gh",
+      "name": "Ghana",
+      "display_name": "Ghana",
+      "ipv4_count": 347,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gi",
+      "name": "Gibraltar",
+      "display_name": "Gibraltar",
+      "ipv4_count": 163,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gr",
+      "name": "Greece",
+      "display_name": "Greece",
+      "ipv4_count": 1563,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gl",
+      "name": "Greenland",
+      "display_name": "Greenland",
+      "ipv4_count": 131,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gd",
+      "name": "Grenada",
+      "display_name": "Grenada",
+      "ipv4_count": 123,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gp",
+      "name": "Guadeloupe",
+      "display_name": "Guadeloupe",
+      "ipv4_count": 263,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gu",
+      "name": "Guam",
+      "display_name": "Guam",
+      "ipv4_count": 186,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gt",
+      "name": "Guatemala",
+      "display_name": "Guatemala",
+      "ipv4_count": 523,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gg",
+      "name": "Guernsey",
+      "display_name": "Guernsey",
+      "ipv4_count": 115,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gn",
+      "name": "Guinea",
+      "display_name": "Guinea",
+      "ipv4_count": 98,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gw",
+      "name": "Guinea-Bissau",
+      "display_name": "Guinea-Bissau",
+      "ipv4_count": 74,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gy",
+      "name": "Guyana",
+      "display_name": "Guyana",
+      "ipv4_count": 95,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ht",
+      "name": "Haiti",
+      "display_name": "Haiti",
+      "ipv4_count": 121,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "hm",
+      "name": "Heard and McDonald Islands",
+      "display_name": "Heard and McDonald Islands",
+      "ipv4_count": 15,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "hn",
+      "name": "Honduras",
+      "display_name": "Honduras",
+      "ipv4_count": 351,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "hu",
+      "name": "Hungary",
+      "display_name": "Hungary",
+      "ipv4_count": 1828,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "is",
+      "name": "Iceland",
+      "display_name": "Iceland",
+      "ipv4_count": 389,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "iq",
+      "name": "Iraq",
+      "display_name": "Iraq",
+      "ipv4_count": 681,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "im",
+      "name": "Isle of Man",
+      "display_name": "Isle of Man",
+      "ipv4_count": 207,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ci",
+      "name": "Ivory Coast",
+      "display_name": "Ivory Coast",
+      "ipv4_count": 350,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "jm",
+      "name": "Jamaica",
+      "display_name": "Jamaica",
+      "ipv4_count": 257,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "je",
+      "name": "Jersey",
+      "display_name": "Jersey",
+      "ipv4_count": 135,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "jo",
+      "name": "Jordan",
+      "display_name": "Jordan",
+      "ipv4_count": 439,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kz",
+      "name": "Kazakhstan",
+      "display_name": "Kazakhstan",
+      "ipv4_count": 1223,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ki",
+      "name": "Kiribati",
+      "display_name": "Kiribati",
+      "ipv4_count": 106,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "xk",
+      "name": "Kosovo",
+      "display_name": "Kosovo",
+      "ipv4_count": 71,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kw",
+      "name": "Kuwait",
+      "display_name": "Kuwait",
+      "ipv4_count": 492,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kg",
+      "name": "Kyrgyzstan",
+      "display_name": "Kyrgyzstan",
+      "ipv4_count": 225,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "la",
+      "name": "Laos",
+      "display_name": "Laos",
+      "ipv4_count": 159,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lv",
+      "name": "Latvia",
+      "display_name": "Latvia",
+      "ipv4_count": 1134,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lb",
+      "name": "Lebanon",
+      "display_name": "Lebanon",
+      "ipv4_count": 377,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ls",
+      "name": "Lesotho",
+      "display_name": "Lesotho",
+      "ipv4_count": 94,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lr",
+      "name": "Liberia",
+      "display_name": "Liberia",
+      "ipv4_count": 111,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ly",
+      "name": "Libya",
+      "display_name": "Libya",
+      "ipv4_count": 146,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "li",
+      "name": "Liechtenstein",
+      "display_name": "Liechtenstein",
+      "ipv4_count": 387,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lt",
+      "name": "Lithuania",
+      "display_name": "Lithuania",
+      "ipv4_count": 1612,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lu",
+      "name": "Luxembourg",
+      "display_name": "Luxembourg",
+      "ipv4_count": 1592,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mg",
+      "name": "Madagascar",
+      "display_name": "Madagascar",
+      "ipv4_count": 135,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mw",
+      "name": "Malawi",
+      "display_name": "Malawi",
+      "ipv4_count": 143,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mv",
+      "name": "Maldives",
+      "display_name": "Maldives",
+      "ipv4_count": 148,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ml",
+      "name": "Mali",
+      "display_name": "Mali",
+      "ipv4_count": 93,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mt",
+      "name": "Malta",
+      "display_name": "Malta",
+      "ipv4_count": 337,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mh",
+      "name": "Marshall Islands",
+      "display_name": "Marshall Islands",
+      "ipv4_count": 63,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mq",
+      "name": "Martinique",
+      "display_name": "Martinique",
+      "ipv4_count": 192,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mr",
+      "name": "Mauritania",
+      "display_name": "Mauritania",
+      "ipv4_count": 95,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mu",
+      "name": "Mauritius",
+      "display_name": "Mauritius",
+      "ipv4_count": 739,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "yt",
+      "name": "Mayotte",
+      "display_name": "Mayotte",
+      "ipv4_count": 82,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "md",
+      "name": "Moldova",
+      "display_name": "Moldova",
+      "ipv4_count": 837,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mc",
+      "name": "Monaco",
+      "display_name": "Monaco",
+      "ipv4_count": 245,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mn",
+      "name": "Mongolia",
+      "display_name": "Mongolia",
+      "ipv4_count": 263,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "me",
+      "name": "Montenegro",
+      "display_name": "Montenegro",
+      "ipv4_count": 165,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ms",
+      "name": "Montserrat",
+      "display_name": "Montserrat",
+      "ipv4_count": 54,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ma",
+      "name": "Morocco",
+      "display_name": "Morocco",
+      "ipv4_count": 533,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mz",
+      "name": "Mozambique",
+      "display_name": "Mozambique",
+      "ipv4_count": 179,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mm",
+      "name": "Myanmar",
+      "display_name": "Myanmar",
+      "ipv4_count": 428,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nan",
+      "name": "Namibia",
+      "display_name": "Namibia",
+      "ipv4_count": 794,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nr",
+      "name": "Nauru",
+      "display_name": "Nauru",
+      "ipv4_count": 64,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "np",
+      "name": "Nepal",
+      "display_name": "Nepal",
+      "ipv4_count": 467,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nc",
+      "name": "New Caledonia",
+      "display_name": "New Caledonia",
+      "ipv4_count": 108,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ni",
+      "name": "Nicaragua",
+      "display_name": "Nicaragua",
+      "ipv4_count": 200,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ne",
+      "name": "Niger",
+      "display_name": "Niger",
+      "ipv4_count": 85,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nu",
+      "name": "Niue",
+      "display_name": "Niue",
+      "ipv4_count": 55,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nf",
+      "name": "Norfolk Island",
+      "display_name": "Norfolk Island",
+      "ipv4_count": 52,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kp",
+      "name": "North Korea",
+      "display_name": "North Korea",
+      "ipv4_count": 14,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mk",
+      "name": "North Macedonia",
+      "display_name": "North Macedonia",
+      "ipv4_count": 275,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mp",
+      "name": "Northern Mariana Islands",
+      "display_name": "Northern Mariana Islands",
+      "ipv4_count": 60,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "om",
+      "name": "Oman",
+      "display_name": "Oman",
+      "ipv4_count": 327,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pw",
+      "name": "Palau",
+      "display_name": "Palau",
+      "ipv4_count": 69,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ps",
+      "name": "Palestine",
+      "display_name": "Palestine",
+      "ipv4_count": 315,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pa",
+      "name": "Panama",
+      "display_name": "Panama",
+      "ipv4_count": 552,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pg",
+      "name": "Papua New Guinea",
+      "display_name": "Papua New Guinea",
+      "ipv4_count": 239,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "py",
+      "name": "Paraguay",
+      "display_name": "Paraguay",
+      "ipv4_count": 473,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pe",
+      "name": "Peru",
+      "display_name": "Peru",
+      "ipv4_count": 1105,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pn",
+      "name": "Pitcairn Islands",
+      "display_name": "Pitcairn Islands",
+      "ipv4_count": 18,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pr",
+      "name": "Puerto Rico",
+      "display_name": "Puerto Rico",
+      "ipv4_count": 811,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "qa",
+      "name": "Qatar",
+      "display_name": "Qatar",
+      "ipv4_count": 503,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ro",
+      "name": "Romania",
+      "display_name": "Romania",
+      "ipv4_count": 3810,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "rw",
+      "name": "Rwanda",
+      "display_name": "Rwanda",
+      "ipv4_count": 126,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "re",
+      "name": "Réunion",
+      "display_name": "Réunion",
+      "ipv4_count": 205,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bl",
+      "name": "Saint Barthélemy",
+      "display_name": "Saint Barthélemy",
+      "ipv4_count": 55,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sh",
+      "name": "Saint Helena",
+      "display_name": "Saint Helena",
+      "ipv4_count": 30,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lc",
+      "name": "Saint Lucia",
+      "display_name": "Saint Lucia",
+      "ipv4_count": 119,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mf",
+      "name": "Saint Martin",
+      "display_name": "Saint Martin",
+      "ipv4_count": 88,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pm",
+      "name": "Saint Pierre and Miquelon",
+      "display_name": "Saint Pierre and Miquelon",
+      "ipv4_count": 81,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ws",
+      "name": "Samoa",
+      "display_name": "Samoa",
+      "ipv4_count": 90,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sm",
+      "name": "San Marino",
+      "display_name": "San Marino",
+      "ipv4_count": 94,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sn",
+      "name": "Senegal",
+      "display_name": "Senegal",
+      "ipv4_count": 137,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "rs",
+      "name": "Serbia",
+      "display_name": "Serbia",
+      "ipv4_count": 968,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sc",
+      "name": "Seychelles",
+      "display_name": "Seychelles",
+      "ipv4_count": 1606,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sl",
+      "name": "Sierra Leone",
+      "display_name": "Sierra Leone",
+      "ipv4_count": 111,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sx",
+      "name": "Sint Maarten",
+      "display_name": "Sint Maarten",
+      "ipv4_count": 72,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sk",
+      "name": "Slovakia",
+      "display_name": "Slovakia",
+      "ipv4_count": 1206,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "si",
+      "name": "Slovenia",
+      "display_name": "Slovenia",
+      "ipv4_count": 1074,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sb",
+      "name": "Solomon Islands",
+      "display_name": "Solomon Islands",
+      "ipv4_count": 78,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "so",
+      "name": "Somalia",
+      "display_name": "Somalia",
+      "ipv4_count": 86,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gs",
+      "name": "South Georgia and the South Sandwich Islands",
+      "display_name": "South Georgia and the South Sandwich Islands",
+      "ipv4_count": 14,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ss",
+      "name": "South Sudan",
+      "display_name": "South Sudan",
+      "ipv4_count": 103,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "lk",
+      "name": "Sri Lanka",
+      "display_name": "Sri Lanka",
+      "ipv4_count": 250,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kn",
+      "name": "St Kitts and Nevis",
+      "display_name": "St Kitts and Nevis",
+      "ipv4_count": 120,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "vc",
+      "name": "St Vincent and Grenadines",
+      "display_name": "St Vincent and Grenadines",
+      "ipv4_count": 109,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sd",
+      "name": "Sudan",
+      "display_name": "Sudan",
+      "ipv4_count": 118,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sr",
+      "name": "Suriname",
+      "display_name": "Suriname",
+      "ipv4_count": 81,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sj",
+      "name": "Svalbard and Jan Mayen",
+      "display_name": "Svalbard and Jan Mayen",
+      "ipv4_count": 39,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sy",
+      "name": "Syria",
+      "display_name": "Syria",
+      "ipv4_count": 290,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "st",
+      "name": "São Tomé and Príncipe",
+      "display_name": "São Tomé and Príncipe",
+      "ipv4_count": 71,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tj",
+      "name": "Tajikistan",
+      "display_name": "Tajikistan",
+      "ipv4_count": 144,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tz",
+      "name": "Tanzania",
+      "display_name": "Tanzania",
+      "ipv4_count": 330,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tl",
+      "name": "Timor-Leste",
+      "display_name": "Timor-Leste",
+      "ipv4_count": 104,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tg",
+      "name": "Togo",
+      "display_name": "Togo",
+      "ipv4_count": 96,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tk",
+      "name": "Tokelau",
+      "display_name": "Tokelau",
+      "ipv4_count": 52,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "to",
+      "name": "Tonga",
+      "display_name": "Tonga",
+      "ipv4_count": 76,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tt",
+      "name": "Trinidad and Tobago",
+      "display_name": "Trinidad and Tobago",
+      "ipv4_count": 202,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tn",
+      "name": "Tunisia",
+      "display_name": "Tunisia",
+      "ipv4_count": 226,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tm",
+      "name": "Turkmenistan",
+      "display_name": "Turkmenistan",
+      "ipv4_count": 91,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tc",
+      "name": "Turks and Caicos Islands",
+      "display_name": "Turks and Caicos Islands",
+      "ipv4_count": 78,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tv",
+      "name": "Tuvalu",
+      "display_name": "Tuvalu",
+      "ipv4_count": 71,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "um",
+      "name": "U.S. Outlying Islands",
+      "display_name": "U.S. Outlying Islands",
+      "ipv4_count": 52,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "vi",
+      "name": "U.S. Virgin Islands",
+      "display_name": "U.S. Virgin Islands",
+      "ipv4_count": 210,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ug",
+      "name": "Uganda",
+      "display_name": "Uganda",
+      "ipv4_count": 239,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "uy",
+      "name": "Uruguay",
+      "display_name": "Uruguay",
+      "ipv4_count": 283,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "uz",
+      "name": "Uzbekistan",
+      "display_name": "Uzbekistan",
+      "ipv4_count": 533,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "vu",
+      "name": "Vanuatu",
+      "display_name": "Vanuatu",
+      "ipv4_count": 90,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "va",
+      "name": "Vatican City",
+      "display_name": "Vatican City",
+      "ipv4_count": 58,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ve",
+      "name": "Venezuela",
+      "display_name": "Venezuela",
+      "ipv4_count": 918,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "wf",
+      "name": "Wallis and Futuna",
+      "display_name": "Wallis and Futuna",
+      "ipv4_count": 48,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "eh",
+      "name": "Western Sahara",
+      "display_name": "Western Sahara",
+      "ipv4_count": 28,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ye",
+      "name": "Yemen",
+      "display_name": "Yemen",
+      "ipv4_count": 129,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "zm",
+      "name": "Zambia",
+      "display_name": "Zambia",
+      "ipv4_count": 194,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "zw",
+      "name": "Zimbabwe",
+      "display_name": "Zimbabwe",
+      "ipv4_count": 208,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ax",
+      "name": "Åland Islands",
+      "display_name": "Åland Islands",
+      "ipv4_count": 73,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ae",
+      "name": "United Arab Emirates",
+      "display_name": "🇦🇪 阿联酋",
+      "ipv4_count": 2934,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ar",
+      "name": "Argentina",
+      "display_name": "🇦🇷 阿根廷",
+      "ipv4_count": 3425,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "at",
+      "name": "Austria",
+      "display_name": "🇦🇹 奥地利",
+      "ipv4_count": 4563,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "au",
+      "name": "Australia",
+      "display_name": "🇦🇺 澳大利亚",
+      "ipv4_count": 11257,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "bd",
+      "name": "Bangladesh",
+      "display_name": "🇧🇩 孟加拉国",
+      "ipv4_count": 2538,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "be",
+      "name": "Belgium",
+      "display_name": "🇧🇪 比利时",
+      "ipv4_count": 5446,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "br",
+      "name": "Brazil",
+      "display_name": "🇧🇷 巴西",
+      "ipv4_count": 11004,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ca",
+      "name": "Canada",
+      "display_name": "🇨🇦 加拿大",
+      "ipv4_count": 17397,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ch",
+      "name": "Switzerland",
+      "display_name": "🇨🇭 瑞士",
+      "ipv4_count": 6312,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cl",
+      "name": "Chile",
+      "display_name": "🇨🇱 智利",
+      "ipv4_count": 1895,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cn",
+      "name": "China",
+      "display_name": "🇨🇳 中国",
+      "ipv4_count": 7496,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "cz",
+      "name": "Czechia",
+      "display_name": "🇨🇿 捷克",
+      "ipv4_count": 3542,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "de",
+      "name": "Germany",
+      "display_name": "🇩🇪 德国",
+      "ipv4_count": 27412,
+      "ipv6_count": 0,
+      "recommended_exit": "de-stream"
+    },
+    {
+      "code": "dk",
+      "name": "Denmark",
+      "display_name": "🇩🇰 丹麦",
+      "ipv4_count": 3636,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "eg",
+      "name": "Egypt",
+      "display_name": "🇪🇬 埃及",
+      "ipv4_count": 694,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "es",
+      "name": "Spain",
+      "display_name": "🇪🇸 西班牙",
+      "ipv4_count": 11484,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "fi",
+      "name": "Finland",
+      "display_name": "🇫🇮 芬兰",
+      "ipv4_count": 3248,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "fr",
+      "name": "France",
+      "display_name": "🇫🇷 法国",
+      "ipv4_count": 31715,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "gb",
+      "name": "United Kingdom",
+      "display_name": "🇬🇧 英国",
+      "ipv4_count": 33084,
+      "ipv6_count": 0,
+      "recommended_exit": "uk-stream"
+    },
+    {
+      "code": "hk",
+      "name": "Hong Kong",
+      "display_name": "🇭🇰 中国香港",
+      "ipv4_count": 10361,
+      "ipv6_count": 0,
+      "recommended_exit": "hk-stream"
+    },
+    {
+      "code": "id",
+      "name": "Indonesia",
+      "display_name": "🇮🇩 印度尼西亚",
+      "ipv4_count": 6251,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ie",
+      "name": "Ireland",
+      "display_name": "🇮🇪 爱尔兰",
+      "ipv4_count": 5185,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "il",
+      "name": "Israel",
+      "display_name": "🇮🇱 以色列",
+      "ipv4_count": 2073,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "in",
+      "name": "India",
+      "display_name": "🇮🇳 印度",
+      "ipv4_count": 12550,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ir",
+      "name": "Iran",
+      "display_name": "🇮🇷 伊朗",
+      "ipv4_count": 1997,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "it",
+      "name": "Italy",
+      "display_name": "🇮🇹 意大利",
+      "ipv4_count": 9327,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "jp",
+      "name": "Japan",
+      "display_name": "🇯🇵 日本",
+      "ipv4_count": 11927,
+      "ipv6_count": 0,
+      "recommended_exit": "jp-stream"
+    },
+    {
+      "code": "ke",
+      "name": "Kenya",
+      "display_name": "🇰🇪 肯尼亚",
+      "ipv4_count": 838,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "kr",
+      "name": "South Korea",
+      "display_name": "🇰🇷 韩国",
+      "ipv4_count": 4016,
+      "ipv6_count": 0,
+      "recommended_exit": "kr-stream"
+    },
+    {
+      "code": "mo",
+      "name": "Macao",
+      "display_name": "🇲🇴 中国澳门",
+      "ipv4_count": 123,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "mx",
+      "name": "Mexico",
+      "display_name": "🇲🇽 墨西哥",
+      "ipv4_count": 4262,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "my",
+      "name": "Malaysia",
+      "display_name": "🇲🇾 马来西亚",
+      "ipv4_count": 2450,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ng",
+      "name": "Nigeria",
+      "display_name": "🇳🇬 尼日利亚",
+      "ipv4_count": 1082,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nl",
+      "name": "The Netherlands",
+      "display_name": "🇳🇱 荷兰",
+      "ipv4_count": 18197,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "no",
+      "name": "Norway",
+      "display_name": "🇳🇴 挪威",
+      "ipv4_count": 3018,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "nz",
+      "name": "New Zealand",
+      "display_name": "🇳🇿 新西兰",
+      "ipv4_count": 2296,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ph",
+      "name": "Philippines",
+      "display_name": "🇵🇭 菲律宾",
+      "ipv4_count": 2013,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pk",
+      "name": "Pakistan",
+      "display_name": "🇵🇰 巴基斯坦",
+      "ipv4_count": 1309,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pl",
+      "name": "Poland",
+      "display_name": "🇵🇱 波兰",
+      "ipv4_count": 7797,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "pt",
+      "name": "Portugal",
+      "display_name": "🇵🇹 葡萄牙",
+      "ipv4_count": 1884,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "ru",
+      "name": "Russia",
+      "display_name": "🇷🇺 俄罗斯",
+      "ipv4_count": 13061,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sa",
+      "name": "Saudi Arabia",
+      "display_name": "🇸🇦 沙特阿拉伯",
+      "ipv4_count": 1615,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "se",
+      "name": "Sweden",
+      "display_name": "🇸🇪 瑞典",
+      "ipv4_count": 9709,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "sg",
+      "name": "Singapore",
+      "display_name": "🇸🇬 新加坡",
+      "ipv4_count": 8940,
+      "ipv6_count": 0,
+      "recommended_exit": "sg-stream"
+    },
+    {
+      "code": "th",
+      "name": "Thailand",
+      "display_name": "🇹🇭 泰国",
+      "ipv4_count": 1899,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tr",
+      "name": "Türkiye",
+      "display_name": "🇹🇷 土耳其",
+      "ipv4_count": 3383,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "tw",
+      "name": "Taiwan",
+      "display_name": "🇹🇼 中国台湾",
+      "ipv4_count": 2418,
+      "ipv6_count": 0,
+      "recommended_exit": "tw-stream"
+    },
+    {
+      "code": "ua",
+      "name": "Ukraine",
+      "display_name": "🇺🇦 乌克兰",
+      "ipv4_count": 5429,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "us",
+      "name": "United States",
+      "display_name": "🇺🇸 美国",
+      "ipv4_count": 208627,
+      "ipv6_count": 0,
+      "recommended_exit": "us-stream"
+    },
+    {
+      "code": "vn",
+      "name": "Vietnam",
+      "display_name": "🇻🇳 越南",
+      "ipv4_count": 2159,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    },
+    {
+      "code": "za",
+      "name": "South Africa",
+      "display_name": "🇿🇦 南非",
+      "ipv4_count": 3964,
+      "ipv6_count": 0,
+      "recommended_exit": "direct"
+    }
+  ]
+}

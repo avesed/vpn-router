@@ -15,12 +15,30 @@ export default function Setup() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
+  // H9: 可配置的密码复杂度验证
+  function validatePasswordComplexity(pwd: string): string | null {
+    if (pwd.length < 8) {
+      return t("auth.passwordTooShort");
+    }
+    if (!/[A-Z]/.test(pwd)) {
+      return t("auth.passwordNeedsUppercase");
+    }
+    if (!/[a-z]/.test(pwd)) {
+      return t("auth.passwordNeedsLowercase");
+    }
+    if (!/\d/.test(pwd)) {
+      return t("auth.passwordNeedsNumber");
+    }
+    return null;
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
 
-    if (password.length < 8) {
-      setError(t("auth.passwordTooShort"));
+    const complexityError = validatePasswordComplexity(password);
+    if (complexityError) {
+      setError(complexityError);
       return;
     }
 
@@ -83,7 +101,7 @@ export default function Setup() {
                 autoFocus
               />
               <p className="mt-1 text-xs text-slate-500">
-                {t("auth.passwordRequirement")}
+                {t("auth.passwordRequirementComplex")}
               </p>
             </div>
 

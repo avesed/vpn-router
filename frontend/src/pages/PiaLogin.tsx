@@ -36,8 +36,9 @@ export default function PiaLogin() {
       setStatus(response.message);
       setIsSuccess(true);
     } catch (error: unknown) {
-      const err = error as Error;
-      setStatus(err.message || t('pia.loginFailed'));
+      // L13 修复: 类型安全的错误处理
+      const message = error instanceof Error ? error.message : t('pia.loginFailed');
+      setStatus(message);
       setIsSuccess(false);
     } finally {
       setLoading(false);
