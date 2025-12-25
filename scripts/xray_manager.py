@@ -575,7 +575,7 @@ class XrayManager:
 
         # 出站配置 - 通过 SOCKS5 连接到 sing-box 路由引擎
         # 使用 SOCKS5 代替 WireGuard，避免复杂的路由问题
-        XRAY_SOCKS_PORT = 38001  # sing-box 的 SOCKS5 入站端口 (xray-in)
+        XRAY_SOCKS_PORT = 38501  # sing-box 的 SOCKS5 入站端口 (xray-in)，避免与 WARP SOCKS (38001+) 冲突
         xray_config["outbounds"].append({
             "tag": "socks-out",
             "protocol": "socks",

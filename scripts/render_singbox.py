@@ -1182,6 +1182,106 @@ def ensure_v2ray_dns_servers(config: dict, v2ray_tags: List[str]) -> None:
             })
 
 
+# ============ WARP Egress 支持 ============
+# Cloudflare WARP 通过 usque (MASQUE 协议) 提供出口
+# - 每个 WARP 出口运行独立的 usque SOCKS5 代理
+# - sing-box 通过 SOCKS outbound 连接到 usque
+
+
+def load_warp_egress() -> List[dict]:
+    """从数据库加载 WARP 出口配置"""
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        egress_list = db.get_warp_egress_list(enabled_only=True)
+        return egress_list
+    except Exception as e:
+        print(f"[render] 从数据库加载 WARP 出口配置失败: {e}")
+        return []
+
+
+def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[str]:
+    """确保每个 WARP 出口都有对应的 SOCKS5 outbound
+
+    WARP 隧道通过 usque SOCKS5 代理桥接到 sing-box:
+    - 每个 WARP 出口运行独立的 usque 进程
+    - 每个出口有对应的 SOCKS5 代理（监听 127.0.0.1:socks_port）
+    - sing-box 通过 SOCKS outbound 连接到 WARP 隧道
+
+    Args:
+        config: sing-box 配置
+        warp_egress: WARP 出口列表
+
+    Returns:
+        所有 WARP 出口的 tag 列表
+    """
+    if not warp_egress:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    warp_tags = []
+
+    for egress in warp_egress:
+        tag = egress.get("tag")
+        socks_port = egress.get("socks_port")
+
+        if not tag or not socks_port:
+            print(f"[render] 警告: WARP 出口缺少 tag 或 socks_port，跳过")
+            continue
+
+        warp_tags.append(tag)
+
+        # 构建 SOCKS outbound
+        outbound = {
+            "type": "socks",
+            "tag": tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port
+        }
+
+        if tag in existing_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag and ob.get("type") == "socks":
+                    outbounds[i] = outbound
+                    break
+        else:
+            # 在 block 之前插入
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+            print(f"[render] 创建 WARP 出口 (SOCKS): {tag} -> 127.0.0.1:{socks_port}")
+
+    return warp_tags
+
+
+def ensure_warp_dns_servers(config: dict, warp_tags: List[str]) -> None:
+    """为 WARP 出口添加 DNS 服务器
+
+    WARP 使用 Cloudflare 的 1.1.1.1 DNS，通过 SOCKS 代理访问。
+    这确保 DNS 查询也通过 WARP 隧道，防止 DNS 泄露。
+
+    sing-box 1.12+ 使用新的 DNS 服务器格式（type + server）
+    """
+    if not warp_tags:
+        return
+
+    dns = config.setdefault("dns", {})
+    servers = dns.setdefault("servers", [])
+    existing_tags = {s.get("tag") for s in servers}
+
+    for tag in warp_tags:
+        dns_tag = f"{tag}-dns"
+        if dns_tag not in existing_tags:
+            servers.append({
+                "tag": dns_tag,
+                "type": "tls",
+                "server": "1.1.1.1",  # Cloudflare DNS
+                "detour": tag
+            })
+
+
 # ============ V2Ray Inbound 支持 ============
 
 
@@ -1682,7 +1782,7 @@ def ensure_xray_socks_inbound(config: dict) -> bool:
     这个 SOCKS5 入口允许 Xray 使用 SOCKS 协议连接到 sing-box，
     比 TUN + TPROXY 方式更简单可靠。
 
-    端口: 38001 (固定)
+    端口: 38501 (固定，避免与 WARP SOCKS 38001+ 冲突)
 
     Returns:
         True if inbound was added, False otherwise
@@ -1703,17 +1803,18 @@ def ensure_xray_socks_inbound(config: dict) -> bool:
             return False
 
     # 添加 SOCKS5 入口
+    # 端口 38501 避免与 WARP SOCKS (38001+) 冲突
     inbound = {
         "type": "socks",
         "tag": "xray-in",
         "listen": "127.0.0.1",
-        "listen_port": 38001,
+        "listen_port": 38501,
         # 启用流量嗅探以支持域名路由
         "sniff": True,
         "sniff_override_destination": False
     }
     inbounds.append(inbound)
-    print("[render] 已添加 Xray SOCKS 入口 (127.0.0.1:38001, sniff=true)")
+    print("[render] 已添加 Xray SOCKS 入口 (127.0.0.1:38501, sniff=true)")
     return True
 
 
@@ -1850,7 +1951,16 @@ def main() -> None:
         ensure_v2ray_dns_servers(config, v2ray_tags)
         all_egress_tags.extend(v2ray_tags)
 
-    # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + V2Ray）
+    # 加载并处理 WARP 出口（Cloudflare WARP 通过 usque MASQUE 协议）
+    # 每个 WARP 出口运行独立的 usque SOCKS5 代理
+    warp_egress = load_warp_egress()
+    if warp_egress:
+        print(f"[render] 处理 {len(warp_egress)} 个 WARP 出口 (通过 usque SOCKS5)")
+        warp_tags = ensure_warp_egress_outbounds(config, warp_egress)
+        ensure_warp_dns_servers(config, warp_tags)
+        all_egress_tags.extend(warp_tags)
+
+    # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + V2Ray + WARP）
     # wg_egress_tags 已包含 PIA 和自定义 WireGuard 出口
     speedtest_tags = list(wg_egress_tags) if wg_egress_tags else []
     if v2ray_egress:

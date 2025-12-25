@@ -238,6 +238,34 @@ CREATE INDEX IF NOT EXISTS idx_v2ray_egress_tag ON v2ray_egress(tag);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_protocol ON v2ray_egress(protocol);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
 
+-- WARP 出口表（Cloudflare WARP via MASQUE 协议）
+CREATE TABLE IF NOT EXISTS warp_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,                 -- 出口标识，如 "warp-main"
+    description TEXT DEFAULT '',               -- 描述
+
+    -- 协议配置
+    protocol TEXT DEFAULT 'masque',            -- masque / wireguard
+    config_path TEXT,                          -- usque/wgcf config 路径
+    license_key TEXT,                          -- WARP+ license key（可选）
+    account_type TEXT DEFAULT 'free',          -- free / warp+ / teams
+
+    -- 运行模式
+    mode TEXT DEFAULT 'socks',                 -- socks / tun
+    socks_port INTEGER UNIQUE,                 -- SOCKS5 端口（38001+）
+
+    -- 自定义 Endpoint（指定地区）
+    endpoint_v4 TEXT,                          -- 自定义 IPv4 endpoint (如 162.159.193.10:2408)
+    endpoint_v6 TEXT,                          -- 自定义 IPv6 endpoint
+
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_warp_egress_tag ON warp_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_warp_egress_enabled ON warp_egress(enabled);
+
 -- V2Ray 入口服务器配置表（单行，类似 wireguard_server）
 -- 使用独立的 Xray 进程 + TUN + TPROXY 架构
 CREATE TABLE IF NOT EXISTS v2ray_inbound_config (
@@ -484,6 +512,28 @@ def migrate_admin_auth(conn: sqlite3.Connection):
     print("✓ 创建 admin_auth 表")
 
 
+def migrate_warp_egress_protocol(conn: sqlite3.Connection):
+    """为现有 warp_egress 表添加 protocol 字段"""
+    cursor = conn.cursor()
+
+    # 检查 warp_egress 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='warp_egress'")
+    if not cursor.fetchone():
+        print("⊘ warp_egress 表不存在，跳过 protocol 迁移")
+        return
+
+    # 检查是否需要迁移（检查 protocol 列是否存在）
+    cursor.execute("PRAGMA table_info(warp_egress)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "protocol" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN protocol TEXT DEFAULT 'masque'")
+        conn.commit()
+        print("✓ 添加 warp_egress.protocol 字段")
+    else:
+        print("⊘ warp_egress.protocol 字段已存在，跳过迁移")
+
+
 def generate_wireguard_private_key() -> str:
     """生成 WireGuard 私钥"""
     try:
@@ -694,6 +744,7 @@ def main():
     migrate_v2ray_inbound_xray_fields(conn)
     migrate_v2ray_egress_socks_port(conn)
     migrate_admin_auth(conn)
+    migrate_warp_egress_protocol(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)
@@ -728,6 +779,7 @@ def main():
         "direct_egress": cursor.execute("SELECT COUNT(*) FROM direct_egress").fetchone()[0],
         "openvpn_egress": cursor.execute("SELECT COUNT(*) FROM openvpn_egress").fetchone()[0],
         "v2ray_egress": cursor.execute("SELECT COUNT(*) FROM v2ray_egress").fetchone()[0],
+        "warp_egress": cursor.execute("SELECT COUNT(*) FROM warp_egress").fetchone()[0],
         "v2ray_users": cursor.execute("SELECT COUNT(*) FROM v2ray_users").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
     }
@@ -747,6 +799,7 @@ def main():
     print(f"Direct 出口:      {stats['direct_egress']:,}")
     print(f"OpenVPN 出口:     {stats['openvpn_egress']:,}")
     print(f"V2Ray 出口:       {stats['v2ray_egress']:,}")
+    print(f"WARP 出口:        {stats['warp_egress']:,}")
     print(f"V2Ray 用户:       {stats['v2ray_users']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")

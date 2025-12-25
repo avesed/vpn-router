@@ -912,3 +912,90 @@ export const VLESS_FLOW_OPTIONS = [
   { value: "", label: "None", description: "No flow control" },
   { value: "xtls-rprx-vision", label: "xtls-rprx-vision", description: "XTLS Vision flow control" },
 ] as const;
+
+// ============ WARP Egress 类型 ============
+
+export type WarpAccountType = "free" | "warp+" | "teams";
+export type WarpMode = "socks" | "tun";
+export type WarpProtocol = "masque" | "wireguard";
+
+export interface WarpEgress {
+  id?: number;
+  tag: string;
+  description: string;
+  config_path?: string;
+  license_key?: string;
+  account_type: WarpAccountType;
+  protocol: WarpProtocol;
+  mode: WarpMode;
+  socks_port?: number;
+  endpoint_v4?: string;
+  endpoint_v6?: string;
+  enabled: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface WarpEgressRegisterRequest {
+  tag: string;
+  description?: string;
+  license_key?: string;
+  protocol?: WarpProtocol;
+}
+
+export interface WarpEgressUpdateRequest {
+  description?: string;
+  enabled?: number;
+}
+
+export interface WarpEgressEndpointRequest {
+  endpoint_v4?: string;
+  endpoint_v6?: string;
+}
+
+export interface WarpEgressLicenseRequest {
+  license_key: string;
+}
+
+export interface WarpEgressListResponse {
+  warp_egress: WarpEgress[];
+}
+
+export interface WarpEgressStatus {
+  tag: string;
+  running: boolean;
+  pid?: number;
+  mode?: string;
+  uptime?: number;
+  error?: string;
+}
+
+export interface WarpEndpointResult {
+  ip: string;
+  port: number;
+  endpoint: string;
+  loss_rate: number;
+  latency_ms: number;
+  min_latency_ms: number;
+  max_latency_ms: number;
+  success_count: number;
+  test_count: number;
+}
+
+export interface WarpEndpointTestRequest {
+  endpoints?: string[];
+  sample_count?: number;
+  top_n?: number;
+}
+
+export interface WarpEndpointTestResponse {
+  results: WarpEndpointResult[];
+  message?: string;
+}
+
+export const WARP_ACCOUNT_TYPES = [
+  { value: "free", label: "Free", description: "免费版 WARP" },
+  { value: "warp+", label: "WARP+", description: "付费版 WARP，更快的速度" },
+  { value: "teams", label: "Teams", description: "企业版 WARP" },
+] as const;
+

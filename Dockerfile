@@ -40,7 +40,38 @@ RUN XRAY_ARCH="" && \
     mv xray /usr/local/bin/xray
 
 # ==========================================
-# Stage 2: Build sing-box with v2ray_api
+# Stage 2: Download usque binary (WARP MASQUE)
+# ==========================================
+FROM debian:12-slim AS usque-downloader
+
+ARG USQUE_VERSION=1.4.2
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download usque binary (release is a zip file)
+# usque provides WARP MASQUE protocol support (RFC 9484 Connect-IP over HTTP/3)
+# https://github.com/Diniboy1123/usque
+# Release format: usque_VERSION_linux_ARCH.zip
+RUN USQUE_ARCH="" && \
+    if [ "$TARGETARCH" = "amd64" ]; then USQUE_ARCH="amd64"; \
+    elif [ "$TARGETARCH" = "arm64" ]; then USQUE_ARCH="arm64"; \
+    else echo "Unsupported architecture: $TARGETARCH" && exit 1; fi && \
+    USQUE_ZIP="usque_${USQUE_VERSION}_linux_${USQUE_ARCH}.zip" && \
+    USQUE_URL="https://github.com/Diniboy1123/usque/releases/download/v${USQUE_VERSION}/${USQUE_ZIP}" && \
+    curl -fsSL -o /tmp/usque.zip "${USQUE_URL}" && \
+    cd /tmp && \
+    unzip usque.zip && \
+    chmod +x usque && \
+    mv usque /usr/local/bin/usque && \
+    echo "usque downloaded successfully"
+
+# ==========================================
+# Stage 3: Build sing-box with v2ray_api
 # ==========================================
 FROM golang:1.23-bookworm AS singbox-builder
 
@@ -58,7 +89,7 @@ RUN CGO_ENABLED=0 go build -v -trimpath -ldflags "-s -w -buildid=" \
     -o /sing-box ./cmd/sing-box
 
 # ==========================================
-# Stage 3: Build Frontend
+# Stage 4: Build Frontend
 # ==========================================
 FROM node:20-alpine AS frontend-builder
 
@@ -69,7 +100,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ==========================================
-# Stage 4: Production Runtime
+# Stage 5: Production Runtime
 # ==========================================
 FROM debian:12-slim
 
@@ -116,6 +147,10 @@ RUN chmod +x /usr/local/bin/sing-box
 COPY --from=xray-downloader /usr/local/bin/xray /usr/local/bin/xray
 RUN chmod +x /usr/local/bin/xray
 
+# Copy usque binary for WARP MASQUE protocol support
+COPY --from=usque-downloader /usr/local/bin/usque /usr/local/bin/usque
+RUN chmod +x /usr/local/bin/usque
+
 # Copy frontend build output
 COPY --from=frontend-builder /app/dist /var/www/html
 
@@ -150,6 +185,8 @@ COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
 COPY scripts/socks5_proxy.py /usr/local/bin/socks5_proxy.py
 COPY scripts/xray_manager.py /usr/local/bin/xray_manager.py
 COPY scripts/xray_egress_manager.py /usr/local/bin/xray_egress_manager.py
+COPY scripts/warp_manager.py /usr/local/bin/warp_manager.py
+COPY scripts/warp_endpoint_optimizer.py /usr/local/bin/warp_endpoint_optimizer.py
 COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
 COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
 COPY scripts/v2ray_stats_client.py /usr/local/bin/v2ray_stats_client.py
@@ -163,7 +200,8 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
     /usr/local/bin/socks5_proxy.py /usr/local/bin/setup_kernel_wg.py \
     /usr/local/bin/setup_kernel_wg_egress.py /usr/local/bin/xray_manager.py \
-    /usr/local/bin/xray_egress_manager.py
+    /usr/local/bin/xray_egress_manager.py /usr/local/bin/warp_manager.py \
+    /usr/local/bin/warp_endpoint_optimizer.py
 
 # Note: Config is mounted via docker-compose volumes
 # - user-config.db is auto-created on first run by init_user_db.py

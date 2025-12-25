@@ -1570,6 +1570,118 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ WARP 出口 ============
+
+    def get_warp_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 WARP 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM warp_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM warp_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_warp_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 WARP 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM warp_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def get_next_warp_socks_port(self) -> int:
+        """获取下一个可用的 WARP SOCKS 端口（从 38001 开始）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(socks_port) FROM warp_egress"
+            ).fetchone()
+            max_port = row[0] if row and row[0] else None
+            if max_port is None:
+                return 38001
+            next_port = max_port + 1
+            # H10 修复: 检查端口溢出
+            if next_port > 65535:
+                raise ValueError(f"WARP SOCKS port overflow: {next_port} > 65535")
+            return next_port
+
+    def add_warp_egress(
+        self,
+        tag: str,
+        description: str = "",
+        protocol: str = "masque",
+        config_path: Optional[str] = None,
+        license_key: Optional[str] = None,
+        account_type: str = "free",
+        mode: str = "socks",
+        socks_port: Optional[int] = None,
+        endpoint_v4: Optional[str] = None,
+        endpoint_v6: Optional[str] = None,
+        enabled: bool = True
+    ) -> int:
+        """添加 WARP 出口"""
+        if socks_port is None:
+            socks_port = self.get_next_warp_socks_port()
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO warp_egress
+                (tag, description, protocol, config_path, license_key, account_type,
+                 mode, socks_port, endpoint_v4, endpoint_v6, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tag, description, protocol, config_path, license_key, account_type,
+                mode, socks_port, endpoint_v4, endpoint_v6,
+                1 if enabled else 0
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_warp_egress(self, tag: str, **kwargs) -> bool:
+        """更新 WARP 出口"""
+        allowed_fields = {
+            "description", "protocol", "config_path", "license_key", "account_type",
+            "mode", "socks_port", "endpoint_v4", "endpoint_v6", "enabled"
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        if not updates:
+            return False
+
+        # 处理 enabled 布尔值
+        if "enabled" in updates:
+            updates["enabled"] = 1 if updates["enabled"] else 0
+
+        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+        values = list(updates.values()) + [tag]
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE warp_egress SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE tag = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_warp_egress(self, tag: str) -> bool:
+        """删除 WARP 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM warp_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
     # ============ V2Ray Inbound 配置 ============
 
     def get_v2ray_inbound_config(self) -> Optional[Dict]:
@@ -2082,6 +2194,41 @@ class DatabaseManager:
 
     def delete_v2ray_egress(self, tag: str) -> bool:
         return self.user.delete_v2ray_egress(tag)
+
+    # WARP Egress
+    def get_warp_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_warp_egress_list(enabled_only)
+
+    def get_warp_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_warp_egress(tag)
+
+    def get_next_warp_socks_port(self) -> int:
+        return self.user.get_next_warp_socks_port()
+
+    def add_warp_egress(
+        self,
+        tag: str,
+        description: str = "",
+        protocol: str = "masque",
+        config_path: Optional[str] = None,
+        license_key: Optional[str] = None,
+        account_type: str = "free",
+        mode: str = "socks",
+        socks_port: Optional[int] = None,
+        endpoint_v4: Optional[str] = None,
+        endpoint_v6: Optional[str] = None,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_warp_egress(
+            tag, description, protocol, config_path, license_key, account_type,
+            mode, socks_port, endpoint_v4, endpoint_v6, enabled
+        )
+
+    def update_warp_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_warp_egress(tag, **kwargs)
+
+    def delete_warp_egress(self, tag: str) -> bool:
+        return self.user.delete_warp_egress(tag)
 
     # V2Ray Inbound
     def get_v2ray_inbound_config(self) -> Optional[Dict]:

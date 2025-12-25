@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cleanup() {
+  if [ -n "${WARP_MGR_PID:-}" ] && kill -0 "${WARP_MGR_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping WARP manager (PID ${WARP_MGR_PID})"
+    kill "${WARP_MGR_PID}" >/dev/null 2>&1 || true
+  fi
   if [ -n "${XRAY_MGR_PID:-}" ] && kill -0 "${XRAY_MGR_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping Xray manager (PID ${XRAY_MGR_PID})"
     kill "${XRAY_MGR_PID}" >/dev/null 2>&1 || true
@@ -24,6 +28,7 @@ NGINX_PID=""
 OPENVPN_MGR_PID=""
 XRAY_MGR_PID=""
 XRAY_EGRESS_MGR_PID=""
+WARP_MGR_PID=""
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
@@ -351,8 +356,34 @@ print(len(egress_list))
   fi
 }
 
+start_warp_manager() {
+  # 检查是否有启用的 WARP 出口
+  local warp_count
+  warp_count=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+egress_list = db.get_warp_egress_list(enabled_only=True)
+print(len(egress_list))
+" 2>/dev/null || echo "0")
+
+  if [ "${warp_count}" -gt "0" ]; then
+    echo "[entrypoint] starting WARP manager for ${warp_count} WARP egress"
+    python3 /usr/local/bin/warp_manager.py daemon >/var/log/warp-manager.log 2>&1 &
+    WARP_MGR_PID=$!
+    echo "[entrypoint] WARP manager started with PID ${WARP_MGR_PID}"
+  else
+    echo "[entrypoint] No WARP egress configured, skipping WARP manager"
+  fi
+}
+
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
+
+  # Ensure nginx log directory exists (may be missing if volume mounted)
+  mkdir -p /var/log/nginx
+  chown www-data:www-data /var/log/nginx 2>/dev/null || true
 
   # Generate nginx.conf from template with environment variables
   NGINX_TEMPLATE="/etc/nginx/nginx.conf.template"
@@ -411,6 +442,7 @@ start_nginx
 start_openvpn_manager
 start_xray_manager
 start_xray_egress_manager
+start_warp_manager
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -529,6 +561,12 @@ while true; do
   if [ -n "${XRAY_EGRESS_MGR_PID}" ] && ! kill -0 "${XRAY_EGRESS_MGR_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: Xray egress manager died, restarting..." >&2
     start_xray_egress_manager
+  fi
+
+  # Check WARP manager
+  if [ -n "${WARP_MGR_PID}" ] && ! kill -0 "${WARP_MGR_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: WARP manager died, restarting..." >&2
+    start_warp_manager
   fi
 
   # Check sing-box

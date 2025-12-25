@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult, V2RayEgress, V2RayURIParseResult, V2RayProtocol, V2RayTransport } from "../types";
+import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult, V2RayEgress, V2RayURIParseResult, V2RayProtocol, V2RayTransport, WarpEgress, WarpEndpointResult, WarpProtocol } from "../types";
 import { V2RAY_PROTOCOLS, V2RAY_TRANSPORTS, V2RAY_SECURITY_OPTIONS, V2RAY_TLS_FINGERPRINTS, VLESS_FLOW_OPTIONS } from "../types";
 import {
   PlusIcon,
@@ -27,7 +27,7 @@ import {
   ChartBarIcon
 } from "@heroicons/react/24/outline";
 
-type TabType = "all" | "pia" | "custom" | "direct" | "openvpn" | "v2ray";
+type TabType = "all" | "pia" | "custom" | "direct" | "openvpn" | "v2ray" | "warp";
 type V2RayImportMethod = "uri" | "manual";
 type ImportMethod = "upload" | "paste" | "manual";
 type OpenVPNImportMethod = "upload" | "paste" | "manual";
@@ -176,18 +176,40 @@ export default function EgressManager() {
   const [v2rayFormTransportHost, setV2rayFormTransportHost] = useState("");
   const [v2rayFormTransportServiceName, setV2rayFormTransportServiceName] = useState("");
 
+  // WARP egress state
+  const [warpEgress, setWarpEgress] = useState<WarpEgress[]>([]);
+  const [showWarpModal, setShowWarpModal] = useState(false);
+  const [warpFormTag, setWarpFormTag] = useState("");
+  const [warpFormDescription, setWarpFormDescription] = useState("");
+  const [warpFormLicenseKey, setWarpFormLicenseKey] = useState("");
+  const [warpFormProtocol, setWarpFormProtocol] = useState<WarpProtocol>("masque");
+  const [warpRegisterLoading, setWarpRegisterLoading] = useState(false);
+  // WARP endpoint modal
+  const [showWarpEndpointModal, setShowWarpEndpointModal] = useState(false);
+  const [editingWarpEgress, setEditingWarpEgress] = useState<WarpEgress | null>(null);
+  const [warpEndpointV4, setWarpEndpointV4] = useState("");
+  const [warpEndpointV6, setWarpEndpointV6] = useState("");
+  const [warpEndpointTestLoading, setWarpEndpointTestLoading] = useState(false);
+  const [warpEndpointTestResults, setWarpEndpointTestResults] = useState<WarpEndpointResult[]>([]);
+  const [warpEndpointTestProgress, setWarpEndpointTestProgress] = useState<{ current: number; total: number } | null>(null);
+  // WARP license modal
+  const [showWarpLicenseModal, setShowWarpLicenseModal] = useState(false);
+  const [warpLicenseInput, setWarpLicenseInput] = useState("");
+  const [warpLicenseLoading, setWarpLicenseLoading] = useState(false);
+
   const loadEgress = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const [allData, customData, profilesData, directData, openvpnData, v2rayData, directDefaultData] = await Promise.all([
+      const [allData, customData, profilesData, directData, openvpnData, v2rayData, directDefaultData, warpData] = await Promise.all([
         api.getAllEgress(),
         api.getCustomEgress(),
         api.getProfiles(),
         api.getDirectEgress(),
         api.getOpenVPNEgress(),
         api.getV2RayEgress(),
-        api.getDirectDefault()
+        api.getDirectDefault(),
+        api.getWarpEgress()
       ]);
       setPiaEgress(allData.pia);
       setCustomEgress(customData.egress);
@@ -196,6 +218,7 @@ export default function EgressManager() {
       setOpenvpnEgress(openvpnData.egress);
       setV2rayEgress(v2rayData.egress);
       setDirectDefaultDns(directDefaultData.dns_servers);
+      setWarpEgress(warpData.warp_egress);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
@@ -1176,6 +1199,189 @@ export default function EgressManager() {
     }
   };
 
+  // ============ WARP Egress Handlers ============
+
+  const handleRegisterWarpEgress = async () => {
+    if (!warpFormTag.trim()) {
+      setError(t('warpEgress.tagRequired'));
+      return;
+    }
+
+    setWarpRegisterLoading(true);
+    try {
+      await api.registerWarpEgress({
+        tag: warpFormTag.trim(),
+        description: warpFormDescription.trim() || undefined,
+        license_key: warpFormLicenseKey.trim() || undefined,
+        protocol: warpFormProtocol
+      });
+      setSuccessMessage(t('warpEgress.registerSuccess'));
+      setShowWarpModal(false);
+      setWarpFormTag("");
+      setWarpFormDescription("");
+      setWarpFormLicenseKey("");
+      setWarpFormProtocol("masque");
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('warpEgress.registerFailed'));
+    } finally {
+      setWarpRegisterLoading(false);
+    }
+  };
+
+  const handleDeleteWarpEgress = async (tag: string) => {
+    if (!confirm(t('warpEgress.confirmDelete', { tag }))) return;
+
+    setActionLoading(`delete-warp-${tag}`);
+    try {
+      await api.deleteWarpEgress(tag);
+      setSuccessMessage(t('warpEgress.deleteSuccess', { tag }));
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common.deleteFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleReregisterWarpEgress = async (tag: string) => {
+    if (!confirm(t('warpEgress.reregisterConfirm', { tag }))) return;
+
+    setActionLoading(`reregister-warp-${tag}`);
+    try {
+      await api.reregisterWarpEgress(tag);
+      setSuccessMessage(t('warpEgress.reregisterSuccess', { tag }));
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('warpEgress.reregisterFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleWarpEndpointEdit = (egress: WarpEgress) => {
+    setEditingWarpEgress(egress);
+    setWarpEndpointV4(egress.endpoint_v4 || "");
+    setWarpEndpointV6(egress.endpoint_v6 || "");
+    setWarpEndpointTestResults([]);
+    setShowWarpEndpointModal(true);
+  };
+
+  const handleWarpEndpointSave = async () => {
+    if (!editingWarpEgress) return;
+
+    setActionLoading(`endpoint-${editingWarpEgress.tag}`);
+    try {
+      await api.setWarpEndpoint(editingWarpEgress.tag, {
+        endpoint_v4: warpEndpointV4.trim() || undefined,
+        endpoint_v6: warpEndpointV6.trim() || undefined
+      });
+      setSuccessMessage(t('warpEgress.endpointSaved'));
+      setShowWarpEndpointModal(false);
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('warpEgress.endpointSaveFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleWarpEndpointTest = async () => {
+    setWarpEndpointTestLoading(true);
+    setWarpEndpointTestProgress(null);
+    setWarpEndpointTestResults([]);
+
+    try {
+      // Use SSE stream for progress updates
+      const token = localStorage.getItem("vpn_gateway_token");
+      const response = await fetch("/api/egress/warp/endpoints/test/stream", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "Authorization": `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({
+          sample_count: 30,
+          top_n: 5
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === "start") {
+                setWarpEndpointTestProgress({ current: 0, total: data.total });
+              } else if (data.type === "progress") {
+                setWarpEndpointTestProgress({ current: data.current, total: data.total });
+              } else if (data.type === "done") {
+                setWarpEndpointTestResults(data.results);
+                setWarpEndpointTestProgress(null);
+              } else if (data.type === "error") {
+                throw new Error(data.message);
+              }
+            } catch (parseErr) {
+              console.error("Failed to parse SSE data:", parseErr);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('warpEgress.testFailed'));
+    } finally {
+      setWarpEndpointTestLoading(false);
+      setWarpEndpointTestProgress(null);
+    }
+  };
+
+  const handleWarpLicenseEdit = (egress: WarpEgress) => {
+    setEditingWarpEgress(egress);
+    setWarpLicenseInput("");
+    setShowWarpLicenseModal(true);
+  };
+
+  const handleWarpLicenseApply = async () => {
+    if (!editingWarpEgress || !warpLicenseInput.trim()) return;
+
+    setWarpLicenseLoading(true);
+    try {
+      await api.applyWarpLicense(editingWarpEgress.tag, {
+        license_key: warpLicenseInput.trim()
+      });
+      setSuccessMessage(t('warpEgress.licenseApplied'));
+      setShowWarpLicenseModal(false);
+      setWarpLicenseInput("");
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('warpEgress.licenseApplyFailed'));
+    } finally {
+      setWarpLicenseLoading(false);
+    }
+  };
+
   const getV2rayProtocolLabel = (protocol: V2RayProtocol) => {
     const p = V2RAY_PROTOCOLS.find(p => p.value === protocol);
     return p ? p.label : protocol.toUpperCase();
@@ -1186,12 +1392,13 @@ export default function EgressManager() {
     return t ? t.label : transport.toUpperCase();
   };
 
-  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : piaProfiles;
-  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : customEgress;
-  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : directEgress;
-  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "v2ray" ? [] : openvpnEgress;
-  const filteredV2ray = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" ? [] : v2rayEgress;
-  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + 1 + openvpnEgress.length + v2rayEgress.length; // +1 for default direct
+  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" ? [] : piaProfiles;
+  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" ? [] : customEgress;
+  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" ? [] : directEgress;
+  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "v2ray" || activeTab === "warp" ? [] : openvpnEgress;
+  const filteredV2ray = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "warp" ? [] : v2rayEgress;
+  const filteredWarp = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : warpEgress;
+  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + 1 + openvpnEgress.length + v2rayEgress.length + warpEgress.length; // +1 for default direct
 
   if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length && !openvpnEgress.length) {
     return (
@@ -1309,7 +1516,8 @@ export default function EgressManager() {
           { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` },
           { key: "direct", label: `${t('egress.direct')} (${directEgress.length + 1})` },
           { key: "openvpn", label: `${t('egress.openvpn')} (${openvpnEgress.length})` },
-          { key: "v2ray", label: `V2Ray (${v2rayEgress.length})` }
+          { key: "v2ray", label: `V2Ray (${v2rayEgress.length})` },
+          { key: "warp", label: `WARP (${warpEgress.length})` }
         ].map((tab) => (
           <button
             key={tab.key}
@@ -1327,11 +1535,11 @@ export default function EgressManager() {
 
       {/* Egress List */}
       {/* Empty state - exclude "all" and "direct" tabs since they always have the default direct card */}
-      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 && activeTab !== "all" && activeTab !== "direct" ? (
+      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 && filteredWarp.length === 0 && activeTab !== "all" && activeTab !== "direct" ? (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : t('egress.noEgressFound')}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : activeTab === "warp" ? t('warpEgress.noWarpEgress') : t('egress.noEgressFound')}
           </p>
           <div className="mt-4">
             {activeTab === "pia" && (
@@ -1364,6 +1572,14 @@ export default function EgressManager() {
                   className="px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm font-medium"
                 >
                   {t('v2rayEgress.addV2rayEgress')}
+                </button>
+              )}
+              {activeTab === "warp" && (
+                <button
+                  onClick={() => setShowWarpModal(true)}
+                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium"
+                >
+                  {t('warpEgress.registerWarp')}
                 </button>
               )}
           </div>
@@ -1981,6 +2197,143 @@ export default function EgressManager() {
                         <span className="text-slate-500">{t('v2rayEgress.transport')}:</span> {getV2rayTransportLabel(egress.transport_type)}
                         {egress.tls_enabled === 1 && " + TLS"}
                       </p>
+                    </div>
+
+                    <div className="mt-3">
+                      <button
+                        onClick={() => handleSpeedTest(egress.tag)}
+                        disabled={speedTestStatus[egress.tag]?.loading}
+                        className={`w-full flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors ${
+                          speedTestStatus[egress.tag]?.result
+                            ? speedTestStatus[egress.tag].result?.success
+                              ? "bg-emerald-500/20 text-emerald-400"
+                              : "bg-red-500/20 text-red-400"
+                            : "bg-slate-800/50 text-slate-300 hover:bg-slate-700"
+                        }`}
+                      >
+                        {speedTestStatus[egress.tag]?.loading ? (
+                          <>
+                            <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                            {t('egress.speedTesting')}
+                          </>
+                        ) : speedTestStatus[egress.tag]?.result ? (
+                          <>
+                            {speedTestStatus[egress.tag].result?.success ? (
+                              <CheckCircleIcon className="h-3.5 w-3.5" />
+                            ) : (
+                              <XCircleIcon className="h-3.5 w-3.5" />
+                            )}
+                            {speedTestStatus[egress.tag].result?.message}
+                          </>
+                        ) : (
+                          <>
+                            <ChartBarIcon className="h-3.5 w-3.5" />
+                            {t('egress.speedTest')}
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* WARP Egress */}
+          {filteredWarp.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
+                  <GlobeAltIcon className="h-4 w-4" />
+                  WARP ({filteredWarp.length})
+                </h3>
+                {activeTab === "warp" && (
+                  <button
+                    onClick={() => setShowWarpModal(true)}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 text-xs font-medium transition-colors"
+                  >
+                    <PlusIcon className="h-3.5 w-3.5" />
+                    {t('warpEgress.register')}
+                  </button>
+                )}
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {filteredWarp.map((egress) => (
+                  <div
+                    key={egress.tag}
+                    className={`rounded-xl border p-4 ${egress.enabled ? "bg-amber-500/5 border-amber-500/20" : "bg-white/5 border-white/10 opacity-50"}`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className={`p-2 rounded-lg flex-shrink-0 ${egress.enabled ? "bg-amber-500/20" : "bg-white/10"}`}>
+                          <GlobeAltIcon className={`h-5 w-5 ${egress.enabled ? "text-amber-400" : "text-slate-400"}`} />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-semibold text-white truncate">{egress.tag}</h4>
+                            {egress.enabled ? (
+                              <CheckCircleIcon className="h-4 w-4 flex-shrink-0 text-amber-400" />
+                            ) : (
+                              <XCircleIcon className="h-4 w-4 flex-shrink-0 text-slate-500" />
+                            )}
+                          </div>
+                          <p className="text-xs text-slate-500 truncate">{egress.description || t('warpEgress.defaultDescription')}</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-1 flex-shrink-0">
+                        <button
+                          onClick={() => handleWarpEndpointEdit(egress)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                          title={t('warpEgress.editEndpoint')}
+                        >
+                          <MapPinIcon className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleWarpLicenseEdit(egress)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                          title={t('warpEgress.applyLicense')}
+                        >
+                          <KeyIcon className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => handleReregisterWarpEgress(egress.tag)}
+                          disabled={actionLoading === `reregister-warp-${egress.tag}`}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-amber-500/20 hover:text-amber-400"
+                          title={t('warpEgress.reregister')}
+                        >
+                          {actionLoading === `reregister-warp-${egress.tag}` ? (
+                            <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <ArrowPathIcon className="h-4 w-4" />
+                          )}
+                        </button>
+                        <button
+                          onClick={() => handleDeleteWarpEgress(egress.tag)}
+                          disabled={actionLoading === `delete-warp-${egress.tag}`}
+                          className="p-1.5 rounded-lg text-slate-400 hover:bg-red-500/20 hover:text-red-400"
+                          title={t('common.delete')}
+                        >
+                          <TrashIcon className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('warpEgress.accountType')}:</span>{" "}
+                        <span className={egress.account_type === "warp+" ? "text-amber-400" : "text-slate-400"}>
+                          {egress.account_type === "warp+" ? "WARP+" : egress.account_type.toUpperCase()}
+                        </span>
+                      </p>
+                      <p className="text-xs text-slate-400 truncate">
+                        <span className="text-slate-500">{t('warpEgress.endpoint')}:</span>{" "}
+                        {egress.endpoint_v4 || t('warpEgress.autoEndpoint')}
+                      </p>
+                      {egress.socks_port && (
+                        <p className="text-xs text-slate-400">
+                          <span className="text-slate-500">{t('warpEgress.socksPort')}:</span> {egress.socks_port}
+                        </p>
+                      )}
                     </div>
 
                     <div className="mt-3">
@@ -3710,6 +4063,345 @@ export default function EgressManager() {
                 {v2rayModalMode === "add" ? t('common.add') : t('common.save')}
               </button>
             </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* WARP Register Modal */}
+      {showWarpModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">{t('warpEgress.registerTitle')}</h2>
+                  <button
+                    onClick={() => {
+                      setShowWarpModal(false);
+                      setWarpFormTag("");
+                      setWarpFormDescription("");
+                      setWarpFormLicenseKey("");
+                      setWarpFormProtocol("masque");
+                    }}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                {/* Protocol Selection */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('warpEgress.protocol')} <span className="text-red-400">*</span>
+                  </label>
+                  <div className="flex gap-3">
+                    <label className={`flex-1 cursor-pointer rounded-lg border p-3 transition-colors ${
+                      warpFormProtocol === 'masque'
+                        ? 'border-amber-500 bg-amber-500/10'
+                        : 'border-white/10 bg-white/5 hover:border-white/20'
+                    }`}>
+                      <input
+                        type="radio"
+                        name="warpProtocol"
+                        value="masque"
+                        checked={warpFormProtocol === 'masque'}
+                        onChange={(e) => setWarpFormProtocol(e.target.value as WarpProtocol)}
+                        className="sr-only"
+                      />
+                      <div className="flex items-center gap-2">
+                        <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                          warpFormProtocol === 'masque' ? 'border-amber-500' : 'border-slate-500'
+                        }`}>
+                          {warpFormProtocol === 'masque' && <div className="w-2 h-2 rounded-full bg-amber-500" />}
+                        </div>
+                        <span className="text-white font-medium">MASQUE</span>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1 ml-6">{t('warpEgress.masqueDesc')}</p>
+                    </label>
+                    <label className={`flex-1 cursor-pointer rounded-lg border p-3 transition-colors ${
+                      warpFormProtocol === 'wireguard'
+                        ? 'border-amber-500 bg-amber-500/10'
+                        : 'border-white/10 bg-white/5 hover:border-white/20'
+                    }`}>
+                      <input
+                        type="radio"
+                        name="warpProtocol"
+                        value="wireguard"
+                        checked={warpFormProtocol === 'wireguard'}
+                        onChange={(e) => setWarpFormProtocol(e.target.value as WarpProtocol)}
+                        className="sr-only"
+                      />
+                      <div className="flex items-center gap-2">
+                        <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                          warpFormProtocol === 'wireguard' ? 'border-amber-500' : 'border-slate-500'
+                        }`}>
+                          {warpFormProtocol === 'wireguard' && <div className="w-2 h-2 rounded-full bg-amber-500" />}
+                        </div>
+                        <span className="text-white font-medium">WireGuard</span>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1 ml-6">{t('warpEgress.wireguardDesc')}</p>
+                    </label>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('warpEgress.tag')} <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={warpFormTag}
+                    onChange={(e) => setWarpFormTag(e.target.value)}
+                    placeholder="warp-main"
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('warpEgress.description')}
+                  </label>
+                  <input
+                    type="text"
+                    value={warpFormDescription}
+                    onChange={(e) => setWarpFormDescription(e.target.value)}
+                    placeholder={t('warpEgress.descriptionPlaceholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('warpEgress.licenseKey')} ({t('common.optional')})
+                  </label>
+                  <input
+                    type="text"
+                    value={warpFormLicenseKey}
+                    onChange={(e) => setWarpFormLicenseKey(e.target.value)}
+                    placeholder="xxxxxxxx-xxxxxxxx-xxxxxxxx"
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-mono text-sm"
+                  />
+                  <p className="text-xs text-slate-500 mt-1">{t('warpEgress.licenseHint')}</p>
+                </div>
+
+                <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
+                  <p className="text-xs text-amber-400">
+                    {warpFormProtocol === 'masque' ? t('warpEgress.masqueInfo') : t('warpEgress.wireguardInfo')}
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+                <button
+                  onClick={() => {
+                    setShowWarpModal(false);
+                    setWarpFormTag("");
+                    setWarpFormDescription("");
+                    setWarpFormLicenseKey("");
+                    setWarpFormProtocol("masque");
+                  }}
+                  className="px-4 py-2 rounded-lg text-slate-400 hover:bg-white/10 text-sm font-medium transition-colors"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={handleRegisterWarpEgress}
+                  disabled={warpRegisterLoading || !warpFormTag.trim()}
+                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {warpRegisterLoading ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <PlusIcon className="h-4 w-4" />
+                  )}
+                  {t('warpEgress.register')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* WARP Endpoint Modal */}
+      {showWarpEndpointModal && editingWarpEgress && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">{t('warpEgress.editEndpointTitle', { tag: editingWarpEgress.tag })}</h2>
+                  <button
+                    onClick={() => setShowWarpEndpointModal(false)}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                {/* Endpoint V4 */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('warpEgress.endpointV4')}</label>
+                  <input
+                    type="text"
+                    value={warpEndpointV4}
+                    onChange={(e) => setWarpEndpointV4(e.target.value)}
+                    placeholder={t('warpEgress.endpointV4Placeholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-mono text-sm"
+                  />
+                  <p className="mt-1 text-xs text-slate-500">{t('warpEgress.endpointV4Hint')}</p>
+                </div>
+
+                {/* Endpoint V6 */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('warpEgress.endpointV6')} ({t('common.optional')})</label>
+                  <input
+                    type="text"
+                    value={warpEndpointV6}
+                    onChange={(e) => setWarpEndpointV6(e.target.value)}
+                    placeholder={t('warpEgress.endpointV6Placeholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-mono text-sm"
+                  />
+                </div>
+
+                {/* Endpoint test button */}
+                <div className="space-y-2">
+                  <button
+                    onClick={handleWarpEndpointTest}
+                    disabled={warpEndpointTestLoading}
+                    className="w-full px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm font-medium transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {warpEndpointTestLoading ? (
+                      <>
+                        <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                        {warpEndpointTestProgress
+                          ? `${t('warpEgress.testing')} ${warpEndpointTestProgress.current}/${warpEndpointTestProgress.total}`
+                          : t('warpEgress.testing')}
+                      </>
+                    ) : (
+                      <>
+                        <MagnifyingGlassIcon className="h-4 w-4" />
+                        {t('warpEgress.testEndpoints')}
+                      </>
+                    )}
+                  </button>
+                  {/* Progress bar */}
+                  {warpEndpointTestProgress && warpEndpointTestProgress.total > 0 && (
+                    <div className="w-full bg-white/10 rounded-full h-2 overflow-hidden">
+                      <div
+                        className="bg-amber-500 h-full rounded-full transition-all duration-300"
+                        style={{ width: `${(warpEndpointTestProgress.current / warpEndpointTestProgress.total) * 100}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Test results */}
+                {warpEndpointTestResults.length > 0 && (
+                  <div className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
+                    <p className="text-xs font-medium text-slate-400">{t('warpEgress.testResults')}</p>
+                    {warpEndpointTestResults.map((result, idx) => (
+                      <button
+                        key={idx}
+                        onClick={() => setWarpEndpointV4(result.ip)}
+                        className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-white/5 hover:bg-amber-500/20 transition-colors text-left"
+                      >
+                        <span className="font-mono text-sm text-white">{result.ip}</span>
+                        <span className="text-xs text-slate-400">{result.latency_ms.toFixed(0)} ms</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+                <button
+                  onClick={() => setShowWarpEndpointModal(false)}
+                  className="px-4 py-2 rounded-lg text-slate-400 hover:bg-white/10 text-sm font-medium transition-colors"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={handleWarpEndpointSave}
+                  disabled={actionLoading?.startsWith("endpoint-")}
+                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {actionLoading?.startsWith("endpoint-") ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <CheckIcon className="h-4 w-4" />
+                  )}
+                  {t('common.save')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* WARP License Modal */}
+      {showWarpLicenseModal && editingWarpEgress && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">{t('warpEgress.applyLicenseTitle', { tag: editingWarpEgress.tag })}</h2>
+                  <button
+                    onClick={() => setShowWarpLicenseModal(false)}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('warpEgress.licenseKey')} <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={warpLicenseInput}
+                    onChange={(e) => setWarpLicenseInput(e.target.value)}
+                    placeholder="xxxxxxxx-xxxxxxxx-xxxxxxxx"
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-mono text-sm"
+                  />
+                </div>
+
+                <div className="rounded-lg bg-amber-500/10 border border-amber-500/20 p-3">
+                  <p className="text-xs text-amber-400">{t('warpEgress.licenseInfo')}</p>
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+                <button
+                  onClick={() => setShowWarpLicenseModal(false)}
+                  className="px-4 py-2 rounded-lg text-slate-400 hover:bg-white/10 text-sm font-medium transition-colors"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={handleWarpLicenseApply}
+                  disabled={warpLicenseLoading || !warpLicenseInput.trim()}
+                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {warpLicenseLoading ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <KeyIcon className="h-4 w-4" />
+                  )}
+                  {t('warpEgress.apply')}
+                </button>
+              </div>
             </div>
           </div>
         </div>,

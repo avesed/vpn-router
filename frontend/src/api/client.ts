@@ -60,7 +60,17 @@ import type {
   V2RayUserShareResponse,
   // Xray types
   XrayStatus,
-  RealityKeyPair
+  RealityKeyPair,
+  // WARP types
+  WarpEgress,
+  WarpEgressRegisterRequest,
+  WarpEgressUpdateRequest,
+  WarpEgressEndpointRequest,
+  WarpEgressLicenseRequest,
+  WarpEgressListResponse,
+  WarpEgressStatus,
+  WarpEndpointTestRequest,
+  WarpEndpointTestResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -532,5 +542,45 @@ export const api = {
   reloadXray: () =>
     request<{ message: string; status: XrayStatus }>("/ingress/v2ray/xray/reload", { method: "POST" }),
   generateRealityKeys: () =>
-    request<RealityKeyPair>("/ingress/v2ray/reality/generate-keys", { method: "POST" })
+    request<RealityKeyPair>("/ingress/v2ray/reality/generate-keys", { method: "POST" }),
+
+  // ============ WARP Egress Management (Cloudflare WARP via usque MASQUE) ============
+  getWarpEgress: () => request<WarpEgressListResponse>("/egress/warp"),
+  getWarpEgressByTag: (tag: string) =>
+    request<WarpEgress>(`/egress/warp/${encodeURIComponent(tag)}`),
+  registerWarpEgress: (data: WarpEgressRegisterRequest) =>
+    request<{ message: string; tag: string; id: number; account_type: string }>("/egress/warp/register", {
+      method: "POST",
+      body: data
+    }),
+  updateWarpEgress: (tag: string, data: WarpEgressUpdateRequest) =>
+    request<{ message: string }>(`/egress/warp/${encodeURIComponent(tag)}`, {
+      method: "PUT",
+      body: data
+    }),
+  deleteWarpEgress: (tag: string) =>
+    request<{ message: string }>(`/egress/warp/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+  reregisterWarpEgress: (tag: string) =>
+    request<{ message: string; account_type: string }>(`/egress/warp/${encodeURIComponent(tag)}/reregister`, {
+      method: "POST",
+      timeout: 60000  // 重新注册可能需要较长时间
+    }),
+  getWarpEgressStatus: (tag: string) =>
+    request<WarpEgressStatus>(`/egress/warp/${encodeURIComponent(tag)}/status`),
+  applyWarpLicense: (tag: string, data: WarpEgressLicenseRequest) =>
+    request<{ message: string; account_type: string }>(`/egress/warp/${encodeURIComponent(tag)}/apply-license`, {
+      method: "POST",
+      body: data
+    }),
+  setWarpEndpoint: (tag: string, data: WarpEgressEndpointRequest) =>
+    request<{ message: string }>(`/egress/warp/${encodeURIComponent(tag)}/endpoint`, {
+      method: "PUT",
+      body: data
+    }),
+  testWarpEndpoints: (data: WarpEndpointTestRequest) =>
+    request<WarpEndpointTestResponse>("/egress/warp/endpoints/test", {
+      method: "POST",
+      body: data,
+      timeout: 120000  // 优选可能需要较长时间
+    })
 };

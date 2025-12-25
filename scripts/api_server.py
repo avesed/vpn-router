@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -27,9 +28,9 @@ except ImportError:
 
 import requests
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -237,8 +238,8 @@ def has_pia_credentials() -> bool:
 _rate_limit_data: Dict[str, List[float]] = {}  # {client_ip: [timestamp1, timestamp2, ...]}
 _rate_limit_lock = threading.Lock()
 # 速率限制配置
-_RATE_LIMIT_GENERAL = 60  # 一般 API: 每分钟 60 次
-_RATE_LIMIT_LOGIN = 5  # 登录 API: 每分钟 5 次
+_RATE_LIMIT_GENERAL = 300  # 一般 API: 每分钟 300 次（放宽以支持频繁操作）
+_RATE_LIMIT_LOGIN = 10  # 登录 API: 每分钟 10 次
 _RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
 
 
@@ -2325,6 +2326,12 @@ def api_get_rules():
             # 从数据库读取 V2Ray 出口
             v2ray_egress = db.get_v2ray_egress_list(enabled_only=True)
             for egress in v2ray_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+
+            # 从数据库读取 WARP 出口
+            warp_egress = db.get_warp_egress_list(enabled_only=True)
+            for egress in warp_egress:
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
         except Exception:
@@ -4954,6 +4961,458 @@ def api_delete_v2ray_egress(tag: str):
     return {"message": f"V2Ray egress '{tag}' deleted{reload_status}"}
 
 
+# ============ WARP Egress APIs ============
+
+class WarpEgressCreate(BaseModel):
+    """WARP 出口创建请求"""
+    tag: str
+    description: str = ""
+    license_key: Optional[str] = None
+    protocol: str = "masque"  # masque 或 wireguard
+
+
+class WarpEgressUpdate(BaseModel):
+    """WARP 出口更新请求"""
+    description: Optional[str] = None
+    license_key: Optional[str] = None
+    endpoint_v4: Optional[str] = None
+    endpoint_v6: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class WarpEndpointUpdate(BaseModel):
+    """WARP Endpoint 设置请求"""
+    endpoint_v4: Optional[str] = None
+    endpoint_v6: Optional[str] = None
+
+
+class WarpEndpointsTest(BaseModel):
+    """WARP Endpoint 测试请求"""
+    endpoints: Optional[List[str]] = None
+    sample_count: int = 50
+    top_n: int = 10
+
+
+def _reload_warp_manager() -> str:
+    """重载 WARP 管理器
+
+    如果守护进程运行中，发送 SIGHUP 信号重载配置。
+    如果守护进程未运行，启动新的守护进程。
+
+    Returns:
+        状态消息
+    """
+    from pathlib import Path
+    import subprocess
+
+    pid_file = Path("/run/warp-manager.pid")
+
+    # 检查守护进程是否运行
+    daemon_running = False
+    if pid_file.exists():
+        try:
+            daemon_pid = int(pid_file.read_text().strip())
+            os.kill(daemon_pid, 0)  # 检查进程是否存在
+            daemon_running = True
+        except (ValueError, ProcessLookupError, PermissionError):
+            # PID 文件无效或进程不存在，清理
+            pid_file.unlink(missing_ok=True)
+
+    if daemon_running:
+        # 发送 SIGHUP 重载
+        try:
+            daemon_pid = int(pid_file.read_text().strip())
+            os.kill(daemon_pid, signal.SIGHUP)
+            print(f"[api] Sent SIGHUP to WARP manager (PID: {daemon_pid})")
+            return ", warp manager reloaded"
+        except (ValueError, ProcessLookupError, PermissionError) as e:
+            print(f"[api] WARP manager reload failed: {e}")
+            return ", warp manager reload failed"
+    else:
+        # 启动新的守护进程
+        try:
+            log_file = open("/var/log/warp-manager.log", "a")
+            subprocess.Popen(
+                ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
+                stdout=log_file,
+                stderr=log_file,
+                start_new_session=True
+            )
+            print("[api] Started WARP manager daemon")
+            time.sleep(1)  # 等待启动
+            return ", warp manager started"
+        except Exception as e:
+            print(f"[api] Failed to start WARP manager: {e}")
+            return f", warp manager start failed: {e}"
+
+
+@app.get("/api/egress/warp")
+def api_list_warp_egress(enabled_only: bool = False):
+    """列出所有 WARP 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress_list = db.get_warp_egress_list(enabled_only)
+    return {"warp_egress": egress_list}
+
+
+@app.get("/api/egress/warp/{tag}")
+def api_get_warp_egress(tag: str):
+    """获取单个 WARP 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_warp_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+    return egress
+
+
+@app.post("/api/egress/warp/register")
+def api_register_warp_egress(data: WarpEgressCreate):
+    """一键注册 WARP 设备并创建出口"""
+    from warp_manager import WarpManager
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    # 检查 tag 是否已存在
+    if db.get_warp_egress(data.tag):
+        raise HTTPException(status_code=400, detail=f"WARP egress '{data.tag}' already exists")
+
+    # 获取下一个可用端口
+    try:
+        socks_port = db.get_next_warp_socks_port()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 验证协议
+    if data.protocol not in ("masque", "wireguard"):
+        raise HTTPException(status_code=400, detail=f"Invalid protocol: {data.protocol}")
+
+    # 调用 warp_manager 进行注册
+    manager = WarpManager()
+    result = manager.register(data.tag, data.license_key, protocol=data.protocol)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error", "Registration failed"))
+
+    # 保存到数据库
+    config_path = result.get("config_path", "")
+    account_type = result.get("account_type", "free")
+
+    db.add_warp_egress(
+        tag=data.tag,
+        description=data.description,
+        protocol=data.protocol,
+        config_path=config_path,
+        license_key=data.license_key,
+        account_type=account_type,
+        mode="socks",
+        socks_port=socks_port,
+        enabled=True
+    )
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+        reload_status += _reload_warp_manager()
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "message": f"WARP egress '{data.tag}' registered{reload_status}",
+        "tag": data.tag,
+        "socks_port": socks_port,
+        "account_type": account_type,
+        "device_id": result.get("device_id", "")
+    }
+
+
+@app.put("/api/egress/warp/{tag}")
+def api_update_warp_egress(tag: str, data: WarpEgressUpdate):
+    """更新 WARP 出口"""
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    if not db.get_warp_egress(tag):
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+
+    # 构建更新字段
+    updates = {}
+    if data.description is not None:
+        updates["description"] = data.description
+    if data.endpoint_v4 is not None:
+        updates["endpoint_v4"] = data.endpoint_v4
+    if data.endpoint_v6 is not None:
+        updates["endpoint_v6"] = data.endpoint_v6
+    if data.enabled is not None:
+        updates["enabled"] = data.enabled
+
+    if updates:
+        db.update_warp_egress(tag, **updates)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+        reload_status += _reload_warp_manager()
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {"message": f"WARP egress '{tag}' updated{reload_status}"}
+
+
+@app.delete("/api/egress/warp/{tag}")
+def api_delete_warp_egress(tag: str):
+    """删除 WARP 出口"""
+    from warp_manager import WarpManager
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    if not db.get_warp_egress(tag):
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+
+    # 停止代理并删除配置
+    manager = WarpManager()
+    import asyncio
+    asyncio.run(manager.stop_proxy(tag))
+    manager.delete_config(tag)
+
+    # 从数据库删除
+    db.delete_warp_egress(tag)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+        reload_status += _reload_warp_manager()
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {"message": f"WARP egress '{tag}' deleted{reload_status}"}
+
+
+@app.post("/api/egress/warp/{tag}/reregister")
+def api_reregister_warp_egress(tag: str):
+    """重新注册 WARP 设备（修复 TLS 握手失败等问题）"""
+    from warp_manager import WarpManager
+    import asyncio
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+
+    egress = db.get_warp_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+
+    # 停止当前代理
+    manager = WarpManager()
+    asyncio.run(manager.stop_proxy(tag))
+
+    # 删除旧配置文件（但保留数据库记录）
+    manager.delete_config(tag)
+
+    # 重新注册
+    license_key = egress.get("license_key")
+    protocol = egress.get("protocol", "masque")
+    result = manager.register(tag, license_key, protocol=protocol)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error", "Re-registration failed"))
+
+    # 更新数据库中的配置路径和账户类型
+    config_path = result.get("config_path", "")
+    account_type = result.get("account_type", "free")
+    db.update_warp_egress(tag, config_path=config_path, account_type=account_type)
+
+    # 重新渲染配置并重载
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+        reload_status += _reload_warp_manager()
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "message": f"WARP egress '{tag}' re-registered{reload_status}",
+        "account_type": account_type,
+        "device_id": result.get("device_id", "")
+    }
+
+
+@app.get("/api/egress/warp/{tag}/status")
+def api_get_warp_status(tag: str):
+    """获取 WARP 代理状态"""
+    from warp_manager import WarpManager
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_warp_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+
+    manager = WarpManager()
+    status = manager.get_status(tag)
+
+    return status
+
+
+@app.post("/api/egress/warp/{tag}/apply-license")
+def api_apply_warp_license(tag: str, license_key: str = Body(..., embed=True)):
+    """应用 WARP+ License"""
+    from warp_manager import WarpManager
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_warp_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+
+    manager = WarpManager()
+    result = manager.apply_license(tag, license_key)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to apply license"))
+
+    # 更新数据库
+    db.update_warp_egress(tag, license_key=license_key, account_type="warp+")
+
+    # 重载代理以应用新 license
+    reload_status = _reload_warp_manager()
+
+    return {"message": f"WARP+ license applied to '{tag}'{reload_status}"}
+
+
+@app.put("/api/egress/warp/{tag}/endpoint")
+def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
+    """设置自定义 Endpoint（指定地区节点）"""
+    from warp_manager import WarpManager
+
+    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    egress = db.get_warp_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
+
+    manager = WarpManager()
+    result = manager.set_endpoint(tag, data.endpoint_v4, data.endpoint_v6)
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to set endpoint"))
+
+    # 更新数据库
+    updates = {}
+    if data.endpoint_v4:
+        updates["endpoint_v4"] = data.endpoint_v4
+    if data.endpoint_v6:
+        updates["endpoint_v6"] = data.endpoint_v6
+    if updates:
+        db.update_warp_egress(tag, **updates)
+
+    # 重载 WARP manager 以应用新 endpoint
+    reload_status = _reload_warp_manager()
+
+    return {
+        "message": f"Endpoint updated for '{tag}'{reload_status}",
+        "endpoint_v4": data.endpoint_v4,
+        "endpoint_v6": data.endpoint_v6
+    }
+
+
+@app.post("/api/egress/warp/endpoints/test")
+async def api_test_warp_endpoints(data: WarpEndpointsTest):
+    """测试 WARP Endpoint 延迟和可用性"""
+    from warp_endpoint_optimizer import optimize_endpoints, test_specific_endpoints
+
+    try:
+        if data.endpoints:
+            # 测试指定的 endpoints
+            results = await test_specific_endpoints(data.endpoints)
+        else:
+            # 随机优选
+            results = await optimize_endpoints(
+                sample_count=data.sample_count,
+                top_n=data.top_n
+            )
+
+        return {
+            "results": [r.to_dict() for r in results],
+            "count": len(results)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/egress/warp/endpoints/test/stream")
+async def api_test_warp_endpoints_stream(data: WarpEndpointsTest):
+    """测试 WARP Endpoint 延迟和可用性（SSE 流式进度）"""
+    import asyncio
+    from warp_endpoint_optimizer import test_endpoint_ping, PROTOCOL_PORTS, get_all_ips
+    import random
+
+    async def generate():
+        try:
+            default_port = PROTOCOL_PORTS.get("masque", 443)
+
+            if data.endpoints:
+                # 测试指定的 endpoints
+                endpoints_to_test = data.endpoints
+            else:
+                # 随机采样 IP
+                all_ips = get_all_ips()
+                sample_ips = random.sample(all_ips, min(data.sample_count, len(all_ips)))
+                endpoints_to_test = sample_ips
+
+            total = len(endpoints_to_test)
+            yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
+
+            results = []
+            # 批量并发测试，但定期发送进度
+            batch_size = 5  # 每批测试数量（较小批次=更平滑进度）
+            for batch_start in range(0, total, batch_size):
+                batch_end = min(batch_start + batch_size, total)
+                batch = endpoints_to_test[batch_start:batch_end]
+
+                # 并发测试当前批次
+                async def test_one(endpoint):
+                    try:
+                        if isinstance(endpoint, str) and ":" in endpoint:
+                            ip, port_str = endpoint.rsplit(":", 1)
+                            port = int(port_str)
+                        else:
+                            ip = endpoint
+                            port = default_port
+                        return await test_endpoint_ping(ip, port, 2.0, 3)
+                    except Exception:
+                        return None
+
+                batch_results = await asyncio.gather(*[test_one(ep) for ep in batch])
+                results.extend([r for r in batch_results if r is not None])
+
+                # 发送进度
+                yield f"data: {json.dumps({'type': 'progress', 'current': batch_end, 'total': total})}\n\n"
+
+            # 排序并取 top N
+            results.sort(key=lambda r: (r.loss_rate, r.latency_ms))
+            top_results = results[:data.top_n]
+
+            # 发送最终结果
+            yield f"data: {json.dumps({'type': 'done', 'results': [r.to_dict() for r in top_results], 'count': len(top_results)})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
 # ============ V2Ray Inbound APIs ============
 
 @app.get("/api/ingress/v2ray")
@@ -5645,9 +6104,15 @@ def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
         socks_port = None
         if HAS_DATABASE:
             db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            # 先检查 OpenVPN
             openvpn_egress = db.get_openvpn_egress(tag)
             if openvpn_egress:
                 socks_port = openvpn_egress.get("socks_port")
+            # 再检查 WARP
+            if not socks_port:
+                warp_egress = db.get_warp_egress(tag)
+                if warp_egress:
+                    socks_port = warp_egress.get("socks_port")
 
         if not socks_port:
             # 回退到 clash_api 测试
@@ -5903,6 +6368,41 @@ def _get_openvpn_socks_port(tag: str) -> Optional[int]:
     return None
 
 
+def _is_warp_egress(tag: str) -> bool:
+    """检查是否是 WARP 出口"""
+    if not HAS_DATABASE:
+        return False
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress = db.get_warp_egress(tag)
+        return egress is not None
+    except Exception:
+        return False
+
+
+def _get_warp_socks_port(tag: str) -> Optional[int]:
+    """获取 WARP 出口的 SOCKS 端口（仅当端口正在监听时返回）"""
+    if not HAS_DATABASE:
+        return None
+    try:
+        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        egress = db.get_warp_egress(tag)
+        if egress:
+            socks_port = egress.get("socks_port")
+            if socks_port:
+                # 检查端口是否正在监听
+                import socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(("127.0.0.1", socks_port))
+                sock.close()
+                if result == 0:
+                    return socks_port
+    except Exception:
+        pass
+    return None
+
+
 def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -> dict:
     """通过下载文件测速
 
@@ -5946,6 +6446,14 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
             proxy_info = f"SOCKS5 :{socks_port}"
         else:
             return {"success": False, "speed_mbps": 0, "message": "OpenVPN tunnel not connected"}
+    elif _is_warp_egress(tag):
+        # WARP：使用已有 SOCKS 端口
+        socks_port = _get_warp_socks_port(tag)
+        if socks_port:
+            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
+            proxy_info = f"SOCKS5 :{socks_port}"
+        else:
+            return {"success": False, "speed_mbps": 0, "message": "WARP not connected"}
     elif tag in ("block", "adblock"):
         return {"success": False, "speed_mbps": 0, "message": "Block egress, cannot test speed"}
     else:
