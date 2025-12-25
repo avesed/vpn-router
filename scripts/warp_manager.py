@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Any
 sys.path.insert(0, str(Path(__file__).parent))
 
 from db_helper import get_db
+from setup_kernel_wg_egress import get_egress_interface_name
 
 logging.basicConfig(
     level=logging.INFO,
@@ -362,7 +363,7 @@ PersistentKeepalive = 25
 
     def apply_license(self, tag: str, license_key: str) -> dict:
         """
-        应用 WARP+ License
+        应用 WARP+ License（通过 Cloudflare API）
 
         Args:
             tag: 出口标识
@@ -371,6 +372,8 @@ PersistentKeepalive = 25
         Returns:
             包含结果的字典
         """
+        import requests
+
         config_dir = self._get_config_dir(tag)
         config_path = config_dir / "config.json"
 
@@ -380,23 +383,47 @@ PersistentKeepalive = 25
         logger.info(f"[{tag}] 应用 WARP+ License...")
 
         try:
-            result = subprocess.run(
-                [str(USQUE_BIN), "license", "--config", str(config_path), license_key],
-                capture_output=True,
-                text=True,
+            # 读取配置获取 device_id 和 access_token
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+
+            device_id = config.get("id")
+            access_token = config.get("access_token")
+
+            if not device_id or not access_token:
+                return {"success": False, "error": "配置文件缺少 device_id 或 access_token"}
+
+            # 调用 Cloudflare API 更新 license
+            license_url = f"https://api.cloudflareclient.com/v0i2109031238/reg/{device_id}/account"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            resp = requests.put(
+                license_url,
+                json={"license": license_key},
+                headers=headers,
                 timeout=30
             )
 
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+            if resp.status_code == 200:
+                # 更新配置文件中的 license
+                config["license"] = license_key
+                write_config_atomic(config_path, config)
+                logger.info(f"[{tag}] WARP+ License 应用成功")
+                return {"success": True, "account_type": "warp+"}
+            else:
+                error_msg = resp.text or f"HTTP {resp.status_code}"
+                logger.error(f"[{tag}] License 应用失败: {error_msg}")
                 return {"success": False, "error": error_msg}
 
-            logger.info(f"[{tag}] WARP+ License 应用成功")
-            return {"success": True}
-
-        except subprocess.TimeoutExpired:
+        except requests.Timeout:
             return {"success": False, "error": "操作超时"}
+        except json.JSONDecodeError:
+            return {"success": False, "error": "配置文件格式错误"}
         except Exception as e:
+            logger.error(f"[{tag}] License 应用异常: {e}")
             return {"success": False, "error": str(e)}
 
     def set_endpoint(self, tag: str, endpoint_v4: Optional[str] = None,
@@ -413,7 +440,26 @@ PersistentKeepalive = 25
         Returns:
             包含结果的字典
         """
+        # 检查协议类型
+        egress = self.db.get_warp_egress(tag)
+        if not egress:
+            return {"success": False, "error": "WARP 配置不存在"}
+
+        protocol = egress.get("protocol", "masque")
         config_dir = self._get_config_dir(tag)
+
+        try:
+            if protocol == "wireguard":
+                return self._set_endpoint_wireguard(tag, config_dir, endpoint_v4, endpoint_v6)
+            else:
+                return self._set_endpoint_masque(tag, config_dir, endpoint_v4, endpoint_v6)
+        except Exception as e:
+            logger.error(f"[{tag}] 设置 Endpoint 失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _set_endpoint_masque(self, tag: str, config_dir: Path,
+                              endpoint_v4: Optional[str], endpoint_v6: Optional[str]) -> dict:
+        """设置 MASQUE 协议的 Endpoint"""
         config_path = config_dir / "config.json"
 
         if not config_path.exists():
@@ -448,7 +494,7 @@ PersistentKeepalive = 25
 
             final_v4 = config.get("endpoint_v4")
             final_v6 = config.get("endpoint_v6")
-            logger.info(f"[{tag}] Endpoint 已更新: v4={final_v4}, v6={final_v6}")
+            logger.info(f"[{tag}] MASQUE Endpoint 已更新: v4={final_v4}, v6={final_v6}")
 
             # 如果代理正在运行，需要重启以应用新 endpoint
             if tag in self.processes and self.processes[tag].status == "running":
@@ -459,8 +505,105 @@ PersistentKeepalive = 25
 
         except json.JSONDecodeError as e:
             return {"success": False, "error": f"配置文件格式错误: {e}"}
+
+    def _set_endpoint_wireguard(self, tag: str, config_dir: Path,
+                                 endpoint_v4: Optional[str], endpoint_v6: Optional[str]) -> dict:
+        """设置 WireGuard 协议的 Endpoint"""
+        wg_conf_path = config_dir / "wg.conf"
+
+        if not wg_conf_path.exists():
+            return {"success": False, "error": "WireGuard 配置文件不存在，请先注册"}
+
+        # 处理 endpoint 格式 - WireGuard 需要 IP:port 格式
+        # 默认端口 2408
+        if endpoint_v4:
+            if ":" in endpoint_v4 and not endpoint_v4.startswith("["):
+                new_endpoint = endpoint_v4  # 已包含端口
+            else:
+                new_endpoint = f"{endpoint_v4}:2408"
+        elif endpoint_v6:
+            if endpoint_v6.startswith("[") and "]:" in endpoint_v6:
+                new_endpoint = endpoint_v6  # 已包含端口
+            else:
+                new_endpoint = f"[{endpoint_v6.strip('[]')}]:2408"
+        else:
+            return {"success": False, "error": "必须提供 endpoint_v4 或 endpoint_v6"}
+
+        try:
+            # 读取现有配置
+            with open(wg_conf_path, 'r') as f:
+                lines = f.readlines()
+
+            # 查找并替换 Endpoint 行
+            updated = False
+            new_lines = []
+            for line in lines:
+                if line.strip().startswith("Endpoint"):
+                    new_lines.append(f"Endpoint = {new_endpoint}\n")
+                    updated = True
+                else:
+                    new_lines.append(line)
+
+            if not updated:
+                return {"success": False, "error": "配置文件中未找到 Endpoint 行"}
+
+            # 原子写入
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', dir=config_dir, delete=False) as tmp:
+                tmp.writelines(new_lines)
+                tmp_path = tmp.name
+            os.rename(tmp_path, wg_conf_path)
+
+            logger.info(f"[{tag}] WireGuard 配置文件 Endpoint 已更新: {new_endpoint}")
+
+            # 更新内核 WireGuard 接口
+            interface = get_egress_interface_name(tag, egress_type="warp")
+            self._update_wg_interface_endpoint(interface, new_endpoint)
+
+            # 提取纯 IP 用于数据库存储
+            if ":" in new_endpoint and not new_endpoint.startswith("["):
+                final_v4 = new_endpoint.rsplit(":", 1)[0]
+                final_v6 = None
+            else:
+                final_v4 = None
+                final_v6 = new_endpoint.split("]:")[0].strip("[") if "]:" in new_endpoint else None
+
+            return {"success": True, "endpoint_v4": final_v4, "endpoint_v6": final_v6}
+
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _update_wg_interface_endpoint(self, interface: str, endpoint: str):
+        """更新内核 WireGuard 接口的 Endpoint"""
+        try:
+            # 获取 peer 的 public key
+            result = subprocess.run(
+                ["wg", "show", interface, "peers"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                logger.warning(f"无法获取接口 {interface} 的 peer 信息")
+                return
+
+            peer_pubkey = result.stdout.strip()
+            if not peer_pubkey:
+                logger.warning(f"接口 {interface} 没有 peer")
+                return
+
+            # 更新 endpoint
+            result = subprocess.run(
+                ["wg", "set", interface, "peer", peer_pubkey, "endpoint", endpoint],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                logger.info(f"内核接口 {interface} Endpoint 已更新: {endpoint}")
+            else:
+                logger.warning(f"更新接口 {interface} Endpoint 失败: {result.stderr}")
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"更新接口 {interface} Endpoint 超时")
+        except Exception as e:
+            logger.warning(f"更新接口 {interface} Endpoint 异常: {e}")
 
     async def _restart_proxy(self, tag: str):
         """重启代理"""
@@ -469,7 +612,7 @@ PersistentKeepalive = 25
         await self.start_proxy(tag)
 
     async def start_proxy(self, tag: str) -> bool:
-        """启动 WARP SOCKS5 代理"""
+        """启动 WARP 代理（MASQUE 启动 SOCKS，WireGuard 设置内核接口）"""
         egress = self.db.get_warp_egress(tag)
         if not egress:
             logger.error(f"[{tag}] WARP 配置不存在")
@@ -479,6 +622,12 @@ PersistentKeepalive = 25
             logger.info(f"[{tag}] 已禁用，跳过")
             return False
 
+        protocol = egress.get("protocol", "masque")
+
+        if protocol == "wireguard":
+            return self._start_wireguard_interface(tag, egress)
+
+        # MASQUE 协议：启动 SOCKS5 代理
         config_dir = self._get_config_dir(tag)
         config_path = config_dir / "config.json"
 
@@ -533,6 +682,50 @@ PersistentKeepalive = 25
 
         except Exception as e:
             logger.error(f"[{tag}] 启动失败: {e}")
+            return False
+
+    def _start_wireguard_interface(self, tag: str, egress: dict) -> bool:
+        """启动 WireGuard 内核接口"""
+        from setup_kernel_wg_egress import (
+            get_egress_interface_name,
+            create_egress_interface,
+            parse_warp_wg_conf
+        )
+
+        config_path = egress.get("config_path", "")
+        if not config_path or not os.path.exists(config_path):
+            logger.error(f"[{tag}] WireGuard 配置文件不存在: {config_path}")
+            return False
+
+        # 解析 wg.conf 文件
+        wg_config = parse_warp_wg_conf(config_path)
+        if not wg_config:
+            logger.error(f"[{tag}] 无法解析 WireGuard 配置")
+            return False
+
+        interface = get_egress_interface_name(tag, egress_type="warp")
+        logger.info(f"[{tag}] 设置 WireGuard 内核接口: {interface}")
+
+        try:
+            success = create_egress_interface(
+                interface=interface,
+                private_key=wg_config.get("private_key"),
+                peer_ip=wg_config.get("address"),
+                server=wg_config.get("endpoint_host"),
+                server_port=wg_config.get("endpoint_port", 2408),
+                public_key=wg_config.get("peer_public_key"),
+                mtu=1420
+            )
+
+            if success:
+                logger.info(f"[{tag}] WireGuard 接口已设置: {interface}")
+                return True
+            else:
+                logger.error(f"[{tag}] WireGuard 接口设置失败")
+                return False
+
+        except Exception as e:
+            logger.error(f"[{tag}] WireGuard 接口设置异常: {e}")
             return False
 
     async def stop_proxy(self, tag: str) -> bool:
@@ -621,22 +814,75 @@ PersistentKeepalive = 25
         # 获取当前数据库中启用的出口
         enabled_egress = {e["tag"]: e for e in self.db.get_warp_egress_list(enabled_only=True)}
         enabled_tags = set(enabled_egress.keys())
-        running_tags = set(self.processes.keys())
+
+        # 检查哪些进程实际在运行（不仅仅在 dict 中）
+        actually_running_tags = set()
+        for tag, process in list(self.processes.items()):
+            if process.pid:
+                try:
+                    os.kill(process.pid, 0)
+                    actually_running_tags.add(tag)
+                except ProcessLookupError:
+                    # 进程已死，从 dict 中移除
+                    logger.info(f"[{tag}] 进程已退出，清理状态")
+                    del self.processes[tag]
 
         # 停止已删除或禁用的代理
-        to_stop = running_tags - enabled_tags
+        to_stop = actually_running_tags - enabled_tags
         for tag in to_stop:
             logger.info(f"[{tag}] 配置已删除/禁用，停止代理")
             await self.stop_proxy(tag)
-            del self.processes[tag]
+            if tag in self.processes:
+                del self.processes[tag]
 
-        # 启动新增的代理
-        to_start = enabled_tags - running_tags
+        # 启动新增或已死亡的代理
+        to_start = enabled_tags - actually_running_tags
         for tag in to_start:
-            logger.info(f"[{tag}] 新配置，启动代理")
+            logger.info(f"[{tag}] 需要启动代理")
             await self.start_proxy(tag)
 
         logger.info("配置重载完成")
+
+    def _check_wg_interface_status(self, interface: str) -> str:
+        """检查 WireGuard 内核接口状态
+
+        Returns:
+            "running" - 接口存在且有最近的握手
+            "connecting" - 接口存在但没有握手
+            "stopped" - 接口不存在
+        """
+        try:
+            # 检查接口是否存在
+            result = subprocess.run(
+                ["wg", "show", interface],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if result.returncode != 0:
+                return "stopped"
+
+            # 检查是否有最近的握手（2 分钟内）
+            output = result.stdout
+            if "latest handshake:" in output:
+                # 解析握手时间
+                for line in output.split("\n"):
+                    if "latest handshake:" in line:
+                        # 格式: "latest handshake: X seconds ago" 或 "X minutes ago" 等
+                        if "second" in line or "minute" in line:
+                            return "running"
+                        # 如果显示 hour/day，说明太久没有握手
+                        return "connecting"
+
+            # 有接口但没有握手
+            return "connecting"
+
+        except subprocess.TimeoutExpired:
+            return "stopped"
+        except Exception as e:
+            logger.debug(f"检查接口 {interface} 状态失败: {e}")
+            return "stopped"
 
     def get_status(self, tag: Optional[str] = None) -> Dict[str, Any]:
         """获取代理状态"""
@@ -646,23 +892,32 @@ PersistentKeepalive = 25
                 # 检查数据库中是否存在
                 egress = self.db.get_warp_egress(tag)
                 if egress:
-                    # 检查 SOCKS 端口是否在监听（可能由其他进程启动）
-                    status = "stopped"
+                    protocol = egress.get("protocol", "masque")
                     socks_port = egress.get("socks_port")
-                    if socks_port:
-                        try:
-                            import socket
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            sock.settimeout(1)
-                            result = sock.connect_ex(("127.0.0.1", socks_port))
-                            sock.close()
-                            if result == 0:
-                                status = "running"
-                        except Exception:
-                            pass
+
+                    if protocol == "wireguard":
+                        # WireGuard 协议: 检查内核接口状态
+                        interface = get_egress_interface_name(tag, egress_type="warp")
+                        status = self._check_wg_interface_status(interface)
+                    else:
+                        # MASQUE 协议: 检查 SOCKS 端口是否在监听
+                        status = "stopped"
+                        if socks_port:
+                            try:
+                                import socket
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(1)
+                                result = sock.connect_ex(("127.0.0.1", socks_port))
+                                sock.close()
+                                if result == 0:
+                                    status = "running"
+                            except Exception:
+                                pass
+
                     return {
                         "tag": tag,
                         "status": status,
+                        "protocol": protocol,
                         "socks_port": socks_port,
                         "endpoint_v4": egress.get("endpoint_v4"),
                         "account_type": egress.get("account_type", "free")
@@ -676,24 +931,34 @@ PersistentKeepalive = 25
                 result[tag] = self._process_to_dict(proc)
             # 包含已配置但未运行的
             for egress in self.db.get_warp_egress_list(enabled_only=False):
-                if egress["tag"] not in result:
-                    # 检查 SOCKS 端口是否在监听
-                    status = "stopped"
+                egress_tag = egress["tag"]
+                if egress_tag not in result:
+                    protocol = egress.get("protocol", "masque")
                     socks_port = egress.get("socks_port")
-                    if socks_port:
-                        try:
-                            import socket
-                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            sock.settimeout(1)
-                            port_result = sock.connect_ex(("127.0.0.1", socks_port))
-                            sock.close()
-                            if port_result == 0:
-                                status = "running"
-                        except Exception:
-                            pass
-                    result[egress["tag"]] = {
-                        "tag": egress["tag"],
+
+                    if protocol == "wireguard":
+                        # WireGuard 协议: 检查内核接口状态
+                        interface = get_egress_interface_name(egress_tag, egress_type="warp")
+                        status = self._check_wg_interface_status(interface)
+                    else:
+                        # MASQUE 协议: 检查 SOCKS 端口是否在监听
+                        status = "stopped"
+                        if socks_port:
+                            try:
+                                import socket
+                                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                sock.settimeout(1)
+                                port_result = sock.connect_ex(("127.0.0.1", socks_port))
+                                sock.close()
+                                if port_result == 0:
+                                    status = "running"
+                            except Exception:
+                                pass
+
+                    result[egress_tag] = {
+                        "tag": egress_tag,
                         "status": status,
+                        "protocol": protocol,
                         "socks_port": socks_port,
                         "endpoint_v4": egress.get("endpoint_v4"),
                         "account_type": egress.get("account_type", "free"),
@@ -717,6 +982,7 @@ PersistentKeepalive = 25
         return {
             "tag": process.tag,
             "status": status,
+            "protocol": "masque",  # 只有 MASQUE 协议使用 usque 进程
             "pid": process.pid if alive else None,
             "socks_port": process.socks_port,
             "config_path": str(process.config_path) if process.config_path else None,

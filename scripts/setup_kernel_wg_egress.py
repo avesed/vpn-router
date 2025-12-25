@@ -35,10 +35,11 @@ USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 # Interface naming prefixes
 PIA_PREFIX = "wg-pia-"     # 8 chars, leaves 7 for tag
 CUSTOM_PREFIX = "wg-eg-"   # 6 chars, leaves 9 for tag
+WARP_PREFIX = "wg-warp-"   # 8 chars, leaves 7 for tag
 MAX_IFACE_LEN = 15         # Linux interface name limit
 
 
-def get_egress_interface_name(tag: str, is_pia: bool) -> str:
+def get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str = None) -> str:
     """Generate kernel WireGuard interface name for egress
 
     H12 修复: 使用 hash 确保唯一性，避免长标签截断冲突
@@ -46,14 +47,23 @@ def get_egress_interface_name(tag: str, is_pia: bool) -> str:
     Naming convention:
     - PIA profiles: wg-pia-{tag}
     - Custom egress: wg-eg-{tag}
+    - WARP WireGuard: wg-warp-{tag}
 
     Examples:
     - wg-pia-new_york (PIA New York exit)
     - wg-eg-cn2-la (custom CN2 LA exit)
+    - wg-warp-main (WARP WireGuard exit)
     - wg-pia-ab12c34 (hash of long tag)
     """
     import hashlib
-    prefix = PIA_PREFIX if is_pia else CUSTOM_PREFIX
+
+    if egress_type == "warp":
+        prefix = WARP_PREFIX
+    elif is_pia:
+        prefix = PIA_PREFIX
+    else:
+        prefix = CUSTOM_PREFIX
+
     max_tag_len = MAX_IFACE_LEN - len(prefix)
 
     if len(tag) <= max_tag_len:
@@ -219,6 +229,79 @@ def get_custom_egress_list(db) -> List[Dict]:
     return db.get_custom_egress_list(enabled_only=True)
 
 
+def get_warp_wireguard_egress_list(db) -> List[Dict]:
+    """Get enabled WARP egress that use WireGuard protocol"""
+    all_warp = db.get_warp_egress_list(enabled_only=True)
+    return [e for e in all_warp if e.get("protocol") == "wireguard"]
+
+
+def parse_warp_wg_conf(config_path: str) -> Optional[Dict]:
+    """Parse WARP WireGuard config file (wg.conf format)
+
+    Returns dict with: private_key, address, peer_public_key, endpoint_host, endpoint_port
+    """
+    from pathlib import Path
+    import re
+
+    conf_path = Path(config_path)
+    if not conf_path.exists():
+        # Try wg.conf in the same directory
+        wg_conf = conf_path.parent / "wg.conf"
+        if not wg_conf.exists():
+            return None
+        conf_path = wg_conf
+
+    try:
+        content = conf_path.read_text()
+        result = {}
+
+        # Parse [Interface] section
+        interface_match = re.search(r'\[Interface\](.*?)(?:\[|$)', content, re.DOTALL)
+        if interface_match:
+            interface_section = interface_match.group(1)
+            # PrivateKey
+            pk_match = re.search(r'PrivateKey\s*=\s*(\S+)', interface_section)
+            if pk_match:
+                result['private_key'] = pk_match.group(1)
+            # Address (can have multiple, take first IPv4)
+            addr_match = re.search(r'Address\s*=\s*([^,\n]+)', interface_section)
+            if addr_match:
+                result['address'] = addr_match.group(1).strip()
+
+        # Parse [Peer] section
+        peer_match = re.search(r'\[Peer\](.*?)(?:\[|$)', content, re.DOTALL)
+        if peer_match:
+            peer_section = peer_match.group(1)
+            # PublicKey
+            pubkey_match = re.search(r'PublicKey\s*=\s*(\S+)', peer_section)
+            if pubkey_match:
+                result['peer_public_key'] = pubkey_match.group(1)
+            # Endpoint (host:port)
+            endpoint_match = re.search(r'Endpoint\s*=\s*(\S+)', peer_section)
+            if endpoint_match:
+                endpoint = endpoint_match.group(1)
+                if ':' in endpoint:
+                    # Handle IPv6 endpoint [ipv6]:port
+                    if endpoint.startswith('['):
+                        ipv6_match = re.match(r'\[([^\]]+)\]:(\d+)', endpoint)
+                        if ipv6_match:
+                            result['endpoint_host'] = ipv6_match.group(1)
+                            result['endpoint_port'] = int(ipv6_match.group(2))
+                    else:
+                        host, port = endpoint.rsplit(':', 1)
+                        result['endpoint_host'] = host
+                        result['endpoint_port'] = int(port)
+                else:
+                    result['endpoint_host'] = endpoint
+                    result['endpoint_port'] = 2408  # WARP default
+
+        return result if 'private_key' in result else None
+
+    except Exception as e:
+        print(f"[wg-egress] Failed to parse WARP wg.conf: {e}")
+        return None
+
+
 def setup_all_egress_interfaces(sync_only: bool = False) -> Dict:
     """Setup all kernel WireGuard egress interfaces from database
 
@@ -230,10 +313,11 @@ def setup_all_egress_interfaces(sync_only: bool = False) -> Dict:
     # Get egress configurations from database
     pia_profiles = get_pia_egress_list(db)
     custom_egress = get_custom_egress_list(db)
+    warp_wg_egress = get_warp_wireguard_egress_list(db)
 
-    print(f"[wg-egress] Found {len(pia_profiles)} PIA profiles, {len(custom_egress)} custom egress")
+    print(f"[wg-egress] Found {len(pia_profiles)} PIA profiles, {len(custom_egress)} custom egress, {len(warp_wg_egress)} WARP WireGuard")
 
-    if not pia_profiles and not custom_egress:
+    if not pia_profiles and not custom_egress and not warp_wg_egress:
         print("[wg-egress] No egress configurations found in database")
         return {"success": True, "interfaces": [], "message": "No egress to configure"}
 
@@ -309,6 +393,43 @@ def setup_all_egress_interfaces(sync_only: bool = False) -> Dict:
                 updated += 1
             else:
                 created += 1
+        else:
+            failed += 1
+
+    # Setup WARP WireGuard egress interfaces
+    for egress in warp_wg_egress:
+        tag = egress.get("tag")
+        interface = get_egress_interface_name(tag, egress_type="warp")
+        expected_interfaces.add(interface)
+
+        if sync_only and interface not in existing_interfaces:
+            continue
+
+        # Parse WireGuard config from wg.conf file
+        config_path = egress.get("config_path", "")
+        wg_config = parse_warp_wg_conf(config_path)
+
+        if not wg_config:
+            print(f"[wg-egress] Failed to parse WARP WireGuard config for {tag}")
+            failed += 1
+            continue
+
+        success = create_egress_interface(
+            interface=interface,
+            private_key=wg_config.get("private_key"),
+            peer_ip=wg_config.get("address"),
+            server=wg_config.get("endpoint_host"),
+            server_port=wg_config.get("endpoint_port", 2408),
+            public_key=wg_config.get("peer_public_key"),
+            mtu=1420
+        )
+
+        if success:
+            if interface in existing_interfaces:
+                updated += 1
+            else:
+                created += 1
+            print(f"[wg-egress] Created WARP WireGuard interface: {interface}")
         else:
             failed += 1
 

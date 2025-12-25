@@ -2325,11 +2325,17 @@ export default function EgressManager() {
                           {egress.account_type === "warp+" ? "WARP+" : egress.account_type.toUpperCase()}
                         </span>
                       </p>
+                      <p className="text-xs text-slate-400">
+                        <span className="text-slate-500">{t('warpEgress.protocol')}:</span>{" "}
+                        <span className={egress.protocol === "wireguard" ? "text-blue-400" : "text-amber-400"}>
+                          {egress.protocol === "wireguard" ? "WireGuard" : "MASQUE"}
+                        </span>
+                      </p>
                       <p className="text-xs text-slate-400 truncate">
                         <span className="text-slate-500">{t('warpEgress.endpoint')}:</span>{" "}
                         {egress.endpoint_v4 || t('warpEgress.autoEndpoint')}
                       </p>
-                      {egress.socks_port && (
+                      {egress.protocol !== "wireguard" && egress.socks_port && (
                         <p className="text-xs text-slate-400">
                           <span className="text-slate-500">{t('warpEgress.socksPort')}:</span> {egress.socks_port}
                         </p>
@@ -4260,7 +4266,7 @@ export default function EgressManager() {
 
                 {/* Endpoint V6 */}
                 <div>
-                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('warpEgress.endpointV6')} ({t('common.optional')})</label>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">{t('warpEgress.endpointV6')}</label>
                   <input
                     type="text"
                     value={warpEndpointV6}

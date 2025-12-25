@@ -947,6 +947,12 @@ def _get_all_outbounds() -> List[str]:
                 if tag and tag not in outbounds:
                     outbounds.append(tag)
 
+            # WARP egress
+            for egress in db.get_warp_egress_list(enabled_only=True):
+                tag = egress.get("tag")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+
             # 从路由规则中获取出口（包括协议规则、端口规则等）
             for rule in db.get_routing_rules():
                 outbound = rule.get("outbound")
@@ -5226,18 +5232,29 @@ def api_reregister_warp_egress(tag: str):
     account_type = result.get("account_type", "free")
     db.update_warp_egress(tag, config_path=config_path, account_type=account_type)
 
-    # 重新渲染配置并重载
+    # 立即启动新代理（不依赖 reload 机制）
+    proxy_status = ""
+    try:
+        started = asyncio.run(manager.start_proxy(tag))
+        if started:
+            proxy_status = ", proxy started"
+        else:
+            proxy_status = ", proxy start failed"
+    except Exception as exc:
+        print(f"[api] Proxy start failed: {exc}")
+        proxy_status = f", proxy start failed: {exc}"
+
+    # 重新渲染配置并重载 sing-box
     reload_status = ""
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
 
     return {
-        "message": f"WARP egress '{tag}' re-registered{reload_status}",
+        "message": f"WARP egress '{tag}' re-registered{proxy_status}{reload_status}",
         "account_type": account_type,
         "device_id": result.get("device_id", "")
     }
@@ -6447,13 +6464,26 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
         else:
             return {"success": False, "speed_mbps": 0, "message": "OpenVPN tunnel not connected"}
     elif _is_warp_egress(tag):
-        # WARP：使用已有 SOCKS 端口
-        socks_port = _get_warp_socks_port(tag)
-        if socks_port:
-            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
-            proxy_info = f"SOCKS5 :{socks_port}"
+        # WARP：根据协议类型选择测试方式
+        if HAS_DATABASE:
+            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            warp_egress = db.get_warp_egress(tag)
+            if warp_egress and warp_egress.get("protocol") == "wireguard":
+                # WireGuard 协议：使用内核接口
+                from setup_kernel_wg_egress import get_egress_interface_name
+                interface = get_egress_interface_name(tag, egress_type="warp")
+                curl_cmd.extend(["--interface", interface])
+                proxy_info = f"接口 {interface}"
+            else:
+                # MASQUE 协议：使用 SOCKS 端口
+                socks_port = _get_warp_socks_port(tag)
+                if socks_port:
+                    curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
+                    proxy_info = f"SOCKS5 :{socks_port}"
+                else:
+                    return {"success": False, "speed_mbps": 0, "message": "WARP not connected"}
         else:
-            return {"success": False, "speed_mbps": 0, "message": "WARP not connected"}
+            return {"success": False, "speed_mbps": 0, "message": "Database not available"}
     elif tag in ("block", "adblock"):
         return {"success": False, "speed_mbps": 0, "message": "Block egress, cannot test speed"}
     else:

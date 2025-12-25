@@ -1202,12 +1202,11 @@ def load_warp_egress() -> List[dict]:
 
 
 def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[str]:
-    """确保每个 WARP 出口都有对应的 SOCKS5 outbound
+    """确保每个 WARP 出口都有对应的 outbound
 
-    WARP 隧道通过 usque SOCKS5 代理桥接到 sing-box:
-    - 每个 WARP 出口运行独立的 usque 进程
-    - 每个出口有对应的 SOCKS5 代理（监听 127.0.0.1:socks_port）
-    - sing-box 通过 SOCKS outbound 连接到 WARP 隧道
+    WARP 支持两种协议:
+    - MASQUE: 通过 usque SOCKS5 代理桥接 (sing-box SOCKS outbound)
+    - WireGuard: 通过内核 WireGuard 接口 (sing-box direct outbound + bind_interface)
 
     Args:
         config: sing-box 配置
@@ -1219,39 +1218,57 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
     if not warp_egress:
         return []
 
+    # Import here to avoid circular dependency
+    from setup_kernel_wg_egress import get_egress_interface_name
+
     outbounds = config.setdefault("outbounds", [])
     existing_tags = {ob.get("tag") for ob in outbounds}
     warp_tags = []
 
     for egress in warp_egress:
         tag = egress.get("tag")
-        socks_port = egress.get("socks_port")
+        protocol = egress.get("protocol", "masque")
 
-        if not tag or not socks_port:
-            print(f"[render] 警告: WARP 出口缺少 tag 或 socks_port，跳过")
+        if not tag:
+            print(f"[render] 警告: WARP 出口缺少 tag，跳过")
             continue
 
         warp_tags.append(tag)
 
-        # 构建 SOCKS outbound
-        outbound = {
-            "type": "socks",
-            "tag": tag,
-            "server": "127.0.0.1",
-            "server_port": socks_port
-        }
+        if protocol == "wireguard":
+            # WireGuard 协议: 使用内核 WireGuard 接口
+            interface = get_egress_interface_name(tag, egress_type="warp")
+            outbound = {
+                "type": "direct",
+                "tag": tag,
+                "bind_interface": interface
+            }
+            outbound_type = f"direct -> {interface}"
+        else:
+            # MASQUE 协议: 使用 usque SOCKS5 代理
+            socks_port = egress.get("socks_port")
+            if not socks_port:
+                print(f"[render] 警告: WARP MASQUE 出口 {tag} 缺少 socks_port，跳过")
+                continue
+            outbound = {
+                "type": "socks",
+                "tag": tag,
+                "server": "127.0.0.1",
+                "server_port": socks_port
+            }
+            outbound_type = f"SOCKS -> 127.0.0.1:{socks_port}"
 
         if tag in existing_tags:
             # 更新现有 outbound
             for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag and ob.get("type") == "socks":
+                if ob.get("tag") == tag:
                     outbounds[i] = outbound
                     break
         else:
             # 在 block 之前插入
             block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
             outbounds.insert(block_idx, outbound)
-            print(f"[render] 创建 WARP 出口 (SOCKS): {tag} -> 127.0.0.1:{socks_port}")
+            print(f"[render] 创建 WARP 出口 ({protocol}): {tag} -> {outbound_type}")
 
     return warp_tags
 
