@@ -290,7 +290,10 @@
     "testTimeout": "Connection Timeout",
     "speedTest": "Speed Test",
     "speedTesting": "Testing speed...",
-    "speedTestFailed": "Speed test failed"
+    "speedTestFailed": "Speed test failed",
+    "customDns": "Custom DNS",
+    "customDnsPlaceholder": "1.1.1.1 or tls://dns.google",
+    "customDnsHint": "Leave empty to use PIA DNS"
   },
   "rules": {
     "title": "Route Rules",

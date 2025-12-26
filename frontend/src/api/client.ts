@@ -264,12 +264,12 @@ export const api = {
 
   // Profile Management
   getProfiles: () => request<ProfilesResponse>("/profiles"),
-  createProfile: (tag: string, description: string, regionId: string) =>
+  createProfile: (tag: string, description: string, regionId: string, customDns?: string) =>
     request<{ message: string; profile: VpnProfile }>("/profiles", {
       method: "POST",
-      body: { tag, description, region_id: regionId }
+      body: { tag, description, region_id: regionId, custom_dns: customDns || null }
     }),
-  updateProfile: (tag: string, data: { description?: string; region_id?: string }) =>
+  updateProfile: (tag: string, data: { description?: string; region_id?: string; custom_dns?: string }) =>
     request<{ message: string }>(`/profiles/${tag}`, {
       method: "PUT",
       body: data

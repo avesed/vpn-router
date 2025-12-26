@@ -746,7 +746,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, description, region_id, dns_strategy, enabled, created_at, updated_at
+                SELECT id, name, description, region_id, custom_dns, enabled, created_at, updated_at
                 FROM pia_profiles
                 WHERE id = ?
             """, (profile_id,)).fetchone()
@@ -757,28 +757,43 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, description, region_id, dns_strategy, enabled, created_at, updated_at
+                SELECT id, name, description, region_id, custom_dns, enabled, created_at, updated_at
                 FROM pia_profiles
                 WHERE name = ?
             """, (name,)).fetchone()
             return dict(row) if row else None
 
     def add_pia_profile(self, name: str, region_id: str, description: str = "",
-                       dns_strategy: str = "direct-dns") -> int:
-        """添加 PIA profile"""
+                       custom_dns: str = None) -> int:
+        """添加 PIA profile
+
+        Args:
+            name: profile 名称
+            region_id: PIA 地区 ID
+            description: 描述
+            custom_dns: 自定义 DNS（空=使用 PIA DNS 10.0.0.241，或如 1.1.1.1, tls://dns.google）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO pia_profiles (name, description, region_id, dns_strategy)
+                INSERT INTO pia_profiles (name, description, region_id, custom_dns)
                 VALUES (?, ?, ?, ?)
-            """, (name, description, region_id, dns_strategy))
+            """, (name, description, region_id, custom_dns))
             conn.commit()
             return cursor.lastrowid
 
     def update_pia_profile(self, profile_id: int, description: Optional[str] = None,
-                          region_id: Optional[str] = None, dns_strategy: Optional[str] = None,
+                          region_id: Optional[str] = None, custom_dns: Optional[str] = None,
                           enabled: Optional[bool] = None) -> bool:
-        """更新 PIA profile"""
+        """更新 PIA profile
+
+        Args:
+            profile_id: profile ID
+            description: 描述
+            region_id: PIA 地区 ID
+            custom_dns: 自定义 DNS（空字符串=使用 PIA DNS，或如 1.1.1.1, tls://dns.google）
+            enabled: 是否启用
+        """
         updates = []
         params = []
 
@@ -788,9 +803,10 @@ class UserDatabase:
         if region_id is not None:
             updates.append("region_id = ?")
             params.append(region_id)
-        if dns_strategy is not None:
-            updates.append("dns_strategy = ?")
-            params.append(dns_strategy)
+        if custom_dns is not None:
+            updates.append("custom_dns = ?")
+            # 空字符串转为 NULL（使用默认 PIA DNS）
+            params.append(custom_dns if custom_dns else None)
         if enabled is not None:
             updates.append("enabled = ?")
             params.append(1 if enabled else 0)
@@ -2443,13 +2459,13 @@ class DatabaseManager:
         return self.user.get_pia_profile_by_name(name)
 
     def add_pia_profile(self, name: str, region_id: str, description: str = "",
-                       dns_strategy: str = "direct-dns") -> int:
-        return self.user.add_pia_profile(name, region_id, description, dns_strategy)
+                       custom_dns: str = None) -> int:
+        return self.user.add_pia_profile(name, region_id, description, custom_dns)
 
     def update_pia_profile(self, profile_id: int, description: Optional[str] = None,
-                          region_id: Optional[str] = None, dns_strategy: Optional[str] = None,
+                          region_id: Optional[str] = None, custom_dns: Optional[str] = None,
                           enabled: Optional[bool] = None) -> bool:
-        return self.user.update_pia_profile(profile_id, description, region_id, dns_strategy, enabled)
+        return self.user.update_pia_profile(profile_id, description, region_id, custom_dns, enabled)
 
     def delete_pia_profile(self, profile_id: int) -> bool:
         return self.user.delete_pia_profile(profile_id)

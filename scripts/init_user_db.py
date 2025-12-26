@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS pia_profiles (
     name TEXT NOT NULL UNIQUE,
     description TEXT,
     region_id TEXT NOT NULL,
-    dns_strategy TEXT DEFAULT 'direct-dns',
+    custom_dns TEXT,          -- 自定义 DNS (空=PIA DNS 10.0.0.241, 或如 1.1.1.1, tls://dns.google)
     -- WireGuard 凭证字段
     server_cn TEXT,           -- 服务器域名/CN
     server_ip TEXT,           -- 服务器 IP
@@ -629,6 +629,31 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
     print("✓ 创建 outbound_groups 表")
 
 
+def migrate_pia_profiles_custom_dns(conn: sqlite3.Connection):
+    """为现有 pia_profiles 表添加 custom_dns 字段（替代 dns_strategy）"""
+    cursor = conn.cursor()
+
+    # 检查 pia_profiles 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pia_profiles'")
+    if not cursor.fetchone():
+        print("⊘ pia_profiles 表不存在，跳过 custom_dns 迁移")
+        return
+
+    # 检查现有列
+    cursor.execute("PRAGMA table_info(pia_profiles)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "custom_dns" in columns:
+        print("⊘ pia_profiles.custom_dns 字段已存在，跳过迁移")
+        return
+
+    # 添加 custom_dns 列
+    cursor.execute("ALTER TABLE pia_profiles ADD COLUMN custom_dns TEXT")
+    print("✓ 添加 pia_profiles.custom_dns 字段")
+
+    conn.commit()
+
+
 def migrate_openvpn_socks_to_tun(conn: sqlite3.Connection):
     """迁移 OpenVPN 从 socks_port 到 tun_device（直接接口绑定）
 
@@ -840,15 +865,15 @@ def load_pia_profiles(conn: sqlite3.Connection, config_dir: Path):
             name = profile.get('name')
             description = profile.get('description', '')
             region_id = profile.get('region_id')
-            dns_strategy = profile.get('dns_strategy', 'direct-dns')
+            custom_dns = profile.get('custom_dns')  # 自定义 DNS，如 1.1.1.1, tls://dns.google
 
             if not name or not region_id:
                 continue
 
             cursor.execute("""
-                INSERT OR IGNORE INTO pia_profiles (name, description, region_id, dns_strategy, enabled)
+                INSERT OR IGNORE INTO pia_profiles (name, description, region_id, custom_dns, enabled)
                 VALUES (?, ?, ?, ?, 1)
-            """, (name, description, region_id, dns_strategy))
+            """, (name, description, region_id, custom_dns))
 
             if cursor.rowcount > 0:
                 loaded += 1
@@ -893,6 +918,7 @@ def main():
     migrate_warp_egress_protocol(conn)
     migrate_outbound_groups(conn)
     migrate_openvpn_socks_to_tun(conn)
+    migrate_pia_profiles_custom_dns(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

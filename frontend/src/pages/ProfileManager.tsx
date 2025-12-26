@@ -29,10 +29,12 @@ export default function ProfileManager() {
   const [newTag, setNewTag] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [newRegionId, setNewRegionId] = useState("");
+  const [newCustomDns, setNewCustomDns] = useState("");
 
   // Edit mode
   const [editingTag, setEditingTag] = useState<string | null>(null);
   const [editRegionId, setEditRegionId] = useState("");
+  const [editCustomDns, setEditCustomDns] = useState("");
 
   // Login modal
   const [showLoginModal, setShowLoginModal] = useState(false);
@@ -75,11 +77,12 @@ export default function ProfileManager() {
 
     setActionLoading("create");
     try {
-      await api.createProfile(newTag, newDescription, newRegionId);
+      await api.createProfile(newTag, newDescription, newRegionId, newCustomDns || undefined);
       setShowNewForm(false);
       setNewTag("");
       setNewDescription("");
       setNewRegionId("");
+      setNewCustomDns("");
       fetchProfiles();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Operation failed");
@@ -107,9 +110,10 @@ export default function ProfileManager() {
 
     setActionLoading(`update-${tag}`);
     try {
-      await api.updateProfile(tag, { region_id: editRegionId });
+      await api.updateProfile(tag, { region_id: editRegionId, custom_dns: editCustomDns });
       setEditingTag(null);
       setEditRegionId("");
+      setEditCustomDns("");
       fetchProfiles();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Operation failed");
@@ -280,7 +284,7 @@ export default function ProfileManager() {
       {showNewForm && (
         <div className="rounded-2xl border border-brand/30 bg-brand/5 p-6">
           <h3 className="text-lg font-semibold text-white mb-4">{t("egress.addPiaLine")}</h3>
-          <div className="grid gap-4 md:grid-cols-3">
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1">
                 {t("egress.lineTag")} ({t("egress.lineTagHint")})
@@ -323,6 +327,18 @@ export default function ProfileManager() {
                   </optgroup>
                 ))}
               </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1">
+                {t("egress.customDns")}
+              </label>
+              <input
+                value={newCustomDns}
+                onChange={(e) => setNewCustomDns(e.target.value)}
+                className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white"
+                placeholder={t("egress.customDnsPlaceholder")}
+              />
+              <p className="mt-1 text-xs text-slate-500">{t("egress.customDnsHint")}</p>
             </div>
           </div>
           <div className="mt-4 flex gap-3">
@@ -387,6 +403,7 @@ export default function ProfileManager() {
                     onClick={() => {
                       setEditingTag(profile.tag);
                       setEditRegionId(profile.region_id);
+                      setEditCustomDns(profile.custom_dns || "");
                     }}
                     className="rounded-lg p-2 text-slate-400 hover:bg-white/10 hover:text-white"
                     title={t("common.edit")}
@@ -427,6 +444,24 @@ export default function ProfileManager() {
                     <span className="text-slate-300">{getRegionName(profile.region_id)}</span>
                   )}
                 </div>
+
+                {/* DNS Setting - show when editing or if custom DNS is set */}
+                {editingTag === profile.tag ? (
+                  <div className="flex items-center gap-2 text-sm min-w-0">
+                    <span className="text-xs text-slate-500 flex-shrink-0">DNS:</span>
+                    <input
+                      value={editCustomDns}
+                      onChange={(e) => setEditCustomDns(e.target.value)}
+                      className="flex-1 min-w-0 rounded border border-white/10 bg-slate-800 px-2 py-1 text-xs text-white"
+                      placeholder={t("egress.customDnsPlaceholder")}
+                    />
+                  </div>
+                ) : profile.custom_dns ? (
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-slate-500">DNS:</span>
+                    <span className="text-slate-300">{profile.custom_dns}</span>
+                  </div>
+                ) : null}
 
                 {profile.server_ip && (
                   <div className="rounded-lg bg-black/20 px-3 py-2">

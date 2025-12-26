@@ -345,6 +345,7 @@ def load_pia_profiles_from_db() -> dict:
                 "server_virtual_ip": profile.get("server_virtual_ip"),
                 "private_key": profile.get("private_key"),
                 "public_key": profile.get("public_key"),
+                "custom_dns": profile.get("custom_dns"),  # 自定义 DNS，空=使用 PIA DNS
             }
 
     if profiles["profiles"]:
@@ -714,13 +715,17 @@ def ensure_direct_dns_config(config: dict) -> None:
         print(f"[render] 注意: sing-box 不支持 DNS 回退，仅使用第一个服务器，其余 {len(dns_servers)-1} 个被忽略")
 
 
-def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
-    """确保每个 profile 都有对应的 DNS 服务器
+def ensure_dns_servers(config: dict, pia_profiles: Dict[str, dict]) -> None:
+    """确保每个 PIA profile 都有对应的 DNS 服务器
 
-    使用 PIA 的私有 DNS 服务器 10.0.0.241 (DNS+Streaming+MACE)
+    支持自定义 DNS 服务器，如果未指定则使用 PIA 的私有 DNS 服务器 10.0.0.241 (DNS+Streaming+MACE)
     这些 DNS 必须通过 VPN 隧道访问，可以防止 DNS 泄露
 
     sing-box 1.12+ 使用新的 DNS 服务器格式（type + server）
+
+    Args:
+        config: sing-box 配置
+        pia_profiles: PIA profiles 字典 {name: {custom_dns: ..., ...}}
     """
     dns = config.setdefault("dns", {})
     servers = dns.setdefault("servers", [])
@@ -728,19 +733,30 @@ def ensure_dns_servers(config: dict, profile_map: Dict[str, str]) -> None:
     # PIA 私有 DNS: 10.0.0.241 (DNS+Streaming+MACE)
     PIA_DNS = "10.0.0.241"
 
-    for tag in profile_map.keys():
+    for tag, profile_data in pia_profiles.items():
         dns_tag = f"{tag}-dns"
 
         # 移除旧的同名 DNS 服务器
         servers[:] = [s for s in servers if s.get("tag") != dns_tag]
 
-        # sing-box 1.12+ 新格式
-        servers.append({
-            "tag": dns_tag,
-            "type": "udp",
-            "server": PIA_DNS,
-            "detour": tag
-        })
+        # 检查是否有自定义 DNS
+        custom_dns = profile_data.get("custom_dns") if isinstance(profile_data, dict) else None
+
+        if custom_dns:
+            # 使用用户自定义的 DNS
+            dns_config = _parse_dns_server(custom_dns)
+            dns_config["tag"] = dns_tag
+            dns_config["detour"] = tag
+            servers.append(dns_config)
+            print(f"[render] {tag} 使用自定义 DNS: {custom_dns}")
+        else:
+            # 使用默认 PIA DNS
+            servers.append({
+                "tag": dns_tag,
+                "type": "udp",
+                "server": PIA_DNS,
+                "detour": tag
+            })
 
 
 def ensure_outbound_selector(config: dict, all_egress_tags: List[str]) -> None:
@@ -2016,9 +2032,10 @@ def main() -> None:
 
         # 确保 DNS 服务器存在
         if pia_profiles and pia_profiles.get("profiles"):
-            profile_map = {name: name for name in pia_profiles["profiles"].keys()
-                          if pia_profiles["profiles"][name].get("private_key")}
-            ensure_dns_servers(config, profile_map)
+            # 过滤出有私钥的 profiles，传递完整 profile 数据（包含 custom_dns）
+            active_profiles = {name: data for name, data in pia_profiles["profiles"].items()
+                              if data.get("private_key")}
+            ensure_dns_servers(config, active_profiles)
 
         if custom_egress:
             custom_tags = [e.get("tag") for e in custom_egress if e.get("tag")]

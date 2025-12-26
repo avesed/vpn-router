@@ -30,7 +30,7 @@ export interface PiaProfile {
   name: string;
   description: string;
   region_id: string;
-  dns_strategy: string;
+  custom_dns: string;  // 自定义 DNS，空=使用 PIA DNS
 }
 
 export interface ProfileStatus {
@@ -76,7 +76,7 @@ export interface VpnProfile {
   name: string;
   description: string;
   region_id: string;
-  dns_strategy: string;
+  custom_dns: string;  // 自定义 DNS，空=使用 PIA DNS
   server_ip?: string;
   server_port?: number;
   is_connected: boolean;

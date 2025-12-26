@@ -83,6 +83,7 @@ export default function EgressManager() {
   const [piaFormTag, setPiaFormTag] = useState("");
   const [piaFormDescription, setPiaFormDescription] = useState("");
   const [piaFormRegionId, setPiaFormRegionId] = useState("");
+  const [piaFormCustomDns, setPiaFormCustomDns] = useState("");
 
   // Region dropdown state
   const [regionDropdownOpen, setRegionDropdownOpen] = useState(false);
@@ -301,6 +302,7 @@ export default function EgressManager() {
     setPiaFormTag("");
     setPiaFormDescription("");
     setPiaFormRegionId("");
+    setPiaFormCustomDns("");
     setEditingPiaProfile(null);
     setRegionDropdownOpen(false);
     setRegionSearchQuery("");
@@ -408,6 +410,7 @@ export default function EgressManager() {
     setPiaFormTag(profile.tag);
     setPiaFormDescription(profile.description);
     setPiaFormRegionId(profile.region_id);
+    setPiaFormCustomDns(profile.custom_dns || "");
     setPiaModalMode("edit");
     setShowPiaModal(true);
   };
@@ -419,7 +422,7 @@ export default function EgressManager() {
     try {
       // Use tag as description if not provided
       const description = piaFormDescription || piaFormTag;
-      await api.createProfile(piaFormTag, description, piaFormRegionId);
+      await api.createProfile(piaFormTag, description, piaFormRegionId, piaFormCustomDns || undefined);
       setSuccessMessage(t('egress.piaLineAddSuccess'));
       setShowPiaModal(false);
       resetPiaForm();
@@ -439,7 +442,8 @@ export default function EgressManager() {
     try {
       await api.updateProfile(editingPiaProfile.tag, {
         description: piaFormDescription,
-        region_id: piaFormRegionId
+        region_id: piaFormRegionId,
+        custom_dns: piaFormCustomDns
       });
       setSuccessMessage(t('egress.piaLineUpdated'));
       setShowPiaModal(false);
@@ -2781,6 +2785,21 @@ export default function EgressManager() {
                     </div>
                   )}
                 </div>
+              </div>
+
+              {/* Custom DNS */}
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t('egress.customDns')}
+                </label>
+                <input
+                  type="text"
+                  value={piaFormCustomDns}
+                  onChange={(e) => setPiaFormCustomDns(e.target.value)}
+                  placeholder={t('egress.customDnsPlaceholder')}
+                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                />
+                <p className="text-xs text-slate-500 mt-1">{t('egress.customDnsHint')}</p>
               </div>
 
               {piaRegions.length > 0 && (

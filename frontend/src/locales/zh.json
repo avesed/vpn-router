@@ -290,7 +290,10 @@
     "testTimeout": "连接超时",
     "speedTest": "测速",
     "speedTesting": "测速中...",
-    "speedTestFailed": "测速失败"
+    "speedTestFailed": "测速失败",
+    "customDns": "自定义 DNS",
+    "customDnsPlaceholder": "1.1.1.1 或 tls://dns.google",
+    "customDnsHint": "留空使用 PIA DNS"
   },
   "rules": {
     "title": "路由规则",

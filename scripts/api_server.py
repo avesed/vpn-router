@@ -487,12 +487,14 @@ class ProfileCreateRequest(BaseModel):
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="线路标识符，如 us-stream")
     description: str = Field(..., description="线路描述，如 US 流媒体出口")
     region_id: str = Field(..., description="PIA 地区 ID，如 us-east")
+    custom_dns: Optional[str] = Field(None, description="自定义 DNS（空=PIA DNS，或如 1.1.1.1, tls://dns.google）")
 
 
 class ProfileUpdateRequest(BaseModel):
     """更新 VPN 线路配置"""
     description: Optional[str] = None
     region_id: Optional[str] = None
+    custom_dns: Optional[str] = Field(None, description="自定义 DNS（空=PIA DNS，或如 1.1.1.1, tls://dns.google）")
 
 
 class RouteRuleRequest(BaseModel):
@@ -2304,7 +2306,7 @@ def api_list_profiles():
             "name": name,
             "description": p.get("description", ""),
             "region_id": p.get("region_id", ""),
-            "dns_strategy": p.get("dns_strategy", "direct-dns"),
+            "custom_dns": p.get("custom_dns") or "",  # 空=使用 PIA DNS
             "server_ip": server_ip,
             "server_port": server_port,
             "is_connected": is_connected,
@@ -2338,7 +2340,7 @@ def api_create_profile(payload: ProfileCreateRequest):
         name=name,
         region_id=payload.region_id,
         description=payload.description,
-        dns_strategy="direct-dns"
+        custom_dns=payload.custom_dns
     )
 
     # 如果有 PIA 凭证，自动配置新线路
@@ -2398,8 +2400,18 @@ def api_update_profile(tag: str, payload: ProfileUpdateRequest):
     db.update_pia_profile(
         profile_id=profile["id"],
         description=payload.description,
-        region_id=payload.region_id
+        region_id=payload.region_id,
+        custom_dns=payload.custom_dns
     )
+
+    # 如果 DNS 设置变化，需要重新生成配置
+    if payload.custom_dns is not None:
+        try:
+            _regenerate_and_reload()
+            return {"message": f"线路 {tag} 更新成功，配置已重载"}
+        except Exception as exc:
+            return {"message": f"线路 {tag} 更新成功，但配置重载失败: {exc}"}
+
     return {"message": f"线路 {tag} 更新成功"}
 
 
@@ -8314,7 +8326,7 @@ def _export_backup_v1(payload: BackupExportRequest) -> dict:
             "name": p["name"],
             "description": p.get("description", ""),
             "region_id": p.get("region_id", ""),
-            "dns_strategy": p.get("dns_strategy", "direct-dns"),
+            "custom_dns": p.get("custom_dns") or "",
             "enabled": p.get("enabled", 1) == 1,
         }
         for p in pia_profiles
@@ -8710,7 +8722,7 @@ def api_import_backup(payload: BackupImportRequest):
                         name=p["name"],
                         region_id=p.get("region_id", ""),
                         description=p.get("description", ""),
-                        dns_strategy=p.get("dns_strategy", "direct-dns")
+                        custom_dns=p.get("custom_dns") or None
                     )
             results["pia_profiles"] = True
         except Exception as exc:
