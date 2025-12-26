@@ -10,10 +10,17 @@ import hashlib
 import json
 import logging
 import os
-import sqlite3
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from contextlib import contextmanager
+
+# SQLCipher 加密数据库支持
+try:
+    from pysqlcipher3 import dbapi2 as sqlite3
+    HAS_SQLCIPHER = True
+except ImportError:
+    import sqlite3
+    HAS_SQLCIPHER = False
 
 # C3 修复: 添加日志记录器
 logger = logging.getLogger(__name__)
@@ -313,15 +320,30 @@ class GeodataDatabase:
 
 
 class UserDatabase:
-    """用户配置数据库（读写）"""
+    """用户配置数据库（读写，支持 SQLCipher 加密）"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, encryption_key: Optional[str] = None):
+        """
+        初始化用户数据库
+
+        Args:
+            db_path: 数据库文件路径
+            encryption_key: SQLCipher 加密密钥（64 字符 hex）
+        """
         self.db_path = db_path
+        self.encryption_key = encryption_key
+
+    def _apply_encryption(self, conn) -> None:
+        """应用 SQLCipher 加密密钥"""
+        if self.encryption_key and HAS_SQLCIPHER:
+            conn.execute(f"PRAGMA key = '{self.encryption_key}'")
 
     @contextmanager
     def _get_conn(self):
         """获取数据库连接（上下文管理器）"""
-        conn = sqlite3.connect(self.db_path)
+        # 确保 db_path 是字符串（兼容 Path 对象）
+        conn = sqlite3.connect(str(self.db_path))
+        self._apply_encryption(conn)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -344,6 +366,7 @@ class UserDatabase:
             # 如果发生异常，自动回滚
         """
         conn = sqlite3.connect(self.db_path)
+        self._apply_encryption(conn)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         try:
@@ -791,6 +814,68 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ PIA 账户凭据管理 ============
+
+    def get_pia_credentials(self) -> Optional[Dict[str, str]]:
+        """获取 PIA 账户凭据
+
+        Returns:
+            {"username": "...", "password": "..."} 或 None（不存在）
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT username, password FROM pia_credentials WHERE id = 1
+            """).fetchone()
+            if row:
+                return {"username": row[0], "password": row[1]}
+            return None
+
+    def set_pia_credentials(self, username: str, password: str) -> bool:
+        """设置 PIA 账户凭据（插入或更新）
+
+        Args:
+            username: PIA 用户名
+            password: PIA 密码
+
+        Returns:
+            是否成功
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 INSERT OR REPLACE 兼容 SQLCipher
+            cursor.execute("""
+                INSERT OR REPLACE INTO pia_credentials (id, username, password, updated_at)
+                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+            """, (username, password))
+            conn.commit()
+            return True
+
+    def delete_pia_credentials(self) -> bool:
+        """删除 PIA 账户凭据
+
+        Returns:
+            是否成功删除（凭据存在并被删除返回 True）
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM pia_credentials WHERE id = 1")
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def has_pia_credentials(self) -> bool:
+        """检查是否存在 PIA 凭据
+
+        Returns:
+            True 如果凭据存在
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT 1 FROM pia_credentials WHERE id = 1
+            """).fetchone()
+            return row is not None
+
     # ============ 自定义分类项目管理 ============
 
     def get_custom_category_items(self, category_id: Optional[str] = None) -> Dict[str, List[Dict]]:
@@ -894,10 +979,10 @@ class UserDatabase:
         """设置或更新设置值"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            # 使用 INSERT OR REPLACE 兼容 SQLCipher
             cursor.execute("""
-                INSERT INTO settings (key, value, updated_at)
+                INSERT OR REPLACE INTO settings (key, value, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
             """, (key, value))
             conn.commit()
             return True
@@ -1886,11 +1971,20 @@ class UserDatabase:
 class DatabaseManager:
     """统一的数据库管理器，协调系统数据和用户数据"""
 
-    def __init__(self, geodata_path: str, user_path: str):
+    def __init__(self, geodata_path: str, user_path: str, encryption_key: Optional[str] = None):
+        """
+        初始化数据库管理器
+
+        Args:
+            geodata_path: GeoIP 数据目录路径
+            user_path: 用户数据库文件路径
+            encryption_key: SQLCipher 加密密钥（用于 user 数据库）
+        """
         self.geodata_path = geodata_path
         self.user_path = user_path
+        self.encryption_key = encryption_key
         self.geodata = GeodataDatabase(geodata_path)
-        self.user = UserDatabase(user_path)
+        self.user = UserDatabase(user_path, encryption_key)
 
     def get_statistics(self) -> Dict[str, int]:
         """获取完整统计信息"""
@@ -2009,6 +2103,19 @@ class DatabaseManager:
 
     def update_pia_credentials(self, name: str, credentials: Dict[str, Any]) -> bool:
         return self.user.update_pia_credentials(name, credentials)
+
+    # PIA Account Credentials (for database persistence)
+    def get_pia_credentials(self) -> Optional[Dict[str, str]]:
+        return self.user.get_pia_credentials()
+
+    def set_pia_credentials(self, username: str, password: str) -> bool:
+        return self.user.set_pia_credentials(username, password)
+
+    def delete_pia_credentials(self) -> bool:
+        return self.user.delete_pia_credentials()
+
+    def has_pia_credentials(self) -> bool:
+        return self.user.has_pia_credentials()
 
     # Custom Category Items
     def get_custom_category_items(self, category_id: Optional[str] = None) -> Dict[str, List[Dict]]:
@@ -2304,14 +2411,24 @@ _db_manager: Optional[DatabaseManager] = None
 
 
 def get_db(geodata_path: str = "/etc/sing-box/geoip-geodata.db",
-           user_path: str = "/etc/sing-box/user-config.db") -> DatabaseManager:
+           user_path: str = "/etc/sing-box/user-config.db",
+           encryption_key: Optional[str] = None) -> DatabaseManager:
     """获取数据库管理器（单例模式）
 
-    注意: 首次调用的路径会被缓存，后续调用如果使用不同路径会打印警告。
+    Args:
+        geodata_path: GeoIP 数据目录路径
+        user_path: 用户数据库文件路径
+        encryption_key: SQLCipher 加密密钥（用于 user 数据库）
+                       如果未提供，会尝试从 SQLCIPHER_KEY 环境变量获取
+
+    注意: 首次调用的参数会被缓存，后续调用如果使用不同参数会打印警告。
     """
     global _db_manager
     if _db_manager is None:
-        _db_manager = DatabaseManager(geodata_path, user_path)
+        # 如果未提供加密密钥，尝试从环境变量获取
+        if encryption_key is None:
+            encryption_key = os.environ.get("SQLCIPHER_KEY")
+        _db_manager = DatabaseManager(geodata_path, user_path, encryption_key)
     else:
         # 检查路径是否与缓存的一致
         if _db_manager.geodata_path != geodata_path or _db_manager.user_path != user_path:

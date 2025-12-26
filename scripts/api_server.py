@@ -61,10 +61,18 @@ except ImportError:
     HAS_V2RAY_PARSER = False
     print("WARNING: V2Ray URI parser not available")
 
+try:
+    from key_manager import KeyManager
+    HAS_KEY_MANAGER = True
+except ImportError:
+    HAS_KEY_MANAGER = False
+    print("WARNING: Key manager not available, v2.0 backup format disabled")
+
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
 GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = Path(os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db"))
 USER_DB_PATH = Path(os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db"))
+SQLCIPHER_KEY = os.environ.get("SQLCIPHER_KEY")  # SQLCipher 加密密钥
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
 PIA_PROFILES_OUTPUT = Path(os.environ.get("PIA_PROFILES_OUTPUT", "/etc/sing-box/pia-profiles.json"))
 WG_CONFIG_PATH = Path(os.environ.get("WG_CONFIG_PATH", "/etc/sing-box/wireguard/server.json"))
@@ -87,6 +95,15 @@ ENTRY_DIR = Path("/usr/local/bin")
 DEFAULT_WG_PORT = int(os.environ.get("WG_LISTEN_PORT", "36100"))
 DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "36000"))
 DEFAULT_WG_SUBNET = os.environ.get("WG_INGRESS_SUBNET", "10.25.0.1/24")
+
+
+def _get_db():
+    """获取加密数据库连接（单例模式）
+
+    自动使用 SQLCIPHER_KEY 环境变量进行加密。
+    """
+    return get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH), SQLCIPHER_KEY)
+
 
 def get_subnet_prefix(subnet_address: str = None) -> str:
     """从子网地址提取前缀（如 10.25.0.1/24 -> 10.25.0.）
@@ -162,26 +179,76 @@ def get_cached_wg_subnet_prefix() -> str:
 
 # ============ 安全凭据存储 ============
 # 使用类变量存储凭据，避免暴露在 /proc/<pid>/environ
+# 同时持久化到加密数据库，容器重启后保留
 class _CredentialStore:
     """
-    安全的凭据存储类。
+    安全的凭据存储类（带数据库持久化）。
 
-    凭据存储在进程内存中，而不是环境变量，
-    避免通过 /proc/<pid>/environ 暴露。
+    凭据存储在进程内存中，避免通过 /proc/<pid>/environ 暴露。
+    同时持久化到 SQLCipher 加密数据库，容器重启后自动恢复。
     """
     _credentials: Dict[str, str] = {}
     _lock = threading.Lock()
+    _db_loaded = False  # 标记是否已从数据库加载
+
+    @classmethod
+    def _load_from_db(cls) -> None:
+        """从数据库加载凭据（懒加载，仅执行一次）"""
+        if cls._db_loaded:
+            return
+        cls._db_loaded = True
+
+        try:
+            if HAS_DATABASE and USER_DB_PATH.exists():
+                db = _get_db()
+                creds = db.get_pia_credentials()
+                if creds:
+                    cls._credentials["PIA_USERNAME"] = creds["username"]
+                    cls._credentials["PIA_PASSWORD"] = creds["password"]
+                    print("[CredentialStore] PIA credentials loaded from database")
+        except Exception as e:
+            print(f"[CredentialStore] Failed to load credentials from database: {e}")
+
+    @classmethod
+    def _save_pia_to_db(cls) -> None:
+        """保存 PIA 凭据到数据库"""
+        try:
+            if HAS_DATABASE and USER_DB_PATH.exists():
+                username = cls._credentials.get("PIA_USERNAME")
+                password = cls._credentials.get("PIA_PASSWORD")
+                if username and password:
+                    db = _get_db()
+                    db.set_pia_credentials(username, password)
+                    print("[CredentialStore] PIA credentials saved to database")
+        except Exception as e:
+            print(f"[CredentialStore] Failed to save credentials to database: {e}")
+
+    @classmethod
+    def _delete_pia_from_db(cls) -> None:
+        """从数据库删除 PIA 凭据"""
+        try:
+            if HAS_DATABASE and USER_DB_PATH.exists():
+                db = _get_db()
+                db.delete_pia_credentials()
+                print("[CredentialStore] PIA credentials deleted from database")
+        except Exception as e:
+            print(f"[CredentialStore] Failed to delete credentials from database: {e}")
 
     @classmethod
     def set(cls, key: str, value: str) -> None:
         """设置凭据"""
         with cls._lock:
             cls._credentials[key] = value
+            # 如果是 PIA 凭据，同步到数据库
+            if key in ("PIA_USERNAME", "PIA_PASSWORD"):
+                cls._save_pia_to_db()
 
     @classmethod
     def get(cls, key: str, default: Optional[str] = None) -> Optional[str]:
         """获取凭据"""
         with cls._lock:
+            # 首次访问时从数据库加载
+            cls._load_from_db()
             # 优先从内存存储获取，回退到环境变量（兼容容器启动时的环境变量）
             return cls._credentials.get(key) or os.environ.get(key, default)
 
@@ -190,17 +257,22 @@ class _CredentialStore:
         """删除凭据"""
         with cls._lock:
             cls._credentials.pop(key, None)
+            # 如果删除的是 PIA 凭据，也从数据库删除
+            if key in ("PIA_USERNAME", "PIA_PASSWORD"):
+                cls._delete_pia_from_db()
 
     @classmethod
     def clear(cls) -> None:
         """清除所有凭据"""
         with cls._lock:
             cls._credentials.clear()
+            cls._delete_pia_from_db()
 
     @classmethod
     def has(cls, key: str) -> bool:
         """检查凭据是否存在"""
         with cls._lock:
+            cls._load_from_db()
             return bool(cls._credentials.get(key) or os.environ.get(key))
 
     @classmethod
@@ -211,6 +283,7 @@ class _CredentialStore:
         """
         env = os.environ.copy()
         with cls._lock:
+            cls._load_from_db()
             env.update(cls._credentials)
         return env
 
@@ -222,7 +295,7 @@ def get_pia_credentials() -> tuple[Optional[str], Optional[str]]:
 
 
 def set_pia_credentials(username: str, password: str) -> None:
-    """设置 PIA 凭据"""
+    """设置 PIA 凭据（同时保存到数据库）"""
     _CredentialStore.set("PIA_USERNAME", username)
     _CredentialStore.set("PIA_PASSWORD", password)
 
@@ -293,6 +366,19 @@ def _check_rate_limit(client_ip: str, limit: int = _RATE_LIMIT_GENERAL) -> bool:
                 del _rate_limit_data[ip]
 
         return True
+
+
+def _clear_rate_limit():
+    """清除所有速率限制计数
+
+    在备份导入后调用，因为：
+    1. JWT secret 可能已改变，用户需要重新登录
+    2. 之前的登录尝试次数不应影响新导入的配置
+    """
+    global _rate_limit_data
+    with _rate_limit_lock:
+        _rate_limit_data.clear()
+    print("[api] Rate limit data cleared")
 
 
 # ============ 流量统计 ============
@@ -545,16 +631,19 @@ class WireGuardConfParseRequest(BaseModel):
 
 
 class BackupExportRequest(BaseModel):
-    """导出配置备份"""
-    password: Optional[str] = Field(None, description="加密密码（可选，不填则不加密敏感数据）")
-    include_pia_credentials: bool = Field(True, description="是否包含 PIA 凭证")
+    """导出配置备份（v2.0: 密码必需）"""
+    password: str = Field(..., min_length=1, description="加密密码（v2.0 必需，用于加密部署密钥）")
+    # v2.0: PIA 凭据自动包含在加密数据库中，无需单独选项
+    # 保留以兼容旧版本
+    include_pia_credentials: bool = Field(True, description="[已废弃] v2.0 自动包含")
 
 
 class BackupImportRequest(BaseModel):
     """导入配置备份"""
     data: str = Field(..., description="备份数据（JSON 字符串）")
-    password: Optional[str] = Field(None, description="解密密码")
-    merge_mode: str = Field("replace", description="合并模式: replace(替换) 或 merge(合并)")
+    password: str = Field(..., min_length=1, description="解密密码（v2.0 必需）")
+    # v2.0: 不再支持合并模式，始终完全替换
+    merge_mode: str = Field("replace", description="[已废弃] v2.0 始终替换")
 
 
 # ============ V2Ray Egress/Inbound Models ============
@@ -5326,8 +5415,20 @@ def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
     if updates:
         db.update_warp_egress(tag, **updates)
 
-    # 重载 WARP manager 以应用新 endpoint
-    reload_status = _reload_warp_manager()
+    protocol = egress.get("protocol", "masque")
+    reload_status = ""
+
+    if protocol == "wireguard":
+        # WireGuard: 重新渲染配置并重载 sing-box
+        try:
+            _regenerate_and_reload()
+            reload_status = ", config reloaded"
+        except Exception as exc:
+            print(f"[api] Reload failed: {exc}")
+            reload_status = f", reload failed: {exc}"
+    else:
+        # MASQUE: 重载 WARP manager 以应用新 endpoint
+        reload_status = _reload_warp_manager()
 
     return {
         "message": f"Endpoint updated for '{tag}'{reload_status}",
@@ -6727,6 +6828,138 @@ def _regenerate_and_reload():
         raise RuntimeError(f"配置重载失败: {error_msg}")
 
 
+def _full_regenerate_after_import():
+    """备份导入后完整重新生成所有接口和配置
+
+    在数据库被替换后调用，重新生成：
+    1. WireGuard 入口接口
+    2. WireGuard 出口接口（PIA、自定义）
+    3. sing-box 配置
+    4. Xray 入口（如果启用 V2Ray ingress）
+    5. Xray 出口（如果配置了 V2Ray egress）
+    6. OpenVPN 隧道（如果配置）
+    7. WARP 代理（如果配置）
+
+    Returns:
+        dict: 各组件的重新生成状态
+    """
+    results = {
+        "wireguard_ingress": False,
+        "wireguard_egress": False,
+        "singbox": False,
+        "xray_ingress": False,
+        "xray_egress": False,
+        "openvpn": False,
+        "warp": False,
+    }
+
+    # 1. WireGuard 入口接口
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/setup_kernel_wg.py"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print("[backup-import] WireGuard ingress interface synced")
+            results["wireguard_ingress"] = True
+        else:
+            print(f"[backup-import] WireGuard ingress sync failed: {result.stderr.strip()}")
+    except Exception as e:
+        print(f"[backup-import] WireGuard ingress error: {e}")
+
+    # 2. WireGuard 出口接口（PIA、自定义）
+    try:
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/setup_kernel_wg_egress.py"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print("[backup-import] WireGuard egress interfaces synced")
+            results["wireguard_egress"] = True
+        else:
+            print(f"[backup-import] WireGuard egress sync failed: {result.stderr.strip()}")
+    except Exception as e:
+        print(f"[backup-import] WireGuard egress error: {e}")
+
+    # 3. sing-box 配置
+    try:
+        _regenerate_and_reload()
+        results["singbox"] = True
+        print("[backup-import] sing-box config regenerated and reloaded")
+    except Exception as e:
+        print(f"[backup-import] sing-box error: {e}")
+
+    # 4. Xray 入口（检查 V2Ray ingress 是否启用）
+    try:
+        db = _get_db()
+        v2ray_config = db.user.get_v2ray_inbound_config()
+        if v2ray_config and v2ray_config.get("enabled"):
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/xray_manager.py", "restart"],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                print("[backup-import] Xray ingress restarted")
+                results["xray_ingress"] = True
+            else:
+                print(f"[backup-import] Xray ingress restart failed: {result.stderr.strip()}")
+        else:
+            results["xray_ingress"] = True  # 未启用，视为成功
+    except Exception as e:
+        print(f"[backup-import] Xray ingress error: {e}")
+
+    # 5. Xray 出口（检查 V2Ray egress）
+    try:
+        db = _get_db()
+        v2ray_egress = db.user.get_v2ray_egress_list()
+        if v2ray_egress:
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/xray_egress_manager.py", "daemon"],
+                capture_output=True, text=True, timeout=5
+            )
+            # daemon 会后台运行，立即返回
+            print("[backup-import] Xray egress manager started")
+            results["xray_egress"] = True
+        else:
+            results["xray_egress"] = True  # 无配置，视为成功
+    except Exception as e:
+        print(f"[backup-import] Xray egress error: {e}")
+
+    # 6. OpenVPN 隧道
+    try:
+        db = _get_db()
+        openvpn_list = db.user.get_openvpn_egress_list()
+        if openvpn_list:
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/openvpn_manager.py", "daemon"],
+                capture_output=True, text=True, timeout=5
+            )
+            print("[backup-import] OpenVPN manager started")
+            results["openvpn"] = True
+        else:
+            results["openvpn"] = True  # 无配置，视为成功
+    except Exception as e:
+        print(f"[backup-import] OpenVPN error: {e}")
+
+    # 7. WARP 代理
+    try:
+        db = _get_db()
+        warp_list = db.user.get_warp_egress_list()
+        if warp_list:
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
+                capture_output=True, text=True, timeout=5
+            )
+            print("[backup-import] WARP manager started")
+            results["warp"] = True
+        else:
+            results["warp"] = True  # 无配置，视为成功
+    except Exception as e:
+        print(f"[backup-import] WARP error: {e}")
+
+    return results
+
+
 def _reload_xray_egress() -> str:
     """重载或启动 Xray 出站进程
 
@@ -7400,14 +7633,68 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
 
 # ============ Backup / Restore APIs ============
 
-BACKUP_VERSION = "1.0"
+BACKUP_VERSION = "2.0"
 
 
 @app.post("/api/backup/export")
 def api_export_backup(payload: BackupExportRequest):
-    """导出配置备份"""
+    """导出配置备份 (v2.0: SQLCipher 加密数据库 + 加密部署密钥)
+
+    v2.0 格式:
+    - database: base64 编码的 SQLCipher 加密数据库
+    - encryption_key: 用用户密码加密的部署密钥
+    - checksum: SHA256 校验和
+    - 所有数据（包括 PIA 凭据）自动包含在加密数据库中
+    """
+    import hashlib
+    import base64
+
+    # 检查 KeyManager 是否可用
+    if not HAS_KEY_MANAGER:
+        raise HTTPException(status_code=500, detail="KeyManager not available")
+
+    # 检查数据库是否存在
+    if not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="Database not found")
+
+    # 1. 读取 SQLCipher 加密的数据库文件
+    db_bytes = USER_DB_PATH.read_bytes()
+    db_size = len(db_bytes)
+
+    # 2. 计算 SHA256 校验和
+    checksum = hashlib.sha256(db_bytes).hexdigest()
+
+    # 3. 用用户密码加密部署密钥
+    try:
+        encrypted_key = KeyManager.encrypt_key_for_export(payload.password)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to encrypt key: {e}") from e
+
+    # 4. 构建 v2.0 备份数据
     backup_data = {
         "version": BACKUP_VERSION,
+        "type": "vpn-gateway-backup",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "checksum": f"sha256:{checksum}",
+        "database_size_bytes": db_size,
+        "database": base64.b64encode(db_bytes).decode("utf-8"),
+        "encryption_key": encrypted_key,
+    }
+
+    return {
+        "message": "备份已生成 (v2.0)",
+        "backup": backup_data,
+        "encrypted": True,
+        "database_size_bytes": db_size,
+        "checksum": f"sha256:{checksum}",
+    }
+
+
+# 保留 v1.0 导出逻辑的辅助函数，供向后兼容
+def _export_backup_v1(payload: BackupExportRequest) -> dict:
+    """v1.0 格式导出（已废弃，仅用于参考）"""
+    backup_data = {
+        "version": "1.0",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "type": "vpn-gateway-backup",
     }
@@ -7638,7 +7925,16 @@ def api_export_backup(payload: BackupExportRequest):
 
 @app.post("/api/backup/import")
 def api_import_backup(payload: BackupImportRequest):
-    """导入配置备份"""
+    """导入配置备份 (支持 v2.0 和 v1.0 格式)
+
+    v2.0: 直接替换 SQLCipher 加密数据库
+    v1.0: 向后兼容的 JSON 格式导入
+    """
+    import hashlib
+    import base64
+    import shutil
+    import tempfile
+
     try:
         backup_data = json.loads(payload.data)
     except json.JSONDecodeError as exc:
@@ -7648,9 +7944,110 @@ def api_import_backup(payload: BackupImportRequest):
     if backup_data.get("type") != "vpn-gateway-backup":
         raise HTTPException(status_code=400, detail="无效的备份文件类型")
 
-    version = backup_data.get("version", "")
-    if not version:
-        raise HTTPException(status_code=400, detail="备份文件缺少版本信息")
+    version = backup_data.get("version", "1.0")
+
+    # === v2.0 格式处理 ===
+    if version == "2.0":
+        if not HAS_KEY_MANAGER:
+            raise HTTPException(status_code=500, detail="KeyManager not available")
+
+        # 1. 解密部署密钥
+        try:
+            encrypted_key = backup_data.get("encryption_key")
+            if not encrypted_key:
+                raise HTTPException(status_code=400, detail="Missing encryption_key in backup")
+            decrypted_key = KeyManager.decrypt_key_from_import(encrypted_key, payload.password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"解密密钥失败（密码错误？）: {e}") from e
+
+        # 2. 解码数据库
+        try:
+            db_base64 = backup_data.get("database")
+            if not db_base64:
+                raise HTTPException(status_code=400, detail="Missing database in backup")
+            db_bytes = base64.b64decode(db_base64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"解码数据库失败: {e}") from e
+
+        # 3. 验证校验和
+        expected_checksum = backup_data.get("checksum", "")
+        if expected_checksum.startswith("sha256:"):
+            expected_hash = expected_checksum[7:]
+            actual_hash = hashlib.sha256(db_bytes).hexdigest()
+            if expected_hash != actual_hash:
+                raise HTTPException(status_code=400, detail="备份校验失败：数据可能已损坏")
+
+        # 4. 验证密钥能打开数据库（使用临时文件）
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.write(db_bytes)
+
+        try:
+            if not KeyManager.validate_key_for_database(tmp_path, decrypted_key):
+                raise HTTPException(status_code=400, detail="密钥无法打开数据库（密码错误？）")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        # 5. 原子替换：数据库 + 密钥文件
+        # 备份当前数据库
+        backup_db_path = USER_DB_PATH.with_suffix(".db.backup")
+        if USER_DB_PATH.exists():
+            shutil.copy2(USER_DB_PATH, backup_db_path)
+
+        try:
+            # 写入新数据库
+            with tempfile.NamedTemporaryFile(dir=USER_DB_PATH.parent, suffix=".db.tmp", delete=False) as tmp:
+                tmp.write(db_bytes)
+                tmp_db_path = tmp.name
+            shutil.move(tmp_db_path, USER_DB_PATH)
+
+            # 保存新密钥
+            KeyManager.save_key(decrypted_key)
+
+            # 更新环境变量（当前进程）
+            os.environ["SQLCIPHER_KEY"] = decrypted_key
+            global SQLCIPHER_KEY
+            SQLCIPHER_KEY = decrypted_key
+
+            # 重置数据库管理器缓存
+            global _db_manager
+            from db_helper import _db_manager as db_mgr
+            # 强制重新创建数据库连接
+            import db_helper
+            db_helper._db_manager = None
+
+            # 重新加载 PIA 凭据到内存
+            _CredentialStore._db_loaded = False  # 强制重新加载
+
+        except Exception as e:
+            # 回滚
+            if backup_db_path.exists():
+                shutil.move(backup_db_path, USER_DB_PATH)
+            raise HTTPException(status_code=500, detail=f"导入失败: {e}") from e
+
+        # 6. 完整重新生成所有接口和配置
+        regen_results = {}
+        try:
+            regen_results = _full_regenerate_after_import()
+            print(f"[backup] 重新生成结果: {regen_results}")
+        except Exception as e:
+            print(f"[backup] 重新生成配置失败: {e}")
+            # 不回滚，数据已成功导入
+
+        # 7. 清除速率限制（用户可能需要重新登录，之前的限制不应影响）
+        _clear_rate_limit()
+
+        return {
+            "message": "备份导入成功 (v2.0)",
+            "version": "2.0",
+            "checksum_verified": True,
+            "database_size_bytes": len(db_bytes),
+            "regeneration_results": regen_results,
+        }
+
+    # === v1.0 格式处理（向后兼容）===
+    # version 已在上面检查过
 
     results = {
         "settings": False,
@@ -7961,34 +8358,52 @@ def api_import_backup(payload: BackupImportRequest):
         except Exception as exc:
             print(f"[backup] 导入 V2Ray 用户失败: {exc}")
 
-    # 重新生成配置
+    # 完整重新生成所有接口和配置
     reload_status = ""
+    regen_results = {}
     try:
-        _regenerate_and_reload()
-        reload_status = "，已重载配置"
+        regen_results = _full_regenerate_after_import()
+        reload_status = "，已重新生成所有接口"
+        print(f"[backup-v1] 重新生成结果: {regen_results}")
     except Exception as exc:
         print(f"[backup] 重载配置失败: {exc}")
         reload_status = f"，重载失败: {exc}"
+
+    # 清除速率限制（用户可能需要重新登录）
+    _clear_rate_limit()
 
     imported_count = sum(1 for v in results.values() if v)
     return {
         "message": f"已导入 {imported_count} 项配置{reload_status}",
         "results": results,
+        "regeneration_results": regen_results,
     }
 
 
 @app.get("/api/backup/status")
 def api_backup_status():
-    """获取备份相关状态"""
+    """获取备份相关状态（v2.0）"""
     ingress = load_ingress_config()
     settings = load_settings()
 
     # 从数据库获取数据
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     pia_profiles = db.get_pia_profiles(enabled_only=False)
     custom_egress = db.get_custom_egress_list()
 
+    # v2.0: 数据库大小和加密状态
+    db_size_bytes = USER_DB_PATH.stat().st_size if USER_DB_PATH.exists() else 0
+    db_encrypted = False
+    if HAS_KEY_MANAGER and USER_DB_PATH.exists():
+        db_encrypted = KeyManager.is_database_encrypted(str(USER_DB_PATH))
+
     return {
+        # v2.0 新增字段
+        "backup_version": BACKUP_VERSION,
+        "database_size_bytes": db_size_bytes,
+        "database_encrypted": db_encrypted,
+        "key_manager_available": HAS_KEY_MANAGER,
+        # 现有字段
         "encryption_available": HAS_CRYPTO,
         "has_ingress": bool(ingress.get("interface", {}).get("private_key")),
         "ingress_peer_count": len(ingress.get("peers", [])),

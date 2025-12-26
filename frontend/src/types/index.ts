@@ -497,8 +497,14 @@ export interface WireGuardConfParseResult {
   pre_shared_key?: string;
 }
 
-// Backup / Restore
+// Backup / Restore (v2.0: SQLCipher 加密数据库)
 export interface BackupStatus {
+  // v2.0 新增字段
+  backup_version: string;
+  database_size_bytes: number;
+  database_encrypted: boolean;
+  key_manager_available: boolean;
+  // 兼容字段
   encryption_available: boolean;
   has_ingress: boolean;
   ingress_peer_count: number;
@@ -509,31 +515,36 @@ export interface BackupStatus {
 }
 
 export interface BackupExportRequest {
-  password?: string;
-  include_pia_credentials: boolean;
+  password: string;  // v2.0: 密码必需
 }
 
 export interface BackupExportResponse {
   message: string;
-  backup: Record<string, unknown>;
-  encrypted: boolean;
+  backup: {
+    version: string;
+    type: string;
+    created_at: string;
+    checksum: string;
+    database_size_bytes: number;
+    database: string;  // base64 编码的加密数据库
+    encryption_key: {
+      salt: string;
+      data: string;
+    };
+  };
 }
 
 export interface BackupImportRequest {
   data: string;
-  password?: string;
-  merge_mode: "replace" | "merge";
+  password: string;  // v2.0: 密码必需
 }
 
 export interface BackupImportResponse {
   message: string;
+  checksum_verified?: boolean;
   results: {
-    settings: boolean;
-    ingress: boolean;
-    custom_egress: boolean;
-    pia_profiles: boolean;
-    pia_credentials: boolean;
-    custom_rules: boolean;
+    database_replaced: boolean;
+    key_replaced: boolean;
   };
 }
 

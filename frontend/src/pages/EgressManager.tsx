@@ -1275,6 +1275,7 @@ export default function EgressManager() {
 
     setActionLoading(`endpoint-${editingWarpEgress.tag}`);
     try {
+      // 设置端点（后端会自动检测 wg.conf 是否存在，不存在则自动重新注册）
       await api.setWarpEndpoint(editingWarpEgress.tag, {
         endpoint_v4: warpEndpointV4.trim() || undefined,
         endpoint_v6: warpEndpointV6.trim() || undefined
@@ -2294,18 +2295,6 @@ export default function EgressManager() {
                           title={t('warpEgress.applyLicense')}
                         >
                           <KeyIcon className="h-4 w-4" />
-                        </button>
-                        <button
-                          onClick={() => handleReregisterWarpEgress(egress.tag)}
-                          disabled={actionLoading === `reregister-warp-${egress.tag}`}
-                          className="p-1.5 rounded-lg text-slate-400 hover:bg-amber-500/20 hover:text-amber-400"
-                          title={t('warpEgress.reregister')}
-                        >
-                          {actionLoading === `reregister-warp-${egress.tag}` ? (
-                            <ArrowPathIcon className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <ArrowPathIcon className="h-4 w-4" />
-                          )}
                         </button>
                         <button
                           onClick={() => handleDeleteWarpEgress(egress.tag)}
@@ -4254,13 +4243,26 @@ export default function EgressManager() {
                 {/* Endpoint V4 */}
                 <div>
                   <label className="block text-sm font-medium text-slate-400 mb-2">{t('warpEgress.endpointV4')}</label>
-                  <input
-                    type="text"
-                    value={warpEndpointV4}
-                    onChange={(e) => setWarpEndpointV4(e.target.value)}
-                    placeholder={t('warpEgress.endpointV4Placeholder')}
-                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-mono text-sm"
-                  />
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={warpEndpointV4}
+                      onChange={(e) => setWarpEndpointV4(e.target.value)}
+                      placeholder={t('warpEgress.endpointV4Placeholder')}
+                      className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-mono text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWarpEndpointV4("engage.cloudflareclient.com");
+                        setWarpEndpointV6("");
+                      }}
+                      className="px-3 py-2 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 text-sm font-medium transition-colors whitespace-nowrap"
+                      title={t('warpEgress.useAutoHint')}
+                    >
+                      {t('warpEgress.useAuto')}
+                    </button>
+                  </div>
                   <p className="mt-1 text-xs text-slate-500">{t('warpEgress.endpointV4Hint')}</p>
                 </div>
 
@@ -4326,25 +4328,56 @@ export default function EgressManager() {
                 )}
               </div>
 
-              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+              <div className="p-6 border-t border-white/10 flex justify-between">
+                {/* Re-register button on the left */}
                 <button
-                  onClick={() => setShowWarpEndpointModal(false)}
-                  className="px-4 py-2 rounded-lg text-slate-400 hover:bg-white/10 text-sm font-medium transition-colors"
+                  onClick={async () => {
+                    if (!confirm(t('warpEgress.reregisterConfirm', { tag: editingWarpEgress.tag }))) return;
+                    setActionLoading(`reregister-warp-${editingWarpEgress.tag}`);
+                    try {
+                      await api.reregisterWarpEgress(editingWarpEgress.tag);
+                      setSuccessMessage(t('warpEgress.reregisterSuccess', { tag: editingWarpEgress.tag }));
+                      loadEgress();
+                      setShowWarpEndpointModal(false);
+                      setTimeout(() => setSuccessMessage(null), 3000);
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : t('warpEgress.reregisterFailed'));
+                    } finally {
+                      setActionLoading(null);
+                    }
+                  }}
+                  disabled={actionLoading?.startsWith("reregister-")}
+                  className="px-4 py-2 rounded-lg border border-amber-500/50 text-amber-400 hover:bg-amber-500/20 text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
                 >
-                  {t('common.cancel')}
-                </button>
-                <button
-                  onClick={handleWarpEndpointSave}
-                  disabled={actionLoading?.startsWith("endpoint-")}
-                  className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
-                >
-                  {actionLoading?.startsWith("endpoint-") ? (
-                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  {actionLoading?.startsWith("reregister-") ? (
+                    <ArrowPathIcon className="h-4 w-4 animate-spin" />
                   ) : (
-                    <CheckIcon className="h-4 w-4" />
+                    <ArrowPathIcon className="h-4 w-4" />
                   )}
-                  {t('common.save')}
+                  {t('warpEgress.reregister')}
                 </button>
+
+                {/* Cancel and Save buttons on the right */}
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setShowWarpEndpointModal(false)}
+                    className="px-4 py-2 rounded-lg text-slate-400 hover:bg-white/10 text-sm font-medium transition-colors"
+                  >
+                    {t('common.cancel')}
+                  </button>
+                  <button
+                    onClick={handleWarpEndpointSave}
+                    disabled={actionLoading?.startsWith("endpoint-")}
+                    className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {actionLoading?.startsWith("endpoint-") ? (
+                      <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                    ) : (
+                      <CheckIcon className="h-4 w-4" />
+                    )}
+                    {t('common.save')}
+                  </button>
+                </div>
               </div>
             </div>
           </div>

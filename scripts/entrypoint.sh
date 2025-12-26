@@ -71,6 +71,28 @@ if [ ! -f "${BASE_CONFIG_PATH}" ]; then
   exit 1
 fi
 
+# === SQLCipher 密钥管理 ===
+# 获取或创建数据库加密密钥
+echo "[entrypoint] initializing encryption key"
+export SQLCIPHER_KEY=$(python3 -c "from key_manager import KeyManager; print(KeyManager.get_or_create_key())")
+if [ -z "${SQLCIPHER_KEY}" ]; then
+  echo "[entrypoint] warning: failed to get encryption key, database will be unencrypted"
+fi
+
+# 检测并迁移未加密数据库
+if [ -f "${USER_DB_PATH}" ]; then
+  python3 -c "
+from key_manager import KeyManager
+import os
+db_path = os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+if KeyManager.is_database_encrypted(db_path):
+    print('[entrypoint] database already encrypted')
+else:
+    print('[entrypoint] migrating unencrypted database to encrypted')
+    KeyManager.migrate_unencrypted_database(db_path)
+"
+fi
+
 # 初始化/升级用户数据库（使用 CREATE TABLE IF NOT EXISTS，安全运行）
 echo "[entrypoint] initializing user database: ${USER_DB_PATH}"
 python3 /usr/local/bin/init_user_db.py /etc/sing-box

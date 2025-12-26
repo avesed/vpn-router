@@ -213,7 +213,8 @@ class WarpManager:
             logger.error(f"[{tag}] 注册异常: {e}")
             return {"success": False, "error": str(e)}
 
-    def _register_wireguard(self, tag: str, license_key: Optional[str] = None) -> dict:
+    def _register_wireguard(self, tag: str, license_key: Optional[str] = None,
+                            custom_endpoint: Optional[str] = None) -> dict:
         """使用 WireGuard 协议注册 WARP 设备"""
         import uuid
         config_dir = self._get_config_dir(tag)
@@ -298,8 +299,11 @@ class WarpManager:
             client_ipv4 = addresses.get("v4", "172.16.0.2")
             client_ipv6 = addresses.get("v6", "2606:4700:110:8a67:2a4c:24dc:73d3:7f03")
 
-            # endpoint.host 已包含端口，如 "engage.cloudflareclient.com:2408"
-            endpoint_host = endpoint.get("host", "engage.cloudflareclient.com:2408")
+            # 使用自定义 endpoint 或 API 返回的默认值
+            if custom_endpoint:
+                endpoint_host = custom_endpoint
+            else:
+                endpoint_host = endpoint.get("host", "engage.cloudflareclient.com:2408")
 
             # 生成 WireGuard 配置文件
             wg_conf = f"""[Interface]
@@ -508,14 +512,11 @@ PersistentKeepalive = 25
 
     def _set_endpoint_wireguard(self, tag: str, config_dir: Path,
                                  endpoint_v4: Optional[str], endpoint_v6: Optional[str]) -> dict:
-        """设置 WireGuard 协议的 Endpoint"""
-        wg_conf_path = config_dir / "wg.conf"
+        """保存 = 用设置的 endpoint 重新注册 WARP
 
-        if not wg_conf_path.exists():
-            return {"success": False, "error": "WireGuard 配置文件不存在，请先注册"}
-
-        # 处理 endpoint 格式 - WireGuard 需要 IP:port 格式
-        # 默认端口 2408
+        每次保存都会重新注册 WARP 设备，使用用户指定的 endpoint。
+        """
+        # 1. 格式化 endpoint - WireGuard 需要 IP:port 格式，默认端口 2408
         if endpoint_v4:
             if ":" in endpoint_v4 and not endpoint_v4.startswith("["):
                 new_endpoint = endpoint_v4  # 已包含端口
@@ -529,49 +530,33 @@ PersistentKeepalive = 25
         else:
             return {"success": False, "error": "必须提供 endpoint_v4 或 endpoint_v6"}
 
-        try:
-            # 读取现有配置
-            with open(wg_conf_path, 'r') as f:
-                lines = f.readlines()
+        # 2. 获取配置（包括 license key）
+        egress = self.db.get_warp_egress(tag)
+        license_key = egress.get("license_key") if egress else None
 
-            # 查找并替换 Endpoint 行
-            updated = False
-            new_lines = []
-            for line in lines:
-                if line.strip().startswith("Endpoint"):
-                    new_lines.append(f"Endpoint = {new_endpoint}\n")
-                    updated = True
-                else:
-                    new_lines.append(line)
+        # 3. 停止旧内核接口
+        interface = get_egress_interface_name(tag, egress_type="warp")
+        subprocess.run(["ip", "link", "delete", interface], capture_output=True)
+        logger.info(f"[{tag}] 已删除旧内核接口 {interface}")
 
-            if not updated:
-                return {"success": False, "error": "配置文件中未找到 Endpoint 行"}
+        # 4. 重新注册 WARP（使用自定义 endpoint）
+        logger.info(f"[{tag}] 重新注册 WARP WireGuard 设备，使用 endpoint: {new_endpoint}")
+        reg_result = self._register_wireguard(tag, license_key, custom_endpoint=new_endpoint)
+        if not reg_result.get("success"):
+            return {"success": False, "error": f"注册失败: {reg_result.get('error')}"}
 
-            # 原子写入
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', dir=config_dir, delete=False) as tmp:
-                tmp.writelines(new_lines)
-                tmp_path = tmp.name
-            os.rename(tmp_path, wg_conf_path)
+        # 5. 更新数据库中的 config_path
+        config_path = reg_result.get("config_path", "")
+        if config_path:
+            self.db.update_warp_egress(tag, config_path=config_path)
 
-            logger.info(f"[{tag}] WireGuard 配置文件 Endpoint 已更新: {new_endpoint}")
+        # 6. 创建新内核接口
+        egress = self.db.get_warp_egress(tag)
+        if not self._start_wireguard_interface(tag, egress):
+            return {"success": False, "error": "内核接口创建失败"}
 
-            # 更新内核 WireGuard 接口
-            interface = get_egress_interface_name(tag, egress_type="warp")
-            self._update_wg_interface_endpoint(interface, new_endpoint)
-
-            # 提取纯 IP 用于数据库存储
-            if ":" in new_endpoint and not new_endpoint.startswith("["):
-                final_v4 = new_endpoint.rsplit(":", 1)[0]
-                final_v6 = None
-            else:
-                final_v4 = None
-                final_v6 = new_endpoint.split("]:")[0].strip("[") if "]:" in new_endpoint else None
-
-            return {"success": True, "endpoint_v4": final_v4, "endpoint_v6": final_v6}
-
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        logger.info(f"[{tag}] WARP WireGuard 设备已重新注册并创建内核接口")
+        return {"success": True, "endpoint_v4": endpoint_v4, "endpoint_v6": endpoint_v6}
 
     def _update_wg_interface_endpoint(self, interface: str, endpoint: str):
         """更新内核 WireGuard 接口的 Endpoint"""

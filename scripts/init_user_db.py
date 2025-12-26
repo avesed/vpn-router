@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""初始化用户配置数据库（用户数据）"""
-import sqlite3
+"""初始化用户配置数据库（用户数据）- 支持 SQLCipher 加密"""
+import argparse
 import json
 import os
 import subprocess
 from pathlib import Path
 import sys
 import yaml
+
+# SQLCipher 加密数据库支持
+try:
+    from pysqlcipher3 import dbapi2 as sqlite3
+    HAS_SQLCIPHER = True
+except ImportError:
+    import sqlite3
+    HAS_SQLCIPHER = False
 
 
 # 用户数据库结构
@@ -364,13 +372,40 @@ CREATE TABLE IF NOT EXISTS admin_auth (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- PIA 凭据表（单行，数据库已加密，无需额外加密）
+CREATE TABLE IF NOT EXISTS pia_credentials (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    username TEXT NOT NULL,
+    password TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
-def init_user_db(db_path: Path) -> sqlite3.Connection:
-    """初始化用户数据库结构"""
+def init_user_db(db_path: Path, encryption_key: str = None) -> sqlite3.Connection:
+    """初始化用户数据库结构
+
+    Args:
+        db_path: 数据库文件路径
+        encryption_key: SQLCipher 加密密钥（64 字符 hex）
+
+    Returns:
+        数据库连接
+    """
     print(f"初始化用户数据库: {db_path}")
-    conn = sqlite3.Connection(db_path)
+    if encryption_key and HAS_SQLCIPHER:
+        print(f"  使用 SQLCipher 加密 (密钥长度: {len(encryption_key)})")
+    elif encryption_key and not HAS_SQLCIPHER:
+        print("  警告: 请求加密但 SQLCipher 不可用，使用未加密数据库")
+
+    conn = sqlite3.connect(str(db_path))
+
+    # 应用 SQLCipher 加密密钥
+    if encryption_key and HAS_SQLCIPHER:
+        conn.execute(f"PRAGMA key = '{encryption_key}'")
+
     conn.executescript(USER_DB_SCHEMA)
     conn.commit()
     return conn
@@ -721,22 +756,27 @@ def load_pia_profiles(conn: sqlite3.Connection, config_dir: Path):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: init_user_db.py <配置目录>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="初始化用户配置数据库")
+    parser.add_argument("config_dir", help="配置目录路径")
+    parser.add_argument("--key", help="SQLCipher 加密密钥（64 字符 hex）")
+    args = parser.parse_args()
 
-    config_dir = Path(sys.argv[1])
+    config_dir = Path(args.config_dir)
     user_db_path = config_dir / "user-config.db"
+
+    # 从参数或环境变量获取密钥
+    encryption_key = args.key or os.environ.get("SQLCIPHER_KEY")
 
     print("=" * 60)
     print("初始化用户配置数据库")
     print("=" * 60)
     print(f"配置目录: {config_dir}")
     print(f"数据库路径: {user_db_path}")
+    print(f"SQLCipher: {'启用' if encryption_key and HAS_SQLCIPHER else '禁用'}")
     print()
 
     # 初始化数据库
-    conn = init_user_db(user_db_path)
+    conn = init_user_db(user_db_path, encryption_key)
 
     # 迁移现有数据库（添加新字段）
     migrate_wireguard_peers_lan_fields(conn)

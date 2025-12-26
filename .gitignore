@@ -36,6 +36,7 @@ vite.config.d.ts
 
 # User config database (auto-created on container startup)
 /config/user-config.db
+config/user-config.db.backup
 
 # Auto-downloaded geo data files
 /config/geoip.db
@@ -93,3 +94,4 @@ htmlcov/
 # Misc
 .cache/
 tmp/
+

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useAuth } from "../contexts/AuthContext";
@@ -7,13 +7,29 @@ import LanguageSwitcher from "../components/LanguageSwitcher";
 
 export default function Setup() {
   const { t } = useTranslation();
-  const { setup } = useAuth();
+  const { setup, isSetup, isLoading: authLoading } = useAuth();
   const navigate = useNavigate();
 
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  // 如果已经设置过管理密码，直接跳转到主页
+  useEffect(() => {
+    if (!authLoading && isSetup) {
+      navigate("/", { replace: true });
+    }
+  }, [authLoading, isSetup, navigate]);
+
+  // 检测中显示 loading
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-brand"></div>
+      </div>
+    );
+  }
 
   // H9: 可配置的密码复杂度验证
   function validatePasswordComplexity(pwd: string): string | null {

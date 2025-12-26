@@ -448,17 +448,17 @@ export const api = {
       message: string;
     }>(`/test/egress/${encodeURIComponent(tag)}/speed?size=${size || 10}&timeout=${timeout || 30}`),
 
-  // Backup / Restore
+  // Backup / Restore (v2.0: SQLCipher 加密数据库)
   getBackupStatus: () => request<BackupStatus>("/backup/status"),
-  exportBackup: (password?: string, includePiaCredentials = true) =>
+  exportBackup: (password: string) =>
     request<BackupExportResponse>("/backup/export", {
       method: "POST",
-      body: { password, include_pia_credentials: includePiaCredentials }
+      body: { password }
     }),
-  importBackup: (data: string, password?: string, mergeMode: "replace" | "merge" = "replace") =>
+  importBackup: (data: string, password: string) =>
     request<BackupImportResponse>("/backup/import", {
       method: "POST",
-      body: { data, password, merge_mode: mergeMode }
+      body: { data, password }
     }),
 
   // AdBlock Rule Sets

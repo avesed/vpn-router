@@ -32,30 +32,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# WARP Endpoint IP 范围（Cloudflare 消费者 WARP 服务）
-WARP_IP_RANGES = [
-    "162.159.192.0/24",
-    "162.159.193.0/24",
-    "162.159.195.0/24",
-    "188.114.96.0/24",
-    "188.114.97.0/24",
-    "188.114.98.0/24",
-    "188.114.99.0/24",
+# WARP Endpoint IP 范围（来自 Cloudflare 官方文档）
+# https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/deployment/firewall/
+WARP_IP_RANGES_WIREGUARD = [
+    "162.159.193.0/24",  # WireGuard IPv4
+]
+WARP_IP_RANGES_MASQUE = [
+    "162.159.197.0/24",  # MASQUE IPv4
 ]
 
-# WARP 端口列表（来自官方文档和实测）
-WARP_PORTS = [
-    500, 854, 859, 864, 878, 880, 890, 891, 894, 903,
-    908, 928, 934, 939, 942, 943, 945, 946, 955, 968,
-    987, 988, 1002, 1010, 1014, 1018, 1070, 1074, 1180,
-    1387, 1843, 2371, 2408, 2506, 3138, 3476, 3581,
-    3854, 4177, 4198, 4233, 5279, 5956, 7103, 7152,
-    7156, 7281, 7559, 8319, 8742, 8854, 8886
-]
+# 兼容旧代码，默认使用 WireGuard 范围
+WARP_IP_RANGES = WARP_IP_RANGES_WIREGUARD
 
-# 协议对应的端口
+# WARP 端口列表（来自官方文档）
+# WireGuard: 2408 (default), 500, 1701, 4500 (fallback)
+# MASQUE: 443 (default), 500, 1701, 4500, 4443, 8443, 8095 (fallback)
+WARP_PORTS_WIREGUARD = [2408, 500, 1701, 4500]
+WARP_PORTS_MASQUE = [443, 500, 1701, 4500, 4443, 8443, 8095]
+
+# 兼容旧代码
+WARP_PORTS = WARP_PORTS_WIREGUARD
+
+# 协议对应的默认端口
 PROTOCOL_PORTS = {
-    "masque": 443,    # HTTPS
+    "masque": 443,      # HTTPS/UDP
     "wireguard": 2408,  # UDP
 }
 

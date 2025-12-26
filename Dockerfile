@@ -111,6 +111,7 @@ ENV SING_BOX_CONFIG=/etc/sing-box/sing-box.json \
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
         ca-certificates \
         curl \
         gettext-base \
@@ -118,9 +119,11 @@ RUN set -eux; \
         iptables \
         iputils-ping \
         jq \
+        libsqlcipher-dev \
         openvpn \
         procps \
         python3 \
+        python3-dev \
         python3-pip \
         python3-requests \
         python3-yaml \
@@ -193,6 +196,7 @@ COPY scripts/v2ray_stats_client.py /usr/local/bin/v2ray_stats_client.py
 COPY scripts/v2ray_uri_parser.py /usr/local/bin/v2ray_uri_parser.py
 COPY scripts/setup_kernel_wg.py /usr/local/bin/setup_kernel_wg.py
 COPY scripts/setup_kernel_wg_egress.py /usr/local/bin/setup_kernel_wg_egress.py
+COPY scripts/key_manager.py /usr/local/bin/key_manager.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \

@@ -820,6 +820,18 @@ export default function IngressManager() {
                       t("ingress.autoDetect")
                     )}
                   </button>
+                  <button
+                    onClick={handleSaveSettings}
+                    disabled={savingSettings || !serverEndpoint.trim() || serverEndpoint.trim() === serverEndpointSaved}
+                    className="px-3 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                  >
+                    {savingSettings ? (
+                      <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                    ) : (
+                      <CheckIcon className="h-4 w-4" />
+                    )}
+                    {t("common.save")}
+                  </button>
                 </div>
                 <p className="text-xs text-slate-500 mt-2">
                   {t("ingress.serverAddressHint", { port: ingress?.interface.listen_port || 36100 })}
