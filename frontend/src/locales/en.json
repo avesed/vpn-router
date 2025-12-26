@@ -677,7 +677,7 @@
   },
   "openvpnEgress": {
     "title": "OpenVPN Egress",
-    "subtitle": "OpenVPN tunnels bridged to sing-box via SOCKS5 proxy",
+    "subtitle": "OpenVPN tunnels with direct interface binding (bind_interface)",
     "addOpenvpnEgress": "Add OpenVPN Egress",
     "addEgress": "Add Egress",
     "editTitle": "Edit OpenVPN Egress",
@@ -726,7 +726,7 @@
     "extraOptions": "Extra Options",
     "extraOptionsPlaceholder": "One OpenVPN option per line",
     "extraOptionsHint": "Advanced configuration options",
-    "socksPort": "SOCKS Port",
+    "tunDevice": "TUN Device",
     "enabled": "Enabled",
     "disabled": "Disabled",
     "importOvpn": "Import .ovpn File",

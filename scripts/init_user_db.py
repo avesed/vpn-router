@@ -176,8 +176,11 @@ CREATE TABLE IF NOT EXISTS openvpn_egress (
     compress TEXT,                    -- 压缩算法（lzo, lz4, etc.）
     extra_options TEXT,               -- 额外的 OpenVPN 选项（JSON 数组）
 
-    -- SOCKS5 代理（自动分配端口）
-    socks_port INTEGER UNIQUE,        -- 本地 SOCKS5 代理端口
+    -- TUN 设备（直接绑定接口，无需 SOCKS5 代理）
+    tun_device TEXT UNIQUE,           -- TUN 设备名 (tun10, tun11, ...)
+
+    -- 遗留字段（保留用于回滚，下个版本删除）
+    socks_port INTEGER UNIQUE,        -- 本地 SOCKS5 代理端口（已废弃）
 
     -- 状态
     enabled INTEGER DEFAULT 1,
@@ -626,6 +629,52 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
     print("✓ 创建 outbound_groups 表")
 
 
+def migrate_openvpn_socks_to_tun(conn: sqlite3.Connection):
+    """迁移 OpenVPN 从 socks_port 到 tun_device（直接接口绑定）
+
+    此迁移将 OpenVPN 出口从 SOCKS5 代理桥接架构改为直接 bind_interface 方式，
+    与 WireGuard 内核出口架构一致。
+
+    架构变更:
+      旧: sing-box → SOCKS outbound (127.0.0.1:37001) → socks5_proxy.py → tun10 → OpenVPN
+      新: sing-box → direct outbound (bind_interface: tun10) → tun10 → OpenVPN
+    """
+    cursor = conn.cursor()
+
+    # 检查 openvpn_egress 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='openvpn_egress'")
+    if not cursor.fetchone():
+        print("⊘ openvpn_egress 表不存在，跳过 tun_device 迁移")
+        return
+
+    # 检查是否需要迁移（检查 tun_device 列是否存在）
+    cursor.execute("PRAGMA table_info(openvpn_egress)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "tun_device" in columns:
+        print("⊘ openvpn_egress.tun_device 字段已存在，跳过迁移")
+        return
+
+    # 1. 添加 tun_device 列
+    cursor.execute("ALTER TABLE openvpn_egress ADD COLUMN tun_device TEXT")
+    print("✓ 添加 openvpn_egress.tun_device 字段")
+
+    # 2. 为现有行分配 tun_device（从 tun10 开始）
+    cursor.execute("SELECT id FROM openvpn_egress ORDER BY id")
+    rows = cursor.fetchall()
+
+    if rows:
+        for i, (row_id,) in enumerate(rows):
+            tun_device = f"tun{10 + i}"
+            cursor.execute(
+                "UPDATE openvpn_egress SET tun_device = ? WHERE id = ?",
+                (tun_device, row_id)
+            )
+        print(f"✓ 为 {len(rows)} 个 OpenVPN 出口分配 tun_device")
+
+    conn.commit()
+
+
 def generate_wireguard_private_key() -> str:
     """生成 WireGuard 私钥"""
     try:
@@ -843,6 +892,7 @@ def main():
     migrate_admin_auth(conn)
     migrate_warp_egress_protocol(conn)
     migrate_outbound_groups(conn)
+    migrate_openvpn_socks_to_tun(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

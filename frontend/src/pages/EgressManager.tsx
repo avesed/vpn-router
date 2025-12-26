@@ -2243,9 +2243,9 @@ export default function EgressManager() {
                       <p className="text-xs text-slate-400">
                         <span className="text-slate-500">{t('openvpnEgress.protocol')}:</span> {egress.protocol.toUpperCase()}
                       </p>
-                      {egress.socks_port && (
+                      {egress.tun_device && (
                         <p className="text-xs font-mono text-slate-400">
-                          <span className="text-slate-500">{t('openvpnEgress.socksPort')}:</span> {egress.socks_port}
+                          <span className="text-slate-500">{t('openvpnEgress.tunDevice')}:</span> {egress.tun_device}
                         </p>
                       )}
                     </div>

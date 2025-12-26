@@ -794,12 +794,15 @@ def load_openvpn_egress() -> List[dict]:
 
 
 def ensure_openvpn_egress_outbounds(config: dict, openvpn_egress: List[dict]) -> List[str]:
-    """确保每个 OpenVPN 出口都有对应的 SOCKS5 outbound
+    """确保每个 OpenVPN 出口都有对应的 direct outbound
 
-    OpenVPN 隧道通过 SOCKS5 代理桥接到 sing-box:
-    - 每个 OpenVPN 隧道运行独立进程
-    - 每个隧道有对应的 SOCKS5 代理（监听 127.0.0.1:socks_port）
-    - sing-box 通过 SOCKS outbound 连接到 OpenVPN 隧道
+    OpenVPN 隧道通过 direct + bind_interface 直接绑定到 TUN 设备:
+    - 每个 OpenVPN 隧道运行独立进程，创建 TUN 设备（如 tun10, tun11）
+    - sing-box 通过 direct outbound 的 bind_interface 直接路由流量
+    - 无需中间 SOCKS5 代理层
+
+    架构:
+      sing-box → direct outbound (bind_interface: tun10) → tun10 → OpenVPN
 
     Args:
         config: sing-box 配置
@@ -817,33 +820,32 @@ def ensure_openvpn_egress_outbounds(config: dict, openvpn_egress: List[dict]) ->
 
     for egress in openvpn_egress:
         tag = egress.get("tag")
-        socks_port = egress.get("socks_port")
+        tun_device = egress.get("tun_device")
 
-        if not tag or not socks_port:
-            print(f"[render] 警告: OpenVPN 出口缺少 tag 或 socks_port，跳过")
+        if not tag or not tun_device:
+            print(f"[render] 警告: OpenVPN 出口缺少 tag 或 tun_device，跳过")
             continue
 
         openvpn_tags.append(tag)
 
-        # 构建 SOCKS outbound
+        # 构建 direct outbound，绑定到 TUN 设备
         outbound = {
-            "type": "socks",
+            "type": "direct",
             "tag": tag,
-            "server": "127.0.0.1",
-            "server_port": socks_port
+            "bind_interface": tun_device
         }
 
         if tag in existing_tags:
-            # 更新现有 outbound
+            # 更新现有 outbound（可能是旧的 socks 类型）
             for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag and ob.get("type") == "socks":
+                if ob.get("tag") == tag:
                     outbounds[i] = outbound
                     break
         else:
             # 在 block 之前插入
             block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
             outbounds.insert(block_idx, outbound)
-            print(f"[render] 创建 OpenVPN 出口 (SOCKS): {tag} -> 127.0.0.1:{socks_port}")
+            print(f"[render] 创建 OpenVPN 出口 (direct): {tag} -> bind_interface: {tun_device}")
 
     return openvpn_tags
 
@@ -2029,8 +2031,9 @@ def main() -> None:
         direct_tags = ensure_direct_egress_outbounds(config, direct_egress)
         all_egress_tags.extend(direct_tags)
 
-    # 加载并处理 OpenVPN 出口（通过 SOCKS5 代理桥接）
+    # 加载并处理 OpenVPN 出口（通过 direct + bind_interface 直接绑定 TUN）
     openvpn_egress = load_openvpn_egress()
+    openvpn_tags = []  # 用于后续 speedtest inbound 生成
     if openvpn_egress:
         print(f"[render] 处理 {len(openvpn_egress)} 个 OpenVPN 出口")
         openvpn_tags = ensure_openvpn_egress_outbounds(config, openvpn_egress)
@@ -2065,13 +2068,16 @@ def main() -> None:
         group_tags = ensure_outbound_group_outbounds(config, outbound_groups)
         all_egress_tags.extend(group_tags)
 
-    # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + V2Ray + WARP）
+    # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + OpenVPN + V2Ray + WARP）
     # wg_egress_tags 已包含 PIA 和自定义 WireGuard 出口
+    # openvpn_tags 现在使用 direct + bind_interface，与 WireGuard 架构一致
     speedtest_tags = list(wg_egress_tags) if wg_egress_tags else []
+    if openvpn_tags:
+        speedtest_tags.extend(openvpn_tags)
     if v2ray_egress:
         speedtest_tags.extend([e.get("tag") for e in v2ray_egress if e.get("tag") and e.get("enabled", 1)])
 
-    # 为 WireGuard/V2Ray 出口添加测速 SOCKS inbound
+    # 为 WireGuard/OpenVPN/V2Ray 出口添加测速 SOCKS inbound
     if speedtest_tags:
         ensure_speed_test_inbounds(config, speedtest_tags)
 

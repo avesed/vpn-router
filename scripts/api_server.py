@@ -4113,7 +4113,7 @@ def api_list_all_egress():
             "server": eg.get("remote_host", ""),
             "port": eg.get("remote_port", 1194),
             "protocol": eg.get("protocol", "udp"),
-            "socks_port": eg.get("socks_port"),
+            "tun_device": eg.get("tun_device"),
             "enabled": eg.get("enabled", 1),
             "is_configured": True,
         })
@@ -4791,9 +4791,9 @@ def api_create_openvpn_egress(payload: OpenVPNEgressCreateRequest):
         extra_options=payload.extra_options,
     )
 
-    # 获取分配的 SOCKS 端口
+    # 获取分配的 TUN 设备
     egress = db.get_openvpn_egress(payload.tag)
-    socks_port = egress.get("socks_port") if egress else None
+    tun_device = egress.get("tun_device") if egress else None
 
     # 重新渲染配置并重载
     reload_status = ""
@@ -4809,7 +4809,7 @@ def api_create_openvpn_egress(payload: OpenVPNEgressCreateRequest):
     return {
         "message": f"OpenVPN 出口 '{payload.tag}' 已创建{reload_status}",
         "tag": payload.tag,
-        "socks_port": socks_port,
+        "tun_device": tun_device,
     }
 
 
@@ -5703,9 +5703,9 @@ def api_get_available_members():
     - Custom WireGuard egress
     - WARP WireGuard egress (protocol == "wireguard")
     - Direct egress (with bind_interface)
+    - OpenVPN egress (使用 TUN 设备直接绑定)
 
     不支持 ECMP 的类型（使用 SOCKS 代理）：
-    - OpenVPN (通过 SOCKS5 桥接)
     - V2Ray egress (通过 SOCKS5 桥接)
     - WARP MASQUE (通过 SOCKS5 代理)
     """
@@ -5765,8 +5765,21 @@ def api_get_available_members():
     except Exception as e:
         print(f"WARNING: Failed to get WARP egress: {e}")
 
+    # OpenVPN egress (使用 TUN 设备直接绑定)
+    try:
+        openvpn_list = db.get_openvpn_egress_list(enabled_only=True)
+        for e in openvpn_list:
+            # 只有已分配 tun_device 的 OpenVPN 才能参与 ECMP
+            if e.get("tun_device"):
+                members.append({
+                    "tag": e.get("tag"),
+                    "type": "openvpn",
+                    "description": e.get("description") or e.get("tag"),
+                })
+    except Exception as e:
+        print(f"WARNING: Failed to get OpenVPN egress: {e}")
+
     # 注意：以下类型不支持 ECMP，不列出
-    # - OpenVPN (SOCKS5 桥接)
     # - V2Ray egress (SOCKS5 桥接)
     # - WARP MASQUE (SOCKS5 代理)
     # - builtin "direct" (没有特定接口)
@@ -6673,21 +6686,21 @@ def _test_direct_connection(tag: str, test_url: str, timeout_sec: float) -> dict
 
 
 def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
-    """使用 curl + SOCKS 代理测试 SOCKS 类型出口"""
+    """使用 curl + SOCKS 代理测试 SOCKS 类型出口（V2Ray、WARP MASQUE）"""
     try:
         # 从数据库获取 SOCKS 端口
         socks_port = None
         if HAS_DATABASE:
             db = _get_db()
-            # 先检查 OpenVPN
+            # 检查 OpenVPN（现在使用 TUN 设备，不是 SOCKS）
             openvpn_egress = db.get_openvpn_egress(tag)
-            if openvpn_egress:
-                socks_port = openvpn_egress.get("socks_port")
-            # 再检查 WARP
-            if not socks_port:
-                warp_egress = db.get_warp_egress(tag)
-                if warp_egress:
-                    socks_port = warp_egress.get("socks_port")
+            if openvpn_egress and openvpn_egress.get("tun_device"):
+                # OpenVPN 使用接口绑定测试
+                return _test_interface_connection(openvpn_egress["tun_device"], test_url, timeout_sec)
+            # 再检查 WARP（仅 MASQUE 协议使用 SOCKS）
+            warp_egress = db.get_warp_egress(tag)
+            if warp_egress and warp_egress.get("socks_port"):
+                socks_port = warp_egress.get("socks_port")
 
         if not socks_port:
             # 回退到 clash_api 测试
@@ -6915,29 +6928,25 @@ def _is_openvpn_egress(tag: str) -> bool:
     try:
         db = _get_db()
         egress = db.get_openvpn_egress(tag)
-        return egress is not None
+        return egress is not None and egress.get("tun_device") is not None
     except Exception:
         return False
 
 
-def _get_openvpn_socks_port(tag: str) -> Optional[int]:
-    """获取 OpenVPN 出口的 SOCKS 端口（仅当端口正在监听时返回）"""
+def _get_openvpn_tun_device(tag: str) -> Optional[str]:
+    """获取 OpenVPN 出口的 TUN 设备名（仅当 TUN 设备存在时返回）"""
     if not HAS_DATABASE:
         return None
     try:
         db = _get_db()
         egress = db.get_openvpn_egress(tag)
         if egress:
-            socks_port = egress.get("socks_port")
-            if socks_port:
-                # 检查端口是否正在监听
-                import socket
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                result = sock.connect_ex(("127.0.0.1", socks_port))
-                sock.close()
-                if result == 0:
-                    return socks_port
+            tun_device = egress.get("tun_device")
+            if tun_device:
+                # 检查 TUN 设备是否存在
+                from pathlib import Path
+                if Path(f"/sys/class/net/{tun_device}").exists():
+                    return tun_device
     except Exception:
         pass
     return None
@@ -7014,11 +7023,11 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
                     curl_cmd.extend(["--interface", direct_egress["inet4_bind_address"]])
                     proxy_info = f"IP {direct_egress['inet4_bind_address']}"
     elif _is_openvpn_egress(tag):
-        # OpenVPN：使用已有 SOCKS 端口
-        socks_port = _get_openvpn_socks_port(tag)
-        if socks_port:
-            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
-            proxy_info = f"SOCKS5 :{socks_port}"
+        # OpenVPN：使用 TUN 设备直接绑定
+        tun_device = _get_openvpn_tun_device(tag)
+        if tun_device:
+            curl_cmd.extend(["--interface", tun_device])
+            proxy_info = f"接口 {tun_device}"
         else:
             return {"success": False, "speed_mbps": 0, "message": "OpenVPN tunnel not connected"}
     elif _is_warp_egress(tag):
@@ -7476,39 +7485,85 @@ def _reload_xray_egress() -> str:
 
 
 def _reload_openvpn_manager() -> str:
-    """重载 OpenVPN 管理器守护进程（同步数据库变更）
+    """重载或启动 OpenVPN 管理器守护进程（同步数据库变更）
 
-    通过 SIGHUP 信号通知守护进程重载配置，避免创建新进程导致状态丢失。
+    如果守护进程已运行，通过 SIGHUP 信号通知重载配置。
+    如果守护进程未运行且有启用的 OpenVPN 出口，则启动守护进程。
 
     Returns:
         状态消息
     """
     import signal as sig_module
+    import fcntl
 
     pid_file = Path("/run/openvpn-manager.pid")
+    lock_file = Path("/run/openvpn-manager.lock")
 
-    if not pid_file.exists():
-        print("[api] OpenVPN manager not running (no PID file)")
-        return ""
+    # 使用文件锁防止竞态条件
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file, 'w') as lf:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # 另一个进程正在启动守护进程，等待并重试
+            import time
+            time.sleep(0.5)
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
 
-    try:
-        daemon_pid = int(pid_file.read_text().strip())
-        os.kill(daemon_pid, sig_module.SIGHUP)
-        print(f"[api] Sent SIGHUP to OpenVPN manager (PID: {daemon_pid})")
-        return ", OpenVPN manager reloaded"
-    except ValueError:
-        print("[api] Invalid PID file content")
-        return ""
-    except ProcessLookupError:
-        print("[api] OpenVPN manager process not found, removing stale PID file")
-        pid_file.unlink(missing_ok=True)
-        return ""
-    except PermissionError:
-        print("[api] Permission denied sending signal to OpenVPN manager")
-        return ""
-    except Exception as e:
-        print(f"[api] OpenVPN manager reload error: {e}")
-        return ""
+        try:
+            # 检查守护进程是否在运行
+            daemon_running = False
+            if pid_file.exists():
+                try:
+                    daemon_pid = int(pid_file.read_text().strip())
+                    os.kill(daemon_pid, 0)  # 检查进程是否存在
+                    daemon_running = True
+                except (ValueError, ProcessLookupError):
+                    pid_file.unlink(missing_ok=True)
+                except PermissionError:
+                    daemon_running = True  # 进程存在但无权限检查
+
+            if daemon_running:
+                # 发送 SIGHUP 重载
+                try:
+                    daemon_pid = int(pid_file.read_text().strip())
+                    os.kill(daemon_pid, sig_module.SIGHUP)
+                    print(f"[api] Sent SIGHUP to OpenVPN manager (PID: {daemon_pid})")
+                    return ", OpenVPN manager reloaded"
+                except Exception as e:
+                    print(f"[api] OpenVPN manager reload error: {e}")
+                    return ""
+            else:
+                # 守护进程未运行，检查是否有启用的 OpenVPN 出口
+                try:
+                    db = _get_db()
+                    openvpn_list = db.get_openvpn_egress_list()
+                    enabled_count = sum(1 for eg in openvpn_list if eg.get("enabled", 0) == 1)
+
+                    if enabled_count > 0:
+                        # 启动守护进程
+                        subprocess.Popen(
+                            ["python3", "/usr/local/bin/openvpn_manager.py", "daemon"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True
+                        )
+                        # 等待 PID 文件创建
+                        import time
+                        for _ in range(10):
+                            time.sleep(0.2)
+                            if pid_file.exists():
+                                break
+                        print(f"[api] Started OpenVPN manager daemon ({enabled_count} tunnels)")
+                        return ", OpenVPN manager started"
+                    else:
+                        print("[api] No enabled OpenVPN egress, skipping manager start")
+                        return ""
+                except Exception as e:
+                    print(f"[api] Failed to start OpenVPN manager: {e}")
+                    return ""
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def _sync_kernel_wg_egress() -> str:

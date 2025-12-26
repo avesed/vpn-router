@@ -90,6 +90,22 @@ def interface_exists(interface: str) -> bool:
     return result.returncode == 0
 
 
+def get_interface_peers(interface: str) -> List[str]:
+    """Get list of peer public keys for an interface"""
+    result = run_cmd(["wg", "show", interface, "peers"], check=False)
+    if result.returncode != 0:
+        return []
+    return [p.strip() for p in result.stdout.strip().split('\n') if p.strip()]
+
+
+def remove_all_peers(interface: str) -> None:
+    """Remove all peers from an interface"""
+    peers = get_interface_peers(interface)
+    for peer in peers:
+        print(f"[wg-egress] Removing old peer {peer[:20]}... from {interface}")
+        run_cmd(["wg", "set", interface, "peer", peer, "remove"], check=False)
+
+
 def get_existing_egress_interfaces() -> List[str]:
     """Get list of existing egress WireGuard interfaces"""
     result = run_cmd(["ip", "-br", "link", "show", "type", "wireguard"], check=False)
@@ -159,10 +175,15 @@ def create_egress_interface(
         # Bring interface down first
         run_cmd(["ip", "link", "set", interface, "down"], check=False)
 
+        # Remove all existing peers first to ensure clean state
+        # This fixes the issue where multiple profiles for the same region
+        # would accumulate peers on the interface
+        remove_all_peers(interface)
+
         # Set private key
         run_cmd(["wg", "set", interface, "private-key", private_key_file])
 
-        # Build peer command
+        # Build peer command (now with exactly one peer)
         peer_cmd = [
             "wg", "set", interface, "peer", public_key,
             "endpoint", f"{server}:{server_port}",

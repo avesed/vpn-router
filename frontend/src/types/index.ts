@@ -337,7 +337,7 @@ export interface EgressItem {
   enabled?: number;
   // OpenVPN specific fields
   protocol?: string;
-  socks_port?: number;
+  tun_device?: string;
   status?: "connected" | "connecting" | "disconnected" | "error";
   // V2Ray specific fields
   transport?: string;
@@ -385,7 +385,7 @@ export interface DirectEgressListResponse {
   egress: DirectEgress[];
 }
 
-// OpenVPN Egress (通过 SOCKS5 代理桥接)
+// OpenVPN Egress (通过 direct + bind_interface 直接绑定 TUN 接口)
 export interface OpenVPNEgress {
   id?: number;
   tag: string;
@@ -405,7 +405,7 @@ export interface OpenVPNEgress {
   auth: string;
   compress?: string;
   extra_options?: string;
-  socks_port?: number;
+  tun_device?: string;
   enabled: number;
   created_at?: string;
   updated_at?: string;
@@ -477,9 +477,8 @@ export interface OpenVPNTunnelStatus {
   tag: string;
   status: "connected" | "connecting" | "disconnected" | "error";
   message?: string;
-  socks_port?: number;
+  tun_device?: string;
   openvpn_pid?: number;
-  socks_pid?: number;
 }
 
 export interface CustomEgressListResponse {

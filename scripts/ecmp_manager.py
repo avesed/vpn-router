@@ -88,7 +88,8 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
     - PIA profiles: wg-pia-{tag}
     - Custom WireGuard: wg-eg-{tag}
     - Direct egress: bind_interface 字段
-    - WARP: wg-warp-{tag}
+    - WARP WireGuard: wg-warp-{tag}
+    - OpenVPN: tun_device 字段 (tun10, tun11, ...)
 
     Args:
         db: 数据库管理器
@@ -130,6 +131,11 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
             # WARP MASQUE 使用 SOCKS 代理，不是内核接口
             logger.warning(f"WARP egress '{tag}' uses SOCKS proxy, not kernel interface")
             return None
+
+    # 检查 OpenVPN egress（使用 TUN 设备）
+    openvpn = db.get_openvpn_egress(tag)
+    if openvpn and openvpn.get("tun_device"):
+        return openvpn["tun_device"]
 
     # 检查其他出口组（嵌套）
     group = db.get_outbound_group(tag)

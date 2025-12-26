@@ -77,6 +77,11 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
     if direct and direct.get("bind_interface"):
         return direct["bind_interface"]
 
+    # 检查 OpenVPN egress（使用 TUN 设备）
+    openvpn = db.get_openvpn_egress(tag)
+    if openvpn and openvpn.get("tun_device"):
+        return openvpn["tun_device"]
+
     return None
 
 
@@ -220,11 +225,12 @@ def check_member_health(db, member_tag: str, url: str, timeout: int) -> Tuple[bo
     Returns:
         (healthy: bool, latency_ms: int, error: str)
     """
-    # 检查是否有 SOCKS 端口（OpenVPN、V2Ray、WARP）
+    # 检查 OpenVPN（使用 TUN 设备，direct + bind_interface）
     openvpn = db.get_openvpn_egress(member_tag)
-    if openvpn and openvpn.get("socks_port"):
-        return check_egress_health_via_socks(openvpn["socks_port"], url, timeout)
+    if openvpn and openvpn.get("tun_device"):
+        return check_egress_health(openvpn["tun_device"], url, timeout)
 
+    # 检查是否有 SOCKS 端口（V2Ray、WARP MASQUE）
     v2ray = db.get_v2ray_egress(member_tag)
     if v2ray and v2ray.get("socks_port"):
         return check_egress_health_via_socks(v2ray["socks_port"], url, timeout)

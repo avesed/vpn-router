@@ -2,12 +2,15 @@
 """
 OpenVPN 隧道管理器
 
-管理多个 OpenVPN 进程和对应的 SOCKS5 代理，支持：
+管理多个 OpenVPN 进程，支持：
 - 从数据库读取配置
 - 生成 OpenVPN 配置文件
 - 启动/停止 OpenVPN 进程
-- 启动/停止 SOCKS5 代理
 - 监控隧道状态
+
+每个 OpenVPN 隧道创建一个 TUN 设备（如 tun10, tun11），
+sing-box 通过 direct outbound + bind_interface 直接路由流量，
+无需中间 SOCKS5 代理层。
 
 使用方法:
     python3 openvpn_manager.py start     # 启动所有启用的隧道
@@ -228,10 +231,85 @@ class TunnelProcess:
     """存储隧道进程信息"""
     tag: str
     openvpn_pid: Optional[int] = None
-    socks_pid: Optional[int] = None
     tun_device: Optional[str] = None
-    socks_port: int = 0
     status: str = "stopped"  # stopped, starting, connected, error
+
+
+def _get_tunnel_status_from_system(tag: str) -> Dict:
+    """
+    从系统状态检查隧道状态（用于独立的 status 命令）
+
+    由于 status 命令创建新的 manager 实例，无法访问运行中守护进程的内存状态。
+    因此需要直接检查系统状态：
+    1. 从数据库读取 tun_device
+    2. 检查 TUN 接口是否存在
+    3. 查找对应的 openvpn 进程
+
+    Args:
+        tag: 隧道标签
+
+    Returns:
+        状态字典，格式与 _tunnel_to_dict 一致
+    """
+    db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+    egress = db.get_openvpn_egress(tag)
+
+    if not egress:
+        return {
+            "tag": tag,
+            "status": "not_found",
+            "openvpn_pid": None,
+            "tun_device": None,
+            "error": f"OpenVPN egress '{tag}' not found in database"
+        }
+
+    tun_device = egress.get("tun_device")
+    if not tun_device:
+        return {
+            "tag": tag,
+            "status": "error",
+            "openvpn_pid": None,
+            "tun_device": None,
+            "error": "No tun_device configured"
+        }
+
+    # 检查 TUN 接口是否存在
+    tun_exists = Path(f"/sys/class/net/{tun_device}").exists()
+
+    # 查找 openvpn 进程
+    openvpn_pid = None
+    config_path = str(OPENVPN_RUN_DIR / tag / "client.conf")
+    try:
+        # 使用 pgrep 查找包含配置文件路径的 openvpn 进程
+        result = subprocess.run(
+            ["pgrep", "-f", f"openvpn.*{config_path}"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # 可能有多个匹配，取第一个
+            pids = result.stdout.strip().split('\n')
+            if pids:
+                openvpn_pid = int(pids[0])
+    except (subprocess.TimeoutExpired, ValueError, Exception) as e:
+        logger.debug(f"查找 openvpn 进程时出错: {e}")
+
+    # 确定状态
+    if tun_exists and openvpn_pid:
+        status = "connected"
+    elif openvpn_pid:
+        # 进程存在但 TUN 还未创建，可能正在启动
+        status = "starting"
+    else:
+        status = "disconnected"
+
+    return {
+        "tag": tag,
+        "status": status,
+        "openvpn_pid": openvpn_pid,
+        "tun_device": tun_device
+    }
 
 
 class OpenVPNManager:
@@ -240,15 +318,8 @@ class OpenVPNManager:
     def __init__(self):
         self.tunnels: Dict[str, TunnelProcess] = {}
         self.db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
-        self._tun_counter = 0
         self._running = False
-
-    def _get_next_tun_device(self) -> str:
-        """获取下一个可用的 tun 设备名"""
-        # 使用 tun10+ 避免与系统其他 tun 冲突
-        device = f"tun{10 + self._tun_counter}"
-        self._tun_counter += 1
-        return device
+        self._reload_event: Optional[asyncio.Event] = None  # 用于立即响应 SIGHUP
 
     def _generate_config(self, egress: dict) -> Path:
         """生成 OpenVPN 配置文件"""
@@ -256,8 +327,10 @@ class OpenVPNManager:
         config_dir = OPENVPN_RUN_DIR / tag
         config_dir.mkdir(parents=True, exist_ok=True)
 
-        # 分配 tun 设备
-        tun_device = self._get_next_tun_device()
+        # 从数据库获取 tun 设备
+        tun_device = egress.get("tun_device")
+        if not tun_device:
+            raise ValueError(f"OpenVPN egress '{tag}' 缺少 tun_device 配置")
 
         # 生成配置文件
         config_lines = [
@@ -354,14 +427,13 @@ class OpenVPNManager:
         else:
             self.tunnels[tag] = TunnelProcess(
                 tag=tag,
-                tun_device=tun_device,
-                socks_port=egress.get("socks_port", 0)
+                tun_device=tun_device
             )
 
         return config_path
 
     async def start_tunnel(self, tag: str) -> bool:
-        """启动单个隧道（OpenVPN + SOCKS5）"""
+        """启动单个隧道（仅 OpenVPN，无需 SOCKS5 代理）"""
         egress = self.db.get_openvpn_egress(tag)
         if not egress:
             logger.error(f"[{tag}] OpenVPN 配置不存在")
@@ -398,31 +470,15 @@ class OpenVPNManager:
             return False
 
         # 等待 tun 设备就绪
-        await self._wait_for_tun(tunnel.tun_device, timeout=30)
+        tun_ready = await self._wait_for_tun(tunnel.tun_device, timeout=30)
+        if tun_ready:
+            tunnel.status = "connected"
+            logger.info(f"[{tag}] 隧道已连接 (tun: {tunnel.tun_device})")
+        else:
+            tunnel.status = "error"
+            logger.error(f"[{tag}] tun 设备未就绪")
+            return False
 
-        # 启动 SOCKS5 代理
-        socks_port = egress.get("socks_port", 0)
-        if socks_port:
-            try:
-                socks_proc = subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(Path(__file__).parent / "socks5_proxy.py"),
-                        "--host", "127.0.0.1",
-                        "--port", str(socks_port),
-                        "--bind-interface", tunnel.tun_device
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                tunnel.socks_pid = socks_proc.pid
-                tunnel.socks_port = socks_port
-                logger.info(f"[{tag}] SOCKS5 代理已启动 (PID: {socks_proc.pid}, 端口: {socks_port})")
-            except Exception as e:
-                logger.error(f"[{tag}] 启动 SOCKS5 代理失败: {e}")
-                # 不影响隧道整体状态
-
-        tunnel.status = "connected"
         return True
 
     async def _wait_for_tun(self, tun_device: str, timeout: int = 30):
@@ -446,15 +502,6 @@ class OpenVPNManager:
 
         tunnel = self.tunnels[tag]
         logger.info(f"[{tag}] 停止隧道...")
-
-        # 停止 SOCKS5 代理
-        if tunnel.socks_pid:
-            try:
-                os.kill(tunnel.socks_pid, signal.SIGTERM)
-                logger.debug(f"[{tag}] 已发送 SIGTERM 到 SOCKS5 (PID: {tunnel.socks_pid})")
-            except ProcessLookupError:
-                pass
-            tunnel.socks_pid = None
 
         # 停止 OpenVPN
         if tunnel.openvpn_pid:
@@ -559,9 +606,8 @@ class OpenVPNManager:
 
     def _tunnel_to_dict(self, tunnel: TunnelProcess) -> Dict:
         """转换隧道信息为字典"""
-        # 检查进程是否存活
+        # 检查 OpenVPN 进程是否存活
         openvpn_alive = False
-        socks_alive = False
 
         if tunnel.openvpn_pid:
             try:
@@ -570,18 +616,9 @@ class OpenVPNManager:
             except ProcessLookupError:
                 pass
 
-        if tunnel.socks_pid:
-            try:
-                os.kill(tunnel.socks_pid, 0)
-                socks_alive = True
-            except ProcessLookupError:
-                pass
-
         # 确定状态
-        if openvpn_alive and socks_alive:
+        if openvpn_alive:
             status = "connected"
-        elif openvpn_alive:
-            status = "connecting"  # OpenVPN 运行但 SOCKS 未启动
         elif tunnel.status == "starting":
             status = "starting"
         else:
@@ -591,9 +628,7 @@ class OpenVPNManager:
             "tag": tunnel.tag,
             "status": status,
             "openvpn_pid": tunnel.openvpn_pid if openvpn_alive else None,
-            "socks_pid": tunnel.socks_pid if socks_alive else None,
-            "tun_device": tunnel.tun_device,
-            "socks_port": tunnel.socks_port
+            "tun_device": tunnel.tun_device
         }
 
     async def run_daemon(self):
@@ -609,9 +644,17 @@ class OpenVPNManager:
         # 启动所有隧道
         await self.start_all()
 
+        # 初始化 reload event
+        self._reload_event = asyncio.Event()
+
         # 监控循环
         while self._running:
-            await asyncio.sleep(10)
+            # 等待 reload 事件或 10 秒超时（用于健康检查）
+            try:
+                await asyncio.wait_for(self._reload_event.wait(), timeout=10)
+                self._reload_event.clear()
+            except asyncio.TimeoutError:
+                pass  # 正常超时，继续健康检查
 
             # 检查是否需要重载
             if self._reload_requested:
@@ -644,6 +687,9 @@ class OpenVPNManager:
         """请求重载配置（由 SIGHUP 信号触发）"""
         logger.info("收到重载请求 (SIGHUP)")
         self._reload_requested = True
+        # 立即唤醒监控循环
+        if self._reload_event:
+            self._reload_event.set()
 
     def stop_daemon(self):
         """停止守护进程"""
@@ -691,7 +737,18 @@ async def main():
         await manager.reload()
 
     elif args.command == 'status':
-        status = manager.get_status(args.tag)
+        # status 命令需要检查实际状态，而非依赖内存中的状态
+        if args.tag:
+            status = _get_tunnel_status_from_system(args.tag)
+        else:
+            # 获取所有隧道状态
+            db = get_db()
+            egress_list = db.get_openvpn_egress_list()
+            status = {}
+            for eg in egress_list:
+                tag = eg.get("tag")
+                if tag:
+                    status[tag] = _get_tunnel_status_from_system(tag)
         print(json.dumps(status, indent=2, ensure_ascii=False))
 
     elif args.command == 'daemon':

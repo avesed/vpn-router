@@ -1347,9 +1347,9 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
-    # ============ OpenVPN Egress 管理（通过 SOCKS5 桥接）============
+    # ============ OpenVPN Egress 管理（直接接口绑定）============
 
-    OPENVPN_SOCKS_PORT_START = 37001  # SOCKS 端口起始值
+    OPENVPN_TUN_DEVICE_START = 10  # TUN 设备编号起始值 (tun10, tun11, ...)
 
     def get_openvpn_egress_list(self, enabled_only: bool = False) -> List[Dict]:
         """获取所有 OpenVPN 出口"""
@@ -1401,21 +1401,42 @@ class UserDatabase:
                     item["extra_options"] = None
             return item
 
-    def get_next_openvpn_socks_port(self) -> int:
-        """获取下一个可用的 SOCKS 端口（从 37001 开始）"""
+    def get_next_openvpn_tun_device(self) -> str:
+        """获取下一个可用的 TUN 设备名（从 tun10 开始）
+
+        Returns:
+            TUN 设备名，如 "tun10", "tun11", ...
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            row = cursor.execute(
-                "SELECT MAX(socks_port) FROM openvpn_egress"
-            ).fetchone()
-            max_port = row[0] if row and row[0] else None
-            if max_port is None:
-                return self.OPENVPN_SOCKS_PORT_START
-            next_port = max_port + 1
-            # H10: 端口边界检查
-            if next_port > 65535:
-                raise ValueError("No available SOCKS ports (exceeded 65535)")
-            return next_port
+            # 获取所有现有的 tun_device
+            rows = cursor.execute(
+                "SELECT tun_device FROM openvpn_egress WHERE tun_device IS NOT NULL"
+            ).fetchall()
+
+            if not rows:
+                return f"tun{self.OPENVPN_TUN_DEVICE_START}"
+
+            # 提取所有使用中的设备编号
+            used_numbers = set()
+            for row in rows:
+                tun_device = row[0]
+                if tun_device and tun_device.startswith("tun"):
+                    try:
+                        num = int(tun_device[3:])
+                        used_numbers.add(num)
+                    except ValueError:
+                        continue
+
+            # 从起始值开始找第一个未使用的编号
+            next_num = self.OPENVPN_TUN_DEVICE_START
+            while next_num in used_numbers:
+                next_num += 1
+                # 安全上限检查
+                if next_num > 255:
+                    raise ValueError("No available TUN devices (exceeded tun255)")
+
+            return f"tun{next_num}"
 
     def add_openvpn_egress(
         self,
@@ -1442,7 +1463,7 @@ class UserDatabase:
         Returns:
             新创建记录的 ID
         """
-        socks_port = self.get_next_openvpn_socks_port()
+        tun_device = self.get_next_openvpn_tun_device()
         extra_options_json = json.dumps(extra_options) if extra_options else None
 
         with self._get_conn() as conn:
@@ -1451,11 +1472,11 @@ class UserDatabase:
                 INSERT INTO openvpn_egress
                 (tag, description, protocol, remote_host, remote_port,
                  ca_cert, client_cert, client_key, tls_auth, tls_crypt, crl_verify,
-                 auth_user, auth_pass, cipher, auth, compress, extra_options, socks_port)
+                 auth_user, auth_pass, cipher, auth, compress, extra_options, tun_device)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (tag, description, protocol, remote_host, remote_port,
                   ca_cert, client_cert, client_key, tls_auth, tls_crypt, crl_verify,
-                  auth_user, auth_pass, cipher, auth, compress, extra_options_json, socks_port))
+                  auth_user, auth_pass, cipher, auth, compress, extra_options_json, tun_device))
             conn.commit()
             return cursor.lastrowid
 
@@ -2545,8 +2566,8 @@ class DatabaseManager:
     def get_openvpn_egress(self, tag: str) -> Optional[Dict]:
         return self.user.get_openvpn_egress(tag)
 
-    def get_next_openvpn_socks_port(self) -> int:
-        return self.user.get_next_openvpn_socks_port()
+    def get_next_openvpn_tun_device(self) -> str:
+        return self.user.get_next_openvpn_tun_device()
 
     def add_openvpn_egress(
         self,

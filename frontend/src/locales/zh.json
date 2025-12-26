@@ -677,7 +677,7 @@
   },
   "openvpnEgress": {
     "title": "OpenVPN 出口",
-    "subtitle": "通过 SOCKS5 代理桥接到 sing-box 的 OpenVPN 隧道",
+    "subtitle": "通过 direct + bind_interface 直接绑定 TUN 接口",
     "addOpenvpnEgress": "添加 OpenVPN 出口",
     "addEgress": "添加出口",
     "editTitle": "编辑 OpenVPN 出口",
@@ -726,7 +726,7 @@
     "extraOptions": "额外选项",
     "extraOptionsPlaceholder": "每行一个 OpenVPN 选项",
     "extraOptionsHint": "高级配置选项",
-    "socksPort": "SOCKS 端口",
+    "tunDevice": "TUN 设备",
     "enabled": "启用",
     "disabled": "禁用",
     "importOvpn": "导入 .ovpn 文件",
