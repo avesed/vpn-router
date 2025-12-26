@@ -163,7 +163,7 @@ def refresh_wg_subnet_cache() -> str:
     """刷新 WireGuard 子网前缀缓存，从数据库读取当前配置"""
     global _cached_wg_subnet_prefix
     try:
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         server = db.get_wireguard_server()
         if server and server.get("address"):
             _cached_wg_subnet_prefix = get_subnet_prefix(server.get("address"))
@@ -924,7 +924,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # 检查是否已设置密码，未设置则允许访问
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             if not db.user.is_admin_setup():
                 return await call_next(request)
         except Exception as e:
@@ -1004,7 +1004,7 @@ def _get_all_outbounds() -> List[str]:
 
     if HAS_DATABASE and USER_DB_PATH.exists():
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
 
             # PIA profiles
             for profile in db.get_pia_profiles(enabled_only=False):
@@ -1076,7 +1076,7 @@ def _get_xray_egress_client():
     if _xray_egress_client is None:
         try:
             # 检查是否有启用的 V2Ray 出口
-            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            db = _get_db()
             v2ray_egress = db.get_v2ray_egress_list(enabled_only=True)
             if not v2ray_egress:
                 return None
@@ -1115,7 +1115,7 @@ def _get_xray_ingress_client():
     if _xray_ingress_client is None:
         try:
             # 检查 V2Ray 入口是否已配置且启用
-            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            db = _get_db()
             config = db.get_v2ray_inbound_config()
             if not config or not config.get("enabled"):
                 return None
@@ -1444,7 +1444,7 @@ def load_custom_rules() -> Dict[str, Any]:
     if HAS_DATABASE and USER_DB_PATH.exists():
         # 从数据库加载
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             rules = db.get_routing_rules(enabled_only=True)
             # 转换为旧格式以保持兼容性
             legacy_rules = []
@@ -1479,7 +1479,7 @@ def generate_singbox_rules_from_db() -> List[Dict[str, Any]]:
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         return []
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     rules_db = db.get_routing_rules(enabled_only=True)
 
     # 按优先级排序（高优先级在前）
@@ -1596,7 +1596,7 @@ def load_custom_category_items() -> Dict[str, List[Dict]]:
     """加载分类自定义项目（数据库优先，降级到 JSON）"""
     if HAS_DATABASE and USER_DB_PATH.exists():
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             return db.get_custom_category_items()
         except Exception as e:
             print(f"WARNING: Failed to load custom category items from database: {e}")
@@ -1722,7 +1722,7 @@ def api_auth_status():
     此端点始终公开，用于确定显示登录页还是设置页
     """
     try:
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         is_setup = db.user.is_admin_setup()
     except Exception:
         is_setup = False
@@ -1739,7 +1739,7 @@ def api_auth_setup(request: SetupRequest):
 
     仅在密码未设置时可用
     """
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     if db.user.is_admin_setup():
         raise HTTPException(
@@ -1771,7 +1771,7 @@ def api_auth_setup(request: SetupRequest):
 @app.post("/api/auth/login")
 def api_auth_login(request: LoginRequest):
     """登录获取 JWT token"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     if not db.user.is_admin_setup():
         raise HTTPException(
@@ -1800,7 +1800,7 @@ def api_auth_login(request: LoginRequest):
 def api_auth_refresh(request: Request):
     """刷新 JWT token（延长会话）"""
     # 验证当前 token（由中间件完成）
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     secret = db.user.get_or_create_jwt_secret()
     token, expires_in = _create_token(secret)
 
@@ -1843,7 +1843,7 @@ def api_health():
     # 检查数据库连接
     try:
         if HAS_DATABASE and USER_DB_PATH.exists():
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             # 简单查询验证数据库可用
             db.get_setting("health_check", "ok")
             checks["database"] = True
@@ -1870,7 +1870,7 @@ def api_status():
     config_stat = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
     wireguard = get_wireguard_status()
     # 从数据库获取 PIA profiles
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     pia_profiles = db.get_pia_profiles(enabled_only=False)
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1912,7 +1912,7 @@ def api_stats_dashboard(time_range: str = "1m"):
 
     # 获取总客户端数量（从数据库）
     try:
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         peers = db.get_wireguard_peers()
         stats["total_clients"] = len(peers) if peers else 0
     except Exception:
@@ -2058,7 +2058,7 @@ def api_list_endpoints():
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="Database not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     endpoints = []
 
     # 1. WireGuard 服务器端点 (wg-server)
@@ -2141,7 +2141,7 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="Database not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 判断端点类型并更新对应的数据库表
     if tag == "wg-server":
@@ -2200,7 +2200,7 @@ def api_get_pia_profiles():
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="Database not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     profiles = db.get_pia_profiles(enabled_only=False)
     return {"profiles": profiles}
 
@@ -2232,7 +2232,7 @@ def api_list_profiles():
         profiles_config = load_pia_profiles_yaml()
         profiles = profiles_config.get("profiles", [])
     else:
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         profiles = db.get_pia_profiles(enabled_only=False)
 
     result = []
@@ -2263,7 +2263,7 @@ def api_create_profile(payload: ProfileCreateRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="Database not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查 tag 是否已存在
     name = payload.tag.replace("-", "_")
@@ -2324,7 +2324,7 @@ def api_update_profile(tag: str, payload: ProfileUpdateRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="Database not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     name = tag.replace("-", "_")
     profile = db.get_pia_profile_by_name(name)
 
@@ -2353,7 +2353,7 @@ def api_delete_profile(tag: str):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="Database not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     name = tag.replace("-", "_")
     profile = db.get_pia_profile_by_name(name)
 
@@ -2391,7 +2391,7 @@ def api_get_rules():
     # 从数据库读取默认出口设置和所有出口
     if HAS_DATABASE and USER_DB_PATH.exists():
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             default_outbound = db.get_setting("default_outbound", "direct")
 
             # 从数据库读取 PIA profiles (PIA uses 'name' as tag)
@@ -2446,7 +2446,7 @@ def api_get_rules():
 
     # 从数据库读取自定义规则
     if HAS_DATABASE and USER_DB_PATH.exists():
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         db_rules = db.get_routing_rules(enabled_only=True)
 
         # 按 tag 分组规则（使用数据库中的实际 tag）
@@ -2511,7 +2511,7 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
     """更新路由规则（数据库版本，使用批量操作优化性能）"""
     if HAS_DATABASE and USER_DB_PATH.exists():
         # 使用数据库存储（方案 B）
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
 
         # 批量删除所有规则，但保留 __adblock__ 前缀的规则（由广告拦截页面管理）
         deleted_count = db.delete_all_routing_rules(preserve_adblock=True)
@@ -2618,7 +2618,7 @@ def api_add_custom_rule(payload: CustomRuleRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     try:
         # 收集所有规则用于批量插入
@@ -2678,7 +2678,7 @@ def api_delete_custom_rule(rule_id: int):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     success = db.delete_routing_rule(rule_id)
 
     if not success:
@@ -2729,7 +2729,7 @@ def api_pia_login(payload: PiaLoginRequest):
     set_pia_credentials(payload.username, payload.password)
 
     # 检查是否有 profiles 配置（从数据库读取）
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     profiles = db.get_pia_profiles(enabled_only=True)
 
     if not profiles:
@@ -2846,7 +2846,7 @@ def api_reload_singbox():
 def api_profiles_status():
     """获取各 WireGuard 出口的连接状态（从数据库）"""
     # 从数据库获取 PIA profiles
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     db_profiles = db.get_pia_profiles(enabled_only=True)
 
     # 构建 name -> profile 映射
@@ -2897,7 +2897,7 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     profile_key = payload.profile_tag.replace("-", "_")
 
     # 验证 profile 是否存在于数据库
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     profiles = db.get_pia_profiles(enabled_only=True)
     valid_names = [p.get("name") for p in profiles]
     if profile_key not in valid_names:
@@ -2961,7 +2961,7 @@ def load_ingress_config() -> dict:
         return json.loads(WG_CONFIG_PATH.read_text())
 
     # 从数据库加载
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 获取服务器配置
     server = db.get_wireguard_server()
@@ -3022,7 +3022,7 @@ def save_ingress_config(data: dict) -> None:
         WG_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
         return
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 保存服务器配置
     interface = data.get("interface", {})
@@ -3084,7 +3084,7 @@ def get_next_peer_ip(config: dict) -> str:
 
     # 2. 检查出口端点使用的 IP（避免冲突）
     try:
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
 
         # 2a. Custom WireGuard 出口
         for egress in db.get_custom_egress_list():
@@ -3552,7 +3552,7 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
 
     # 添加到数据库
     if HAS_DATABASE and USER_DB_PATH.exists():
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         peer_id = db.add_wireguard_peer(
             name=payload.name,
             public_key=client_public_key,
@@ -3608,7 +3608,7 @@ def api_delete_ingress_peer(peer_name: str):
 
     # 从数据库删除
     if HAS_DATABASE and USER_DB_PATH.exists():
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         if "id" in peer_to_delete:
             db.delete_wireguard_peer(peer_to_delete["id"])
     else:
@@ -3740,7 +3740,7 @@ class SubnetUpdateRequest(BaseModel):
 def api_get_ingress_subnet():
     """获取入口子网配置"""
     import ipaddress
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     server = db.get_wireguard_server()
     address = server.get("address", DEFAULT_WG_SUBNET) if server else DEFAULT_WG_SUBNET
 
@@ -3798,7 +3798,7 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
         raise HTTPException(status_code=400, detail=f"Invalid subnet format: {e}")
 
     # 2. 检查与出口地址的冲突
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     conflicts = []
 
     for egress in db.get_custom_egress_list():
@@ -3987,7 +3987,7 @@ def api_list_all_egress():
     v2ray_result = []
 
     # 从数据库获取 PIA profiles
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     pia_profiles = db.get_pia_profiles(enabled_only=False)
 
     for p in pia_profiles:
@@ -4068,7 +4068,7 @@ def api_list_all_egress():
 @app.get("/api/egress/direct-default")
 def api_get_direct_default():
     """获取默认 direct 出口的配置（包括 DNS 设置）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 从 settings 表读取 DNS 配置
     dns_servers_json = db.get_setting("direct_dns_servers", "[]")
@@ -4144,7 +4144,7 @@ def api_update_direct_default(data: DirectDefaultUpdate):
         if not domain_pattern.match(server):
             raise HTTPException(status_code=400, detail=f"Invalid DNS server format: {server}")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     db.set_setting("direct_dns_servers", json.dumps(data.dns_servers))
 
     # 重新生成配置并重载
@@ -4272,7 +4272,7 @@ def api_get_wg_egress_interface(interface: str):
 @app.get("/api/egress/custom")
 def api_list_custom_egress():
     """列出所有自定义出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress_list = db.get_custom_egress_list()
     # 不返回敏感信息（私钥）
     result = []
@@ -4294,7 +4294,7 @@ def api_list_custom_egress():
 @app.post("/api/egress/custom")
 def api_create_custom_egress(payload: CustomEgressCreateRequest):
     """创建自定义出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查 tag 是否已存在
     if db.get_custom_egress(payload.tag):
@@ -4368,7 +4368,7 @@ def api_parse_wireguard_conf(payload: WireGuardConfParseRequest):
 @app.put("/api/egress/custom/{tag}")
 def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
     """更新自定义出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_custom_egress(tag):
@@ -4416,7 +4416,7 @@ def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
 @app.delete("/api/egress/custom/{tag}")
 def api_delete_custom_egress(tag: str):
     """删除自定义出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_custom_egress(tag):
@@ -4443,7 +4443,7 @@ def api_delete_custom_egress(tag: str):
 @app.get("/api/egress/direct")
 def api_list_direct_egress():
     """列出所有 direct 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress_list = db.get_direct_egress_list(enabled_only=False)
     return {"egress": egress_list}
 
@@ -4451,7 +4451,7 @@ def api_list_direct_egress():
 @app.get("/api/egress/direct/{tag}")
 def api_get_direct_egress(tag: str):
     """获取单个 direct 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_direct_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"Direct 出口 '{tag}' 不存在")
@@ -4461,7 +4461,7 @@ def api_get_direct_egress(tag: str):
 @app.post("/api/egress/direct")
 def api_create_direct_egress(payload: DirectEgressCreateRequest):
     """创建 direct 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 不允许使用保留名称
     if payload.tag == "direct":
@@ -4511,7 +4511,7 @@ def api_create_direct_egress(payload: DirectEgressCreateRequest):
 @app.put("/api/egress/direct/{tag}")
 def api_update_direct_egress(tag: str, payload: DirectEgressUpdateRequest):
     """更新 direct 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_direct_egress(tag):
@@ -4549,7 +4549,7 @@ def api_update_direct_egress(tag: str, payload: DirectEgressUpdateRequest):
 @app.delete("/api/egress/direct/{tag}")
 def api_delete_direct_egress(tag: str):
     """删除 direct 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_direct_egress(tag):
@@ -4651,7 +4651,7 @@ def _parse_ovpn_content(content: str) -> dict:
 @app.get("/api/egress/openvpn")
 def api_list_openvpn_egress():
     """列出所有 OpenVPN 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress_list = db.get_openvpn_egress_list(enabled_only=False)
     # 隐藏敏感信息
     for egress in egress_list:
@@ -4665,7 +4665,7 @@ def api_list_openvpn_egress():
 @app.get("/api/egress/openvpn/{tag}")
 def api_get_openvpn_egress(tag: str):
     """获取单个 OpenVPN 出口（包含完整配置）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_openvpn_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"OpenVPN 出口 '{tag}' 不存在")
@@ -4675,7 +4675,7 @@ def api_get_openvpn_egress(tag: str):
 @app.post("/api/egress/openvpn")
 def api_create_openvpn_egress(payload: OpenVPNEgressCreateRequest):
     """创建 OpenVPN 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查 tag 是否已存在
     if db.get_openvpn_egress(payload.tag):
@@ -4752,7 +4752,7 @@ def api_parse_openvpn_file(payload: OpenVPNParseRequest):
 @app.put("/api/egress/openvpn/{tag}")
 def api_update_openvpn_egress(tag: str, payload: OpenVPNEgressUpdateRequest):
     """更新 OpenVPN 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_openvpn_egress(tag):
@@ -4797,7 +4797,7 @@ def api_update_openvpn_egress(tag: str, payload: OpenVPNEgressUpdateRequest):
 @app.delete("/api/egress/openvpn/{tag}")
 def api_delete_openvpn_egress(tag: str):
     """删除 OpenVPN 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_openvpn_egress(tag):
@@ -4823,7 +4823,7 @@ def api_delete_openvpn_egress(tag: str):
 @app.get("/api/egress/openvpn/{tag}/status")
 def api_get_openvpn_status(tag: str):
     """获取 OpenVPN 隧道状态"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     egress = db.get_openvpn_egress(tag)
@@ -4854,7 +4854,7 @@ def api_get_openvpn_status(tag: str):
 @app.get("/api/egress/v2ray")
 def api_list_v2ray_egress():
     """列出所有 V2Ray 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress_list = db.get_v2ray_egress_list(enabled_only=False)
     # 隐藏敏感信息
     for egress in egress_list:
@@ -4866,7 +4866,7 @@ def api_list_v2ray_egress():
 @app.get("/api/egress/v2ray/{tag}")
 def api_get_v2ray_egress(tag: str):
     """获取单个 V2Ray 出口（包含完整配置）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_v2ray_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"V2Ray egress '{tag}' not found")
@@ -4876,7 +4876,7 @@ def api_get_v2ray_egress(tag: str):
 @app.post("/api/egress/v2ray")
 def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
     """创建 V2Ray 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 验证协议
     if payload.protocol not in ("vmess", "vless", "trojan"):
@@ -4974,7 +4974,7 @@ def api_parse_v2ray_uri(payload: V2RayURIParseRequest):
 @app.put("/api/egress/v2ray/{tag}")
 def api_update_v2ray_egress(tag: str, payload: V2RayEgressUpdateRequest):
     """更新 V2Ray 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_v2ray_egress(tag):
@@ -5033,7 +5033,7 @@ def api_update_v2ray_egress(tag: str, payload: V2RayEgressUpdateRequest):
 @app.delete("/api/egress/v2ray/{tag}")
 def api_delete_v2ray_egress(tag: str):
     """删除 V2Ray 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查出口是否存在
     if not db.get_v2ray_egress(tag):
@@ -5144,7 +5144,7 @@ def _reload_warp_manager() -> str:
 @app.get("/api/egress/warp")
 def api_list_warp_egress(enabled_only: bool = False):
     """列出所有 WARP 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress_list = db.get_warp_egress_list(enabled_only)
     return {"warp_egress": egress_list}
 
@@ -5152,7 +5152,7 @@ def api_list_warp_egress(enabled_only: bool = False):
 @app.get("/api/egress/warp/{tag}")
 def api_get_warp_egress(tag: str):
     """获取单个 WARP 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_warp_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
@@ -5164,7 +5164,7 @@ def api_register_warp_egress(data: WarpEgressCreate):
     """一键注册 WARP 设备并创建出口"""
     from warp_manager import WarpManager
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查 tag 是否已存在
     if db.get_warp_egress(data.tag):
@@ -5225,7 +5225,7 @@ def api_register_warp_egress(data: WarpEgressCreate):
 @app.put("/api/egress/warp/{tag}")
 def api_update_warp_egress(tag: str, data: WarpEgressUpdate):
     """更新 WARP 出口"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     if not db.get_warp_egress(tag):
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
@@ -5262,7 +5262,7 @@ def api_delete_warp_egress(tag: str):
     """删除 WARP 出口"""
     from warp_manager import WarpManager
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     if not db.get_warp_egress(tag):
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
@@ -5295,7 +5295,7 @@ def api_reregister_warp_egress(tag: str):
     from warp_manager import WarpManager
     import asyncio
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     egress = db.get_warp_egress(tag)
     if not egress:
@@ -5354,7 +5354,7 @@ def api_get_warp_status(tag: str):
     """获取 WARP 代理状态"""
     from warp_manager import WarpManager
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_warp_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
@@ -5370,7 +5370,7 @@ def api_apply_warp_license(tag: str, license_key: str = Body(..., embed=True)):
     """应用 WARP+ License"""
     from warp_manager import WarpManager
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_warp_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
@@ -5395,7 +5395,7 @@ def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
     """设置自定义 Endpoint（指定地区节点）"""
     from warp_manager import WarpManager
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress = db.get_warp_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
@@ -5536,7 +5536,7 @@ async def api_test_warp_endpoints_stream(data: WarpEndpointsTest):
 @app.get("/api/ingress/v2ray")
 def api_get_v2ray_inbound():
     """获取 V2Ray 入口配置和用户列表"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     config = db.get_v2ray_inbound_config()
     users = db.get_v2ray_users(enabled_only=False)
@@ -5584,7 +5584,7 @@ def api_get_v2ray_inbound():
 @app.put("/api/ingress/v2ray")
 def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
     """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 验证协议
     if payload.protocol not in ("vmess", "vless", "trojan"):
@@ -5675,7 +5675,7 @@ def api_get_v2ray_users_online():
     Returns:
         {email: {"online": bool, "last_seen": timestamp, "upload": bytes, "download": bytes}}
     """
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     users = db.get_v2ray_users(enabled_only=True)
 
     now = time.time()
@@ -5713,7 +5713,7 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
     """添加 V2Ray 用户"""
     import uuid as uuid_module
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查用户名是否已存在
     if db.get_v2ray_user_by_name(payload.name):
@@ -5751,7 +5751,7 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
 @app.put("/api/ingress/v2ray/users/{user_id}")
 def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
     """更新 V2Ray 用户"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查用户是否存在
     user = db.get_v2ray_user(user_id)
@@ -5783,7 +5783,7 @@ def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
 @app.delete("/api/ingress/v2ray/users/{user_id}")
 def api_delete_v2ray_user(user_id: int):
     """删除 V2Ray 用户"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查用户是否存在
     user = db.get_v2ray_user(user_id)
@@ -5826,7 +5826,7 @@ def api_get_v2ray_user_share_uri(user_id: int):
     if not HAS_V2RAY_PARSER:
         raise HTTPException(status_code=500, detail="V2Ray URI generator not available")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 获取用户
     user = db.get_v2ray_user(user_id)
@@ -5954,7 +5954,7 @@ def api_get_xray_status():
             status = json.loads(result.stdout)
             # 转换为前端期望的格式
             # 获取 V2Ray 配置以补充 REALITY/XTLS 状态
-            _db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            _db = _get_db()
             v2ray_config = _db.get_v2ray_inbound_config()
             config = v2ray_config.get("config", {}) if v2ray_config else {}
             return {
@@ -6184,7 +6184,7 @@ def _test_direct_connection(tag: str, test_url: str, timeout_sec: float) -> dict
 
         # 如果是 direct-* 类型，尝试获取绑定配置
         if tag.startswith("direct-") and HAS_DATABASE:
-            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            db = _get_db()
             direct_egress = db.get_direct_egress_by_tag(tag)
             if direct_egress:
                 if direct_egress.get("bind_interface"):
@@ -6221,7 +6221,7 @@ def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
         # 从数据库获取 SOCKS 端口
         socks_port = None
         if HAS_DATABASE:
-            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            db = _get_db()
             # 先检查 OpenVPN
             openvpn_egress = db.get_openvpn_egress(tag)
             if openvpn_egress:
@@ -6456,7 +6456,7 @@ def _is_openvpn_egress(tag: str) -> bool:
     if not HAS_DATABASE:
         return False
     try:
-        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        db = _get_db()
         egress = db.get_openvpn_egress(tag)
         return egress is not None
     except Exception:
@@ -6468,7 +6468,7 @@ def _get_openvpn_socks_port(tag: str) -> Optional[int]:
     if not HAS_DATABASE:
         return None
     try:
-        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        db = _get_db()
         egress = db.get_openvpn_egress(tag)
         if egress:
             socks_port = egress.get("socks_port")
@@ -6491,7 +6491,7 @@ def _is_warp_egress(tag: str) -> bool:
     if not HAS_DATABASE:
         return False
     try:
-        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        db = _get_db()
         egress = db.get_warp_egress(tag)
         return egress is not None
     except Exception:
@@ -6503,7 +6503,7 @@ def _get_warp_socks_port(tag: str) -> Optional[int]:
     if not HAS_DATABASE:
         return None
     try:
-        db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+        db = _get_db()
         egress = db.get_warp_egress(tag)
         if egress:
             socks_port = egress.get("socks_port")
@@ -6547,7 +6547,7 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
     elif tag.startswith("direct-"):
         # Direct 出口：绑定接口
         if HAS_DATABASE:
-            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            db = _get_db()
             direct_egress = db.get_direct_egress_by_tag(tag)
             if direct_egress:
                 if direct_egress.get("bind_interface"):
@@ -6567,7 +6567,7 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
     elif _is_warp_egress(tag):
         # WARP：根据协议类型选择测试方式
         if HAS_DATABASE:
-            db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
+            db = _get_db()
             warp_egress = db.get_warp_egress(tag)
             if warp_egress and warp_egress.get("protocol") == "wireguard":
                 # WireGuard 协议：使用内核接口
@@ -6681,7 +6681,7 @@ class AdblockRuleSetCreateRequest(BaseModel):
 @app.get("/api/adblock/rules")
 def api_list_adblock_rules(category: Optional[str] = None):
     """列出所有广告拦截规则集"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     rules = db.get_remote_rule_sets(enabled_only=False, category=category)
 
     # 按分类分组
@@ -6703,7 +6703,7 @@ def api_list_adblock_rules(category: Optional[str] = None):
 @app.get("/api/adblock/rules/{tag}")
 def api_get_adblock_rule(tag: str):
     """获取单个广告拦截规则集"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     rule = db.get_remote_rule_set(tag)
     if not rule:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
@@ -6713,7 +6713,7 @@ def api_get_adblock_rule(tag: str):
 @app.put("/api/adblock/rules/{tag}/toggle")
 def api_toggle_adblock_rule(tag: str):
     """切换广告拦截规则集启用状态"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查规则是否存在
     rule = db.get_remote_rule_set(tag)
@@ -6734,7 +6734,7 @@ def api_toggle_adblock_rule(tag: str):
 @app.put("/api/adblock/rules/{tag}")
 def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
     """更新广告拦截规则集"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查规则是否存在
     if not db.get_remote_rule_set(tag):
@@ -6751,7 +6751,7 @@ def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
 @app.post("/api/adblock/rules")
 def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
     """创建新的广告拦截规则集"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查 tag 是否已存在
     if db.get_remote_rule_set(payload.tag):
@@ -6776,7 +6776,7 @@ def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
 @app.delete("/api/adblock/rules/{tag}")
 def api_delete_adblock_rule(tag: str):
     """删除广告拦截规则集"""
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 检查规则是否存在
     if not db.get_remote_rule_set(tag):
@@ -7313,7 +7313,7 @@ def api_create_quick_rule(payload: QuickRuleRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 收集所有域名 - 从内存中的 _DOMAIN_CATALOG 读取
     all_domains = []
@@ -7376,7 +7376,7 @@ def api_add_custom_category_item(category_id: str, payload: CustomCategoryItemRe
 
     # 使用数据库存储
     if HAS_DATABASE and USER_DB_PATH.exists():
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
 
         # 检查是否已存在
         existing_item = db.get_custom_category_item(item_id)
@@ -7424,7 +7424,7 @@ def api_delete_custom_category_item(category_id: str, item_id: str):
     """删除分类中的自定义域名列表项"""
     # 使用数据库删除
     if HAS_DATABASE and USER_DB_PATH.exists():
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
 
         # 删除项目
         deleted = db.delete_custom_category_item(item_id)
@@ -7616,7 +7616,7 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
 
     # 批量添加 IP CIDR 到数据库（使用 executemany 一次性插入）
     # 格式: (rule_type, target, outbound, tag, priority)
@@ -7735,7 +7735,7 @@ def _export_backup_v1(payload: BackupExportRequest) -> dict:
     )
 
     # 3. 导出自定义出口配置（从数据库）
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     egress_list = db.get_custom_egress_list()
 
     # 分离敏感和非敏感数据
@@ -7789,7 +7789,7 @@ def _export_backup_v1(payload: BackupExportRequest) -> dict:
 
     # 6. 导出路由规则（从数据库）
     if HAS_DATABASE and USER_DB_PATH.exists():
-        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        db = _get_db()
         db_rules = db.get_routing_rules(enabled_only=False)
 
         # 将数据库规则转换为备份格式
@@ -8110,7 +8110,7 @@ def api_import_backup(payload: BackupImportRequest):
     # 3. 导入自定义出口（到数据库）
     if "custom_egress" in backup_data and "custom_egress_sensitive" in backup_data:
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             sensitive_json = decrypt_sensitive_data(
                 backup_data["custom_egress_sensitive"], payload.password
             )
@@ -8153,7 +8153,7 @@ def api_import_backup(payload: BackupImportRequest):
     if "pia_profiles" in backup_data:
         try:
             profiles = backup_data["pia_profiles"]
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
 
             if payload.merge_mode == "replace":
                 # 删除所有现有 profiles
@@ -8194,7 +8194,7 @@ def api_import_backup(payload: BackupImportRequest):
             rules_list = rules_data.get("rules", [])
 
             if HAS_DATABASE and USER_DB_PATH.exists():
-                db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+                db = _get_db()
 
                 # 如果是替换模式，先批量删除所有规则（但保留广告拦截规则）
                 if payload.merge_mode == "replace":
@@ -8238,7 +8238,7 @@ def api_import_backup(payload: BackupImportRequest):
     # 7. 导入 V2Ray 出口配置
     if "v2ray_egress" in backup_data and "v2ray_egress_sensitive" in backup_data:
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
 
             # 解密敏感数据
             sensitive_json = decrypt_sensitive_data(
@@ -8293,7 +8293,7 @@ def api_import_backup(payload: BackupImportRequest):
     # 8. 导入 V2Ray 入口配置
     if "v2ray_inbound" in backup_data:
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
             inbound_public = backup_data["v2ray_inbound"]
 
             inbound_sensitive = {}
@@ -8325,7 +8325,7 @@ def api_import_backup(payload: BackupImportRequest):
     # 9. 导入 V2Ray 用户
     if "v2ray_users" in backup_data and "v2ray_users_sensitive" in backup_data:
         try:
-            db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+            db = _get_db()
 
             # 解密敏感数据
             sensitive_json = decrypt_sensitive_data(
@@ -8422,7 +8422,7 @@ def api_get_db_stats():
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     return db.get_statistics()
 
 
@@ -8432,7 +8432,7 @@ def api_get_db_rules(enabled_only: bool = True):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     rules = db.get_routing_rules(enabled_only=enabled_only)
     return {"rules": rules, "count": len(rules)}
 
@@ -8448,7 +8448,7 @@ def api_update_db_rule(
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
-    db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    db = _get_db()
     success = db.update_routing_rule(rule_id, outbound, priority, enabled)
 
     if not success:
