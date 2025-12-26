@@ -120,20 +120,59 @@ def find_region(serverlist: Dict[str, Any], region_id: str) -> Dict[str, Any]:
     raise ProvisionError(f"地区 {region_id} 不存在于 serverlist")
 
 
-def pick_server(region: Dict[str, Any], wg_groups: Dict[str, List[int]]) -> Tuple[Dict[str, Any], int]:
+def get_all_servers(region: Dict[str, Any], wg_groups: Dict[str, List[int]]) -> List[Tuple[Dict[str, Any], int]]:
+    """获取 region 中所有可用的 WireGuard 服务器
+
+    Returns:
+        List of (server, port) tuples
+    """
+    result = []
     servers = region.get("servers")
     if isinstance(servers, list):
         for entry in servers:
             group_name = entry.get("service_config")
             if group_name in wg_groups:
-                return entry, wg_groups[group_name][0]
+                result.append((entry, wg_groups[group_name][0]))
     elif isinstance(servers, dict):
         for group_name, entries in servers.items():
             if group_name not in wg_groups:
                 continue
-            entries = entries or []
-            if entries:
-                return entries[0], wg_groups[group_name][0]
+            for entry in (entries or []):
+                result.append((entry, wg_groups[group_name][0]))
+    return result
+
+
+def pick_server(
+    region: Dict[str, Any],
+    wg_groups: Dict[str, List[int]],
+    exclude_ips: set = None
+) -> Tuple[Dict[str, Any], int]:
+    """选择一个 WireGuard 服务器，排除已使用的 IP
+
+    PIA 的 addKey API 会覆盖同一 token 对同一服务器注册的公钥，
+    所以同一 region 的多个 profile 需要请求不同的服务器。
+
+    Args:
+        region: 地区配置
+        wg_groups: WireGuard 服务组配置
+        exclude_ips: 要排除的服务器 IP 集合
+
+    Returns:
+        (server, port) tuple
+    """
+    exclude_ips = exclude_ips or set()
+    all_servers = get_all_servers(region, wg_groups)
+
+    # 优先选择未使用的服务器
+    for server, port in all_servers:
+        if server.get("ip") not in exclude_ips:
+            return server, port
+
+    # 如果所有服务器都已使用，选择第一个（由于使用独立 token，不会导致冲突）
+    if all_servers:
+        print(f"[pia] 提示: {region.get('id')} 的所有 {len(all_servers)} 个服务器都已被使用，将复用服务器（使用独立 token，不会冲突）")
+        return all_servers[0]
+
     raise ProvisionError(f"地区 {region.get('id')} 没有可用的 WireGuard 服务组")
 
 
@@ -173,20 +212,35 @@ def main() -> None:
         profiles = load_profiles_from_db()
         username = require_env("PIA_USERNAME")
         password = require_env("PIA_PASSWORD")
-        token = fetch_token(username, password)
         serverlist = fetch_serverlist()
         wg_groups = parse_wireguard_groups(serverlist)
         if not wg_groups:
             raise ProvisionError("serverlist 中未找到 WireGuard 服务组")
 
         output: Dict[str, Any] = {"profiles": {}}
+        # 跟踪每个 region 已使用的服务器 IP，用于负载均衡（分散到不同服务器）
+        used_servers: Dict[str, set] = {}
         for profile in profiles:
             name = profile.get("name")
             region_id = profile.get("region_id")
             if not name or not region_id:
                 raise ProvisionError(f"非法 profile 配置: {profile}")
+
+            # 每个 profile 获取独立的 token，避免 PIA 的 addKey 覆盖问题
+            # PIA 通过 token + server_ip 识别会话，相同 token 请求同一服务器会覆盖之前的注册
+            print(f"[pia] {name}: 获取独立 token...")
+            token = fetch_token(username, password)
+
             region = find_region(serverlist, region_id)
-            server, port = pick_server(region, wg_groups)
+            # 获取该 region 已使用的服务器 IP（用于负载均衡，即使有独立 token 也尽量分散）
+            exclude_ips = used_servers.get(region_id, set())
+            server, port = pick_server(region, wg_groups, exclude_ips)
+            # 记录使用的服务器 IP
+            server_ip = server.get("ip")
+            if region_id not in used_servers:
+                used_servers[region_id] = set()
+            used_servers[region_id].add(server_ip)
+            print(f"[pia] {name}: 请求服务器 {server_ip} (region {region_id} 已使用 {len(used_servers[region_id])} 个服务器)")
             priv, pub = gen_keypair()
             auth = add_key(server, port, token, pub)
             output["profiles"][name] = {
