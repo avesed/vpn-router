@@ -396,6 +396,12 @@ _MAX_HISTORY_SECONDS = 24 * 60 * 60  # 保留24小时历史
 _MAX_HISTORY_ENTRIES = 90000  # 最大条目数 (C9: 内存泄漏防护, ~86400 for 24h + buffer)
 _last_history_time = 0  # 上次记录历史的时间
 _rate_samples: List[Dict[str, Dict[str, int]]] = []  # 最近 N 个流量样本用于计算速率
+
+# Outbounds 列表缓存（避免锁内 DB 查询）
+_outbounds_cache: List[str] = []
+_outbounds_cache_time: float = 0
+_OUTBOUNDS_CACHE_TTL = 10  # 10秒刷新一次
+
 # V2Ray API 客户端（懒加载）
 _v2ray_client = None
 # Xray 出站 V2Ray API 客户端（懒加载，用于获取 V2Ray 出口的流量统计）
@@ -418,6 +424,17 @@ _V2RAY_USER_ONLINE_TIMEOUT = 60  # 60 秒无流量变化视为离线
 _peer_activity_cache: Dict[str, Dict[str, Any]] = {}
 _peer_activity_lock = threading.Lock()
 _PEER_ONLINE_GRACE_PERIOD = 120  # Consider peer online for 120s after last activity
+
+# clash_api 响应缓存（避免超时阻塞）
+_clash_api_cache: Dict = {}
+_clash_api_cache_time: float = 0
+_CLASH_API_CACHE_TTL = 2  # 缓存有效期 2 秒
+_CLASH_API_TIMEOUT = 0.5  # 超时从 2s 改为 0.5s
+
+# Adblock 日志增量扫描（避免全量扫描大文件）
+_adblock_count: int = 0
+_adblock_log_position: int = 0
+_adblock_log_inode: int = 0  # 用于检测日志轮转
 
 
 # ============ 认证相关模型 ============
@@ -1053,6 +1070,19 @@ def _get_all_outbounds() -> List[str]:
     return outbounds
 
 
+def _get_cached_outbounds() -> List[str]:
+    """获取缓存的 outbounds 列表（避免锁内 DB 查询）
+
+    缓存 TTL 为 10 秒，新增的 egress 最多延迟 10 秒显示在图表中
+    """
+    global _outbounds_cache, _outbounds_cache_time
+    now = time.time()
+    if now - _outbounds_cache_time > _OUTBOUNDS_CACHE_TTL or not _outbounds_cache:
+        _outbounds_cache = _get_all_outbounds()
+        _outbounds_cache_time = now
+    return _outbounds_cache
+
+
 def _get_v2ray_client():
     """获取 V2Ray API 客户端（懒加载）"""
     global _v2ray_client
@@ -1220,6 +1250,9 @@ def _update_traffic_stats():
                     # M5 修复: 记录 Xray 统计错误（可能还未启动或已停止）
                     logging.debug(f"Xray egress stats unavailable: {type(e).__name__}: {e}")
 
+            # 在锁外获取 outbounds 列表（使用缓存，避免锁内 DB 查询）
+            all_outbounds = _get_cached_outbounds()
+
             with _traffic_stats_lock:
                 # 更新累计流量（使用合并后的精确数据）
                 for outbound, stats in outbound_stats.items():
@@ -1259,7 +1292,7 @@ def _update_traffic_stats():
                 if now - _last_history_time >= _HISTORY_INTERVAL:
                     _last_history_time = now
                     history_point = {"timestamp": now, "rates": {}}
-                    all_outbounds = _get_all_outbounds()
+                    # 使用锁外预先获取的 all_outbounds（已缓存）
                     for outbound in all_outbounds:
                         if outbound in _traffic_rates:
                             rates = _traffic_rates[outbound]
@@ -2037,17 +2070,34 @@ def api_stats_dashboard(time_range: str = "1m"):
 
         stats["rate_history"] = filtered_history
 
-    # 从 sing-box 日志文件统计广告拦截
+    # 从 sing-box 日志文件统计广告拦截（增量扫描优化）
     # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
+    global _adblock_count, _adblock_log_position, _adblock_log_inode
     try:
         log_file = Path("/var/log/sing-box.log")
         if log_file.exists():
+            # 检测日志轮转（inode 变化或文件变小）
+            stat = log_file.stat()
+            current_inode = stat.st_ino
+            current_size = stat.st_size
+
+            if current_inode != _adblock_log_inode or current_size < _adblock_log_position:
+                # 日志轮转，重新全量扫描
+                _adblock_count = 0
+                _adblock_log_position = 0
+                _adblock_log_inode = current_inode
+
+            # 增量扫描：从上次位置读取新内容
             with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(_adblock_log_position)
                 for line in f:
                     if "outbound/block[adblock]: blocked connection" in line:
-                        stats["adblock_connections"] += 1
+                        _adblock_count += 1
+                _adblock_log_position = f.tell()
+
+        stats["adblock_connections"] = _adblock_count
     except Exception:
-        pass
+        stats["adblock_connections"] = _adblock_count  # 出错时返回已有计数
 
     return stats
 
@@ -3142,65 +3192,77 @@ def get_peer_status_from_clash_api() -> dict:
 
     Updates global _peer_activity_cache with last_seen timestamps for each peer IP.
     This cache is used to determine online status even when no active connections exist.
+
+    优化: 使用缓存 + 短超时避免阻塞
+    - 超时从 2s 改为 0.5s
+    - 失败时返回缓存数据（10秒有效期）
     """
-    global _peer_activity_cache
+    global _peer_activity_cache, _clash_api_cache, _clash_api_cache_time
     import time
     peer_status = {}  # ip -> {"active": bool, "last_seen": timestamp, "rx": int, "tx": int}
 
     # 使用缓存的子网前缀（避免频繁数据库查询）
     wg_subnet_prefix = get_cached_wg_subnet_prefix()
+    now = time.time()
+    now_int = int(now)
 
+    # 尝试获取 clash_api 数据
+    data = None
     try:
-        # 查询 sing-box clash_api 获取活跃连接
+        # 查询 sing-box clash_api 获取活跃连接（超时 0.5s）
         import urllib.request
-        with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=2) as resp:
+        with urllib.request.urlopen("http://127.0.0.1:9090/connections", timeout=_CLASH_API_TIMEOUT) as resp:
             data = json.loads(resp.read().decode())
+        # 成功时更新缓存
+        _clash_api_cache = data
+        _clash_api_cache_time = now
+    except Exception:
+        # 失败时使用缓存（10秒有效期）
+        if now - _clash_api_cache_time < 10 and _clash_api_cache:
+            data = _clash_api_cache
 
-        now = int(time.time())
-        connections = data.get("connections", [])
+    if data is None:
+        return peer_status
 
-        # 遍历所有连接，按源 IP 分组
-        for conn in connections:
-            metadata = conn.get("metadata", {})
-            src_ip = metadata.get("sourceIP", "")
+    connections = data.get("connections", [])
 
-            # 只处理来自 WireGuard 网段的连接
-            if not src_ip.startswith(wg_subnet_prefix):
-                continue
+    # 遍历所有连接，按源 IP 分组
+    for conn in connections:
+        metadata = conn.get("metadata", {})
+        src_ip = metadata.get("sourceIP", "")
 
-            # 提取流量数据
-            download = conn.get("download", 0)
-            upload = conn.get("upload", 0)
-            start_time = conn.get("start", "")
+        # 只处理来自 WireGuard 网段的连接
+        if not src_ip.startswith(wg_subnet_prefix):
+            continue
 
-            if src_ip not in peer_status:
-                peer_status[src_ip] = {
-                    "active": True,
-                    "last_seen": now,
-                    "rx": 0,
-                    "tx": 0,
-                    "connections": 0
-                }
+        # 提取流量数据
+        download = conn.get("download", 0)
+        upload = conn.get("upload", 0)
 
-            peer_status[src_ip]["rx"] += download
-            peer_status[src_ip]["tx"] += upload
-            peer_status[src_ip]["connections"] += 1
+        if src_ip not in peer_status:
+            peer_status[src_ip] = {
+                "active": True,
+                "last_seen": now_int,
+                "rx": 0,
+                "tx": 0,
+                "connections": 0
+            }
 
-        # Update global peer activity cache with current activity
-        with _peer_activity_lock:
-            for ip, status in peer_status.items():
-                if ip not in _peer_activity_cache:
-                    _peer_activity_cache[ip] = {"last_seen": 0, "rx": 0, "tx": 0}
+        peer_status[src_ip]["rx"] += download
+        peer_status[src_ip]["tx"] += upload
+        peer_status[src_ip]["connections"] += 1
 
-                # Update last_seen timestamp when we see new activity
-                if status["rx"] > 0 or status["tx"] > 0:
-                    _peer_activity_cache[ip]["last_seen"] = now
-                    _peer_activity_cache[ip]["rx"] = status["rx"]
-                    _peer_activity_cache[ip]["tx"] = status["tx"]
+    # Update global peer activity cache with current activity
+    with _peer_activity_lock:
+        for ip, status in peer_status.items():
+            if ip not in _peer_activity_cache:
+                _peer_activity_cache[ip] = {"last_seen": 0, "rx": 0, "tx": 0}
 
-    except Exception as e:
-        # clash_api 不可用时静默失败
-        pass
+            # Update last_seen timestamp when we see new activity
+            if status["rx"] > 0 or status["tx"] > 0:
+                _peer_activity_cache[ip]["last_seen"] = now_int
+                _peer_activity_cache[ip]["rx"] = status["rx"]
+                _peer_activity_cache[ip]["tx"] = status["tx"]
 
     return peer_status
 

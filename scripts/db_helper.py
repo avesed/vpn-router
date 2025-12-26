@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from contextlib import contextmanager
@@ -320,7 +321,11 @@ class GeodataDatabase:
 
 
 class UserDatabase:
-    """用户配置数据库（读写，支持 SQLCipher 加密）"""
+    """用户配置数据库（读写，支持 SQLCipher 加密）
+
+    性能优化：使用线程本地存储 (Thread-Local Storage) 缓存数据库连接，
+    避免每次操作都创建新连接并执行 PRAGMA key（SQLCipher 密钥派生约 30-50ms）。
+    """
 
     def __init__(self, db_path: str, encryption_key: Optional[str] = None):
         """
@@ -332,23 +337,54 @@ class UserDatabase:
         """
         self.db_path = db_path
         self.encryption_key = encryption_key
+        # 线程本地存储：每个线程独立的连接缓存
+        self._local = threading.local()
 
     def _apply_encryption(self, conn) -> None:
         """应用 SQLCipher 加密密钥"""
         if self.encryption_key and HAS_SQLCIPHER:
             conn.execute(f"PRAGMA key = '{self.encryption_key}'")
 
+    def _get_cached_conn(self):
+        """获取当前线程的缓存连接
+
+        性能优化：连接复用避免每次创建新连接的开销（SQLCipher PRAGMA key 约 30-50ms）
+        使用线程本地存储确保每个线程有独立的连接，避免多线程冲突。
+
+        Returns:
+            sqlite3.Connection: 数据库连接
+        """
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            conn = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,  # 允许跨线程（但 TLS 保证每个线程用自己的连接）
+                timeout=30.0
+            )
+            self._apply_encryption(conn)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+            logger.debug(f"Created new database connection for thread {threading.current_thread().name}")
+        return self._local.conn
+
     @contextmanager
     def _get_conn(self):
-        """获取数据库连接（上下文管理器）"""
-        # 确保 db_path 是字符串（兼容 Path 对象）
-        conn = sqlite3.connect(str(self.db_path))
-        self._apply_encryption(conn)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
+        """获取数据库连接（上下文管理器，兼容现有代码）
+
+        使用线程本地缓存连接，不在退出时关闭连接以支持复用。
+        """
+        yield self._get_cached_conn()
+        # 不关闭连接，保持复用
+
+    def close_connection(self):
+        """关闭当前线程的缓存连接（用于清理）"""
+        if hasattr(self._local, 'conn') and self._local.conn is not None:
+            try:
+                self._local.conn.close()
+                logger.debug(f"Closed database connection for thread {threading.current_thread().name}")
+            except Exception as e:
+                logger.warning(f"Error closing connection: {e}")
+            finally:
+                self._local.conn = None
 
     @contextmanager
     def _transaction(self):
@@ -358,6 +394,8 @@ class UserDatabase:
         在发生异常时自动回滚未提交的更改，防止数据不一致。
         成功完成时自动提交。
 
+        性能优化：使用线程本地缓存连接，不在退出时关闭连接。
+
         Usage:
             with db._transaction() as (conn, cursor):
                 cursor.execute("INSERT ...")
@@ -365,9 +403,7 @@ class UserDatabase:
                 # 自动提交
             # 如果发生异常，自动回滚
         """
-        conn = sqlite3.connect(self.db_path)
-        self._apply_encryption(conn)
-        conn.row_factory = sqlite3.Row
+        conn = self._get_cached_conn()
         cursor = conn.cursor()
         try:
             yield conn, cursor
@@ -375,8 +411,7 @@ class UserDatabase:
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
+        # 不关闭连接，保持复用
 
     def get_statistics(self) -> Dict[str, int]:
         """获取用户数据库统计信息"""
@@ -1519,7 +1554,8 @@ class UserDatabase:
                             elif json_field == "transport_config":
                                 item[json_field] = validate_dict(parsed, "transport_config")
                         except (json.JSONDecodeError, TypeError) as e:
-                            logger.warning(f"Failed to parse {json_field} JSON for {item.get('tag', 'unknown')}: {e}")
+                            # 降级为 debug（避免日志刷屏，这些解析错误通常不影响功能）
+                            logger.debug(f"Failed to parse {json_field} JSON for {item.get('tag', 'unknown')}: {e}")
                 result.append(item)
             return result
 
@@ -1545,7 +1581,8 @@ class UserDatabase:
                         elif json_field == "transport_config":
                             item[json_field] = validate_dict(parsed, "transport_config")
                     except (json.JSONDecodeError, TypeError) as e:
-                        logger.warning(f"Failed to parse {json_field} JSON for {tag}: {e}")
+                        # 降级为 debug（避免日志刷屏）
+                        logger.debug(f"Failed to parse {json_field} JSON for {tag}: {e}")
             return item
 
     def add_v2ray_egress(
@@ -1787,7 +1824,8 @@ class UserDatabase:
                     parsed = json.loads(item["transport_config"])
                     item["transport_config"] = validate_dict(parsed, "transport_config")
                 except (json.JSONDecodeError, TypeError) as e:
-                    logger.warning(f"Failed to parse transport_config JSON: {e}")
+                    # 降级为 debug（避免日志刷屏）
+                    logger.debug(f"Failed to parse transport_config JSON: {e}")
             return item
 
     def set_v2ray_inbound_config(

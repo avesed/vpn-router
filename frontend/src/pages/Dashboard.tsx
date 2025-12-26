@@ -13,8 +13,8 @@ import {
 } from "@heroicons/react/24/outline";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip, LineChart, Line, XAxis, YAxis } from "recharts";
 
-// 数据刷新间隔（毫秒）- 与后端 _HISTORY_INTERVAL 匹配
-const REFRESH_INTERVAL = 1000;
+// 数据刷新间隔（毫秒）- 优化: 从 1s 改为 3s 减少 API 负载
+const REFRESH_INTERVAL = 3000;
 
 // 时间范围配置
 const TIME_RANGE_CONFIG = {
