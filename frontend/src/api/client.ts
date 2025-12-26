@@ -70,7 +70,14 @@ import type {
   WarpEgressListResponse,
   WarpEgressStatus,
   WarpEndpointTestRequest,
-  WarpEndpointTestResponse
+  WarpEndpointTestResponse,
+  // Outbound Groups types
+  OutboundGroup,
+  OutboundGroupCreateRequest,
+  OutboundGroupUpdateRequest,
+  OutboundGroupListResponse,
+  AvailableMembersResponse,
+  GroupHealthCheckResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -582,5 +589,43 @@ export const api = {
       method: "POST",
       body: data,
       timeout: 120000  // 优选可能需要较长时间
-    })
+    }),
+
+  // ============ Outbound Groups Management (ECMP Load Balancing) ============
+
+  getOutboundGroups: (enabledOnly = false) =>
+    request<OutboundGroupListResponse>(`/outbound-groups?enabled_only=${enabledOnly}`),
+
+  getOutboundGroup: (tag: string) =>
+    request<OutboundGroup>(`/outbound-groups/${encodeURIComponent(tag)}`),
+
+  createOutboundGroup: (data: OutboundGroupCreateRequest) =>
+    request<{ success: boolean; group: OutboundGroup; message: string }>("/outbound-groups", {
+      method: "POST",
+      body: data
+    }),
+
+  updateOutboundGroup: (tag: string, data: OutboundGroupUpdateRequest) =>
+    request<{ success: boolean; group: OutboundGroup; message: string }>(
+      `/outbound-groups/${encodeURIComponent(tag)}`,
+      {
+        method: "PUT",
+        body: data
+      }
+    ),
+
+  deleteOutboundGroup: (tag: string) =>
+    request<{ success: boolean; message: string }>(
+      `/outbound-groups/${encodeURIComponent(tag)}`,
+      { method: "DELETE" }
+    ),
+
+  getAvailableMembers: () =>
+    request<AvailableMembersResponse>("/outbound-groups/available-members"),
+
+  triggerGroupHealthCheck: (tag: string) =>
+    request<GroupHealthCheckResponse>(
+      `/outbound-groups/${encodeURIComponent(tag)}/health-check`,
+      { method: "POST", timeout: 60000 }  // 健康检查可能需要较长时间
+    )
 };

@@ -1299,6 +1299,85 @@ def ensure_warp_dns_servers(config: dict, warp_tags: List[str]) -> None:
             })
 
 
+# ============ 出口组支持 (负载均衡/故障转移) ============
+
+
+def load_outbound_groups() -> List[dict]:
+    """从数据库加载出口组配置
+
+    Returns:
+        启用的出口组列表
+    """
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        groups = db.get_outbound_groups(enabled_only=True)
+        return groups
+    except Exception as e:
+        print(f"[render] 从数据库加载出口组失败: {e}")
+        return []
+
+
+def ensure_outbound_group_outbounds(config: dict, outbound_groups: List[dict]) -> List[str]:
+    """为出口组生成 sing-box outbound 配置
+
+    每个组生成一个 direct outbound，使用 routing_mark 指向对应的路由表。
+    实际的流量分散由 Linux ECMP 路由在内核层完成。
+
+    架构:
+        sing-box → direct (routing_mark=200) → ip rule → ECMP table 200 → 多个 WG 接口
+
+    Args:
+        config: sing-box 配置
+        outbound_groups: 出口组列表
+
+    Returns:
+        组 tag 列表（用于添加到 available_outbounds）
+    """
+    if not outbound_groups:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    group_tags = []
+
+    for group in outbound_groups:
+        tag = group.get("tag")
+        table_id = group.get("routing_table")
+        group_type = group.get("type", "loadbalance")
+        members = group.get("members", [])
+
+        if not tag or not table_id:
+            print(f"[render] 警告: 出口组缺少 tag 或 routing_table，跳过")
+            continue
+
+        group_tags.append(tag)
+
+        # 创建 direct outbound，使用 routing_mark 将流量导向 ECMP 路由表
+        # sing-box 会在发出的包上设置 SO_MARK，内核根据 ip rule 查找对应路由表
+        outbound = {
+            "type": "direct",
+            "tag": tag,
+            "routing_mark": table_id  # Linux fwmark，对应 ip rule fwmark X table Y
+        }
+
+        if tag in existing_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = outbound
+                    break
+        else:
+            # 在 block 之前插入
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+
+        print(f"[render] 创建出口组: {tag} ({group_type}, routing_table={table_id}, members={len(members)})")
+
+    return group_tags
+
+
 # ============ V2Ray Inbound 支持 ============
 
 
@@ -1976,6 +2055,15 @@ def main() -> None:
         warp_tags = ensure_warp_egress_outbounds(config, warp_egress)
         ensure_warp_dns_servers(config, warp_tags)
         all_egress_tags.extend(warp_tags)
+
+    # 加载并处理出口组（负载均衡/故障转移）
+    # 出口组使用 Linux ECMP 在内核层实现流量分散
+    # sing-box 通过 routing_mark 将流量导向对应的 ECMP 路由表
+    outbound_groups = load_outbound_groups()
+    if outbound_groups:
+        print(f"[render] 处理 {len(outbound_groups)} 个出口组 (ECMP 负载均衡)")
+        group_tags = ensure_outbound_group_outbounds(config, outbound_groups)
+        all_egress_tags.extend(group_tags)
 
     # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + V2Ray + WARP）
     # wg_egress_tags 已包含 PIA 和自定义 WireGuard 出口

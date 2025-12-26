@@ -197,6 +197,8 @@ COPY scripts/v2ray_uri_parser.py /usr/local/bin/v2ray_uri_parser.py
 COPY scripts/setup_kernel_wg.py /usr/local/bin/setup_kernel_wg.py
 COPY scripts/setup_kernel_wg_egress.py /usr/local/bin/setup_kernel_wg_egress.py
 COPY scripts/key_manager.py /usr/local/bin/key_manager.py
+COPY scripts/ecmp_manager.py /usr/local/bin/ecmp_manager.py
+COPY scripts/health_checker.py /usr/local/bin/health_checker.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
@@ -205,7 +207,8 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/socks5_proxy.py /usr/local/bin/setup_kernel_wg.py \
     /usr/local/bin/setup_kernel_wg_egress.py /usr/local/bin/xray_manager.py \
     /usr/local/bin/xray_egress_manager.py /usr/local/bin/warp_manager.py \
-    /usr/local/bin/warp_endpoint_optimizer.py
+    /usr/local/bin/warp_endpoint_optimizer.py /usr/local/bin/ecmp_manager.py \
+    /usr/local/bin/health_checker.py
 
 # Note: Config is mounted via docker-compose volumes
 # - user-config.db is auto-created on first run by init_user_db.py

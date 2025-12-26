@@ -381,6 +381,29 @@ CREATE TABLE IF NOT EXISTS pia_credentials (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 出口组表（负载均衡/故障转移）
+CREATE TABLE IF NOT EXISTS outbound_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+    type TEXT NOT NULL CHECK(type IN ('loadbalance', 'failover')),
+    members TEXT NOT NULL,                 -- JSON 数组 ["us-stream", "jp-stream"]
+    -- 负载均衡参数
+    weights TEXT,                          -- JSON 对象 {"us-stream": 2, "jp-stream": 1}
+    -- 健康检查参数
+    health_check_url TEXT DEFAULT 'http://www.gstatic.com/generate_204',
+    health_check_interval INTEGER DEFAULT 60,   -- 秒
+    health_check_timeout INTEGER DEFAULT 5,     -- 秒
+    -- 路由表配置（Linux ECMP）
+    routing_table INTEGER,                 -- Linux 路由表号 (200+)
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_outbound_groups_tag ON outbound_groups(tag);
+CREATE INDEX IF NOT EXISTS idx_outbound_groups_enabled ON outbound_groups(enabled);
 """
 
 
@@ -567,6 +590,40 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
         print("✓ 添加 warp_egress.protocol 字段")
     else:
         print("⊘ warp_egress.protocol 字段已存在，跳过迁移")
+
+
+def migrate_outbound_groups(conn: sqlite3.Connection):
+    """为现有数据库添加 outbound_groups 表（负载均衡/故障转移）"""
+    cursor = conn.cursor()
+
+    # 检查 outbound_groups 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbound_groups'")
+    if cursor.fetchone():
+        print("⊘ outbound_groups 表已存在，跳过迁移")
+        return
+
+    # 创建表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS outbound_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tag TEXT NOT NULL UNIQUE,
+            description TEXT DEFAULT '',
+            type TEXT NOT NULL CHECK(type IN ('loadbalance', 'failover')),
+            members TEXT NOT NULL,
+            weights TEXT,
+            health_check_url TEXT DEFAULT 'http://www.gstatic.com/generate_204',
+            health_check_interval INTEGER DEFAULT 60,
+            health_check_timeout INTEGER DEFAULT 5,
+            routing_table INTEGER,
+            enabled INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outbound_groups_tag ON outbound_groups(tag)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outbound_groups_enabled ON outbound_groups(enabled)")
+    conn.commit()
+    print("✓ 创建 outbound_groups 表")
 
 
 def generate_wireguard_private_key() -> str:
@@ -785,6 +842,7 @@ def main():
     migrate_v2ray_egress_socks_port(conn)
     migrate_admin_auth(conn)
     migrate_warp_egress_protocol(conn)
+    migrate_outbound_groups(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)
@@ -822,6 +880,7 @@ def main():
         "warp_egress": cursor.execute("SELECT COUNT(*) FROM warp_egress").fetchone()[0],
         "v2ray_users": cursor.execute("SELECT COUNT(*) FROM v2ray_users").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
+        "outbound_groups": cursor.execute("SELECT COUNT(*) FROM outbound_groups").fetchone()[0],
     }
 
     db_size_bytes = user_db_path.stat().st_size
@@ -841,6 +900,7 @@ def main():
     print(f"V2Ray 出口:       {stats['v2ray_egress']:,}")
     print(f"WARP 出口:        {stats['warp_egress']:,}")
     print(f"V2Ray 用户:       {stats['v2ray_users']:,}")
+    print(f"出口组:           {stats['outbound_groups']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

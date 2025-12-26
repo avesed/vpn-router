@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { api } from "../api/client";
-import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult, V2RayEgress, V2RayURIParseResult, V2RayProtocol, V2RayTransport, WarpEgress, WarpEndpointResult, WarpProtocol } from "../types";
-import { V2RAY_PROTOCOLS, V2RAY_TRANSPORTS, V2RAY_SECURITY_OPTIONS, V2RAY_TLS_FINGERPRINTS, VLESS_FLOW_OPTIONS } from "../types";
+import type { EgressItem, CustomEgress, WireGuardConfParseResult, PiaRegion, VpnProfile, DirectEgress, OpenVPNEgress, OpenVPNParseResult, V2RayEgress, V2RayURIParseResult, V2RayProtocol, V2RayTransport, WarpEgress, WarpEndpointResult, WarpProtocol, OutboundGroup, AvailableMember, OutboundGroupType } from "../types";
+import { V2RAY_PROTOCOLS, V2RAY_TRANSPORTS, V2RAY_SECURITY_OPTIONS, V2RAY_TLS_FINGERPRINTS, VLESS_FLOW_OPTIONS, OUTBOUND_GROUP_TYPES } from "../types";
 import {
   PlusIcon,
   TrashIcon,
@@ -27,7 +27,7 @@ import {
   ChartBarIcon
 } from "@heroicons/react/24/outline";
 
-type TabType = "all" | "pia" | "custom" | "direct" | "openvpn" | "v2ray" | "warp";
+type TabType = "all" | "pia" | "custom" | "direct" | "openvpn" | "v2ray" | "warp" | "groups";
 type V2RayImportMethod = "uri" | "manual";
 type ImportMethod = "upload" | "paste" | "manual";
 type OpenVPNImportMethod = "upload" | "paste" | "manual";
@@ -197,11 +197,28 @@ export default function EgressManager() {
   const [warpLicenseInput, setWarpLicenseInput] = useState("");
   const [warpLicenseLoading, setWarpLicenseLoading] = useState(false);
 
+  // Outbound Groups state (ECMP load balancing)
+  const [outboundGroups, setOutboundGroups] = useState<OutboundGroup[]>([]);
+  const [availableMembers, setAvailableMembers] = useState<AvailableMember[]>([]);
+  const [showGroupModal, setShowGroupModal] = useState(false);
+  const [groupModalMode, setGroupModalMode] = useState<"add" | "edit">("add");
+  const [editingGroup, setEditingGroup] = useState<OutboundGroup | null>(null);
+  // Group form fields
+  const [groupFormTag, setGroupFormTag] = useState("");
+  const [groupFormDescription, setGroupFormDescription] = useState("");
+  const [groupFormType, setGroupFormType] = useState<OutboundGroupType>("loadbalance");
+  const [groupFormMembers, setGroupFormMembers] = useState<string[]>([]);
+  const [groupFormWeights, setGroupFormWeights] = useState<Record<string, number>>({});
+  const [groupFormHealthUrl, setGroupFormHealthUrl] = useState("http://www.gstatic.com/generate_204");
+  const [groupFormHealthInterval, setGroupFormHealthInterval] = useState(60);
+  const [groupFormHealthTimeout, setGroupFormHealthTimeout] = useState(5);
+  const [groupHealthCheckLoading, setGroupHealthCheckLoading] = useState<string | null>(null);
+
   const loadEgress = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      const [allData, customData, profilesData, directData, openvpnData, v2rayData, directDefaultData, warpData] = await Promise.all([
+      const [allData, customData, profilesData, directData, openvpnData, v2rayData, directDefaultData, warpData, groupsData, membersData] = await Promise.all([
         api.getAllEgress(),
         api.getCustomEgress(),
         api.getProfiles(),
@@ -209,7 +226,9 @@ export default function EgressManager() {
         api.getOpenVPNEgress(),
         api.getV2RayEgress(),
         api.getDirectDefault(),
-        api.getWarpEgress()
+        api.getWarpEgress(),
+        api.getOutboundGroups(),
+        api.getAvailableMembers()
       ]);
       setPiaEgress(allData.pia);
       setCustomEgress(customData.egress);
@@ -219,6 +238,8 @@ export default function EgressManager() {
       setV2rayEgress(v2rayData.egress);
       setDirectDefaultDns(directDefaultData.dns_servers);
       setWarpEgress(warpData.warp_egress);
+      setOutboundGroups(groupsData.groups);
+      setAvailableMembers(membersData.members);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('egress.loadFailed'));
     } finally {
@@ -1383,6 +1404,138 @@ export default function EgressManager() {
     }
   };
 
+  // ============ Outbound Groups Handlers ============
+
+  const resetGroupForm = () => {
+    setGroupFormTag("");
+    setGroupFormDescription("");
+    setGroupFormType("loadbalance");
+    setGroupFormMembers([]);
+    setGroupFormWeights({});
+    setGroupFormHealthUrl("http://www.gstatic.com/generate_204");
+    setGroupFormHealthInterval(60);
+    setGroupFormHealthTimeout(5);
+    setEditingGroup(null);
+  };
+
+  const handleAddGroup = () => {
+    resetGroupForm();
+    setGroupModalMode("add");
+    setShowGroupModal(true);
+  };
+
+  const handleEditGroup = (group: OutboundGroup) => {
+    setEditingGroup(group);
+    setGroupFormTag(group.tag);
+    setGroupFormDescription(group.description || "");
+    setGroupFormType(group.type);
+    setGroupFormMembers(group.members || []);
+    setGroupFormWeights(group.weights || {});
+    setGroupFormHealthUrl(group.health_check_url);
+    setGroupFormHealthInterval(group.health_check_interval);
+    setGroupFormHealthTimeout(group.health_check_timeout);
+    setGroupModalMode("edit");
+    setShowGroupModal(true);
+  };
+
+  const handleSaveGroup = async () => {
+    if (!groupFormTag.trim() || groupFormMembers.length < 2) {
+      setError(t('groups.minMembersRequired'));
+      return;
+    }
+
+    setActionLoading("group");
+    try {
+      const data = {
+        tag: groupFormTag.trim(),
+        description: groupFormDescription.trim(),
+        type: groupFormType,
+        members: groupFormMembers,
+        weights: Object.keys(groupFormWeights).length > 0 ? groupFormWeights : undefined,
+        health_check_url: groupFormHealthUrl,
+        health_check_interval: groupFormHealthInterval,
+        health_check_timeout: groupFormHealthTimeout
+      };
+
+      if (groupModalMode === "add") {
+        await api.createOutboundGroup(data);
+        setSuccessMessage(t('groups.groupCreated'));
+      } else {
+        await api.updateOutboundGroup(groupFormTag, {
+          description: data.description,
+          members: data.members,
+          weights: data.weights,
+          health_check_url: data.health_check_url,
+          health_check_interval: data.health_check_interval,
+          health_check_timeout: data.health_check_timeout
+        });
+        setSuccessMessage(t('groups.groupUpdated'));
+      }
+      setShowGroupModal(false);
+      resetGroupForm();
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('groups.saveFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDeleteGroup = async (tag: string) => {
+    if (!confirm(t('groups.deleteGroupConfirm', { tag }))) return;
+
+    setActionLoading(tag);
+    try {
+      await api.deleteOutboundGroup(tag);
+      setSuccessMessage(t('groups.groupDeleted'));
+      loadEgress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('groups.deleteFailed'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleGroupHealthCheck = async (tag: string) => {
+    setGroupHealthCheckLoading(tag);
+    try {
+      const result = await api.triggerGroupHealthCheck(tag);
+      // Update local state with new health status
+      setOutboundGroups(prev => prev.map(g =>
+        g.tag === tag ? { ...g, health_status: result.health_status } : g
+      ));
+      setSuccessMessage(t('groups.healthCheckComplete'));
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('groups.healthCheckFailed'));
+    } finally {
+      setGroupHealthCheckLoading(null);
+    }
+  };
+
+  const toggleGroupMember = (memberTag: string) => {
+    setGroupFormMembers(prev => {
+      if (prev.includes(memberTag)) {
+        // Also remove from weights
+        const newWeights = { ...groupFormWeights };
+        delete newWeights[memberTag];
+        setGroupFormWeights(newWeights);
+        return prev.filter(m => m !== memberTag);
+      } else {
+        return [...prev, memberTag];
+      }
+    });
+  };
+
+  const updateMemberWeight = (memberTag: string, weight: number) => {
+    setGroupFormWeights(prev => ({
+      ...prev,
+      [memberTag]: Math.max(1, Math.min(100, weight))
+    }));
+  };
+
   const getV2rayProtocolLabel = (protocol: V2RayProtocol) => {
     const p = V2RAY_PROTOCOLS.find(p => p.value === protocol);
     return p ? p.label : protocol.toUpperCase();
@@ -1393,13 +1546,14 @@ export default function EgressManager() {
     return t ? t.label : transport.toUpperCase();
   };
 
-  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" ? [] : piaProfiles;
-  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" ? [] : customEgress;
-  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" ? [] : directEgress;
-  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "v2ray" || activeTab === "warp" ? [] : openvpnEgress;
-  const filteredV2ray = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "warp" ? [] : v2rayEgress;
-  const filteredWarp = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" ? [] : warpEgress;
-  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + 1 + openvpnEgress.length + v2rayEgress.length + warpEgress.length; // +1 for default direct
+  const filteredPia = activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" || activeTab === "groups" ? [] : piaProfiles;
+  const filteredCustom = activeTab === "pia" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" || activeTab === "groups" ? [] : customEgress;
+  const filteredDirect = activeTab === "pia" || activeTab === "custom" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "warp" || activeTab === "groups" ? [] : directEgress;
+  const filteredOpenvpn = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "v2ray" || activeTab === "warp" || activeTab === "groups" ? [] : openvpnEgress;
+  const filteredV2ray = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "warp" || activeTab === "groups" ? [] : v2rayEgress;
+  const filteredWarp = activeTab === "pia" || activeTab === "custom" || activeTab === "direct" || activeTab === "openvpn" || activeTab === "v2ray" || activeTab === "groups" ? [] : warpEgress;
+  const filteredGroups = activeTab === "all" || activeTab === "groups" ? outboundGroups : [];
+  const totalCount = piaProfiles.length + customEgress.length + directEgress.length + 1 + openvpnEgress.length + v2rayEgress.length + warpEgress.length + outboundGroups.length; // +1 for default direct
 
   if (loading && !piaProfiles.length && !customEgress.length && !directEgress.length && !openvpnEgress.length) {
     return (
@@ -1513,6 +1667,7 @@ export default function EgressManager() {
       <div className="flex gap-2 border-b border-white/10 pb-2 mb-4 md:mb-6 overflow-x-auto scrollbar-hide">
         {[
           { key: "all", label: `${t('common.all')} (${totalCount})` },
+          { key: "groups", label: `${t('groups.title')} (${outboundGroups.length})` },
           { key: "pia", label: `${t('egress.pia')} (${piaProfiles.length})` },
           { key: "custom", label: `${t('egress.custom')} (${customEgress.length})` },
           { key: "direct", label: `${t('egress.direct')} (${directEgress.length + 1})` },
@@ -1536,11 +1691,11 @@ export default function EgressManager() {
 
       {/* Egress List */}
       {/* Empty state - exclude "all" and "direct" tabs since they always have the default direct card */}
-      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 && filteredWarp.length === 0 && activeTab !== "all" && activeTab !== "direct" ? (
+      {filteredPia.length === 0 && filteredCustom.length === 0 && filteredDirect.length === 0 && filteredOpenvpn.length === 0 && filteredV2ray.length === 0 && filteredWarp.length === 0 && filteredGroups.length === 0 && activeTab !== "all" && activeTab !== "direct" ? (
         <div className="flex-1 rounded-xl bg-white/5 border border-white/10 p-12 text-center flex flex-col items-center justify-center">
           <GlobeAltIcon className="h-12 w-12 text-slate-600 mb-4" />
           <p className="text-slate-400">
-            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : activeTab === "warp" ? t('warpEgress.noWarpEgress') : t('egress.noEgressFound')}
+            {activeTab === "custom" ? t('egress.noCustomEgress') : activeTab === "pia" ? t('egress.noPiaLines') : activeTab === "openvpn" ? t('openvpnEgress.noOpenvpnEgress') : activeTab === "v2ray" ? t('v2rayEgress.noV2rayEgress') : activeTab === "warp" ? t('warpEgress.noWarpEgress') : activeTab === "groups" ? t('groups.noGroups') : t('egress.noEgressFound')}
           </p>
           <div className="mt-4">
             {activeTab === "pia" && (
@@ -1581,6 +1736,14 @@ export default function EgressManager() {
                   className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium"
                 >
                   {t('warpEgress.registerWarp')}
+                </button>
+              )}
+              {activeTab === "groups" && (
+                <button
+                  onClick={handleAddGroup}
+                  className="px-4 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 text-white text-sm font-medium"
+                >
+                  {t('groups.addGroup')}
                 </button>
               )}
           </div>
@@ -2363,6 +2526,123 @@ export default function EgressManager() {
                             {t('egress.speedTest')}
                           </>
                         )}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Outbound Groups (ECMP Load Balancing) */}
+          {filteredGroups.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-slate-400 flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-indigo-400" />
+                  {t('groups.title')} ({outboundGroups.length})
+                </h3>
+                <button
+                  onClick={handleAddGroup}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-500/20 text-indigo-400 hover:bg-indigo-500/30 text-sm font-medium transition-colors"
+                >
+                  <PlusIcon className="h-4 w-4" />
+                  {t('groups.addGroup')}
+                </button>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
+                {filteredGroups.map((group) => (
+                  <div
+                    key={group.tag}
+                    className="rounded-xl bg-slate-800/50 border border-white/5 p-4 space-y-3"
+                  >
+                    {/* Header */}
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        <ServerIcon className="h-5 w-5 text-indigo-400 flex-shrink-0" />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-sm font-medium text-white truncate">{group.tag}</p>
+                          <p className="text-xs text-slate-400 truncate">{group.description || t('groups.noDescription')}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-shrink-0">
+                        <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                          group.type === 'loadbalance'
+                            ? 'bg-indigo-500/20 text-indigo-400'
+                            : 'bg-amber-500/20 text-amber-400'
+                        }`}>
+                          {group.type === 'loadbalance' ? t('groups.loadbalance') : t('groups.failover')}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Members */}
+                    <div className="space-y-1.5">
+                      <p className="text-xs text-slate-500">{t('groups.members')} ({group.members?.length || 0})</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(group.members || []).map((member) => {
+                          const healthStatus = group.health_status?.[member];
+                          const isHealthy = healthStatus?.healthy !== false;
+                          return (
+                            <span
+                              key={member}
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${
+                                isHealthy
+                                  ? 'bg-slate-700/50 text-slate-300'
+                                  : 'bg-red-500/20 text-red-400'
+                              }`}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${
+                                healthStatus === undefined
+                                  ? 'bg-slate-500'
+                                  : isHealthy
+                                    ? 'bg-emerald-400'
+                                    : 'bg-red-400'
+                              }`} />
+                              {member}
+                              {group.type === 'loadbalance' && group.weights?.[member] && (
+                                <span className="text-slate-500">×{group.weights[member]}</span>
+                              )}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Info */}
+                    <div className="text-xs text-slate-500">
+                      <p>{t('groups.routingTable')}: {group.routing_table}</p>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="grid grid-cols-3 gap-2 pt-2 border-t border-white/5">
+                      <button
+                        onClick={() => handleEditGroup(group)}
+                        disabled={actionLoading === group.tag}
+                        className="flex items-center justify-center gap-1.5 rounded-lg bg-slate-700/50 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700 transition-colors"
+                      >
+                        <PencilIcon className="h-3.5 w-3.5" />
+                        {t('common.edit')}
+                      </button>
+                      <button
+                        onClick={() => handleGroupHealthCheck(group.tag)}
+                        disabled={groupHealthCheckLoading === group.tag}
+                        className="flex items-center justify-center gap-1.5 rounded-lg bg-slate-700/50 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700 transition-colors"
+                      >
+                        {groupHealthCheckLoading === group.tag ? (
+                          <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <ShieldCheckIcon className="h-3.5 w-3.5" />
+                        )}
+                        {t('groups.checkHealth')}
+                      </button>
+                      <button
+                        onClick={() => handleDeleteGroup(group.tag)}
+                        disabled={actionLoading === group.tag}
+                        className="flex items-center justify-center gap-1.5 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-400 hover:bg-red-500/20 transition-colors"
+                      >
+                        <TrashIcon className="h-3.5 w-3.5" />
+                        {t('common.delete')}
                       </button>
                     </div>
                   </div>
@@ -4439,6 +4719,223 @@ export default function EgressManager() {
                     <KeyIcon className="h-4 w-4" />
                   )}
                   {t('warpEgress.apply')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Outbound Group Modal */}
+      {showGroupModal && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">
+                    {groupModalMode === "add" ? t('groups.addGroup') : t('groups.editGroup', { tag: editingGroup?.tag })}
+                  </h2>
+                  <button
+                    onClick={() => {
+                      setShowGroupModal(false);
+                      resetGroupForm();
+                    }}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                {/* Tag */}
+                {groupModalMode === "add" && (
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">
+                      {t('groups.tag')} <span className="text-red-400">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={groupFormTag}
+                      onChange={(e) => setGroupFormTag(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, "-"))}
+                      placeholder={t('groups.tagPlaceholder')}
+                      className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">{t('groups.tagHint')}</p>
+                  </div>
+                )}
+
+                {/* Description */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('common.description')}
+                  </label>
+                  <input
+                    type="text"
+                    value={groupFormDescription}
+                    onChange={(e) => setGroupFormDescription(e.target.value)}
+                    placeholder={t('groups.descriptionPlaceholder')}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+
+                {/* Type */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('groups.groupType')} <span className="text-red-400">*</span>
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    {OUTBOUND_GROUP_TYPES.map((type) => (
+                      <button
+                        key={type.value}
+                        onClick={() => setGroupFormType(type.value as OutboundGroupType)}
+                        className={`p-3 rounded-lg border text-left transition-colors ${
+                          groupFormType === type.value
+                            ? type.value === 'loadbalance'
+                              ? "bg-indigo-500/20 border-indigo-500/50 text-white"
+                              : "bg-amber-500/20 border-amber-500/50 text-white"
+                            : "bg-white/5 border-white/10 text-slate-400 hover:border-white/20"
+                        }`}
+                      >
+                        <p className="font-medium">{type.label}</p>
+                        <p className="text-xs text-slate-500 mt-1">{type.description}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Member Selection */}
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t('groups.selectMembers')} <span className="text-red-400">*</span>
+                    <span className="text-xs text-slate-500 ml-2">
+                      ({groupFormMembers.length} {t('groups.selected')}, {t('groups.minRequired')})
+                    </span>
+                  </label>
+                  <div className="max-h-48 overflow-y-auto rounded-lg border border-white/10 bg-white/5">
+                    {availableMembers.length === 0 ? (
+                      <p className="p-4 text-sm text-slate-500 text-center">{t('groups.noMembersAvailable')}</p>
+                    ) : (
+                      <div className="divide-y divide-white/5">
+                        {availableMembers.map((member) => (
+                          <label
+                            key={member.tag}
+                            className={`flex items-center gap-3 p-3 cursor-pointer hover:bg-white/5 transition-colors ${
+                              groupFormMembers.includes(member.tag) ? 'bg-indigo-500/10' : ''
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={groupFormMembers.includes(member.tag)}
+                              onChange={() => toggleGroupMember(member.tag)}
+                              className="w-4 h-4 rounded border-white/20 bg-white/5 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-white truncate">{member.tag}</p>
+                              <p className="text-xs text-slate-500 truncate">{member.description}</p>
+                            </div>
+                            <span className="px-2 py-0.5 rounded text-xs bg-slate-700/50 text-slate-400">
+                              {member.type}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Weights (only for loadbalance) */}
+                {groupFormType === 'loadbalance' && groupFormMembers.length > 0 && (
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">
+                      {t('groups.weights')}
+                      <span className="text-xs text-slate-500 ml-2">{t('groups.weightHint')}</span>
+                    </label>
+                    <div className="space-y-2">
+                      {groupFormMembers.map((member) => (
+                        <div key={member} className="flex items-center gap-3">
+                          <span className="text-sm text-white w-40 truncate">{member}</span>
+                          <input
+                            type="range"
+                            min="1"
+                            max="10"
+                            value={groupFormWeights[member] || 1}
+                            onChange={(e) => updateMemberWeight(member, parseInt(e.target.value))}
+                            className="flex-1 h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                          />
+                          <span className="text-sm text-slate-400 w-8 text-right">
+                            {groupFormWeights[member] || 1}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Health Check Settings */}
+                <div className="border-t border-white/10 pt-4">
+                  <p className="text-sm font-medium text-slate-400 mb-3">{t('groups.healthCheck')}</p>
+                  <div className="grid gap-4 md:grid-cols-3">
+                    <div>
+                      <label className="block text-xs text-slate-500 mb-1">{t('groups.healthCheckUrl')}</label>
+                      <input
+                        type="text"
+                        value={groupFormHealthUrl}
+                        onChange={(e) => setGroupFormHealthUrl(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-500 mb-1">{t('groups.healthCheckInterval')} (s)</label>
+                      <input
+                        type="number"
+                        min="10"
+                        max="3600"
+                        value={groupFormHealthInterval}
+                        onChange={(e) => setGroupFormHealthInterval(parseInt(e.target.value) || 60)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-500 mb-1">{t('groups.healthCheckTimeout')} (s)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="30"
+                        value={groupFormHealthTimeout}
+                        onChange={(e) => setGroupFormHealthTimeout(parseInt(e.target.value) || 5)}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white text-sm focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+                <button
+                  onClick={() => {
+                    setShowGroupModal(false);
+                    resetGroupForm();
+                  }}
+                  className="px-4 py-2 rounded-lg bg-white/10 text-slate-300 hover:bg-white/20"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  onClick={handleSaveGroup}
+                  disabled={actionLoading === "group" || !groupFormTag.trim() || groupFormMembers.length < 2}
+                  className="px-4 py-2 rounded-lg bg-indigo-500 text-white hover:bg-indigo-600 disabled:opacity-50"
+                >
+                  {actionLoading === "group" ? (
+                    <ArrowPathIcon className="h-5 w-5 animate-spin" />
+                  ) : groupModalMode === "add" ? (
+                    t('common.create')
+                  ) : (
+                    t('common.save')
+                  )}
                 </button>
               </div>
             </div>

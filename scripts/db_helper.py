@@ -1804,6 +1804,300 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ 出口组（负载均衡/故障转移） ============
+
+    def get_outbound_groups(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有出口组"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM outbound_groups WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM outbound_groups ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            result = []
+            for row in rows:
+                item = dict(zip(columns, row))
+                # 解析 JSON 字段
+                if item.get("members"):
+                    try:
+                        item["members"] = json.loads(item["members"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["members"] = []
+                if item.get("weights"):
+                    try:
+                        item["weights"] = json.loads(item["weights"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["weights"] = None
+                result.append(item)
+            return result
+
+    def get_outbound_group(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取单个出口组"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM outbound_groups WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            item = dict(zip(columns, row))
+            # 解析 JSON 字段
+            if item.get("members"):
+                try:
+                    item["members"] = json.loads(item["members"])
+                except (json.JSONDecodeError, TypeError):
+                    item["members"] = []
+            if item.get("weights"):
+                try:
+                    item["weights"] = json.loads(item["weights"])
+                except (json.JSONDecodeError, TypeError):
+                    item["weights"] = None
+            return item
+
+    def get_next_routing_table(self) -> int:
+        """获取下一个可用的路由表号（从 200 开始）
+
+        Linux 路由表号 0-255 有特殊含义，从 200 开始避免冲突。
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(routing_table) FROM outbound_groups"
+            ).fetchone()
+            max_table = row[0] if row and row[0] else None
+            if max_table is None:
+                return 200
+            return max_table + 1
+
+    def get_all_egress_tags(self) -> set:
+        """获取所有有效的出口 tag（用于验证成员）
+
+        包括：PIA profiles, custom egress, direct egress, OpenVPN, V2Ray, WARP, 已有的出口组
+        """
+        tags = set()
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # PIA profiles
+            for row in cursor.execute("SELECT name FROM pia_profiles WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # Custom WireGuard egress
+            for row in cursor.execute("SELECT tag FROM custom_egress WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # Direct egress
+            for row in cursor.execute("SELECT tag FROM direct_egress WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # OpenVPN egress
+            for row in cursor.execute("SELECT tag FROM openvpn_egress WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # V2Ray egress
+            for row in cursor.execute("SELECT tag FROM v2ray_egress WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # WARP egress
+            for row in cursor.execute("SELECT tag FROM warp_egress WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # 已有的出口组（支持嵌套）
+            for row in cursor.execute("SELECT tag FROM outbound_groups WHERE enabled = 1").fetchall():
+                tags.add(row[0])
+            # 内置出口
+            tags.add("direct")
+            tags.add("block")
+        return tags
+
+    def tag_exists_in_any_egress(self, tag: str) -> bool:
+        """检查 tag 是否已被任何出口类型使用"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 检查所有出口表
+            tables = [
+                ("pia_profiles", "name"),
+                ("custom_egress", "tag"),
+                ("direct_egress", "tag"),
+                ("openvpn_egress", "tag"),
+                ("v2ray_egress", "tag"),
+                ("warp_egress", "tag"),
+                ("outbound_groups", "tag"),
+            ]
+            for table, column in tables:
+                row = cursor.execute(
+                    f"SELECT 1 FROM {table} WHERE {column} = ?", (tag,)
+                ).fetchone()
+                if row:
+                    return True
+            # 检查内置出口
+            if tag in ("direct", "block", "adblock"):
+                return True
+            return False
+
+    def validate_group_members(
+        self,
+        members: List[str],
+        exclude_tag: Optional[str] = None
+    ) -> tuple:
+        """验证成员有效性
+
+        Args:
+            members: 成员 tag 列表
+            exclude_tag: 排除的 tag（用于编辑时排除自己）
+
+        Returns:
+            (valid: bool, error_msg: str, invalid_members: List[str])
+        """
+        valid_tags = self.get_all_egress_tags()
+        if exclude_tag:
+            valid_tags.discard(exclude_tag)
+
+        invalid = []
+        for member in members:
+            if member not in valid_tags:
+                invalid.append(member)
+
+        if invalid:
+            return False, f"无效的成员: {', '.join(invalid)}", invalid
+        return True, "", []
+
+    def check_circular_reference(
+        self,
+        tag: str,
+        members: List[str],
+        visited: Optional[set] = None
+    ) -> tuple:
+        """检测循环引用
+
+        使用 DFS 检测是否存在 A -> B -> C -> A 的循环依赖。
+
+        Args:
+            tag: 当前组的 tag
+            members: 当前组的成员列表
+            visited: 已访问的节点（用于 DFS）
+
+        Returns:
+            (has_cycle: bool, cycle_path: List[str])
+        """
+        if visited is None:
+            visited = set()
+
+        # 检查自引用
+        if tag in members:
+            return True, [tag, tag]
+
+        visited.add(tag)
+
+        for member in members:
+            # 检查成员是否是已访问的节点（形成环）
+            if member in visited:
+                return True, [tag, member]
+
+            # 如果成员是出口组，递归检查
+            group = self.get_outbound_group(member)
+            if group:
+                # 递归检查
+                has_cycle, path = self.check_circular_reference(
+                    member, group["members"], visited.copy()
+                )
+                if has_cycle:
+                    return True, [tag] + path
+
+        return False, []
+
+    def add_outbound_group(
+        self,
+        tag: str,
+        group_type: str,
+        members: List[str],
+        description: str = "",
+        weights: Optional[Dict[str, int]] = None,
+        health_check_url: str = "http://www.gstatic.com/generate_204",
+        health_check_interval: int = 60,
+        health_check_timeout: int = 5,
+        enabled: bool = True
+    ) -> int:
+        """添加出口组
+
+        Args:
+            tag: 组标识（唯一）
+            group_type: 组类型 ('loadbalance' 或 'failover')
+            members: 成员出口 tag 列表
+            description: 描述
+            weights: 权重配置（仅 loadbalance 使用）
+            health_check_url: 健康检查 URL
+            health_check_interval: 健康检查间隔（秒）
+            health_check_timeout: 健康检查超时（秒）
+            enabled: 是否启用
+
+        Returns:
+            新创建的组 ID
+        """
+        # 自动分配路由表号
+        routing_table = self.get_next_routing_table()
+
+        members_json = json.dumps(members)
+        weights_json = json.dumps(weights) if weights else None
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO outbound_groups
+                (tag, description, type, members, weights,
+                 health_check_url, health_check_interval, health_check_timeout,
+                 routing_table, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tag, description, group_type, members_json, weights_json,
+                health_check_url, health_check_interval, health_check_timeout,
+                routing_table, 1 if enabled else 0
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_outbound_group(self, tag: str, **kwargs) -> bool:
+        """更新出口组
+
+        支持的字段：description, members, weights,
+        health_check_url, health_check_interval, health_check_timeout, enabled
+        """
+        allowed_fields = {
+            "description", "members", "weights",
+            "health_check_url", "health_check_interval", "health_check_timeout",
+            "enabled"
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        if not updates:
+            return False
+
+        # 处理特殊字段
+        if "members" in updates:
+            updates["members"] = json.dumps(updates["members"])
+        if "weights" in updates:
+            updates["weights"] = json.dumps(updates["weights"]) if updates["weights"] else None
+        if "enabled" in updates:
+            updates["enabled"] = 1 if updates["enabled"] else 0
+
+        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+        values = list(updates.values()) + [tag]
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE outbound_groups SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE tag = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_outbound_group(self, tag: str) -> bool:
+        """删除出口组"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM outbound_groups WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
     # ============ V2Ray Inbound 配置 ============
 
     def get_v2ray_inbound_config(self) -> Optional[Dict]:
@@ -2374,6 +2668,60 @@ class DatabaseManager:
 
     def delete_warp_egress(self, tag: str) -> bool:
         return self.user.delete_warp_egress(tag)
+
+    # Outbound Groups (负载均衡/故障转移)
+    def get_outbound_groups(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_outbound_groups(enabled_only)
+
+    def get_outbound_group(self, tag: str) -> Optional[Dict]:
+        return self.user.get_outbound_group(tag)
+
+    def get_next_routing_table(self) -> int:
+        return self.user.get_next_routing_table()
+
+    def get_all_egress_tags(self) -> set:
+        return self.user.get_all_egress_tags()
+
+    def tag_exists_in_any_egress(self, tag: str) -> bool:
+        return self.user.tag_exists_in_any_egress(tag)
+
+    def validate_group_members(
+        self,
+        members: List[str],
+        exclude_tag: Optional[str] = None
+    ) -> tuple:
+        return self.user.validate_group_members(members, exclude_tag)
+
+    def check_circular_reference(
+        self,
+        tag: str,
+        members: List[str],
+        visited: Optional[set] = None
+    ) -> tuple:
+        return self.user.check_circular_reference(tag, members, visited)
+
+    def add_outbound_group(
+        self,
+        tag: str,
+        group_type: str,
+        members: List[str],
+        description: str = "",
+        weights: Optional[Dict[str, int]] = None,
+        health_check_url: str = "http://www.gstatic.com/generate_204",
+        health_check_interval: int = 60,
+        health_check_timeout: int = 5,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_outbound_group(
+            tag, group_type, members, description, weights,
+            health_check_url, health_check_interval, health_check_timeout, enabled
+        )
+
+    def update_outbound_group(self, tag: str, **kwargs) -> bool:
+        return self.user.update_outbound_group(tag, **kwargs)
+
+    def delete_outbound_group(self, tag: str) -> bool:
+        return self.user.delete_outbound_group(tag)
 
     # V2Ray Inbound
     def get_v2ray_inbound_config(self) -> Optional[Dict]:

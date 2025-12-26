@@ -1059,6 +1059,12 @@ def _get_all_outbounds() -> List[str]:
                 if tag and tag not in outbounds:
                     outbounds.append(tag)
 
+            # Outbound groups (负载均衡/故障转移组)
+            for group in db.get_outbound_groups(enabled_only=True):
+                tag = group.get("tag")
+                if tag and tag not in outbounds:
+                    outbounds.append(tag)
+
             # 从路由规则中获取出口（包括协议规则、端口规则等）
             for rule in db.get_routing_rules():
                 outbound = rule.get("outbound")
@@ -2479,6 +2485,12 @@ def api_get_rules():
             for egress in warp_egress:
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
+
+            # 从数据库读取出口组（负载均衡/故障转移）
+            outbound_groups = db.get_outbound_groups(enabled_only=True)
+            for group in outbound_groups:
+                if group.get("tag") and group["tag"] not in available_outbounds:
+                    available_outbounds.append(group["tag"])
         except Exception:
             pass
 
@@ -5591,6 +5603,389 @@ async def api_test_warp_endpoints_stream(data: WarpEndpointsTest):
             "X-Accel-Buffering": "no"
         }
     )
+
+
+# ============ Outbound Groups APIs (ECMP 负载均衡) ============
+
+class OutboundGroupCreate(BaseModel):
+    """出口组创建请求"""
+    tag: str = Field(..., min_length=1, max_length=30, pattern=r'^[a-zA-Z0-9_-]+$')
+    description: str = ""
+    type: str = Field(..., pattern=r'^(loadbalance|failover)$')
+    members: List[str] = Field(..., min_length=2, max_length=10)
+    weights: Optional[Dict[str, int]] = None
+    health_check_url: str = "http://www.gstatic.com/generate_204"
+    health_check_interval: int = Field(60, ge=10, le=3600)
+    health_check_timeout: int = Field(5, ge=1, le=30)
+
+
+class OutboundGroupUpdate(BaseModel):
+    """出口组更新请求"""
+    description: Optional[str] = None
+    members: Optional[List[str]] = Field(None, min_length=2, max_length=10)
+    weights: Optional[Dict[str, int]] = None
+    health_check_url: Optional[str] = None
+    health_check_interval: Optional[int] = Field(None, ge=10, le=3600)
+    health_check_timeout: Optional[int] = Field(None, ge=1, le=30)
+    enabled: Optional[bool] = None
+
+
+def _sync_ecmp_for_group(group: Dict) -> str:
+    """同步单个出口组的 ECMP 路由
+
+    Returns:
+        状态消息
+    """
+    try:
+        from ecmp_manager import sync_group
+        db = _get_db()
+        if sync_group(db, group):
+            return ", ecmp synced"
+        else:
+            return ", ecmp sync failed"
+    except ImportError:
+        return ", ecmp_manager not available"
+    except Exception as e:
+        print(f"[api] ECMP sync failed: {e}")
+        return f", ecmp sync failed: {e}"
+
+
+def _teardown_ecmp_for_group(tag: str) -> str:
+    """删除出口组的 ECMP 路由
+
+    Returns:
+        状态消息
+    """
+    try:
+        from ecmp_manager import teardown_group
+        db = _get_db()
+        if teardown_group(db, tag):
+            return ", ecmp removed"
+        else:
+            return ", ecmp removal failed"
+    except ImportError:
+        return ", ecmp_manager not available"
+    except Exception as e:
+        print(f"[api] ECMP teardown failed: {e}")
+        return f", ecmp teardown failed: {e}"
+
+
+@app.get("/api/outbound-groups")
+def api_list_outbound_groups(enabled_only: bool = False):
+    """列出所有出口组"""
+    db = _get_db()
+    groups = db.get_outbound_groups(enabled_only)
+
+    # 获取健康状态
+    try:
+        from health_checker import get_health_status
+        health_status = get_health_status()
+    except ImportError:
+        health_status = {}
+
+    # 附加健康状态到每个组
+    for group in groups:
+        group_tag = group.get("tag")
+        if group_tag in health_status:
+            group["health_status"] = health_status[group_tag]
+        else:
+            group["health_status"] = {}
+
+    return {"groups": groups}
+
+
+@app.get("/api/outbound-groups/available-members")
+def api_get_available_members():
+    """获取可用的出口成员列表（用于创建组时选择）
+
+    只返回支持 ECMP 负载均衡的出口类型（有内核接口的）：
+    - PIA WireGuard profiles
+    - Custom WireGuard egress
+    - WARP WireGuard egress (protocol == "wireguard")
+    - Direct egress (with bind_interface)
+
+    不支持 ECMP 的类型（使用 SOCKS 代理）：
+    - OpenVPN (通过 SOCKS5 桥接)
+    - V2Ray egress (通过 SOCKS5 桥接)
+    - WARP MASQUE (通过 SOCKS5 代理)
+    """
+    db = _get_db()
+
+    members = []
+
+    # PIA profiles (WireGuard)
+    try:
+        pia_profiles = db.get_pia_profiles(enabled_only=True)
+        for p in pia_profiles:
+            members.append({
+                "tag": p.get("name"),
+                "type": "pia",
+                "description": p.get("description") or p.get("name"),
+            })
+    except Exception as e:
+        print(f"WARNING: Failed to get PIA profiles: {e}")
+
+    # Custom egress (WireGuard)
+    try:
+        custom_list = db.get_custom_egress_list()
+        for e in custom_list:
+            members.append({
+                "tag": e.get("tag"),
+                "type": "wireguard",
+                "description": e.get("description", e.get("tag")),
+            })
+    except Exception as e:
+        print(f"WARNING: Failed to get custom egress: {e}")
+
+    # Direct egress (只包含有 bind_interface 的)
+    try:
+        direct_list = db.get_direct_egress_list()
+        for e in direct_list:
+            # 只有绑定了接口的 Direct egress 才能参与 ECMP
+            if e.get("bind_interface"):
+                members.append({
+                    "tag": e.get("tag"),
+                    "type": "direct",
+                    "description": e.get("description", e.get("tag")),
+                })
+    except Exception as e:
+        print(f"WARNING: Failed to get direct egress: {e}")
+
+    # WARP egress (只包含 WireGuard 协议的)
+    try:
+        warp_list = db.get_warp_egress_list()
+        for e in warp_list:
+            # 只有 WireGuard 协议的 WARP 才有内核接口，才能参与 ECMP
+            if e.get("protocol") == "wireguard":
+                members.append({
+                    "tag": e.get("tag"),
+                    "type": "warp",
+                    "description": e.get("description", e.get("tag")),
+                })
+    except Exception as e:
+        print(f"WARNING: Failed to get WARP egress: {e}")
+
+    # 注意：以下类型不支持 ECMP，不列出
+    # - OpenVPN (SOCKS5 桥接)
+    # - V2Ray egress (SOCKS5 桥接)
+    # - WARP MASQUE (SOCKS5 代理)
+    # - builtin "direct" (没有特定接口)
+
+    return {"members": members}
+
+
+@app.get("/api/outbound-groups/{tag}")
+def api_get_outbound_group(tag: str):
+    """获取单个出口组详情"""
+    db = _get_db()
+    group = db.get_outbound_group(tag)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Outbound group '{tag}' not found")
+
+    # 获取健康状态
+    try:
+        from health_checker import get_health_status
+        health_status = get_health_status(tag)
+        group["health_status"] = health_status.get(tag, {})
+    except ImportError:
+        group["health_status"] = {}
+
+    return group
+
+
+@app.post("/api/outbound-groups")
+def api_create_outbound_group(data: OutboundGroupCreate):
+    """创建出口组"""
+    db = _get_db()
+
+    # 1. 验证 tag 唯一性（跨所有出口类型）
+    if db.tag_exists_in_any_egress(data.tag):
+        raise HTTPException(status_code=400, detail=f"Tag '{data.tag}' is already used by another egress")
+
+    # 2. 验证成员有效性
+    valid, error, invalid = db.validate_group_members(data.members)
+    if not valid:
+        raise HTTPException(status_code=400, detail=f"Invalid members: {', '.join(invalid)}")
+
+    # 3. 检测循环引用
+    has_cycle, path = db.check_circular_reference(data.tag, data.members)
+    if has_cycle:
+        raise HTTPException(status_code=400, detail=f"Circular reference detected: {' → '.join(path)}")
+
+    # 4. 验证权重配置
+    if data.weights:
+        for member, weight in data.weights.items():
+            if member not in data.members:
+                raise HTTPException(status_code=400, detail=f"Weight config for '{member}' not in member list")
+            if weight < 1 or weight > 100:
+                raise HTTPException(status_code=400, detail="Weight must be between 1 and 100")
+
+    # 5. 创建组
+    try:
+        group_id = db.add_outbound_group(
+            tag=data.tag,
+            description=data.description,
+            group_type=data.type,
+            members=data.members,
+            weights=data.weights,
+            health_check_url=data.health_check_url,
+            health_check_interval=data.health_check_interval,
+            health_check_timeout=data.health_check_timeout
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create outbound group: {str(e)}")
+
+    # 6. 获取创建的组
+    group = db.get_outbound_group(data.tag)
+
+    # 7. 同步 ECMP 路由
+    ecmp_status = _sync_ecmp_for_group(group)
+
+    # 8. 重新生成 sing-box 配置并 reload
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "success": True,
+        "group": group,
+        "message": f"Outbound group '{data.tag}' created{ecmp_status}{reload_status}"
+    }
+
+
+@app.put("/api/outbound-groups/{tag}")
+def api_update_outbound_group(tag: str, data: OutboundGroupUpdate):
+    """更新出口组"""
+    db = _get_db()
+
+    # 检查组是否存在
+    existing = db.get_outbound_group(tag)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Outbound group '{tag}' not found")
+
+    # 如果更新成员，需要验证
+    if data.members is not None:
+        # 验证成员有效性
+        valid, error, invalid = db.validate_group_members(data.members, exclude_tag=tag)
+        if not valid:
+            raise HTTPException(status_code=400, detail=f"Invalid members: {', '.join(invalid)}")
+
+        # 检测循环引用
+        has_cycle, path = db.check_circular_reference(tag, data.members)
+        if has_cycle:
+            raise HTTPException(status_code=400, detail=f"Circular reference detected: {' → '.join(path)}")
+
+    # 验证权重配置
+    # existing.members 已经被 get_outbound_group() 解析为 list，不需要 json.loads
+    members_to_check = data.members if data.members is not None else existing.get("members", [])
+    if data.weights:
+        for member, weight in data.weights.items():
+            if member not in members_to_check:
+                raise HTTPException(status_code=400, detail=f"Weight config for '{member}' not in member list")
+            if weight < 1 or weight > 100:
+                raise HTTPException(status_code=400, detail="Weight must be between 1 and 100")
+
+    # 构建更新参数
+    update_kwargs = {}
+    if data.description is not None:
+        update_kwargs["description"] = data.description
+    if data.members is not None:
+        update_kwargs["members"] = data.members
+    if data.weights is not None:
+        update_kwargs["weights"] = data.weights
+    if data.health_check_url is not None:
+        update_kwargs["health_check_url"] = data.health_check_url
+    if data.health_check_interval is not None:
+        update_kwargs["health_check_interval"] = data.health_check_interval
+    if data.health_check_timeout is not None:
+        update_kwargs["health_check_timeout"] = data.health_check_timeout
+    if data.enabled is not None:
+        update_kwargs["enabled"] = data.enabled
+
+    # 更新数据库
+    try:
+        db.update_outbound_group(tag, **update_kwargs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update outbound group: {str(e)}")
+
+    # 获取更新后的组
+    group = db.get_outbound_group(tag)
+
+    # 同步 ECMP 路由
+    ecmp_status = _sync_ecmp_for_group(group)
+
+    # 重新生成 sing-box 配置并 reload
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "success": True,
+        "group": group,
+        "message": f"Outbound group '{tag}' updated{ecmp_status}{reload_status}"
+    }
+
+
+@app.delete("/api/outbound-groups/{tag}")
+def api_delete_outbound_group(tag: str):
+    """删除出口组"""
+    db = _get_db()
+
+    # 检查组是否存在
+    if not db.get_outbound_group(tag):
+        raise HTTPException(status_code=404, detail=f"Outbound group '{tag}' not found")
+
+    # 先删除 ECMP 路由
+    ecmp_status = _teardown_ecmp_for_group(tag)
+
+    # 删除数据库记录
+    db.delete_outbound_group(tag)
+
+    # 重新生成 sing-box 配置并 reload
+    reload_status = ""
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
+
+    return {
+        "success": True,
+        "message": f"Outbound group '{tag}' deleted{ecmp_status}{reload_status}"
+    }
+
+
+@app.post("/api/outbound-groups/{tag}/health-check")
+def api_trigger_group_health_check(tag: str):
+    """立即触发出口组的健康检查"""
+    db = _get_db()
+
+    # 检查组是否存在
+    group = db.get_outbound_group(tag)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Outbound group '{tag}' not found")
+
+    try:
+        from health_checker import check_and_update_group
+        member_status = check_and_update_group(db, group)
+        return {
+            "success": True,
+            "tag": tag,
+            "health_status": member_status
+        }
+    except ImportError:
+        raise HTTPException(status_code=500, detail="Health checker not available")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
 
 # ============ V2Ray Inbound APIs ============

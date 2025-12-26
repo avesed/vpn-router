@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cleanup() {
+  if [ -n "${HEALTH_CHECKER_PID:-}" ] && kill -0 "${HEALTH_CHECKER_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping health checker (PID ${HEALTH_CHECKER_PID})"
+    kill "${HEALTH_CHECKER_PID}" >/dev/null 2>&1 || true
+  fi
   if [ -n "${WARP_MGR_PID:-}" ] && kill -0 "${WARP_MGR_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping WARP manager (PID ${WARP_MGR_PID})"
     kill "${WARP_MGR_PID}" >/dev/null 2>&1 || true
@@ -29,6 +33,7 @@ OPENVPN_MGR_PID=""
 XRAY_MGR_PID=""
 XRAY_EGRESS_MGR_PID=""
 WARP_MGR_PID=""
+HEALTH_CHECKER_PID=""
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
@@ -234,6 +239,19 @@ setup_kernel_wireguard_egress() {
 # Setup kernel WireGuard egress interfaces (PIA + custom)
 setup_kernel_wireguard_egress
 
+# === ECMP Routes Setup for Outbound Groups ===
+sync_ecmp_routes() {
+  echo "[entrypoint] syncing ECMP routes for outbound groups"
+  if python3 /usr/local/bin/ecmp_manager.py --sync-all 2>/dev/null; then
+    echo "[entrypoint] ECMP routes synced successfully"
+  else
+    echo "[entrypoint] warning: ECMP route sync failed or no groups configured"
+  fi
+}
+
+# Sync ECMP routes for outbound groups (after egress interfaces are ready)
+sync_ecmp_routes
+
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
     local api_port="${API_PORT:-8000}"
@@ -400,6 +418,29 @@ print(len(egress_list))
   fi
 }
 
+# === Health Checker Daemon ===
+start_health_checker() {
+  # 检查是否有启用的出口组
+  local group_count
+  group_count=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+groups = db.get_outbound_groups(enabled_only=True)
+print(len(groups))
+" 2>/dev/null || echo "0")
+
+  if [ "${group_count}" -gt "0" ]; then
+    echo "[entrypoint] starting health checker for ${group_count} outbound groups"
+    python3 /usr/local/bin/health_checker.py --daemon >/var/log/health-checker.log 2>&1 &
+    HEALTH_CHECKER_PID=$!
+    echo "[entrypoint] health checker started with PID ${HEALTH_CHECKER_PID}"
+  else
+    echo "[entrypoint] No outbound groups configured, skipping health checker"
+  fi
+}
+
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
 
@@ -465,6 +506,7 @@ start_openvpn_manager
 start_xray_manager
 start_xray_egress_manager
 start_warp_manager
+start_health_checker
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -589,6 +631,12 @@ while true; do
   if [ -n "${WARP_MGR_PID}" ] && ! kill -0 "${WARP_MGR_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: WARP manager died, restarting..." >&2
     start_warp_manager
+  fi
+
+  # Check health checker
+  if [ -n "${HEALTH_CHECKER_PID}" ] && ! kill -0 "${HEALTH_CHECKER_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: health checker died, restarting..." >&2
+    start_health_checker
   fi
 
   # Check sing-box

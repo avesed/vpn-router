@@ -1010,3 +1010,77 @@ export const WARP_ACCOUNT_TYPES = [
   { value: "teams", label: "Teams", description: "企业版 WARP" },
 ] as const;
 
+// ============ Outbound Groups 类型 (ECMP 负载均衡) ============
+
+export type OutboundGroupType = "loadbalance" | "failover";
+
+export interface OutboundGroup {
+  id: number;
+  tag: string;
+  description: string;
+  type: OutboundGroupType;
+  members: string[];  // 解析后的数组
+  weights?: Record<string, number>;  // 解析后的对象
+  health_check_url: string;
+  health_check_interval: number;
+  health_check_timeout: number;
+  routing_table: number;
+  enabled: number;
+  health_status?: Record<string, MemberHealthStatus>;  // 各成员健康状态
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface MemberHealthStatus {
+  healthy: boolean;
+  latency_ms: number;
+  last_check: string;
+  error?: string;
+}
+
+export interface OutboundGroupCreateRequest {
+  tag: string;
+  description?: string;
+  type: OutboundGroupType;
+  members: string[];
+  weights?: Record<string, number>;
+  health_check_url?: string;
+  health_check_interval?: number;
+  health_check_timeout?: number;
+}
+
+export interface OutboundGroupUpdateRequest {
+  description?: string;
+  members?: string[];
+  weights?: Record<string, number>;
+  health_check_url?: string;
+  health_check_interval?: number;
+  health_check_timeout?: number;
+  enabled?: boolean;
+}
+
+export interface OutboundGroupListResponse {
+  groups: OutboundGroup[];
+}
+
+export interface AvailableMember {
+  tag: string;
+  type: string;  // 'pia', 'wireguard', 'direct', 'openvpn', 'v2ray', 'warp', 'builtin'
+  description: string;
+}
+
+export interface AvailableMembersResponse {
+  members: AvailableMember[];
+}
+
+export interface GroupHealthCheckResponse {
+  success: boolean;
+  tag: string;
+  health_status: Record<string, MemberHealthStatus>;
+}
+
+export const OUTBOUND_GROUP_TYPES = [
+  { value: "loadbalance", label: "Load Balance", description: "流量均匀分散到所有成员" },
+  { value: "failover", label: "Failover", description: "优先使用第一个健康的成员" },
+] as const;
+
