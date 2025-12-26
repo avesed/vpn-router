@@ -3,13 +3,16 @@
 从数据库读取 PIA profiles，调用 PIA 的 API (参考 desktop-pia)
 以用户名/密码登录并为每个地区生成 WireGuard 配置。
 凭证存储到数据库，供 sing-box 使用。
+
+支持 --profile <name> 参数只重连单个 profile。
 """
+import argparse
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
@@ -52,8 +55,12 @@ def require_env(name: str) -> str:
     return value
 
 
-def load_profiles_from_db() -> List[Dict[str, Any]]:
-    """从数据库加载 PIA profiles"""
+def load_profiles_from_db(profile_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    """从数据库加载 PIA profiles
+
+    Args:
+        profile_name: 如果指定，只加载该 profile；否则加载所有 profiles
+    """
     if not HAS_DATABASE:
         raise ProvisionError("数据库模块不可用")
 
@@ -65,6 +72,15 @@ def load_profiles_from_db() -> List[Dict[str, Any]]:
 
     if not profiles:
         raise ProvisionError("数据库中没有 PIA profiles，请先通过 API 或前端添加")
+
+    # 如果指定了 profile_name，只返回匹配的 profile
+    if profile_name:
+        # 支持 tag 格式（用 - 分隔）和 name 格式（用 _ 分隔）
+        profile_key = profile_name.replace("-", "_")
+        matching = [p for p in profiles if p.get("name") == profile_key]
+        if not matching:
+            raise ProvisionError(f"未找到 profile: {profile_name}")
+        return matching
 
     return profiles
 
@@ -208,8 +224,17 @@ def add_key(server: Dict[str, Any], port: int, token: str, public_key: str) -> D
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="PIA WireGuard 配置工具")
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="只重连指定的 profile（不指定则重连所有）"
+    )
+    args = parser.parse_args()
+
     try:
-        profiles = load_profiles_from_db()
+        profiles = load_profiles_from_db(args.profile)
         username = require_env("PIA_USERNAME")
         password = require_env("PIA_PASSWORD")
         serverlist = fetch_serverlist()

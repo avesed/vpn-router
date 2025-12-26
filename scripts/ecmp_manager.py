@@ -294,6 +294,132 @@ def teardown_ip_rule(mark: int, table_id: int) -> bool:
     return True
 
 
+def get_interface_ip(interface: str) -> Optional[str]:
+    """获取接口的 IPv4 地址
+
+    Args:
+        interface: 接口名
+
+    Returns:
+        IP 地址（不含掩码），如果无法获取则返回 None
+    """
+    cmd = ["ip", "-4", "addr", "show", interface]
+    success, stdout, stderr = run_command(cmd, check=False)
+
+    if not success or not stdout:
+        return None
+
+    # 解析 "inet 10.11.225.169/32 scope global wg-pia-china"
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("inet "):
+            parts = line.split()
+            if len(parts) >= 2:
+                # 提取 IP 地址（去掉掩码）
+                ip_with_mask = parts[1]
+                return ip_with_mask.split("/")[0]
+
+    return None
+
+
+def setup_snat_for_interface(interface: str, source_ip: str) -> bool:
+    """为接口设置 SNAT 规则
+
+    用于 ECMP 路由场景：当使用 routing_mark 时，源 IP 可能不正确，
+    需要通过 SNAT 将源 IP 修改为接口对应的 peer_ip。
+
+    注意：此函数会先删除该接口的所有旧 SNAT 规则，然后添加新规则。
+    这是为了处理 VPN 重连后 peer_ip 变化的情况。
+
+    Args:
+        interface: 接口名
+        source_ip: 源 IP 地址
+
+    Returns:
+        是否成功
+    """
+    # 检查精确规则是否已存在
+    check_cmd = ["iptables", "-t", "nat", "-C", "POSTROUTING",
+                 "-o", interface, "-j", "SNAT", "--to-source", source_ip]
+    success, _, _ = run_command(check_cmd, check=False)
+
+    if success:
+        logger.debug(f"SNAT rule for {interface} -> {source_ip} already exists")
+        return True
+
+    # 删除该接口的所有旧 SNAT 规则（IP 可能已变化）
+    # 这里调用 teardown 清理旧规则，确保只有最新的规则生效
+    teardown_snat_for_interface(interface)
+
+    # 添加新的 SNAT 规则
+    cmd = ["iptables", "-t", "nat", "-A", "POSTROUTING",
+           "-o", interface, "-j", "SNAT", "--to-source", source_ip]
+    success, stdout, stderr = run_command(cmd, check=False)
+
+    if not success:
+        logger.error(f"Failed to add SNAT rule for {interface}: {stderr}")
+        return False
+
+    logger.info(f"SNAT rule added: {interface} -> {source_ip}")
+    return True
+
+
+def teardown_snat_for_interface(interface: str) -> bool:
+    """删除接口的 SNAT 规则
+
+    Args:
+        interface: 接口名
+
+    Returns:
+        是否成功
+    """
+    # 使用 -S 格式列出规则（包含完整的接口名）
+    cmd = ["iptables", "-t", "nat", "-S", "POSTROUTING"]
+    success, stdout, stderr = run_command(cmd, check=False)
+
+    if not success:
+        return True
+
+    # 找到匹配的规则并删除（按精确规则删除，避免行号问题）
+    for line in stdout.split("\n"):
+        # 匹配精确的接口名（避免 wg-pia-china 匹配到 wg-pia-china2）
+        if f"-o {interface} " in line and "SNAT" in line and line.startswith("-A"):
+            # 将 -A 替换为 -D 来删除
+            delete_rule = line.replace("-A ", "-D ", 1)
+            delete_cmd = ["iptables", "-t", "nat"] + delete_rule.split()
+            run_command(delete_cmd, check=False)
+            logger.debug(f"Removed SNAT rule for {interface}: {line}")
+
+    return True
+
+
+def setup_snat_for_ecmp_group(interfaces: Dict[str, str]) -> bool:
+    """为 ECMP 组的所有成员接口设置 SNAT 规则
+
+    当使用 ECMP 路由时，不同接口可能有不同的 peer_ip（如 PIA VPN）。
+    需要为每个接口设置 SNAT，确保从该接口发出的流量使用正确的源 IP。
+
+    Args:
+        interfaces: {tag: interface_name} 映射
+
+    Returns:
+        是否全部成功
+    """
+    all_success = True
+
+    for tag, interface in interfaces.items():
+        # 获取接口的 IP 地址
+        ip = get_interface_ip(interface)
+        if not ip:
+            logger.warning(f"Could not get IP for interface {interface}, skipping SNAT")
+            continue
+
+        if not setup_snat_for_interface(interface, ip):
+            all_success = False
+
+    return all_success
+
+
 def get_route_status(table_id: int) -> Dict:
     """获取路由表状态
 
@@ -373,6 +499,12 @@ def sync_group(db, group: Dict) -> bool:
     if not setup_ecmp_route(table_id, interfaces, weights):
         logger.error(f"Failed to setup ECMP route for group {tag}")
         return False
+
+    # 设置 SNAT 规则（解决不同接口有不同 peer_ip 的问题）
+    # 当使用 routing_mark 时，源 IP 可能不正确，需要通过 SNAT 修正
+    if not setup_snat_for_ecmp_group(interfaces):
+        logger.warning(f"Some SNAT rules failed for group {tag}, but continuing")
+        # SNAT 失败不阻止整体同步，因为某些接口可能共用相同 IP（如 WARP）
 
     logger.info(f"Group {tag} synced successfully")
     return True

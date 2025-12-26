@@ -2980,13 +2980,16 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     render_script = ENTRY_DIR / "render_singbox.py"
 
     try:
-        run_command(["python3", str(provision_script)], env=env)
+        # 只重连指定的 profile
+        run_command(["python3", str(provision_script), "--profile", profile_key], env=env)
         run_command(["python3", str(render_script)], env=env)
         reload_result = reload_singbox()
         # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
         wg_sync_msg = _sync_kernel_wg_egress()
+        # 同步所有出口组的 ECMP 路由和 SNAT 规则（peer_ip 可能改变）
+        ecmp_sync_msg = _sync_all_ecmp_groups()
         return {
-            "message": f"已重新连接 {payload.profile_tag}{wg_sync_msg}",
+            "message": f"已重新连接 {payload.profile_tag}{wg_sync_msg}{ecmp_sync_msg}",
             "reload": reload_result
         }
     except HTTPException:
@@ -5668,6 +5671,33 @@ def _teardown_ecmp_for_group(tag: str) -> str:
     except Exception as e:
         print(f"[api] ECMP teardown failed: {e}")
         return f", ecmp teardown failed: {e}"
+
+
+def _sync_all_ecmp_groups() -> str:
+    """同步所有出口组的 ECMP 路由和 SNAT 规则
+
+    当 WireGuard 出口重新连接后，peer_ip 可能改变，需要更新 SNAT 规则。
+
+    Returns:
+        状态消息
+    """
+    try:
+        from ecmp_manager import sync_all_groups
+        db = _get_db()
+        results = sync_all_groups(db)
+        success_count = sum(1 for v in results.values() if v)
+        total_count = len(results)
+        if total_count == 0:
+            return ""
+        if success_count == total_count:
+            return f", {total_count} ecmp group(s) synced"
+        else:
+            return f", {success_count}/{total_count} ecmp group(s) synced"
+    except ImportError:
+        return ""
+    except Exception as e:
+        print(f"[api] ECMP sync all failed: {e}")
+        return f", ecmp sync failed: {e}"
 
 
 @app.get("/api/outbound-groups")
