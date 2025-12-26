@@ -37,6 +37,11 @@ vite.config.d.ts
 # User config database (auto-created on container startup)
 /config/user-config.db
 config/user-config.db.backup
+config/user-config.db.unencrypted
+
+# SQLCipher encryption key (NEVER commit!)
+/config/.db-key
+.db-key
 
 # Auto-downloaded geo data files
 /config/geoip.db
@@ -50,6 +55,9 @@ config/user-config.db.backup
 # Runtime generated files
 /config/cache.db
 /config/settings.json
+
+# WARP config directories (contain device credentials)
+/config/warp/
 
 # Old source data directories (data now in databases)
 /ip-list/

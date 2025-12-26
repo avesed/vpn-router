@@ -18,12 +18,21 @@ frontend/dist
 
 # Auto-generated config files
 config/user-config.db
+config/user-config.db.unencrypted
 config/geoip.db
 config/geosite.db
 config/settings.json
 config/sing-box.generated.json
 config/custom-rules.json
 config/cache.db
+config/rulesets/
+
+# SQLCipher encryption key
+config/.db-key
+.db-key
+
+# WARP config directories
+config/warp/
 
 # Python cache
 __pycache__/
