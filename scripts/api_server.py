@@ -105,6 +105,59 @@ def _get_db():
     return get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH), SQLCIPHER_KEY)
 
 
+def _get_available_outbounds(db) -> list:
+    """获取所有可用出口列表
+
+    从数据库收集所有启用的出口，包括：
+    - direct（默认直连）
+    - PIA WireGuard 线路
+    - 自定义 WireGuard 出口
+    - Direct 出口（接口/IP 绑定）
+    - OpenVPN 出口
+    - V2Ray 出口
+    - WARP 出口
+    - 出口组（负载均衡/故障转移）
+    """
+    available = ["direct"]
+
+    # PIA profiles
+    for profile in db.get_pia_profiles(enabled_only=True):
+        if profile.get("private_key") and profile.get("name"):
+            available.append(profile["name"])
+
+    # Custom WireGuard egress
+    for egress in db.get_custom_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # Direct egress (interface/IP binding)
+    for egress in db.get_direct_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # OpenVPN egress
+    for egress in db.get_openvpn_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # V2Ray egress
+    for egress in db.get_v2ray_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # WARP egress
+    for egress in db.get_warp_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # Outbound groups
+    for group in db.get_outbound_groups(enabled_only=True):
+        if group.get("tag"):
+            available.append(group["tag"])
+
+    return available
+
+
 def get_subnet_prefix(subnet_address: str = None) -> str:
     """从子网地址提取前缀（如 10.25.0.1/24 -> 10.25.0.）
 
@@ -543,11 +596,13 @@ class IngressPeerCreateRequest(BaseModel):
     name: str = Field(..., description="客户端名称，如 laptop, phone")
     public_key: Optional[str] = Field(None, description="客户端公钥（可选，不填则服务端生成密钥对）")
     allow_lan: bool = Field(False, description="是否允许访问本地局域网")
+    default_outbound: Optional[str] = Field(None, description="此客户端的默认出口（不填则使用入口默认或全局默认）")
 
 
 class IngressPeerUpdateRequest(BaseModel):
     """更新入口 WireGuard peer"""
     name: Optional[str] = Field(None, description="客户端名称")
+    default_outbound: Optional[str] = Field(None, description="此客户端的默认出口（空字符串表示清空，使用入口默认）")
 
 
 class CustomEgressCreateRequest(BaseModel):
@@ -2661,6 +2716,168 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
         return {"message": "路由规则已保存，需要重新连接 VPN 生效"}
 
 
+class DefaultOutboundRequest(BaseModel):
+    """默认出口切换请求"""
+    outbound: str = Field(..., description="新的默认出口 tag")
+
+
+@app.put("/api/outbound/default")
+def api_switch_default_outbound(payload: DefaultOutboundRequest):
+    """通过 Clash API 热切换默认出口（不中断现有连接）
+
+    使用 sing-box 的 selector 出口 + Clash API 实现热切换：
+    1. 验证出口是否有效
+    2. 通过 Clash API 更新 default-exit selector 的选中项
+    3. 更新数据库中的 default_outbound 设置
+
+    由于 selector 设置了 interrupt_exist_connections: false，
+    切换时现有连接不会中断。
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    new_outbound = payload.outbound
+
+    # 验证出口是否有效
+    db = _get_db()
+    available_outbounds = ["direct"]
+
+    # 收集所有可用出口
+    for profile in db.get_pia_profiles(enabled_only=True):
+        if profile.get("private_key"):
+            available_outbounds.append(profile["name"])
+
+    for egress in db.get_custom_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_direct_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_openvpn_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_v2ray_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_warp_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for group in db.get_outbound_groups(enabled_only=True):
+        available_outbounds.append(group["tag"])
+
+    if new_outbound not in available_outbounds:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效的出口: {new_outbound}。可用: {', '.join(available_outbounds)}"
+        )
+
+    # 通过 Clash API 切换 selector
+    # PUT /proxies/{selector_name} with body {"name": "outbound_name"}
+    clash_url = "http://127.0.0.1:9090/proxies/default-exit"
+    try:
+        req_data = json.dumps({"name": new_outbound}).encode("utf-8")
+        req = urllib.request.Request(
+            clash_url,
+            data=req_data,
+            method="PUT",
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            # Clash API 返回 204 No Content 表示成功
+            if resp.status in (200, 204):
+                # 更新数据库设置
+                db.set_setting("default_outbound", new_outbound)
+                return {
+                    "message": f"默认出口已切换为 {new_outbound}（无需重载，连接不中断）",
+                    "outbound": new_outbound,
+                    "hot_switch": True
+                }
+
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # selector 不存在，可能是旧配置，需要重载
+            db.set_setting("default_outbound", new_outbound)
+            try:
+                _regenerate_and_reload()
+                return {
+                    "message": f"默认出口已切换为 {new_outbound}（需要重载配置）",
+                    "outbound": new_outbound,
+                    "hot_switch": False,
+                    "reloaded": True
+                }
+            except Exception as reload_err:
+                return {
+                    "message": f"默认出口已保存，但重载失败: {reload_err}",
+                    "outbound": new_outbound,
+                    "hot_switch": False,
+                    "reloaded": False,
+                    "error": str(reload_err)
+                }
+        else:
+            raise HTTPException(status_code=500, detail=f"Clash API 错误: HTTP {e.code}")
+
+    except urllib.error.URLError as e:
+        # sing-box 未运行，保存设置并尝试重载
+        db.set_setting("default_outbound", new_outbound)
+        try:
+            _regenerate_and_reload()
+            return {
+                "message": f"默认出口已切换为 {new_outbound}（sing-box 已重载）",
+                "outbound": new_outbound,
+                "hot_switch": False,
+                "reloaded": True
+            }
+        except Exception as reload_err:
+            return {
+                "message": f"默认出口已保存，但重载失败: {reload_err}",
+                "outbound": new_outbound,
+                "hot_switch": False,
+                "reloaded": False,
+                "error": str(reload_err)
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"切换失败: {e}")
+
+
+@app.get("/api/outbound/default")
+def api_get_default_outbound():
+    """获取当前默认出口设置"""
+    db = _get_db()
+    default_outbound = db.get_setting("default_outbound", "direct")
+
+    # 收集所有可用出口
+    available_outbounds = ["direct"]
+
+    for profile in db.get_pia_profiles(enabled_only=True):
+        if profile.get("private_key"):
+            available_outbounds.append(profile["name"])
+
+    for egress in db.get_custom_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_direct_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_openvpn_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_v2ray_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_warp_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for group in db.get_outbound_groups(enabled_only=True):
+        available_outbounds.append(group["tag"])
+
+    return {
+        "outbound": default_outbound,
+        "available_outbounds": available_outbounds
+    }
+
+
 @app.post("/api/rules/custom")
 def api_add_custom_rule(payload: CustomRuleRequest):
     """添加自定义路由规则（数据库版本，使用批量操作优化性能）"""
@@ -3082,6 +3299,7 @@ def load_ingress_config() -> dict:
             "preshared_key": peer.get("preshared_key"),
             "allow_lan": peer.get("allow_lan", 0) == 1,
             "lan_subnet": peer.get("lan_subnet"),
+            "default_outbound": peer.get("default_outbound"),
             "enabled": peer.get("enabled", 1) == 1
         })
 
@@ -3552,6 +3770,7 @@ def api_get_ingress():
             "tx_bytes": transfer.get("tx", 0),
             "allow_lan": peer.get("allow_lan", False),
             "lan_subnet": peer.get("lan_subnet"),
+            "default_outbound": peer.get("default_outbound"),
         })
 
     return {
@@ -3647,7 +3866,8 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
             public_key=client_public_key,
             allowed_ips=f"{peer_ip}/32",
             allow_lan=payload.allow_lan,
-            lan_subnet=lan_subnet
+            lan_subnet=lan_subnet,
+            default_outbound=payload.default_outbound
         )
     else:
         # 降级到配置文件
@@ -3712,6 +3932,50 @@ def api_delete_ingress_peer(peer_name: str):
     return {
         "message": f"客户端 '{peer_name}' 已删除",
         "apply_result": apply_result,
+    }
+
+
+@app.put("/api/ingress/peers/{peer_name}")
+def api_update_ingress_peer(peer_name: str, payload: IngressPeerUpdateRequest):
+    """更新入口 peer 配置（如默认出口）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=500, detail="数据库不可用")
+
+    db = _get_db()
+    peer = db.get_wireguard_peer_by_name(peer_name)
+
+    if not peer:
+        raise HTTPException(status_code=404, detail=f"客户端 '{peer_name}' 不存在")
+
+    # 准备更新参数
+    update_kwargs = {}
+    if payload.name is not None:
+        update_kwargs["name"] = payload.name
+    if payload.default_outbound is not None:
+        # 空字符串表示清空，设为 None
+        update_kwargs["default_outbound"] = payload.default_outbound if payload.default_outbound else None
+
+    if not update_kwargs:
+        return {"message": "无需更新", "peer": peer}
+
+    # 更新数据库
+    db.update_wireguard_peer(peer["id"], **update_kwargs)
+
+    # 如果更改了默认出口，需要重新生成配置
+    reload_status = ""
+    if "default_outbound" in update_kwargs:
+        try:
+            _regenerate_and_reload()
+            reload_status = "，配置已重载"
+        except Exception as exc:
+            reload_status = f"，重载失败: {exc}"
+
+    # 获取更新后的 peer
+    updated_peer = db.get_wireguard_peer_by_name(payload.name if payload.name else peer_name)
+
+    return {
+        "message": f"客户端 '{peer_name}' 已更新{reload_status}",
+        "peer": updated_peer,
     }
 
 
@@ -3951,6 +4215,168 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
         "address": payload.address,
         "migrated_peers": migrated_count
     }
+
+
+# ============ Ingress Outbound Binding APIs (入口绑定出口) ============
+
+class IngressOutboundRequest(BaseModel):
+    """设置入口默认出口"""
+    outbound: Optional[str] = Field(None, description="出口标签（NULL=使用全局默认）")
+
+
+@app.get("/api/ingress/wireguard/outbound")
+def api_get_wireguard_ingress_outbound():
+    """获取 WireGuard 入口的默认出口设置"""
+    db = _get_db()
+    server = db.get_wireguard_server()
+
+    if not server:
+        raise HTTPException(status_code=404, detail="WireGuard server not configured")
+
+    # 获取可用出口列表
+    available_outbounds = _get_available_outbounds(db)
+
+    # 获取全局默认出口
+    global_default = db.get_setting("default_outbound", "direct")
+
+    return {
+        "outbound": server.get("default_outbound"),  # None = 使用全局默认
+        "global_default": global_default,
+        "available_outbounds": available_outbounds
+    }
+
+
+@app.put("/api/ingress/wireguard/outbound")
+def api_set_wireguard_ingress_outbound(payload: IngressOutboundRequest):
+    """设置 WireGuard 入口的默认出口（热切换：仅需重载配置，不影响 WireGuard 隧道）"""
+    db = _get_db()
+    server = db.get_wireguard_server()
+
+    if not server:
+        raise HTTPException(status_code=404, detail="WireGuard server not configured")
+
+    # 验证出口是否存在
+    if payload.outbound:
+        available = _get_available_outbounds(db)
+        if payload.outbound not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Outbound '{payload.outbound}' not found. Available: {available}"
+            )
+
+    # 更新数据库
+    db.set_wireguard_server(
+        interface_name=server.get("interface_name", "wg-ingress"),
+        address=server.get("address"),
+        listen_port=server.get("listen_port"),
+        mtu=server.get("mtu", 1420),
+        private_key=server.get("private_key"),
+        default_outbound=payload.outbound
+    )
+
+    # 重新生成配置并重载（sing-box 路由规则变更需要重载）
+    try:
+        _regenerate_and_reload()
+        return {
+            "success": True,
+            "message": f"WireGuard ingress outbound set to {payload.outbound or 'global default'}",
+            "outbound": payload.outbound,
+            "reloaded": True
+        }
+    except Exception as e:
+        return {
+            "success": True,
+            "message": f"Outbound saved but reload failed: {e}",
+            "outbound": payload.outbound,
+            "reloaded": False,
+            "error": str(e)
+        }
+
+
+@app.get("/api/ingress/v2ray/outbound")
+def api_get_v2ray_ingress_outbound():
+    """获取 V2Ray 入口的默认出口设置"""
+    db = _get_db()
+    config = db.get_v2ray_inbound_config()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="V2Ray inbound not configured")
+
+    # 获取可用出口列表
+    available_outbounds = _get_available_outbounds(db)
+
+    # 获取全局默认出口
+    global_default = db.get_setting("default_outbound", "direct")
+
+    return {
+        "outbound": config.get("default_outbound"),  # None = 使用全局默认
+        "global_default": global_default,
+        "available_outbounds": available_outbounds
+    }
+
+
+@app.put("/api/ingress/v2ray/outbound")
+def api_set_v2ray_ingress_outbound(payload: IngressOutboundRequest):
+    """设置 V2Ray 入口的默认出口（热切换：仅需重载配置）"""
+    db = _get_db()
+    config = db.get_v2ray_inbound_config()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="V2Ray inbound not configured")
+
+    # 验证出口是否存在
+    if payload.outbound:
+        available = _get_available_outbounds(db)
+        if payload.outbound not in available:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Outbound '{payload.outbound}' not found. Available: {available}"
+            )
+
+    # 更新数据库 - 使用现有 save 方法，添加 default_outbound 字段
+    db.save_v2ray_inbound_config(
+        protocol=config.get("protocol", "vless"),
+        listen_address=config.get("listen_address", "0.0.0.0"),
+        listen_port=config.get("listen_port", 443),
+        tls_enabled=config.get("tls_enabled", 1),
+        tls_cert_path=config.get("tls_cert_path"),
+        tls_key_path=config.get("tls_key_path"),
+        tls_cert_content=config.get("tls_cert_content"),
+        tls_key_content=config.get("tls_key_content"),
+        transport_type=config.get("transport_type", "tcp"),
+        transport_config=config.get("transport_config"),
+        fallback_server=config.get("fallback_server"),
+        fallback_port=config.get("fallback_port"),
+        enabled=config.get("enabled", 0),
+        xtls_vision_enabled=config.get("xtls_vision_enabled", 0),
+        reality_enabled=config.get("reality_enabled", 0),
+        reality_private_key=config.get("reality_private_key"),
+        reality_public_key=config.get("reality_public_key"),
+        reality_short_ids=config.get("reality_short_ids"),
+        reality_dest=config.get("reality_dest"),
+        reality_server_names=config.get("reality_server_names"),
+        tun_device=config.get("tun_device", "xray-tun0"),
+        tun_subnet=config.get("tun_subnet", "10.24.0.0/24"),
+        default_outbound=payload.outbound
+    )
+
+    # 重新生成配置并重载
+    try:
+        _regenerate_and_reload()
+        return {
+            "success": True,
+            "message": f"V2Ray ingress outbound set to {payload.outbound or 'global default'}",
+            "outbound": payload.outbound,
+            "reloaded": True
+        }
+    except Exception as e:
+        return {
+            "success": True,
+            "message": f"Outbound saved but reload failed: {e}",
+            "outbound": payload.outbound,
+            "reloaded": False,
+            "error": str(e)
+        }
 
 
 # ============ Settings APIs ============

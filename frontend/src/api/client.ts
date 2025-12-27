@@ -290,6 +290,53 @@ export const api = {
       body: { rules, default_outbound: defaultOutbound }
     }),
 
+  // Default Outbound (Hot Switch)
+  getDefaultOutbound: () =>
+    request<{ outbound: string; available_outbounds: string[] }>("/outbound/default"),
+  switchDefaultOutbound: (outbound: string) =>
+    request<{
+      message: string;
+      outbound: string;
+      hot_switch: boolean;
+      reloaded?: boolean;
+      error?: string;
+    }>("/outbound/default", {
+      method: "PUT",
+      body: { outbound }
+    }),
+
+  // Ingress Outbound Binding (入口绑定出口)
+  getWireGuardIngressOutbound: () =>
+    request<{ outbound: string | null; global_default: string; available_outbounds: string[] }>(
+      "/ingress/wireguard/outbound"
+    ),
+  setWireGuardIngressOutbound: (outbound: string | null) =>
+    request<{
+      success: boolean;
+      message: string;
+      outbound: string | null;
+      reloaded: boolean;
+      error?: string;
+    }>("/ingress/wireguard/outbound", {
+      method: "PUT",
+      body: { outbound }
+    }),
+  getV2RayIngressOutbound: () =>
+    request<{ outbound: string | null; global_default: string; available_outbounds: string[] }>(
+      "/ingress/v2ray/outbound"
+    ),
+  setV2RayIngressOutbound: (outbound: string | null) =>
+    request<{
+      success: boolean;
+      message: string;
+      outbound: string | null;
+      reloaded: boolean;
+      error?: string;
+    }>("/ingress/v2ray/outbound", {
+      method: "PUT",
+      body: { outbound }
+    }),
+
   // Actions
   reloadSingbox: () => request<{ message: string; method?: string }>("/actions/reload", { method: "POST" }),
 
@@ -336,11 +383,16 @@ export const api = {
 
   // Ingress WireGuard
   getIngress: () => request<IngressResponse>("/ingress"),
-  addIngressPeer: (name: string, publicKey?: string, allowLan?: boolean) =>
+  addIngressPeer: (name: string, publicKey?: string, allowLan?: boolean, defaultOutbound?: string) =>
     request<IngressPeerCreateResponse>("/ingress/peers", {
       method: "POST",
-      body: { name, public_key: publicKey, allow_lan: allowLan }
+      body: { name, public_key: publicKey, allow_lan: allowLan, default_outbound: defaultOutbound }
     }),
+  updateIngressPeer: (name: string, data: { name?: string; default_outbound?: string | null }) =>
+    request<{ message: string; reload_status?: { success: boolean; message: string } }>(
+      `/ingress/peers/${encodeURIComponent(name)}`,
+      { method: "PUT", body: data }
+    ),
   deleteIngressPeer: (name: string) =>
     request<{ message: string }>(`/ingress/peers/${encodeURIComponent(name)}`, { method: "DELETE" }),
   getIngressPeerConfig: (name: string, privateKey?: string) => {

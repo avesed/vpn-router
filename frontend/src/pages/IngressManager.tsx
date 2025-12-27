@@ -16,7 +16,9 @@ import {
   ComputerDesktopIcon,
   DevicePhoneMobileIcon,
   Cog6ToothIcon,
-  ExclamationTriangleIcon
+  ExclamationTriangleIcon,
+  PencilIcon,
+  ArrowRightCircleIcon
 } from "@heroicons/react/24/outline";
 
 function formatBytes(bytes: number): string {
@@ -51,6 +53,13 @@ export default function IngressManager() {
   const [newPeerPublicKey, setNewPeerPublicKey] = useState("");
   const [useCustomKey, setUseCustomKey] = useState(false);
   const [allowLan, setAllowLan] = useState(false);
+  const [newPeerOutbound, setNewPeerOutbound] = useState<string>("");
+
+  // Edit peer outbound modal
+  const [showEditOutboundModal, setShowEditOutboundModal] = useState(false);
+  const [editingPeer, setEditingPeer] = useState<IngressPeer | null>(null);
+  const [editPeerOutbound, setEditPeerOutbound] = useState<string>("");
+  const [savingPeerOutbound, setSavingPeerOutbound] = useState(false);
 
   // Config modal (shows after adding peer or for existing peer)
   const [showConfigModal, setShowConfigModal] = useState(false);
@@ -73,6 +82,9 @@ export default function IngressManager() {
   const [subnetConflicts, setSubnetConflicts] = useState<SubnetConflict[]>([]);
   const [migratePeers, setMigratePeers] = useState(true);
   const [savingSubnet, setSavingSubnet] = useState(false);
+
+  // Available outbounds for peer selection
+  const [availableOutbounds, setAvailableOutbounds] = useState<string[]>([]);
 
   const detectIp = useCallback(async () => {
     setDetectingIp(true);
@@ -109,6 +121,15 @@ export default function IngressManager() {
     }
   }, []);
 
+  const loadAvailableOutbounds = useCallback(async () => {
+    try {
+      const result = await api.getWireGuardIngressOutbound();
+      setAvailableOutbounds(result.available_outbounds);
+    } catch {
+      // Ignore errors
+    }
+  }, []);
+
   const loadIngress = useCallback(async () => {
     try {
       setLoading(true);
@@ -126,9 +147,10 @@ export default function IngressManager() {
     loadIngress();
     loadSettings();
     loadSubnet();
+    loadAvailableOutbounds();
     const interval = setInterval(loadIngress, 30000);
     return () => clearInterval(interval);
-  }, [loadIngress, loadSettings, loadSubnet]);
+  }, [loadIngress, loadSettings, loadSubnet, loadAvailableOutbounds]);
 
   const handleSaveSettings = async () => {
     setSavingSettings(true);
@@ -192,7 +214,8 @@ export default function IngressManager() {
       const result = await api.addIngressPeer(
         newPeerName.trim(),
         useCustomKey ? newPeerPublicKey.trim() : undefined,
-        allowLan
+        allowLan,
+        newPeerOutbound || undefined
       );
       setSuccessMessage(t("ingress.clientAdded", { name: newPeerName.trim() }));
       setShowAddModal(false);
@@ -200,6 +223,7 @@ export default function IngressManager() {
       setNewPeerPublicKey("");
       setUseCustomKey(false);
       setAllowLan(false);
+      setNewPeerOutbound("");
       setDetectedIps(null);
 
       if (result.client_private_key) {
@@ -237,6 +261,32 @@ export default function IngressManager() {
     setConfigPeerName(peer.name);
     setConfigPrivateKey("");
     setShowConfigModal(true);
+  };
+
+  const handleEditOutbound = (peer: IngressPeer) => {
+    setEditingPeer(peer);
+    setEditPeerOutbound(peer.default_outbound || "");
+    setShowEditOutboundModal(true);
+  };
+
+  const handleSavePeerOutbound = async () => {
+    if (!editingPeer) return;
+
+    setSavingPeerOutbound(true);
+    try {
+      // 空字符串表示清空，使用入口默认；API会将""转换为null
+      await api.updateIngressPeer(editingPeer.name, { default_outbound: editPeerOutbound });
+      setSuccessMessage(t("ingress.peerOutboundUpdated", { name: editingPeer.name }));
+      setShowEditOutboundModal(false);
+      setEditingPeer(null);
+      setEditPeerOutbound("");
+      loadIngress();
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("ingress.peerOutboundUpdateFailed"));
+    } finally {
+      setSavingPeerOutbound(false);
+    }
   };
 
   // 关闭 config modal 并清理 blob URL
@@ -453,6 +503,13 @@ export default function IngressManager() {
                     </div>
                     <div className="flex gap-1">
                       <button
+                        onClick={() => handleEditOutbound(peer)}
+                        className="p-2 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+                        title={t("ingress.editOutbound")}
+                      >
+                        <PencilIcon className="h-4 w-4" />
+                      </button>
+                      <button
                         onClick={() => handleShowConfig(peer)}
                         className="p-2 rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
                         title={t("ingress.getConfig")}
@@ -469,6 +526,14 @@ export default function IngressManager() {
                       </button>
                     </div>
                   </div>
+
+                  {/* Outbound indicator */}
+                  {peer.default_outbound && (
+                    <div className="mt-2 flex items-center gap-1.5">
+                      <ArrowRightCircleIcon className="h-3.5 w-3.5 text-brand" />
+                      <span className="text-xs text-brand font-medium">{peer.default_outbound}</span>
+                    </div>
+                  )}
 
                   <div className="mt-3 pt-3 border-t border-white/5 grid grid-cols-3 gap-2 text-xs">
                     <div>
@@ -631,6 +696,30 @@ export default function IngressManager() {
                   </p>
                 )}
               </div>
+
+              {/* Client Outbound Selector */}
+              {availableOutbounds.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t("ingress.peerOutbound")}
+                  </label>
+                  <select
+                    value={newPeerOutbound}
+                    onChange={(e) => setNewPeerOutbound(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                  >
+                    <option value="">{t("ingress.useIngressDefault")}</option>
+                    {availableOutbounds.map((outbound) => (
+                      <option key={outbound} value={outbound}>
+                        {outbound}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-slate-500 mt-1">
+                    {t("ingress.peerOutboundHint")}
+                  </p>
+                </div>
+              )}
 
               {useCustomKey && (
                 <div>
@@ -986,6 +1075,91 @@ export default function IngressManager() {
                 {t("common.close")}
               </button>
             </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Edit Peer Outbound Modal */}
+      {showEditOutboundModal && editingPeer && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-md">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-white">
+                    {t("ingress.editOutbound")} - {editingPeer.name}
+                  </h2>
+                  <button
+                    onClick={() => {
+                      setShowEditOutboundModal(false);
+                      setEditingPeer(null);
+                      setEditPeerOutbound("");
+                    }}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t("ingress.peerOutbound")}
+                  </label>
+                  <select
+                    value={editPeerOutbound}
+                    onChange={(e) => setEditPeerOutbound(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                  >
+                    <option value="">{t("ingress.useIngressDefault")}</option>
+                    {availableOutbounds.map((outbound) => (
+                      <option key={outbound} value={outbound}>
+                        {outbound}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-slate-500 mt-2">
+                    {t("ingress.peerOutboundHint")}
+                  </p>
+                </div>
+
+                {/* Current outbound indicator */}
+                {editingPeer.default_outbound && (
+                  <div className="rounded-lg bg-brand/10 border border-brand/20 p-3">
+                    <p className="text-xs text-brand">
+                      {t("ingress.currentOutbound")}: {editingPeer.default_outbound}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-6 border-t border-white/10 flex justify-end gap-3">
+                <button
+                  onClick={() => {
+                    setShowEditOutboundModal(false);
+                    setEditingPeer(null);
+                    setEditPeerOutbound("");
+                  }}
+                  className="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-sm transition-colors"
+                >
+                  {t("common.cancel")}
+                </button>
+                <button
+                  onClick={handleSavePeerOutbound}
+                  disabled={savingPeerOutbound || editPeerOutbound === (editingPeer.default_outbound || "")}
+                  className="px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                >
+                  {savingPeerOutbound ? (
+                    <div className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    <CheckIcon className="h-4 w-4" />
+                  )}
+                  {t("common.save")}
+                </button>
+              </div>
             </div>
           </div>
         </div>,

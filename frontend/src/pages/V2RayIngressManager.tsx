@@ -72,6 +72,13 @@ export default function V2RayIngressManager() {
   // User online status: {email: online}
   const [userOnlineStatus, setUserOnlineStatus] = useState<Record<string, boolean>>({});
 
+  // Default outbound configuration
+  const [defaultOutbound, setDefaultOutbound] = useState<string | null>(null);
+  const [defaultOutboundSaved, setDefaultOutboundSaved] = useState<string | null>(null);
+  const [globalDefault, setGlobalDefault] = useState<string>("direct");
+  const [availableOutbounds, setAvailableOutbounds] = useState<string[]>([]);
+  const [savingOutbound, setSavingOutbound] = useState(false);
+
   const loadV2rayInbound = useCallback(async () => {
     try {
       setV2rayLoading(true);
@@ -108,10 +115,23 @@ export default function V2RayIngressManager() {
     }
   }, []);
 
+  const loadIngressOutbound = useCallback(async () => {
+    try {
+      const result = await api.getV2RayIngressOutbound();
+      setDefaultOutbound(result.outbound);
+      setDefaultOutboundSaved(result.outbound);
+      setGlobalDefault(result.global_default);
+      setAvailableOutbounds(result.available_outbounds);
+    } catch {
+      // Ignore errors
+    }
+  }, []);
+
   useEffect(() => {
     loadV2rayInbound();
     loadXrayStatus();
-  }, [loadV2rayInbound, loadXrayStatus]);
+    loadIngressOutbound();
+  }, [loadV2rayInbound, loadXrayStatus, loadIngressOutbound]);
 
   // Poll user online status every 5 seconds
   useEffect(() => {
@@ -256,6 +276,25 @@ export default function V2RayIngressManager() {
       setError(err instanceof Error ? err.message : t("common.saveFailed"));
     } finally {
       setActionLoading(null);
+    }
+  };
+
+  const handleSaveOutbound = async () => {
+    setSavingOutbound(true);
+    try {
+      const result = await api.setV2RayIngressOutbound(defaultOutbound);
+      if (result.success) {
+        setDefaultOutboundSaved(defaultOutbound);
+        const outboundName = defaultOutbound || t("ingress.useGlobalDefault");
+        setSuccessMessage(t("ingress.outboundSwitched", { outbound: outboundName }));
+        setTimeout(() => setSuccessMessage(null), 3000);
+      } else {
+        setError(result.error || t("ingress.outboundSwitchFailed"));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("ingress.outboundSwitchFailed"));
+    } finally {
+      setSavingOutbound(false);
     }
   };
 
@@ -1332,6 +1371,51 @@ export default function V2RayIngressManager() {
                     </div>
                   </div>
                 )}
+
+                {/* Default Outbound Configuration */}
+                <div className="pt-4 border-t border-white/10">
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t("ingress.defaultOutbound")}
+                  </label>
+                  <div className="flex gap-2">
+                    <select
+                      value={defaultOutbound || ""}
+                      onChange={(e) => setDefaultOutbound(e.target.value || null)}
+                      className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-violet-500"
+                    >
+                      <option value="">{t("ingress.useGlobalDefault")} ({globalDefault})</option>
+                      {availableOutbounds.map((outbound) => (
+                        <option key={outbound} value={outbound}>
+                          {outbound}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={handleSaveOutbound}
+                      disabled={savingOutbound || defaultOutbound === defaultOutboundSaved}
+                      className="px-3 py-2 rounded-lg bg-violet-500 hover:bg-violet-600 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
+                    >
+                      {savingOutbound ? (
+                        <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <CheckIcon className="h-4 w-4" />
+                      )}
+                      {t("common.save")}
+                    </button>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-2">
+                    {t("ingress.defaultOutboundHint")}
+                  </p>
+
+                  {/* Current outbound indicator */}
+                  {defaultOutboundSaved && (
+                    <div className="mt-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3">
+                      <p className="text-xs text-emerald-300">
+                        {t("ingress.currentOutbound")}: {defaultOutboundSaved}
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
               <div className="p-6 border-t border-white/10 flex justify-end gap-3">
                 <button

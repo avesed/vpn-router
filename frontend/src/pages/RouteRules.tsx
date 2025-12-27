@@ -11,6 +11,7 @@ import {
   ServerStackIcon,
   TagIcon,
   CheckCircleIcon,
+  CheckIcon,
   SignalIcon,
   ServerIcon
 } from "@heroicons/react/24/outline";
@@ -46,8 +47,10 @@ export default function RouteRules() {
   const [profiles, setProfiles] = useState<VpnProfile[]>([]);
   const [availableOutbounds, setAvailableOutbounds] = useState<string[]>([]);
   const [defaultOutbound, setDefaultOutbound] = useState("direct");
+  const [defaultOutboundSaved, setDefaultOutboundSaved] = useState("direct");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -73,6 +76,7 @@ export default function RouteRules() {
       // 过滤掉广告拦截规则，这些规则由广告拦截页面管理
       setRules(filterAdblockRules(rulesData.rules));
       setDefaultOutbound(rulesData.default_outbound);
+      setDefaultOutboundSaved(rulesData.default_outbound);
       setAvailableOutbounds(rulesData.available_outbounds || []);
       setProfiles(profilesData.profiles);
       setError(null);
@@ -87,6 +91,35 @@ export default function RouteRules() {
   useEffect(() => {
     fetchData();
   }, []);
+
+  // Hot-switch default outbound via Clash API (no reload needed)
+  const handleSaveDefaultOutbound = async () => {
+    if (defaultOutbound === defaultOutboundSaved) return;
+
+    setSwitching(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const result = await api.switchDefaultOutbound(defaultOutbound);
+      setDefaultOutboundSaved(defaultOutbound);
+
+      if (result.hot_switch) {
+        setSuccess(t('rules.hotSwitchSuccess', { outbound: defaultOutbound }));
+      } else if (result.reloaded) {
+        setSuccess(t('rules.switchReloadSuccess', { outbound: defaultOutbound }));
+      } else {
+        setSuccess(result.message);
+      }
+      setTimeout(() => setSuccess(null), 3000);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to switch outbound");
+      // Revert the select value
+      setDefaultOutbound(defaultOutboundSaved);
+    } finally {
+      setSwitching(false);
+    }
+  };
 
   const parseList = (str: string): string[] => {
     return str
@@ -246,28 +279,50 @@ export default function RouteRules() {
         </div>
       )}
 
-      {/* Default Outbound */}
+      {/* Default Outbound (Hot Switch) */}
       <div className="rounded-xl md:rounded-2xl border border-white/10 bg-slate-900/40 p-4 md:p-5">
         <div className="flex items-center gap-3 mb-3 md:mb-4">
           <div className="rounded-lg bg-blue-500/20 p-2">
             <ServerStackIcon className="h-5 w-5 text-blue-400" />
           </div>
-          <div>
-            <h3 className="font-semibold text-white text-sm md:text-base">{t('rules.defaultOutbound')}</h3>
-            <p className="text-xs text-slate-400">{t('rules.defaultOutboundDesc')}</p>
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <h3 className="font-semibold text-white text-sm md:text-base">{t('rules.defaultOutbound')}</h3>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-medium">
+                {t('rules.hotSwitch')}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400">{t('rules.defaultOutboundDescHot')}</p>
           </div>
         </div>
-        <select
-          value={defaultOutbound}
-          onChange={(e) => setDefaultOutbound(e.target.value)}
-          className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white"
-        >
-          {outboundOptions.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
+        <div className="flex gap-2">
+          <div className="relative flex-1">
+            <select
+              value={defaultOutbound}
+              onChange={(e) => setDefaultOutbound(e.target.value)}
+              disabled={switching}
+              className="w-full rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-sm text-white disabled:opacity-50"
+            >
+              {outboundOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <button
+            onClick={handleSaveDefaultOutbound}
+            disabled={switching || defaultOutbound === defaultOutboundSaved}
+            className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          >
+            {switching ? (
+              <ArrowPathIcon className="h-4 w-4 animate-spin" />
+            ) : (
+              <CheckIcon className="h-4 w-4" />
+            )}
+            {t('common.save')}
+          </button>
+        </div>
       </div>
 
       {/* New Rule Form */}

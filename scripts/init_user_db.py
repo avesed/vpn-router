@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS wireguard_server (
     listen_port INTEGER NOT NULL DEFAULT 36100,
     mtu INTEGER DEFAULT 1420,
     private_key TEXT NOT NULL,
+    default_outbound TEXT,                -- 此入口的默认出口（NULL=使用全局默认）
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS wireguard_peers (
     preshared_key TEXT,
     allow_lan INTEGER DEFAULT 0,      -- 是否允许访问本地局域网
     lan_subnet TEXT,                  -- 局域网子网 (如 192.168.1.0/24)
+    default_outbound TEXT,            -- 此客户端的默认出口（NULL=使用入口默认或全局默认）
     enabled INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -319,6 +321,9 @@ CREATE TABLE IF NOT EXISTS v2ray_inbound_config (
     tun_device TEXT DEFAULT 'xray-tun0',  -- TUN 设备名
     tun_subnet TEXT DEFAULT '10.24.0.0/24',  -- TUN 子网
 
+    -- 入口绑定出口
+    default_outbound TEXT,                -- 此入口的默认出口（NULL=使用全局默认）
+
     enabled INTEGER DEFAULT 0,    -- 默认禁用
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -457,10 +462,15 @@ def migrate_wireguard_peers_lan_fields(conn: sqlite3.Connection):
         migrations_done += 1
         print("✓ 添加 wireguard_peers.lan_subnet 字段")
 
+    if "default_outbound" not in columns:
+        cursor.execute("ALTER TABLE wireguard_peers ADD COLUMN default_outbound TEXT")
+        migrations_done += 1
+        print("✓ 添加 wireguard_peers.default_outbound 字段")
+
     if migrations_done > 0:
         conn.commit()
     else:
-        print("⊘ wireguard_peers LAN 字段已存在，跳过迁移")
+        print("⊘ wireguard_peers 字段已存在，跳过迁移")
 
 
 def migrate_openvpn_egress_crl_verify(conn: sqlite3.Connection):
@@ -627,6 +637,37 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_outbound_groups_enabled ON outbound_groups(enabled)")
     conn.commit()
     print("✓ 创建 outbound_groups 表")
+
+
+def migrate_ingress_default_outbound(conn: sqlite3.Connection):
+    """为入口表添加 default_outbound 字段（入口绑定出口）"""
+    cursor = conn.cursor()
+    migrations_done = 0
+
+    # 1. wireguard_server 表
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='wireguard_server'")
+    if cursor.fetchone():
+        cursor.execute("PRAGMA table_info(wireguard_server)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "default_outbound" not in columns:
+            cursor.execute("ALTER TABLE wireguard_server ADD COLUMN default_outbound TEXT")
+            migrations_done += 1
+            print("✓ 添加 wireguard_server.default_outbound 字段")
+
+    # 2. v2ray_inbound_config 表
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='v2ray_inbound_config'")
+    if cursor.fetchone():
+        cursor.execute("PRAGMA table_info(v2ray_inbound_config)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "default_outbound" not in columns:
+            cursor.execute("ALTER TABLE v2ray_inbound_config ADD COLUMN default_outbound TEXT")
+            migrations_done += 1
+            print("✓ 添加 v2ray_inbound_config.default_outbound 字段")
+
+    if migrations_done > 0:
+        conn.commit()
+    else:
+        print("⊘ 入口 default_outbound 字段已存在，跳过迁移")
 
 
 def migrate_pia_profiles_custom_dns(conn: sqlite3.Connection):
@@ -919,6 +960,7 @@ def main():
     migrate_outbound_groups(conn)
     migrate_openvpn_socks_to_tun(conn)
     migrate_pia_profiles_custom_dns(conn)
+    migrate_ingress_default_outbound(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

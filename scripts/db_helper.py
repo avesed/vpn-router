@@ -596,22 +596,24 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, interface_name, address, listen_port, mtu, private_key, created_at, updated_at
+                SELECT id, interface_name, address, listen_port, mtu, private_key,
+                       default_outbound, created_at, updated_at
                 FROM wireguard_server
                 WHERE id = 1
             """).fetchone()
             return dict(row) if row else None
 
     def set_wireguard_server(self, interface_name: str, address: str, listen_port: int,
-                            mtu: int, private_key: str) -> bool:
+                            mtu: int, private_key: str,
+                            default_outbound: Optional[str] = None) -> bool:
         """设置 WireGuard 服务器配置（插入或更新）"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO wireguard_server
-                (id, interface_name, address, listen_port, mtu, private_key, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (interface_name, address, listen_port, mtu, private_key))
+                (id, interface_name, address, listen_port, mtu, private_key, default_outbound, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (interface_name, address, listen_port, mtu, private_key, default_outbound))
             conn.commit()
             return True
 
@@ -623,14 +625,14 @@ class UserDatabase:
             cursor = conn.cursor()
             if enabled_only:
                 rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
+                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
                     FROM wireguard_peers
                     WHERE enabled = 1
                     ORDER BY name
                 """).fetchall()
             else:
                 rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
+                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
                     FROM wireguard_peers
                     ORDER BY name
                 """).fetchall()
@@ -641,7 +643,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
                 FROM wireguard_peers
                 WHERE id = ?
             """, (peer_id,)).fetchone()
@@ -652,7 +654,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
                 FROM wireguard_peers
                 WHERE name = ?
             """, (name,)).fetchone()
@@ -661,22 +663,32 @@ class UserDatabase:
     def add_wireguard_peer(self, name: str, public_key: str, allowed_ips: str,
                           preshared_key: Optional[str] = None,
                           allow_lan: bool = False,
-                          lan_subnet: Optional[str] = None) -> int:
-        """添加 WireGuard 对等点"""
+                          lan_subnet: Optional[str] = None,
+                          default_outbound: Optional[str] = None) -> int:
+        """添加 WireGuard 对等点
+
+        Args:
+            default_outbound: 此客户端的默认出口（None=使用入口默认或全局默认）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet))
+                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet, default_outbound))
             conn.commit()
             return cursor.lastrowid
 
     def update_wireguard_peer(self, peer_id: int, name: Optional[str] = None,
                              allowed_ips: Optional[str] = None, enabled: Optional[bool] = None,
                              allow_lan: Optional[bool] = None,
-                             lan_subnet: Optional[str] = None) -> bool:
-        """更新 WireGuard 对等点"""
+                             lan_subnet: Optional[str] = None,
+                             default_outbound: Optional[str] = ...) -> bool:
+        """更新 WireGuard 对等点
+
+        Args:
+            default_outbound: 使用 ... 表示不更新，None 表示清空，字符串表示设置新值
+        """
         updates = []
         params = []
 
@@ -695,6 +707,9 @@ class UserDatabase:
         if lan_subnet is not None:
             updates.append("lan_subnet = ?")
             params.append(lan_subnet)
+        if default_outbound is not ...:
+            updates.append("default_outbound = ?")
+            params.append(default_outbound)
 
         if not updates:
             return False
@@ -2182,7 +2197,8 @@ class UserDatabase:
         fallback_port: Optional[int] = None,
         tun_device: str = "xray-tun0",
         tun_subnet: str = "10.24.0.0/24",
-        enabled: bool = False
+        enabled: bool = False,
+        default_outbound: Optional[str] = None
     ) -> bool:
         """设置 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
         transport_config_json = json.dumps(transport_config) if transport_config else None
@@ -2197,9 +2213,9 @@ class UserDatabase:
                  xtls_vision_enabled, reality_enabled, reality_private_key, reality_public_key,
                  reality_short_ids, reality_dest, reality_server_names,
                  transport_type, transport_config, fallback_server, fallback_port,
-                 tun_device, tun_subnet, enabled,
+                 tun_device, tun_subnet, enabled, default_outbound,
                  updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """, (protocol, listen_address, listen_port,
                   1 if tls_enabled else 0, tls_cert_path, tls_key_path,
                   tls_cert_content, tls_key_content,
@@ -2207,7 +2223,7 @@ class UserDatabase:
                   reality_short_ids, reality_dest, reality_server_names,
                   transport_type, transport_config_json,
                   fallback_server, fallback_port,
-                  tun_device, tun_subnet, 1 if enabled else 0))
+                  tun_device, tun_subnet, 1 if enabled else 0, default_outbound))
             conn.commit()
             return True
 
@@ -2222,7 +2238,8 @@ class UserDatabase:
             "reality_short_ids", "reality_dest", "reality_server_names",
             "transport_type", "transport_config",
             "fallback_server", "fallback_port",
-            "tun_device", "tun_subnet", "enabled"
+            "tun_device", "tun_subnet", "enabled",
+            "default_outbound"
         }
         updates = []
         values = []
@@ -2420,8 +2437,9 @@ class DatabaseManager:
         return self.user.get_wireguard_server()
 
     def set_wireguard_server(self, interface_name: str, address: str, listen_port: int,
-                            mtu: int, private_key: str) -> bool:
-        return self.user.set_wireguard_server(interface_name, address, listen_port, mtu, private_key)
+                            mtu: int, private_key: str,
+                            default_outbound: Optional[str] = None) -> bool:
+        return self.user.set_wireguard_server(interface_name, address, listen_port, mtu, private_key, default_outbound)
 
     # WireGuard 对等点
     def get_wireguard_peers(self, enabled_only: bool = True) -> List[Dict]:
@@ -2436,14 +2454,16 @@ class DatabaseManager:
     def add_wireguard_peer(self, name: str, public_key: str, allowed_ips: str,
                           preshared_key: Optional[str] = None,
                           allow_lan: bool = False,
-                          lan_subnet: Optional[str] = None) -> int:
-        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet)
+                          lan_subnet: Optional[str] = None,
+                          default_outbound: Optional[str] = None) -> int:
+        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound)
 
     def update_wireguard_peer(self, peer_id: int, name: Optional[str] = None,
                              allowed_ips: Optional[str] = None, enabled: Optional[bool] = None,
                              allow_lan: Optional[bool] = None,
-                             lan_subnet: Optional[str] = None) -> bool:
-        return self.user.update_wireguard_peer(peer_id, name, allowed_ips, enabled, allow_lan, lan_subnet)
+                             lan_subnet: Optional[str] = None,
+                             default_outbound: Optional[str] = ...) -> bool:
+        return self.user.update_wireguard_peer(peer_id, name, allowed_ips, enabled, allow_lan, lan_subnet, default_outbound)
 
     def delete_wireguard_peer(self, peer_id: int) -> bool:
         return self.user.delete_wireguard_peer(peer_id)
@@ -2787,7 +2807,8 @@ class DatabaseManager:
         fallback_port: Optional[int] = None,
         tun_device: str = "xray-tun0",
         tun_subnet: str = "10.24.0.0/24",
-        enabled: bool = False
+        enabled: bool = False,
+        default_outbound: Optional[str] = None
     ) -> bool:
         return self.user.set_v2ray_inbound_config(
             protocol, listen_port, listen_address,
@@ -2795,8 +2816,11 @@ class DatabaseManager:
             xtls_vision_enabled, reality_enabled, reality_private_key, reality_public_key,
             reality_short_ids, reality_dest, reality_server_names,
             transport_type, transport_config, fallback_server, fallback_port,
-            tun_device, tun_subnet, enabled
+            tun_device, tun_subnet, enabled, default_outbound
         )
+
+    # Alias for API compatibility
+    save_v2ray_inbound_config = set_v2ray_inbound_config
 
     def update_v2ray_inbound_config(self, **kwargs) -> bool:
         return self.user.update_v2ray_inbound_config(**kwargs)

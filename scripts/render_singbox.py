@@ -258,6 +258,125 @@ def generate_lan_access_rules(config: dict) -> None:
     print(f"[render] 已添加 LAN 访问规则: {list(lan_subnets)} → direct")
 
 
+def ensure_ingress_outbound_rules(config: dict, all_egress_tags: List[str]) -> None:
+    """为入口和客户端添加默认出口路由规则
+
+    1. 如果单个 WireGuard 客户端（peer）配置了 default_outbound，
+       添加 source_ip_cidr 规则将该客户端的流量路由到指定出口。
+
+    2. 如果 WireGuard 入口或 V2Ray 入口配置了 default_outbound，
+       添加 inbound 规则将该入口的剩余流量路由到指定出口。
+
+    规则优先级：
+    - 客户端级别规则（source_ip_cidr）> 入口级别规则（inbound）> 全局默认
+
+    这些规则应在 sniff/hijack-dns/LAN 规则之后，但在自定义规则之前。
+
+    Args:
+        config: sing-box 配置
+        all_egress_tags: 所有有效的出口标签列表
+    """
+    if not HAS_DATABASE or not Path(USER_DB_PATH).exists():
+        return
+
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+    except Exception as e:
+        print(f"[render] 警告: 无法加载数据库: {e}")
+        return
+
+    # 有效出口列表（包括基础出口和 selector）
+    valid_outbounds = {"direct", "block", "adblock", "default-exit"} | set(all_egress_tags)
+
+    # 收集需要添加的规则
+    peer_rules = []      # 客户端级别规则（source_ip_cidr）
+    ingress_rules = []   # 入口级别规则（inbound）
+
+    # 1. 检查 WireGuard 客户端（peer）的 default_outbound
+    try:
+        peers = db.get_wireguard_peers(enabled_only=True)
+        for peer in peers:
+            if peer.get("default_outbound"):
+                peer_outbound = peer["default_outbound"]
+                if peer_outbound in valid_outbounds:
+                    # 从 allowed_ips 提取客户端 IP（格式如 "10.25.0.2/32"）
+                    allowed_ips = peer.get("allowed_ips", "")
+                    if allowed_ips:
+                        # 确保是 CIDR 格式
+                        peer_ip = allowed_ips if "/" in allowed_ips else f"{allowed_ips}/32"
+                        peer_rules.append({
+                            "source_ip_cidr": [peer_ip],
+                            "outbound": peer_outbound
+                        })
+                        print(f"[render] 客户端 '{peer['name']}' ({peer_ip}) 出口: {peer_outbound}")
+                else:
+                    print(f"[render] 警告: 客户端 '{peer['name']}' 指定的出口 '{peer_outbound}' 不存在")
+    except Exception as e:
+        print(f"[render] 警告: 无法加载 WireGuard 客户端配置: {e}")
+
+    # 2. 检查 WireGuard 入口
+    try:
+        wg_server = db.get_wireguard_server()
+        if wg_server and wg_server.get("default_outbound"):
+            wg_outbound = wg_server["default_outbound"]
+            if wg_outbound in valid_outbounds:
+                ingress_rules.append({
+                    "inbound": ["tproxy-in"],
+                    "outbound": wg_outbound
+                })
+                print(f"[render] WireGuard 入口默认出口: {wg_outbound}")
+            else:
+                print(f"[render] 警告: WireGuard 入口指定的出口 '{wg_outbound}' 不存在")
+    except Exception as e:
+        print(f"[render] 警告: 无法加载 WireGuard 服务器配置: {e}")
+
+    # 3. 检查 V2Ray 入口（使用 xray-in 作为 inbound tag）
+    try:
+        v2ray_config = db.get_v2ray_inbound_config()
+        if v2ray_config and v2ray_config.get("enabled") and v2ray_config.get("default_outbound"):
+            v2ray_outbound = v2ray_config["default_outbound"]
+            if v2ray_outbound in valid_outbounds:
+                ingress_rules.append({
+                    "inbound": ["xray-in"],
+                    "outbound": v2ray_outbound
+                })
+                print(f"[render] V2Ray 入口默认出口: {v2ray_outbound}")
+            else:
+                print(f"[render] 警告: V2Ray 入口指定的出口 '{v2ray_outbound}' 不存在")
+    except Exception as e:
+        print(f"[render] 警告: 无法加载 V2Ray 入口配置: {e}")
+
+    if not peer_rules and not ingress_rules:
+        return
+
+    # 找到合适的插入位置（在 sniff, hijack-dns, LAN 规则之后）
+    insert_pos = 0
+    for i, rule in enumerate(rules):
+        # 跳过 action 类规则和 ip_cidr 规则（LAN 规则）
+        if rule.get("action") in ("sniff", "hijack-dns"):
+            insert_pos = i + 1
+        elif "ip_cidr" in rule and "inbound" not in rule:
+            # LAN 规则（有 ip_cidr 但没有 inbound）
+            insert_pos = i + 1
+        elif "inbound" in rule:
+            # 已有的入口规则，跳到后面
+            insert_pos = i + 1
+        elif "source_ip_cidr" in rule:
+            # 已有的源 IP 规则，跳到后面
+            insert_pos = i + 1
+
+    # 先插入客户端级别规则（更高优先级）
+    for idx, peer_rule in enumerate(peer_rules):
+        rules.insert(insert_pos + idx, peer_rule)
+
+    # 再插入入口级别规则（较低优先级）
+    for idx, ingress_rule in enumerate(ingress_rules):
+        rules.insert(insert_pos + len(peer_rules) + idx, ingress_rule)
+
+
 def _create_wireguard_endpoint(tag: str, profile: dict, index: int) -> dict:
     """为 profile 创建新的 WireGuard endpoint（sing-box 1.11+ 格式）
 
@@ -759,15 +878,60 @@ def ensure_dns_servers(config: dict, pia_profiles: Dict[str, dict]) -> None:
             })
 
 
-def ensure_outbound_selector(config: dict, all_egress_tags: List[str]) -> None:
-    """更新 default-exit selector 包含所有出口"""
+def ensure_outbound_selector(config: dict, all_egress_tags: List[str], default_outbound: str = "direct") -> None:
+    """创建或更新 default-exit selector，支持通过 Clash API 热切换默认出口
+
+    使用 selector 出口 + interrupt_exist_connections: false 可以实现：
+    - 通过 Clash API 切换默认出口而不中断现有连接
+    - 所有流量通过 default-exit selector 路由
+    - route.final 指向 default-exit
+
+    Args:
+        config: sing-box 配置
+        all_egress_tags: 所有可用的出口 tags
+        default_outbound: 当前默认出口（selector 的 default 值）
+    """
     outbounds = config.setdefault("outbounds", [])
 
-    for ob in outbounds:
-        if ob.get("tag") == "default-exit" and ob.get("type") == "selector":
-            available = ["direct"] + all_egress_tags
-            ob["outbounds"] = available
+    # 收集所有可用出口（包括 direct）
+    available = ["direct"] + list(all_egress_tags)
+
+    # 验证 default_outbound 是否有效
+    if default_outbound not in available:
+        print(f"[render] 警告: 默认出口 '{default_outbound}' 不在可用列表中，使用 'direct'")
+        default_outbound = "direct"
+
+    # 查找现有的 selector
+    existing_selector = None
+    selector_idx = -1
+    for i, ob in enumerate(outbounds):
+        if ob.get("tag") == "default-exit":
+            existing_selector = ob
+            selector_idx = i
             break
+
+    # 创建新的 selector 配置
+    selector_config = {
+        "type": "selector",
+        "tag": "default-exit",
+        "outbounds": available,
+        "default": default_outbound,
+        "interrupt_exist_connections": False  # 关键：切换时不中断现有连接
+    }
+
+    if existing_selector:
+        # 更新现有 selector
+        outbounds[selector_idx] = selector_config
+    else:
+        # 在 block/adblock 之前插入新的 selector
+        block_idx = next(
+            (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
+            len(outbounds)
+        )
+        outbounds.insert(block_idx, selector_config)
+        print(f"[render] 创建 default-exit selector (interrupt_exist_connections=false)")
+
+    print(f"[render] default-exit selector: {len(available)} 个出口，默认 = {default_outbound}")
 
 
 def load_custom_egress() -> List[dict]:
@@ -1833,31 +1997,25 @@ def apply_custom_rules(config: dict, custom_rules: Dict[str, Any], valid_outboun
     if skipped_rules:
         print(f"[render] 警告: 跳过 {len(skipped_rules)} 条指向无效出口的规则: {skipped_rules}")
 
-    # 更新默认出口（验证是否有效）
+    # 更新 DNS final（基于默认出口）
+    # 注意：route["final"] 现在始终指向 "default-exit" selector
+    # 这里只设置 DNS final 以确保 DNS 查询使用正确的 DNS 服务器
     default_outbound = custom_rules.get("default_outbound")
-    if default_outbound:
-        if default_outbound in all_valid:
-            route["final"] = default_outbound
-            # 同时设置 DNS final，使用对应的 DNS 服务器
-            dns = config.setdefault("dns", {})
-            dns_servers = dns.get("servers", [])
-            dns_tag = f"{default_outbound}-dns"
-            # 检查对应的 DNS 服务器是否存在
-            if any(s.get("tag") == dns_tag for s in dns_servers):
-                dns["final"] = dns_tag
-                print(f"[render] DNS final 设置为: {dns_tag}")
-            elif default_outbound == "direct":
-                dns["final"] = "direct-dns"
-                print(f"[render] DNS final 设置为: direct-dns")
-            else:
-                # 如果没有对应的 DNS 服务器，使用 direct-dns
-                dns["final"] = "direct-dns"
-                print(f"[render] 警告: 未找到 {dns_tag}，DNS final 使用 direct-dns")
-        else:
-            print(f"[render] 警告: 默认出口 '{default_outbound}' 无效，使用 'direct'")
-            route["final"] = "direct"
-            dns = config.setdefault("dns", {})
+    if default_outbound and default_outbound in all_valid:
+        dns = config.setdefault("dns", {})
+        dns_servers = dns.get("servers", [])
+        dns_tag = f"{default_outbound}-dns"
+        # 检查对应的 DNS 服务器是否存在
+        if any(s.get("tag") == dns_tag for s in dns_servers):
+            dns["final"] = dns_tag
+            print(f"[render] DNS final 设置为: {dns_tag}")
+        elif default_outbound == "direct":
             dns["final"] = "direct-dns"
+            print(f"[render] DNS final 设置为: direct-dns")
+        else:
+            # 如果没有对应的 DNS 服务器，使用 direct-dns
+            dns["final"] = "direct-dns"
+            print(f"[render] 警告: 未找到 {dns_tag}，DNS final 使用 direct-dns")
 
 
 def ensure_log_config(config: dict) -> None:
@@ -2106,18 +2264,26 @@ def main() -> None:
         print("[render] 警告: 没有找到任何出口配置（PIA 或自定义）")
         # 仍然生成配置，只是没有 VPN 出口
 
-    # 更新 selector outbound（如果有的话）
-    if all_egress_tags:
-        ensure_outbound_selector(config, all_egress_tags)
+    # 加载自定义规则以获取默认出口设置
+    custom_rules = load_custom_rules()
+    default_outbound = custom_rules.get("default_outbound", "direct")
+
+    # 创建 default-exit selector（支持热切换，不中断连接）
+    # selector 包含所有可用出口，通过 Clash API 切换 default 值
+    ensure_outbound_selector(config, all_egress_tags, default_outbound)
+
+    # route.final 始终指向 default-exit selector
+    # 这样切换默认出口只需要通过 Clash API 更新 selector，无需重载配置
+    route = config.setdefault("route", {})
+    route["final"] = "default-exit"
 
     # 应用自定义规则（传入有效出口列表用于验证）
-    custom_rules = load_custom_rules()
-    if custom_rules.get("rules") or custom_rules.get("default_outbound"):
+    if custom_rules.get("rules"):
         apply_custom_rules(config, custom_rules, all_egress_tags)
-        if custom_rules.get("rules"):
-            print(f"[render] 应用了 {len(custom_rules['rules'])} 条自定义规则")
-        if custom_rules.get("default_outbound"):
-            print(f"[render] 默认出口设置为: {custom_rules['default_outbound']}")
+        print(f"[render] 应用了 {len(custom_rules['rules'])} 条自定义规则")
+
+    if default_outbound != "direct":
+        print(f"[render] 默认出口设置为: {default_outbound} (通过 selector)")
 
     # 生成广告拦截 rule_set
     adblock_rule_sets, adblock_route_rules = generate_adblock_rule_sets()
@@ -2140,6 +2306,9 @@ def main() -> None:
 
     # 生成 LAN 访问规则（在 sniff 之后，其他规则之前）
     generate_lan_access_rules(config)
+
+    # 生成入口绑定出口规则（在 LAN 规则之后，自定义规则之前）
+    ensure_ingress_outbound_rules(config, all_egress_tags)
 
     # 添加 experimental API 用于获取连接状态
     # 收集所有需要统计的出口（包括 direct, block, adblock 和所有 egress）

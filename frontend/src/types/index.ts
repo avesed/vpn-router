@@ -245,6 +245,7 @@ export interface IngressPeer {
   is_online: boolean;
   rx_bytes: number;
   tx_bytes: number;
+  default_outbound?: string | null;
 }
 
 export interface IngressResponse {
