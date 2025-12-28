@@ -1,9 +1,15 @@
+# ==========================================
 # Dependencies
+# ==========================================
 node_modules/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
+# ==========================================
 # Build outputs
+# ==========================================
 /frontend/dist/
 /out/
 /build/
@@ -12,86 +18,90 @@ __pycache__/
 vite.config.js
 vite.config.d.ts
 
+# ==========================================
 # Environment & secrets
+# ==========================================
 .env
 .env.local
 .env.*.local
 *.pem
 *.key
 
-# Config files with sensitive data (NOT sing-box.json - that's the base template)
-/config/pia-profiles.json
-/config/sing-box.generated.json
-/config/rulesets/
-
-# WireGuard client configs (contain private keys)
-*-client.conf
-*.wg.conf
-
-# Domain catalog file (temporary)
-/config/domain-catalog-new.json
-
-# Old database files (migrated to separated databases)
-/config/routing.db
-
-# User config database (auto-created on container startup)
-/config/user-config.db
-config/user-config.db.backup
-config/user-config.db.unencrypted
-
-# SQLCipher encryption key (NEVER commit!)
+# ==========================================
+# SQLCipher encryption keys (NEVER commit!)
+# ==========================================
 /config/.db-key
+/config/encryption.key
 .db-key
 
-# Auto-downloaded geo data files
-/config/geoip.db
-/config/geosite.db
-/config/.geodata-ready
+# ==========================================
+# Config files with sensitive data
+# (NOT sing-box.json - that's the base template)
+# ==========================================
+/config/pia-profiles.json
+/config/sing-box.generated.json
+/config/custom-rules.json
+/config/settings.json
 
-# Database backup files
+# ==========================================
+# User config database (auto-created on container startup)
+# ==========================================
+/config/user-config.db
+/config/user-config.db.backup
+/config/user-config.db.unencrypted
+/config/user-config.db-shm
+/config/user-config.db-wal
 *.db.bak
 *.db-journal
 
-# Runtime generated files
+# ==========================================
+# Auto-downloaded/generated geo data files
+# ==========================================
+/config/geoip.db
+/config/geosite.db
+/config/geoip-geodata.db
+/config/.geodata-ready
 /config/cache.db
-/config/settings.json
 
-# WARP config directories (contain device credentials)
+# ==========================================
+# Runtime generated directories
+# ==========================================
+/config/rulesets/
+/config/backups/
 /config/warp/
 
+# ==========================================
+# WireGuard client configs (contain private keys)
+# ==========================================
+*-client.conf
+*.wg.conf
+
+# ==========================================
 # Old source data directories (data now in databases)
+# ==========================================
 /ip-list/
 /config/ip-list/
+/domain-list/
 
-# Test directories
+# ==========================================
+# Logs
+# ==========================================
+*.log
+/logs/
+
+# ==========================================
+# Test directories and artifacts
+# ==========================================
 /test-wg/
 /test-client/
 /test-egress/
 /test-wg-client/
 /xray-client-debug/
-
-# IDE & editor
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Logs
-*.log
-logs/
-
-# Docker
-docker-compose.override.yml
-docker-compose.local.yml
-
-# Claude Code
-.claude/
-CLAUDE.md
-CODE_REVIEW_REPORT.md
-
-# Test artifacts
+/tests/xray-server/
+/tests/xray-test/
+/tests/*_REPORT.md
+/tests/*_PLAN.md
+/tests/run_*.py
 coverage/
 htmlcov/
 .coverage
@@ -99,7 +109,33 @@ htmlcov/
 *.cover
 *.py,cover
 
+# ==========================================
+# IDE & editor
+# ==========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ==========================================
+# Docker
+# ==========================================
+docker-compose.override.yml
+docker-compose.local.yml
+
+# ==========================================
+# Claude Code
+# ==========================================
+.claude/
+CLAUDE.md
+CODE_REVIEW_REPORT.md
+REVIEW_REPORT.md
+
+# ==========================================
 # Misc
+# ==========================================
 .cache/
 tmp/
-
+*.tmp

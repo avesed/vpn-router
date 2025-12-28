@@ -23,7 +23,7 @@ server {
 
     # SSE streaming endpoints (WARP endpoint test with progress)
     location = /api/egress/warp/endpoints/test/stream {
-        proxy_pass http://localhost:8000;
+        proxy_pass http://localhost:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -40,7 +40,7 @@ server {
 
     # Long-running API endpoints (WARP endpoint test, speed test)
     location ~ ^/api/(egress/warp/endpoints/test|test/egress/.*/speed) {
-        proxy_pass http://localhost:8000;
+        proxy_pass http://localhost:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -53,7 +53,7 @@ server {
 
     # API proxy to backend
     location /api {
-        proxy_pass http://localhost:8000;
+        proxy_pass http://localhost:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

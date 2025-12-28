@@ -193,6 +193,106 @@ class KeyManager:
         logger.info(f"Saved encryption key: {key_path}")
 
     @classmethod
+    def encrypt_with_deploy_key(cls, plaintext: str) -> str:
+        """使用部署密钥加密数据（用于 PSK 等敏感数据）
+
+        Args:
+            plaintext: 要加密的明文字符串
+
+        Returns:
+            Base64 编码的加密数据（格式: salt:encrypted_data）
+
+        Raises:
+            RuntimeError: 如果 cryptography 库不可用
+        """
+        if not HAS_CRYPTO:
+            raise RuntimeError("cryptography library not available")
+
+        # 获取部署密钥
+        deploy_key = cls.get_or_create_key()
+
+        # 生成随机 salt
+        salt = secrets.token_bytes(16)
+
+        # 派生 Fernet 密钥
+        derived_key = cls._derive_key(deploy_key, salt)
+
+        # Fernet 加密
+        f = Fernet(derived_key)
+        encrypted = f.encrypt(plaintext.encode())
+
+        # 返回 salt:encrypted_data 格式（Base64 编码）
+        result = base64.b64encode(salt).decode() + ":" + base64.b64encode(encrypted).decode()
+        return result
+
+    @classmethod
+    def decrypt_with_deploy_key(cls, encrypted_data: str) -> str:
+        """使用部署密钥解密数据
+
+        Args:
+            encrypted_data: encrypt_with_deploy_key() 返回的加密数据
+
+        Returns:
+            解密后的明文字符串
+
+        Raises:
+            ValueError: 数据格式错误或解密失败
+            RuntimeError: 如果 cryptography 库不可用
+        """
+        if not HAS_CRYPTO:
+            raise RuntimeError("cryptography library not available")
+
+        try:
+            # 解析 salt:encrypted_data 格式
+            if ":" not in encrypted_data:
+                raise ValueError("Invalid encrypted data format")
+
+            salt_b64, data_b64 = encrypted_data.split(":", 1)
+            salt = base64.b64decode(salt_b64)
+            data = base64.b64decode(data_b64)
+
+            # 获取部署密钥
+            deploy_key = cls.get_or_create_key()
+
+            # 派生 Fernet 密钥
+            derived_key = cls._derive_key(deploy_key, salt)
+
+            # Fernet 解密
+            f = Fernet(derived_key)
+            decrypted = f.decrypt(data)
+
+            return decrypted.decode()
+        except Exception as e:
+            raise ValueError(f"Failed to decrypt data: {e}") from e
+
+    @classmethod
+    def is_encrypted_format(cls, data: str) -> bool:
+        """检查数据是否为加密格式（salt:encrypted_data）
+
+        用于检测旧的明文 PSK 并进行迁移
+        """
+        if not data:
+            return False
+        # 加密格式: base64(salt):base64(encrypted)
+        # Base64 字符集: A-Za-z0-9+/=
+        if ":" not in data:
+            return False
+        parts = data.split(":", 1)
+        if len(parts) != 2:
+            return False
+        # salt 部分应该是 16 字节的 base64 编码 (~24 字符)
+        # encrypted 部分应该较长（Fernet 格式）
+        try:
+            salt = base64.b64decode(parts[0])
+            if len(salt) != 16:
+                return False
+            # 尝试解码 data 部分
+            base64.b64decode(parts[1])
+            return True
+        except Exception:
+            return False
+
+    @classmethod
     def is_database_encrypted(cls, db_path: str) -> bool:
         """检测数据库是否已加密
 

@@ -2,8 +2,15 @@ services:
   vpn-gateway:
     container_name: vpn-gateway
     image: ghcr.io/avesed/vpn-router:latest
+    # SECURITY: privileged mode is required for:
+    # - Kernel WireGuard interface creation (ip link add type wireguard)
+    # - TPROXY iptables rules (requires NET_ADMIN + mangle table access)
+    # - sysctl modifications (ip_forward, rp_filter)
+    # This cannot be replaced with cap_add due to TPROXY requirements
     privileged: true
     network_mode: host
+    # Graceful shutdown timeout (allow cleanup of WireGuard interfaces)
+    stop_grace_period: 30s
     # Required for kernel WireGuard + TPROXY
     # security_opt disables seccomp/apparmor restrictions needed for TPROXY
     #cap_add:
@@ -40,4 +47,18 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+    # Resource limits for production stability
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
     restart: unless-stopped
+    # Explicit healthcheck (matches Dockerfile HEALTHCHECK)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3

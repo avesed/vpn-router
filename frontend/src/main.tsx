@@ -12,6 +12,9 @@ import DomainCatalog from "./pages/DomainCatalog";
 import IpCatalog from "./pages/IpCatalog";
 import IngressManager from "./pages/IngressManager";
 import V2RayIngressManager from "./pages/V2RayIngressManager";
+import PeerManager from "./pages/PeerManager";
+import ChainManager from "./pages/ChainManager";
+import TopologyView from "./pages/TopologyView";
 import BackupRestore from "./pages/BackupRestore";
 import AdBlock from "./pages/AdBlock";
 import Login from "./pages/Login";
@@ -36,6 +39,9 @@ const router = createBrowserRouter([
       { index: true, element: <Dashboard /> },
       { path: "ingress", element: <IngressManager /> },
       { path: "ingress-v2ray", element: <V2RayIngressManager /> },
+      { path: "peers", element: <PeerManager /> },
+      { path: "chains", element: <ChainManager /> },
+      { path: "topology", element: <TopologyView /> },
       { path: "egress", element: <EgressManager /> },
       { path: "profiles", element: <Navigate to="/egress" replace /> },
       { path: "rules", element: <RouteRules /> },

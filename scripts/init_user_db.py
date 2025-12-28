@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS wireguard_peers (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- [DB-001] 添加 enabled 索引以优化查询性能
+CREATE INDEX IF NOT EXISTS idx_wireguard_peers_enabled ON wireguard_peers(enabled);
 
 -- PIA profiles 表
 CREATE TABLE IF NOT EXISTS pia_profiles (
@@ -95,6 +97,9 @@ CREATE TABLE IF NOT EXISTS pia_profiles (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- [DB-001] 添加 enabled 索引和覆盖索引以优化查询性能
+CREATE INDEX IF NOT EXISTS idx_pia_profiles_enabled ON pia_profiles(enabled);
+CREATE INDEX IF NOT EXISTS idx_pia_profiles_enabled_name ON pia_profiles(enabled, name);
 
 -- 自定义分类项目表（域名列表）
 CREATE TABLE IF NOT EXISTS custom_category_items (
@@ -136,6 +141,9 @@ CREATE TABLE IF NOT EXISTS custom_egress (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_custom_egress_tag ON custom_egress(tag);
+-- [DB-001] 添加 enabled 索引和覆盖索引以优化查询性能
+CREATE INDEX IF NOT EXISTS idx_custom_egress_enabled ON custom_egress(enabled);
+CREATE INDEX IF NOT EXISTS idx_custom_egress_enabled_tag ON custom_egress(enabled, tag);
 
 -- Direct 出口表（绑定特定接口/IP 的直连出口）
 CREATE TABLE IF NOT EXISTS direct_egress (
@@ -150,6 +158,8 @@ CREATE TABLE IF NOT EXISTS direct_egress (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_direct_egress_tag ON direct_egress(tag);
+-- [DB-001] 添加 enabled 索引以优化查询性能
+CREATE INDEX IF NOT EXISTS idx_direct_egress_enabled ON direct_egress(enabled);
 
 -- OpenVPN 出口表（通过 SOCKS5 代理桥接）
 CREATE TABLE IF NOT EXISTS openvpn_egress (
@@ -412,6 +422,92 @@ CREATE TABLE IF NOT EXISTS outbound_groups (
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_groups_tag ON outbound_groups(tag);
 CREATE INDEX IF NOT EXISTS idx_outbound_groups_enabled ON outbound_groups(enabled);
+
+-- 对等节点表（主从服务器管理）
+CREATE TABLE IF NOT EXISTS peer_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,              -- 唯一标识 (node-tokyo)
+    name TEXT NOT NULL,                    -- 显示名称
+    description TEXT DEFAULT '',
+
+    -- 连接信息
+    endpoint TEXT NOT NULL,                -- IP:port 或 域名:port
+
+    -- PSK 认证
+    psk_hash TEXT NOT NULL,                -- bcrypt 哈希（用于接收认证）
+    psk_encrypted TEXT,                    -- Fernet 加密后的 PSK（格式: salt:encrypted_data）
+
+    -- 隧道配置
+    tunnel_type TEXT DEFAULT 'wireguard' CHECK(tunnel_type IN ('wireguard', 'xray')),
+    tunnel_status TEXT DEFAULT 'disconnected' CHECK(tunnel_status IN ('disconnected', 'connecting', 'connected', 'error')),
+    tunnel_interface TEXT,                 -- wg-peer-{tag} 或 xray-peer-{tag}
+    tunnel_local_ip TEXT,                  -- 本端隧道 IP (10.200.200.1)
+    tunnel_remote_ip TEXT,                 -- 对端隧道 IP (10.200.200.2)
+    tunnel_port INTEGER,                   -- 本地监听端口
+
+    -- WireGuard 专用
+    wg_private_key TEXT,
+    wg_public_key TEXT,
+    wg_peer_public_key TEXT,
+
+    -- Xray 专用
+    xray_protocol TEXT DEFAULT 'vless' CHECK(xray_protocol IN ('vless', 'vmess', 'trojan')),
+    xray_uuid TEXT,
+    xray_socks_port INTEGER,               -- SOCKS5 代理端口
+
+    -- TLS 验证配置（用于 Trojan 协议）
+    tls_verify INTEGER DEFAULT 1,          -- 1=验证证书（默认安全），0=跳过验证（需警告）
+    tls_fingerprint TEXT,                  -- 可选：证书指纹固定（十六进制格式）
+
+    -- 入口绑定出口（来自此节点隧道的流量默认出口）
+    default_outbound TEXT,
+
+    -- 状态
+    last_seen TIMESTAMP,
+    last_error TEXT,
+    auto_reconnect INTEGER DEFAULT 1,
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_peer_nodes_tag ON peer_nodes(tag);
+CREATE INDEX IF NOT EXISTS idx_peer_nodes_enabled ON peer_nodes(enabled);
+CREATE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_status ON peer_nodes(tunnel_status);
+-- 唯一索引防止资源分配竞态条件
+CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_local_ip ON peer_nodes(tunnel_local_ip) WHERE tunnel_local_ip IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_port ON peer_nodes(tunnel_port) WHERE tunnel_port IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_xray_socks_port ON peer_nodes(xray_socks_port) WHERE xray_socks_port IS NOT NULL;
+
+-- 多跳链路表
+CREATE TABLE IF NOT EXISTS node_chains (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,              -- 链路标识 (us-via-tokyo)
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+
+    -- 链路定义 (JSON 数组，按顺序)
+    hops TEXT NOT NULL,                    -- ["node-tokyo", "node-us"]
+
+    -- 每跳协议 (JSON)
+    hop_protocols TEXT,                    -- {"node-tokyo": "wireguard", "node-us": "xray"}
+
+    -- 入口分流规则 (JSON) - 哪些流量走这条链
+    entry_rules TEXT,                      -- {"domain_suffix": ["google.com"], "geoip": ["us"]}
+
+    -- 中继分流规则 (JSON) - 在哪个节点出去
+    relay_rules TEXT,                      -- {"node-tokyo": {"exit_domains": ["*.jp"]}}
+
+    -- 健康状态
+    health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
+    last_health_check TIMESTAMP,
+
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_node_chains_tag ON node_chains(tag);
+CREATE INDEX IF NOT EXISTS idx_node_chains_enabled ON node_chains(enabled);
 """
 
 
@@ -741,6 +837,91 @@ def migrate_openvpn_socks_to_tun(conn: sqlite3.Connection):
     conn.commit()
 
 
+def migrate_peer_nodes_tables(conn: sqlite3.Connection):
+    """为现有数据库添加 peer_nodes 和 node_chains 表"""
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS peer_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                endpoint TEXT NOT NULL,
+                psk_hash TEXT NOT NULL,
+                psk_encrypted TEXT,
+                tunnel_type TEXT DEFAULT 'wireguard' CHECK(tunnel_type IN ('wireguard', 'xray')),
+                tunnel_status TEXT DEFAULT 'disconnected' CHECK(tunnel_status IN ('disconnected', 'connecting', 'connected', 'error')),
+                tunnel_interface TEXT,
+                tunnel_local_ip TEXT,
+                tunnel_remote_ip TEXT,
+                tunnel_port INTEGER,
+                wg_private_key TEXT,
+                wg_public_key TEXT,
+                wg_peer_public_key TEXT,
+                xray_protocol TEXT DEFAULT 'vless' CHECK(xray_protocol IN ('vless', 'vmess', 'trojan')),
+                xray_uuid TEXT,
+                xray_socks_port INTEGER,
+                default_outbound TEXT,
+                last_seen TIMESTAMP,
+                last_error TEXT,
+                auto_reconnect INTEGER DEFAULT 1,
+                enabled INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_nodes_tag ON peer_nodes(tag)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_nodes_enabled ON peer_nodes(enabled)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_status ON peer_nodes(tunnel_status)")
+        # 唯一索引防止资源分配竞态条件
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_local_ip ON peer_nodes(tunnel_local_ip) WHERE tunnel_local_ip IS NOT NULL")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_port ON peer_nodes(tunnel_port) WHERE tunnel_port IS NOT NULL")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_xray_socks_port ON peer_nodes(xray_socks_port) WHERE xray_socks_port IS NOT NULL")
+        print("✓ 创建 peer_nodes 表")
+    else:
+        # 检查是否需要添加 psk_encrypted 列
+        cursor.execute("PRAGMA table_info(peer_nodes)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "psk_encrypted" not in columns:
+            cursor.execute("ALTER TABLE peer_nodes ADD COLUMN psk_encrypted TEXT")
+            print("✓ 添加 peer_nodes.psk_encrypted 列")
+        else:
+            print("⊘ peer_nodes 表已存在，跳过")
+
+    # 检查 node_chains 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='node_chains'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS node_chains (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                hops TEXT NOT NULL,
+                hop_protocols TEXT,
+                entry_rules TEXT,
+                relay_rules TEXT,
+                health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
+                last_health_check TIMESTAMP,
+                enabled INTEGER DEFAULT 1,
+                priority INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_node_chains_tag ON node_chains(tag)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_node_chains_enabled ON node_chains(enabled)")
+        print("✓ 创建 node_chains 表")
+    else:
+        print("⊘ node_chains 表已存在，跳过")
+
+    conn.commit()
+
+
 def generate_wireguard_private_key() -> str:
     """生成 WireGuard 私钥"""
     try:
@@ -961,6 +1142,7 @@ def main():
     migrate_openvpn_socks_to_tun(conn)
     migrate_pia_profiles_custom_dns(conn)
     migrate_ingress_default_outbound(conn)
+    migrate_peer_nodes_tables(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)
@@ -999,6 +1181,8 @@ def main():
         "v2ray_users": cursor.execute("SELECT COUNT(*) FROM v2ray_users").fetchone()[0],
         "custom_category_items": cursor.execute("SELECT COUNT(*) FROM custom_category_items").fetchone()[0],
         "outbound_groups": cursor.execute("SELECT COUNT(*) FROM outbound_groups").fetchone()[0],
+        "peer_nodes": cursor.execute("SELECT COUNT(*) FROM peer_nodes").fetchone()[0],
+        "node_chains": cursor.execute("SELECT COUNT(*) FROM node_chains").fetchone()[0],
     }
 
     db_size_bytes = user_db_path.stat().st_size
@@ -1019,6 +1203,8 @@ def main():
     print(f"WARP 出口:        {stats['warp_egress']:,}")
     print(f"V2Ray 用户:       {stats['v2ray_users']:,}")
     print(f"出口组:           {stats['outbound_groups']:,}")
+    print(f"对等节点:         {stats['peer_nodes']:,}")
+    print(f"多跳链路:         {stats['node_chains']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

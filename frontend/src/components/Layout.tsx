@@ -15,9 +15,12 @@ import {
   WrenchScrewdriverIcon,
   UsersIcon,
   ServerIcon,
+  ServerStackIcon,
   CloudArrowUpIcon,
   EllipsisHorizontalIcon,
-  XMarkIcon
+  XMarkIcon,
+  LinkIcon,
+  MapIcon
 } from "@heroicons/react/24/outline";
 import LanguageSwitcher from "./LanguageSwitcher";
 import { useAuth } from "../contexts/AuthContext";
@@ -45,7 +48,10 @@ const navGroups: NavGroup[] = [
     icon: ArrowLeftEndOnRectangleIcon,
     items: [
       { labelKey: "nav.ingressClient", path: "/ingress", icon: UsersIcon, descriptionKey: "nav.ingressClientDesc" },
-      { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: ServerIcon, descriptionKey: "nav.v2rayIngressDesc" }
+      { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: ServerIcon, descriptionKey: "nav.v2rayIngressDesc" },
+      { labelKey: "nav.peerNodes", path: "/peers", icon: ServerStackIcon, descriptionKey: "nav.peerNodesDesc" },
+      { labelKey: "nav.nodeChains", path: "/chains", icon: LinkIcon, descriptionKey: "nav.nodeChainsDesc" },
+      { labelKey: "nav.topology", path: "/topology", icon: MapIcon, descriptionKey: "nav.topologyDesc" }
     ]
   },
   {
@@ -84,7 +90,10 @@ const bottomNavItems: BottomNavItem[] = [
 // Ingress submenu items
 const ingressMenuItems: BottomNavItem[] = [
   { labelKey: "nav.ingressClient", path: "/ingress", icon: UsersIcon },
-  { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: ServerIcon }
+  { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: ServerIcon },
+  { labelKey: "nav.peerNodes", path: "/peers", icon: ServerStackIcon },
+  { labelKey: "nav.nodeChains", path: "/chains", icon: LinkIcon },
+  { labelKey: "nav.topology", path: "/topology", icon: MapIcon }
 ];
 
 // "More" menu items

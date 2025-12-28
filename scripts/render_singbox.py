@@ -8,6 +8,7 @@
 - 应用自定义路由规则（如果有）
 - 支持广告拦截 rule_set（从 ABP/hosts 列表转换）
 """
+import ipaddress
 import json
 import os
 import shutil
@@ -307,6 +308,12 @@ def ensure_ingress_outbound_rules(config: dict, all_egress_tags: List[str]) -> N
                     if allowed_ips:
                         # 确保是 CIDR 格式
                         peer_ip = allowed_ips if "/" in allowed_ips else f"{allowed_ips}/32"
+                        # 验证 IP 格式
+                        try:
+                            ipaddress.ip_network(peer_ip, strict=False)
+                        except ValueError as e:
+                            print(f"[render] 警告: 客户端 '{peer['name']}' 的 IP 格式无效: {peer_ip} ({e})")
+                            continue
                         peer_rules.append({
                             "source_ip_cidr": [peer_ip],
                             "outbound": peer_outbound
@@ -1560,6 +1567,195 @@ def ensure_outbound_group_outbounds(config: dict, outbound_groups: List[dict]) -
     return group_tags
 
 
+# ============ 对等节点隧道支持 ============
+
+
+def load_peer_nodes() -> List[dict]:
+    """从数据库加载已连接的对等节点
+
+    Returns:
+        已连接状态的节点列表
+    """
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        nodes = db.get_peer_nodes(enabled_only=True)
+        # 只返回已连接的节点（有隧道接口的）
+        connected_nodes = [n for n in nodes if n.get("tunnel_status") == "connected" and n.get("tunnel_interface")]
+        return connected_nodes
+    except Exception as e:
+        print(f"[render] 从数据库加载对等节点失败: {e}")
+        return []
+
+
+def load_node_chains() -> List[dict]:
+    """从数据库加载启用的多跳链路
+
+    Returns:
+        启用的链路列表
+    """
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        chains = db.get_node_chains(enabled_only=True)
+        return chains
+    except Exception as e:
+        print(f"[render] 从数据库加载链路失败: {e}")
+        return []
+
+
+def ensure_peer_node_outbounds(config: dict, peer_nodes: List[dict]) -> List[str]:
+    """为对等节点隧道生成 sing-box outbound 配置
+
+    每个已连接的节点生成一个 direct outbound，绑定到隧道接口。
+    WireGuard 隧道使用 bind_interface (wg-peer-*)
+    Xray 隧道使用 SOCKS5 代理 (127.0.0.1:port)
+
+    Args:
+        config: sing-box 配置
+        peer_nodes: 对等节点列表
+
+    Returns:
+        节点 tag 列表
+    """
+    if not peer_nodes:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    node_tags = []
+
+    for node in peer_nodes:
+        tag = node.get("tag")
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        tunnel_interface = node.get("tunnel_interface")
+        xray_socks_port = node.get("xray_socks_port")
+
+        if not tag:
+            continue
+
+        node_tags.append(tag)
+
+        if tunnel_type == "wireguard":
+            # WireGuard 隧道: 使用 direct + bind_interface
+            outbound = {
+                "type": "direct",
+                "tag": tag,
+                "bind_interface": tunnel_interface
+            }
+        else:
+            # Xray 隧道: 使用 SOCKS5 代理
+            if not xray_socks_port:
+                print(f"[render] 警告: 节点 '{tag}' Xray 隧道缺少 SOCKS 端口")
+                continue
+            outbound = {
+                "type": "socks",
+                "tag": tag,
+                "server": "127.0.0.1",
+                "server_port": xray_socks_port,
+                "version": "5"
+            }
+
+        if tag in existing_tags:
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = outbound
+                    break
+        else:
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+
+        print(f"[render] 创建节点隧道出口: {tag} ({tunnel_type})")
+
+    return node_tags
+
+
+def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[dict]) -> List[str]:
+    """为多跳链路生成 sing-box outbound 配置
+
+    每条链路生成一个 outbound，绑定到第一跳的隧道接口。
+    流量通过第一跳隧道发出后，由对端节点继续转发。
+
+    Args:
+        config: sing-box 配置
+        chains: 链路列表
+        peer_nodes: 对等节点列表（用于查找第一跳接口）
+
+    Returns:
+        链路 tag 列表
+    """
+    if not chains:
+        return []
+
+    # 构建节点查找表
+    node_map = {n.get("tag"): n for n in peer_nodes}
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    chain_tags = []
+
+    for chain in chains:
+        tag = chain.get("tag")
+        hops = chain.get("hops", [])
+
+        if isinstance(hops, str):
+            try:
+                import json as json_module
+                hops = json_module.loads(hops)
+            except:
+                continue
+
+        if not tag or not hops:
+            continue
+
+        # 获取第一跳节点
+        first_hop = hops[0]
+        first_node = node_map.get(first_hop)
+
+        if not first_node:
+            print(f"[render] 警告: 链路 '{tag}' 第一跳 '{first_hop}' 节点未连接或不存在")
+            continue
+
+        tunnel_type = first_node.get("tunnel_type", "wireguard")
+        tunnel_interface = first_node.get("tunnel_interface")
+        xray_socks_port = first_node.get("xray_socks_port")
+
+        chain_tags.append(tag)
+
+        if tunnel_type == "wireguard":
+            outbound = {
+                "type": "direct",
+                "tag": tag,
+                "bind_interface": tunnel_interface
+            }
+        else:
+            if not xray_socks_port:
+                print(f"[render] 警告: 链路 '{tag}' 第一跳 '{first_hop}' Xray 隧道缺少 SOCKS 端口")
+                continue
+            outbound = {
+                "type": "socks",
+                "tag": tag,
+                "server": "127.0.0.1",
+                "server_port": xray_socks_port,
+                "version": "5"
+            }
+
+        if tag in existing_tags:
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == tag:
+                    outbounds[i] = outbound
+                    break
+        else:
+            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
+            outbounds.insert(block_idx, outbound)
+
+        print(f"[render] 创建链路出口: {tag} (hops={len(hops)}, first_hop={first_hop})")
+
+    return chain_tags
+
+
 # ============ V2Ray Inbound 支持 ============
 
 
@@ -2242,6 +2438,22 @@ def main() -> None:
         print(f"[render] 处理 {len(outbound_groups)} 个出口组 (ECMP 负载均衡)")
         group_tags = ensure_outbound_group_outbounds(config, outbound_groups)
         all_egress_tags.extend(group_tags)
+
+    # 加载并处理对等节点隧道（节点间互联）
+    # 每个已连接的节点生成一个 outbound，用于流量转发
+    peer_nodes = load_peer_nodes()
+    if peer_nodes:
+        print(f"[render] 处理 {len(peer_nodes)} 个已连接的对等节点")
+        peer_tags = ensure_peer_node_outbounds(config, peer_nodes)
+        all_egress_tags.extend(peer_tags)
+
+    # 加载并处理多跳链路（A→B→C 多节点串联）
+    # 每条链路生成一个 outbound，绑定到第一跳的隧道接口
+    node_chains = load_node_chains()
+    if node_chains:
+        print(f"[render] 处理 {len(node_chains)} 条多跳链路")
+        chain_tags = ensure_chain_outbounds(config, node_chains, peer_nodes)
+        all_egress_tags.extend(chain_tags)
 
     # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + OpenVPN + V2Ray + WARP）
     # wg_egress_tags 已包含 PIA 和自定义 WireGuard 出口

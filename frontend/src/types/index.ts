@@ -1084,3 +1084,145 @@ export const OUTBOUND_GROUP_TYPES = [
   { value: "failover", label: "Failover", description: "优先使用第一个健康的成员" },
 ] as const;
 
+// ============ Peer Nodes 类型 (对等节点) ============
+
+export type PeerTunnelType = "wireguard" | "xray";
+export type PeerTunnelStatus = "disconnected" | "connecting" | "connected" | "error";
+export type PeerXrayProtocol = "vless" | "vmess" | "trojan";
+
+export interface PeerNode {
+  id?: number;
+  tag: string;
+  name: string;
+  description?: string;
+  endpoint: string;
+  tunnel_type: PeerTunnelType;
+  tunnel_status: PeerTunnelStatus;
+  tunnel_interface?: string;
+  tunnel_local_ip?: string;
+  tunnel_remote_ip?: string;
+  tunnel_port?: number;
+  xray_protocol?: PeerXrayProtocol;
+  xray_socks_port?: number;
+  // TLS 验证配置（用于 Trojan 协议）
+  tls_verify?: number;  // 1=验证，0=跳过
+  tls_fingerprint?: string;
+  last_seen?: string;
+  last_error?: string;
+  auto_reconnect: boolean;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface PeerNodeCreateRequest {
+  tag: string;
+  name: string;
+  description?: string;
+  endpoint: string;
+  psk: string;
+  tunnel_type: PeerTunnelType;
+  xray_protocol?: PeerXrayProtocol;
+  // TLS 验证配置（用于 Trojan 协议）
+  tls_verify?: boolean;
+  tls_fingerprint?: string;
+  auto_reconnect?: boolean;
+}
+
+export interface PeerNodeUpdateRequest {
+  name?: string;
+  description?: string;
+  endpoint?: string;
+  psk?: string;
+  // TLS 验证配置（用于 Trojan 协议）
+  tls_verify?: boolean;
+  tls_fingerprint?: string;
+  auto_reconnect?: boolean;
+  enabled?: boolean;
+}
+
+export interface PeerNodeListResponse {
+  nodes: PeerNode[];
+}
+
+export interface PeerNodeStatusResponse {
+  tag: string;
+  tunnel_status: PeerTunnelStatus;
+  tunnel_interface?: string;
+  tunnel_local_ip?: string;
+  tunnel_remote_ip?: string;
+  last_seen?: string;
+  last_error?: string;
+}
+
+export interface BatchOperationRequest {
+  tags: string[];
+}
+
+export interface BatchOperationResponse {
+  success: boolean;
+  results: Record<string, { success: boolean; message: string }>;
+}
+
+// ============ Node Chains Types (Multi-hop Chains) ============
+
+export type ChainHealthStatus = "unknown" | "healthy" | "degraded" | "unhealthy";
+
+export interface NodeChain {
+  id?: number;
+  tag: string;
+  name: string;
+  description?: string;
+  hops: string[];  // Array of node tags in order
+  hop_protocols?: Record<string, string>;  // {node_tag: protocol}
+  entry_rules?: Record<string, unknown>;
+  relay_rules?: Record<string, unknown>;
+  health_status: ChainHealthStatus;
+  last_health_check?: string;
+  enabled: boolean;
+  priority: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface NodeChainCreateRequest {
+  tag: string;
+  name: string;
+  description?: string;
+  hops: string[];
+  hop_protocols?: Record<string, string>;
+  entry_rules?: Record<string, unknown>;
+  relay_rules?: Record<string, unknown>;
+  priority?: number;
+  enabled?: boolean;
+}
+
+export interface NodeChainUpdateRequest {
+  name?: string;
+  description?: string;
+  hops?: string[];
+  hop_protocols?: Record<string, string>;
+  entry_rules?: Record<string, unknown>;
+  relay_rules?: Record<string, unknown>;
+  priority?: number;
+  enabled?: boolean;
+}
+
+export interface NodeChainListResponse {
+  chains: NodeChain[];
+}
+
+export interface ChainStats {
+  tag: string;
+  total_bytes: number;
+  upload_bytes: number;
+  download_bytes: number;
+  active_connections: number;
+  health_status: ChainHealthStatus;
+  hop_latencies?: Record<string, number>;  // {node_tag: latency_ms}
+}
+
+export interface ChainStatsResponse {
+  chains: Record<string, ChainStats>;
+}
+

@@ -2,13 +2,22 @@
 set -euo pipefail
 
 cleanup() {
+  echo "[entrypoint] cleanup: stopping all managed processes..."
+
+  # Stop health checker first (depends on other services)
   if [ -n "${HEALTH_CHECKER_PID:-}" ] && kill -0 "${HEALTH_CHECKER_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping health checker (PID ${HEALTH_CHECKER_PID})"
     kill "${HEALTH_CHECKER_PID}" >/dev/null 2>&1 || true
   fi
+
+  # Stop tunnel managers
   if [ -n "${WARP_MGR_PID:-}" ] && kill -0 "${WARP_MGR_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping WARP manager (PID ${WARP_MGR_PID})"
     kill "${WARP_MGR_PID}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${XRAY_EGRESS_MGR_PID:-}" ] && kill -0 "${XRAY_EGRESS_MGR_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping Xray egress manager (PID ${XRAY_EGRESS_MGR_PID})"
+    kill "${XRAY_EGRESS_MGR_PID}" >/dev/null 2>&1 || true
   fi
   if [ -n "${XRAY_MGR_PID:-}" ] && kill -0 "${XRAY_MGR_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping Xray manager (PID ${XRAY_MGR_PID})"
@@ -18,13 +27,21 @@ cleanup() {
     echo "[entrypoint] stopping OpenVPN manager (PID ${OPENVPN_MGR_PID})"
     kill "${OPENVPN_MGR_PID}" >/dev/null 2>&1 || true
   fi
+
+  # Stop web services
   if [ -n "${NGINX_PID:-}" ] && kill -0 "${NGINX_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping nginx (PID ${NGINX_PID})"
     kill "${NGINX_PID}" >/dev/null 2>&1 || true
   fi
   if [ -n "${API_PID:-}" ] && kill -0 "${API_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping API server (PID ${API_PID})"
     kill "${API_PID}" >/dev/null 2>&1 || true
   fi
+
+  # Cleanup WireGuard interfaces created by this container
+  cleanup_wireguard_interfaces
+
+  echo "[entrypoint] cleanup complete"
 }
 trap cleanup EXIT
 API_PID=""
@@ -34,6 +51,53 @@ XRAY_MGR_PID=""
 XRAY_EGRESS_MGR_PID=""
 WARP_MGR_PID=""
 HEALTH_CHECKER_PID=""
+
+# Cleanup WireGuard interfaces created by this container
+# This is important for network_mode: host to prevent stale interfaces
+cleanup_wireguard_interfaces() {
+  echo "[entrypoint] cleaning up WireGuard interfaces..."
+
+  # Cleanup ingress interface
+  if ip link show wg-ingress >/dev/null 2>&1; then
+    echo "[entrypoint] removing wg-ingress interface"
+    ip link delete wg-ingress 2>/dev/null || true
+  fi
+
+  # Cleanup egress interfaces (wg-pia-*, wg-eg-*, wg-warp-*, wg-peer-*)
+  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-(pia|eg|warp|peer)-'); do
+    echo "[entrypoint] removing interface: ${iface}"
+    ip link delete "${iface}" 2>/dev/null || true
+  done
+
+  # Cleanup Xray TUN interface
+  if ip link show xray-tun0 >/dev/null 2>&1; then
+    echo "[entrypoint] removing xray-tun0 interface"
+    ip link delete xray-tun0 2>/dev/null || true
+  fi
+
+  # Cleanup iptables rules (TPROXY and NAT)
+  echo "[entrypoint] cleaning up iptables rules..."
+  iptables -t mangle -F PREROUTING 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -s "10.25.0.0/24" ! -o "wg-ingress" -j MASQUERADE 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -s "10.24.0.0/24" ! -o "xray-tun0" -j MASQUERADE 2>/dev/null || true
+
+  # Cleanup ip rules
+  ip rule del fwmark 1 lookup 100 2>/dev/null || true
+}
+
+# Cleanup any stale interfaces from previous runs before starting
+cleanup_stale_interfaces() {
+  echo "[entrypoint] checking for stale interfaces from previous runs..."
+
+  # Only cleanup if interface exists but process is not running
+  if ip link show wg-ingress >/dev/null 2>&1; then
+    # Check if sing-box is running (it manages the ingress)
+    if ! pgrep -x sing-box >/dev/null 2>&1; then
+      echo "[entrypoint] found stale wg-ingress, cleaning up"
+      ip link delete wg-ingress 2>/dev/null || true
+    fi
+  fi
+}
 
 BASE_CONFIG_PATH="${SING_BOX_CONFIG:-/etc/sing-box/sing-box.json}"
 GENERATED_CONFIG_PATH="${SING_BOX_GENERATED_CONFIG:-/etc/sing-box/sing-box.generated.json}"
@@ -46,6 +110,58 @@ DEFAULT_CONFIG_DIR="/opt/default-config"
 # Port configuration
 export WEB_PORT="${WEB_PORT:-36000}"
 export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
+
+# Check for port conflicts before starting services
+check_port_conflicts() {
+  local port="$1"
+  local service="$2"
+  local protocol="${3:-tcp}"
+
+  if [ "${protocol}" = "udp" ]; then
+    # Check UDP port
+    if ss -uln "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
+      echo "[entrypoint] ERROR: Port ${port}/udp is already in use (required for ${service})" >&2
+      return 1
+    fi
+  else
+    # Check TCP port
+    if ss -tln "sport = :${port}" 2>/dev/null | grep -q ":${port}"; then
+      echo "[entrypoint] ERROR: Port ${port}/tcp is already in use (required for ${service})" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Verify critical ports are available
+verify_required_ports() {
+  local has_conflict=0
+
+  echo "[entrypoint] checking for port conflicts..."
+
+  # Check web port
+  if ! check_port_conflicts "${WEB_PORT}" "nginx/web UI" "tcp"; then
+    has_conflict=1
+  fi
+
+  # Check API port
+  if ! check_port_conflicts "${API_PORT:-8000}" "API server" "tcp"; then
+    has_conflict=1
+  fi
+
+  # Check WireGuard port
+  if ! check_port_conflicts "${WG_LISTEN_PORT}" "WireGuard ingress" "udp"; then
+    has_conflict=1
+  fi
+
+  if [ ${has_conflict} -eq 1 ]; then
+    echo "[entrypoint] FATAL: Port conflicts detected. Resolve conflicts or change port configuration." >&2
+    echo "[entrypoint] Hint: Set WEB_PORT, API_PORT, or WG_LISTEN_PORT environment variables" >&2
+    exit 1
+  fi
+
+  echo "[entrypoint] no port conflicts detected"
+}
 
 if [ ! -f "${BASE_CONFIG_PATH}" ] && [ -f "${DEFAULT_CONFIG_DIR}/sing-box.json" ]; then
   echo "[entrypoint] initializing sing-box config from default config"
@@ -86,6 +202,16 @@ fi
 
 # 检测并迁移未加密数据库
 if [ -f "${USER_DB_PATH}" ]; then
+  # Create automatic backup before any database operations
+  BACKUP_DIR="${RULESET_DIR}/backups"
+  mkdir -p "${BACKUP_DIR}"
+  BACKUP_FILE="${BACKUP_DIR}/user-config.db.$(date +%Y%m%d_%H%M%S).bak"
+  cp "${USER_DB_PATH}" "${BACKUP_FILE}" 2>/dev/null || true
+  echo "[entrypoint] created database backup: ${BACKUP_FILE}"
+
+  # Keep only last 5 backups to prevent disk fill
+  ls -t "${BACKUP_DIR}"/user-config.db.*.bak 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null || true
+
   python3 -c "
 from key_manager import KeyManager
 import os
@@ -105,6 +231,12 @@ if [ $? -ne 0 ]; then
   echo "[entrypoint] failed to initialize user database" >&2
   exit 1
 fi
+
+# Cleanup stale interfaces from previous container runs (important for network_mode: host)
+cleanup_stale_interfaces
+
+# Verify ports are available before proceeding
+verify_required_ports
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
@@ -452,8 +584,8 @@ start_nginx() {
   NGINX_TEMPLATE="/etc/nginx/nginx.conf.template"
   NGINX_CONF="/etc/nginx/conf.d/default.conf"
   if [ -f "${NGINX_TEMPLATE}" ]; then
-    envsubst '${WEB_PORT}' < "${NGINX_TEMPLATE}" > "${NGINX_CONF}"
-    echo "[entrypoint] generated nginx config with WEB_PORT=${WEB_PORT}"
+    envsubst '${WEB_PORT} ${API_PORT}' < "${NGINX_TEMPLATE}" > "${NGINX_CONF}"
+    echo "[entrypoint] generated nginx config with WEB_PORT=${WEB_PORT}, API_PORT=${API_PORT}"
   fi
 
   # Test nginx configuration

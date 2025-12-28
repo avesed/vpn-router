@@ -275,13 +275,19 @@ export default function IngressManager() {
     setSavingPeerOutbound(true);
     try {
       // 空字符串表示清空，使用入口默认；API会将""转换为null
-      await api.updateIngressPeer(editingPeer.name, { default_outbound: editPeerOutbound });
-      setSuccessMessage(t("ingress.peerOutboundUpdated", { name: editingPeer.name }));
+      const result = await api.updateIngressPeer(editingPeer.name, { default_outbound: editPeerOutbound });
+      // 根据重载结果显示不同消息
+      if (result.reload_success) {
+        setSuccessMessage(t("ingress.peerOutboundUpdated", { name: editingPeer.name }));
+      } else {
+        // 更新成功但重载失败，显示警告
+        setError(t("ingress.peerOutboundUpdatedReloadFailed"));
+      }
       setShowEditOutboundModal(false);
       setEditingPeer(null);
       setEditPeerOutbound("");
       loadIngress();
-      setTimeout(() => setSuccessMessage(null), 3000);
+      setTimeout(() => { setSuccessMessage(null); setError(null); }, 3000);
     } catch (err) {
       setError(err instanceof Error ? err.message : t("ingress.peerOutboundUpdateFailed"));
     } finally {

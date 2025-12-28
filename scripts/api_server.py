@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """FastAPI 服务：为前端提供 sing-box 网关管理接口"""
+import asyncio
 import hashlib
+import ipaddress
 import json
+import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -28,7 +32,7 @@ except ImportError:
 
 import requests
 import yaml
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -67,6 +71,30 @@ try:
 except ImportError:
     HAS_KEY_MANAGER = False
     print("WARNING: Key manager not available, v2.0 backup format disabled")
+
+# [安全] 导入主机名验证函数
+try:
+    from peer_tunnel_manager import validate_hostname
+    HAS_HOSTNAME_VALIDATOR = True
+except ImportError:
+    HAS_HOSTNAME_VALIDATOR = False
+    # 回退实现：基本验证
+    def validate_hostname(hostname: str) -> bool:
+        """回退实现：基本主机名验证"""
+        if not hostname:
+            return False
+        # 尝试解析为 IP
+        try:
+            ipaddress.ip_address(hostname)
+            return True
+        except ValueError:
+            pass
+        # 基本主机名正则
+        hostname_pattern = re.compile(
+            r'^(?=.{1,253}$)(?!-)[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?'
+            r'(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+        )
+        return bool(hostname_pattern.match(hostname))
 
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
 GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
@@ -843,6 +871,83 @@ class V2RayUserUpdateRequest(BaseModel):
     enabled: Optional[int] = Field(None, ge=0, le=1)
 
 
+# ============ 对等节点 (Peer Node) 模型 ============
+
+class PeerAuthValidateRequest(BaseModel):
+    """PSK 认证请求"""
+    psk: str = Field(..., description="预共享密钥")
+    node_id: str = Field(..., description="请求方节点标识")
+
+
+class PeerAuthExchangeRequest(BaseModel):
+    """隧道参数交换请求"""
+    psk: str = Field(..., description="预共享密钥")
+    node_id: str = Field(..., description="请求方节点标识")
+    tunnel_type: str = Field("wireguard", description="隧道类型 (wireguard/xray)")
+    # WireGuard 参数
+    wg_public_key: Optional[str] = Field(None, description="请求方 WireGuard 公钥")
+    wg_listen_port: Optional[int] = Field(None, ge=1, le=65535, description="请求方监听端口")
+    # Xray 参数
+    xray_protocol: Optional[str] = Field(None, description="Xray 协议 (vless/vmess/trojan)")
+    xray_uuid: Optional[str] = Field(None, description="Xray UUID")
+
+
+class PeerNodeCreateRequest(BaseModel):
+    """创建对等节点"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="节点标识符，如 node-tokyo")
+    name: str = Field(..., description="节点显示名称")
+    description: str = Field("", description="节点描述")
+    endpoint: str = Field(..., description="节点连接地址 (IP:port 或 域名:port)")
+    psk: str = Field(..., min_length=16, description="预共享密钥（用于认证，至少 16 字符）")
+    tunnel_type: str = Field("wireguard", pattern=r"^(wireguard|xray)$", description="隧道类型 (wireguard/xray)")
+    xray_protocol: str = Field("vless", pattern=r"^(vless|vmess|trojan)$", description="Xray 协议 (vless/vmess/trojan)")
+    tls_verify: int = Field(1, ge=0, le=1, description="是否验证 TLS 证书（1=验证，0=跳过）")
+    tls_fingerprint: Optional[str] = Field(None, description="TLS 证书指纹（十六进制格式，用于证书固定）")
+    default_outbound: Optional[str] = Field(None, description="此节点入口的默认出口")
+    auto_reconnect: int = Field(1, ge=0, le=1, description="是否自动重连")
+    enabled: int = Field(1, ge=0, le=1, description="是否启用")
+
+
+class PeerNodeUpdateRequest(BaseModel):
+    """更新对等节点"""
+    name: Optional[str] = Field(None, description="节点显示名称")
+    description: Optional[str] = Field(None, description="节点描述")
+    endpoint: Optional[str] = Field(None, description="节点连接地址")
+    psk: Optional[str] = Field(None, min_length=16, description="预共享密钥（至少 16 字符）")
+    tunnel_type: Optional[str] = Field(None, pattern=r"^(wireguard|xray)$", description="隧道类型")
+    xray_protocol: Optional[str] = Field(None, pattern=r"^(vless|vmess|trojan)$", description="Xray 协议")
+    tls_verify: Optional[int] = Field(None, ge=0, le=1, description="是否验证 TLS 证书")
+    tls_fingerprint: Optional[str] = Field(None, description="TLS 证书指纹")
+    default_outbound: Optional[str] = Field(None, description="默认出口")
+    auto_reconnect: Optional[int] = Field(None, ge=0, le=1, description="自动重连")
+    enabled: Optional[int] = Field(None, ge=0, le=1, description="是否启用")
+
+
+class NodeChainCreateRequest(BaseModel):
+    """创建多跳链路"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="链路标识符")
+    name: str = Field(..., description="链路名称")
+    description: str = Field("", description="链路描述")
+    hops: List[str] = Field(..., min_length=2, description="节点跳转列表（至少 2 跳）")
+    hop_protocols: Optional[Dict[str, str]] = Field(None, description="每跳协议配置")
+    entry_rules: Optional[Dict[str, Any]] = Field(None, description="入口分流规则")
+    relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
+    priority: int = Field(0, description="优先级")
+    enabled: int = Field(1, ge=0, le=1, description="是否启用")
+
+
+class NodeChainUpdateRequest(BaseModel):
+    """更新多跳链路"""
+    name: Optional[str] = Field(None, description="链路名称")
+    description: Optional[str] = Field(None, description="链路描述")
+    hops: Optional[List[str]] = Field(None, min_length=2, description="节点跳转列表")
+    hop_protocols: Optional[Dict[str, str]] = Field(None, description="每跳协议配置")
+    entry_rules: Optional[Dict[str, Any]] = Field(None, description="入口分流规则")
+    relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
+    priority: Optional[int] = Field(None, description="优先级")
+    enabled: Optional[int] = Field(None, ge=0, le=1, description="是否启用")
+
+
 # ============ 加密/解密工具 ============
 
 def _derive_key(password: str, salt: bytes) -> bytes:
@@ -927,6 +1032,9 @@ PUBLIC_PATHS = {
     "/api/auth/setup",
     "/api/auth/login",
     "/api/health",
+    # 节点间 PSK 认证端点（远程节点无需 JWT）
+    "/api/peer-auth/validate",
+    "/api/peer-auth/exchange",
 }
 
 
@@ -970,6 +1078,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+
+        # 允许 CORS 预检请求通过（OPTIONS 请求没有 Authorization header）
+        if request.method == "OPTIONS":
+            return await call_next(request)
 
         # API 速率限制 (H3)
         if path.startswith("/api/"):
@@ -3952,30 +4064,42 @@ def api_update_ingress_peer(peer_name: str, payload: IngressPeerUpdateRequest):
     if payload.name is not None:
         update_kwargs["name"] = payload.name
     if payload.default_outbound is not None:
+        # 验证出口是否存在（空字符串表示清空，允许通过）
+        if payload.default_outbound:
+            available = _get_available_outbounds(db)
+            if payload.default_outbound not in available:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"出口 '{payload.default_outbound}' 不存在"
+                )
         # 空字符串表示清空，设为 None
         update_kwargs["default_outbound"] = payload.default_outbound if payload.default_outbound else None
 
     if not update_kwargs:
-        return {"message": "无需更新", "peer": peer}
+        return {"message": "无需更新", "peer": peer, "reload_success": True}
 
     # 更新数据库
     db.update_wireguard_peer(peer["id"], **update_kwargs)
 
     # 如果更改了默认出口，需要重新生成配置
-    reload_status = ""
+    reload_success = True
+    reload_message = ""
     if "default_outbound" in update_kwargs:
         try:
             _regenerate_and_reload()
-            reload_status = "，配置已重载"
+            reload_message = "，配置已重载"
         except Exception as exc:
-            reload_status = f"，重载失败: {exc}"
+            reload_success = False
+            reload_message = f"，重载失败: {exc}"
+            logging.error(f"更新客户端 '{peer_name}' 后重载失败: {exc}")
 
     # 获取更新后的 peer
     updated_peer = db.get_wireguard_peer_by_name(payload.name if payload.name else peer_name)
 
     return {
-        "message": f"客户端 '{peer_name}' 已更新{reload_status}",
+        "message": f"客户端 '{peer_name}' 已更新{reload_message}",
         "peer": updated_peer,
+        "reload_success": reload_success,
     }
 
 
@@ -9441,6 +9565,1038 @@ def api_update_db_rule(
 # Domain data served from JSON catalog via /api/domain-catalog
 
 
+# ============ Peer Node API Endpoints ============
+
+# PSK 认证速率限制（更严格）
+_PSK_AUTH_RATE_LIMIT = 5  # 每分钟最多 5 次认证尝试
+_PSK_AUTH_CLEANUP_THRESHOLD = 10000  # 超过此数量时清理不活跃 IP
+_psk_auth_rate_limit_data: Dict[str, List[float]] = {}
+_psk_auth_rate_limit_lock = threading.Lock()
+
+
+def _check_psk_rate_limit(client_ip: str) -> bool:
+    """检查 PSK 认证速率限制
+
+    包含内存泄漏防护：当 IP 数量超过阈值时，清理 1 小时内无活动的 IP
+    """
+    with _psk_auth_rate_limit_lock:
+        now = time.time()
+        cutoff = now - 60  # 1 分钟窗口
+
+        if client_ip not in _psk_auth_rate_limit_data:
+            _psk_auth_rate_limit_data[client_ip] = []
+
+        # 清理过期记录
+        _psk_auth_rate_limit_data[client_ip] = [
+            ts for ts in _psk_auth_rate_limit_data[client_ip] if ts > cutoff
+        ]
+
+        # 内存泄漏防护：清理不活跃的 IP
+        if len(_psk_auth_rate_limit_data) > _PSK_AUTH_CLEANUP_THRESHOLD:
+            stale_cutoff = now - 3600  # 1 小时
+            stale_ips = [
+                ip for ip, times in _psk_auth_rate_limit_data.items()
+                if not times or max(times) < stale_cutoff
+            ]
+            for ip in stale_ips:
+                del _psk_auth_rate_limit_data[ip]
+            if stale_ips:
+                logging.debug(f"[psk-ratelimit] 清理了 {len(stale_ips)} 个不活跃 IP")
+
+        # 检查是否超限
+        if len(_psk_auth_rate_limit_data[client_ip]) >= _PSK_AUTH_RATE_LIMIT:
+            return False
+
+        # 记录本次请求
+        _psk_auth_rate_limit_data[client_ip].append(now)
+        return True
+
+
+def _verify_psk(psk: str, psk_hash: str) -> bool:
+    """验证 PSK 与存储的哈希是否匹配"""
+    try:
+        return bcrypt.checkpw(psk.encode(), psk_hash.encode())
+    except Exception:
+        return False
+
+
+def _encrypt_psk(psk: str) -> str:
+    """使用部署密钥加密 PSK
+
+    Args:
+        psk: 明文 PSK
+
+    Returns:
+        加密后的 PSK（格式: salt:encrypted_data）
+    """
+    if not HAS_KEY_MANAGER:
+        logging.warning("[psk] KeyManager 不可用，PSK 将以明文存储")
+        return psk
+    try:
+        return KeyManager.encrypt_with_deploy_key(psk)
+    except Exception as e:
+        logging.error(f"[psk] 加密失败: {e}，将以明文存储")
+        return psk
+
+
+def _decrypt_psk(encrypted_psk: str) -> str:
+    """解密 PSK
+
+    Args:
+        encrypted_psk: 加密的 PSK 或明文 PSK（兼容旧数据）
+
+    Returns:
+        解密后的明文 PSK
+    """
+    if not encrypted_psk:
+        return ""
+
+    if not HAS_KEY_MANAGER:
+        # KeyManager 不可用，假设是明文
+        return encrypted_psk
+
+    # 检查是否为加密格式
+    if not KeyManager.is_encrypted_format(encrypted_psk):
+        # 旧的明文格式，直接返回
+        logging.debug("[psk] 检测到明文 PSK（旧格式）")
+        return encrypted_psk
+
+    try:
+        return KeyManager.decrypt_with_deploy_key(encrypted_psk)
+    except Exception as e:
+        logging.error(f"[psk] 解密失败: {e}")
+        # 解密失败，可能是数据损坏，返回空字符串
+        raise ValueError(f"PSK 解密失败: {e}")
+
+
+@app.post("/api/peer-auth/validate")
+def api_peer_auth_validate(request: Request, payload: PeerAuthValidateRequest):
+    """验证 PSK 认证
+
+    远程节点使用此端点验证 PSK，无需 JWT 认证。
+    返回认证结果，用于节点间建立信任。
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 查找节点：优先通过源 IP 查找（支持不同 tag），否则按 node_id 查找
+    node = _find_peer_node_by_ip(db, client_ip)
+    if node:
+        logging.info(f"[peer-auth] 通过源 IP {client_ip} 找到节点 '{node['tag']}'")
+    else:
+        node = db.get_peer_node(payload.node_id)
+
+    if not node:
+        # [CR-007] 不透露节点是否存在，不在日志中记录 node_id（防止枚举）
+        logging.warning(f"[peer-auth] 认证失败 (from {client_ip})")
+        return {"valid": False, "message": "Authentication failed"}
+
+    # 验证 PSK
+    if not node.get("psk_hash"):
+        # [CR-007] 仅在内部日志记录，不透露节点信息
+        logging.warning(f"[peer-auth] 认证失败: 节点未配置 PSK (from {client_ip})")
+        return {"valid": False, "message": "Authentication failed"}
+
+    if not _verify_psk(payload.psk, node["psk_hash"]):
+        # [CR-007] 不透露具体节点信息（防止枚举）
+        logging.warning(f"[peer-auth] PSK 验证失败 (from {client_ip})")
+        return {"valid": False, "message": "Authentication failed"}
+
+    logging.info(f"[peer-auth] PSK 验证成功: 节点 '{payload.node_id}' (from {client_ip})")
+    return {
+        "valid": True,
+        "message": "Authentication successful",
+        "node_name": node.get("name"),
+    }
+
+
+def _find_peer_node_by_ip(db, client_ip: str):
+    """通过源 IP 查找对等节点
+
+    遍历所有节点，检查 endpoint 是否包含该 IP。
+    支持不同 tag 的互联场景。
+    """
+    all_nodes = db.get_peer_nodes()
+    for node in all_nodes:
+        endpoint = node.get("endpoint", "")
+        # endpoint 格式: "ip:port" 或 "hostname:port"
+        if ":" in endpoint:
+            endpoint_host = endpoint.rsplit(":", 1)[0]
+        else:
+            endpoint_host = endpoint
+        if endpoint_host == client_ip:
+            return node
+    return None
+
+
+@app.post("/api/peer-auth/exchange")
+def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
+    """交换隧道参数
+
+    在 PSK 验证成功后，交换 WireGuard 或 Xray 隧道参数。
+    返回本节点的隧道配置供对方连接。
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 查找节点：优先通过源 IP 查找（支持不同 tag），否则按 node_id 查找
+    node = _find_peer_node_by_ip(db, client_ip)
+    if node:
+        logging.info(f"[peer-auth] 通过源 IP {client_ip} 找到节点 '{node['tag']}'")
+    else:
+        node = db.get_peer_node(payload.node_id)
+
+    if not node:
+        # [CR-007] 不透露节点是否存在（防止枚举）
+        logging.warning(f"[peer-auth] 参数交换失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    # 验证 PSK
+    if not node.get("psk_hash") or not _verify_psk(payload.psk, node["psk_hash"]):
+        # [CR-007] 不透露具体节点信息（防止枚举）
+        logging.warning(f"[peer-auth] 参数交换 PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(f"[peer-auth] 开始参数交换: 节点 '{payload.node_id}', 类型={payload.tunnel_type} (from {client_ip})")
+
+    response = {
+        "success": True,
+        "node_id": payload.node_id,
+        "tunnel_type": payload.tunnel_type,
+    }
+
+    if payload.tunnel_type == "wireguard":
+        # 生成或获取 WireGuard 密钥对
+        if not node.get("wg_private_key"):
+            # 生成新密钥对
+            result = subprocess.run(
+                ["wg", "genkey"],
+                capture_output=True, text=True, check=True
+            )
+            private_key = result.stdout.strip()
+            result = subprocess.run(
+                ["wg", "pubkey"],
+                input=private_key,
+                capture_output=True, text=True, check=True
+            )
+            public_key = result.stdout.strip()
+
+            # 分配隧道 IP 和端口（带重试机制防止竞态条件）
+            # 使用数据库 UNIQUE 约束 + 重试确保 IP 和端口唯一性
+            local_ip = None
+            tunnel_port = None
+            max_retries = 10
+            for retry in range(max_retries):
+                # 每次重试重新获取可用资源
+                tunnel_port = db.get_next_peer_tunnel_port()
+                existing_nodes = db.get_peer_nodes()
+                used_ips = {n.get("tunnel_local_ip") for n in existing_nodes if n.get("tunnel_local_ip")}
+
+                # 从 10.200.200.0/24 子网分配 IP
+                local_ip = None
+                for i in range(1, 254):
+                    candidate = f"10.200.200.{i}"
+                    if candidate not in used_ips:
+                        local_ip = candidate
+                        break
+
+                if not local_ip:
+                    raise HTTPException(status_code=500, detail="No available tunnel IP")
+
+                try:
+                    # 尝试更新节点配置（数据库有 UNIQUE 约束）
+                    # 使用找到的节点的 tag（不是 payload.node_id，因为两边可能用不同的 tag）
+                    db.update_peer_node(
+                        node["tag"],
+                        wg_private_key=private_key,
+                        wg_public_key=public_key,
+                        tunnel_port=tunnel_port,
+                        tunnel_local_ip=local_ip,
+                    )
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    # 检查是否是 UNIQUE 约束冲突（IP 或端口）
+                    if "UNIQUE constraint failed" in str(e) or "unique constraint" in str(e).lower():
+                        logging.warning(f"[peer-auth] IP/Port 冲突 ({local_ip}:{tunnel_port})，重试 {retry + 1}/{max_retries}")
+                        continue
+                    raise  # 其他错误直接抛出
+            else:
+                # 重试次数耗尽
+                raise HTTPException(status_code=500, detail="Failed to allocate unique tunnel resources after retries")
+            node["wg_public_key"] = public_key
+            node["tunnel_port"] = tunnel_port
+            node["tunnel_local_ip"] = local_ip
+
+        # 保存对方的公钥和端口
+        remote_ip = None
+        if payload.wg_public_key:
+            # 计算对方的隧道 IP（本方 IP + 1，或取下一个可用）
+            local_ip = node.get("tunnel_local_ip", "10.200.200.1")
+            local_num = int(local_ip.split(".")[-1])
+            remote_ip = f"10.200.200.{(local_num % 252) + 2}"
+
+            db.update_peer_node(
+                node["tag"],
+                wg_peer_public_key=payload.wg_public_key,
+                tunnel_remote_ip=remote_ip,
+            )
+
+        response.update({
+            "wg_public_key": node.get("wg_public_key"),
+            "wg_listen_port": node.get("tunnel_port"),
+            "tunnel_local_ip": node.get("tunnel_local_ip"),
+            "tunnel_remote_ip": remote_ip,  # 使用刚计算的值而非 stale 的 node dict
+        })
+
+    elif payload.tunnel_type == "xray":
+        # 生成或获取 Xray 配置
+        if not node.get("xray_uuid"):
+            import uuid as uuid_module
+            xray_uuid = str(uuid_module.uuid4())
+
+            # 分配 SOCKS 端口（带重试机制防止竞态条件）
+            xray_socks_port = None
+            max_retries = 10
+            for retry in range(max_retries):
+                xray_socks_port = db.get_next_peer_xray_socks_port()
+                try:
+                    # 使用找到的节点的 tag（不是 payload.node_id，因为两边可能用不同的 tag）
+                    db.update_peer_node(
+                        node["tag"],
+                        xray_uuid=xray_uuid,
+                        xray_socks_port=xray_socks_port,
+                        xray_protocol=payload.xray_protocol or "vless",
+                    )
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    if "UNIQUE constraint failed" in str(e) or "unique constraint" in str(e).lower():
+                        logging.warning(f"[peer-auth] SOCKS 端口 {xray_socks_port} 冲突，重试 {retry + 1}/{max_retries}")
+                        continue
+                    raise
+            else:
+                raise HTTPException(status_code=500, detail="Failed to allocate unique SOCKS port after retries")
+
+            node["xray_uuid"] = xray_uuid
+            node["xray_socks_port"] = xray_socks_port
+
+        response.update({
+            "xray_protocol": node.get("xray_protocol", "vless"),
+            "xray_uuid": node.get("xray_uuid"),
+            "xray_socks_port": node.get("xray_socks_port"),
+        })
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported tunnel type: {payload.tunnel_type}")
+
+    logging.info(f"[peer-auth] 参数交换成功: 本地节点 '{node['tag']}' (远程称为 '{payload.node_id}')")
+    return response
+
+
+# ============ Endpoint Validation Helper ============
+
+def _validate_endpoint(endpoint: str) -> tuple:
+    """[安全] 完整验证 endpoint 格式 (host:port)
+
+    Args:
+        endpoint: 要验证的端点字符串
+
+    Returns:
+        (is_valid, error_message, host, port) - 验证结果、错误信息、主机名、端口号
+    """
+    if not endpoint:
+        return False, "endpoint 不能为空", None, None
+
+    if ":" not in endpoint:
+        return False, "endpoint 格式应为 host:port", None, None
+
+    # 分离主机名和端口
+    try:
+        host, port_str = endpoint.rsplit(":", 1)
+    except ValueError:
+        return False, "endpoint 格式无效", None, None
+
+    # 验证主机名不为空
+    if not host:
+        return False, "主机名不能为空", None, None
+
+    # [CR-003] 验证主机名格式
+    if not validate_hostname(host):
+        return False, f"主机名 '{host}' 格式无效（应为有效域名或 IP 地址）", None, None
+
+    # [CR-004] 验证端口
+    try:
+        port = int(port_str)
+    except ValueError:
+        return False, f"端口 '{port_str}' 不是有效数字", None, None
+
+    if not (1 <= port <= 65535):
+        return False, f"端口 {port} 超出有效范围 (1-65535)", None, None
+
+    return True, "", host, port
+
+
+# ============ Peer Node CRUD API ============
+
+@app.get("/api/peers")
+def api_list_peers(enabled_only: bool = False):
+    """列出所有对等节点"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    nodes = db.get_peer_nodes(enabled_only=enabled_only)
+
+    # 隐藏敏感字段
+    for node in nodes:
+        node.pop("psk_hash", None)
+        node.pop("psk_encrypted", None)
+        node.pop("wg_private_key", None)
+
+    return {"nodes": nodes, "count": len(nodes)}
+
+
+@app.get("/api/peers/{tag}")
+def api_get_peer(tag: str):
+    """获取单个对等节点详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 隐藏敏感字段
+    node.pop("psk_hash", None)
+    node.pop("psk_encrypted", None)
+    node.pop("wg_private_key", None)
+
+    return node
+
+
+@app.post("/api/peers")
+def api_create_peer(payload: PeerNodeCreateRequest):
+    """创建新的对等节点"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 检查 tag 是否已存在
+    if db.get_peer_node(payload.tag):
+        raise HTTPException(status_code=400, detail=f"节点标识 '{payload.tag}' 已存在")
+
+    # [CR-003/CR-004] 完整验证 endpoint 格式 (host:port)
+    is_valid, error_msg, _, _ = _validate_endpoint(payload.endpoint)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    # 验证隧道类型
+    if payload.tunnel_type not in ("wireguard", "xray"):
+        raise HTTPException(status_code=400, detail="tunnel_type 必须是 wireguard 或 xray")
+
+    # 验证 Xray 协议
+    if payload.xray_protocol not in ("vless", "vmess", "trojan"):
+        raise HTTPException(status_code=400, detail="xray_protocol 必须是 vless, vmess 或 trojan")
+
+    # 验证默认出口存在
+    if payload.default_outbound:
+        available = _get_available_outbounds(db)
+        if payload.default_outbound not in available:
+            raise HTTPException(status_code=400, detail=f"出口 '{payload.default_outbound}' 不存在")
+
+    # 使用 bcrypt 哈希 PSK，同时保存原始 PSK 用于发起连接
+    psk_hash = bcrypt.hashpw(payload.psk.encode(), bcrypt.gensalt()).decode()
+
+    try:
+        node_id = db.add_peer_node(
+            tag=payload.tag,
+            name=payload.name,
+            description=payload.description,
+            endpoint=payload.endpoint,
+            psk_hash=psk_hash,
+            psk_encrypted=_encrypt_psk(payload.psk),  # 加密后存储
+            tunnel_type=payload.tunnel_type,
+            xray_protocol=payload.xray_protocol,
+            tls_verify=bool(payload.tls_verify),
+            tls_fingerprint=payload.tls_fingerprint,
+            default_outbound=payload.default_outbound,
+            auto_reconnect=payload.auto_reconnect,
+            enabled=payload.enabled,
+        )
+    except Exception as e:
+        logging.error(f"创建节点失败: {e}")
+        raise HTTPException(status_code=500, detail=f"创建节点失败: {e}")
+
+    logging.info(f"[peers] 创建节点 '{payload.tag}' (id={node_id})")
+    return {
+        "message": f"节点 '{payload.tag}' 创建成功",
+        "id": node_id,
+        "tag": payload.tag,
+    }
+
+
+@app.put("/api/peers/{tag}")
+def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
+    """更新对等节点配置"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 检查节点是否存在
+    node = db.get_peer_node(tag)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 构建更新参数
+    update_kwargs = {}
+
+    if payload.name is not None:
+        update_kwargs["name"] = payload.name
+    if payload.description is not None:
+        update_kwargs["description"] = payload.description
+    if payload.endpoint is not None:
+        # [CR-003/CR-004] 完整验证 endpoint 格式
+        is_valid, error_msg, _, _ = _validate_endpoint(payload.endpoint)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
+        update_kwargs["endpoint"] = payload.endpoint
+    if payload.psk is not None:
+        # 重新哈希 PSK 并加密存储
+        update_kwargs["psk_hash"] = bcrypt.hashpw(payload.psk.encode(), bcrypt.gensalt()).decode()
+        update_kwargs["psk_encrypted"] = _encrypt_psk(payload.psk)
+    if payload.tunnel_type is not None:
+        if payload.tunnel_type not in ("wireguard", "xray"):
+            raise HTTPException(status_code=400, detail="tunnel_type 必须是 wireguard 或 xray")
+        update_kwargs["tunnel_type"] = payload.tunnel_type
+    if payload.xray_protocol is not None:
+        if payload.xray_protocol not in ("vless", "vmess", "trojan"):
+            raise HTTPException(status_code=400, detail="xray_protocol 必须是 vless, vmess 或 trojan")
+        update_kwargs["xray_protocol"] = payload.xray_protocol
+    if payload.default_outbound is not None:
+        if payload.default_outbound:
+            available = _get_available_outbounds(db)
+            if payload.default_outbound not in available:
+                raise HTTPException(status_code=400, detail=f"出口 '{payload.default_outbound}' 不存在")
+        update_kwargs["default_outbound"] = payload.default_outbound or None
+    if payload.auto_reconnect is not None:
+        update_kwargs["auto_reconnect"] = payload.auto_reconnect
+    if payload.enabled is not None:
+        update_kwargs["enabled"] = payload.enabled
+    if payload.tls_verify is not None:
+        update_kwargs["tls_verify"] = payload.tls_verify
+    if payload.tls_fingerprint is not None:
+        update_kwargs["tls_fingerprint"] = payload.tls_fingerprint
+
+    if not update_kwargs:
+        return {"message": "没有需要更新的字段", "peer": node}
+
+    success = db.update_peer_node(tag, **update_kwargs)
+    if not success:
+        raise HTTPException(status_code=500, detail="更新节点失败")
+
+    updated_node = db.get_peer_node(tag)
+    updated_node.pop("psk_hash", None)
+    updated_node.pop("wg_private_key", None)
+
+    logging.info(f"[peers] 更新节点 '{tag}'")
+    return {"message": f"节点 '{tag}' 已更新", "peer": updated_node}
+
+
+@app.delete("/api/peers/{tag}")
+def api_delete_peer(tag: str):
+    """删除对等节点"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 检查节点是否存在
+    node = db.get_peer_node(tag)
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 检查是否有链路使用此节点
+    chains = db.get_node_chains()
+    for chain in chains:
+        hops = json.loads(chain.get("hops", "[]")) if isinstance(chain.get("hops"), str) else chain.get("hops", [])
+        if tag in hops:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无法删除: 节点 '{tag}' 被链路 '{chain['tag']}' 使用"
+            )
+
+    success = db.delete_peer_node(tag)
+    if not success:
+        raise HTTPException(status_code=500, detail="删除节点失败")
+
+    logging.info(f"[peers] 删除节点 '{tag}'")
+    return {"message": f"节点 '{tag}' 已删除"}
+
+
+@app.get("/api/peers/{tag}/status")
+def api_get_peer_status(tag: str):
+    """获取对等节点隧道状态"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    status = {
+        "tag": tag,
+        "name": node.get("name"),
+        "tunnel_type": node.get("tunnel_type"),
+        "tunnel_status": node.get("tunnel_status", "disconnected"),
+        "tunnel_interface": node.get("tunnel_interface"),
+        "tunnel_local_ip": node.get("tunnel_local_ip"),
+        "tunnel_remote_ip": node.get("tunnel_remote_ip"),
+        "last_seen": node.get("last_seen"),
+        "last_error": node.get("last_error"),
+        "enabled": bool(node.get("enabled", 1)),
+    }
+
+    # 如果是 WireGuard 隧道，尝试获取接口状态
+    if node.get("tunnel_type") == "wireguard" and node.get("tunnel_interface"):
+        try:
+            result = subprocess.run(
+                ["wg", "show", node["tunnel_interface"]],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                status["wg_status"] = "up"
+                # 解析最后握手时间
+                for line in result.stdout.split("\n"):
+                    if "latest handshake" in line.lower():
+                        status["last_handshake"] = line.split(":", 1)[1].strip()
+            else:
+                status["wg_status"] = "down"
+        except subprocess.TimeoutExpired:
+            status["wg_status"] = "timeout"
+        except Exception as e:
+            status["wg_status"] = f"error: {e}"
+
+    return status
+
+
+def _do_peer_exchange(db, node: dict) -> dict:
+    """与远程节点执行参数交换
+
+    自动调用远程节点的 /api/peer-auth/exchange 端点交换隧道参数。
+    返回更新后的节点信息。
+    """
+    import requests
+
+    tag = node["tag"]
+    endpoint = node.get("endpoint", "")
+    psk_encrypted = node.get("psk_encrypted")
+    tunnel_type = node.get("tunnel_type", "wireguard")
+
+    if not psk_encrypted:
+        raise HTTPException(status_code=400, detail="节点缺少 PSK，无法进行参数交换")
+
+    # 解密 PSK
+    try:
+        psk = _decrypt_psk(psk_encrypted)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"PSK 解密失败: {e}")
+
+    # 从 endpoint 提取主机和端口
+    # endpoint 格式: "host:wg_port" 如 "10.1.1.10:36100"
+    if ":" in endpoint:
+        host, wg_port_str = endpoint.rsplit(":", 1)
+        try:
+            wg_port = int(wg_port_str)
+            # 推导 API 端口：WireGuard 端口 - 100 (36100 → 36000, 37100 → 37000)
+            api_port = wg_port - 100
+        except ValueError:
+            api_port = 36000
+    else:
+        host = endpoint
+        api_port = 36000
+
+    # 构建远程 API URL
+    remote_api_url = f"http://{host}:{api_port}/api/peer-auth/exchange"
+
+    # 生成本地 WireGuard 密钥对（如果需要）
+    local_public_key = node.get("wg_public_key")
+    local_private_key = node.get("wg_private_key")
+
+    if tunnel_type == "wireguard" and not local_private_key:
+        result = subprocess.run(["wg", "genkey"], capture_output=True, text=True, check=True)
+        local_private_key = result.stdout.strip()
+        result = subprocess.run(["wg", "pubkey"], input=local_private_key, capture_output=True, text=True, check=True)
+        local_public_key = result.stdout.strip()
+
+        # 保存本地密钥
+        db.update_peer_node(tag, wg_private_key=local_private_key, wg_public_key=local_public_key)
+
+    # 准备交换请求
+    exchange_payload = {
+        "psk": psk,
+        "node_id": tag,
+        "tunnel_type": tunnel_type,
+    }
+
+    if tunnel_type == "wireguard":
+        exchange_payload["wg_public_key"] = local_public_key
+    elif tunnel_type == "xray":
+        exchange_payload["xray_protocol"] = node.get("xray_protocol", "vless")
+
+    logging.info(f"[peers] 正在与远程节点进行参数交换: {remote_api_url}")
+
+    try:
+        resp = requests.post(remote_api_url, json=exchange_payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=502, detail=f"无法连接到远程节点 {host}:36000")
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail=f"连接远程节点 {host} 超时")
+    except requests.exceptions.HTTPError as e:
+        error_detail = "参数交换失败"
+        try:
+            error_detail = e.response.json().get("detail", error_detail)
+        except Exception:
+            pass
+        # 不要传递远程 401，否则会触发前端的认证失败处理
+        # 使用 502 (Bad Gateway) 表示远程服务器拒绝请求
+        status = e.response.status_code
+        if status == 401:
+            status = 502
+        raise HTTPException(status_code=status, detail=f"远程节点拒绝: {error_detail}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"参数交换失败: {str(e)}")
+
+    if not data.get("success"):
+        raise HTTPException(status_code=400, detail=data.get("message", "参数交换失败"))
+
+    # 保存远程节点返回的参数
+    update_data = {}
+
+    if tunnel_type == "wireguard":
+        remote_public_key = data.get("wg_public_key")
+        remote_tunnel_ip = data.get("tunnel_local_ip")  # 远程的 local_ip 是我们的 remote_ip
+        local_tunnel_ip = data.get("tunnel_remote_ip")  # 远程分配给我们的 IP
+
+        if remote_public_key:
+            update_data["wg_peer_public_key"] = remote_public_key
+        if remote_tunnel_ip:
+            update_data["tunnel_remote_ip"] = remote_tunnel_ip
+        if local_tunnel_ip:
+            update_data["tunnel_local_ip"] = local_tunnel_ip
+
+        # 为本地分配一个唯一的隧道端口（如果还没有）
+        if not node.get("tunnel_port"):
+            update_data["tunnel_port"] = db.get_next_peer_tunnel_port()
+
+    elif tunnel_type == "xray":
+        remote_uuid = data.get("xray_uuid")
+        remote_socks_port = data.get("xray_socks_port")
+
+        if remote_uuid:
+            update_data["xray_uuid"] = remote_uuid
+        if remote_socks_port:
+            update_data["xray_socks_port"] = remote_socks_port
+
+    if update_data:
+        db.update_peer_node(tag, **update_data)
+
+    logging.info(f"[peers] 与节点 '{tag}' 参数交换成功")
+    return db.get_peer_node(tag)
+
+
+@app.post("/api/peers/{tag}/connect")
+def api_peer_connect(tag: str):
+    """连接到对等节点
+
+    建立与指定节点的隧道连接（WireGuard 或 Xray）。
+    如果尚未完成参数交换，会自动与远程节点交换参数。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    if not node.get("enabled"):
+        raise HTTPException(status_code=400, detail=f"节点 '{tag}' 未启用")
+
+    # 检查是否需要参数交换
+    tunnel_type = node.get("tunnel_type", "wireguard")
+    needs_exchange = False
+
+    if tunnel_type == "wireguard":
+        if not node.get("wg_private_key") or not node.get("wg_peer_public_key"):
+            needs_exchange = True
+    elif tunnel_type == "xray":
+        if not node.get("xray_uuid"):
+            needs_exchange = True
+
+    # 自动执行参数交换
+    if needs_exchange:
+        logging.info(f"[peers] 节点 '{tag}' 需要参数交换，自动执行...")
+        node = _do_peer_exchange(db, node)
+
+    # 调用隧道管理器连接
+    try:
+        # 导入并使用 peer_tunnel_manager
+        from peer_tunnel_manager import PeerTunnelManager
+        manager = PeerTunnelManager()
+        success = manager.connect_node(tag)
+
+        if success:
+            # 重新获取更新后的节点信息
+            node = db.get_peer_node(tag)
+            return {
+                "success": True,
+                "message": f"隧道连接成功",
+                "tag": tag,
+                "tunnel_status": node.get("tunnel_status"),
+                "tunnel_interface": node.get("tunnel_interface"),
+            }
+        else:
+            node = db.get_peer_node(tag)
+            raise HTTPException(
+                status_code=500,
+                detail=node.get("last_error", "隧道连接失败")
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[peers] 连接节点 '{tag}' 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"连接失败: {str(e)}")
+
+
+@app.post("/api/peers/{tag}/disconnect")
+def api_peer_disconnect(tag: str):
+    """断开对等节点隧道
+
+    断开与指定节点的隧道连接。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 调用隧道管理器断开
+    try:
+        from peer_tunnel_manager import PeerTunnelManager
+        manager = PeerTunnelManager()
+        success = manager.disconnect_node(tag)
+
+        if success:
+            return {
+                "success": True,
+                "message": f"隧道已断开",
+                "tag": tag,
+                "tunnel_status": "disconnected",
+            }
+        else:
+            raise HTTPException(status_code=500, detail="断开隧道失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[peers] 断开节点 '{tag}' 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"断开失败: {str(e)}")
+
+
+# ============ Node Chain CRUD API ============
+
+@app.get("/api/chains")
+def api_list_chains(enabled_only: bool = False):
+    """列出所有多跳链路"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    chains = db.get_node_chains(enabled_only=enabled_only)
+
+    # 解析 JSON 字段
+    for chain in chains:
+        if isinstance(chain.get("hops"), str):
+            chain["hops"] = json.loads(chain["hops"])
+        if isinstance(chain.get("hop_protocols"), str) and chain.get("hop_protocols"):
+            chain["hop_protocols"] = json.loads(chain["hop_protocols"])
+        if isinstance(chain.get("entry_rules"), str) and chain.get("entry_rules"):
+            chain["entry_rules"] = json.loads(chain["entry_rules"])
+        if isinstance(chain.get("relay_rules"), str) and chain.get("relay_rules"):
+            chain["relay_rules"] = json.loads(chain["relay_rules"])
+
+    return {"chains": chains, "count": len(chains)}
+
+
+@app.get("/api/chains/{tag}")
+def api_get_chain(tag: str):
+    """获取单个链路详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    chain = db.get_node_chain(tag)
+
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    # 解析 JSON 字段
+    if isinstance(chain.get("hops"), str):
+        chain["hops"] = json.loads(chain["hops"])
+    if isinstance(chain.get("hop_protocols"), str) and chain.get("hop_protocols"):
+        chain["hop_protocols"] = json.loads(chain["hop_protocols"])
+    if isinstance(chain.get("entry_rules"), str) and chain.get("entry_rules"):
+        chain["entry_rules"] = json.loads(chain["entry_rules"])
+    if isinstance(chain.get("relay_rules"), str) and chain.get("relay_rules"):
+        chain["relay_rules"] = json.loads(chain["relay_rules"])
+
+    return chain
+
+
+@app.post("/api/chains")
+def api_create_chain(payload: NodeChainCreateRequest):
+    """创建新的多跳链路"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 检查 tag 是否已存在
+    if db.get_node_chain(payload.tag):
+        raise HTTPException(status_code=400, detail=f"链路标识 '{payload.tag}' 已存在")
+
+    # 验证所有跳转节点存在
+    valid, error = db.validate_chain_hops(payload.hops)
+    if not valid:
+        raise HTTPException(status_code=400, detail=error)
+
+    try:
+        chain_id = db.add_node_chain(
+            tag=payload.tag,
+            name=payload.name,
+            description=payload.description,
+            hops=payload.hops,
+            hop_protocols=payload.hop_protocols,
+            entry_rules=payload.entry_rules,
+            relay_rules=payload.relay_rules,
+            priority=payload.priority,
+            enabled=payload.enabled,
+        )
+    except Exception as e:
+        logging.error(f"创建链路失败: {e}")
+        raise HTTPException(status_code=500, detail=f"创建链路失败: {e}")
+
+    logging.info(f"[chains] 创建链路 '{payload.tag}' (id={chain_id})")
+    return {
+        "message": f"链路 '{payload.tag}' 创建成功",
+        "id": chain_id,
+        "tag": payload.tag,
+    }
+
+
+@app.put("/api/chains/{tag}")
+def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
+    """更新链路配置"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 检查链路是否存在
+    chain = db.get_node_chain(tag)
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    # 构建更新参数
+    update_kwargs = {}
+
+    if payload.name is not None:
+        update_kwargs["name"] = payload.name
+    if payload.description is not None:
+        update_kwargs["description"] = payload.description
+    if payload.hops is not None:
+        # 验证所有跳转节点存在
+        valid, error = db.validate_chain_hops(payload.hops)
+        if not valid:
+            raise HTTPException(status_code=400, detail=error)
+        update_kwargs["hops"] = json.dumps(payload.hops)
+    if payload.hop_protocols is not None:
+        update_kwargs["hop_protocols"] = json.dumps(payload.hop_protocols) if payload.hop_protocols else None
+    if payload.entry_rules is not None:
+        update_kwargs["entry_rules"] = json.dumps(payload.entry_rules) if payload.entry_rules else None
+    if payload.relay_rules is not None:
+        update_kwargs["relay_rules"] = json.dumps(payload.relay_rules) if payload.relay_rules else None
+    if payload.priority is not None:
+        update_kwargs["priority"] = payload.priority
+    if payload.enabled is not None:
+        update_kwargs["enabled"] = payload.enabled
+
+    if not update_kwargs:
+        return {"message": "没有需要更新的字段", "chain": chain}
+
+    success = db.update_node_chain(tag, **update_kwargs)
+    if not success:
+        raise HTTPException(status_code=500, detail="更新链路失败")
+
+    updated_chain = db.get_node_chain(tag)
+
+    logging.info(f"[chains] 更新链路 '{tag}'")
+    return {"message": f"链路 '{tag}' 已更新", "chain": updated_chain}
+
+
+@app.delete("/api/chains/{tag}")
+def api_delete_chain(tag: str):
+    """删除链路"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 检查链路是否存在
+    chain = db.get_node_chain(tag)
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    success = db.delete_node_chain(tag)
+    if not success:
+        raise HTTPException(status_code=500, detail="删除链路失败")
+
+    logging.info(f"[chains] 删除链路 '{tag}'")
+    return {"message": f"链路 '{tag}' 已删除"}
+
+
 @app.post("/api/config/regenerate")
 def api_regenerate_config():
     """重新生成 sing-box 配置（包含数据库规则）"""
@@ -9477,6 +10633,680 @@ def api_regenerate_config():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成配置失败: {str(e)}")
+
+
+# ============ Remote API Proxy ============
+
+# 隧道子网（用于验证 tunnel_remote_ip）
+PEER_TUNNEL_SUBNET = ipaddress.ip_network("10.200.200.0/24")
+
+# 允许的 API 路径字符（防止 SSRF 路径注入）
+ALLOWED_PATH_PATTERN = re.compile(r'^[a-zA-Z0-9_\-/\.]+$')
+
+
+def _validate_api_path(path: str) -> bool:
+    """验证 API 路径是否安全
+
+    防止路径遍历和 URL 注入攻击。
+    """
+    # 禁止路径遍历
+    if ".." in path:
+        return False
+    # 禁止 URL 编码的遍历
+    if "%2e" in path.lower() or "%2f" in path.lower():
+        return False
+    # 禁止特殊 URL 字符
+    if any(c in path for c in ['#', '?', '\x00', '\n', '\r']):
+        return False
+    # 只允许安全字符
+    if not ALLOWED_PATH_PATTERN.match(path):
+        return False
+    return True
+
+
+def _validate_tunnel_ip(ip_str: str) -> bool:
+    """验证隧道 IP 是否在允许的子网内"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip in PEER_TUNNEL_SUBNET
+    except ValueError:
+        return False
+
+
+@app.api_route("/api/remote/{peer_tag}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def api_remote_proxy(
+    peer_tag: str,
+    path: str,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """代理 API 请求到远程节点
+
+    通过已建立的隧道（WireGuard 或 Xray SOCKS）转发 API 请求到远程节点。
+
+    Args:
+        peer_tag: 目标节点的标识符
+        path: 要代理的 API 路径（不含 /api/ 前缀）
+
+    示例:
+        GET /api/remote/node-tokyo/status → GET http://10.200.200.2:8000/api/status
+        PUT /api/remote/node-tokyo/rules → PUT http://10.200.200.2:8000/api/rules
+    """
+    # [安全] 验证路径参数，防止 SSRF 路径注入
+    if not _validate_api_path(path):
+        raise HTTPException(status_code=400, detail="Invalid API path")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(peer_tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{peer_tag}' 不存在")
+
+    # 检查隧道状态
+    tunnel_status = node.get("tunnel_status", "disconnected")
+    if tunnel_status != "connected":
+        raise HTTPException(
+            status_code=503,
+            detail=f"节点 '{peer_tag}' 隧道未连接 (状态: {tunnel_status})"
+        )
+
+    tunnel_type = node.get("tunnel_type", "wireguard")
+    tunnel_remote_ip = node.get("tunnel_remote_ip")
+    xray_socks_port = node.get("xray_socks_port")
+
+    # [安全] 验证隧道 IP 在允许的子网内
+    if not tunnel_remote_ip or not _validate_tunnel_ip(tunnel_remote_ip):
+        raise HTTPException(status_code=500, detail="Invalid tunnel IP configuration")
+
+    # 构建目标 URL
+    target_port = 8000  # 远程节点 API 端口
+    target_url = f"http://{tunnel_remote_ip}:{target_port}/api/{path}"
+
+    # 获取查询参数
+    query_string = str(request.query_params)
+    if query_string:
+        target_url += f"?{query_string}"
+
+    # 获取请求体
+    body = None
+    if request.method in ["POST", "PUT", "PATCH"]:
+        body = await request.body()
+
+    # 准备请求头（转发 Authorization 头）
+    headers = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    try:
+        if tunnel_type == "wireguard":
+            # WireGuard 隧道: 直接通过隧道内网 IP 访问
+            response = await _proxy_request_direct(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                body=body,
+                timeout=30,
+            )
+        else:
+            # Xray 隧道: 通过 SOCKS5 代理
+            if not xray_socks_port:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"节点 '{peer_tag}' 缺少 SOCKS 端口配置"
+                )
+            response = await _proxy_request_via_socks(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                body=body,
+                socks_port=xray_socks_port,
+                timeout=30,
+            )
+
+        return Response(
+            content=response["body"],
+            status_code=response["status_code"],
+            headers=response.get("headers", {}),
+        )
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"远程节点 '{peer_tag}' 请求超时")
+    except Exception as e:
+        logging.error(f"[remote-proxy] 代理请求到 '{peer_tag}' 失败: {e}")
+        raise HTTPException(status_code=502, detail=f"代理请求失败: {str(e)}")
+
+
+async def _proxy_request_direct(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    body: Optional[bytes],
+    timeout: int = 30,
+) -> Dict:
+    """直接 HTTP 请求（用于 WireGuard 隧道）"""
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return {
+                "status_code": response.status,
+                "body": response.read(),
+                "headers": dict(response.headers),
+            }
+    except urllib.error.HTTPError as e:
+        return {
+            "status_code": e.code,
+            "body": e.read(),
+            "headers": dict(e.headers) if e.headers else {},
+        }
+
+
+async def _proxy_request_via_socks(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    body: Optional[bytes],
+    socks_port: int,
+    timeout: int = 30,
+) -> Dict:
+    """通过 SOCKS5 代理发送请求（用于 Xray 隧道）"""
+    import subprocess
+
+    # 使用 curl 通过 SOCKS5 代理发送请求
+    curl_cmd = [
+        "curl", "-s", "-S",
+        "--max-time", str(timeout),
+        "--proxy", f"socks5://127.0.0.1:{socks_port}",
+        "-X", method,
+        "-w", "\n%{http_code}",  # 输出状态码
+    ]
+
+    # [安全] 添加请求头（过滤可能导致 HTTP 头注入的字符）
+    for key, value in headers.items():
+        # 过滤换行符防止 HTTP 头注入
+        if '\r' in value or '\n' in value:
+            logging.warning(f"[socks-proxy] 跳过包含换行符的请求头: {key}")
+            continue
+        curl_cmd.extend(["-H", f"{key}: {value}"])
+
+    # 添加请求体
+    if body:
+        curl_cmd.extend(["-d", body.decode("utf-8", errors="replace")])
+
+    curl_cmd.append(url)
+
+    result = subprocess.run(
+        curl_cmd,
+        capture_output=True,
+        timeout=timeout + 5,
+    )
+
+    if result.returncode != 0:
+        error_msg = result.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"SOCKS 代理请求失败: {error_msg}")
+
+    # 解析响应（最后一行是状态码）
+    output = result.stdout.decode("utf-8", errors="replace")
+    lines = output.rsplit("\n", 1)
+    response_body = lines[0] if len(lines) > 1 else ""
+    status_code = int(lines[-1]) if lines[-1].isdigit() else 200
+
+    return {
+        "status_code": status_code,
+        "body": response_body.encode("utf-8"),
+        "headers": {"Content-Type": "application/json"},
+    }
+
+
+# ============ Batch Operations API ============
+
+# 批量操作最大数量限制
+MAX_BATCH_SIZE = 100
+
+
+class BatchConnectRequest(BaseModel):
+    """批量连接请求"""
+    tags: List[str] = Field(...)
+
+
+class BatchDisconnectRequest(BaseModel):
+    """批量断开请求"""
+    tags: List[str] = Field(...)
+
+
+class BatchRulesRequest(BaseModel):
+    """批量推送规则请求"""
+    tags: List[str] = Field(...)
+    rules: List[Dict[str, Any]] = Field(...)
+    mode: str = "append"  # append | replace
+
+
+@app.post("/api/batch/connect")
+async def api_batch_connect(payload: BatchConnectRequest):
+    """批量连接多个节点"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # [优化] 在循环外获取数据库连接和管理器
+    db = _get_db()
+    from peer_tunnel_manager import PeerTunnelManager
+    manager = PeerTunnelManager()
+
+    results = []
+    for tag in payload.tags:
+        try:
+            node = db.get_peer_node(tag)
+
+            if not node:
+                results.append({"tag": tag, "success": False, "error": "节点不存在"})
+                continue
+
+            if not node.get("enabled"):
+                results.append({"tag": tag, "success": False, "error": "节点已禁用"})
+                continue
+
+            success = manager.connect_node(tag)
+
+            if success:
+                results.append({"tag": tag, "success": True})
+            else:
+                node = db.get_peer_node(tag)
+                results.append({
+                    "tag": tag,
+                    "success": False,
+                    "error": node.get("last_error", "连接失败") if node else "连接失败"
+                })
+        except Exception as e:
+            logging.exception(f"[batch-connect] 连接节点 '{tag}' 失败")
+            results.append({"tag": tag, "success": False, "error": "Internal error"})
+
+    success_count = sum(1 for r in results if r["success"])
+    return {
+        "total": len(payload.tags),
+        "success": success_count,
+        "failed": len(payload.tags) - success_count,
+        "results": results,
+    }
+
+
+@app.post("/api/batch/disconnect")
+async def api_batch_disconnect(payload: BatchDisconnectRequest):
+    """批量断开多个节点"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # [优化] 在循环外获取管理器
+    from peer_tunnel_manager import PeerTunnelManager
+    manager = PeerTunnelManager()
+
+    results = []
+    for tag in payload.tags:
+        try:
+            success = manager.disconnect_node(tag)
+
+            if success:
+                results.append({"tag": tag, "success": True})
+            else:
+                results.append({"tag": tag, "success": False, "error": "断开失败"})
+        except Exception as e:
+            logging.exception(f"[batch-disconnect] 断开节点 '{tag}' 失败")
+            results.append({"tag": tag, "success": False, "error": "Internal error"})
+
+    success_count = sum(1 for r in results if r["success"])
+    return {
+        "total": len(payload.tags),
+        "success": success_count,
+        "failed": len(payload.tags) - success_count,
+        "results": results,
+    }
+
+
+@app.post("/api/batch/rules")
+async def api_batch_push_rules(
+    payload: BatchRulesRequest,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """批量推送路由规则到多个节点
+
+    通过远程代理向多个节点推送路由规则。
+    mode: "append" 追加规则，"replace" 替换所有规则
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    results = []
+    db = _get_db()
+
+    for tag in payload.tags:
+        try:
+            node = db.get_peer_node(tag)
+
+            if not node:
+                results.append({"tag": tag, "success": False, "error": "节点不存在"})
+                continue
+
+            if node.get("tunnel_status") != "connected":
+                results.append({"tag": tag, "success": False, "error": "隧道未连接"})
+                continue
+
+            # 构建远程 API 请求
+            tunnel_type = node.get("tunnel_type", "wireguard")
+            tunnel_remote_ip = node.get("tunnel_remote_ip")
+            xray_socks_port = node.get("xray_socks_port")
+
+            target_url = f"http://{tunnel_remote_ip}:8000/api/rules"
+
+            headers = {"Content-Type": "application/json"}
+            if authorization:
+                headers["Authorization"] = authorization
+
+            body = json.dumps({
+                "rules": payload.rules,
+                "mode": payload.mode,
+            }).encode("utf-8")
+
+            if tunnel_type == "wireguard":
+                response = await _proxy_request_direct(
+                    method="PUT",
+                    url=target_url,
+                    headers=headers,
+                    body=body,
+                    timeout=30,
+                )
+            else:
+                response = await _proxy_request_via_socks(
+                    method="PUT",
+                    url=target_url,
+                    headers=headers,
+                    body=body,
+                    socks_port=xray_socks_port,
+                    timeout=30,
+                )
+
+            if response["status_code"] in (200, 201):
+                results.append({"tag": tag, "success": True})
+            else:
+                error_body = response["body"].decode("utf-8", errors="replace")
+                results.append({
+                    "tag": tag,
+                    "success": False,
+                    "error": f"HTTP {response['status_code']}: {error_body[:200]}"
+                })
+        except Exception as e:
+            results.append({"tag": tag, "success": False, "error": str(e)})
+
+    success_count = sum(1 for r in results if r["success"])
+    return {
+        "total": len(payload.tags),
+        "success": success_count,
+        "failed": len(payload.tags) - success_count,
+        "results": results,
+    }
+
+
+@app.post("/api/batch/reload")
+async def api_batch_reload(
+    payload: BatchConnectRequest,  # 使用相同的 tags 格式
+    authorization: Optional[str] = Header(None),
+):
+    """批量重载多个节点配置"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    results = []
+    db = _get_db()
+
+    for tag in payload.tags:
+        try:
+            node = db.get_peer_node(tag)
+
+            if not node:
+                results.append({"tag": tag, "success": False, "error": "节点不存在"})
+                continue
+
+            if node.get("tunnel_status") != "connected":
+                results.append({"tag": tag, "success": False, "error": "隧道未连接"})
+                continue
+
+            tunnel_type = node.get("tunnel_type", "wireguard")
+            tunnel_remote_ip = node.get("tunnel_remote_ip")
+            xray_socks_port = node.get("xray_socks_port")
+
+            target_url = f"http://{tunnel_remote_ip}:8000/api/config/reload"
+
+            headers = {}
+            if authorization:
+                headers["Authorization"] = authorization
+
+            if tunnel_type == "wireguard":
+                response = await _proxy_request_direct(
+                    method="POST",
+                    url=target_url,
+                    headers=headers,
+                    body=None,
+                    timeout=30,
+                )
+            else:
+                response = await _proxy_request_via_socks(
+                    method="POST",
+                    url=target_url,
+                    headers=headers,
+                    body=None,
+                    socks_port=xray_socks_port,
+                    timeout=30,
+                )
+
+            if response["status_code"] in (200, 201):
+                results.append({"tag": tag, "success": True})
+            else:
+                error_body = response["body"].decode("utf-8", errors="replace")
+                results.append({
+                    "tag": tag,
+                    "success": False,
+                    "error": f"HTTP {response['status_code']}: {error_body[:200]}"
+                })
+        except Exception as e:
+            results.append({"tag": tag, "success": False, "error": str(e)})
+
+    success_count = sum(1 for r in results if r["success"])
+    return {
+        "total": len(payload.tags),
+        "success": success_count,
+        "failed": len(payload.tags) - success_count,
+        "results": results,
+    }
+
+
+# ============ Peer/Chain Traffic Stats API ============
+
+@app.get("/api/stats/peers")
+def api_stats_peers():
+    """获取所有节点隧道流量统计"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    nodes = db.get_peer_nodes()
+
+    stats = []
+    for node in nodes:
+        tag = node.get("tag")
+        tunnel_status = node.get("tunnel_status", "disconnected")
+        tunnel_interface = node.get("tunnel_interface")
+
+        # 从 V2Ray Stats API 获取流量数据
+        traffic = {"upload": 0, "download": 0}
+        if tunnel_status == "connected" and tunnel_interface:
+            try:
+                outbound_stats = _v2ray_client.get_outbound_stats() if _v2ray_client else {}
+                if tag in outbound_stats:
+                    traffic = outbound_stats[tag]
+            except Exception:
+                pass
+
+        stats.append({
+            "tag": tag,
+            "name": node.get("name", tag),
+            "status": tunnel_status,
+            "upload": traffic.get("upload", 0),
+            "download": traffic.get("download", 0),
+            "last_seen": node.get("last_seen"),
+        })
+
+    return {"peers": stats, "count": len(stats)}
+
+
+@app.get("/api/stats/peers/{tag}")
+def api_stats_peer_detail(tag: str):
+    """获取单个节点流量详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    tunnel_status = node.get("tunnel_status", "disconnected")
+    tunnel_interface = node.get("tunnel_interface")
+
+    # 从 V2Ray Stats API 获取流量数据
+    traffic = {"upload": 0, "download": 0}
+    if tunnel_status == "connected" and tunnel_interface:
+        try:
+            outbound_stats = _v2ray_client.get_outbound_stats() if _v2ray_client else {}
+            if tag in outbound_stats:
+                traffic = outbound_stats[tag]
+        except Exception:
+            pass
+
+    return {
+        "tag": tag,
+        "name": node.get("name", tag),
+        "status": tunnel_status,
+        "upload": traffic.get("upload", 0),
+        "download": traffic.get("download", 0),
+        "last_seen": node.get("last_seen"),
+        "endpoint": node.get("endpoint"),
+        "tunnel_type": node.get("tunnel_type"),
+        "tunnel_local_ip": node.get("tunnel_local_ip"),
+        "tunnel_remote_ip": node.get("tunnel_remote_ip"),
+    }
+
+
+@app.get("/api/stats/chains")
+def api_stats_chains():
+    """获取所有链路流量统计"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    chains = db.get_node_chains()
+
+    stats = []
+    for chain in chains:
+        tag = chain.get("tag")
+        hops = chain.get("hops", [])
+        if isinstance(hops, str):
+            hops = json.loads(hops)
+
+        # 检查链路健康状态（所有跳转节点都连接）
+        all_connected = True
+        for hop in hops:
+            node = db.get_peer_node(hop)
+            if not node or node.get("tunnel_status") != "connected":
+                all_connected = False
+                break
+
+        # 链路流量 = 第一跳的流量
+        traffic = {"upload": 0, "download": 0}
+        if hops and all_connected:
+            try:
+                outbound_stats = _v2ray_client.get_outbound_stats() if _v2ray_client else {}
+                if tag in outbound_stats:
+                    traffic = outbound_stats[tag]
+            except Exception:
+                pass
+
+        stats.append({
+            "tag": tag,
+            "name": chain.get("name", tag),
+            "hops": hops,
+            "status": "healthy" if all_connected else "unhealthy",
+            "upload": traffic.get("upload", 0),
+            "download": traffic.get("download", 0),
+        })
+
+    return {"chains": stats, "count": len(stats)}
+
+
+@app.get("/api/stats/chains/{tag}")
+def api_stats_chain_detail(tag: str):
+    """获取单个链路流量详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    chain = db.get_node_chain(tag)
+
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        hops = json.loads(hops)
+
+    # 获取每个跳转节点的状态
+    hop_details = []
+    all_connected = True
+    for hop in hops:
+        node = db.get_peer_node(hop)
+        if node:
+            status = node.get("tunnel_status", "disconnected")
+            if status != "connected":
+                all_connected = False
+            hop_details.append({
+                "tag": hop,
+                "name": node.get("name", hop),
+                "status": status,
+            })
+        else:
+            all_connected = False
+            hop_details.append({
+                "tag": hop,
+                "name": hop,
+                "status": "missing",
+            })
+
+    # 链路流量
+    traffic = {"upload": 0, "download": 0}
+    if all_connected:
+        try:
+            outbound_stats = _v2ray_client.get_outbound_stats() if _v2ray_client else {}
+            if tag in outbound_stats:
+                traffic = outbound_stats[tag]
+        except Exception:
+            pass
+
+    return {
+        "tag": tag,
+        "name": chain.get("name", tag),
+        "hops": hop_details,
+        "status": "healthy" if all_connected else "unhealthy",
+        "upload": traffic.get("upload", 0),
+        "download": traffic.get("download", 0),
+    }
 
 
 if __name__ == "__main__":

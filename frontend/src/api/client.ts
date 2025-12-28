@@ -19,6 +19,7 @@ import type {
   IpSearchResponse,
   IpQuickRuleResponse,
   IngressResponse,
+  IngressPeer,
   IngressPeerCreateResponse,
   SubnetInfo,
   SubnetUpdateResponse,
@@ -77,7 +78,20 @@ import type {
   OutboundGroupUpdateRequest,
   OutboundGroupListResponse,
   AvailableMembersResponse,
-  GroupHealthCheckResponse
+  GroupHealthCheckResponse,
+  // Peer Nodes types
+  PeerNode,
+  PeerNodeCreateRequest,
+  PeerNodeUpdateRequest,
+  PeerNodeListResponse,
+  PeerNodeStatusResponse,
+  BatchOperationResponse,
+  // Node Chains types
+  NodeChain,
+  NodeChainCreateRequest,
+  NodeChainUpdateRequest,
+  NodeChainListResponse,
+  ChainStatsResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -150,6 +164,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       // 服务器错误 - 不暴露内部详情
       console.error(`Server error ${response.status}:`, text);
       safeMessage = "Server error, please try again later";
+    } else if (response.status === 429) {
+      // 速率限制 - 显示明确提示
+      safeMessage = "请求过于频繁，请稍后再试";
     } else if (response.status === 404) {
       safeMessage = "Resource not found";
     } else if (response.status === 403) {
@@ -389,7 +406,7 @@ export const api = {
       body: { name, public_key: publicKey, allow_lan: allowLan, default_outbound: defaultOutbound }
     }),
   updateIngressPeer: (name: string, data: { name?: string; default_outbound?: string | null }) =>
-    request<{ message: string; reload_status?: { success: boolean; message: string } }>(
+    request<{ message: string; peer: IngressPeer; reload_success: boolean }>(
       `/ingress/peers/${encodeURIComponent(name)}`,
       { method: "PUT", body: data }
     ),
@@ -679,5 +696,96 @@ export const api = {
     request<GroupHealthCheckResponse>(
       `/outbound-groups/${encodeURIComponent(tag)}/health-check`,
       { method: "POST", timeout: 60000 }  // 健康检查可能需要较长时间
+    ),
+
+  // ============ Peer Nodes Management (对等节点) ============
+
+  getPeerNodes: () => request<PeerNodeListResponse>("/peers"),
+
+  getPeerNode: (tag: string) =>
+    request<PeerNode>(`/peers/${encodeURIComponent(tag)}`),
+
+  createPeerNode: (data: PeerNodeCreateRequest) =>
+    request<{ message: string; node: PeerNode }>("/peers", {
+      method: "POST",
+      body: data
+    }),
+
+  updatePeerNode: (tag: string, data: PeerNodeUpdateRequest) =>
+    request<{ message: string; node: PeerNode }>(
+      `/peers/${encodeURIComponent(tag)}`,
+      { method: "PUT", body: data }
+    ),
+
+  deletePeerNode: (tag: string) =>
+    request<{ message: string }>(
+      `/peers/${encodeURIComponent(tag)}`,
+      { method: "DELETE" }
+    ),
+
+  connectPeerNode: (tag: string) =>
+    request<{ message: string; status: PeerNodeStatusResponse }>(
+      `/peers/${encodeURIComponent(tag)}/connect`,
+      { method: "POST", timeout: 60000 }
+    ),
+
+  disconnectPeerNode: (tag: string) =>
+    request<{ message: string }>(
+      `/peers/${encodeURIComponent(tag)}/disconnect`,
+      { method: "POST" }
+    ),
+
+  getPeerNodeStatus: (tag: string) =>
+    request<PeerNodeStatusResponse>(
+      `/peers/${encodeURIComponent(tag)}/status`
+    ),
+
+  batchConnectPeerNodes: (tags: string[]) =>
+    request<BatchOperationResponse>("/batch/connect", {
+      method: "POST",
+      body: { tags },
+      timeout: 120000
+    }),
+
+  batchDisconnectPeerNodes: (tags: string[]) =>
+    request<BatchOperationResponse>("/batch/disconnect", {
+      method: "POST",
+      body: { tags }
+    }),
+
+  // ============ Node Chains (Multi-hop) API ============
+
+  getNodeChains: () => request<NodeChainListResponse>("/chains"),
+
+  getNodeChain: (tag: string) =>
+    request<NodeChain>(`/chains/${encodeURIComponent(tag)}`),
+
+  createNodeChain: (data: NodeChainCreateRequest) =>
+    request<{ message: string; chain: NodeChain }>("/chains", {
+      method: "POST",
+      body: data
+    }),
+
+  updateNodeChain: (tag: string, data: NodeChainUpdateRequest) =>
+    request<{ message: string; chain: NodeChain }>(
+      `/chains/${encodeURIComponent(tag)}`,
+      { method: "PUT", body: data }
+    ),
+
+  deleteNodeChain: (tag: string) =>
+    request<{ message: string }>(
+      `/chains/${encodeURIComponent(tag)}`,
+      { method: "DELETE" }
+    ),
+
+  getChainStats: () => request<ChainStatsResponse>("/stats/chains"),
+
+  getChainStatsForTag: (tag: string) =>
+    request<ChainStatsResponse>(`/stats/chains/${encodeURIComponent(tag)}`),
+
+  triggerChainHealthCheck: (tag: string) =>
+    request<{ message: string; health_status: string }>(
+      `/chains/${encodeURIComponent(tag)}/health-check`,
+      { method: "POST", timeout: 60000 }
     )
 };

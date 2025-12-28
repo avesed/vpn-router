@@ -108,10 +108,31 @@ ENV SING_BOX_CONFIG=/etc/sing-box/sing-box.json \
     RULESET_DIR=/etc/sing-box \
     PYTHONPATH=/usr/local/bin
 
+# Install build dependencies (will be removed after pip install)
+# Must include python3-pip for pip3 command
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential \
+        python3 \
+        python3-pip \
+        python3-dev \
+        libsqlcipher-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy and install pinned Python dependencies (C8: version pinning)
+# Install before runtime deps to leverage build cache
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
+
+# Remove build dependencies and install runtime dependencies
+# This reduces image size by ~100MB
+RUN set -eux; \
+    apt-get update; \
+    apt-get remove -y --purge build-essential python3-dev && \
+    apt-get autoremove -y; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         gettext-base \
@@ -119,11 +140,10 @@ RUN set -eux; \
         iptables \
         iputils-ping \
         jq \
-        libsqlcipher-dev \
+        libsqlcipher0 \
         openvpn \
         procps \
         python3 \
-        python3-dev \
         python3-pip \
         python3-requests \
         python3-yaml \
@@ -136,11 +156,6 @@ RUN set -eux; \
         nginx-light; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
-
-# Copy and install pinned Python dependencies (C8: version pinning)
-COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && \
-    rm /tmp/requirements.txt
 
 # Copy sing-box binary built from source (with v2ray_api support)
 COPY --from=singbox-builder /sing-box /usr/local/bin/sing-box
@@ -198,6 +213,7 @@ COPY scripts/setup_kernel_wg_egress.py /usr/local/bin/setup_kernel_wg_egress.py
 COPY scripts/key_manager.py /usr/local/bin/key_manager.py
 COPY scripts/ecmp_manager.py /usr/local/bin/ecmp_manager.py
 COPY scripts/health_checker.py /usr/local/bin/health_checker.py
+COPY scripts/peer_tunnel_manager.py /usr/local/bin/peer_tunnel_manager.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
@@ -207,7 +223,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/setup_kernel_wg_egress.py /usr/local/bin/xray_manager.py \
     /usr/local/bin/xray_egress_manager.py /usr/local/bin/warp_manager.py \
     /usr/local/bin/warp_endpoint_optimizer.py /usr/local/bin/ecmp_manager.py \
-    /usr/local/bin/health_checker.py
+    /usr/local/bin/health_checker.py /usr/local/bin/peer_tunnel_manager.py
 
 # Note: Config is mounted via docker-compose volumes
 # - user-config.db is auto-created on first run by init_user_db.py

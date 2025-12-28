@@ -341,9 +341,23 @@ class UserDatabase:
         self._local = threading.local()
 
     def _apply_encryption(self, conn) -> None:
-        """应用 SQLCipher 加密密钥"""
+        """[DB-003] 应用 SQLCipher 加密密钥和性能调优 PRAGMA
+
+        性能调优说明：
+        - cipher_memory_security = OFF: 减少内存安全检查开销（生产环境可接受）
+        - cache_size = -2000: 使用 2MB 页面缓存（负值表示 KB）
+        - temp_store = MEMORY: 临时表存储在内存中
+        - journal_mode = WAL: 写前日志模式，提升并发性能
+        - synchronous = NORMAL: 平衡安全性和速度
+        """
         if self.encryption_key and HAS_SQLCIPHER:
             conn.execute(f"PRAGMA key = '{self.encryption_key}'")
+            # [DB-003] 性能调优 PRAGMA
+            conn.execute("PRAGMA cipher_memory_security = OFF")
+            conn.execute("PRAGMA cache_size = -2000")  # 2MB
+            conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
 
     def _get_cached_conn(self):
         """获取当前线程的缓存连接
@@ -1928,38 +1942,28 @@ class UserDatabase:
             return max_table + 1
 
     def get_all_egress_tags(self) -> set:
-        """获取所有有效的出口 tag（用于验证成员）
+        """[PERF-001] 获取所有有效的出口 tag（用于验证成员）
 
+        使用 UNION ALL 单次查询优化（替代 N+1 查询模式）。
         包括：PIA profiles, custom egress, direct egress, OpenVPN, V2Ray, WARP, 已有的出口组
         """
-        tags = set()
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            # PIA profiles
-            for row in cursor.execute("SELECT name FROM pia_profiles WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # Custom WireGuard egress
-            for row in cursor.execute("SELECT tag FROM custom_egress WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # Direct egress
-            for row in cursor.execute("SELECT tag FROM direct_egress WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # OpenVPN egress
-            for row in cursor.execute("SELECT tag FROM openvpn_egress WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # V2Ray egress
-            for row in cursor.execute("SELECT tag FROM v2ray_egress WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # WARP egress
-            for row in cursor.execute("SELECT tag FROM warp_egress WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # 已有的出口组（支持嵌套）
-            for row in cursor.execute("SELECT tag FROM outbound_groups WHERE enabled = 1").fetchall():
-                tags.add(row[0])
-            # 内置出口
+            # 使用 UNION ALL 单次查询获取所有出口 tag
+            rows = cursor.execute("""
+                SELECT name as tag FROM pia_profiles WHERE enabled = 1
+                UNION ALL SELECT tag FROM custom_egress WHERE enabled = 1
+                UNION ALL SELECT tag FROM direct_egress WHERE enabled = 1
+                UNION ALL SELECT tag FROM openvpn_egress WHERE enabled = 1
+                UNION ALL SELECT tag FROM v2ray_egress WHERE enabled = 1
+                UNION ALL SELECT tag FROM warp_egress WHERE enabled = 1
+                UNION ALL SELECT tag FROM outbound_groups WHERE enabled = 1
+            """).fetchall()
+            # 转换为 set 并添加内置出口
+            tags = {row[0] for row in rows if row[0]}
             tags.add("direct")
             tags.add("block")
-        return tags
+            return tags
 
     def tag_exists_in_any_egress(self, tag: str) -> bool:
         """检查 tag 是否已被任何出口类型使用"""
@@ -2352,6 +2356,313 @@ class UserDatabase:
             cursor.execute("DELETE FROM v2ray_users WHERE id = ?", (user_id,))
             conn.commit()
             return cursor.rowcount > 0
+
+    # ============ Peer Nodes 管理 ============
+
+    def get_peer_nodes(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM peer_nodes WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM peer_nodes ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_peer_node(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取单个对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM peer_nodes WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def get_peer_node_by_id(self, node_id: int) -> Optional[Dict]:
+        """根据 ID 获取单个对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM peer_nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_peer_node(
+        self,
+        tag: str,
+        name: str,
+        endpoint: str,
+        psk_hash: str,
+        psk_encrypted: Optional[str] = None,
+        description: str = "",
+        tunnel_type: str = "wireguard",
+        tunnel_port: Optional[int] = None,
+        wg_private_key: Optional[str] = None,
+        wg_public_key: Optional[str] = None,
+        xray_protocol: str = "vless",
+        xray_uuid: Optional[str] = None,
+        tls_verify: bool = True,
+        tls_fingerprint: Optional[str] = None,
+        default_outbound: Optional[str] = None,
+        auto_reconnect: bool = True,
+        enabled: bool = True
+    ) -> int:
+        """添加对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO peer_nodes (
+                    tag, name, description, endpoint, psk_hash, psk_encrypted,
+                    tunnel_type, tunnel_port,
+                    wg_private_key, wg_public_key,
+                    xray_protocol, xray_uuid,
+                    tls_verify, tls_fingerprint,
+                    default_outbound, auto_reconnect, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tag, name, description, endpoint, psk_hash, psk_encrypted,
+                tunnel_type, tunnel_port,
+                wg_private_key, wg_public_key,
+                xray_protocol, xray_uuid,
+                1 if tls_verify else 0, tls_fingerprint,
+                default_outbound, 1 if auto_reconnect else 0, 1 if enabled else 0
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_peer_node(self, tag: str, **kwargs) -> bool:
+        """更新对等节点"""
+        allowed_fields = {
+            "name", "description", "endpoint", "psk_hash", "psk_encrypted",
+            "tunnel_type", "tunnel_status", "tunnel_interface",
+            "tunnel_local_ip", "tunnel_remote_ip", "tunnel_port",
+            "wg_private_key", "wg_public_key", "wg_peer_public_key",
+            "xray_protocol", "xray_uuid", "xray_socks_port",
+            "tls_verify", "tls_fingerprint",
+            "default_outbound", "last_seen", "last_error",
+            "auto_reconnect", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE peer_nodes SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_peer_node(self, tag: str) -> bool:
+        """删除对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM peer_nodes WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_connected_peer_nodes(self) -> List[Dict]:
+        """获取所有已连接的对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(
+                "SELECT * FROM peer_nodes WHERE tunnel_status = 'connected' AND enabled = 1 ORDER BY tag"
+            ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_next_peer_tunnel_port(self) -> int:
+        """获取下一个可用的对等节点隧道端口（从 36300 开始，避免与入口端口冲突）
+
+        Raises:
+            ValueError: 端口超出 65535 限制
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(tunnel_port) FROM peer_nodes WHERE tunnel_port IS NOT NULL"
+            ).fetchone()
+            max_port = row[0] if row and row[0] else 36299
+            next_port = max(max_port + 1, 36300)
+            if next_port > 65535:
+                raise ValueError(f"Peer tunnel port overflow: {next_port} > 65535")
+            return next_port
+
+    def get_next_peer_xray_socks_port(self) -> int:
+        """获取下一个可用的 Xray SOCKS 端口（从 37201 开始）
+
+        Raises:
+            ValueError: 端口超出 65535 限制
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(xray_socks_port) FROM peer_nodes WHERE xray_socks_port IS NOT NULL"
+            ).fetchone()
+            max_port = row[0] if row and row[0] else 37200
+            next_port = max(max_port + 1, 37201)
+            if next_port > 65535:
+                raise ValueError(f"Peer Xray SOCKS port overflow: {next_port} > 65535")
+            return next_port
+
+    # ============ Node Chains 管理 ============
+
+    def get_node_chains(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有多跳链路"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM node_chains WHERE enabled = 1 ORDER BY priority, tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM node_chains ORDER BY priority, tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            result = []
+            for row in rows:
+                item = dict(zip(columns, row))
+                # 解析 JSON 字段
+                for json_field in ["hops", "hop_protocols", "entry_rules", "relay_rules"]:
+                    if item.get(json_field):
+                        try:
+                            item[json_field] = json.loads(item[json_field])
+                        except (json.JSONDecodeError, TypeError):
+                            if json_field == "hops":
+                                item[json_field] = []
+                            else:
+                                item[json_field] = None
+                result.append(item)
+            return result
+
+    def get_node_chain(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取单个多跳链路"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM node_chains WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            item = dict(zip(columns, row))
+            # 解析 JSON 字段
+            for json_field in ["hops", "hop_protocols", "entry_rules", "relay_rules"]:
+                if item.get(json_field):
+                    try:
+                        item[json_field] = json.loads(item[json_field])
+                    except (json.JSONDecodeError, TypeError):
+                        if json_field == "hops":
+                            item[json_field] = []
+                        else:
+                            item[json_field] = None
+            return item
+
+    def add_node_chain(
+        self,
+        tag: str,
+        name: str,
+        hops: List[str],
+        description: str = "",
+        hop_protocols: Optional[Dict[str, str]] = None,
+        entry_rules: Optional[Dict] = None,
+        relay_rules: Optional[Dict] = None,
+        priority: int = 0,
+        enabled: bool = True
+    ) -> int:
+        """添加多跳链路"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO node_chains (
+                    tag, name, description, hops, hop_protocols,
+                    entry_rules, relay_rules, priority, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tag, name, description,
+                json.dumps(hops),
+                json.dumps(hop_protocols) if hop_protocols else None,
+                json.dumps(entry_rules) if entry_rules else None,
+                json.dumps(relay_rules) if relay_rules else None,
+                priority, 1 if enabled else 0
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_node_chain(self, tag: str, **kwargs) -> bool:
+        """更新多跳链路"""
+        allowed_fields = {
+            "name", "description", "hops", "hop_protocols",
+            "entry_rules", "relay_rules", "health_status",
+            "last_health_check", "priority", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                # JSON 字段需要序列化
+                if key in {"hops", "hop_protocols", "entry_rules", "relay_rules"}:
+                    if value is not None:
+                        value = json.dumps(value)
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE node_chains SET {", ".join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_node_chain(self, tag: str) -> bool:
+        """删除多跳链路"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM node_chains WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def validate_chain_hops(self, hops: List[str]) -> tuple:
+        """验证链路的跳点节点是否都存在
+
+        Returns:
+            (is_valid, missing_nodes)
+        """
+        if not hops:
+            return False, ["hops cannot be empty"]
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            missing = []
+            for hop in hops:
+                row = cursor.execute(
+                    "SELECT tag FROM peer_nodes WHERE tag = ?", (hop,)
+                ).fetchone()
+                if not row:
+                    missing.append(hop)
+            return len(missing) == 0, missing
 
 
 class DatabaseManager:
@@ -2851,6 +3162,91 @@ class DatabaseManager:
 
     def delete_v2ray_user(self, user_id: int) -> bool:
         return self.user.delete_v2ray_user(user_id)
+
+    # Peer Nodes (对等节点管理)
+    def get_peer_nodes(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_peer_nodes(enabled_only)
+
+    def get_peer_node(self, tag: str) -> Optional[Dict]:
+        return self.user.get_peer_node(tag)
+
+    def get_peer_node_by_id(self, node_id: int) -> Optional[Dict]:
+        return self.user.get_peer_node_by_id(node_id)
+
+    def add_peer_node(
+        self,
+        tag: str,
+        name: str,
+        endpoint: str,
+        psk_hash: str,
+        psk_encrypted: Optional[str] = None,
+        description: str = "",
+        tunnel_type: str = "wireguard",
+        tunnel_port: Optional[int] = None,
+        wg_private_key: Optional[str] = None,
+        wg_public_key: Optional[str] = None,
+        xray_protocol: str = "vless",
+        xray_uuid: Optional[str] = None,
+        tls_verify: bool = True,
+        tls_fingerprint: Optional[str] = None,
+        default_outbound: Optional[str] = None,
+        auto_reconnect: bool = True,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_peer_node(
+            tag, name, endpoint, psk_hash, psk_encrypted, description, tunnel_type,
+            tunnel_port, wg_private_key, wg_public_key,
+            xray_protocol, xray_uuid, tls_verify, tls_fingerprint,
+            default_outbound, auto_reconnect, enabled
+        )
+
+    def update_peer_node(self, tag: str, **kwargs) -> bool:
+        return self.user.update_peer_node(tag, **kwargs)
+
+    def delete_peer_node(self, tag: str) -> bool:
+        return self.user.delete_peer_node(tag)
+
+    def get_connected_peer_nodes(self) -> List[Dict]:
+        return self.user.get_connected_peer_nodes()
+
+    def get_next_peer_tunnel_port(self) -> int:
+        return self.user.get_next_peer_tunnel_port()
+
+    def get_next_peer_xray_socks_port(self) -> int:
+        return self.user.get_next_peer_xray_socks_port()
+
+    # Node Chains (多跳链路管理)
+    def get_node_chains(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_node_chains(enabled_only)
+
+    def get_node_chain(self, tag: str) -> Optional[Dict]:
+        return self.user.get_node_chain(tag)
+
+    def add_node_chain(
+        self,
+        tag: str,
+        name: str,
+        hops: List[str],
+        description: str = "",
+        hop_protocols: Optional[Dict[str, str]] = None,
+        entry_rules: Optional[Dict] = None,
+        relay_rules: Optional[Dict] = None,
+        priority: int = 0,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_node_chain(
+            tag, name, hops, description, hop_protocols,
+            entry_rules, relay_rules, priority, enabled
+        )
+
+    def update_node_chain(self, tag: str, **kwargs) -> bool:
+        return self.user.update_node_chain(tag, **kwargs)
+
+    def delete_node_chain(self, tag: str) -> bool:
+        return self.user.delete_node_chain(tag)
+
+    def validate_chain_hops(self, hops: List[str]) -> tuple:
+        return self.user.validate_chain_hops(hops)
 
 
 # 全局缓存

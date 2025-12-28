@@ -1,51 +1,128 @@
-# Frontend build artifacts
-frontend/node_modules
-frontend/dist
-
-# Git
+# ==========================================
+# Git & Version Control
+# ==========================================
 .git
 .gitignore
+.gitattributes
 
+# ==========================================
 # Documentation (not needed in container)
+# ==========================================
 *.md
+!requirements*.md
+LICENSE
 
+# ==========================================
+# Frontend build artifacts (rebuilt in Docker)
+# ==========================================
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# ==========================================
 # Environment & secrets
+# ==========================================
 .env
 .env.local
+.env.*.local
 
+# ==========================================
 # Claude Code
+# ==========================================
 .claude/
 
-# Auto-generated config files
+# ==========================================
+# Auto-generated config files (created at runtime)
+# ==========================================
 config/user-config.db
+config/user-config.db.backup
 config/user-config.db.unencrypted
+config/user-config.db-shm
+config/user-config.db-wal
 config/geoip.db
 config/geosite.db
+config/geoip-geodata.db
 config/settings.json
 config/sing-box.generated.json
 config/custom-rules.json
 config/cache.db
-config/rulesets/
+config/.geodata-ready
 
+# ==========================================
 # SQLCipher encryption key
+# ==========================================
 config/.db-key
+config/encryption.key
 .db-key
 
-# WARP config directories
+# ==========================================
+# Runtime generated directories
+# ==========================================
+config/rulesets/
+config/backups/
 config/warp/
 
+# ==========================================
 # Python cache
+# ==========================================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 
+# ==========================================
 # Logs
+# ==========================================
 *.log
+logs/
 
+# ==========================================
+# Tests (not needed in production container)
+# ==========================================
+tests/
+.pytest_cache/
+coverage/
+htmlcov/
+.coverage
+*.cover
+
+# ==========================================
 # Test directories
+# ==========================================
 test-wg/
 test-client/
 test-egress/
+test-wg-client/
+xray-client-debug/
 
+# ==========================================
 # WireGuard client configs
+# ==========================================
 *-client.conf
 *.wg.conf
+
+# ==========================================
+# IDE & editor
+# ==========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ==========================================
+# Docker (avoid recursive inclusion)
+# ==========================================
+docker-compose.override.yml
+docker-compose.local.yml
+Dockerfile.dev
+
+# ==========================================
+# Misc
+# ==========================================
+.cache/
+tmp/
+*.tmp
+*.bak
