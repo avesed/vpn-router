@@ -19,12 +19,16 @@ import {
   ArrowRightIcon
 } from "@heroicons/react/24/outline";
 import { api } from "../api/client";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import type {
   NodeChain,
   NodeChainCreateRequest,
   NodeChainUpdateRequest,
   PeerNode,
-  ChainHealthStatus
+  ChainHealthStatus,
+  ChainHealthCheckResponse,
+  ChainHopResult,
+  DownstreamStatus
 } from "../types";
 
 // Health status color and icon mapping
@@ -45,6 +49,76 @@ function getHealthStatusInfo(status: ChainHealthStatus) {
         icon: ExclamationTriangleIcon
       };
     case "unhealthy":
+      return {
+        color: "text-rose-400",
+        bgColor: "bg-rose-500/20",
+        borderColor: "border-rose-500/30",
+        icon: ExclamationCircleIcon
+      };
+    default:
+      return {
+        color: "text-slate-400",
+        bgColor: "bg-slate-500/20",
+        borderColor: "border-slate-500/30",
+        icon: QuestionMarkCircleIcon
+      };
+  }
+}
+
+// Hop status color and icon mapping
+function getHopStatusInfo(status: ChainHopResult["status"]) {
+  switch (status) {
+    case "connected":
+      return {
+        color: "text-emerald-400",
+        bgColor: "bg-emerald-500/20",
+        icon: CheckCircleIcon
+      };
+    case "connecting":
+      return {
+        color: "text-amber-400",
+        bgColor: "bg-amber-500/20",
+        icon: ArrowPathIcon
+      };
+    case "disconnected":
+      return {
+        color: "text-slate-400",
+        bgColor: "bg-slate-500/20",
+        icon: ExclamationCircleIcon
+      };
+    case "error":
+    case "unreachable":
+      return {
+        color: "text-rose-400",
+        bgColor: "bg-rose-500/20",
+        icon: ExclamationCircleIcon
+      };
+    case "not_found":
+      return {
+        color: "text-orange-400",
+        bgColor: "bg-orange-500/20",
+        icon: QuestionMarkCircleIcon
+      };
+    default:
+      return {
+        color: "text-slate-400",
+        bgColor: "bg-slate-500/20",
+        icon: QuestionMarkCircleIcon
+      };
+  }
+}
+
+// Downstream status color and icon mapping
+function getDownstreamStatusInfo(status: DownstreamStatus | undefined) {
+  switch (status) {
+    case "connected":
+      return {
+        color: "text-emerald-400",
+        bgColor: "bg-emerald-500/20",
+        borderColor: "border-emerald-500/30",
+        icon: CheckCircleIcon
+      };
+    case "disconnected":
       return {
         color: "text-rose-400",
         bgColor: "bg-rose-500/20",
@@ -86,6 +160,13 @@ export default function ChainManager() {
   const [showModal, setShowModal] = useState(false);
   const [editingChain, setEditingChain] = useState<NodeChain | null>(null);
   const [checkingHealth, setCheckingHealth] = useState<string | null>(null);
+  const [healthCheckResult, setHealthCheckResult] = useState<ChainHealthCheckResponse | null>(null);
+  const [showHealthModal, setShowHealthModal] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // Delete confirmation state
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [chainToDelete, setChainToDelete] = useState<NodeChain | null>(null);
 
   // Form state
   const [formData, setFormData] = useState({
@@ -122,6 +203,18 @@ export default function ChainManager() {
     loadData();
   }, [loadData]);
 
+  // Auto-refresh every 30 seconds to update downstream status
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Only refresh if not showing modals (to avoid interrupting user)
+      if (!showModal && !showHealthModal) {
+        loadData();
+      }
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, [loadData, showModal, showHealthModal]);
+
   const resetForm = useCallback(() => {
     setFormData({
       tag: "",
@@ -139,18 +232,27 @@ export default function ChainManager() {
   // [可访问性] Escape 键关闭模态框
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && showModal) {
-        setShowModal(false);
-        setEditingChain(null);
-        resetForm();
+      if (e.key === "Escape") {
+        // Close health check modal first (if open)
+        if (showHealthModal) {
+          setShowHealthModal(false);
+          setHealthCheckResult(null);
+          return;
+        }
+        // Then close add/edit modal
+        if (showModal) {
+          setShowModal(false);
+          setEditingChain(null);
+          resetForm();
+        }
       }
     };
 
-    if (showModal) {
+    if (showModal || showHealthModal) {
       document.addEventListener("keydown", handleEscape);
       return () => document.removeEventListener("keydown", handleEscape);
     }
-  }, [showModal, resetForm]);
+  }, [showModal, showHealthModal, resetForm]);
 
   const openAddModal = () => {
     resetForm();
@@ -207,6 +309,7 @@ export default function ChainManager() {
       return;
     }
 
+    setSaving(true);
     try {
       const payload: NodeChainCreateRequest | NodeChainUpdateRequest = {
         name: formData.name.trim(),
@@ -233,13 +336,24 @@ export default function ChainManager() {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : (editingChain ? t("chains.updateFailed") : t("chains.createFailed"));
       setError(message);
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleDelete = async (chain: NodeChain) => {
-    if (!window.confirm(t("chains.confirmDelete", { name: chain.name }))) {
-      return;
-    }
+  // Delete chain - step 1: open confirmation dialog
+  const handleDelete = (chain: NodeChain) => {
+    setChainToDelete(chain);
+    setDeleteConfirmOpen(true);
+  };
+
+  // Delete chain - step 2: perform actual deletion after confirmation
+  const confirmDeleteChain = useCallback(async () => {
+    if (!chainToDelete) return;
+
+    const chain = chainToDelete;
+    setDeleteConfirmOpen(false);
+    setChainToDelete(null);
 
     try {
       await api.deleteNodeChain(chain.tag);
@@ -248,12 +362,20 @@ export default function ChainManager() {
       const message = err instanceof Error ? err.message : t("chains.deleteFailed");
       setError(message);
     }
-  };
+  }, [chainToDelete, loadData, t]);
+
+  // Cancel delete
+  const cancelDeleteChain = useCallback(() => {
+    setDeleteConfirmOpen(false);
+    setChainToDelete(null);
+  }, []);
 
   const handleHealthCheck = async (chain: NodeChain) => {
     setCheckingHealth(chain.tag);
     try {
-      await api.triggerChainHealthCheck(chain.tag);
+      const result = await api.triggerChainHealthCheck(chain.tag);
+      setHealthCheckResult(result);
+      setShowHealthModal(true);
       await loadData();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t("chains.healthCheckFailed");
@@ -261,6 +383,11 @@ export default function ChainManager() {
     } finally {
       setCheckingHealth(null);
     }
+  };
+
+  const closeHealthModal = () => {
+    setShowHealthModal(false);
+    setHealthCheckResult(null);
   };
 
   const addHop = () => {
@@ -443,6 +570,8 @@ export default function ChainManager() {
           {chains.map(chain => {
             const healthInfo = getHealthStatusInfo(chain.health_status);
             const HealthIcon = healthInfo.icon;
+            const downstreamInfo = getDownstreamStatusInfo(chain.downstream_status);
+            const DownstreamIcon = downstreamInfo.icon;
 
             return (
               <div
@@ -470,6 +599,13 @@ export default function ChainManager() {
                       <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-500/20 text-blue-400">
                         {t("chains.hopCount", { count: chain.hops?.length || 0 })}
                       </span>
+                      {/* Downstream status warning badge (only show when disconnected) */}
+                      {chain.downstream_status === "disconnected" && (
+                        <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-rose-500/20 text-rose-400">
+                          <ExclamationCircleIcon className="h-3 w-3" />
+                          {t("chains.downstreamDisconnected")}
+                        </span>
+                      )}
                     </div>
                     <p className="text-sm text-slate-400 truncate">
                       {chain.description || chain.tag}
@@ -517,6 +653,21 @@ export default function ChainManager() {
                     <HealthIcon className="h-4 w-4" />
                     <span>{t(`chains.status.${chain.health_status}`)}</span>
                   </div>
+
+                  {/* Downstream status (only show when not unknown) */}
+                  {chain.downstream_status && chain.downstream_status !== "unknown" && (
+                    <div className={`flex items-center gap-1.5 ${downstreamInfo.color}`}>
+                      <DownstreamIcon className="h-4 w-4" />
+                      <span>
+                        {t("chains.downstream")}: {t(`chains.downstreamStatus.${chain.downstream_status}`)}
+                        {chain.downstream_status === "disconnected" && chain.disconnected_node && (
+                          <span className="text-slate-500 ml-1">
+                            ({getNodeName(chain.disconnected_node)})
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                  )}
 
                   {/* Last health check */}
                   {chain.last_health_check && (
@@ -758,8 +909,12 @@ export default function ChainManager() {
                 </button>
                 <button
                   onClick={handleSubmit}
-                  className="px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors"
+                  disabled={saving}
+                  className="px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                 >
+                  {saving && (
+                    <ArrowPathIcon className="w-4 h-4 animate-spin" />
+                  )}
                   {editingChain ? t("common.save") : t("common.create")}
                 </button>
               </div>
@@ -768,6 +923,137 @@ export default function ChainManager() {
         </div>,
         document.body
       )}
+
+      {/* Health Check Result Modal */}
+      {showHealthModal && healthCheckResult && createPortal(
+        <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="health-modal-title"
+              className="bg-slate-900 rounded-2xl border border-white/10 w-full max-w-lg"
+            >
+              {/* Modal header */}
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <h3 id="health-modal-title" className="text-xl font-bold text-white">
+                    {t("chains.healthCheckResult")}
+                  </h3>
+                  <button
+                    onClick={closeHealthModal}
+                    className="p-1 rounded-lg hover:bg-white/10 text-slate-400"
+                  >
+                    <XMarkIcon className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Modal body */}
+              <div className="p-6 space-y-4">
+                {/* Overall status */}
+                <div className={`p-4 rounded-xl ${healthCheckResult.healthy ? "bg-emerald-500/10 border border-emerald-500/20" : "bg-rose-500/10 border border-rose-500/20"}`}>
+                  <div className="flex items-center gap-3">
+                    {healthCheckResult.healthy ? (
+                      <CheckCircleIcon className="h-6 w-6 text-emerald-400" />
+                    ) : (
+                      <ExclamationCircleIcon className="h-6 w-6 text-rose-400" />
+                    )}
+                    <div>
+                      <div className={`font-semibold ${healthCheckResult.healthy ? "text-emerald-400" : "text-rose-400"}`}>
+                        {healthCheckResult.healthy ? t("chains.chainHealthy") : t("chains.chainUnhealthy")}
+                      </div>
+                      <div className="text-sm text-slate-400 mt-1">
+                        {healthCheckResult.message}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Per-hop status */}
+                <div>
+                  <h4 className="text-sm font-medium text-slate-400 mb-3">
+                    {t("chains.hopStatus")} ({healthCheckResult.total_hops} {t("chains.hopsTotal")})
+                  </h4>
+                  <div className="space-y-2">
+                    {healthCheckResult.hops.map((hop, index) => {
+                      const hopInfo = getHopStatusInfo(hop.status);
+                      const HopIcon = hopInfo.icon;
+                      return (
+                        <div
+                          key={index}
+                          className={`flex items-center gap-3 p-3 rounded-lg ${hopInfo.bgColor}`}
+                        >
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <span className="text-xs text-slate-500 w-12">
+                              {t("chains.hopNumber", { number: hop.hop })}
+                            </span>
+                            <HopIcon className={`h-4 w-4 ${hopInfo.color} ${hop.status === "connecting" ? "animate-spin" : ""}`} />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-white font-medium truncate">
+                                {getNodeName(hop.node)}
+                              </span>
+                              {hop.tunnel_type && (
+                                <span className="text-xs text-slate-500 uppercase">
+                                  {hop.tunnel_type}
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <span className={`text-xs ${hopInfo.color}`}>
+                                {t(`chains.hopStatus.${hop.status}`)}
+                              </span>
+                              {hop.message && (
+                                <span className="text-xs text-slate-500 truncate">
+                                  - {hop.message}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Modal footer */}
+              <div className="p-6 border-t border-white/10 flex justify-end">
+                <button
+                  onClick={closeHealthModal}
+                  className="px-4 py-2 rounded-lg bg-brand hover:bg-brand/90 text-white text-sm font-medium transition-colors"
+                >
+                  {t("common.close")}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Delete Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={deleteConfirmOpen}
+        title={t("chains.confirmDeleteTitle")}
+        message={
+          chainToDelete ? (
+            <span>
+              {t("chains.confirmDeleteMessage", { name: chainToDelete.name })}
+              <br />
+              <span className="text-slate-400 text-xs mt-1 block">
+                Tag: <code className="font-mono">{chainToDelete.tag}</code>
+              </span>
+            </span>
+          ) : null
+        }
+        confirmText={t("common.delete")}
+        variant="danger"
+        onConfirm={confirmDeleteChain}
+        onCancel={cancelDeleteChain}
+      />
     </div>
   );
 }

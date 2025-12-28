@@ -183,6 +183,11 @@ def _get_available_outbounds(db) -> list:
         if group.get("tag"):
             available.append(group["tag"])
 
+    # Node chains (multi-hop)
+    for chain in db.get_node_chains(enabled_only=True):
+        if chain.get("tag"):
+            available.append(chain['tag'])
+
     return available
 
 
@@ -499,6 +504,13 @@ XRAY_INGRESS_API_PORT = 10087
 _v2ray_user_activity: Dict[str, Dict[str, Any]] = {}
 _v2ray_user_activity_lock = threading.Lock()
 _V2RAY_USER_ONLINE_TIMEOUT = 60  # 60 秒无流量变化视为离线
+
+# ============ 级联通知去重 ============
+# 防止循环通知：{notification_id: timestamp}
+_cascade_notification_cache: Dict[str, float] = {}
+_cascade_notification_lock = threading.Lock()
+_CASCADE_NOTIFICATION_TTL = 300  # 5 分钟去重窗口
+_CASCADE_NOTIFICATION_MAX_SIZE = 1000  # 最大缓存条目数
 
 # Peer activity cache: {ip: {"last_seen": timestamp, "rx": bytes, "tx": bytes}}
 # Used to track peer online status even when no active connections exist
@@ -875,37 +887,78 @@ class V2RayUserUpdateRequest(BaseModel):
 
 class PeerAuthValidateRequest(BaseModel):
     """PSK 认证请求"""
-    psk: str = Field(..., description="预共享密钥")
-    node_id: str = Field(..., description="请求方节点标识")
+    psk: str = Field(..., min_length=16, max_length=256, description="预共享密钥")
+    node_id: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", max_length=64, description="请求方节点标识")
 
 
 class PeerAuthExchangeRequest(BaseModel):
-    """隧道参数交换请求"""
-    psk: str = Field(..., description="预共享密钥")
-    node_id: str = Field(..., description="请求方节点标识")
+    """隧道参数交换请求
+
+    用于节点间交换隧道参数。对于 Xray 类型，固定使用 VLESS+XHTTP+REALITY。
+    """
+    psk: str = Field(..., min_length=16, max_length=256, description="预共享密钥")
+    node_id: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", max_length=64, description="请求方节点标识")
     tunnel_type: str = Field("wireguard", description="隧道类型 (wireguard/xray)")
     # WireGuard 参数
     wg_public_key: Optional[str] = Field(None, description="请求方 WireGuard 公钥")
     wg_listen_port: Optional[int] = Field(None, ge=1, le=65535, description="请求方监听端口")
-    # Xray 参数
-    xray_protocol: Optional[str] = Field(None, description="Xray 协议 (vless/vmess/trojan)")
+    # Xray REALITY 参数（请求方提供自己的公钥供对端连接）
     xray_uuid: Optional[str] = Field(None, description="Xray UUID")
+    xray_reality_public_key: Optional[str] = Field(None, description="请求方 REALITY 公钥")
+    xray_reality_short_id: Optional[str] = Field(None, description="请求方 REALITY Short ID")
+    xray_reality_dest: Optional[str] = Field(None, description="请求方 REALITY Dest Server")
+    xray_reality_server_names: Optional[List[str]] = Field(None, description="请求方 REALITY Server Names")
+    # XHTTP 传输配置
+    xray_xhttp_path: Optional[str] = Field(None, description="请求方 XHTTP 路径")
+    xray_xhttp_mode: Optional[str] = Field(None, description="请求方 XHTTP 模式")
+    xray_xhttp_host: Optional[str] = Field(None, description="请求方 XHTTP Host")
+
+
+class PeerNotifyRequest(BaseModel):
+    """对等节点连接/断开通知请求"""
+    psk: str = Field(..., min_length=16, description="预共享密钥（至少 16 字符）")
+    node_id: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="发起方节点标识")
+    # 发起方的隧道参数（接收方需要用这些参数建立隧道）
+    initiator_endpoint: Optional[str] = Field(None, description="发起方的 WireGuard 监听端点 (IP:port)")
+    initiator_public_key: Optional[str] = Field(None, description="发起方的 WireGuard 公钥")
+    initiator_tunnel_ip: Optional[str] = Field(None, description="发起方的隧道 IP")
 
 
 class PeerNodeCreateRequest(BaseModel):
-    """创建对等节点"""
+    """创建对等节点
+
+    对于 Xray 类型节点，使用固定 VLESS+XHTTP+REALITY 协议组合。
+    REALITY 密钥（私钥、公钥、Short ID）在创建时自动生成。
+    """
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="节点标识符，如 node-tokyo")
     name: str = Field(..., description="节点显示名称")
     description: str = Field("", description="节点描述")
     endpoint: str = Field(..., description="节点连接地址 (IP:port 或 域名:port)")
     psk: str = Field(..., min_length=16, description="预共享密钥（用于认证，至少 16 字符）")
     tunnel_type: str = Field("wireguard", pattern=r"^(wireguard|xray)$", description="隧道类型 (wireguard/xray)")
-    xray_protocol: str = Field("vless", pattern=r"^(vless|vmess|trojan)$", description="Xray 协议 (vless/vmess/trojan)")
-    tls_verify: int = Field(1, ge=0, le=1, description="是否验证 TLS 证书（1=验证，0=跳过）")
-    tls_fingerprint: Optional[str] = Field(None, description="TLS 证书指纹（十六进制格式，用于证书固定）")
+    # REALITY 配置（Dest 和 Server Names 可自定义）
+    xray_reality_dest: str = Field("www.microsoft.com:443", description="REALITY Dest Server（伪装目标）")
+    xray_reality_server_names: List[str] = Field(
+        default=["www.microsoft.com"],
+        description="REALITY Server Names（SNI 列表）"
+    )
+    # XHTTP 传输配置
+    xray_xhttp_path: str = Field("/", description="XHTTP 路径")
+    xray_xhttp_mode: str = Field(
+        "auto",
+        pattern=r"^(auto|packet-up|stream-up|stream-one)$",
+        description="XHTTP 模式"
+    )
+    xray_xhttp_host: Optional[str] = Field(None, description="XHTTP Host")
     default_outbound: Optional[str] = Field(None, description="此节点入口的默认出口")
     auto_reconnect: int = Field(1, ge=0, le=1, description="是否自动重连")
     enabled: int = Field(1, ge=0, le=1, description="是否启用")
+    # 连接模式
+    connection_mode: str = Field(
+        "outbound",
+        pattern=r"^(outbound|inbound)$",
+        description="连接模式：outbound（连接到对端主隧道）或 inbound（连接到对端入站监听）"
+    )
 
 
 class PeerNodeUpdateRequest(BaseModel):
@@ -915,12 +968,26 @@ class PeerNodeUpdateRequest(BaseModel):
     endpoint: Optional[str] = Field(None, description="节点连接地址")
     psk: Optional[str] = Field(None, min_length=16, description="预共享密钥（至少 16 字符）")
     tunnel_type: Optional[str] = Field(None, pattern=r"^(wireguard|xray)$", description="隧道类型")
-    xray_protocol: Optional[str] = Field(None, pattern=r"^(vless|vmess|trojan)$", description="Xray 协议")
-    tls_verify: Optional[int] = Field(None, ge=0, le=1, description="是否验证 TLS 证书")
-    tls_fingerprint: Optional[str] = Field(None, description="TLS 证书指纹")
+    # REALITY 配置
+    xray_reality_dest: Optional[str] = Field(None, description="REALITY Dest Server")
+    xray_reality_server_names: Optional[List[str]] = Field(None, description="REALITY Server Names")
+    # XHTTP 传输配置
+    xray_xhttp_path: Optional[str] = Field(None, description="XHTTP 路径")
+    xray_xhttp_mode: Optional[str] = Field(
+        None,
+        pattern=r"^(auto|packet-up|stream-up|stream-one)$",
+        description="XHTTP 模式"
+    )
+    xray_xhttp_host: Optional[str] = Field(None, description="XHTTP Host")
     default_outbound: Optional[str] = Field(None, description="默认出口")
     auto_reconnect: Optional[int] = Field(None, ge=0, le=1, description="自动重连")
     enabled: Optional[int] = Field(None, ge=0, le=1, description="是否启用")
+    # 连接模式
+    connection_mode: Optional[str] = Field(
+        None,
+        pattern=r"^(outbound|inbound)$",
+        description="连接模式：outbound（连接到对端主隧道）或 inbound（连接到对端入站监听）"
+    )
 
 
 class NodeChainCreateRequest(BaseModel):
@@ -1035,6 +1102,15 @@ PUBLIC_PATHS = {
     # 节点间 PSK 认证端点（远程节点无需 JWT）
     "/api/peer-auth/validate",
     "/api/peer-auth/exchange",
+    # 节点间连接通知端点（PSK 认证）
+    "/api/peer-notify/connected",
+    "/api/peer-notify/disconnected",
+    "/api/peer-notify/downstream-disconnected",  # 级联断连通知
+    # 节点间链路注册端点（PSK 认证）
+    "/api/peer-chain/register",
+    "/api/peer-chain/unregister",
+    # 节点间中继查询端点（PSK 认证）
+    "/api/peer-relay/status",
 }
 
 
@@ -2670,6 +2746,12 @@ def api_get_rules():
             for group in outbound_groups:
                 if group.get("tag") and group["tag"] not in available_outbounds:
                     available_outbounds.append(group["tag"])
+
+            # 从数据库读取多跳链路
+            node_chains = db.get_node_chains(enabled_only=True)
+            for chain in node_chains:
+                if chain.get("tag") and chain['tag'] not in available_outbounds:
+                    available_outbounds.append(chain['tag'])
         except Exception:
             pass
 
@@ -2878,6 +2960,10 @@ def api_switch_default_outbound(payload: DefaultOutboundRequest):
     for group in db.get_outbound_groups(enabled_only=True):
         available_outbounds.append(group["tag"])
 
+    for chain in db.get_node_chains(enabled_only=True):
+        if chain.get("tag"):
+            available_outbounds.append(chain['tag'])
+
     if new_outbound not in available_outbounds:
         raise HTTPException(
             status_code=400,
@@ -2983,6 +3069,10 @@ def api_get_default_outbound():
 
     for group in db.get_outbound_groups(enabled_only=True):
         available_outbounds.append(group["tag"])
+
+    for chain in db.get_node_chains(enabled_only=True):
+        if chain.get("tag"):
+            available_outbounds.append(chain['tag'])
 
     return {
         "outbound": default_outbound,
@@ -7087,9 +7177,13 @@ def api_reload_xray():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/ingress/v2ray/reality/generate-keys")
-def api_generate_reality_keys():
-    """生成 REALITY 密钥对"""
+def _generate_xray_reality_keys() -> Optional[Dict[str, str]]:
+    """生成 Xray REALITY 密钥对（内部辅助函数）
+
+    Returns:
+        成功返回 {"private_key": str, "public_key": str, "short_id": str}
+        失败返回 None
+    """
     import subprocess
     try:
         result = subprocess.run(
@@ -7097,21 +7191,26 @@ def api_generate_reality_keys():
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
-            keys = json.loads(result.stdout)
-            return keys
+            return json.loads(result.stdout)
         else:
-            # 尝试解析错误信息
-            try:
-                error = json.loads(result.stderr)
-                raise HTTPException(status_code=500, detail=error.get("error", "Unknown error"))
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=500, detail=f"Failed to generate keys: {result.stderr}")
+            logging.error(f"生成 REALITY 密钥失败: {result.stderr}")
+            return None
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Key generation timeout")
-    except HTTPException:
-        raise
+        logging.error("生成 REALITY 密钥超时")
+        return None
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"生成 REALITY 密钥异常: {e}")
+        return None
+
+
+@app.post("/api/ingress/v2ray/reality/generate-keys")
+def api_generate_reality_keys():
+    """生成 REALITY 密钥对"""
+    keys = _generate_xray_reality_keys()
+    if keys:
+        return keys
+    else:
+        raise HTTPException(status_code=500, detail="Failed to generate REALITY keys")
 
 
 # ============ Xray Egress Control APIs ============
@@ -9871,6 +9970,7 @@ def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
         })
 
     elif payload.tunnel_type == "xray":
+        # Xray 节点使用 VLESS+XHTTP+REALITY 协议
         # 生成或获取 Xray 配置
         if not node.get("xray_uuid"):
             import uuid as uuid_module
@@ -9887,7 +9987,7 @@ def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
                         node["tag"],
                         xray_uuid=xray_uuid,
                         xray_socks_port=xray_socks_port,
-                        xray_protocol=payload.xray_protocol or "vless",
+                        xray_protocol="vless",  # 固定为 VLESS
                     )
                     break  # 成功则跳出重试循环
                 except Exception as e:
@@ -9901,17 +10001,961 @@ def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
             node["xray_uuid"] = xray_uuid
             node["xray_socks_port"] = xray_socks_port
 
+        # 存储对端的 REALITY 配置（用于本节点作为客户端连接对端）
+        peer_update = {}
+        if payload.xray_reality_public_key:
+            peer_update["xray_peer_reality_public_key"] = payload.xray_reality_public_key
+        if payload.xray_reality_short_id:
+            peer_update["xray_peer_reality_short_id"] = payload.xray_reality_short_id
+        if payload.xray_reality_dest:
+            peer_update["xray_peer_reality_dest"] = payload.xray_reality_dest
+        if payload.xray_reality_server_names:
+            peer_update["xray_peer_reality_server_names"] = json.dumps(payload.xray_reality_server_names)
+        if payload.xray_xhttp_path:
+            # 存储对端的 XHTTP 配置（用于连接对端时使用）
+            # 注意：这些会覆盖本地的配置，所以只在没有本地配置时使用
+            pass  # 暂时不存储，使用对端返回的配置即可
+
+        if peer_update:
+            db.update_peer_node(node["tag"], **peer_update)
+            logging.info(f"[peer-auth] 存储对端 REALITY 配置: {list(peer_update.keys())}")
+
+        # 解析 server names JSON
+        server_names = node.get("xray_reality_server_names", '["www.microsoft.com"]')
+        try:
+            server_names_list = json.loads(server_names) if isinstance(server_names, str) else server_names
+        except (json.JSONDecodeError, TypeError):
+            server_names_list = ["www.microsoft.com"]
+
+        # 返回本节点的 REALITY 配置（供对端作为客户端连接本节点）
         response.update({
-            "xray_protocol": node.get("xray_protocol", "vless"),
+            "xray_protocol": "vless",  # 固定为 VLESS
             "xray_uuid": node.get("xray_uuid"),
             "xray_socks_port": node.get("xray_socks_port"),
+            # REALITY 服务端配置（对端连接时使用）
+            "xray_reality_public_key": node.get("xray_reality_public_key"),
+            "xray_reality_short_id": node.get("xray_reality_short_id"),
+            "xray_reality_dest": node.get("xray_reality_dest", "www.microsoft.com:443"),
+            "xray_reality_server_names": server_names_list,
+            # XHTTP 传输配置
+            "xray_xhttp_path": node.get("xray_xhttp_path", "/"),
+            "xray_xhttp_mode": node.get("xray_xhttp_mode", "auto"),
+            "xray_xhttp_host": node.get("xray_xhttp_host"),
         })
 
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported tunnel type: {payload.tunnel_type}")
 
+    # Phase 2: 添加入站信息（如果启用且端口已分配）
+    # 当本节点启用了入站监听时，将入站配置返回给对端
+    # 对端可以使用这些信息连接到本节点的入站端口
+    inbound_port = node.get("inbound_port")
+    if node.get("inbound_enabled") and inbound_port:
+        response.update({
+            "inbound_enabled": True,
+            "inbound_port": inbound_port,
+            # 入站 UUID（对端连接到本节点入站时使用）
+            "inbound_uuid": node.get("inbound_uuid"),
+            # 入站 REALITY 配置（使用与出站相同的密钥对）
+            "inbound_reality_public_key": node.get("xray_reality_public_key"),
+            "inbound_reality_short_id": node.get("xray_reality_short_id"),
+            # 注：dest 和 server_names 不返回，对端使用默认值 www.microsoft.com
+        })
+        logging.info(f"[peer-auth] 返回入站信息: port={inbound_port}, uuid={node.get('inbound_uuid')}")
+
     logging.info(f"[peer-auth] 参数交换成功: 本地节点 '{node['tag']}' (远程称为 '{payload.node_id}')")
     return response
+
+
+@app.post("/api/peer-notify/connected")
+def api_peer_notify_connected(request: Request, payload: PeerNotifyRequest):
+    """接收远程节点的连接通知
+
+    当远程节点完成隧道建立后调用此端点，通知本节点也建立其侧的隧道。
+    这实现了双向连接同步。
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 通过源 IP 查找对应的节点（该节点配置了连接到我们的 endpoint）
+    node = _find_peer_node_by_ip(db, client_ip)
+    if not node:
+        # 尝试通过 node_id 查找，但需要验证 IP 在合理范围内
+        candidate = db.get_peer_node(payload.node_id)
+        if candidate:
+            # 验证请求来源 IP 与节点配置的 endpoint 匹配（防止 node_id 泄露被利用）
+            endpoint = candidate.get("endpoint", "")
+            endpoint_host = endpoint.split(":")[0] if ":" in endpoint else endpoint
+            if endpoint_host and (endpoint_host == client_ip or _resolve_hostname(endpoint_host) == client_ip):
+                node = candidate
+            else:
+                logging.warning(f"[peer-notify] 节点 '{payload.node_id}' IP 不匹配: 期望={endpoint_host}, 实际={client_ip}")
+
+    if not node:
+        logging.warning(f"[peer-notify] 连接通知失败: 未找到匹配节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown peer")
+
+    # 验证 PSK
+    if not node.get("psk_hash") or not _verify_psk(payload.psk, node["psk_hash"]):
+        logging.warning(f"[peer-notify] PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    tag = node["tag"]
+    tunnel_type = node.get("tunnel_type", "wireguard")
+    current_status = node.get("tunnel_status", "disconnected")
+
+    logging.info(f"[peer-notify] 收到连接通知: 节点 '{tag}', 当前状态={current_status} (from {client_ip})")
+
+    # 如果已经连接，直接返回成功
+    if current_status == "connected":
+        return {"success": True, "message": "Already connected", "status": "connected"}
+
+    # 更新发起方的参数（如果提供）
+    if payload.initiator_public_key:
+        db.update_peer_node(
+            tag,
+            wg_peer_public_key=payload.initiator_public_key,
+            tunnel_remote_ip=payload.initiator_tunnel_ip,
+        )
+        # 重新获取更新后的节点信息
+        node = db.get_peer_node(tag)
+
+    # 检查是否有建立隧道所需的参数
+    if tunnel_type == "wireguard":
+        if not node.get("wg_private_key"):
+            logging.warning(f"[peer-notify] 节点 '{tag}' 缺少本地私钥，需要先进行参数交换")
+            raise HTTPException(
+                status_code=400,
+                detail="Missing local private key. Key exchange required first."
+            )
+        if not node.get("wg_peer_public_key"):
+            logging.warning(f"[peer-notify] 节点 '{tag}' 缺少对端公钥")
+            raise HTTPException(
+                status_code=400,
+                detail="Missing peer public key. Provide initiator_public_key or complete key exchange first."
+            )
+
+    # 建立本地隧道
+    try:
+        from peer_tunnel_manager import PeerTunnelManager
+        manager = PeerTunnelManager()
+        success = manager.connect_node(tag)
+
+        if success:
+            logging.info(f"[peer-notify] 节点 '{tag}' 隧道已建立（响应远程通知）")
+            return {"success": True, "message": "Tunnel established", "status": "connected"}
+        else:
+            updated_node = db.get_peer_node(tag)
+            internal_error = updated_node.get("last_error", "Unknown error")
+            logging.error(f"[peer-notify] 节点 '{tag}' 隧道建立失败: {internal_error}")
+            # 不暴露内部错误详情给客户端
+            raise HTTPException(status_code=500, detail="Tunnel setup failed")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"[peer-notify] 节点 '{tag}' 隧道建立异常: {e}")
+        # 不暴露内部异常详情给客户端
+        raise HTTPException(status_code=500, detail="Internal tunnel error")
+
+
+@app.post("/api/peer-notify/disconnected")
+def api_peer_notify_disconnected(request: Request, payload: PeerNotifyRequest):
+    """接收远程节点的断开通知
+
+    当远程节点断开隧道时调用此端点，通知本节点也断开其侧的隧道。
+    这实现了双向断开同步。
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 通过源 IP 查找对应的节点
+    node = _find_peer_node_by_ip(db, client_ip)
+    if not node:
+        # 尝试通过 node_id 查找，但需要验证 IP 在合理范围内
+        candidate = db.get_peer_node(payload.node_id)
+        if candidate:
+            # 验证请求来源 IP 与节点配置的 endpoint 匹配（防止 node_id 泄露被利用）
+            endpoint = candidate.get("endpoint", "")
+            endpoint_host = endpoint.split(":")[0] if ":" in endpoint else endpoint
+            if endpoint_host and (endpoint_host == client_ip or _resolve_hostname(endpoint_host) == client_ip):
+                node = candidate
+            else:
+                logging.warning(f"[peer-notify] 节点 '{payload.node_id}' IP 不匹配: 期望={endpoint_host}, 实际={client_ip}")
+
+    if not node:
+        logging.warning(f"[peer-notify] 断开通知失败: 未找到匹配节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown peer")
+
+    # 验证 PSK
+    if not node.get("psk_hash") or not _verify_psk(payload.psk, node["psk_hash"]):
+        logging.warning(f"[peer-notify] PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    tag = node["tag"]
+    current_status = node.get("tunnel_status", "disconnected")
+
+    logging.info(f"[peer-notify] 收到断开通知: 节点 '{tag}', 当前状态={current_status} (from {client_ip})")
+
+    # 如果已经断开，直接返回成功
+    if current_status == "disconnected":
+        return {"success": True, "message": "Already disconnected", "status": "disconnected"}
+
+    # 断开本地隧道
+    try:
+        from peer_tunnel_manager import PeerTunnelManager
+        manager = PeerTunnelManager()
+        success = manager.disconnect_node(tag)
+
+        if success:
+            logging.info(f"[peer-notify] 节点 '{tag}' 隧道已断开（响应远程通知）")
+            return {"success": True, "message": "Tunnel disconnected", "status": "disconnected"}
+        else:
+            # 断开失败也更新状态（可能接口已经不存在）
+            db.update_peer_node(tag, tunnel_status="disconnected")
+            return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
+    except Exception as e:
+        logging.warning(f"[peer-notify] 节点 '{tag}' 断开异常: {e}")
+        # 异常情况下也标记为断开
+        db.update_peer_node(tag, tunnel_status="disconnected")
+        return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
+
+
+# ============ Peer Notification Helpers ============
+
+
+def _notify_peer_connected(db, node: dict) -> bool:
+    """通知远程节点我们已建立隧道
+
+    调用远程节点的 /api/peer-notify/connected 端点，
+    让对方也建立其侧的隧道，实现双向连接。
+
+    Args:
+        db: 数据库实例
+        node: 节点信息字典
+
+    Returns:
+        是否通知成功
+    """
+    import requests
+
+    tag = node["tag"]
+    endpoint = node.get("endpoint", "")
+    psk_encrypted = node.get("psk_encrypted")
+
+    if not endpoint or not psk_encrypted:
+        logging.warning(f"[peer-notify] 无法通知节点 '{tag}': 缺少 endpoint 或 PSK")
+        return False
+
+    # 解密 PSK
+    try:
+        psk = _decrypt_psk(psk_encrypted)
+    except ValueError as e:
+        logging.warning(f"[peer-notify] 解密 PSK 失败: {e}")
+        return False
+
+    # 从 endpoint 推导 API URL
+    # endpoint 格式: host:wg_port, API 端口 = wg_port - 100
+    if ":" in endpoint:
+        host, wg_port_str = endpoint.rsplit(":", 1)
+        try:
+            wg_port = int(wg_port_str)
+            api_port = wg_port - 100
+        except ValueError:
+            api_port = 36000
+    else:
+        host = endpoint
+        api_port = 36000
+
+    notify_url = f"http://{host}:{api_port}/api/peer-notify/connected"
+
+    # 准备通知请求
+    payload = {
+        "psk": psk,
+        "node_id": tag,
+        # 提供我们的参数，让对方可以连接到我们
+        "initiator_endpoint": f"{_get_local_ip()}:{node.get('tunnel_port', 36300)}",
+        "initiator_public_key": node.get("wg_public_key"),
+        "initiator_tunnel_ip": node.get("tunnel_local_ip"),
+    }
+
+    try:
+        logging.info(f"[peer-notify] 通知远程节点 '{tag}' 建立隧道: {notify_url}")
+        resp = requests.post(
+            notify_url,
+            json=payload,
+            timeout=30
+        )
+
+        if resp.status_code == 200:
+            logging.info(f"[peer-notify] 远程节点 '{tag}' 已确认建立隧道")
+            return True
+        else:
+            logging.warning(f"[peer-notify] 远程节点 '{tag}' 响应: {resp.status_code} - {resp.text}")
+            return False
+    except requests.RequestException as e:
+        logging.warning(f"[peer-notify] 通知节点 '{tag}' 失败: {e}")
+        return False
+
+
+def _notify_peer_disconnected(db, node: dict) -> bool:
+    """通知远程节点我们已断开隧道
+
+    调用远程节点的 /api/peer-notify/disconnected 端点，
+    让对方也断开其侧的隧道，实现双向断开。
+
+    Args:
+        db: 数据库实例
+        node: 节点信息字典
+
+    Returns:
+        是否通知成功
+    """
+    import requests
+
+    tag = node["tag"]
+    endpoint = node.get("endpoint", "")
+    psk_encrypted = node.get("psk_encrypted")
+
+    if not endpoint or not psk_encrypted:
+        return False
+
+    # 解密 PSK
+    try:
+        psk = _decrypt_psk(psk_encrypted)
+    except ValueError:
+        return False
+
+    # 从 endpoint 推导 API URL
+    if ":" in endpoint:
+        host, wg_port_str = endpoint.rsplit(":", 1)
+        try:
+            wg_port = int(wg_port_str)
+            api_port = wg_port - 100
+        except ValueError:
+            api_port = 36000
+    else:
+        host = endpoint
+        api_port = 36000
+
+    notify_url = f"http://{host}:{api_port}/api/peer-notify/disconnected"
+
+    payload = {
+        "psk": psk,
+        "node_id": tag,
+    }
+
+    try:
+        logging.info(f"[peer-notify] 通知远程节点 '{tag}' 断开隧道: {notify_url}")
+        resp = requests.post(
+            notify_url,
+            json=payload,
+            timeout=10  # 断开通知超时短一些
+        )
+        return resp.status_code == 200
+    except requests.RequestException as e:
+        logging.warning(f"[peer-notify] 通知节点 '{tag}' 断开失败: {e}")
+        return False
+
+
+# ============ Cascade Notification Helpers ============
+
+def _is_duplicate_notification(notification_id: str) -> bool:
+    """检查通知是否重复（防止循环通知）
+
+    Args:
+        notification_id: 唯一通知 ID
+
+    Returns:
+        True 如果是重复通知，False 如果是新通知
+    """
+    import time
+    now = time.time()
+
+    with _cascade_notification_lock:
+        # 检查是否已存在
+        if notification_id in _cascade_notification_cache:
+            return True
+
+        # 添加到缓存
+        _cascade_notification_cache[notification_id] = now
+
+        # 清理过期条目
+        cutoff = now - _CASCADE_NOTIFICATION_TTL
+        expired_keys = [k for k, v in _cascade_notification_cache.items() if v < cutoff]
+        for k in expired_keys:
+            del _cascade_notification_cache[k]
+
+        # 防止缓存过大
+        if len(_cascade_notification_cache) > _CASCADE_NOTIFICATION_MAX_SIZE:
+            # 删除最老的一半
+            sorted_items = sorted(_cascade_notification_cache.items(), key=lambda x: x[1])
+            for k, _ in sorted_items[:len(sorted_items) // 2]:
+                del _cascade_notification_cache[k]
+
+        return False
+
+
+def _forward_downstream_disconnected(
+    db,
+    upstream_reg: dict,
+    chain_id: str,
+    disconnected_node: str,
+    notification_id: str,
+    timestamp: str
+) -> bool:
+    """向上游节点转发下游断连通知
+
+    Args:
+        db: 数据库实例
+        upstream_reg: 上游注册信息
+        chain_id: 链路 ID
+        disconnected_node: 断开的节点标签
+        notification_id: 通知 ID（用于去重）
+        timestamp: 原始时间戳
+
+    Returns:
+        是否转发成功
+    """
+    import requests
+
+    upstream_endpoint = upstream_reg.get("upstream_endpoint", "")
+    if not upstream_endpoint:
+        logging.warning(f"[cascade-notify] 无法转发: 缺少 upstream_endpoint")
+        return False
+
+    # 解析端点
+    if ":" in upstream_endpoint:
+        host, port = upstream_endpoint.rsplit(":", 1)
+        try:
+            api_port = int(port)
+        except ValueError:
+            api_port = 36000
+    else:
+        host = upstream_endpoint
+        api_port = 36000
+
+    # 获取本节点配置的 PSK 用于与上游通信
+    # 注意：这里需要找到对应的本地节点配置来获取 PSK
+    upstream_node_tag = upstream_reg.get("upstream_node_tag", "")
+    local_node = db.get_peer_node(upstream_node_tag) if upstream_node_tag else None
+
+    if not local_node:
+        logging.warning(f"[cascade-notify] 无法转发: 未找到上游节点 '{upstream_node_tag}'")
+        return False
+
+    # 解密 PSK
+    psk_encrypted = local_node.get("psk_encrypted")
+    if not psk_encrypted:
+        logging.warning(f"[cascade-notify] 无法转发: 节点 '{upstream_node_tag}' 缺少 PSK")
+        return False
+
+    try:
+        psk = _decrypt_psk(psk_encrypted)
+    except Exception as e:
+        logging.warning(f"[cascade-notify] 解密 PSK 失败: {e}")
+        return False
+
+    notify_url = f"http://{host}:{api_port}/api/peer-notify/downstream-disconnected"
+    payload = {
+        "psk": psk,
+        "node_id": local_node.get("tag", ""),
+        "chain_id": chain_id,
+        "disconnected_node": disconnected_node,
+        "notification_id": notification_id,
+        "timestamp": timestamp,
+    }
+
+    try:
+        logging.info(f"[cascade-notify] 转发下游断连通知到 '{upstream_node_tag}': {notify_url}")
+        resp = requests.post(notify_url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logging.info(f"[cascade-notify] 上游节点 '{upstream_node_tag}' 已收到通知")
+            return True
+        else:
+            logging.warning(f"[cascade-notify] 上游节点响应: {resp.status_code} - {resp.text}")
+            return False
+    except requests.RequestException as e:
+        logging.warning(f"[cascade-notify] 转发失败: {e}")
+        return False
+
+
+def _get_local_api_endpoint() -> str:
+    """获取本地 API 端点
+
+    用于向其他节点注册时提供回调地址。
+    优先使用设置中的 server_endpoint，否则尝试自动检测。
+    """
+    import socket
+
+    # 从设置中读取
+    settings = _load_settings()
+    server_endpoint = settings.get("server_endpoint", "")
+    if server_endpoint:
+        # 确保有端口
+        if ":" not in server_endpoint:
+            return f"{server_endpoint}:36000"
+        return server_endpoint
+
+    # 自动检测
+    try:
+        # 获取本地 IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            return f"{local_ip}:36000"
+        finally:
+            s.close()
+    except Exception:
+        pass
+
+    return "127.0.0.1:36000"
+
+
+def _register_chain_with_peers(db, chain: dict) -> dict:
+    """向链路中的中间节点发送注册请求
+
+    当链路启用时，需要向所有中间节点注册，以便它们知道此链路经过它们。
+
+    Args:
+        db: 数据库实例
+        chain: 链路配置字典
+
+    Returns:
+        注册结果 {tag: success_bool, ...}
+    """
+    import requests
+
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        hops = json.loads(hops)
+
+    if len(hops) < 2:
+        return {}  # 少于 2 跳无需注册
+
+    chain_id = chain.get("tag", "")
+    local_endpoint = _get_local_api_endpoint()
+    results = {}
+
+    # 对于 A → B → C 的链路:
+    # - 向 B 注册，告知 C 是下游
+    # 对于 A → B → C → D:
+    # - 向 B 注册，告知后面都是下游（C, D）
+    # - 向 C 注册，告知 D 是下游
+
+    for i in range(len(hops) - 1):
+        intermediate_tag = hops[i]
+        downstream_tag = hops[i + 1]  # 直接下游节点
+
+        # 获取中间节点信息
+        intermediate_node = db.get_peer_node(intermediate_tag)
+        if not intermediate_node:
+            logging.warning(f"[chain-register] 中间节点 '{intermediate_tag}' 不存在，跳过")
+            results[intermediate_tag] = False
+            continue
+
+        endpoint = intermediate_node.get("endpoint", "")
+        if not endpoint:
+            logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 无端点，跳过")
+            results[intermediate_tag] = False
+            continue
+
+        # 解析端点获取 API 地址
+        if ":" in endpoint:
+            host, port = endpoint.rsplit(":", 1)
+        else:
+            host = endpoint
+            port = "36100"
+
+        # API 端口默认 36000
+        api_endpoint = f"{host}:36000"
+
+        # 获取 PSK（用于向此节点认证）
+        psk_encrypted = intermediate_node.get("psk_encrypted", "")
+        if not psk_encrypted:
+            logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 无加密 PSK，跳过")
+            results[intermediate_tag] = False
+            continue
+
+        try:
+            psk = _decrypt_psk(psk_encrypted)
+        except Exception as e:
+            logging.warning(f"[chain-register] 解密节点 '{intermediate_tag}' PSK 失败: {e}")
+            results[intermediate_tag] = False
+            continue
+
+        # 发送注册请求
+        register_url = f"http://{api_endpoint}/api/peer-chain/register"
+        payload = {
+            "psk": psk,
+            "node_id": intermediate_tag,  # 这是我们认识的节点 tag
+            "chain_id": chain_id,
+            "upstream_endpoint": local_endpoint,
+            "downstream_node": downstream_tag,
+        }
+
+        try:
+            logging.info(f"[chain-register] 向 '{intermediate_tag}' 注册链路 '{chain_id}'")
+            resp = requests.post(register_url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logging.info(f"[chain-register] 节点 '{intermediate_tag}' 注册成功")
+                results[intermediate_tag] = True
+            else:
+                logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 注册失败: {resp.status_code}")
+                results[intermediate_tag] = False
+        except requests.RequestException as e:
+            logging.warning(f"[chain-register] 向 '{intermediate_tag}' 注册失败: {e}")
+            results[intermediate_tag] = False
+
+    return results
+
+
+def _unregister_chain_from_peers(db, chain: dict) -> dict:
+    """向链路中的中间节点发送注销请求
+
+    当链路禁用或删除时，需要通知所有中间节点注销此链路注册。
+
+    Args:
+        db: 数据库实例
+        chain: 链路配置字典
+
+    Returns:
+        注销结果 {tag: success_bool, ...}
+    """
+    import requests
+
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        hops = json.loads(hops)
+
+    if len(hops) < 2:
+        return {}
+
+    chain_id = chain.get("tag", "")
+    results = {}
+
+    for i in range(len(hops) - 1):
+        intermediate_tag = hops[i]
+
+        intermediate_node = db.get_peer_node(intermediate_tag)
+        if not intermediate_node:
+            results[intermediate_tag] = False
+            continue
+
+        endpoint = intermediate_node.get("endpoint", "")
+        if not endpoint:
+            results[intermediate_tag] = False
+            continue
+
+        if ":" in endpoint:
+            host, port = endpoint.rsplit(":", 1)
+        else:
+            host = endpoint
+
+        api_endpoint = f"{host}:36000"
+
+        psk_encrypted = intermediate_node.get("psk_encrypted", "")
+        if not psk_encrypted:
+            results[intermediate_tag] = False
+            continue
+
+        try:
+            psk = _decrypt_psk(psk_encrypted)
+        except Exception:
+            results[intermediate_tag] = False
+            continue
+
+        unregister_url = f"http://{api_endpoint}/api/peer-chain/unregister"
+        payload = {
+            "psk": psk,
+            "node_id": intermediate_tag,
+            "chain_id": chain_id,
+        }
+
+        try:
+            logging.info(f"[chain-unregister] 向 '{intermediate_tag}' 注销链路 '{chain_id}'")
+            resp = requests.request("DELETE", unregister_url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                logging.info(f"[chain-unregister] 节点 '{intermediate_tag}' 注销成功")
+                results[intermediate_tag] = True
+            else:
+                logging.warning(f"[chain-unregister] 节点 '{intermediate_tag}' 注销失败: {resp.status_code}")
+                results[intermediate_tag] = False
+        except requests.RequestException as e:
+            logging.warning(f"[chain-unregister] 向 '{intermediate_tag}' 注销失败: {e}")
+            results[intermediate_tag] = False
+
+    return results
+
+
+# ============ Cascade Notification Endpoints ============
+
+class DownstreamDisconnectedRequest(BaseModel):
+    """下游断连通知请求"""
+    psk: str
+    node_id: str  # 发送通知的节点 ID
+    chain_id: str  # 链路 ID
+    disconnected_node: str  # 断开的下游节点
+    notification_id: str  # 唯一通知 ID（用于去重）
+    timestamp: str  # 断开时间戳
+
+
+@app.post("/api/peer-notify/downstream-disconnected")
+def api_peer_notify_downstream_disconnected(request: Request, payload: DownstreamDisconnectedRequest):
+    """接收下游节点断连通知
+
+    当链路中的下游节点断开时，中间节点会调用此端点通知上游节点。
+    实现级联通知机制。
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 去重检查（防止循环通知）
+    if _is_duplicate_notification(payload.notification_id):
+        logging.info(f"[cascade-notify] 忽略重复通知: {payload.notification_id[:8]}...")
+        return {"status": "duplicate", "forwarded": False}
+
+    # 通过源 IP 或 node_id 查找发送通知的节点
+    node = _find_peer_node_by_ip(db, client_ip)
+    if not node:
+        candidate = db.get_peer_node(payload.node_id)
+        if candidate:
+            endpoint = candidate.get("endpoint", "")
+            endpoint_host = endpoint.split(":")[0] if ":" in endpoint else endpoint
+            if endpoint_host and (endpoint_host == client_ip or _resolve_hostname(endpoint_host) == client_ip):
+                node = candidate
+            else:
+                logging.warning(f"[cascade-notify] 节点 '{payload.node_id}' IP 不匹配")
+
+    if not node:
+        logging.warning(f"[cascade-notify] 未找到匹配节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown peer")
+
+    # 验证 PSK
+    if not node.get("psk_hash") or not _verify_psk(payload.psk, node["psk_hash"]):
+        logging.warning(f"[cascade-notify] PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(
+        f"[cascade-notify] 收到下游断连通知: chain={payload.chain_id}, "
+        f"disconnected={payload.disconnected_node} (from {node['tag']})"
+    )
+
+    # 更新本地链路状态
+    db.update_chain_downstream_status(
+        payload.chain_id,
+        "disconnected",
+        payload.disconnected_node
+    )
+
+    # 检查是否需要继续向上游转发
+    upstream_reg = db.get_chain_upstream_registration(payload.chain_id)
+    forwarded = False
+    if upstream_reg:
+        forwarded = _forward_downstream_disconnected(
+            db,
+            upstream_reg,
+            payload.chain_id,
+            payload.disconnected_node,
+            payload.notification_id,
+            payload.timestamp
+        )
+
+    return {"status": "received", "forwarded": forwarded}
+
+
+class ChainRegisterRequest(BaseModel):
+    """链路注册请求"""
+    psk: str
+    node_id: str  # 发送请求的节点 ID（上游节点）
+    chain_id: str  # 链路 ID
+    upstream_endpoint: str  # 上游节点端点（用于发送断连通知）
+    downstream_node: str  # 下游节点标签
+
+
+@app.post("/api/peer-chain/register")
+def api_peer_chain_register(request: Request, payload: ChainRegisterRequest):
+    """注册链路经过此节点
+
+    当上游节点启用链路时，向中间节点发送注册请求。
+    中间节点记录链路信息，以便在下游断开时发送通知。
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 通过源 IP 或 node_id 查找发送请求的节点
+    node = _find_peer_node_by_ip(db, client_ip)
+    if not node:
+        candidate = db.get_peer_node(payload.node_id)
+        if candidate:
+            endpoint = candidate.get("endpoint", "")
+            endpoint_host = endpoint.split(":")[0] if ":" in endpoint else endpoint
+            if endpoint_host and (endpoint_host == client_ip or _resolve_hostname(endpoint_host) == client_ip):
+                node = candidate
+
+    if not node:
+        logging.warning(f"[chain-register] 未找到匹配节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown peer")
+
+    # 验证 PSK
+    if not node.get("psk_hash") or not _verify_psk(payload.psk, node["psk_hash"]):
+        logging.warning(f"[chain-register] PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(
+        f"[chain-register] 注册链路: chain={payload.chain_id}, "
+        f"upstream={payload.node_id}, downstream={payload.downstream_node}"
+    )
+
+    # 添加链路注册（保存 PSK 以便后续向上游发送通知时使用）
+    db.add_chain_registration(
+        chain_id=payload.chain_id,
+        upstream_node_tag=payload.node_id,
+        upstream_endpoint=payload.upstream_endpoint,
+        upstream_psk=payload.psk,
+        downstream_node_tag=payload.downstream_node
+    )
+
+    return {"status": "registered", "chain_id": payload.chain_id}
+
+
+class ChainUnregisterRequest(BaseModel):
+    """链路注销请求"""
+    psk: str
+    node_id: str  # 发送请求的节点 ID（上游节点）
+    chain_id: str  # 链路 ID
+
+
+@app.delete("/api/peer-chain/unregister")
+def api_peer_chain_unregister(request: Request, payload: ChainUnregisterRequest):
+    """注销链路
+
+    当上游节点禁用链路时，向中间节点发送注销请求。
+    中间节点删除链路记录。
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 通过源 IP 或 node_id 查找发送请求的节点
+    node = _find_peer_node_by_ip(db, client_ip)
+    if not node:
+        candidate = db.get_peer_node(payload.node_id)
+        if candidate:
+            endpoint = candidate.get("endpoint", "")
+            endpoint_host = endpoint.split(":")[0] if ":" in endpoint else endpoint
+            if endpoint_host and (endpoint_host == client_ip or _resolve_hostname(endpoint_host) == client_ip):
+                node = candidate
+
+    if not node:
+        logging.warning(f"[chain-unregister] 未找到匹配节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown peer")
+
+    # 验证 PSK
+    if not node.get("psk_hash") or not _verify_psk(payload.psk, node["psk_hash"]):
+        logging.warning(f"[chain-unregister] PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(f"[chain-unregister] 注销链路: chain={payload.chain_id}, from={payload.node_id}")
+
+    # 删除链路注册
+    deleted = db.delete_chain_registration(payload.chain_id, payload.node_id)
+
+    return {"status": "unregistered" if deleted else "not_found", "chain_id": payload.chain_id}
+
+
+def _resolve_hostname(hostname: str) -> Optional[str]:
+    """解析主机名为 IP 地址
+
+    Args:
+        hostname: 要解析的主机名
+
+    Returns:
+        解析后的 IP 地址，失败返回 None
+    """
+    import socket
+    try:
+        return socket.gethostbyname(hostname)
+    except socket.gaierror:
+        return None
+
+
+def _get_local_ip() -> str:
+    """获取本机 IP 地址（用于告知对端如何连接我们）"""
+    import socket
+    try:
+        # 通过连接外部地址来获取本机 IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except Exception:
+        return "127.0.0.1"
 
 
 # ============ Endpoint Validation Helper ============
@@ -9959,6 +11003,124 @@ def _validate_endpoint(endpoint: str) -> tuple:
 
 # ============ Peer Node CRUD API ============
 
+
+def _check_peer_tunnel_status(node: dict) -> str:
+    """检查对等节点隧道的实时状态
+
+    对于 WireGuard 隧道：检查接口是否存在以及最后握手时间
+    对于 Xray 隧道：检查 SOCKS 端口是否响应
+
+    Args:
+        node: 节点信息字典
+
+    Returns:
+        实时状态: "connected", "disconnected", "stale"
+    """
+    import time
+
+    db_status = node.get("tunnel_status", "disconnected")
+    tunnel_type = node.get("tunnel_type", "wireguard")
+
+    # 如果数据库状态不是已连接，直接返回
+    if db_status != "connected":
+        return db_status
+
+    if tunnel_type == "wireguard":
+        tunnel_interface = node.get("tunnel_interface")
+        if not tunnel_interface:
+            return "disconnected"
+
+        try:
+            # 检查接口是否存在
+            result = subprocess.run(
+                ["ip", "link", "show", tunnel_interface],
+                capture_output=True, timeout=5
+            )
+            if result.returncode != 0:
+                return "disconnected"
+
+            # 检查最后握手时间
+            result = subprocess.run(
+                ["wg", "show", tunnel_interface, "latest-handshakes"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                return "disconnected"
+
+            # 解析握手时间
+            output = result.stdout.strip()
+            if output:
+                parts = output.split()
+                if len(parts) >= 2:
+                    try:
+                        last_handshake = int(parts[1])
+                        # 如果握手时间为0，说明接口已创建但尚未完成握手
+                        # 这是正常的"正在连接"状态，不应该标记为断开
+                        if last_handshake == 0:
+                            return "connecting"  # 接口已创建，等待握手
+                        elapsed = int(time.time()) - last_handshake
+                        if elapsed > 180:
+                            return "stale"  # 握手超时
+                    except ValueError:
+                        pass
+
+            return "connected"
+        except (subprocess.TimeoutExpired, Exception) as e:
+            logging.warning(f"[peers] 检查 WireGuard 隧道状态失败: {e}")
+            return db_status  # 检查失败时返回数据库状态
+
+    elif tunnel_type == "xray":
+        xray_socks_port = node.get("xray_socks_port")
+        if not xray_socks_port:
+            return "disconnected"
+
+        try:
+            import socket
+            # 尝试连接 SOCKS 端口
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex(("127.0.0.1", xray_socks_port))
+            sock.close()
+
+            if result == 0:
+                return "connected"
+            else:
+                return "disconnected"
+        except Exception as e:
+            logging.warning(f"[peers] 检查 Xray 隧道状态失败: {e}")
+            return db_status
+
+    return db_status
+
+
+def _update_stale_peer_status(db, node: dict, real_status: str) -> None:
+    """如果实时状态与数据库状态不一致，更新数据库
+
+    Args:
+        db: 数据库实例
+        node: 节点信息
+        real_status: 实时检测到的状态 (connected/connecting/stale/disconnected)
+    """
+    tag = node.get("tag")
+    db_status = node.get("tunnel_status", "disconnected")
+
+    # 如果实时状态是 "connecting"，说明接口已创建但尚未完成握手
+    # 这是正常状态，不需要更新数据库（保持 "connected" 状态）
+    if real_status == "connecting":
+        return
+
+    if real_status in ("disconnected", "stale") and db_status == "connected":
+        try:
+            db.update_peer_node(
+                tag,
+                tunnel_status="disconnected",
+                last_error="隧道连接已断开（远端不可达）"
+            )
+            logging.info(f"[peers] 节点 '{tag}' 状态已更新为 disconnected（实时检测）")
+        except Exception as e:
+            logging.warning(f"[peers] 更新节点 '{tag}' 状态失败: {e}")
+
+
 @app.get("/api/peers")
 def api_list_peers(enabled_only: bool = False):
     """列出所有对等节点"""
@@ -9968,8 +11130,20 @@ def api_list_peers(enabled_only: bool = False):
     db = _get_db()
     nodes = db.get_peer_nodes(enabled_only=enabled_only)
 
-    # 隐藏敏感字段
+    # 实时检测隧道状态并更新
     for node in nodes:
+        if node.get("tunnel_status") == "connected":
+            real_status = _check_peer_tunnel_status(node)
+            if real_status == "connecting":
+                # 接口已创建但尚未完成握手，保持 "connected" 状态
+                # 这是刚连接后的正常过渡状态
+                pass
+            elif real_status != "connected":
+                # 真正的断开状态（disconnected 或 stale）
+                _update_stale_peer_status(db, node, real_status)
+                node["tunnel_status"] = "disconnected"
+
+        # 隐藏敏感字段
         node.pop("psk_hash", None)
         node.pop("psk_encrypted", None)
         node.pop("wg_private_key", None)
@@ -9989,6 +11163,16 @@ def api_get_peer(tag: str):
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
+    # 实时检测隧道状态并更新
+    if node.get("tunnel_status") == "connected":
+        real_status = _check_peer_tunnel_status(node)
+        if real_status == "connecting":
+            # 接口已创建但尚未完成握手，保持 "connected" 状态
+            pass
+        elif real_status != "connected":
+            _update_stale_peer_status(db, node, real_status)
+            node["tunnel_status"] = "disconnected"
+
     # 隐藏敏感字段
     node.pop("psk_hash", None)
     node.pop("psk_encrypted", None)
@@ -9999,7 +11183,11 @@ def api_get_peer(tag: str):
 
 @app.post("/api/peers")
 def api_create_peer(payload: PeerNodeCreateRequest):
-    """创建新的对等节点"""
+    """创建新的对等节点
+
+    对于 Xray 类型节点，自动生成 REALITY 密钥（私钥、公钥、Short ID）。
+    固定使用 VLESS+XHTTP+REALITY 协议组合。
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -10018,10 +11206,6 @@ def api_create_peer(payload: PeerNodeCreateRequest):
     if payload.tunnel_type not in ("wireguard", "xray"):
         raise HTTPException(status_code=400, detail="tunnel_type 必须是 wireguard 或 xray")
 
-    # 验证 Xray 协议
-    if payload.xray_protocol not in ("vless", "vmess", "trojan"):
-        raise HTTPException(status_code=400, detail="xray_protocol 必须是 vless, vmess 或 trojan")
-
     # 验证默认出口存在
     if payload.default_outbound:
         available = _get_available_outbounds(db)
@@ -10030,6 +11214,23 @@ def api_create_peer(payload: PeerNodeCreateRequest):
 
     # 使用 bcrypt 哈希 PSK，同时保存原始 PSK 用于发起连接
     psk_hash = bcrypt.hashpw(payload.psk.encode(), bcrypt.gensalt()).decode()
+
+    # 为 Xray 节点自动生成 REALITY 密钥
+    xray_reality_private_key = None
+    xray_reality_public_key = None
+    xray_reality_short_id = None
+
+    if payload.tunnel_type == "xray":
+        reality_keys = _generate_xray_reality_keys()
+        if not reality_keys:
+            raise HTTPException(status_code=500, detail="生成 REALITY 密钥失败")
+        xray_reality_private_key = reality_keys["private_key"]
+        xray_reality_public_key = reality_keys["public_key"]
+        xray_reality_short_id = reality_keys["short_id"]
+        logging.info(f"[peers] 为节点 '{payload.tag}' 生成 REALITY 密钥")
+
+    # 将 Server Names 列表转为 JSON 字符串存储
+    xray_reality_server_names = json.dumps(payload.xray_reality_server_names)
 
     try:
         node_id = db.add_peer_node(
@@ -10040,9 +11241,20 @@ def api_create_peer(payload: PeerNodeCreateRequest):
             psk_hash=psk_hash,
             psk_encrypted=_encrypt_psk(payload.psk),  # 加密后存储
             tunnel_type=payload.tunnel_type,
-            xray_protocol=payload.xray_protocol,
-            tls_verify=bool(payload.tls_verify),
-            tls_fingerprint=payload.tls_fingerprint,
+            # Xray 协议固定为 VLESS
+            xray_protocol="vless",
+            # REALITY 配置
+            xray_reality_private_key=xray_reality_private_key,
+            xray_reality_public_key=xray_reality_public_key,
+            xray_reality_short_id=xray_reality_short_id,
+            xray_reality_dest=payload.xray_reality_dest,
+            xray_reality_server_names=xray_reality_server_names,
+            # XHTTP 传输配置
+            xray_xhttp_path=payload.xray_xhttp_path,
+            xray_xhttp_mode=payload.xray_xhttp_mode,
+            xray_xhttp_host=payload.xray_xhttp_host,
+            # 连接模式
+            connection_mode=payload.connection_mode,
             default_outbound=payload.default_outbound,
             auto_reconnect=payload.auto_reconnect,
             enabled=payload.enabled,
@@ -10093,10 +11305,29 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
         if payload.tunnel_type not in ("wireguard", "xray"):
             raise HTTPException(status_code=400, detail="tunnel_type 必须是 wireguard 或 xray")
         update_kwargs["tunnel_type"] = payload.tunnel_type
-    if payload.xray_protocol is not None:
-        if payload.xray_protocol not in ("vless", "vmess", "trojan"):
-            raise HTTPException(status_code=400, detail="xray_protocol 必须是 vless, vmess 或 trojan")
-        update_kwargs["xray_protocol"] = payload.xray_protocol
+        # 如果切换到 xray 且没有 REALITY 密钥，自动生成
+        if payload.tunnel_type == "xray" and not node.get("xray_reality_private_key"):
+            reality_keys = _generate_xray_reality_keys()
+            if reality_keys:
+                update_kwargs["xray_reality_private_key"] = reality_keys["private_key"]
+                update_kwargs["xray_reality_public_key"] = reality_keys["public_key"]
+                update_kwargs["xray_reality_short_id"] = reality_keys["short_id"]
+                logging.info(f"[peers] 为节点 '{tag}' 生成 REALITY 密钥")
+
+    # REALITY 配置
+    if payload.xray_reality_dest is not None:
+        update_kwargs["xray_reality_dest"] = payload.xray_reality_dest
+    if payload.xray_reality_server_names is not None:
+        update_kwargs["xray_reality_server_names"] = json.dumps(payload.xray_reality_server_names)
+
+    # XHTTP 传输配置
+    if payload.xray_xhttp_path is not None:
+        update_kwargs["xray_xhttp_path"] = payload.xray_xhttp_path
+    if payload.xray_xhttp_mode is not None:
+        update_kwargs["xray_xhttp_mode"] = payload.xray_xhttp_mode
+    if payload.xray_xhttp_host is not None:
+        update_kwargs["xray_xhttp_host"] = payload.xray_xhttp_host
+
     if payload.default_outbound is not None:
         if payload.default_outbound:
             available = _get_available_outbounds(db)
@@ -10107,10 +11338,9 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
         update_kwargs["auto_reconnect"] = payload.auto_reconnect
     if payload.enabled is not None:
         update_kwargs["enabled"] = payload.enabled
-    if payload.tls_verify is not None:
-        update_kwargs["tls_verify"] = payload.tls_verify
-    if payload.tls_fingerprint is not None:
-        update_kwargs["tls_fingerprint"] = payload.tls_fingerprint
+    # 连接模式
+    if payload.connection_mode is not None:
+        update_kwargs["connection_mode"] = payload.connection_mode
 
     if not update_kwargs:
         return {"message": "没有需要更新的字段", "peer": node}
@@ -10122,6 +11352,7 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
     updated_node = db.get_peer_node(tag)
     updated_node.pop("psk_hash", None)
     updated_node.pop("wg_private_key", None)
+    updated_node.pop("xray_reality_private_key", None)  # 不返回私钥
 
     logging.info(f"[peers] 更新节点 '{tag}'")
     return {"message": f"节点 '{tag}' 已更新", "peer": updated_node}
@@ -10242,6 +11473,10 @@ def _do_peer_exchange(db, node: dict) -> dict:
         host = endpoint
         api_port = 36000
 
+    # 如果明确指定了 api_port，优先使用（支持端口映射场景）
+    if node.get("api_port"):
+        api_port = node["api_port"]
+
     # 构建远程 API URL
     remote_api_url = f"http://{host}:{api_port}/api/peer-auth/exchange"
 
@@ -10277,7 +11512,7 @@ def _do_peer_exchange(db, node: dict) -> dict:
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=502, detail=f"无法连接到远程节点 {host}:36000")
+        raise HTTPException(status_code=502, detail=f"无法连接到远程节点 {host}:{api_port}")
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=504, detail=f"连接远程节点 {host} 超时")
     except requests.exceptions.HTTPError as e:
@@ -10319,12 +11554,33 @@ def _do_peer_exchange(db, node: dict) -> dict:
 
     elif tunnel_type == "xray":
         remote_uuid = data.get("xray_uuid")
-        remote_socks_port = data.get("xray_socks_port")
 
         if remote_uuid:
             update_data["xray_uuid"] = remote_uuid
-        if remote_socks_port:
-            update_data["xray_socks_port"] = remote_socks_port
+        # 注意：不存储远程的 xray_socks_port，本地 SOCKS 端口由创建隧道时分配
+        # 远程的 SOCKS 端口对我们没有用处
+
+    # Phase 2: 存储对端的入站信息（如果有）
+    # 对端如果启用了入站，会返回入站配置
+    # 我们将这些信息存储在 peer_inbound_* 字段中，供后续连接到对端入站使用
+    peer_inbound_port = data.get("inbound_port")
+    if data.get("inbound_enabled") and peer_inbound_port:
+        update_data["peer_inbound_enabled"] = 1
+        update_data["peer_inbound_port"] = peer_inbound_port
+        if data.get("inbound_uuid"):
+            update_data["peer_inbound_uuid"] = data.get("inbound_uuid")
+        if data.get("inbound_reality_public_key"):
+            update_data["peer_inbound_reality_public_key"] = data.get("inbound_reality_public_key")
+        if data.get("inbound_reality_short_id"):
+            update_data["peer_inbound_reality_short_id"] = data.get("inbound_reality_short_id")
+        logging.info(f"[peers] 对端 '{tag}' 有入站: port={peer_inbound_port}, uuid={data.get('inbound_uuid')}")
+    elif not data.get("inbound_enabled"):
+        # 清除过期的入站信息（对端可能禁用了入站）
+        update_data["peer_inbound_enabled"] = 0
+        update_data["peer_inbound_port"] = None
+        update_data["peer_inbound_uuid"] = None
+        update_data["peer_inbound_reality_public_key"] = None
+        update_data["peer_inbound_reality_short_id"] = None
 
     if update_data:
         db.update_peer_node(tag, **update_data)
@@ -10378,12 +11634,21 @@ def api_peer_connect(tag: str):
         if success:
             # 重新获取更新后的节点信息
             node = db.get_peer_node(tag)
+
+            # 通知远程节点也建立隧道（双向同步）
+            notify_success = False
+            try:
+                notify_success = _notify_peer_connected(db, node)
+            except Exception as e:
+                logging.warning(f"[peers] 通知远程节点失败: {e}")
+
             return {
                 "success": True,
-                "message": f"隧道连接成功",
+                "message": "隧道连接成功" + ("，远程节点已同步" if notify_success else ""),
                 "tag": tag,
                 "tunnel_status": node.get("tunnel_status"),
                 "tunnel_interface": node.get("tunnel_interface"),
+                "remote_notified": notify_success,
             }
         else:
             node = db.get_peer_node(tag)
@@ -10403,6 +11668,7 @@ def api_peer_disconnect(tag: str):
     """断开对等节点隧道
 
     断开与指定节点的隧道连接。
+    会同时通知远程节点断开其侧的隧道（双向同步）。
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -10413,7 +11679,15 @@ def api_peer_disconnect(tag: str):
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
-    # 调用隧道管理器断开
+    # 先通知远程节点断开（在本地断开之前，否则无法获取连接信息）
+    notify_success = False
+    if node.get("tunnel_status") == "connected":
+        try:
+            notify_success = _notify_peer_disconnected(db, node)
+        except Exception as e:
+            logging.warning(f"[peers] 通知远程节点断开失败: {e}")
+
+    # 调用隧道管理器断开本地隧道
     try:
         from peer_tunnel_manager import PeerTunnelManager
         manager = PeerTunnelManager()
@@ -10422,9 +11696,10 @@ def api_peer_disconnect(tag: str):
         if success:
             return {
                 "success": True,
-                "message": f"隧道已断开",
+                "message": "隧道已断开" + ("，远程节点已同步" if notify_success else ""),
                 "tag": tag,
                 "tunnel_status": "disconnected",
+                "remote_notified": notify_success,
             }
         else:
             raise HTTPException(status_code=500, detail="断开隧道失败")
@@ -10433,6 +11708,198 @@ def api_peer_disconnect(tag: str):
     except Exception as e:
         logging.error(f"[peers] 断开节点 '{tag}' 失败: {e}")
         raise HTTPException(status_code=500, detail=f"断开失败: {str(e)}")
+
+
+# ============ Peer Node Inbound API ============
+
+@app.post("/api/peers/{tag}/inbound/enable")
+def api_enable_peer_inbound(tag: str):
+    """启用对等节点的入站监听
+
+    启用后，本节点将能够接收来自该对等节点的连接请求。
+    系统会自动分配入站端口（36500+）并生成 REALITY 密钥（如果未配置）。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 检查是否已启用
+    if node.get("inbound_enabled"):
+        return {
+            "success": True,
+            "message": "入站监听已启用",
+            "tag": tag,
+            "inbound_port": node.get("inbound_port"),
+            "inbound_uuid": node.get("inbound_uuid"),
+        }
+
+    # 分配入站端口（如果未分配）
+    inbound_port = node.get("inbound_port")
+    if not inbound_port:
+        try:
+            inbound_port = db.get_next_peer_inbound_port()
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 生成入站 UUID（使用对方的 UUID，从交换获取）
+    # 如果还没有进行交换，使用临时 UUID
+    inbound_uuid = node.get("inbound_uuid") or node.get("xray_uuid")
+    if not inbound_uuid:
+        import uuid
+        inbound_uuid = str(uuid.uuid4())
+
+    # 检查 REALITY 密钥（如果未配置则生成）
+    if not node.get("xray_reality_private_key"):
+        try:
+            from xray_manager import generate_reality_keypair
+            private_key, public_key = generate_reality_keypair()
+            short_id = secrets.token_hex(4)  # 8 字符 hex
+        except Exception as e:
+            logging.error(f"生成 REALITY 密钥失败: {e}")
+            raise HTTPException(status_code=500, detail=f"生成 REALITY 密钥失败: {str(e)}")
+    else:
+        private_key = node.get("xray_reality_private_key")
+        public_key = node.get("xray_reality_public_key")
+        short_id = node.get("xray_reality_short_id")
+
+    # 更新数据库
+    db.update_peer_node(
+        tag,
+        inbound_enabled=1,
+        inbound_port=inbound_port,
+        inbound_uuid=inbound_uuid,
+        xray_reality_private_key=private_key,
+        xray_reality_public_key=public_key,
+        xray_reality_short_id=short_id,
+    )
+
+    # 启动入站监听器
+    try:
+        from xray_peer_inbound_manager import XrayPeerInboundManager
+        manager = XrayPeerInboundManager()
+        success = manager.start_inbound(tag)
+
+        if success:
+            logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (Port: {inbound_port})")
+            return {
+                "success": True,
+                "message": "入站监听已启用",
+                "tag": tag,
+                "inbound_port": inbound_port,
+                "inbound_uuid": inbound_uuid,
+                "reality_public_key": public_key,
+                "reality_short_id": short_id,
+            }
+        else:
+            raise HTTPException(status_code=500, detail="启动入站监听器失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[peers] 启动入站监听器失败: {e}")
+        raise HTTPException(status_code=500, detail=f"启动入站监听器失败: {str(e)}")
+
+
+@app.post("/api/peers/{tag}/inbound/disable")
+def api_disable_peer_inbound(tag: str):
+    """禁用对等节点的入站监听
+
+    禁用后，本节点将不再接收来自该对等节点的连接请求。
+    已有的出站连接不受影响。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 检查是否已禁用
+    if not node.get("inbound_enabled"):
+        return {
+            "success": True,
+            "message": "入站监听已禁用",
+            "tag": tag,
+        }
+
+    # 停止入站监听器
+    try:
+        from xray_peer_inbound_manager import XrayPeerInboundManager
+        manager = XrayPeerInboundManager()
+        manager.stop_inbound(tag)
+    except Exception as e:
+        logging.warning(f"[peers] 停止入站监听器时出错: {e}")
+
+    # 更新数据库
+    db.update_peer_node(tag, inbound_enabled=0)
+
+    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用")
+    return {
+        "success": True,
+        "message": "入站监听已禁用",
+        "tag": tag,
+    }
+
+
+@app.get("/api/peers/{tag}/inbound/status")
+def api_get_peer_inbound_status(tag: str):
+    """获取对等节点入站状态
+
+    返回入站监听器的运行状态、端口等信息。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 获取进程状态
+    process_status = "stopped"
+    pid = None
+    try:
+        from xray_peer_inbound_manager import XrayPeerInboundManager
+        manager = XrayPeerInboundManager()
+        status = manager.get_inbound_status(tag)
+        process_status = status.get("status", "stopped")
+        pid = status.get("pid")
+    except Exception as e:
+        logging.warning(f"[peers] 获取入站状态失败: {e}")
+
+    return {
+        "tag": tag,
+        "inbound_enabled": bool(node.get("inbound_enabled")),
+        "inbound_port": node.get("inbound_port"),
+        "inbound_uuid": node.get("inbound_uuid"),
+        "process_status": process_status,
+        "pid": pid,
+        "reality_public_key": node.get("xray_reality_public_key"),
+        "reality_short_id": node.get("xray_reality_short_id"),
+    }
+
+
+@app.get("/api/peers/inbound/all")
+def api_get_all_peer_inbound_status():
+    """获取所有启用入站的节点状态"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    try:
+        from xray_peer_inbound_manager import XrayPeerInboundManager
+        manager = XrayPeerInboundManager()
+        statuses = manager.get_all_status()
+        return {"inbounds": statuses, "count": len(statuses)}
+    except Exception as e:
+        logging.error(f"[peers] 获取所有入站状态失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}")
 
 
 # ============ Node Chain CRUD API ============
@@ -10519,10 +11986,19 @@ def api_create_chain(payload: NodeChainCreateRequest):
         raise HTTPException(status_code=500, detail=f"创建链路失败: {e}")
 
     logging.info(f"[chains] 创建链路 '{payload.tag}' (id={chain_id})")
+
+    # 如果链路启用，向中间节点注册
+    registration_results = {}
+    if payload.enabled:
+        chain = db.get_node_chain(payload.tag)
+        if chain:
+            registration_results = _register_chain_with_peers(db, chain)
+
     return {
         "message": f"链路 '{payload.tag}' 创建成功",
         "id": chain_id,
         "tag": payload.tag,
+        "registration_results": registration_results,
     }
 
 
@@ -10566,14 +12042,34 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
     if not update_kwargs:
         return {"message": "没有需要更新的字段", "chain": chain}
 
+    # 记录当前启用状态，用于判断是否需要注册/注销
+    was_enabled = chain.get("enabled", 0)
+    will_be_enabled = payload.enabled if payload.enabled is not None else was_enabled
+
     success = db.update_node_chain(tag, **update_kwargs)
     if not success:
         raise HTTPException(status_code=500, detail="更新链路失败")
 
     updated_chain = db.get_node_chain(tag)
 
+    # 处理链路注册/注销
+    registration_results = {}
+    if payload.enabled is not None:
+        if will_be_enabled and not was_enabled:
+            # 从禁用变为启用：注册
+            logging.info(f"[chains] 链路 '{tag}' 启用，向中间节点注册")
+            registration_results = _register_chain_with_peers(db, updated_chain)
+        elif not will_be_enabled and was_enabled:
+            # 从启用变为禁用：注销
+            logging.info(f"[chains] 链路 '{tag}' 禁用，向中间节点注销")
+            registration_results = _unregister_chain_from_peers(db, chain)
+
     logging.info(f"[chains] 更新链路 '{tag}'")
-    return {"message": f"链路 '{tag}' 已更新", "chain": updated_chain}
+    return {
+        "message": f"链路 '{tag}' 已更新",
+        "chain": updated_chain,
+        "registration_results": registration_results,
+    }
 
 
 @app.delete("/api/chains/{tag}")
@@ -10589,12 +12085,413 @@ def api_delete_chain(tag: str):
     if not chain:
         raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
 
+    # 如果链路是启用状态，先向中间节点注销
+    unregistration_results = {}
+    if chain.get("enabled"):
+        logging.info(f"[chains] 删除前注销链路 '{tag}' 的中间节点注册")
+        unregistration_results = _unregister_chain_from_peers(db, chain)
+
     success = db.delete_node_chain(tag)
     if not success:
         raise HTTPException(status_code=500, detail="删除链路失败")
 
     logging.info(f"[chains] 删除链路 '{tag}'")
-    return {"message": f"链路 '{tag}' 已删除"}
+    return {
+        "message": f"链路 '{tag}' 已删除",
+        "unregistration_results": unregistration_results,
+    }
+
+
+# ============ Peer Relay Status API (PSK Authenticated) ============
+
+
+class PeerRelayStatusRequest(BaseModel):
+    """中继状态查询请求"""
+    psk: str = Field(..., min_length=16, max_length=256, description="预共享密钥")
+    target_node: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", max_length=64, description="目标节点标识")
+    # 用于多跳递归查询：如果设置，会通过 target_node 继续查询 next_hop
+    next_hop: Optional[str] = Field(None, pattern=r"^[a-z][a-z0-9-]*$", max_length=64, description="下一跳节点（递归查询）")
+
+
+@app.post("/api/peer-relay/status")
+def api_peer_relay_status(request: Request, payload: PeerRelayStatusRequest):
+    """通过已连接的隧道查询目标节点的状态
+
+    此端点用于多跳链路中的状态查询。例如：
+    - A 想知道 C 的状态
+    - A 通过与 B 的隧道调用 B 的此端点
+    - B 查询其与 C 的隧道状态并返回
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证调用方身份（通过 IP 查找调用方节点）
+    caller_node = _find_peer_node_by_ip(db, client_ip)
+    if not caller_node:
+        logging.warning(f"[peer-relay] 中继查询失败: 未找到调用方节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown caller")
+
+    # 验证 PSK
+    if not caller_node.get("psk_hash") or not _verify_psk(payload.psk, caller_node["psk_hash"]):
+        logging.warning(f"[peer-relay] PSK 验证失败 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    caller_tag = caller_node["tag"]
+    target_tag = payload.target_node
+
+    logging.info(f"[peer-relay] 收到中继查询: 调用方='{caller_tag}', 目标='{target_tag}' (from {client_ip})")
+
+    # 查找目标节点
+    target_node = db.get_peer_node(target_tag)
+    if not target_node:
+        return {
+            "success": False,
+            "target_node": target_tag,
+            "status": "not_found",
+            "message": f"目标节点 '{target_tag}' 不存在于本节点配置中"
+        }
+
+    # 检查本节点到目标节点的隧道状态
+    tunnel_status = target_node.get("tunnel_status", "disconnected")
+    real_status = _check_peer_tunnel_status(target_node)
+
+    # 如果数据库状态与实际状态不一致，更新数据库
+    if real_status != tunnel_status and real_status not in ("connecting",):
+        db.update_peer_node(target_tag, tunnel_status=real_status)
+        tunnel_status = real_status
+
+    result = {
+        "success": True,
+        "target_node": target_tag,
+        "status": tunnel_status,
+        "tunnel_type": target_node.get("tunnel_type", "wireguard"),
+        "tunnel_interface": target_node.get("tunnel_interface"),
+        "message": f"节点 '{target_tag}' 状态: {tunnel_status}"
+    }
+
+    # 如果指定了 next_hop 并且 target_node 已连接，递归查询下一跳
+    if payload.next_hop and tunnel_status == "connected":
+        next_hop_result = _query_relay_status(db, target_node, payload.next_hop)
+        result["next_hop_result"] = next_hop_result
+
+    return result
+
+
+def _query_relay_status(db, relay_node: dict, target_node_tag: str) -> dict:
+    """通过中继节点查询目标节点状态
+
+    Args:
+        db: 数据库实例
+        relay_node: 中继节点信息
+        target_node_tag: 目标节点标识
+
+    Returns:
+        查询结果字典
+    """
+    import requests
+
+    relay_tag = relay_node["tag"]
+    endpoint = relay_node.get("endpoint", "")
+    psk_encrypted = relay_node.get("psk_encrypted")
+
+    if not endpoint or not psk_encrypted:
+        return {
+            "success": False,
+            "target_node": target_node_tag,
+            "status": "error",
+            "message": "中继节点配置不完整"
+        }
+
+    # 解密 PSK
+    try:
+        psk = _decrypt_psk(psk_encrypted)
+    except ValueError:
+        return {
+            "success": False,
+            "target_node": target_node_tag,
+            "status": "error",
+            "message": "无法解密 PSK"
+        }
+
+    # 从 endpoint 推导 API URL
+    if ":" in endpoint:
+        host, wg_port_str = endpoint.rsplit(":", 1)
+        try:
+            wg_port = int(wg_port_str)
+            api_port = wg_port - 100
+        except ValueError:
+            api_port = 36000
+    else:
+        host = endpoint
+        api_port = 36000
+
+    relay_url = f"http://{host}:{api_port}/api/peer-relay/status"
+
+    payload = {
+        "psk": psk,
+        "target_node": target_node_tag,
+    }
+
+    try:
+        logging.info(f"[peer-relay] 通过中继 '{relay_tag}' 查询 '{target_node_tag}' 状态")
+        resp = requests.post(relay_url, json=payload, timeout=15)
+
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            return {
+                "success": False,
+                "target_node": target_node_tag,
+                "status": "error",
+                "message": f"中继返回错误: {resp.status_code}"
+            }
+    except requests.RequestException as e:
+        logging.warning(f"[peer-relay] 中继查询失败: {e}")
+        return {
+            "success": False,
+            "target_node": target_node_tag,
+            "status": "unreachable",
+            "message": f"无法连接中继节点"
+        }
+
+
+MAX_CHAIN_HOPS = 10  # 防止 DoS 攻击的最大跳数限制
+
+
+@app.post("/api/chains/{tag}/health-check")
+def api_chain_health_check(tag: str):
+    """检查多跳链路的健康状态
+
+    遍历链路中的所有跳转，检查每一跳的隧道状态。
+    对于多跳链路，使用递归中继查询来获取下游节点的状态。
+
+    例如链路 A → B → C → D：
+    1. 检查本节点 (A) 到 B 的隧道状态（直接查询）
+    2. 通过 B 查询 B 到 C 的隧道状态（中继查询）
+    3. 通过 B 查询 C 到 D 的隧道状态（B 递归转发给 C）
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 获取链路配置
+    chain = db.get_node_chain(tag)
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    # 解析 hops
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        try:
+            hops = json.loads(hops)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="链路配置格式错误")
+
+    if not hops:
+        return {
+            "chain": tag,
+            "healthy": False,
+            "message": "链路没有配置跳转节点",
+            "hops": []
+        }
+
+    # 跳数限制
+    if len(hops) > MAX_CHAIN_HOPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"链路跳数 ({len(hops)}) 超过最大限制 ({MAX_CHAIN_HOPS})"
+        )
+
+    hop_results = []
+    all_healthy = True
+    first_hop_node = None  # 第一跳节点，用于所有后续中继查询
+
+    for i, hop_tag in enumerate(hops):
+        hop_result = {
+            "hop": i + 1,
+            "node": hop_tag,
+            "status": "unknown",
+            "tunnel_type": None,
+            "message": None,
+        }
+
+        if i == 0:
+            # 第一跳：直接查询本节点到该节点的隧道状态
+            node = db.get_peer_node(hop_tag)
+            if not node:
+                hop_result["status"] = "not_found"
+                hop_result["message"] = f"节点 '{hop_tag}' 不存在"
+                all_healthy = False
+            else:
+                real_status = _check_peer_tunnel_status(node)
+                hop_result["status"] = real_status
+                hop_result["tunnel_type"] = node.get("tunnel_type", "wireguard")
+                hop_result["message"] = f"本节点到 '{hop_tag}' 的隧道状态"
+
+                if real_status != "connected":
+                    all_healthy = False
+                else:
+                    first_hop_node = node
+        elif i == 1:
+            # 第二跳：通过第一跳中继查询
+            if not first_hop_node:
+                hop_result["status"] = "unreachable"
+                hop_result["message"] = f"第一跳 '{hops[0]}' 不可用，无法查询"
+                all_healthy = False
+            else:
+                relay_result = _query_relay_status(db, first_hop_node, hop_tag)
+                hop_result["status"] = relay_result.get("status", "error")
+                hop_result["tunnel_type"] = relay_result.get("tunnel_type")
+                hop_result["message"] = relay_result.get("message")
+
+                if hop_result["status"] != "connected":
+                    all_healthy = False
+        else:
+            # 第三跳及以后：通过第一跳进行递归中继查询
+            # 请求第一跳查询 hops[i-1] 到 hop_tag 的状态
+            if not first_hop_node:
+                hop_result["status"] = "unreachable"
+                hop_result["message"] = f"第一跳 '{hops[0]}' 不可用，无法查询"
+                all_healthy = False
+            else:
+                # 使用递归查询：通过第一跳，查询 hops[i-1]，并让其转发查询 hop_tag
+                relay_result = _query_relay_status_recursive(
+                    db, first_hop_node, hops[i-1], hop_tag
+                )
+                hop_result["status"] = relay_result.get("status", "error")
+                hop_result["tunnel_type"] = relay_result.get("tunnel_type")
+                hop_result["message"] = relay_result.get("message")
+
+                if hop_result["status"] != "connected":
+                    all_healthy = False
+
+        hop_results.append(hop_result)
+
+    return {
+        "chain": tag,
+        "healthy": all_healthy,
+        "message": "链路健康" if all_healthy else "链路存在断开的节点",
+        "total_hops": len(hops),
+        "hops": hop_results,
+    }
+
+
+def _query_relay_status_recursive(
+    db, relay_node: dict, target_node_tag: str, next_hop_tag: str
+) -> dict:
+    """通过中继节点递归查询目标节点的下一跳状态
+
+    用于 3+ 跳链路的健康检查。例如 A→B→C→D 链路中：
+    - A 调用此函数，relay_node=B, target_node_tag=C, next_hop_tag=D
+    - B 收到请求后，查询自己到 C 的状态
+    - 如果 C 已连接，B 递归查询 C 到 D 的状态
+
+    Args:
+        db: 数据库实例
+        relay_node: 中继节点信息（第一跳）
+        target_node_tag: 目标节点标识（中间跳）
+        next_hop_tag: 下一跳节点标识（要查询的最终目标）
+
+    Returns:
+        查询结果字典
+    """
+    import requests
+
+    relay_tag = relay_node["tag"]
+    endpoint = relay_node.get("endpoint", "")
+    psk_encrypted = relay_node.get("psk_encrypted")
+
+    if not endpoint or not psk_encrypted:
+        return {
+            "success": False,
+            "target_node": next_hop_tag,
+            "status": "error",
+            "message": "中继节点配置不完整"
+        }
+
+    # 解密 PSK
+    try:
+        psk = _decrypt_psk(psk_encrypted)
+    except ValueError:
+        return {
+            "success": False,
+            "target_node": next_hop_tag,
+            "status": "error",
+            "message": "无法解密 PSK"
+        }
+
+    # 从 endpoint 推导 API URL
+    if ":" in endpoint:
+        host, wg_port_str = endpoint.rsplit(":", 1)
+        try:
+            wg_port = int(wg_port_str)
+            api_port = wg_port - 100
+            # 端口验证
+            if not (1 <= api_port <= 65535):
+                api_port = 36000
+        except ValueError:
+            api_port = 36000
+    else:
+        host = endpoint
+        api_port = 36000
+
+    relay_url = f"http://{host}:{api_port}/api/peer-relay/status"
+
+    # 使用 next_hop 参数进行递归查询
+    payload = {
+        "psk": psk,
+        "target_node": target_node_tag,
+        "next_hop": next_hop_tag,
+    }
+
+    try:
+        logging.info(
+            f"[peer-relay] 通过中继 '{relay_tag}' 递归查询 '{target_node_tag}' → '{next_hop_tag}'"
+        )
+        resp = requests.post(relay_url, json=payload, timeout=20)
+
+        if resp.status_code == 200:
+            result = resp.json()
+            # 从递归结果中提取下一跳状态
+            if "next_hop_result" in result:
+                return result["next_hop_result"]
+            else:
+                # 如果没有 next_hop_result，可能是中间节点未连接
+                return {
+                    "success": False,
+                    "target_node": next_hop_tag,
+                    "status": "unreachable",
+                    "message": f"中间节点 '{target_node_tag}' 状态: {result.get('status', 'unknown')}"
+                }
+        else:
+            return {
+                "success": False,
+                "target_node": next_hop_tag,
+                "status": "error",
+                "message": f"中继返回错误: {resp.status_code}"
+            }
+    except requests.RequestException as e:
+        logging.warning(f"[peer-relay] 递归中继查询失败: {e}")
+        return {
+            "success": False,
+            "target_node": next_hop_tag,
+            "status": "unreachable",
+            "message": "无法连接中继节点"
+        }
 
 
 @app.post("/api/config/regenerate")

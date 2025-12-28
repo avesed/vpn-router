@@ -1088,7 +1088,9 @@ export const OUTBOUND_GROUP_TYPES = [
 
 export type PeerTunnelType = "wireguard" | "xray";
 export type PeerTunnelStatus = "disconnected" | "connecting" | "connected" | "error";
-export type PeerXrayProtocol = "vless" | "vmess" | "trojan";
+
+// XHTTP mode options for VLESS+XHTTP+REALITY
+export type XHttpMode = "auto" | "packet-up" | "stream-up" | "stream-one";
 
 export interface PeerNode {
   id?: number;
@@ -1102,11 +1104,26 @@ export interface PeerNode {
   tunnel_local_ip?: string;
   tunnel_remote_ip?: string;
   tunnel_port?: number;
-  xray_protocol?: PeerXrayProtocol;
   xray_socks_port?: number;
-  // TLS 验证配置（用于 Trojan 协议）
-  tls_verify?: number;  // 1=验证，0=跳过
-  tls_fingerprint?: string;
+
+  // REALITY 配置（本节点作为服务端）- 自动生成，只读
+  xray_reality_private_key?: string;
+  xray_reality_public_key?: string;
+  xray_reality_short_id?: string;
+  xray_reality_dest?: string;  // 默认: www.microsoft.com:443
+  xray_reality_server_names?: string;  // JSON 数组，如 ["www.microsoft.com"]
+
+  // 对端 REALITY 配置（本节点作为客户端连接对端时使用）- 从交换获得
+  xray_peer_reality_public_key?: string;
+  xray_peer_reality_short_id?: string;
+  xray_peer_reality_dest?: string;
+  xray_peer_reality_server_names?: string;  // JSON 数组
+
+  // XHTTP 传输配置
+  xray_xhttp_path?: string;  // 默认: /
+  xray_xhttp_mode?: XHttpMode;  // 默认: auto
+  xray_xhttp_host?: string;
+
   last_seen?: string;
   last_error?: string;
   auto_reconnect: boolean;
@@ -1122,10 +1139,16 @@ export interface PeerNodeCreateRequest {
   endpoint: string;
   psk: string;
   tunnel_type: PeerTunnelType;
-  xray_protocol?: PeerXrayProtocol;
-  // TLS 验证配置（用于 Trojan 协议）
-  tls_verify?: boolean;
-  tls_fingerprint?: string;
+
+  // REALITY 服务端配置（可选，有默认值）
+  xray_reality_dest?: string;  // 默认: www.microsoft.com:443
+  xray_reality_server_names?: string[];  // 默认: ["www.microsoft.com"]
+
+  // XHTTP 传输配置（可选，有默认值）
+  xray_xhttp_path?: string;  // 默认: /
+  xray_xhttp_mode?: XHttpMode;  // 默认: auto
+  xray_xhttp_host?: string;
+
   auto_reconnect?: boolean;
 }
 
@@ -1134,9 +1157,16 @@ export interface PeerNodeUpdateRequest {
   description?: string;
   endpoint?: string;
   psk?: string;
-  // TLS 验证配置（用于 Trojan 协议）
-  tls_verify?: boolean;
-  tls_fingerprint?: string;
+
+  // REALITY 服务端配置
+  xray_reality_dest?: string;
+  xray_reality_server_names?: string[];
+
+  // XHTTP 传输配置
+  xray_xhttp_path?: string;
+  xray_xhttp_mode?: XHttpMode;
+  xray_xhttp_host?: string;
+
   auto_reconnect?: boolean;
   enabled?: boolean;
 }
@@ -1155,6 +1185,22 @@ export interface PeerNodeStatusResponse {
   last_error?: string;
 }
 
+export interface PeerNodeConnectResponse {
+  success: boolean;
+  message: string;
+  tag: string;
+  tunnel_status: PeerTunnelStatus;
+  tunnel_interface?: string;
+  remote_notified?: boolean;  // 是否成功通知远程节点
+}
+
+export interface PeerNodeDisconnectResponse {
+  success: boolean;
+  message: string;
+  tag: string;
+  remote_notified?: boolean;  // 是否成功通知远程节点
+}
+
 export interface BatchOperationRequest {
   tags: string[];
 }
@@ -1168,6 +1214,9 @@ export interface BatchOperationResponse {
 
 export type ChainHealthStatus = "unknown" | "healthy" | "degraded" | "unhealthy";
 
+// Downstream status for cascade notifications
+export type DownstreamStatus = "unknown" | "connected" | "disconnected";
+
 export interface NodeChain {
   id?: number;
   tag: string;
@@ -1178,6 +1227,8 @@ export interface NodeChain {
   entry_rules?: Record<string, unknown>;
   relay_rules?: Record<string, unknown>;
   health_status: ChainHealthStatus;
+  downstream_status?: DownstreamStatus;  // Status of downstream nodes (cascade notification)
+  disconnected_node?: string;  // The disconnected downstream node tag (if any)
   last_health_check?: string;
   enabled: boolean;
   priority: number;
@@ -1224,5 +1275,22 @@ export interface ChainStats {
 
 export interface ChainStatsResponse {
   chains: Record<string, ChainStats>;
+}
+
+// Health check response with per-hop details
+export interface ChainHopResult {
+  hop: number;
+  node: string;
+  status: "connected" | "disconnected" | "connecting" | "error" | "unreachable" | "not_found" | "unknown";
+  tunnel_type?: string;
+  message?: string;
+}
+
+export interface ChainHealthCheckResponse {
+  chain: string;
+  healthy: boolean;
+  message: string;
+  total_hops: number;
+  hops: ChainHopResult[];
 }
 

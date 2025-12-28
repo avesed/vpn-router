@@ -2406,37 +2406,79 @@ class UserDatabase:
         psk_hash: str,
         psk_encrypted: Optional[str] = None,
         description: str = "",
+        api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
         tunnel_port: Optional[int] = None,
         wg_private_key: Optional[str] = None,
         wg_public_key: Optional[str] = None,
         xray_protocol: str = "vless",
         xray_uuid: Optional[str] = None,
-        tls_verify: bool = True,
-        tls_fingerprint: Optional[str] = None,
+        # REALITY 配置（本节点作为服务端）
+        xray_reality_private_key: Optional[str] = None,
+        xray_reality_public_key: Optional[str] = None,
+        xray_reality_short_id: Optional[str] = None,
+        xray_reality_dest: str = "www.microsoft.com:443",
+        xray_reality_server_names: str = '["www.microsoft.com"]',
+        # XHTTP 传输配置
+        xray_xhttp_path: str = "/",
+        xray_xhttp_mode: str = "auto",
+        xray_xhttp_host: Optional[str] = None,
+        # 连接模式
+        connection_mode: str = "outbound",  # 'outbound' or 'inbound'
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
         enabled: bool = True
     ) -> int:
-        """添加对等节点"""
+        """添加对等节点
+
+        Args:
+            tag: 唯一标识
+            name: 显示名称
+            endpoint: 远程端点 IP:port 或 域名:port
+            psk_hash: PSK 的 bcrypt 哈希（用于接收认证）
+            psk_encrypted: 加密的 PSK（用于发起连接）
+            description: 描述
+            tunnel_type: 隧道类型 (wireguard/xray)
+            tunnel_port: 本地监听端口
+            wg_private_key: WireGuard 私钥
+            wg_public_key: WireGuard 公钥
+            xray_protocol: Xray 协议 (固定为 vless)
+            xray_uuid: Xray UUID
+            xray_reality_private_key: REALITY 私钥（x25519）
+            xray_reality_public_key: REALITY 公钥
+            xray_reality_short_id: REALITY Short ID
+            xray_reality_dest: REALITY Dest Server（伪装目标）
+            xray_reality_server_names: REALITY Server Names（JSON 数组）
+            xray_xhttp_path: XHTTP 路径
+            xray_xhttp_mode: XHTTP 模式 (auto/packet-up/stream-up/stream-one)
+            xray_xhttp_host: XHTTP Host
+            connection_mode: 连接模式 ('outbound' 或 'inbound')
+            default_outbound: 默认出口
+            auto_reconnect: 自动重连
+            enabled: 是否启用
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO peer_nodes (
-                    tag, name, description, endpoint, psk_hash, psk_encrypted,
+                    tag, name, description, endpoint, api_port, psk_hash, psk_encrypted,
                     tunnel_type, tunnel_port,
                     wg_private_key, wg_public_key,
                     xray_protocol, xray_uuid,
-                    tls_verify, tls_fingerprint,
-                    default_outbound, auto_reconnect, enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
+                    xray_reality_dest, xray_reality_server_names,
+                    xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
+                    connection_mode, default_outbound, auto_reconnect, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                tag, name, description, endpoint, psk_hash, psk_encrypted,
+                tag, name, description, endpoint, api_port, psk_hash, psk_encrypted,
                 tunnel_type, tunnel_port,
                 wg_private_key, wg_public_key,
                 xray_protocol, xray_uuid,
-                1 if tls_verify else 0, tls_fingerprint,
-                default_outbound, 1 if auto_reconnect else 0, 1 if enabled else 0
+                xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
+                xray_reality_dest, xray_reality_server_names,
+                xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
+                connection_mode, default_outbound, 1 if auto_reconnect else 0, 1 if enabled else 0
             ))
             conn.commit()
             return cursor.lastrowid
@@ -2444,12 +2486,26 @@ class UserDatabase:
     def update_peer_node(self, tag: str, **kwargs) -> bool:
         """更新对等节点"""
         allowed_fields = {
-            "name", "description", "endpoint", "psk_hash", "psk_encrypted",
+            "name", "description", "endpoint", "api_port", "psk_hash", "psk_encrypted",
             "tunnel_type", "tunnel_status", "tunnel_interface",
             "tunnel_local_ip", "tunnel_remote_ip", "tunnel_port",
             "wg_private_key", "wg_public_key", "wg_peer_public_key",
             "xray_protocol", "xray_uuid", "xray_socks_port",
-            "tls_verify", "tls_fingerprint",
+            # REALITY 配置（本节点作为服务端）
+            "xray_reality_private_key", "xray_reality_public_key", "xray_reality_short_id",
+            "xray_reality_dest", "xray_reality_server_names",
+            # 对端 REALITY 配置（本节点作为客户端）
+            "xray_peer_reality_public_key", "xray_peer_reality_short_id",
+            "xray_peer_reality_dest", "xray_peer_reality_server_names",
+            # XHTTP 传输配置
+            "xray_xhttp_path", "xray_xhttp_mode", "xray_xhttp_host",
+            # 入站监听配置（本节点作为服务端接收对方连接）
+            "inbound_enabled", "inbound_port", "inbound_uuid", "inbound_socks_port",
+            # 对方入站信息（用于连接到对方的入站）
+            "peer_inbound_enabled", "peer_inbound_port", "peer_inbound_uuid",
+            "peer_inbound_reality_public_key", "peer_inbound_reality_short_id",
+            # 连接模式
+            "connection_mode",  # 'outbound' or 'inbound'
             "default_outbound", "last_seen", "last_error",
             "auto_reconnect", "enabled"
         }
@@ -2522,6 +2578,116 @@ class UserDatabase:
             if next_port > 65535:
                 raise ValueError(f"Peer Xray SOCKS port overflow: {next_port} > 65535")
             return next_port
+
+    def get_next_peer_inbound_port(self) -> int:
+        """获取下一个可用的对等节点入站端口（从 36500 开始）
+
+        Raises:
+            ValueError: 端口超出 65535 限制
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT MAX(inbound_port) FROM peer_nodes WHERE inbound_port IS NOT NULL"
+            ).fetchone()
+            max_port = row[0] if row and row[0] else 36499
+            next_port = max(max_port + 1, 36500)
+            if next_port > 65535:
+                raise ValueError(f"Peer inbound port overflow: {next_port} > 65535")
+            return next_port
+
+    def get_peer_nodes_with_inbound(self) -> List[Dict]:
+        """获取所有启用入站监听的对等节点"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(
+                "SELECT * FROM peer_nodes WHERE inbound_enabled = 1 AND enabled = 1 ORDER BY tag"
+            ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    # ============ Relay Routes 管理 ============
+
+    def get_relay_routes(self, chain_tag: Optional[str] = None, enabled_only: bool = False) -> List[Dict]:
+        """获取中继路由列表
+
+        Args:
+            chain_tag: 可选，按链路过滤
+            enabled_only: 是否只返回启用的路由
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            sql = "SELECT * FROM relay_routes WHERE 1=1"
+            params = []
+            if chain_tag:
+                sql += " AND chain_tag = ?"
+                params.append(chain_tag)
+            if enabled_only:
+                sql += " AND enabled = 1"
+            sql += " ORDER BY id"
+            rows = cursor.execute(sql, params).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def add_relay_route(
+        self,
+        chain_tag: str,
+        source_peer_tag: str,
+        target_peer_tag: str,
+        enabled: bool = True
+    ) -> int:
+        """添加中继路由
+
+        Args:
+            chain_tag: 所属链路标识
+            source_peer_tag: 流量来源节点标识
+            target_peer_tag: 转发目标节点标识
+            enabled: 是否启用
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO relay_routes (chain_tag, source_peer_tag, target_peer_tag, enabled)
+                VALUES (?, ?, ?, ?)
+            """, (chain_tag, source_peer_tag, target_peer_tag, 1 if enabled else 0))
+            conn.commit()
+            return cursor.lastrowid
+
+    def delete_relay_route(self, route_id: int) -> bool:
+        """删除中继路由"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM relay_routes WHERE id = ?", (route_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_relay_routes_by_chain(self, chain_tag: str) -> int:
+        """删除指定链路的所有中继路由"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM relay_routes WHERE chain_tag = ?", (chain_tag,))
+            conn.commit()
+            return cursor.rowcount
+
+    def update_relay_route(self, route_id: int, **kwargs) -> bool:
+        """更新中继路由"""
+        allowed_fields = {"enabled"}
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        values.append(route_id)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE relay_routes SET {", ".join(updates)} WHERE id = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
 
     # ============ Node Chains 管理 ============
 
@@ -2613,7 +2779,8 @@ class UserDatabase:
         allowed_fields = {
             "name", "description", "hops", "hop_protocols",
             "entry_rules", "relay_rules", "health_status",
-            "last_health_check", "priority", "enabled"
+            "last_health_check", "priority", "enabled",
+            "downstream_status", "disconnected_node"  # 级联通知字段
         }
         updates = []
         values = []
@@ -2663,6 +2830,183 @@ class UserDatabase:
                 if not row:
                     missing.append(hop)
             return len(missing) == 0, missing
+
+    # ============ Chain Registrations 管理（级联通知用）============
+
+    def get_chain_registrations(self) -> List[Dict]:
+        """获取所有链路注册"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(
+                "SELECT * FROM chain_registrations ORDER BY registered_at DESC"
+            ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_chain_registrations_by_downstream(self, downstream_node_tag: str) -> List[Dict]:
+        """获取经过指定下游节点的所有链路注册（用于断连时通知上游）
+
+        Args:
+            downstream_node_tag: 下游节点标签
+
+        Returns:
+            包含上游端点信息的注册列表，用于发送断连通知
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute(
+                "SELECT * FROM chain_registrations WHERE downstream_node_tag = ?",
+                (downstream_node_tag,)
+            ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_chain_upstream_registration(self, chain_id: str) -> Optional[Dict]:
+        """获取链路的上游注册（用于级联转发通知）
+
+        当收到下游断连通知时，检查自己是否也需要向更上游转发
+
+        Args:
+            chain_id: 链路标识
+
+        Returns:
+            上游注册信息，如果本节点是链路起点则返回 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM chain_registrations WHERE chain_id = ?",
+                (chain_id,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_chain_registration(
+        self,
+        chain_id: str,
+        upstream_node_tag: str,
+        upstream_endpoint: str,
+        upstream_psk: str,
+        downstream_node_tag: str
+    ) -> int:
+        """添加链路注册
+
+        当上游节点启用链路时，向中间节点注册，以便断连时能收到通知
+
+        Args:
+            chain_id: 链路标识
+            upstream_node_tag: 上游节点标签
+            upstream_endpoint: 上游节点端点（IP:port）
+            upstream_psk: 上游节点 PSK（用于向上游发送通知时的认证）
+            downstream_node_tag: 下游节点标签
+
+        Returns:
+            新记录 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO chain_registrations
+                (chain_id, upstream_node_tag, upstream_endpoint, upstream_psk, downstream_node_tag)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chain_id, upstream_node_tag, upstream_endpoint, upstream_psk, downstream_node_tag))
+            conn.commit()
+            return cursor.lastrowid
+
+    def delete_chain_registration(self, chain_id: str, upstream_node_tag: str = None) -> bool:
+        """删除链路注册
+
+        Args:
+            chain_id: 链路标识
+            upstream_node_tag: 上游节点标签（可选，不指定则删除该链路的所有注册）
+
+        Returns:
+            是否删除成功
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if upstream_node_tag:
+                cursor.execute(
+                    "DELETE FROM chain_registrations WHERE chain_id = ? AND upstream_node_tag = ?",
+                    (chain_id, upstream_node_tag)
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM chain_registrations WHERE chain_id = ?",
+                    (chain_id,)
+                )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_chain_registrations_by_downstream(self, downstream_node_tag: str) -> int:
+        """删除指定下游节点的所有注册
+
+        当节点被删除时，清理相关注册
+
+        Args:
+            downstream_node_tag: 下游节点标签
+
+        Returns:
+            删除的记录数
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM chain_registrations WHERE downstream_node_tag = ?",
+                (downstream_node_tag,)
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def update_chain_downstream_status(
+        self,
+        chain_tag: str,
+        status: str,
+        disconnected_node: str = None
+    ) -> bool:
+        """更新链路的下游状态
+
+        Args:
+            chain_tag: 链路标签
+            status: 状态 ('unknown', 'connected', 'disconnected')
+            disconnected_node: 断开的节点标签
+
+        Returns:
+            是否更新成功
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE node_chains
+                SET downstream_status = ?,
+                    disconnected_node = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE tag = ?
+            """, (status, disconnected_node, chain_tag))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_chains_with_downstream_node(self, node_tag: str) -> List[Dict]:
+        """获取包含指定节点作为下游的所有链路
+
+        用于当节点断开时，找到需要更新状态的链路
+
+        Args:
+            node_tag: 节点标签
+
+        Returns:
+            链路列表
+        """
+        chains = self.get_node_chains()
+        result = []
+        for chain in chains:
+            hops = chain.get("hops", [])
+            # 检查节点是否在链路中（不是第一个节点，因为第一个是直连）
+            if node_tag in hops[1:]:
+                result.append(chain)
+        return result
 
 
 class DatabaseManager:
@@ -3181,22 +3525,34 @@ class DatabaseManager:
         psk_hash: str,
         psk_encrypted: Optional[str] = None,
         description: str = "",
+        api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
         tunnel_port: Optional[int] = None,
         wg_private_key: Optional[str] = None,
         wg_public_key: Optional[str] = None,
         xray_protocol: str = "vless",
         xray_uuid: Optional[str] = None,
-        tls_verify: bool = True,
-        tls_fingerprint: Optional[str] = None,
+        # REALITY 配置（本节点作为服务端）
+        xray_reality_private_key: Optional[str] = None,
+        xray_reality_public_key: Optional[str] = None,
+        xray_reality_short_id: Optional[str] = None,
+        xray_reality_dest: str = "www.microsoft.com:443",
+        xray_reality_server_names: str = '["www.microsoft.com"]',
+        # XHTTP 传输配置
+        xray_xhttp_path: str = "/",
+        xray_xhttp_mode: str = "auto",
+        xray_xhttp_host: Optional[str] = None,
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
         enabled: bool = True
     ) -> int:
         return self.user.add_peer_node(
-            tag, name, endpoint, psk_hash, psk_encrypted, description, tunnel_type,
-            tunnel_port, wg_private_key, wg_public_key,
-            xray_protocol, xray_uuid, tls_verify, tls_fingerprint,
+            tag, name, endpoint, psk_hash, psk_encrypted, description, api_port,
+            tunnel_type, tunnel_port, wg_private_key, wg_public_key,
+            xray_protocol, xray_uuid,
+            xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
+            xray_reality_dest, xray_reality_server_names,
+            xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
             default_outbound, auto_reconnect, enabled
         )
 
@@ -3214,6 +3570,34 @@ class DatabaseManager:
 
     def get_next_peer_xray_socks_port(self) -> int:
         return self.user.get_next_peer_xray_socks_port()
+
+    def get_next_peer_inbound_port(self) -> int:
+        return self.user.get_next_peer_inbound_port()
+
+    def get_peer_nodes_with_inbound(self) -> List[Dict]:
+        return self.user.get_peer_nodes_with_inbound()
+
+    # Relay Routes (中继路由管理)
+    def get_relay_routes(self, chain_tag: Optional[str] = None, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_relay_routes(chain_tag, enabled_only)
+
+    def add_relay_route(
+        self,
+        chain_tag: str,
+        source_peer_tag: str,
+        target_peer_tag: str,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_relay_route(chain_tag, source_peer_tag, target_peer_tag, enabled)
+
+    def delete_relay_route(self, route_id: int) -> bool:
+        return self.user.delete_relay_route(route_id)
+
+    def delete_relay_routes_by_chain(self, chain_tag: str) -> int:
+        return self.user.delete_relay_routes_by_chain(chain_tag)
+
+    def update_relay_route(self, route_id: int, **kwargs) -> bool:
+        return self.user.update_relay_route(route_id, **kwargs)
 
     # Node Chains (多跳链路管理)
     def get_node_chains(self, enabled_only: bool = False) -> List[Dict]:
@@ -3247,6 +3631,45 @@ class DatabaseManager:
 
     def validate_chain_hops(self, hops: List[str]) -> tuple:
         return self.user.validate_chain_hops(hops)
+
+    # Chain Registrations (级联通知用)
+    def get_chain_registrations(self) -> List[Dict]:
+        return self.user.get_chain_registrations()
+
+    def get_chain_registrations_by_downstream(self, downstream_node_tag: str) -> List[Dict]:
+        return self.user.get_chain_registrations_by_downstream(downstream_node_tag)
+
+    def get_chain_upstream_registration(self, chain_id: str) -> Optional[Dict]:
+        return self.user.get_chain_upstream_registration(chain_id)
+
+    def add_chain_registration(
+        self,
+        chain_id: str,
+        upstream_node_tag: str,
+        upstream_endpoint: str,
+        upstream_psk: str,
+        downstream_node_tag: str
+    ) -> int:
+        return self.user.add_chain_registration(
+            chain_id, upstream_node_tag, upstream_endpoint, upstream_psk, downstream_node_tag
+        )
+
+    def delete_chain_registration(self, chain_id: str, upstream_node_tag: str = None) -> bool:
+        return self.user.delete_chain_registration(chain_id, upstream_node_tag)
+
+    def delete_chain_registrations_by_downstream(self, downstream_node_tag: str) -> int:
+        return self.user.delete_chain_registrations_by_downstream(downstream_node_tag)
+
+    def update_chain_downstream_status(
+        self,
+        chain_tag: str,
+        status: str,
+        disconnected_node: str = None
+    ) -> bool:
+        return self.user.update_chain_downstream_status(chain_tag, status, disconnected_node)
+
+    def get_chains_with_downstream_node(self, node_tag: str) -> List[Dict]:
+        return self.user.get_chains_with_downstream_node(node_tag)
 
 
 # 全局缓存

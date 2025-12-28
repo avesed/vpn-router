@@ -431,7 +431,8 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     description TEXT DEFAULT '',
 
     -- 连接信息
-    endpoint TEXT NOT NULL,                -- IP:port 或 域名:port
+    endpoint TEXT NOT NULL,                -- IP:port 或 域名:port (WireGuard/Xray 隧道端口)
+    api_port INTEGER,                      -- API 端口（默认 36000，用于端口映射场景）
 
     -- PSK 认证
     psk_hash TEXT NOT NULL,                -- bcrypt 哈希（用于接收认证）
@@ -455,9 +456,41 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     xray_uuid TEXT,
     xray_socks_port INTEGER,               -- SOCKS5 代理端口
 
-    -- TLS 验证配置（用于 Trojan 协议）
-    tls_verify INTEGER DEFAULT 1,          -- 1=验证证书（默认安全），0=跳过验证（需警告）
-    tls_fingerprint TEXT,                  -- 可选：证书指纹固定（十六进制格式）
+    -- Xray REALITY 配置（本节点作为服务端）
+    xray_reality_private_key TEXT,         -- 本节点私钥（x25519）
+    xray_reality_public_key TEXT,          -- 本节点公钥（发送给客户端）
+    xray_reality_short_id TEXT,            -- Short ID（hex 格式）
+    xray_reality_dest TEXT DEFAULT 'www.microsoft.com:443',  -- Dest Server（伪装目标）
+    xray_reality_server_names TEXT DEFAULT '["www.microsoft.com"]',  -- Server Names SNI（JSON 数组）
+
+    -- 对端 REALITY 配置（本节点作为客户端连接对端时使用）
+    xray_peer_reality_public_key TEXT,     -- 对端公钥（从交换获得）
+    xray_peer_reality_short_id TEXT,       -- 对端 Short ID
+    xray_peer_reality_dest TEXT,           -- 对端 Dest Server
+    xray_peer_reality_server_names TEXT,   -- 对端 Server Names（JSON 数组）
+
+    -- XHTTP 传输配置
+    xray_xhttp_path TEXT DEFAULT '/',
+    xray_xhttp_mode TEXT DEFAULT 'auto',   -- auto, packet-up, stream-up, stream-one
+    xray_xhttp_host TEXT,
+
+    -- 入站监听配置（本节点作为服务端接收对方连接）
+    inbound_enabled INTEGER DEFAULT 0,      -- 是否启用入站监听
+    inbound_port INTEGER,                   -- 入站监听端口 (36500+)
+    inbound_uuid TEXT,                      -- 允许连接的 UUID（对方的 UUID）
+    inbound_socks_port INTEGER,             -- SOCKS5 输出端口 (38601+)，sing-box 监听
+
+    -- 对方的入站信息（用于连接到对方的入站）
+    peer_inbound_enabled INTEGER DEFAULT 0, -- 对方是否有入站
+    peer_inbound_port INTEGER,              -- 对方的入站端口
+    peer_inbound_uuid TEXT,                 -- 对方入站的 UUID（用于认证）
+    peer_inbound_reality_public_key TEXT,   -- 对方入站的 REALITY 公钥
+    peer_inbound_reality_short_id TEXT,     -- 对方入站的 Short ID
+
+    -- 连接模式
+    connection_mode TEXT DEFAULT 'outbound' CHECK(connection_mode IN ('outbound', 'inbound')),
+    -- outbound: 连接到对端的主隧道端点（默认）
+    -- inbound: 连接到对端的入站监听器（需要 peer_inbound_enabled=1）
 
     -- 入口绑定出口（来自此节点隧道的流量默认出口）
     default_outbound TEXT,
@@ -477,6 +510,8 @@ CREATE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_status ON peer_nodes(tunnel_sta
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_local_ip ON peer_nodes(tunnel_local_ip) WHERE tunnel_local_ip IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_port ON peer_nodes(tunnel_port) WHERE tunnel_port IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_xray_socks_port ON peer_nodes(xray_socks_port) WHERE xray_socks_port IS NOT NULL;
+-- 注意：inbound_port 和 inbound_socks_port 索引在 migrate_peer_nodes_inbound_fields() 中创建
+-- 因为这些是新添加的列，需要先迁移后才能创建索引
 
 -- 多跳链路表
 CREATE TABLE IF NOT EXISTS node_chains (
@@ -501,6 +536,10 @@ CREATE TABLE IF NOT EXISTS node_chains (
     health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
     last_health_check TIMESTAMP,
 
+    -- 下游节点状态（级联通知用）
+    downstream_status TEXT DEFAULT 'unknown' CHECK(downstream_status IN ('unknown', 'connected', 'disconnected')),
+    disconnected_node TEXT,                -- 记录断开的下游节点 tag
+
     enabled INTEGER DEFAULT 1,
     priority INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -508,6 +547,34 @@ CREATE TABLE IF NOT EXISTS node_chains (
 );
 CREATE INDEX IF NOT EXISTS idx_node_chains_tag ON node_chains(tag);
 CREATE INDEX IF NOT EXISTS idx_node_chains_enabled ON node_chains(enabled);
+
+-- 链路注册表（记录哪些链经过当前节点，用于级联通知）
+CREATE TABLE IF NOT EXISTS chain_registrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_id TEXT NOT NULL,                -- 链标识（来自上游节点）
+    upstream_node_tag TEXT NOT NULL,       -- 上游节点标签
+    upstream_endpoint TEXT NOT NULL,       -- 上游节点端点（用于发送通知）
+    upstream_psk TEXT NOT NULL,            -- 上游节点 PSK（用于向上游发送通知时的认证）
+    downstream_node_tag TEXT NOT NULL,     -- 下游节点标签
+    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chain_id, upstream_node_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_chain_registrations_chain_id ON chain_registrations(chain_id);
+CREATE INDEX IF NOT EXISTS idx_chain_registrations_downstream ON chain_registrations(downstream_node_tag);
+
+-- 中继路由表（链路中的流量转发规则）
+CREATE TABLE IF NOT EXISTS relay_routes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_tag TEXT NOT NULL,                    -- 所属链路
+    source_peer_tag TEXT NOT NULL,              -- 流量来源节点
+    target_peer_tag TEXT NOT NULL,              -- 转发目标节点
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (chain_tag) REFERENCES node_chains(tag),
+    UNIQUE(chain_tag, source_peer_tag, target_peer_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_relay_routes_chain_tag ON relay_routes(chain_tag);
+CREATE INDEX IF NOT EXISTS idx_relay_routes_enabled ON relay_routes(enabled)
 """
 
 
@@ -907,6 +974,8 @@ def migrate_peer_nodes_tables(conn: sqlite3.Connection):
                 relay_rules TEXT,
                 health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
                 last_health_check TIMESTAMP,
+                downstream_status TEXT DEFAULT 'unknown' CHECK(downstream_status IN ('unknown', 'connected', 'disconnected')),
+                disconnected_node TEXT,
                 enabled INTEGER DEFAULT 1,
                 priority INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -917,9 +986,258 @@ def migrate_peer_nodes_tables(conn: sqlite3.Connection):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_node_chains_enabled ON node_chains(enabled)")
         print("✓ 创建 node_chains 表")
     else:
-        print("⊘ node_chains 表已存在，跳过")
+        # 检查是否需要添加级联通知相关列
+        cursor.execute("PRAGMA table_info(node_chains)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "downstream_status" not in columns:
+            cursor.execute("ALTER TABLE node_chains ADD COLUMN downstream_status TEXT DEFAULT 'unknown'")
+            print("✓ 添加 node_chains.downstream_status 列")
+        if "disconnected_node" not in columns:
+            cursor.execute("ALTER TABLE node_chains ADD COLUMN disconnected_node TEXT")
+            print("✓ 添加 node_chains.disconnected_node 列")
+        if "downstream_status" in columns and "disconnected_node" in columns:
+            print("⊘ node_chains 表已存在，跳过")
+
+    # 检查 chain_registrations 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chain_registrations'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chain_registrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_id TEXT NOT NULL,
+                upstream_node_tag TEXT NOT NULL,
+                upstream_endpoint TEXT NOT NULL,
+                upstream_psk TEXT NOT NULL,
+                downstream_node_tag TEXT NOT NULL,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chain_id, upstream_node_tag)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_registrations_chain_id ON chain_registrations(chain_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_registrations_downstream ON chain_registrations(downstream_node_tag)")
+        print("✓ 创建 chain_registrations 表")
+    else:
+        # 检查是否需要添加 upstream_psk 列
+        cursor.execute("PRAGMA table_info(chain_registrations)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "upstream_psk" not in columns:
+            cursor.execute("ALTER TABLE chain_registrations ADD COLUMN upstream_psk TEXT DEFAULT ''")
+            print("✓ 添加 chain_registrations.upstream_psk 字段")
+        else:
+            print("⊘ chain_registrations 表已存在，跳过")
 
     conn.commit()
+
+
+def migrate_peer_nodes_inbound_fields(conn: sqlite3.Connection):
+    """为 peer_nodes 表添加入站监听配置字段
+
+    支持双向对等连接和中继功能:
+    - 入站监听配置（本节点作为服务端）：启用标志、端口、允许的 UUID
+    - 对方入站信息（用于连接到对方的入站）：对方端口、公钥、Short ID
+    """
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        print("⊘ peer_nodes 表不存在，跳过入站字段迁移")
+        return
+
+    # 检查现有列
+    cursor.execute("PRAGMA table_info(peer_nodes)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    migrations_done = 0
+
+    # 入站监听配置字段（本节点作为服务端）
+    inbound_server_fields = [
+        ("inbound_enabled", "INTEGER DEFAULT 0"),
+        ("inbound_port", "INTEGER"),
+        ("inbound_uuid", "TEXT"),
+        ("inbound_socks_port", "INTEGER"),  # SOCKS5 输出端口，sing-box 监听
+    ]
+
+    # 对方入站信息字段（用于连接到对方的入站）
+    peer_inbound_fields = [
+        ("peer_inbound_enabled", "INTEGER DEFAULT 0"),
+        ("peer_inbound_port", "INTEGER"),
+        ("peer_inbound_uuid", "TEXT"),  # 对方入站的 UUID（用于认证）
+        ("peer_inbound_reality_public_key", "TEXT"),
+        ("peer_inbound_reality_short_id", "TEXT"),
+    ]
+
+    all_fields = inbound_server_fields + peer_inbound_fields
+
+    for field_name, field_type in all_fields:
+        if field_name not in columns:
+            cursor.execute(f"ALTER TABLE peer_nodes ADD COLUMN {field_name} {field_type}")
+            migrations_done += 1
+            print(f"✓ 添加 peer_nodes.{field_name} 字段")
+
+    if migrations_done > 0:
+        # 创建唯一索引防止端口冲突
+        try:
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_inbound_port
+                ON peer_nodes(inbound_port) WHERE inbound_port IS NOT NULL
+            """)
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_inbound_socks_port
+                ON peer_nodes(inbound_socks_port) WHERE inbound_socks_port IS NOT NULL
+            """)
+            print("✓ 创建入站端口唯一索引")
+        except Exception as e:
+            print(f"⊘ 创建索引时出错（可能已存在）: {e}")
+
+        conn.commit()
+        print(f"✓ peer_nodes 入站字段迁移完成（{migrations_done} 个字段）")
+    else:
+        print("⊘ peer_nodes 入站字段已存在，跳过迁移")
+
+
+def migrate_relay_routes_table(conn: sqlite3.Connection):
+    """为现有数据库添加 relay_routes 表（中继路由）"""
+    cursor = conn.cursor()
+
+    # 检查 relay_routes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='relay_routes'")
+    if cursor.fetchone():
+        print("⊘ relay_routes 表已存在，跳过迁移")
+        return
+
+    # 创建表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS relay_routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_tag TEXT NOT NULL,
+            source_peer_tag TEXT NOT NULL,
+            target_peer_tag TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chain_tag, source_peer_tag, target_peer_tag)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_relay_routes_chain_tag ON relay_routes(chain_tag)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_relay_routes_enabled ON relay_routes(enabled)")
+    conn.commit()
+    print("✓ 创建 relay_routes 表")
+
+
+def migrate_peer_nodes_xray_reality_fields(conn: sqlite3.Connection):
+    """为 peer_nodes 表添加 REALITY 和 XHTTP 配置字段
+
+    支持 VLESS+XHTTP+REALITY 协议组合:
+    - REALITY 配置（本节点作为服务端）：私钥、公钥、Short ID、Dest、ServerNames
+    - 对端 REALITY 配置（本节点作为客户端）：对端公钥、Short ID、Dest、ServerNames
+    - XHTTP 传输配置：Path、Mode、Host
+    """
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        print("⊘ peer_nodes 表不存在，跳过 REALITY 字段迁移")
+        return
+
+    # 检查现有列
+    cursor.execute("PRAGMA table_info(peer_nodes)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    migrations_done = 0
+
+    # REALITY 配置字段（本节点作为服务端）
+    reality_server_fields = [
+        ("xray_reality_private_key", "TEXT"),
+        ("xray_reality_public_key", "TEXT"),
+        ("xray_reality_short_id", "TEXT"),
+        ("xray_reality_dest", "TEXT DEFAULT 'www.microsoft.com:443'"),
+        ("xray_reality_server_names", "TEXT DEFAULT '[\"www.microsoft.com\"]'"),
+    ]
+
+    # 对端 REALITY 配置字段（本节点作为客户端）
+    reality_peer_fields = [
+        ("xray_peer_reality_public_key", "TEXT"),
+        ("xray_peer_reality_short_id", "TEXT"),
+        ("xray_peer_reality_dest", "TEXT"),
+        ("xray_peer_reality_server_names", "TEXT"),
+    ]
+
+    # XHTTP 传输配置字段
+    xhttp_fields = [
+        ("xray_xhttp_path", "TEXT DEFAULT '/'"),
+        ("xray_xhttp_mode", "TEXT DEFAULT 'auto'"),
+        ("xray_xhttp_host", "TEXT"),
+    ]
+
+    all_fields = reality_server_fields + reality_peer_fields + xhttp_fields
+
+    for field_name, field_type in all_fields:
+        if field_name not in columns:
+            cursor.execute(f"ALTER TABLE peer_nodes ADD COLUMN {field_name} {field_type}")
+            migrations_done += 1
+            print(f"✓ 添加 peer_nodes.{field_name} 字段")
+
+    if migrations_done > 0:
+        conn.commit()
+        print(f"✓ peer_nodes REALITY/XHTTP 字段迁移完成（{migrations_done} 个字段）")
+    else:
+        print("⊘ peer_nodes REALITY/XHTTP 字段已存在，跳过迁移")
+
+
+def migrate_peer_nodes_api_port(conn: sqlite3.Connection):
+    """为 peer_nodes 表添加 api_port 字段
+
+    用于支持端口映射场景，允许 API 端口与隧道端口不同
+    """
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        print("⊘ peer_nodes 表不存在，跳过 api_port 迁移")
+        return
+
+    # 检查 api_port 列是否存在
+    cursor.execute("PRAGMA table_info(peer_nodes)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "api_port" not in columns:
+        cursor.execute("ALTER TABLE peer_nodes ADD COLUMN api_port INTEGER")
+        conn.commit()
+        print("✓ 添加 peer_nodes.api_port 字段")
+    else:
+        print("⊘ peer_nodes.api_port 字段已存在，跳过迁移")
+
+
+def migrate_peer_nodes_connection_mode(conn: sqlite3.Connection):
+    """为 peer_nodes 表添加 connection_mode 字段
+
+    用于支持双向连接：
+    - outbound: 连接到对端的主隧道端点（默认行为）
+    - inbound: 连接到对端的入站监听器（需要对端启用 inbound）
+    """
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        print("⊘ peer_nodes 表不存在，跳过 connection_mode 迁移")
+        return
+
+    # 检查 connection_mode 列是否存在
+    cursor.execute("PRAGMA table_info(peer_nodes)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "connection_mode" not in columns:
+        cursor.execute("""
+            ALTER TABLE peer_nodes ADD COLUMN connection_mode TEXT DEFAULT 'outbound'
+            CHECK(connection_mode IN ('outbound', 'inbound'))
+        """)
+        conn.commit()
+        print("✓ 添加 peer_nodes.connection_mode 字段")
+    else:
+        print("⊘ peer_nodes.connection_mode 字段已存在，跳过迁移")
 
 
 def generate_wireguard_private_key() -> str:
@@ -1143,6 +1461,11 @@ def main():
     migrate_pia_profiles_custom_dns(conn)
     migrate_ingress_default_outbound(conn)
     migrate_peer_nodes_tables(conn)
+    migrate_peer_nodes_xray_reality_fields(conn)
+    migrate_peer_nodes_inbound_fields(conn)
+    migrate_peer_nodes_api_port(conn)
+    migrate_peer_nodes_connection_mode(conn)
+    migrate_relay_routes_table(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)
@@ -1183,6 +1506,7 @@ def main():
         "outbound_groups": cursor.execute("SELECT COUNT(*) FROM outbound_groups").fetchone()[0],
         "peer_nodes": cursor.execute("SELECT COUNT(*) FROM peer_nodes").fetchone()[0],
         "node_chains": cursor.execute("SELECT COUNT(*) FROM node_chains").fetchone()[0],
+        "relay_routes": cursor.execute("SELECT COUNT(*) FROM relay_routes").fetchone()[0],
     }
 
     db_size_bytes = user_db_path.stat().st_size
@@ -1205,6 +1529,7 @@ def main():
     print(f"出口组:           {stats['outbound_groups']:,}")
     print(f"对等节点:         {stats['peer_nodes']:,}")
     print(f"多跳链路:         {stats['node_chains']:,}")
+    print(f"中继路由:         {stats['relay_routes']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

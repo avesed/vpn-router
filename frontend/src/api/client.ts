@@ -85,13 +85,16 @@ import type {
   PeerNodeUpdateRequest,
   PeerNodeListResponse,
   PeerNodeStatusResponse,
+  PeerNodeConnectResponse,
+  PeerNodeDisconnectResponse,
   BatchOperationResponse,
   // Node Chains types
   NodeChain,
   NodeChainCreateRequest,
   NodeChainUpdateRequest,
   NodeChainListResponse,
-  ChainStatsResponse
+  ChainStatsResponse,
+  ChainHealthCheckResponse
 } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
@@ -192,8 +195,13 @@ async function fetchWithAuth(path: string, timeout: number = DEFAULT_TIMEOUT): P
   const token = localStorage.getItem(TOKEN_KEY);
 
   const headers: Record<string, string> = {};
-  if (token) {
+  // Apply same JWT validation as request()
+  if (token && JWT_PATTERN.test(token)) {
     headers["Authorization"] = `Bearer ${token}`;
+  } else if (token) {
+    // Token 格式无效，清除并记录
+    console.warn("Invalid token format detected, clearing token");
+    localStorage.removeItem(TOKEN_KEY);
   }
 
   // M8: 使用 AbortController 实现请求超时
@@ -724,13 +732,13 @@ export const api = {
     ),
 
   connectPeerNode: (tag: string) =>
-    request<{ message: string; status: PeerNodeStatusResponse }>(
+    request<PeerNodeConnectResponse>(
       `/peers/${encodeURIComponent(tag)}/connect`,
       { method: "POST", timeout: 60000 }
     ),
 
   disconnectPeerNode: (tag: string) =>
-    request<{ message: string }>(
+    request<PeerNodeDisconnectResponse>(
       `/peers/${encodeURIComponent(tag)}/disconnect`,
       { method: "POST" }
     ),
@@ -784,7 +792,7 @@ export const api = {
     request<ChainStatsResponse>(`/stats/chains/${encodeURIComponent(tag)}`),
 
   triggerChainHealthCheck: (tag: string) =>
-    request<{ message: string; health_status: string }>(
+    request<ChainHealthCheckResponse>(
       `/chains/${encodeURIComponent(tag)}/health-check`,
       { method: "POST", timeout: 60000 }
     )

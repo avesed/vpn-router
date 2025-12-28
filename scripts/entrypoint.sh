@@ -10,6 +10,12 @@ cleanup() {
     kill "${HEALTH_CHECKER_PID}" >/dev/null 2>&1 || true
   fi
 
+  # Stop peer tunnel manager
+  if [ -n "${PEER_TUNNEL_MGR_PID:-}" ] && kill -0 "${PEER_TUNNEL_MGR_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping peer tunnel manager (PID ${PEER_TUNNEL_MGR_PID})"
+    kill "${PEER_TUNNEL_MGR_PID}" >/dev/null 2>&1 || true
+  fi
+
   # Stop tunnel managers
   if [ -n "${WARP_MGR_PID:-}" ] && kill -0 "${WARP_MGR_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping WARP manager (PID ${WARP_MGR_PID})"
@@ -51,6 +57,7 @@ XRAY_MGR_PID=""
 XRAY_EGRESS_MGR_PID=""
 WARP_MGR_PID=""
 HEALTH_CHECKER_PID=""
+PEER_TUNNEL_MGR_PID=""
 
 # Cleanup WireGuard interfaces created by this container
 # This is important for network_mode: host to prevent stale interfaces
@@ -573,6 +580,31 @@ print(len(groups))
   fi
 }
 
+# === Peer Tunnel Manager Daemon ===
+start_peer_tunnel_manager() {
+  # 检查是否有启用自动重连的对等节点
+  local peer_count
+  peer_count=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+peers = db.get_peer_nodes()
+# 统计启用自动重连的节点数
+count = sum(1 for p in peers if p.get('auto_reconnect', False))
+print(count)
+" 2>/dev/null || echo "0")
+
+  if [ "${peer_count}" -gt "0" ]; then
+    echo "[entrypoint] starting peer tunnel manager for ${peer_count} auto-reconnect peers"
+    python3 /usr/local/bin/peer_tunnel_manager.py daemon >/var/log/peer-tunnel-manager.log 2>&1 &
+    PEER_TUNNEL_MGR_PID=$!
+    echo "[entrypoint] peer tunnel manager started with PID ${PEER_TUNNEL_MGR_PID}"
+  else
+    echo "[entrypoint] No auto-reconnect peers configured, skipping peer tunnel manager"
+  fi
+}
+
 start_nginx() {
   echo "[entrypoint] starting nginx on port ${WEB_PORT}"
 
@@ -639,6 +671,7 @@ start_xray_manager
 start_xray_egress_manager
 start_warp_manager
 start_health_checker
+start_peer_tunnel_manager
 
 echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
 
@@ -769,6 +802,12 @@ while true; do
   if [ -n "${HEALTH_CHECKER_PID}" ] && ! kill -0 "${HEALTH_CHECKER_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: health checker died, restarting..." >&2
     start_health_checker
+  fi
+
+  # Check peer tunnel manager
+  if [ -n "${PEER_TUNNEL_MGR_PID}" ] && ! kill -0 "${PEER_TUNNEL_MGR_PID}" 2>/dev/null; then
+    echo "[entrypoint] WARNING: peer tunnel manager died, restarting..." >&2
+    start_peer_tunnel_manager
   fi
 
   # Check sing-box

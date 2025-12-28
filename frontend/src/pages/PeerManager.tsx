@@ -26,8 +26,8 @@ import type {
   PeerNodeCreateRequest,
   PeerNodeUpdateRequest,
   PeerTunnelType,
-  PeerXrayProtocol,
-  PeerTunnelStatus
+  PeerTunnelStatus,
+  XHttpMode
 } from "../types";
 
 // Status color mapping
@@ -69,9 +69,13 @@ export default function PeerManager() {
     endpoint: string;
     psk: string;
     tunnel_type: PeerTunnelType;
-    xray_protocol: PeerXrayProtocol;
-    tls_verify: boolean;
-    tls_fingerprint: string;
+    // REALITY 配置（Xray 隧道用）
+    xray_reality_dest: string;
+    xray_reality_server_names: string;
+    // XHTTP 传输配置
+    xray_xhttp_path: string;
+    xray_xhttp_mode: XHttpMode;
+    xray_xhttp_host: string;
     auto_reconnect: boolean;
   }>({
     tag: "",
@@ -80,9 +84,13 @@ export default function PeerManager() {
     endpoint: "",
     psk: "",
     tunnel_type: "wireguard",
-    xray_protocol: "vless",
-    tls_verify: true,
-    tls_fingerprint: "",
+    // REALITY 默认值
+    xray_reality_dest: "www.microsoft.com:443",
+    xray_reality_server_names: "www.microsoft.com",
+    // XHTTP 默认值
+    xray_xhttp_path: "/",
+    xray_xhttp_mode: "auto",
+    xray_xhttp_host: "",
     auto_reconnect: true
   });
   const [formError, setFormError] = useState<string | null>(null);
@@ -182,9 +190,13 @@ export default function PeerManager() {
       endpoint: "",
       psk: "",
       tunnel_type: "wireguard",
-      xray_protocol: "vless",
-      tls_verify: true,
-      tls_fingerprint: "",
+      // REALITY 默认值
+      xray_reality_dest: "www.microsoft.com:443",
+      xray_reality_server_names: "www.microsoft.com",
+      // XHTTP 默认值
+      xray_xhttp_path: "/",
+      xray_xhttp_mode: "auto",
+      xray_xhttp_host: "",
       auto_reconnect: true
     });
     setFormError(null);
@@ -208,12 +220,27 @@ export default function PeerManager() {
       endpoint: node.endpoint,
       psk: "",
       tunnel_type: node.tunnel_type,
-      xray_protocol: node.xray_protocol || "vless",
-      tls_verify: node.tls_verify !== 0,  // Convert 0/1 to boolean
-      tls_fingerprint: node.tls_fingerprint || "",
+      // REALITY 配置
+      xray_reality_dest: node.xray_reality_dest || "www.microsoft.com:443",
+      xray_reality_server_names: parseServerNames(node.xray_reality_server_names),
+      // XHTTP 配置
+      xray_xhttp_path: node.xray_xhttp_path || "/",
+      xray_xhttp_mode: node.xray_xhttp_mode || "auto",
+      xray_xhttp_host: node.xray_xhttp_host || "",
       auto_reconnect: node.auto_reconnect
     });
     setShowModal(true);
+  };
+
+  // Helper to parse server names from JSON string
+  const parseServerNames = (json?: string): string => {
+    if (!json) return "www.microsoft.com";
+    try {
+      const arr = JSON.parse(json);
+      return Array.isArray(arr) ? arr.join(", ") : "www.microsoft.com";
+    } catch {
+      return "www.microsoft.com";
+    }
   };
 
   // Close modal
@@ -245,6 +272,12 @@ export default function PeerManager() {
 
     setSaving(true);
     try {
+      // Parse server names from comma-separated string to array
+      const serverNamesArray = formData.xray_reality_server_names
+        .split(",")
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
+
       if (editingNode) {
         // Update existing node
         const updateData: PeerNodeUpdateRequest = {
@@ -252,9 +285,13 @@ export default function PeerManager() {
           description: formData.description || undefined,
           endpoint: formData.endpoint,
           auto_reconnect: formData.auto_reconnect,
-          // TLS 配置（用于 Trojan 协议）
-          tls_verify: formData.tls_verify,
-          tls_fingerprint: formData.tls_fingerprint || undefined
+          // REALITY 配置（仅 Xray 隧道）
+          xray_reality_dest: formData.xray_reality_dest || undefined,
+          xray_reality_server_names: serverNamesArray.length > 0 ? serverNamesArray : undefined,
+          // XHTTP 配置
+          xray_xhttp_path: formData.xray_xhttp_path || undefined,
+          xray_xhttp_mode: formData.xray_xhttp_mode || undefined,
+          xray_xhttp_host: formData.xray_xhttp_host || undefined
         };
         if (formData.psk) {
           updateData.psk = formData.psk;
@@ -270,10 +307,13 @@ export default function PeerManager() {
           endpoint: formData.endpoint,
           psk: formData.psk,
           tunnel_type: formData.tunnel_type,
-          xray_protocol: formData.tunnel_type === "xray" ? formData.xray_protocol : undefined,
-          // TLS 配置（用于 Trojan 协议）
-          tls_verify: formData.tls_verify,
-          tls_fingerprint: formData.tls_fingerprint || undefined,
+          // REALITY 配置（仅 Xray 隧道）
+          xray_reality_dest: formData.tunnel_type === "xray" ? formData.xray_reality_dest : undefined,
+          xray_reality_server_names: formData.tunnel_type === "xray" && serverNamesArray.length > 0 ? serverNamesArray : undefined,
+          // XHTTP 配置
+          xray_xhttp_path: formData.tunnel_type === "xray" ? formData.xray_xhttp_path : undefined,
+          xray_xhttp_mode: formData.tunnel_type === "xray" ? formData.xray_xhttp_mode : undefined,
+          xray_xhttp_host: formData.tunnel_type === "xray" ? (formData.xray_xhttp_host || undefined) : undefined,
           auto_reconnect: formData.auto_reconnect
         };
         await api.createPeerNode(createData);
@@ -329,8 +369,13 @@ export default function PeerManager() {
   const handleConnectNode = async (node: PeerNode) => {
     setConnectingNodes((prev) => new Set(prev).add(node.tag));
     try {
-      await api.connectPeerNode(node.tag);
-      showSuccess(t("peers.connectSuccess", { name: node.name }));
+      const response = await api.connectPeerNode(node.tag);
+      // 根据是否成功通知远程节点显示不同的消息
+      if (response.remote_notified) {
+        showSuccess(t("peers.connectSuccessSynced", { name: node.name }));
+      } else {
+        showSuccess(t("peers.connectSuccess", { name: node.name }));
+      }
       loadNodes();
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -348,8 +393,13 @@ export default function PeerManager() {
   const handleDisconnectNode = async (node: PeerNode) => {
     setDisconnectingNodes((prev) => new Set(prev).add(node.tag));
     try {
-      await api.disconnectPeerNode(node.tag);
-      showSuccess(t("peers.disconnectSuccess", { name: node.name }));
+      const response = await api.disconnectPeerNode(node.tag);
+      // 根据是否成功通知远程节点显示不同的消息
+      if (response.remote_notified) {
+        showSuccess(t("peers.disconnectSuccessSynced", { name: node.name }));
+      } else {
+        showSuccess(t("peers.disconnectSuccess", { name: node.name }));
+      }
       loadNodes();
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -453,7 +503,7 @@ export default function PeerManager() {
           isWireGuard ? "bg-blue-500/20 text-blue-400" : "bg-purple-500/20 text-purple-400"
         }`}
       >
-        {isWireGuard ? t("peers.wireguard") : `${t("peers.xray")} (${node.xray_protocol?.toUpperCase()})`}
+        {isWireGuard ? t("peers.wireguard") : t("peers.xrayReality")}
       </span>
     );
   };
@@ -875,59 +925,98 @@ export default function PeerManager() {
                 </div>
               )}
 
-              {/* Xray Protocol (only for Xray tunnel type) */}
-              {!editingNode && formData.tunnel_type === "xray" && (
-                <div>
-                  <label className="block text-sm font-medium text-slate-400 mb-2">
-                    {t("peers.xrayProtocol")}
-                  </label>
-                  <select
-                    name="xray_protocol"
-                    value={formData.xray_protocol}
-                    onChange={handleInputChange}
-                    className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
-                  >
-                    <option value="vless">{t("peers.vless")}</option>
-                    <option value="vmess">{t("peers.vmess")}</option>
-                    <option value="trojan">{t("peers.trojan")}</option>
-                  </select>
-                </div>
-              )}
-
-              {/* TLS Verification (only for Xray Trojan protocol) */}
-              {formData.tunnel_type === "xray" && formData.xray_protocol === "trojan" && (
+              {/* REALITY Configuration (only for Xray tunnel type) */}
+              {formData.tunnel_type === "xray" && (
                 <>
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="checkbox"
-                      id="tls_verify"
-                      name="tls_verify"
-                      checked={formData.tls_verify}
-                      onChange={handleInputChange}
-                      className="w-4 h-4 rounded border-white/10 bg-white/5 text-brand focus:ring-brand focus:ring-offset-0"
-                    />
-                    <label htmlFor="tls_verify" className="text-slate-300">
-                      {t("peers.tlsVerify")}
-                    </label>
-                  </div>
-                  {!formData.tls_verify && (
-                    <p className="text-xs text-yellow-500 -mt-2 ml-7">{t("peers.tlsVerifyWarning")}</p>
-                  )}
+                  <div className="border-t border-white/10 pt-4 mt-4">
+                    <h3 className="text-sm font-medium text-slate-300 mb-3">{t("peers.realityConfig")}</h3>
 
-                  <div>
-                    <label className="block text-sm font-medium text-slate-400 mb-2">
-                      {t("peers.tlsFingerprint")}
-                      <span className="text-slate-500 ml-2">({t("common.optional")})</span>
-                    </label>
-                    <input
-                      type="text"
-                      name="tls_fingerprint"
-                      value={formData.tls_fingerprint}
-                      onChange={handleInputChange}
-                      placeholder={t("peers.tlsFingerprintPlaceholder")}
-                      className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
-                    />
-                    <p className="text-xs text-slate-500 mt-1">{t("peers.tlsFingerprintHint")}</p>
+                    {/* REALITY Dest */}
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t("peers.realityDest")}
+                      </label>
+                      <input
+                        type="text"
+                        name="xray_reality_dest"
+                        value={formData.xray_reality_dest}
+                        onChange={handleInputChange}
+                        placeholder="www.microsoft.com:443"
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                      <p className="text-xs text-slate-500 mt-1">{t("peers.realityDestHint")}</p>
+                    </div>
+
+                    {/* REALITY Server Names */}
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t("peers.realityServerNames")}
+                      </label>
+                      <input
+                        type="text"
+                        name="xray_reality_server_names"
+                        value={formData.xray_reality_server_names}
+                        onChange={handleInputChange}
+                        placeholder="www.microsoft.com"
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                      <p className="text-xs text-slate-500 mt-1">{t("peers.realityServerNamesHint")}</p>
+                    </div>
+                  </div>
+
+                  {/* XHTTP Configuration */}
+                  <div className="border-t border-white/10 pt-4 mt-4">
+                    <h3 className="text-sm font-medium text-slate-300 mb-3">{t("peers.xhttpConfig")}</h3>
+
+                    {/* XHTTP Path */}
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t("peers.xhttpPath")}
+                      </label>
+                      <input
+                        type="text"
+                        name="xray_xhttp_path"
+                        value={formData.xray_xhttp_path}
+                        onChange={handleInputChange}
+                        placeholder="/"
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                    </div>
+
+                    {/* XHTTP Mode */}
+                    <div className="mb-4">
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t("peers.xhttpMode")}
+                      </label>
+                      <select
+                        name="xray_xhttp_mode"
+                        value={formData.xray_xhttp_mode}
+                        onChange={handleInputChange}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                      >
+                        <option value="auto">auto</option>
+                        <option value="packet-up">packet-up</option>
+                        <option value="stream-up">stream-up</option>
+                        <option value="stream-one">stream-one</option>
+                      </select>
+                      <p className="text-xs text-slate-500 mt-1">{t("peers.xhttpModeHint")}</p>
+                    </div>
+
+                    {/* XHTTP Host */}
+                    <div>
+                      <label className="block text-sm font-medium text-slate-400 mb-2">
+                        {t("peers.xhttpHost")}
+                        <span className="text-slate-500 ml-2">({t("common.optional")})</span>
+                      </label>
+                      <input
+                        type="text"
+                        name="xray_xhttp_host"
+                        value={formData.xray_xhttp_host}
+                        onChange={handleInputChange}
+                        placeholder={t("peers.xhttpHostPlaceholder")}
+                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white placeholder-slate-500 focus:outline-none focus:border-brand"
+                      />
+                    </div>
                   </div>
                 </>
               )}
@@ -1065,6 +1154,77 @@ export default function PeerManager() {
                       )}
                     </div>
                   </>
+                )}
+
+                {/* REALITY Keys (for Xray nodes) */}
+                {detailNode.tunnel_type === "xray" && (
+                  <div className="border-t border-white/10 pt-4 mt-4">
+                    <h3 className="text-sm font-medium text-slate-300 mb-3">{t("peers.realityKeysTitle")}</h3>
+
+                    {/* Local keys (this node as server) */}
+                    {detailNode.xray_reality_public_key && (
+                      <div className="space-y-3 mb-4">
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">{t("peers.localPublicKey")}</label>
+                          <p className="text-white font-mono text-xs break-all bg-slate-800 p-2 rounded">
+                            {detailNode.xray_reality_public_key}
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">{t("peers.localShortId")}</label>
+                          <p className="text-white font-mono text-sm">{detailNode.xray_reality_short_id}</p>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1">{t("peers.realityDest")}</label>
+                            <p className="text-white font-mono text-sm">{detailNode.xray_reality_dest}</p>
+                          </div>
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1">{t("peers.realityServerNames")}</label>
+                            <p className="text-white font-mono text-sm">{parseServerNames(detailNode.xray_reality_server_names)}</p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Peer keys (for connecting to peer) */}
+                    {detailNode.xray_peer_reality_public_key && (
+                      <div className="space-y-3 border-t border-white/5 pt-3">
+                        <label className="block text-xs text-slate-400">{t("peers.peerKeysLabel")}</label>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">{t("peers.peerPublicKey")}</label>
+                          <p className="text-white font-mono text-xs break-all bg-slate-800 p-2 rounded">
+                            {detailNode.xray_peer_reality_public_key}
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">{t("peers.peerShortId")}</label>
+                          <p className="text-white font-mono text-sm">{detailNode.xray_peer_reality_short_id}</p>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* XHTTP Config */}
+                    <div className="border-t border-white/5 pt-3 mt-3">
+                      <label className="block text-xs text-slate-400 mb-2">{t("peers.xhttpConfig")}</label>
+                      <div className="grid grid-cols-3 gap-4">
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">{t("peers.xhttpPath")}</label>
+                          <p className="text-white font-mono text-sm">{detailNode.xray_xhttp_path || "/"}</p>
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">{t("peers.xhttpMode")}</label>
+                          <p className="text-white font-mono text-sm">{detailNode.xray_xhttp_mode || "auto"}</p>
+                        </div>
+                        {detailNode.xray_xhttp_host && (
+                          <div>
+                            <label className="block text-xs text-slate-500 mb-1">{t("peers.xhttpHost")}</label>
+                            <p className="text-white font-mono text-sm">{detailNode.xray_xhttp_host}</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 )}
 
                 {/* Last seen / error */}

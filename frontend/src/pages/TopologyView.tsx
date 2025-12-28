@@ -112,7 +112,7 @@ const PeerNodeComponent = React.memo(function PeerNodeComponent({ data }: { data
           <span className={`text-xs ${colors.text}`}>{t(`peers.status.${node.tunnel_status}`)}</span>
         </div>
         <div className="text-xs text-slate-500 mt-1 truncate">
-          {node.tunnel_type === "wireguard" ? "WireGuard" : `Xray (${node.xray_protocol?.toUpperCase()})`}
+          {node.tunnel_type === "wireguard" ? "WireGuard" : "VLESS+REALITY"}
         </div>
       </div>
     </div>
@@ -559,7 +559,7 @@ export default function TopologyView() {
                   <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium ${
                     selectedNode.tunnel_type === "wireguard" ? "bg-blue-500/20 text-blue-400" : "bg-purple-500/20 text-purple-400"
                   }`}>
-                    {selectedNode.tunnel_type === "wireguard" ? "WireGuard" : `Xray (${selectedNode.xray_protocol?.toUpperCase()})`}
+                    {selectedNode.tunnel_type === "wireguard" ? "WireGuard" : "VLESS+REALITY"}
                   </span>
                 </div>
               </div>

@@ -2345,6 +2345,82 @@ def ensure_speed_test_inbounds(config: dict, egress_tags: List[str]) -> None:
         print(f"[render] 已添加 {added_count} 个测速 SOCKS inbound (端口 {base_port}-{base_port + len(egress_tags) - 1})")
 
 
+def ensure_peer_inbound_socks(config: dict) -> None:
+    """为启用入站的对等节点添加 SOCKS inbound
+
+    每个启用入站的对等节点会有一个 Xray 入站监听器，
+    Xray 将流量转发到 sing-box 的 SOCKS inbound 进行路由。
+
+    端口映射（由数据库的 inbound_socks_port 字段决定）:
+    - peer-node-1 -> socks://127.0.0.1:38601
+    - peer-node-2 -> socks://127.0.0.1:38602
+    - ...
+
+    Args:
+        config: sing-box 配置
+    """
+    # 获取所有启用入站的对等节点
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        nodes = db.get_peer_nodes_with_inbound()
+    except Exception as e:
+        print(f"[render] 获取对等节点列表失败: {e}")
+        return
+
+    if not nodes:
+        return
+
+    inbounds = config.setdefault("inbounds", [])
+    route = config.setdefault("route", {})
+    rules = route.setdefault("rules", [])
+
+    # 获取已存在的 inbound tags
+    existing_inbound_tags = {ib.get("tag") for ib in inbounds}
+
+    added_count = 0
+
+    for node in nodes:
+        tag = node.get("tag")
+        socks_port = node.get("inbound_socks_port")
+        default_outbound = node.get("default_outbound", "direct")
+
+        if not socks_port:
+            print(f"[render] 对等节点 {tag} 未分配 SOCKS 端口，跳过")
+            continue
+
+        inbound_tag = f"peer-in-{tag}"
+
+        # 跳过已存在的 inbound
+        if inbound_tag in existing_inbound_tags:
+            continue
+
+        # 添加 SOCKS inbound
+        inbound = {
+            "type": "socks",
+            "tag": inbound_tag,
+            "listen": "127.0.0.1",
+            "listen_port": socks_port,
+            # 启用流量嗅探以支持域名路由
+            "sniff": True,
+            "sniff_override_destination": False
+        }
+        inbounds.append(inbound)
+
+        # 添加路由规则：从该 inbound 的流量走默认出口
+        # 这个规则需要高优先级，插入到 rules 的前面
+        route_rule = {
+            "inbound": inbound_tag,
+            "outbound": default_outbound if default_outbound else "direct"
+        }
+        rules.insert(0, route_rule)
+
+        added_count += 1
+        print(f"[render] 添加对等节点入站 SOCKS: {inbound_tag} -> {socks_port} -> {default_outbound}")
+
+    if added_count > 0:
+        print(f"[render] 已添加 {added_count} 个对等节点 SOCKS inbound")
+
+
 def main() -> None:
     config = load_json(BASE_CONFIG)
 
@@ -2446,6 +2522,10 @@ def main() -> None:
         print(f"[render] 处理 {len(peer_nodes)} 个已连接的对等节点")
         peer_tags = ensure_peer_node_outbounds(config, peer_nodes)
         all_egress_tags.extend(peer_tags)
+
+    # 为启用入站的对等节点添加 SOCKS inbound
+    # Xray 入站监听器将流量转发到这些 SOCKS 端口
+    ensure_peer_inbound_socks(config)
 
     # 加载并处理多跳链路（A→B→C 多节点串联）
     # 每条链路生成一个 outbound，绑定到第一跳的隧道接口
