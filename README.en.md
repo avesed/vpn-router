@@ -97,7 +97,3 @@ environment:
   - WEB_PORT=36000             # Web UI port (optional)
   - WG_LISTEN_PORT=36100       # WireGuard port (optional)
 ```
-
-## License
-
-MIT
