@@ -215,6 +215,12 @@ COPY scripts/key_manager.py /usr/local/bin/key_manager.py
 COPY scripts/ecmp_manager.py /usr/local/bin/ecmp_manager.py
 COPY scripts/health_checker.py /usr/local/bin/health_checker.py
 COPY scripts/peer_tunnel_manager.py /usr/local/bin/peer_tunnel_manager.py
+# Phase 11: Multi-node peering scripts
+COPY scripts/dscp_manager.py /usr/local/bin/dscp_manager.py
+COPY scripts/relay_config_manager.py /usr/local/bin/relay_config_manager.py
+COPY scripts/peer_pairing.py /usr/local/bin/peer_pairing.py
+COPY scripts/tunnel_api_client.py /usr/local/bin/tunnel_api_client.py
+COPY scripts/chain_route_manager.py /usr/local/bin/chain_route_manager.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
@@ -225,7 +231,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/xray_egress_manager.py /usr/local/bin/xray_peer_inbound_manager.py \
     /usr/local/bin/warp_manager.py \
     /usr/local/bin/warp_endpoint_optimizer.py /usr/local/bin/ecmp_manager.py \
-    /usr/local/bin/health_checker.py /usr/local/bin/peer_tunnel_manager.py
+    /usr/local/bin/health_checker.py /usr/local/bin/peer_tunnel_manager.py \
+    /usr/local/bin/dscp_manager.py /usr/local/bin/relay_config_manager.py \
+    /usr/local/bin/peer_pairing.py /usr/local/bin/tunnel_api_client.py \
+    /usr/local/bin/chain_route_manager.py
 
 # Note: Config is mounted via docker-compose volumes
 # - user-config.db is auto-created on first run by init_user_db.py

@@ -795,5 +795,26 @@ export const api = {
     request<ChainHealthCheckResponse>(
       `/chains/${encodeURIComponent(tag)}/health-check`,
       { method: "POST", timeout: 60000 }
+    ),
+
+  // Get terminal node's available egress list (with cache support - Phase 11.5)
+  getTerminalEgress: (tag: string, refresh?: boolean) =>
+    request<{ egress_list: Array<{ tag: string; type: string; description?: string; enabled: boolean }>; node_tag: string; cached?: boolean; cached_at?: string }>(
+      `/chains/${encodeURIComponent(tag)}/terminal-egress${refresh ? '?refresh=true' : ''}`,
+      { timeout: 30000 }
+    ),
+
+  // Activate chain (register routes to terminal node)
+  activateChain: (tag: string) =>
+    request<{ message: string; chain_state: string; dscp_value?: number }>(
+      `/chains/${encodeURIComponent(tag)}/activate`,
+      { method: "POST", timeout: 30000 }
+    ),
+
+  // Deactivate chain (unregister routes)
+  deactivateChain: (tag: string) =>
+    request<{ message: string; chain_state: string }>(
+      `/chains/${encodeURIComponent(tag)}/deactivate`,
+      { method: "POST", timeout: 30000 }
     )
 };

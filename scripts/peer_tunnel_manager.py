@@ -72,7 +72,23 @@ SQLCIPHER_KEY = os.environ.get("SQLCIPHER_KEY")
 # 隧道 IP 子网
 PEER_TUNNEL_SUBNET = "10.200.200"
 
-# 端口范围（避免与 WireGuard 入口端口 36100-36299 冲突）
+# ============ Phase 11-Fix.D: 端口分配说明 ============
+#
+# 端口用途表:
+#   36000       Web UI + API（nginx）
+#   36100       WireGuard 客户端入口（WG_LISTEN_PORT 环境变量）
+#   36300+      Peer 节点 WireGuard 隧道（本常量）
+#   37101+      V2Ray 出口 SOCKS 桥接端口
+#   37201+      Peer 节点 Xray SOCKS 端口
+#   38001+      WARP MASQUE SOCKS 端口
+#   38501       Xray 入口到 sing-box SOCKS 桥接
+#   39001+      速度测试专用 SOCKS 端口
+#
+# 重要：创建 peer 时 endpoint 应指向远程节点的 36300 端口（而非 36100）
+# 例如：10.1.100.12:36300 而非 10.1.100.12:36100
+#
+# ============================================
+
 PEER_WG_PORT_START = 36300
 PEER_XRAY_SOCKS_PORT_START = 37201
 
@@ -180,6 +196,389 @@ def get_interface_name(tag: str, tunnel_type: str = "wireguard") -> str:
             # 空间不足时只使用哈希（调整哈希长度以适应 max_tag_len）
             tag_hash = hashlib.md5(tag.encode()).hexdigest()[:max_tag_len]
             return f"{prefix}{tag_hash}"
+
+
+def get_pending_interface_name(pairing_id: str) -> str:
+    """生成待处理配对的接口名称
+
+    使用 wg-pend-{hash} 格式，保证唯一性且不超过 15 字符
+
+    Args:
+        pairing_id: 配对标识（base64 hash）
+
+    Returns:
+        接口名称，如 wg-pend-a1b2c3d
+    """
+    # wg-pend- 是 8 字符，留 7 字符给 hash
+    prefix = "wg-pend-"
+    hash_part = hashlib.md5(pairing_id.encode()).hexdigest()[:7]
+    return f"{prefix}{hash_part}"
+
+
+def create_pending_wireguard_interface(
+    pairing_id: str,
+    local_ip: str,
+    remote_ip: str,
+    listen_port: int,
+    private_key: str,
+    expected_peer_public_key: str,
+) -> tuple:
+    """创建用于配对的待处理 WireGuard 接口
+
+    此接口只监听，不设置 endpoint（等待对端主动连接）。
+    当对端连接后，WireGuard 会自动学习对端的 endpoint。
+
+    Args:
+        pairing_id: 配对标识（用于生成接口名）
+        local_ip: 本端隧道 IP（如 10.200.200.1）
+        remote_ip: 对端隧道 IP（如 10.200.200.2）
+        listen_port: 监听端口
+        private_key: 本节点私钥
+        expected_peer_public_key: 预生成的对端公钥（用于验证连接）
+
+    Returns:
+        (success, interface_name, error_message)
+    """
+    interface = get_pending_interface_name(pairing_id)
+
+    logger.info(f"[pending-pairing] 创建待处理接口: {interface} (port={listen_port})")
+
+    try:
+        # 检查接口是否已存在
+        check_result = subprocess.run(
+            ["ip", "link", "show", interface],
+            capture_output=True, text=True, timeout=10
+        )
+        if check_result.returncode == 0:
+            logger.info(f"[pending-pairing] 接口 {interface} 已存在，先删除")
+            subprocess.run(["ip", "link", "delete", interface], check=False, timeout=10)
+
+        # 创建 WireGuard 接口
+        subprocess.run(["ip", "link", "add", interface, "type", "wireguard"], check=True, timeout=10)
+
+        # 设置私钥（使用原子替换）
+        key_file = PEER_RUN_DIR / f"pending-{pairing_id[:8]}.key"
+        PEER_RUN_DIR.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(dir=PEER_RUN_DIR, suffix='.key')
+        try:
+            os.write(fd, private_key.encode('utf-8'))
+            os.close(fd)
+            os.chmod(temp_path, 0o600)
+            os.rename(temp_path, str(key_file))
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+
+        subprocess.run(["wg", "set", interface, "private-key", str(key_file)], check=True, timeout=10)
+
+        # 设置监听端口
+        subprocess.run(["wg", "set", interface, "listen-port", str(listen_port)], check=True, timeout=10)
+
+        # 添加对端（不设置 endpoint，只等待对方连接）
+        # allowed-ips 设置为对端的隧道 IP，这样只接受来自正确 IP 的流量
+        subprocess.run([
+            "wg", "set", interface, "peer", expected_peer_public_key,
+            "allowed-ips", f"{remote_ip}/32",
+            "persistent-keepalive", "25"
+        ], check=True, timeout=10)
+
+        # 配置 IP 地址
+        subprocess.run(["ip", "addr", "add", f"{local_ip}/30", "dev", interface], check=True, timeout=10)
+
+        # 启动接口
+        subprocess.run(["ip", "link", "set", interface, "up"], check=True, timeout=10)
+
+        logger.info(f"[pending-pairing] 待处理接口创建成功: {interface} ({local_ip} 等待 {remote_ip})")
+        return True, interface, None
+
+    except subprocess.CalledProcessError as e:
+        error_msg = f"命令执行失败: {e}"
+        logger.error(f"[pending-pairing] {error_msg}")
+        # 清理部分创建的接口
+        subprocess.run(["ip", "link", "delete", interface], check=False, timeout=10)
+        return False, None, error_msg
+
+    except subprocess.TimeoutExpired as e:
+        error_msg = f"命令超时: {e}"
+        logger.error(f"[pending-pairing] {error_msg}")
+        subprocess.run(["ip", "link", "delete", interface], check=False, timeout=10)
+        return False, None, error_msg
+
+    except Exception as e:
+        error_msg = f"未知错误: {e}"
+        logger.error(f"[pending-pairing] {error_msg}")
+        try:
+            subprocess.run(["ip", "link", "delete", interface], check=False, timeout=10)
+        except Exception:
+            pass
+        return False, None, error_msg
+
+
+def teardown_pending_wireguard_interface(interface_name: str) -> bool:
+    """清理待处理的 WireGuard 接口
+
+    Args:
+        interface_name: 接口名称
+
+    Returns:
+        是否成功
+    """
+    if not interface_name:
+        return True
+
+    logger.info(f"[pending-pairing] 清理待处理接口: {interface_name}")
+
+    try:
+        result = subprocess.run(
+            ["ip", "link", "show", interface_name],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            logger.debug(f"[pending-pairing] 接口 {interface_name} 不存在，无需清理")
+            return True
+
+        subprocess.run(["ip", "link", "delete", interface_name], check=True, timeout=10)
+        logger.info(f"[pending-pairing] 接口 {interface_name} 已删除")
+        return True
+
+    except Exception as e:
+        logger.warning(f"[pending-pairing] 清理接口失败: {e}")
+        return False
+
+
+def rename_wireguard_interface(old_name: str, new_name: str) -> bool:
+    """重命名 WireGuard 接口
+
+    将待处理接口重命名为正式接口（如 wg-pend-xxx -> wg-peer-node2）
+
+    Args:
+        old_name: 原接口名
+        new_name: 新接口名
+
+    Returns:
+        是否成功
+    """
+    logger.info(f"[pending-pairing] 重命名接口: {old_name} -> {new_name}")
+
+    try:
+        # 先关闭接口
+        subprocess.run(["ip", "link", "set", old_name, "down"], check=True, timeout=10)
+
+        # 重命名
+        subprocess.run(["ip", "link", "set", old_name, "name", new_name], check=True, timeout=10)
+
+        # 重新启动
+        subprocess.run(["ip", "link", "set", new_name, "up"], check=True, timeout=10)
+
+        logger.info(f"[pending-pairing] 接口重命名成功")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[pending-pairing] 接口重命名失败: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"[pending-pairing] 接口重命名出错: {e}")
+        return False
+
+
+def update_wireguard_peer_endpoint(interface: str, peer_public_key: str, endpoint: str) -> bool:
+    """更新 WireGuard 对端的 endpoint
+
+    当对端连接后，如果需要主动发起连接，可以设置 endpoint
+
+    Args:
+        interface: 接口名称
+        peer_public_key: 对端公钥
+        endpoint: 对端端点（IP:port）
+
+    Returns:
+        是否成功
+    """
+    logger.info(f"[pending-pairing] 更新对端 endpoint: {interface} -> {endpoint}")
+
+    try:
+        subprocess.run([
+            "wg", "set", interface, "peer", peer_public_key,
+            "endpoint", endpoint
+        ], check=True, timeout=10)
+        return True
+    except Exception as e:
+        logger.error(f"[pending-pairing] 更新 endpoint 失败: {e}")
+        return False
+
+
+def create_wireguard_tunnel_with_endpoint(
+    interface_name: str,
+    local_ip: str,
+    remote_ip: str,
+    listen_port: int,
+    private_key: str,
+    peer_public_key: str,
+    remote_endpoint: str,
+) -> tuple:
+    """Phase 11-Tunnel: 创建 WireGuard 隧道并连接到远程端点
+
+    用于导入配对请求时，Node B 创建隧道并连接到 Node A。
+
+    Args:
+        interface_name: 接口名称 (如 wg-peer-node1)
+        local_ip: 本地隧道 IP (如 10.200.200.2)
+        remote_ip: 对端隧道 IP (如 10.200.200.1)
+        listen_port: 本地监听端口 (如 36301)
+        private_key: 本地私钥
+        peer_public_key: 对端公钥
+        remote_endpoint: 远程端点 (如 10.1.100.11:36300)
+
+    Returns:
+        (success: bool, error_message: Optional[str])
+    """
+    logger.info(f"[tunnel] 创建 WireGuard 隧道: {interface_name} -> {remote_endpoint}")
+
+    try:
+        # 验证端点格式
+        if ":" in remote_endpoint:
+            ep_host, ep_port = remote_endpoint.rsplit(":", 1)
+        else:
+            return False, "Invalid endpoint format (missing port)"
+
+        if not validate_hostname(ep_host):
+            return False, f"Invalid endpoint hostname: {ep_host}"
+
+        # 检查并删除已存在的接口
+        check_result = subprocess.run(
+            ["ip", "link", "show", interface_name],
+            capture_output=True, text=True, timeout=10
+        )
+        if check_result.returncode == 0:
+            logger.info(f"[tunnel] 接口 {interface_name} 已存在，先删除")
+            subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
+
+        # 创建 WireGuard 接口
+        subprocess.run(["ip", "link", "add", interface_name, "type", "wireguard"], check=True, timeout=10)
+
+        # 写入私钥
+        PEER_RUN_DIR.mkdir(parents=True, exist_ok=True)
+        key_file = PEER_RUN_DIR / f"{interface_name}.key"
+        fd, temp_path = tempfile.mkstemp(dir=PEER_RUN_DIR, suffix='.key')
+        try:
+            os.write(fd, private_key.encode('utf-8'))
+            os.close(fd)
+            os.chmod(temp_path, 0o600)
+            os.rename(temp_path, str(key_file))
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
+
+        # 设置私钥
+        subprocess.run(["wg", "set", interface_name, "private-key", str(key_file)], check=True, timeout=10)
+
+        # 设置监听端口
+        subprocess.run(["wg", "set", interface_name, "listen-port", str(listen_port)], check=True, timeout=10)
+
+        # 添加对端（带 endpoint，用于主动连接）
+        subprocess.run([
+            "wg", "set", interface_name, "peer", peer_public_key,
+            "endpoint", remote_endpoint,
+            "allowed-ips", "0.0.0.0/0",
+            "persistent-keepalive", "25"
+        ], check=True, timeout=10)
+
+        # 配置 IP 地址
+        subprocess.run(["ip", "addr", "add", f"{local_ip}/30", "dev", interface_name], check=True, timeout=10)
+
+        # 启动接口
+        subprocess.run(["ip", "link", "set", interface_name, "up"], check=True, timeout=10)
+
+        # 添加路由到对端
+        subprocess.run(
+            ["ip", "route", "add", f"{remote_ip}/32", "dev", interface_name],
+            check=False, timeout=10
+        )
+
+        # 设置策略路由
+        iface_hash = hash(interface_name) % 100
+        table_num = 500 + iface_hash
+        subprocess.run(
+            ["ip", "route", "add", "default", "via", remote_ip, "dev", interface_name, "table", str(table_num)],
+            check=False, timeout=10
+        )
+        subprocess.run(
+            ["ip", "rule", "add", "from", local_ip, "lookup", str(table_num), "priority", "50"],
+            check=False, timeout=10
+        )
+
+        logger.info(f"[tunnel] WireGuard 隧道创建成功: {interface_name} ({local_ip} -> {remote_ip})")
+        return True, None
+
+    except subprocess.CalledProcessError as e:
+        error_msg = f"WireGuard setup command failed: {e}"
+        logger.error(f"[tunnel] {error_msg}")
+        subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
+        return False, error_msg
+    except subprocess.TimeoutExpired as e:
+        error_msg = f"WireGuard setup timed out: {e}"
+        logger.error(f"[tunnel] {error_msg}")
+        subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
+        return False, error_msg
+    except Exception as e:
+        error_msg = f"WireGuard setup failed: {e}"
+        logger.error(f"[tunnel] {error_msg}")
+        try:
+            subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
+        except Exception:
+            pass
+        return False, error_msg
+
+
+def wait_for_wireguard_handshake(interface_name: str, timeout_seconds: int = 10) -> bool:
+    """等待 WireGuard 隧道完成握手
+
+    Args:
+        interface_name: 接口名称
+        timeout_seconds: 超时时间（秒）
+
+    Returns:
+        是否成功握手
+    """
+    import time
+    start_time = time.time()
+
+    while time.time() - start_time < timeout_seconds:
+        try:
+            result = subprocess.run(
+                ["wg", "show", interface_name, "latest-handshakes"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                # 输出格式: <public_key>\t<timestamp>
+                # 如果 timestamp > 0，说明已完成握手
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split('\t')
+                    if len(parts) >= 2:
+                        try:
+                            handshake_time = int(parts[1])
+                            if handshake_time > 0:
+                                logger.info(f"[tunnel] WireGuard 握手成功: {interface_name}")
+                                return True
+                        except (ValueError, IndexError):
+                            pass
+        except Exception as e:
+            logger.warning(f"[tunnel] 检查握手状态失败: {e}")
+
+        time.sleep(0.5)
+
+    logger.warning(f"[tunnel] WireGuard 握手超时 ({timeout_seconds}s): {interface_name}")
+    return False
 
 
 @dataclass
@@ -313,10 +712,12 @@ class PeerTunnelManager:
             subprocess.run(["wg", "set", interface, "listen-port", str(port)], check=True, timeout=10)
 
             # 添加对端
+            # AllowedIPs 设为 0.0.0.0/0 允许所有流量通过隧道
+            # 实际流量走向由 Linux 路由表控制 (只有路由指向该接口的流量才会发送)
             subprocess.run([
                 "wg", "set", interface, "peer", peer_public_key,
                 "endpoint", endpoint,
-                "allowed-ips", f"{remote_ip}/32",
+                "allowed-ips", "0.0.0.0/0",
                 "persistent-keepalive", "25"
             ], check=True, timeout=10)
 
@@ -331,6 +732,30 @@ class PeerTunnelManager:
                 ["ip", "route", "add", f"{remote_ip}/32", "dev", interface],
                 check=False, timeout=10  # 路由可能已存在
             )
+
+            # 设置策略路由: 从本地隧道 IP 发出的流量通过对端转发
+            # 这允许 sing-box 使用 bind_interface 时流量正确路由
+            # 路由表分配：
+            #   - ECMP 使用 200-299
+            #   - DSCP 终端路由使用 300-399 (300 + dscp_value)
+            #   - 中继路由使用 400-463
+            #   - 对等节点隧道使用 500-599
+            iface_num = int(interface.split('-')[-1].replace('node', '')) if 'node' in interface else hash(interface) % 100
+            table_num = 500 + iface_num
+
+            # 添加默认路由到策略路由表
+            subprocess.run(
+                ["ip", "route", "add", "default", "via", remote_ip, "dev", interface, "table", str(table_num)],
+                check=False, timeout=10
+            )
+
+            # 添加策略规则: 从本地隧道 IP 发出的流量使用该表
+            subprocess.run(
+                ["ip", "rule", "add", "from", local_ip, "lookup", str(table_num), "priority", "50"],
+                check=False, timeout=10
+            )
+
+            logger.info(f"[{tag}] 策略路由设置: from {local_ip} -> table {table_num} (default via {remote_ip})")
 
             # 更新数据库
             db = _get_db()
@@ -361,7 +786,42 @@ class PeerTunnelManager:
         """拆除 WireGuard 隧道"""
         logger.info(f"[{tag}] 拆除 WireGuard 隧道: {interface}")
         try:
+            # 获取节点信息用于清理策略路由
+            db = _get_db()
+            node = db.get_peer_node(tag)
+            local_ip = node.get("tunnel_local_ip") if node else None
+
+            # 清理策略路由规则
+            if local_ip:
+                # 计算 table 号 (与设置时相同的逻辑)
+                # 对等节点隧道使用路由表 500-599
+                iface_num = int(interface.split('-')[-1].replace('node', '')) if 'node' in interface else hash(interface) % 100
+                table_num = 500 + iface_num
+
+                # 删除策略规则
+                subprocess.run(
+                    ["ip", "rule", "del", "from", local_ip, "lookup", str(table_num)],
+                    check=False, timeout=10
+                )
+                # 删除路由表
+                subprocess.run(
+                    ["ip", "route", "flush", "table", str(table_num)],
+                    check=False, timeout=10
+                )
+                logger.info(f"[{tag}] 清理策略路由: from {local_ip} table {table_num}")
+
+            # 清理 DSCP iptables 规则（多跳链路相关）
+            try:
+                from dscp_manager import get_dscp_manager
+                dscp_mgr = get_dscp_manager()
+                dscp_mgr.cleanup_rules_for_interface(interface)
+                logger.info(f"[{tag}] 清理 DSCP 规则: {interface}")
+            except Exception as e:
+                logger.warning(f"[{tag}] DSCP 规则清理失败: {e}")
+
+            # 删除接口
             subprocess.run(["ip", "link", "delete", interface], check=False, timeout=10)
+
             # 清理密钥文件
             key_file = PEER_RUN_DIR / f"{tag}.key"
             if key_file.exists():
@@ -564,10 +1024,10 @@ class PeerTunnelManager:
             if f":{socks_port}" not in check_result.stdout:
                 logger.warning(f"[{tag}] SOCKS 端口 {socks_port} 未监听，可能启动失败")
 
-            # 更新数据库
+            # 更新数据库（包含 xray_socks_port，用于状态检测）
             db = _get_db()
             interface_name = get_interface_name(tag, "xray")
-            db.update_peer_node(tag, tunnel_interface=interface_name)
+            db.update_peer_node(tag, tunnel_interface=interface_name, xray_socks_port=socks_port)
 
             logger.info(f"[{tag}] Xray 隧道启动成功 (PID: {proc.pid}, SOCKS: {socks_port})")
             return True
@@ -754,10 +1214,10 @@ class PeerTunnelManager:
             if f":{socks_port}" not in check_result.stdout:
                 logger.warning(f"[{tag}] SOCKS 端口 {socks_port} 未监听，可能启动失败")
 
-            # 更新数据库
+            # 更新数据库（包含 xray_socks_port，用于状态检测）
             db = _get_db()
             interface_name = get_interface_name(tag, "xray")
-            db.update_peer_node(tag, tunnel_interface=interface_name)
+            db.update_peer_node(tag, tunnel_interface=interface_name, xray_socks_port=socks_port)
 
             logger.info(f"[{tag}] Xray 入站模式隧道启动成功 (PID: {proc.pid}, SOCKS: {socks_port})")
             return True

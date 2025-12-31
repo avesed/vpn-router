@@ -23,11 +23,13 @@ import fcntl
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import subprocess
 import sys
 import time
+import uuid as uuid_module
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -37,12 +39,357 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from db_helper import get_db
 
+# 配置 logger（在其他模块级函数使用前定义）
 logging.basicConfig(
     level=logging.INFO,
     format='[xray-mgr] %(asctime)s %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Email 格式验证（用于链路标记）
+# 允许以字母或数字开头（兼容数字开头的 chain tag）
+EMAIL_PATTERN = re.compile(r'^chain-[a-z0-9][a-z0-9\-]*@[a-z0-9][a-z0-9\-]*$')
+MAX_EMAIL_LEN = 128
+
+def validate_chain_email(email: str) -> bool:
+    """验证链路 email 格式
+
+    格式: chain-{chain_tag}@{source_node}
+    例如: chain-us-stream@node-tokyo
+    """
+    if not email or len(email) > MAX_EMAIL_LEN:
+        return False
+    return bool(EMAIL_PATTERN.match(email))
+
+
+def build_chain_email(chain_tag: str, source_node: str) -> str:
+    """构建链路 email 标识
+
+    Args:
+        chain_tag: 链路标识
+        source_node: 来源节点标识
+
+    Returns:
+        格式化的 email 字符串
+
+    Raises:
+        ValueError: 如果输入为空或无有效字符
+    """
+    if not chain_tag or not source_node:
+        raise ValueError("chain_tag and source_node must not be empty")
+
+    # 清理 tag 和 node，只保留安全字符
+    safe_chain = re.sub(r'[^a-z0-9\-]', '', chain_tag.lower())[:32]
+    safe_node = re.sub(r'[^a-z0-9\-]', '', source_node.lower())[:32]
+
+    if not safe_chain or not safe_node:
+        raise ValueError("chain_tag and source_node must contain valid characters (a-z, 0-9, -)")
+
+    return f"chain-{safe_chain}@{safe_node}"
+
+
+# 导入 DSCP 常量用于 fwmark 计算
+# 终端节点的 Xray email 路由使用与 DSCP 相同的 fwmark 和策略路由表
+try:
+    from dscp_manager import TERMINAL_FWMARK_BASE, TERMINAL_TABLE_BASE
+except ImportError:
+    # 默认值，与 dscp_manager.py 保持一致
+    TERMINAL_FWMARK_BASE = 300
+    TERMINAL_TABLE_BASE = 300
+
+
+@dataclass
+class ChainEgressInfo:
+    """链路出口信息
+
+    用于描述终端节点如何路由链路流量到本地出口。
+    """
+    egress_tag: str
+    egress_type: str  # "interface", "socks", "direct"
+    interface: Optional[str] = None  # 网络接口名 (wg-pia-*, tun*, etc.)
+    socks_port: Optional[int] = None  # SOCKS 代理端口 (V2Ray/WARP MASQUE)
+    fwmark: Optional[int] = None  # 策略路由 fwmark
+
+
+def get_chain_egress_info(db, egress_tag: str, mark_value: int) -> Optional[ChainEgressInfo]:
+    """获取链路出口配置信息
+
+    根据出口类型返回相应的配置信息，用于生成 Xray 出站配置。
+
+    Args:
+        db: DatabaseManager 实例
+        egress_tag: 出口标识
+        mark_value: 标记值（用于计算 fwmark，范围 0-63）
+
+    Returns:
+        ChainEgressInfo 实例，或 None 如果出口不存在或参数无效
+    """
+    # 验证 mark_value 范围（DSCP 值范围是 0-63）
+    if not isinstance(mark_value, int) or mark_value < 0 or mark_value > 63:
+        logger.error(f"Invalid mark_value: {mark_value} (must be 0-63)")
+        return None
+
+    # 计算 fwmark 并验证不超过 65535
+    fwmark = TERMINAL_FWMARK_BASE + mark_value
+    if fwmark > 65535:
+        logger.error(f"Calculated fwmark {fwmark} exceeds 65535")
+        return None
+
+    # 特殊情况：direct 使用默认直连
+    if egress_tag == "direct":
+        return ChainEgressInfo(
+            egress_tag="direct",
+            egress_type="direct"
+        )
+
+    # 检查 PIA profiles
+    try:
+        profiles = db.get_pia_profiles(enabled_only=True)
+        for p in profiles:
+            if p.get("name") == egress_tag:
+                from db_helper import get_egress_interface_name
+                interface = get_egress_interface_name(egress_tag, is_pia=True)
+                return ChainEgressInfo(
+                    egress_tag=egress_tag,
+                    egress_type="interface",
+                    interface=interface,
+                    fwmark=fwmark
+                )
+    except Exception as e:
+        logger.warning(f"检查 PIA profiles 时出错: {e}")
+
+    # 检查 Custom WireGuard
+    try:
+        custom_list = db.get_custom_egress_list(enabled_only=True)
+        for e in custom_list:
+            if e.get("tag") == egress_tag:
+                from db_helper import get_egress_interface_name
+                interface = get_egress_interface_name(egress_tag, is_pia=False)
+                return ChainEgressInfo(
+                    egress_tag=egress_tag,
+                    egress_type="interface",
+                    interface=interface,
+                    fwmark=fwmark
+                )
+    except Exception as e:
+        logger.warning(f"检查 Custom WireGuard 时出错: {e}")
+
+    # 检查 WARP WireGuard
+    try:
+        warp_list = db.get_warp_egress_list(enabled_only=True)
+        for e in warp_list:
+            if e.get("tag") == egress_tag:
+                protocol = e.get("protocol", "masque")
+                if protocol == "wireguard":
+                    # Phase 11-Fix.I: 使用统一的接口命名函数
+                    from setup_kernel_wg_egress import get_egress_interface_name as get_wg_egress_iface
+                    interface = get_wg_egress_iface(egress_tag, egress_type="warp")
+                    return ChainEgressInfo(
+                        egress_tag=egress_tag,
+                        egress_type="interface",
+                        interface=interface,
+                        fwmark=fwmark
+                    )
+                else:
+                    # WARP MASQUE 使用 SOCKS
+                    socks_port = e.get("socks_port")
+                    if socks_port:
+                        return ChainEgressInfo(
+                            egress_tag=egress_tag,
+                            egress_type="socks",
+                            socks_port=socks_port
+                        )
+    except Exception as e:
+        logger.warning(f"检查 WARP egress 时出错: {e}")
+
+    # 检查 OpenVPN（TUN 设备）
+    try:
+        openvpn_list = db.get_openvpn_egress_list(enabled_only=True)
+        for e in openvpn_list:
+            if e.get("tag") == egress_tag:
+                tun_device = e.get("tun_device")
+                if tun_device:
+                    return ChainEgressInfo(
+                        egress_tag=egress_tag,
+                        egress_type="interface",
+                        interface=tun_device,
+                        fwmark=fwmark
+                    )
+    except Exception as e:
+        logger.warning(f"检查 OpenVPN egress 时出错: {e}")
+
+    # 检查 Direct egress（bind_interface）
+    try:
+        direct_list = db.get_direct_egress_list(enabled_only=True)
+        for e in direct_list:
+            if e.get("tag") == egress_tag:
+                interface = e.get("bind_interface")
+                if interface:
+                    return ChainEgressInfo(
+                        egress_tag=egress_tag,
+                        egress_type="interface",
+                        interface=interface,
+                        fwmark=fwmark
+                    )
+                else:
+                    # Direct without interface uses default routing
+                    return ChainEgressInfo(
+                        egress_tag=egress_tag,
+                        egress_type="direct"
+                    )
+    except Exception as e:
+        logger.warning(f"检查 Direct egress 时出错: {e}")
+
+    # 检查 V2Ray egress（SOCKS）
+    try:
+        v2ray_list = db.get_v2ray_egress_list(enabled_only=True)
+        for e in v2ray_list:
+            if e.get("tag") == egress_tag:
+                socks_port = e.get("socks_port")
+                if socks_port:
+                    return ChainEgressInfo(
+                        egress_tag=egress_tag,
+                        egress_type="socks",
+                        socks_port=socks_port
+                    )
+    except Exception as e:
+        logger.warning(f"检查 V2Ray egress 时出错: {e}")
+
+    logger.warning(f"未找到出口: {egress_tag}")
+    return None
+
+
+def build_chain_routing_outbound(egress_info: ChainEgressInfo, chain_tag: str) -> Optional[Dict]:
+    """构建链路路由出站配置
+
+    根据出口类型生成相应的 Xray 出站配置。
+
+    Args:
+        egress_info: 出口信息
+        chain_tag: 链路标识
+
+    Returns:
+        Xray 出站配置字典，或 None 如果无法生成
+    """
+    safe_chain = re.sub(r'[^a-z0-9\-]', '', chain_tag.lower())[:32]
+    outbound_tag = f"chain-egress-{safe_chain}"
+
+    if egress_info.egress_type == "interface":
+        # 接口类型：使用 freedom 出站 + sockopt.mark
+        # 策略路由会根据 mark 选择正确的接口
+        if egress_info.fwmark is None:
+            logger.error(f"接口类型出口缺少 fwmark: {egress_info.egress_tag}")
+            return None
+        return {
+            "tag": outbound_tag,
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "AsIs"
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "mark": egress_info.fwmark
+                }
+            }
+        }
+
+    elif egress_info.egress_type == "socks":
+        # SOCKS 类型：使用 SOCKS 出站
+        if egress_info.socks_port is None:
+            logger.error(f"SOCKS 类型出口缺少端口: {egress_info.egress_tag}")
+            return None
+        return {
+            "tag": outbound_tag,
+            "protocol": "socks",
+            "settings": {
+                "servers": [{
+                    "address": "127.0.0.1",
+                    "port": egress_info.socks_port
+                }]
+            }
+        }
+
+    elif egress_info.egress_type == "direct":
+        # 直连类型：使用 freedom 出站（无 mark）
+        return {
+            "tag": outbound_tag,
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "AsIs"
+            }
+        }
+
+    logger.warning(f"未知的出口类型: {egress_info.egress_type}")
+    return None
+
+
+def build_chain_routing_rule(chain_tag: str, source_node: Optional[str] = None) -> Dict:
+    """构建链路路由规则
+
+    生成 Xray 路由规则，匹配链路 email 并路由到对应出站。
+
+    Args:
+        chain_tag: 链路标识
+        source_node: 来源节点（可选，用于精确匹配）
+
+    Returns:
+        Xray 路由规则字典
+    """
+    safe_chain = re.sub(r'[^a-z0-9\-]', '', chain_tag.lower())[:32]
+    outbound_tag = f"chain-egress-{safe_chain}"
+
+    # 构建 user 匹配模式
+    if source_node:
+        safe_node = re.sub(r'[^a-z0-9\-]', '', source_node.lower())[:32]
+        user_pattern = f"chain-{safe_chain}@{safe_node}"
+    else:
+        # 使用通配符匹配任意来源节点
+        user_pattern = f"chain-{safe_chain}@*"
+
+    return {
+        "type": "field",
+        "user": [user_pattern],
+        "outboundTag": outbound_tag
+    }
+
+
+# 确保 SQLCIPHER_KEY 环境变量设置正确
+if not os.environ.get("SQLCIPHER_KEY"):
+    try:
+        from key_manager import KeyManager
+        key = KeyManager.get_or_create_key()
+        if key:
+            os.environ["SQLCIPHER_KEY"] = key
+    except Exception:
+        pass  # 忽略密钥获取失败，db_helper 会处理
+
+# logging.basicConfig 配置已在模块顶部设置
+
+
+def is_valid_uuid(value: str) -> bool:
+    """验证 UUID 格式是否正确"""
+    if not value:
+        return False
+    try:
+        uuid_module.UUID(value, version=4)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def sanitize_tag_for_email(tag: str) -> str:
+    """清理 tag 用作 Xray email 字段，防止配置注入
+
+    Email 字段用于标识客户端，只允许安全字符
+    """
+    if not tag:
+        return "unknown"
+    # 只保留字母、数字、下划线、连字符和点
+    sanitized = re.sub(r'[^a-zA-Z0-9_\-.]', '_', tag)
+    # 限制长度
+    return sanitized[:64] if len(sanitized) > 64 else sanitized
+
 
 # 配置路径
 XRAY_RUN_DIR = Path("/run/xray")
@@ -55,6 +402,14 @@ XRAY_PID_FILE = XRAY_RUN_DIR / "xray.pid"
 XRAY_INGRESS_API_PORT = 10087
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
+
+# Peer 节点 SOCKS5 端口范围（用于连接到远程 peer）
+# sing-box 通过这些 SOCKS 端口将流量路由到对应的 peer 出站
+PEER_SOCKS_PORT_START = 37201
+
+# 入口链路 SOCKS5 端口范围（用于链路流量入口）
+# sing-box 将链路流量路由到这些端口，Xray 添加 email 标记后转发到第一跳 peer
+CHAIN_ENTRY_SOCKS_PORT_START = 37301
 
 # TUN 配置
 DEFAULT_TUN_DEVICE = "xray-tun0"
@@ -150,6 +505,150 @@ class XrayManager:
         except Exception as e:
             logger.error(f"读取 V2Ray 用户列表失败: {e}")
             return []
+
+    def _get_peer_nodes_for_inbound(self) -> List[Dict]:
+        """获取启用了入站的 peer 节点（它们的 UUID 需要加入入站配置）"""
+        try:
+            nodes = self.db.get_peer_nodes_with_inbound()
+            return [n for n in nodes if n.get("inbound_enabled") and n.get("inbound_uuid")]
+        except Exception as e:
+            logger.error(f"读取 peer 节点入站配置失败: {e}")
+            return []
+
+    def _get_peer_nodes_for_outbound(self) -> List[Dict]:
+        """获取需要建立出站连接的 peer 节点
+
+        返回所有启用的 peer 节点，这些节点需要：
+        1. SOCKS5 入站（供 sing-box 路由）
+        2. VLESS+XHTTP+REALITY 出站（连接到远程 peer）
+        """
+        try:
+            nodes = self.db.get_peer_nodes(enabled_only=True)
+            result = []
+            for n in nodes:
+                # 需要有对端的 REALITY 公钥和 UUID 才能建立出站连接
+                if n.get("xray_peer_reality_public_key") and n.get("xray_uuid"):
+                    result.append(n)
+            return result
+        except Exception as e:
+            logger.error(f"读取 peer 节点出站配置失败: {e}")
+            return []
+
+    def _get_chain_routing_entries(self) -> List[Dict]:
+        """获取链路路由条目（用于终端节点）
+
+        返回所有 mark_type='xray_email' 的链路路由条目。
+        这些条目用于在终端节点生成 Xray 路由规则，
+        将带有特定 email 标记的流量路由到本地出口。
+
+        Returns:
+            链路路由条目列表，每个包含:
+            - chain_tag: 链路标识
+            - mark_value: 标记值（用于计算 fwmark）
+            - egress_tag: 本地出口标识
+            - source_node: 来源节点（可选）
+        """
+        try:
+            entries = self.db.get_chain_routing_list(mark_type="xray_email")
+            logger.debug(f"获取到 {len(entries)} 条 xray_email 链路路由")
+            return entries
+        except Exception as e:
+            logger.error(f"读取链路路由条目失败: {e}")
+            return []
+
+    def _get_local_node_id(self) -> str:
+        """获取本地节点标识
+
+        用于构建 email 标识的来源节点部分。
+        优先使用主机名，回退时使用 machine-id。
+        """
+        import socket
+        # 优先使用主机名
+        try:
+            hostname = socket.gethostname()
+            if hostname and hostname != "localhost":
+                # 清理主机名，只保留小写字母数字和连字符
+                clean_name = re.sub(r'[^a-z0-9\-]', '', hostname.lower())[:32]
+                if clean_name:
+                    return clean_name
+        except Exception:
+            pass
+
+        # 回退：使用 machine-id
+        machine_id_path = Path("/etc/machine-id")
+        if machine_id_path.exists():
+            try:
+                machine_id = machine_id_path.read_text().strip()
+                if machine_id:
+                    return f"node-{machine_id[:8]}"
+            except Exception:
+                pass
+
+        # 最后回退：返回固定标识
+        return "vpn-gateway"
+
+    def _get_entry_chains(self) -> List[Dict]:
+        """获取本节点作为入口的链路列表
+
+        返回所有启用的链路，其中本节点是入口（发起方）。
+        链路的 hops 数组第一个元素是下一跳节点。
+
+        对于 xray_email 类型的链路，需要在出站配置中添加 email 字段。
+
+        Returns:
+            链路列表，每个包含:
+            - tag: 链路标识
+            - hops: 节点跳列表 (JSON)
+            - chain_mark_type: 标记类型 ("dscp" 或 "xray_email")
+            - dscp_value: DSCP/标记值
+            - exit_egress: 终端节点的本地出口
+        """
+        try:
+            # 获取所有启用的链路
+            chains = self.db.get_node_chains(enabled_only=True)
+            # 过滤出 xray_email 类型的链路
+            xray_chains = [c for c in chains if c.get("chain_mark_type") == "xray_email"]
+            logger.debug(f"获取到 {len(xray_chains)} 条 xray_email 入口链路")
+            return xray_chains
+        except Exception as e:
+            logger.error(f"读取入口链路失败: {e}")
+            return []
+
+    def get_entry_chain_socks_ports(self) -> Dict[str, int]:
+        """获取入口链路的 SOCKS 端口映射
+
+        供 sing-box/render_singbox.py 使用，生成 SOCKS outbound 将链路流量
+        路由到 Xray 的入口链路 SOCKS 入站。
+
+        Returns:
+            字典，键为链路 tag，值为 SOCKS 端口号
+            例如: {"us-via-tokyo": 37301, "jp-gaming": 37302}
+        """
+        entry_chains = self._get_entry_chains()
+        peer_outbound_nodes = self._get_peer_nodes_for_outbound()
+
+        result = {}
+        for idx, chain in enumerate(entry_chains):
+            chain_tag = chain.get("tag")
+            hops = chain.get("hops", [])
+
+            if not chain_tag or not hops:
+                continue
+
+            # 验证第一跳 peer 存在
+            first_hop_tag = hops[0]
+            has_valid_peer = any(
+                peer.get("tag") == first_hop_tag and
+                peer.get("xray_peer_reality_public_key") and
+                peer.get("xray_uuid")
+                for peer in peer_outbound_nodes
+            )
+
+            if has_valid_peer:
+                socks_port = CHAIN_ENTRY_SOCKS_PORT_START + idx
+                result[chain_tag] = socks_port
+
+        return result
 
     def _get_or_create_xray_wg_keypair(self) -> Dict[str, str]:
         """获取或创建 Xray 专用的 WireGuard 密钥对"""
@@ -353,8 +852,27 @@ class XrayManager:
             logger.error(f"修复 local 路由失败: {e}")
             return False
 
-    def _generate_xray_config(self, config: Dict, users: List[Dict]) -> Dict:
-        """生成 Xray 配置"""
+    def _generate_xray_config(
+        self,
+        config: Dict,
+        users: List[Dict],
+        peer_inbound_nodes: List[Dict] = None,
+        peer_outbound_nodes: List[Dict] = None,
+        chain_routing_entries: List[Dict] = None
+    ) -> Dict:
+        """生成 Xray 配置
+
+        Args:
+            config: V2Ray 入站配置
+            users: V2Ray 用户列表
+            peer_inbound_nodes: 启用入站的 peer 节点（它们的 UUID 加入 clients）
+            peer_outbound_nodes: 需要出站连接的 peer 节点（生成 SOCKS 入站和 VLESS 出站）
+            chain_routing_entries: 链路路由条目（终端节点使用，将 email 标记路由到本地出口）
+        """
+        peer_inbound_nodes = peer_inbound_nodes or []
+        peer_outbound_nodes = peer_outbound_nodes or []
+        chain_routing_entries = chain_routing_entries or []
+
         protocol = config.get("protocol", "vless")
         listen_port = config.get("listen_port", 443)
         listen_address = config.get("listen_address", "0.0.0.0")
@@ -429,6 +947,7 @@ class XrayManager:
         # 根据协议配置用户
         if protocol == "vless":
             clients = []
+            # 添加普通用户
             for user in users:
                 # email 用于 V2Ray API 统计和在线检测
                 # 优先使用 email，否则用 name，再否则用 "user"
@@ -443,6 +962,24 @@ class XrayManager:
                 if config.get("xtls_vision_enabled") and transport_type == "tcp":
                     client["flow"] = user.get("flow") or "xtls-rprx-vision"
                 clients.append(client)
+
+            # 添加 Peer 节点的 UUID（允许 peer 连接到本节点）
+            for peer in peer_inbound_nodes:
+                peer_uuid = peer.get("inbound_uuid")
+                peer_tag = peer.get("tag", "unknown")
+                # 验证 UUID 格式
+                if not is_valid_uuid(peer_uuid):
+                    logger.warning(f"跳过无效 peer UUID: {peer_tag}")
+                    continue
+                # 用 peer:tag 作为 email 标识，便于区分和统计
+                sanitized_tag = sanitize_tag_for_email(peer_tag)
+                client = {
+                    "id": peer_uuid,
+                    "email": f"peer:{sanitized_tag}",
+                    "level": 0
+                }
+                clients.append(client)
+                logger.info(f"添加 peer 入站 UUID: {peer_tag}")
 
             inbound["settings"] = {
                 "clients": clients,
@@ -595,10 +1132,307 @@ class XrayManager:
             "settings": {}
         })
 
-        # 路由配置
-        # 保留 API 路由规则，其他流量通过 SOCKS5 到 sing-box 路由引擎
-        # 注意: routing 已在基础配置中定义，包含 API 路由规则
-        # 无需添加其他规则，默认走第一个 outbound (socks-out)
+        # ============ Peer 节点出站配置 ============
+        # 为每个需要连接的 peer 节点创建:
+        # 1. SOCKS5 入站 - 供 sing-box 路由流量到此 peer
+        # 2. VLESS+XHTTP+REALITY 出站 - 连接到远程 peer
+        # 3. 路由规则 - 将 SOCKS 入站流量路由到对应出站
+
+        for idx, peer in enumerate(peer_outbound_nodes):
+            peer_tag = peer.get("tag")
+            if not peer_tag:
+                continue
+
+            # 分配 SOCKS 端口 (37201, 37202, ...)
+            # 使用数据库中分配的端口，如果没有则按索引分配
+            socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_START + idx)
+
+            # 解析 endpoint 获取服务器地址和端口
+            endpoint = peer.get("endpoint", "")
+            if ":" in endpoint:
+                server_host = endpoint.rsplit(":", 1)[0]
+                try:
+                    server_port = int(endpoint.rsplit(":", 1)[1])
+                except ValueError:
+                    server_port = 443
+            else:
+                server_host = endpoint
+                server_port = 443
+
+            # 获取对端的 REALITY 配置
+            peer_reality_public_key = peer.get("xray_peer_reality_public_key")
+            peer_reality_short_id = peer.get("xray_peer_reality_short_id", "")
+            peer_uuid = peer.get("xray_uuid")
+
+            # 解析 server names
+            server_names_raw = peer.get("xray_peer_reality_server_names", '["www.microsoft.com"]')
+            try:
+                server_names = json.loads(server_names_raw) if isinstance(server_names_raw, str) else server_names_raw
+            except (json.JSONDecodeError, TypeError):
+                server_names = ["www.microsoft.com"]
+            reality_server_name = server_names[0] if server_names else "www.microsoft.com"
+
+            # XHTTP 配置
+            xhttp_path = peer.get("xray_xhttp_path", "/")
+            xhttp_mode = peer.get("xray_xhttp_mode", "auto")
+
+            if not all([server_host, peer_reality_public_key, peer_uuid]):
+                logger.warning(f"Peer {peer_tag} 配置不完整，跳过")
+                continue
+
+            # 验证 UUID 格式
+            if not is_valid_uuid(peer_uuid):
+                logger.warning(f"Peer {peer_tag} UUID 格式无效，跳过")
+                continue
+
+            # 清理 tag 用于 Xray 配置标识
+            sanitized_tag = sanitize_tag_for_email(peer_tag)
+
+            # 1. 添加 SOCKS5 入站（供 sing-box 路由流量）
+            socks_inbound = {
+                "tag": f"socks-in-{sanitized_tag}",
+                "port": socks_port,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": True
+                }
+            }
+            xray_config["inbounds"].append(socks_inbound)
+
+            # 2. 添加 VLESS+XHTTP+REALITY 出站（连接到远程 peer）
+            xhttp_settings: Dict[str, Any] = {
+                "path": xhttp_path,
+                "mode": xhttp_mode
+            }
+
+            peer_outbound = {
+                "tag": f"peer-{sanitized_tag}",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": server_host,
+                        "port": server_port,
+                        "users": [{
+                            "id": peer_uuid,
+                            "encryption": "none"
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "xhttpSettings": xhttp_settings,
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": reality_server_name,
+                        "fingerprint": "chrome",
+                        "publicKey": peer_reality_public_key,
+                        "shortId": peer_reality_short_id
+                    }
+                }
+            }
+            xray_config["outbounds"].append(peer_outbound)
+
+            # 3. 添加路由规则（SOCKS 入站 → peer 出站）
+            peer_route = {
+                "type": "field",
+                "inboundTag": [f"socks-in-{sanitized_tag}"],
+                "outboundTag": f"peer-{sanitized_tag}"
+            }
+            xray_config["routing"]["rules"].append(peer_route)
+
+            logger.info(f"添加 peer 出站配置: {peer_tag} -> {server_host}:{server_port} (SOCKS:{socks_port})")
+
+        # ============ 链路路由配置（终端节点） ============
+        # 为每个 xray_email 类型的链路路由条目创建:
+        # 1. 出站（freedom with mark 或 SOCKS）
+        # 2. 路由规则（匹配 email → 对应出站）
+        chain_count = 0
+        for entry in chain_routing_entries:
+            chain_tag = entry.get("chain_tag")
+            mark_value = entry.get("mark_value")
+            egress_tag = entry.get("egress_tag")
+            source_node = entry.get("source_node")
+
+            if not all([chain_tag, mark_value is not None, egress_tag]):
+                logger.warning(f"链路路由条目不完整，跳过: {entry}")
+                continue
+
+            # 获取出口信息
+            egress_info = get_chain_egress_info(self.db, egress_tag, mark_value)
+            if not egress_info:
+                logger.warning(f"无法获取出口信息: {egress_tag}，跳过链路 {chain_tag}")
+                continue
+
+            # 生成出站配置
+            outbound = build_chain_routing_outbound(egress_info, chain_tag)
+            if not outbound:
+                logger.warning(f"无法生成出站配置: {chain_tag} -> {egress_tag}")
+                continue
+
+            # 检查是否已存在同名出站
+            existing_tags = [o.get("tag") for o in xray_config["outbounds"]]
+            if outbound["tag"] not in existing_tags:
+                xray_config["outbounds"].append(outbound)
+            else:
+                logger.debug(f"出站已存在，跳过添加: {outbound['tag']}")
+
+            # 生成路由规则
+            rule = build_chain_routing_rule(chain_tag, source_node)
+            xray_config["routing"]["rules"].append(rule)
+
+            logger.info(
+                f"添加链路路由: {chain_tag} (mark={mark_value}) -> "
+                f"{egress_tag} ({egress_info.egress_type})"
+            )
+            chain_count += 1
+
+        if chain_count > 0:
+            logger.info(f"共添加 {chain_count} 条链路路由规则")
+
+        # ============ 入口链路配置（入口节点） ============
+        # 当本节点是链路的入口节点时，需要为每个链路创建:
+        # 1. SOCKS5 入站 - 供 sing-box 路由流量到此链路
+        # 2. VLESS 出站 - 连接到第一跳 peer，带有 email 字段标识链路
+        # 3. 路由规则 - 将 SOCKS 入站流量路由到对应出站
+        entry_chains = self._get_entry_chains()
+        local_node_id = self._get_local_node_id()
+        entry_count = 0
+
+        for idx, chain in enumerate(entry_chains):
+            chain_tag = chain.get("tag")
+            hops = chain.get("hops", [])
+
+            if not chain_tag or not hops:
+                logger.warning(f"链路 {chain_tag} 配置不完整，跳过")
+                continue
+
+            # 获取第一跳 peer 节点
+            first_hop_tag = hops[0]
+
+            # 从 peer 出站节点中查找对应的配置
+            first_hop_peer = None
+            for peer in peer_outbound_nodes:
+                if peer.get("tag") == first_hop_tag:
+                    first_hop_peer = peer
+                    break
+
+            if not first_hop_peer:
+                logger.warning(f"链路 {chain_tag} 的第一跳 {first_hop_tag} 未找到有效的 peer 出站配置")
+                continue
+
+            # 获取 peer 连接详情
+            endpoint = first_hop_peer.get("endpoint", "")
+            if ":" in endpoint:
+                server_host = endpoint.rsplit(":", 1)[0]
+                try:
+                    server_port = int(endpoint.rsplit(":", 1)[1])
+                except ValueError:
+                    server_port = 443
+            else:
+                server_host = endpoint
+                server_port = 443
+
+            peer_reality_public_key = first_hop_peer.get("xray_peer_reality_public_key")
+            peer_reality_short_id = first_hop_peer.get("xray_peer_reality_short_id", "")
+            peer_uuid = first_hop_peer.get("xray_uuid")
+
+            # 解析 server names
+            server_names_raw = first_hop_peer.get("xray_peer_reality_server_names", '["www.microsoft.com"]')
+            try:
+                server_names = json.loads(server_names_raw) if isinstance(server_names_raw, str) else server_names_raw
+            except (json.JSONDecodeError, TypeError):
+                server_names = ["www.microsoft.com"]
+            reality_server_name = server_names[0] if server_names else "www.microsoft.com"
+
+            # XHTTP 配置
+            xhttp_path = first_hop_peer.get("xray_xhttp_path", "/")
+            xhttp_mode = first_hop_peer.get("xray_xhttp_mode", "auto")
+
+            if not all([server_host, peer_reality_public_key, peer_uuid]):
+                logger.warning(f"链路 {chain_tag} 的第一跳 {first_hop_tag} 配置不完整")
+                continue
+
+            # 验证 UUID 格式
+            if not is_valid_uuid(peer_uuid):
+                logger.warning(f"链路 {chain_tag} 的第一跳 {first_hop_tag} UUID 格式无效")
+                continue
+
+            # 分配 SOCKS 端口 (37301, 37302, ...)
+            socks_port = CHAIN_ENTRY_SOCKS_PORT_START + idx
+
+            # 清理标识符
+            safe_chain = re.sub(r'[^a-z0-9\-]', '', chain_tag.lower())[:32]
+
+            # 构建 email 标识（用于链路流量识别）
+            chain_email = build_chain_email(chain_tag, local_node_id)
+
+            # 1. 添加 SOCKS5 入站（供 sing-box 路由流量）
+            socks_inbound = {
+                "tag": f"chain-in-{safe_chain}",
+                "port": socks_port,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": True
+                }
+            }
+            xray_config["inbounds"].append(socks_inbound)
+
+            # 2. 添加 VLESS+XHTTP+REALITY 出站（带 email 标识）
+            xhttp_settings: Dict[str, Any] = {
+                "path": xhttp_path,
+                "mode": xhttp_mode
+            }
+
+            chain_outbound = {
+                "tag": f"chain-out-{safe_chain}",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": server_host,
+                        "port": server_port,
+                        "users": [{
+                            "id": peer_uuid,
+                            "encryption": "none",
+                            "email": chain_email  # 链路标识
+                        }]
+                    }]
+                },
+                "streamSettings": {
+                    "network": "xhttp",
+                    "xhttpSettings": xhttp_settings,
+                    "security": "reality",
+                    "realitySettings": {
+                        "serverName": reality_server_name,
+                        "fingerprint": "chrome",
+                        "publicKey": peer_reality_public_key,
+                        "shortId": peer_reality_short_id
+                    }
+                }
+            }
+            xray_config["outbounds"].append(chain_outbound)
+
+            # 3. 添加路由规则（SOCKS 入站 → 链路出站）
+            chain_route = {
+                "type": "field",
+                "inboundTag": [f"chain-in-{safe_chain}"],
+                "outboundTag": f"chain-out-{safe_chain}"
+            }
+            xray_config["routing"]["rules"].append(chain_route)
+
+            logger.info(
+                f"添加入口链路配置: {chain_tag} -> {first_hop_tag} "
+                f"(SOCKS:{socks_port}, email:{chain_email})"
+            )
+            entry_count += 1
+
+        if entry_count > 0:
+            logger.info(f"共添加 {entry_count} 条入口链路配置")
+
+        # 路由配置已在上面添加，默认流量走 socks-out 到 sing-box
 
         return xray_config
 
@@ -687,6 +1521,14 @@ class XrayManager:
             logger.warning("没有启用的 V2Ray 用户")
             # 继续启动，但警告无用户
 
+        # 加载 peer 节点配置
+        peer_inbound_nodes = self._get_peer_nodes_for_inbound()
+        peer_outbound_nodes = self._get_peer_nodes_for_outbound()
+        chain_routing_entries = self._get_chain_routing_entries()
+        logger.info(f"Peer 节点: {len(peer_inbound_nodes)} 入站, {len(peer_outbound_nodes)} 出站")
+        if chain_routing_entries:
+            logger.info(f"链路路由: {len(chain_routing_entries)} 条 (xray_email)")
+
         logger.info("启动 Xray...")
         self.process.status = "starting"
 
@@ -704,9 +1546,12 @@ class XrayManager:
             self.process.status = "error"
             return False
 
-        # 生成配置
+        # 生成配置（包含客户端用户、peer 节点和链路路由）
         try:
-            xray_config = self._generate_xray_config(config, users)
+            xray_config = self._generate_xray_config(
+                config, users, peer_inbound_nodes, peer_outbound_nodes,
+                chain_routing_entries
+            )
             XRAY_CONFIG_PATH.write_text(json.dumps(xray_config, indent=2))
             self.process.config = xray_config
             logger.info(f"Xray 配置已生成: {XRAY_CONFIG_PATH}")
@@ -818,9 +1663,20 @@ class XrayManager:
 
         users = self._get_v2ray_users()
 
-        # 生成新配置
+        # 加载 peer 节点配置
+        peer_inbound_nodes = self._get_peer_nodes_for_inbound()
+        peer_outbound_nodes = self._get_peer_nodes_for_outbound()
+        chain_routing_entries = self._get_chain_routing_entries()
+        logger.info(f"Peer 节点: {len(peer_inbound_nodes)} 入站, {len(peer_outbound_nodes)} 出站")
+        if chain_routing_entries:
+            logger.info(f"链路路由: {len(chain_routing_entries)} 条 (xray_email)")
+
+        # 生成新配置（包含客户端用户、peer 节点和链路路由）
         try:
-            xray_config = self._generate_xray_config(config, users)
+            xray_config = self._generate_xray_config(
+                config, users, peer_inbound_nodes, peer_outbound_nodes,
+                chain_routing_entries
+            )
             XRAY_CONFIG_PATH.write_text(json.dumps(xray_config, indent=2))
             self.process.config = xray_config
         except Exception as e:
@@ -881,21 +1737,48 @@ class XrayManager:
         }
 
     async def run_daemon(self):
-        """以守护进程模式运行"""
+        """以守护进程模式运行 - 带重试和指数退避
+
+        Phase 10.5: 实现健康检查循环和指数退避重启策略
+        - 初始启动最多重试 3 次（5s, 10s, 15s 间隔）
+        - 运行时崩溃使用指数退避重启（最大 5 分钟）
+        - 成功启动后重置重启计数
+        """
         self._running = True
         logger.info("Xray 管理器启动（守护模式）")
 
-        # 启动 Xray
-        await self.start()
+        # 初始启动（最多重试 3 次）
+        max_retries = 3
+        startup_success = False
+        for attempt in range(max_retries):
+            if await self.start():
+                startup_success = True
+                break
+            logger.warning(f"Xray 启动失败，重试 {attempt + 1}/{max_retries}")
+            await asyncio.sleep(5 * (attempt + 1))  # 5s, 10s, 15s
 
-        # 监控循环
+        if not startup_success:
+            logger.error(f"Xray 启动失败，已尝试 {max_retries} 次")
+            # 继续监控循环，等待配置变更
+
+        # 健康检查循环（带指数退避）
+        restart_count = 0
         while self._running:
             await asyncio.sleep(10)
 
             # 检查进程健康
             if self.process.status == "running" and not self._is_process_alive():
-                logger.warning("Xray 进程已退出，尝试重启")
-                await self.start()
+                restart_count += 1
+                # 指数退避：10s, 20s, 40s, 80s, 160s, 最大 300s (5分钟)
+                delay = min(10 * (2 ** restart_count), 300)
+                logger.warning(f"Xray 进程退出，{delay}s 后重启 (第 {restart_count} 次重试)")
+                await asyncio.sleep(delay)
+
+                if await self.start():
+                    restart_count = 0  # 成功后重置计数
+                    logger.info("Xray 重启成功，重试计数已重置")
+                else:
+                    logger.error(f"Xray 重启失败 (第 {restart_count} 次)")
 
         # 清理
         await self.stop()
@@ -904,6 +1787,178 @@ class XrayManager:
     def stop_daemon(self):
         """停止守护进程"""
         self._running = False
+
+
+def should_xray_run(db) -> bool:
+    """判断是否需要运行 Xray 进程
+
+    Phase 10.5: Xray 应该在以下情况运行：
+    1. 有启用的 V2Ray 用户（V2Ray Ingress 功能）
+    2. 有启用了 inbound 的 peer 节点（Peer Inbound 功能）
+
+    Args:
+        db: DatabaseManager 实例
+
+    Returns:
+        True 如果需要运行 Xray，否则 False
+    """
+    try:
+        # 检查 V2Ray 入口配置是否启用
+        v2ray_config = db.get_v2ray_inbound_config()
+        if not v2ray_config or not v2ray_config.get("enabled"):
+            logger.debug("V2Ray 入口未启用")
+            return False
+
+        # 检查是否有启用的 V2Ray 用户
+        v2ray_users = db.get_v2ray_users(enabled_only=True)
+        if v2ray_users:
+            logger.debug(f"发现 {len(v2ray_users)} 个启用的 V2Ray 用户")
+            return True
+
+        # 检查是否有启用 inbound 的 peer 节点
+        try:
+            peers = db.get_peer_nodes_with_inbound()
+            inbound_enabled_peers = [p for p in peers if p.get("inbound_enabled") and p.get("inbound_uuid")]
+            if inbound_enabled_peers:
+                logger.debug(f"发现 {len(inbound_enabled_peers)} 个启用 inbound 的 peer 节点")
+                return True
+        except Exception as e:
+            logger.debug(f"检查 peer 节点时出错: {e}")
+
+        logger.debug("无需运行 Xray: 没有 V2Ray 用户或启用 inbound 的 peer")
+        return False
+
+    except Exception as e:
+        logger.error(f"检查 Xray 运行需求时出错: {e}")
+        return False
+
+
+def is_xray_running() -> bool:
+    """检查 Xray 进程是否正在运行
+
+    Returns:
+        True 如果 Xray 进程存活，否则 False
+    """
+    if not XRAY_PID_FILE.exists():
+        return False
+
+    try:
+        pid_str = XRAY_PID_FILE.read_text().strip()
+        pid = int(pid_str)
+        os.kill(pid, 0)  # 检查进程是否存在
+        return True
+    except (ValueError, ProcessLookupError, PermissionError, IOError):
+        return False
+
+
+async def ensure_xray_state(db) -> bool:
+    """确保 Xray 进程状态正确
+
+    Phase 10.5: 根据当前配置自动启停 Xray：
+    - 如果需要运行但未运行 → 启动
+    - 如果不需要运行但在运行 → 停止
+
+    Args:
+        db: DatabaseManager 实例
+
+    Returns:
+        True 如果操作成功（包括无需操作的情况），否则 False
+    """
+    should_run = should_xray_run(db)
+    running = is_xray_running()
+
+    if should_run and not running:
+        logger.info("Xray 需要运行但未运行，正在启动...")
+        manager = XrayManager()
+        return await manager.start()
+    elif not should_run and running:
+        logger.info("Xray 不需要运行但在运行，正在停止...")
+        manager = XrayManager()
+        return await manager.stop()
+    else:
+        status = "运行中" if running else "已停止"
+        logger.debug(f"Xray 状态正确: {status}")
+        return True
+
+
+def ensure_xray_state_sync(db) -> bool:
+    """同步版本的 ensure_xray_state
+
+    供非异步代码调用（如 API 端点的同步部分）。
+
+    注意: 如果在异步上下文中调用，会在新线程中运行以避免事件循环嵌套。
+
+    Args:
+        db: DatabaseManager 实例
+
+    Returns:
+        True 如果操作成功，否则 False
+    """
+    import asyncio
+    import concurrent.futures
+
+    try:
+        # 检查是否已有运行中的事件循环
+        try:
+            asyncio.get_running_loop()
+            # 在异步上下文中，使用线程池避免嵌套事件循环
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, ensure_xray_state(db))
+                return future.result(timeout=30)
+        except RuntimeError:
+            # 没有运行中的事件循环，直接运行
+            return asyncio.run(ensure_xray_state(db))
+    except concurrent.futures.TimeoutError:
+        logger.error("ensure_xray_state_sync 超时 (30s)")
+        return False
+    except Exception as e:
+        logger.error(f"ensure_xray_state_sync 失败: {e}")
+        return False
+
+
+def get_xray_chain_entry_ports(db) -> Dict[str, int]:
+    """获取 Xray 链路入口的 SOCKS 端口映射（模块级函数）
+
+    供 render_singbox.py 调用，生成 sing-box SOCKS outbound 配置。
+    sing-box 将链路流量路由到 Xray 的入口链路 SOCKS 入站。
+
+    Args:
+        db: DatabaseManager 实例
+
+    Returns:
+        字典，键为链路 tag，值为 SOCKS 端口号
+        例如: {"us-via-tokyo": 37301, "jp-gaming": 37302}
+    """
+    try:
+        # 获取所有启用的 xray_email 类型链路
+        chains = db.get_node_chains(enabled_only=True)
+        xray_chains = [c for c in chains if c.get("chain_mark_type") == "xray_email"]
+
+        # 获取有效的 peer 出站节点
+        peer_nodes = db.get_peer_nodes(enabled_only=True)
+        valid_peer_tags = set()
+        for p in peer_nodes:
+            if p.get("xray_peer_reality_public_key") and p.get("xray_uuid"):
+                valid_peer_tags.add(p.get("tag"))
+
+        result = {}
+        for idx, chain in enumerate(xray_chains):
+            chain_tag = chain.get("tag")
+            hops = chain.get("hops", [])
+
+            if not chain_tag or not hops:
+                continue
+
+            # 验证第一跳 peer 存在
+            first_hop_tag = hops[0]
+            if first_hop_tag in valid_peer_tags:
+                socks_port = CHAIN_ENTRY_SOCKS_PORT_START + idx
+                result[chain_tag] = socks_port
+
+        return result
+    except Exception as e:
+        logger.warning(f"获取链路入口端口失败: {e}")
+        return {}
 
 
 def generate_reality_keys() -> Dict[str, str]:

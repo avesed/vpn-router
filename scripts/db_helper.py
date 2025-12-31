@@ -2403,14 +2403,23 @@ class UserDatabase:
         tag: str,
         name: str,
         endpoint: str,
-        psk_hash: str,
-        psk_encrypted: Optional[str] = None,
+        psk_hash: str = "",  # 已废弃，保留参数兼容
+        psk_encrypted: Optional[str] = None,  # 已废弃
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
+        # 隧道状态和 IP 参数（Phase 2 配对系统需要）
+        tunnel_status: str = "disconnected",
+        tunnel_interface: Optional[str] = None,  # Phase 11-Tunnel: WireGuard 接口名
+        tunnel_local_ip: Optional[str] = None,
+        tunnel_remote_ip: Optional[str] = None,
         tunnel_port: Optional[int] = None,
+        tunnel_api_endpoint: Optional[str] = None,
+        # WireGuard 参数
         wg_private_key: Optional[str] = None,
         wg_public_key: Optional[str] = None,
+        wg_peer_public_key: Optional[str] = None,
+        # Xray 参数
         xray_protocol: str = "vless",
         xray_uuid: Optional[str] = None,
         # REALITY 配置（本节点作为服务端）
@@ -2419,6 +2428,9 @@ class UserDatabase:
         xray_reality_short_id: Optional[str] = None,
         xray_reality_dest: str = "www.microsoft.com:443",
         xray_reality_server_names: str = '["www.microsoft.com"]',
+        # 对端 REALITY 配置（本节点作为客户端连接对端时使用）
+        xray_peer_reality_public_key: Optional[str] = None,
+        xray_peer_reality_short_id: Optional[str] = None,
         # XHTTP 传输配置
         xray_xhttp_path: str = "/",
         xray_xhttp_mode: str = "auto",
@@ -2427,7 +2439,9 @@ class UserDatabase:
         connection_mode: str = "outbound",  # 'outbound' or 'inbound'
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
-        enabled: bool = True
+        enabled: bool = True,
+        # Phase 11: 双向连接状态
+        bidirectional_status: str = "pending",
     ) -> int:
         """添加对等节点
 
@@ -2435,13 +2449,18 @@ class UserDatabase:
             tag: 唯一标识
             name: 显示名称
             endpoint: 远程端点 IP:port 或 域名:port
-            psk_hash: PSK 的 bcrypt 哈希（用于接收认证）
-            psk_encrypted: 加密的 PSK（用于发起连接）
+            psk_hash: [已废弃] 保留兼容，不再使用
+            psk_encrypted: [已废弃] 保留兼容，不再使用
             description: 描述
             tunnel_type: 隧道类型 (wireguard/xray)
+            tunnel_status: 隧道状态 (disconnected/connecting/connected/error)
+            tunnel_local_ip: 本端隧道 IP (如 10.200.200.1)
+            tunnel_remote_ip: 对端隧道 IP (如 10.200.200.2)
             tunnel_port: 本地监听端口
+            tunnel_api_endpoint: 隧道内 API 地址 (如 10.200.200.2:36000)
             wg_private_key: WireGuard 私钥
             wg_public_key: WireGuard 公钥
+            wg_peer_public_key: 对端 WireGuard 公钥
             xray_protocol: Xray 协议 (固定为 vless)
             xray_uuid: Xray UUID
             xray_reality_private_key: REALITY 私钥（x25519）
@@ -2449,6 +2468,8 @@ class UserDatabase:
             xray_reality_short_id: REALITY Short ID
             xray_reality_dest: REALITY Dest Server（伪装目标）
             xray_reality_server_names: REALITY Server Names（JSON 数组）
+            xray_peer_reality_public_key: 对端 REALITY 公钥
+            xray_peer_reality_short_id: 对端 REALITY Short ID
             xray_xhttp_path: XHTTP 路径
             xray_xhttp_mode: XHTTP 模式 (auto/packet-up/stream-up/stream-one)
             xray_xhttp_host: XHTTP Host
@@ -2456,29 +2477,38 @@ class UserDatabase:
             default_outbound: 默认出口
             auto_reconnect: 自动重连
             enabled: 是否启用
+
+        Raises:
+            sqlite3.IntegrityError: 如果 tunnel_local_ip 或 tunnel_port 冲突（竞态条件检测）
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO peer_nodes (
                     tag, name, description, endpoint, api_port, psk_hash, psk_encrypted,
-                    tunnel_type, tunnel_port,
-                    wg_private_key, wg_public_key,
+                    tunnel_type, tunnel_status, tunnel_interface,
+                    tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
+                    wg_private_key, wg_public_key, wg_peer_public_key,
                     xray_protocol, xray_uuid,
                     xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
                     xray_reality_dest, xray_reality_server_names,
+                    xray_peer_reality_public_key, xray_peer_reality_short_id,
                     xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
-                    connection_mode, default_outbound, auto_reconnect, enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    connection_mode, default_outbound, auto_reconnect, enabled,
+                    bidirectional_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, name, description, endpoint, api_port, psk_hash, psk_encrypted,
-                tunnel_type, tunnel_port,
-                wg_private_key, wg_public_key,
+                tunnel_type, tunnel_status, tunnel_interface,
+                tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
+                wg_private_key, wg_public_key, wg_peer_public_key,
                 xray_protocol, xray_uuid,
                 xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
                 xray_reality_dest, xray_reality_server_names,
+                xray_peer_reality_public_key, xray_peer_reality_short_id,
                 xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
-                connection_mode, default_outbound, 1 if auto_reconnect else 0, 1 if enabled else 0
+                connection_mode, default_outbound, 1 if auto_reconnect else 0, 1 if enabled else 0,
+                bidirectional_status
             ))
             conn.commit()
             return cursor.lastrowid
@@ -2488,7 +2518,7 @@ class UserDatabase:
         allowed_fields = {
             "name", "description", "endpoint", "api_port", "psk_hash", "psk_encrypted",
             "tunnel_type", "tunnel_status", "tunnel_interface",
-            "tunnel_local_ip", "tunnel_remote_ip", "tunnel_port",
+            "tunnel_local_ip", "tunnel_remote_ip", "tunnel_port", "tunnel_api_endpoint",
             "wg_private_key", "wg_public_key", "wg_peer_public_key",
             "xray_protocol", "xray_uuid", "xray_socks_port",
             # REALITY 配置（本节点作为服务端）
@@ -2504,6 +2534,8 @@ class UserDatabase:
             # 对方入站信息（用于连接到对方的入站）
             "peer_inbound_enabled", "peer_inbound_port", "peer_inbound_uuid",
             "peer_inbound_reality_public_key", "peer_inbound_reality_short_id",
+            # Phase 11.1: 双向自动连接参数
+            "bidirectional_status", "remote_wg_private_key", "remote_wg_public_key",
             # 连接模式
             "connection_mode",  # 'outbound' or 'inbound'
             "default_outbound", "last_seen", "last_error",
@@ -2605,6 +2637,603 @@ class UserDatabase:
             ).fetchall()
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
+
+    # ============ 双向连接管理 (Phase 11.1) ============
+
+    def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
+        """更新对等节点的双向连接状态
+
+        Args:
+            tag: 节点标识
+            status: 状态值 ('pending', 'outbound_only', 'bidirectional')
+
+        Returns:
+            是否更新成功
+        """
+        valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
+        if status not in valid_statuses:
+            logger.warning(f"Invalid bidirectional_status: {status}")
+            return False
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE peer_nodes SET bidirectional_status = ?, updated_at = CURRENT_TIMESTAMP WHERE tag = ?",
+                (status, tag)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_peers_pending_bidirectional(self) -> List[Dict]:
+        """获取等待双向连接的对等节点列表
+
+        Returns:
+            bidirectional_status='pending' 且已连接的节点列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT * FROM peer_nodes
+                WHERE bidirectional_status = 'pending'
+                  AND tunnel_status = 'connected'
+                  AND enabled = 1
+                ORDER BY tag
+            """).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_peers_by_bidirectional_status(self, status: str) -> List[Dict]:
+        """按双向连接状态获取对等节点列表
+
+        Args:
+            status: 状态值 ('pending', 'outbound_only', 'bidirectional')
+
+        Returns:
+            符合条件的节点列表
+        """
+        # 输入验证 (Phase 11.1)
+        valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
+        if status not in valid_statuses:
+            logger.warning(f"Invalid bidirectional_status query: {status}")
+            return []
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT * FROM peer_nodes
+                WHERE bidirectional_status = ?
+                  AND enabled = 1
+                ORDER BY tag
+            """, (status,)).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    # ============ Pending Pairings 管理 (Phase 11-Tunnel) ============
+
+    def add_pending_pairing(
+        self,
+        pairing_id: str,
+        local_tag: str,
+        local_endpoint: str,
+        tunnel_type: str = "wireguard",
+        tunnel_local_ip: str = None,
+        tunnel_remote_ip: str = None,
+        tunnel_port: int = None,
+        wg_private_key: str = None,
+        wg_public_key: str = None,
+        remote_wg_private_key: str = None,
+        remote_wg_public_key: str = None,
+        interface_name: str = None,
+        expires_days: int = 7
+    ) -> int:
+        """添加待处理配对记录
+
+        当节点 A 生成配对码时，同时创建 WireGuard 接口并保存配对信息。
+        当节点 B 通过隧道调用 complete-handshake 后，此记录将被删除。
+
+        Args:
+            pairing_id: 配对标识（base64 hash，用于匹配请求）
+            local_tag: 本节点标识
+            local_endpoint: 本节点端点 (IP:port)
+            tunnel_type: 隧道类型 (wireguard/xray)
+            tunnel_local_ip: 本端隧道 IP
+            tunnel_remote_ip: 对端隧道 IP
+            tunnel_port: WireGuard 监听端口
+            wg_private_key: 本节点私钥
+            wg_public_key: 本节点公钥
+            remote_wg_private_key: 预生成的对端私钥（将包含在配对码中）
+            remote_wg_public_key: 预生成的对端公钥
+            interface_name: WireGuard 接口名 (wg-pending-xxx)
+            expires_days: 过期天数（默认 7 天）
+
+        Returns:
+            新记录的 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO pending_pairings (
+                    pairing_id, local_tag, local_endpoint, tunnel_type,
+                    tunnel_local_ip, tunnel_remote_ip, tunnel_port,
+                    wg_private_key, wg_public_key,
+                    remote_wg_private_key, remote_wg_public_key,
+                    interface_name, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    datetime('now', '+' || ? || ' days'))
+            """, (
+                pairing_id, local_tag, local_endpoint, tunnel_type,
+                tunnel_local_ip, tunnel_remote_ip, tunnel_port,
+                wg_private_key, wg_public_key,
+                remote_wg_private_key, remote_wg_public_key,
+                interface_name, expires_days
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_pending_pairing(self, pairing_id: str) -> Optional[Dict]:
+        """根据配对标识获取待处理配对记录
+
+        Args:
+            pairing_id: 配对标识
+
+        Returns:
+            配对记录字典，不存在返回 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM pending_pairings WHERE pairing_id = ?",
+                (pairing_id,)
+            ).fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            return None
+
+    def get_pending_pairing_by_interface(self, interface_name: str) -> Optional[Dict]:
+        """根据接口名获取待处理配对记录
+
+        Args:
+            interface_name: WireGuard 接口名
+
+        Returns:
+            配对记录字典，不存在返回 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM pending_pairings WHERE interface_name = ?",
+                (interface_name,)
+            ).fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            return None
+
+    def delete_pending_pairing(self, pairing_id: str) -> bool:
+        """删除待处理配对记录
+
+        当配对成功完成后，应删除此记录。
+
+        Args:
+            pairing_id: 配对标识
+
+        Returns:
+            是否删除成功
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM pending_pairings WHERE pairing_id = ?",
+                (pairing_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def cleanup_expired_pairings(self) -> int:
+        """清理过期的待处理配对记录
+
+        Returns:
+            删除的记录数量
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM pending_pairings WHERE expires_at < datetime('now')"
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def get_all_pending_pairings(self) -> List[Dict]:
+        """获取所有未过期的待处理配对记录
+
+        Returns:
+            配对记录列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT * FROM pending_pairings
+                WHERE expires_at > datetime('now')
+                ORDER BY created_at DESC
+            """).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    # ============ Phase 11-Cascade: 级联删除通知支持 ============
+
+    # 有效的事件类型 (必须与数据库 CHECK 约束保持一致)
+    # Phase B: 添加 port_change 事件类型支持端口变更通知
+    VALID_PEER_EVENT_TYPES = frozenset({'delete', 'disconnect', 'broadcast', 'received', 'port_change'})
+
+    def log_peer_event(
+        self,
+        event_type: str,
+        peer_tag: str,
+        event_id: Optional[str] = None,
+        from_node: Optional[str] = None,
+        details: Optional[Dict] = None,
+        source_ip: Optional[str] = None
+    ) -> int:
+        """记录对等节点事件到审计日志
+
+        Args:
+            event_type: 事件类型 (delete, disconnect, broadcast, received)
+            peer_tag: 相关节点 tag
+            event_id: 事件唯一 ID
+            from_node: 事件来源节点
+            details: 额外信息 (Dict, 将转为 JSON)
+            source_ip: 请求来源 IP
+
+        Returns:
+            新记录的 ID
+
+        Raises:
+            ValueError: 如果 event_type 无效
+        """
+        # 输入验证
+        if event_type not in self.VALID_PEER_EVENT_TYPES:
+            raise ValueError(f"Invalid event_type: {event_type}. Must be one of: {', '.join(sorted(self.VALID_PEER_EVENT_TYPES))}")
+
+        details_json = json.dumps(details) if details else None
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 SQLite 的 strftime 生成 ISO 8601 格式时间戳 (与 schema 默认值一致)
+            cursor.execute("""
+                INSERT INTO peer_event_log
+                    (event_type, peer_tag, event_id, from_node, details, source_ip, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            """, (event_type, peer_tag, event_id, from_node, details_json, source_ip))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_peer_events(
+        self,
+        peer_tag: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        """查询对等节点事件日志
+
+        Args:
+            peer_tag: 按节点过滤
+            event_type: 按事件类型过滤
+            limit: 返回记录数量上限
+
+        Returns:
+            事件记录列表 (按时间倒序)
+
+        Raises:
+            ValueError: 如果 event_type 无效
+        """
+        # 输入验证
+        if event_type is not None and event_type not in self.VALID_PEER_EVENT_TYPES:
+            raise ValueError(f"Invalid event_type: {event_type}. Must be one of: {', '.join(sorted(self.VALID_PEER_EVENT_TYPES))}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            sql = "SELECT * FROM peer_event_log WHERE 1=1"
+            params = []
+            if peer_tag:
+                sql += " AND peer_tag = ?"
+                params.append(peer_tag)
+            if event_type:
+                sql += " AND event_type = ?"
+                params.append(event_type)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            rows = cursor.execute(sql, params).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            # 解析 JSON 格式的 details 字段
+            result = []
+            for row in rows:
+                row_dict = dict(zip(columns, row))
+                if row_dict.get('details'):
+                    try:
+                        row_dict['details'] = json.loads(row_dict['details'])
+                    except (json.JSONDecodeError, TypeError):
+                        pass  # 保持原始字符串
+                result.append(row_dict)
+            return result
+
+    # 默认墓碑 TTL (小时) - 防止删除后节点在此期间重新连接
+    DEFAULT_TOMBSTONE_TTL_HOURS = 24
+
+    def add_peer_tombstone(
+        self,
+        tag: str,
+        deleted_by: str = "local",
+        reason: str = "deleted",
+        ttl_hours: int = DEFAULT_TOMBSTONE_TTL_HOURS
+    ) -> bool:
+        """添加节点墓碑记录
+
+        Args:
+            tag: 节点 tag
+            deleted_by: 删除来源 ('local' 或远程节点 tag)
+            reason: 删除原因
+            ttl_hours: 墓碑有效期 (小时)
+
+        Returns:
+            是否成功
+
+        Raises:
+            ValueError: 如果 ttl_hours <= 0
+        """
+        # 输入验证
+        if not isinstance(ttl_hours, int) or ttl_hours <= 0:
+            raise ValueError(f"ttl_hours must be a positive integer, got: {ttl_hours}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 SQLite 的 datetime 函数计算时间，确保格式一致
+            # 注意: pysqlcipher3 使用 SQLite 3.15.2，不支持 ON CONFLICT 语法
+            # 因此使用 INSERT OR REPLACE (SQLite 3.15+ 兼容)
+            cursor.execute("""
+                INSERT OR REPLACE INTO peer_tombstones (tag, deleted_at, expires_at, deleted_by, reason)
+                VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                        strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+' || ? || ' hours'),
+                        ?, ?)
+            """, (tag, ttl_hours, deleted_by, reason))
+            conn.commit()
+            return True
+
+    def get_peer_tombstone(self, tag: str) -> Optional[Dict]:
+        """查询节点墓碑记录
+
+        Args:
+            tag: 节点 tag
+
+        Returns:
+            墓碑记录 (如果存在且未过期)，否则 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 strftime 确保与存储格式一致 (ISO 8601)
+            row = cursor.execute("""
+                SELECT * FROM peer_tombstones
+                WHERE tag = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            """, (tag,)).fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            return None
+
+    def is_peer_tombstoned(self, tag: str) -> bool:
+        """检查节点是否在墓碑期内
+
+        Args:
+            tag: 节点 tag
+
+        Returns:
+            是否在墓碑期
+        """
+        return self.get_peer_tombstone(tag) is not None
+
+    def cleanup_expired_tombstones(self) -> int:
+        """清理过期的墓碑记录
+
+        Returns:
+            删除的记录数
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 strftime 确保与存储格式一致 (ISO 8601)
+            cursor.execute("""
+                DELETE FROM peer_tombstones
+                WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            """)
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+
+    def get_all_tombstones(self, include_expired: bool = False) -> List[Dict]:
+        """获取所有墓碑记录
+
+        Args:
+            include_expired: 是否包含已过期的记录
+
+        Returns:
+            墓碑记录列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if include_expired:
+                sql = "SELECT * FROM peer_tombstones ORDER BY deleted_at DESC"
+            else:
+                sql = """
+                    SELECT * FROM peer_tombstones
+                    WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                    ORDER BY deleted_at DESC
+                """
+            rows = cursor.execute(sql).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def delete_peer_tombstone(self, tag: str) -> bool:
+        """手动删除墓碑记录 (允许节点重新连接)
+
+        Args:
+            tag: 节点 tag
+
+        Returns:
+            是否成功删除
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM peer_tombstones WHERE tag = ?", (tag,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return deleted
+
+    # 默认审计日志保留时间 (小时)
+    DEFAULT_PEER_EVENT_RETENTION_HOURS = 168  # 7 天
+
+    def cleanup_old_peer_events(self, hours: int = DEFAULT_PEER_EVENT_RETENTION_HOURS) -> int:
+        """清理旧的审计日志记录
+
+        Args:
+            hours: 保留时间 (小时)，默认 7 天
+
+        Returns:
+            删除的记录数
+
+        Raises:
+            ValueError: 如果 hours <= 0
+        """
+        if not isinstance(hours, int) or hours <= 0:
+            raise ValueError(f"hours must be a positive integer, got: {hours}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM peer_event_log
+                WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-' || ? || ' hours')
+            """, (hours,))
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+
+    def is_event_processed(self, event_id: str) -> bool:
+        """检查事件是否已处理 (幂等性检查)
+
+        Args:
+            event_id: 事件唯一 ID
+
+        Returns:
+            是否已处理
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT 1 FROM processed_peer_events WHERE event_id = ?
+            """, (event_id,)).fetchone()
+            return row is not None
+
+    def mark_event_processed(
+        self,
+        event_id: str,
+        from_node: str,
+        action: Optional[str] = None
+    ) -> bool:
+        """标记事件为已处理
+
+        Args:
+            event_id: 事件唯一 ID
+            from_node: 事件来源节点
+            action: 事件动作类型
+
+        Returns:
+            是否成功
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                # 使用 SQLite 的 strftime 生成 ISO 8601 格式时间戳
+                cursor.execute("""
+                    INSERT INTO processed_peer_events
+                        (event_id, processed_at, from_node, action)
+                    VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, ?)
+                """, (event_id, from_node, action))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                # 已存在，返回 True (幂等)
+                return True
+
+    def mark_event_if_not_processed(
+        self,
+        event_id: str,
+        from_node: str,
+        action: Optional[str] = None
+    ) -> tuple:
+        """原子操作：检查并标记事件为已处理（防止 TOCTOU 竞态条件）
+
+        在单个事务中执行检查和标记，避免并发请求重复处理同一事件。
+
+        Args:
+            event_id: 事件唯一 ID
+            from_node: 事件来源节点
+            action: 事件动作类型
+
+        Returns:
+            元组 (was_processed, now_marked):
+            - was_processed: True 表示之前已处理（幂等返回）
+            - now_marked: True 表示本次成功标记
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                # 使用 INSERT OR IGNORE + 检查 rowcount 实现原子操作
+                cursor.execute("""
+                    INSERT OR IGNORE INTO processed_peer_events
+                        (event_id, processed_at, from_node, action)
+                    VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?, ?)
+                """, (event_id, from_node, action))
+                conn.commit()
+
+                if cursor.rowcount > 0:
+                    # 成功插入，这是第一次处理
+                    return (False, True)
+                else:
+                    # 插入被忽略，说明之前已存在
+                    return (True, False)
+            except Exception as e:
+                logging.error(f"mark_event_if_not_processed 失败: {e}")
+                conn.rollback()
+                raise
+
+    # 默认已处理事件保留时间 (小时) - 用于幂等性去重
+    DEFAULT_PROCESSED_EVENT_RETENTION_HOURS = 24
+
+    def cleanup_old_processed_events(self, hours: int = DEFAULT_PROCESSED_EVENT_RETENTION_HOURS) -> int:
+        """清理旧的已处理事件记录
+
+        Args:
+            hours: 保留时间 (小时)
+
+        Returns:
+            删除的记录数
+
+        Raises:
+            ValueError: 如果 hours <= 0
+        """
+        # 输入验证 (防止 SQL 注入和无效值)
+        if not isinstance(hours, int) or hours <= 0:
+            raise ValueError(f"hours must be a positive integer, got: {hours}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用参数化查询避免 SQL 注入
+            # strftime 格式与存储格式一致 (ISO 8601)
+            cursor.execute("""
+                DELETE FROM processed_peer_events
+                WHERE processed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-' || ? || ' hours')
+            """, (hours,))
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
 
     # ============ Relay Routes 管理 ============
 
@@ -2753,23 +3382,46 @@ class UserDatabase:
         entry_rules: Optional[Dict] = None,
         relay_rules: Optional[Dict] = None,
         priority: int = 0,
-        enabled: bool = True
+        enabled: bool = True,
+        # 多跳链路架构 v2 新增字段
+        exit_egress: Optional[str] = None,
+        dscp_value: Optional[int] = None,
+        chain_mark_type: str = "dscp",
+        chain_state: str = "inactive"
     ) -> int:
-        """添加多跳链路"""
+        """添加多跳链路
+
+        Args:
+            tag: 链路唯一标识
+            name: 显示名称
+            hops: 跳点节点列表 ["node-tokyo", "node-us"]
+            description: 描述
+            hop_protocols: 每跳协议 {"node-tokyo": "wireguard", "node-us": "xray"}
+            entry_rules: 入口分流规则
+            relay_rules: 中继分流规则
+            priority: 优先级
+            enabled: 是否启用
+            exit_egress: 终端节点的本地出口 tag（多跳链路架构 v2）
+            dscp_value: DSCP 标记值 1-63（多跳链路架构 v2）
+            chain_mark_type: 标记类型 'dscp' 或 'xray_email'
+            chain_state: 链路状态 'inactive'/'activating'/'active'/'error'
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO node_chains (
                     tag, name, description, hops, hop_protocols,
-                    entry_rules, relay_rules, priority, enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    entry_rules, relay_rules, priority, enabled,
+                    exit_egress, dscp_value, chain_mark_type, chain_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, name, description,
                 json.dumps(hops),
                 json.dumps(hop_protocols) if hop_protocols else None,
                 json.dumps(entry_rules) if entry_rules else None,
                 json.dumps(relay_rules) if relay_rules else None,
-                priority, 1 if enabled else 0
+                priority, 1 if enabled else 0,
+                exit_egress, dscp_value, chain_mark_type, chain_state
             ))
             conn.commit()
             return cursor.lastrowid
@@ -2780,7 +3432,9 @@ class UserDatabase:
             "name", "description", "hops", "hop_protocols",
             "entry_rules", "relay_rules", "health_status",
             "last_health_check", "priority", "enabled",
-            "downstream_status", "disconnected_node"  # 级联通知字段
+            "downstream_status", "disconnected_node",  # 级联通知字段
+            # 多跳链路架构 v2 字段
+            "exit_egress", "dscp_value", "chain_mark_type", "chain_state"
         }
         updates = []
         values = []
@@ -2805,31 +3459,92 @@ class UserDatabase:
             return cursor.rowcount > 0
 
     def delete_node_chain(self, tag: str) -> bool:
-        """删除多跳链路"""
+        """删除多跳链路
+
+        级联删除关联数据：
+        - terminal_egress_cache (入口节点缓存的终端出口列表)
+        - chain_routing (链路路由规则)
+        - relay_routes (中继路由)
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+
+            # 级联删除关联的缓存和路由数据
+            cursor.execute("DELETE FROM terminal_egress_cache WHERE chain_tag = ?", (tag,))
+            cursor.execute("DELETE FROM chain_routing WHERE chain_tag = ?", (tag,))
+            cursor.execute("DELETE FROM relay_routes WHERE chain_tag = ?", (tag,))
+
+            # 删除链路本身
             cursor.execute("DELETE FROM node_chains WHERE tag = ?", (tag,))
             conn.commit()
             return cursor.rowcount > 0
 
-    def validate_chain_hops(self, hops: List[str]) -> tuple:
-        """验证链路的跳点节点是否都存在
+    def validate_chain_hops(self, hops: List[str], allow_transitive: bool = False) -> tuple:
+        """Phase 11-Fix.C: 验证链路的跳点节点，支持传递模式
+
+        验证内容：
+        1. hops 不能为空
+        2. 检测重复节点（循环链路防护）
+        3. 验证节点存在性：
+           - 严格模式 (allow_transitive=False): 所有节点必须存在于本地 peer_nodes 表
+           - 传递模式 (allow_transitive=True): 只验证第一跳存在于本地 peer_nodes，
+             后续跳通过隧道向下游节点查询（用于线性拓扑 A→B→C，A 只知道 B）
+
+        Args:
+            hops: 跳点列表（不包含本地节点）
+            allow_transitive: 是否允许传递模式（只验证第一跳）
 
         Returns:
-            (is_valid, missing_nodes)
+            (is_valid, error_message_or_missing_nodes)
         """
         if not hops:
             return False, ["hops cannot be empty"]
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            missing = []
-            for hop in hops:
+
+        # 检测重复节点（循环链路防护）
+        # 同一链路中不应出现重复节点，如 A→B→A 或 A→B→C→B
+        seen = set()
+        duplicates = []
+        for hop in hops:
+            if hop in seen:
+                duplicates.append(hop)
+            seen.add(hop)
+
+        if duplicates:
+            return False, [f"circular chain detected: duplicate node(s) {duplicates}"]
+
+        if allow_transitive:
+            # 传递模式：只验证第一跳是本地 peer
+            first_hop = hops[0]
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
                 row = cursor.execute(
-                    "SELECT tag FROM peer_nodes WHERE tag = ?", (hop,)
+                    "SELECT tag, tunnel_status FROM peer_nodes WHERE tag = ?",
+                    (first_hop,)
                 ).fetchone()
+
                 if not row:
-                    missing.append(hop)
-            return len(missing) == 0, missing
+                    return False, [f"first hop '{first_hop}' not found in local peer_nodes"]
+
+                # 可选：检查第一跳是否已连接
+                tunnel_status = row[1]
+                if tunnel_status != "connected":
+                    return False, [f"first hop '{first_hop}' is not connected (status: {tunnel_status})"]
+
+                return True, []
+        else:
+            # 严格模式：所有节点必须在本地 peer_nodes 表
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
+                # 使用单一 IN 查询代替 N+1 循环
+                placeholders = ",".join("?" * len(hops))
+                rows = cursor.execute(
+                    f"SELECT tag FROM peer_nodes WHERE tag IN ({placeholders})",
+                    hops
+                ).fetchall()
+
+                existing_tags = {row[0] for row in rows}
+                missing = [hop for hop in hops if hop not in existing_tags]
+                return len(missing) == 0, missing
 
     # ============ Chain Registrations 管理（级联通知用）============
 
@@ -3007,6 +3722,425 @@ class UserDatabase:
             if node_tag in hops[1:]:
                 result.append(chain)
         return result
+
+    # ============ Chain Routing 管理（终端节点 DSCP/email 到出口映射）============
+
+    def get_chain_routing_list(self, mark_type: Optional[str] = None) -> List[Dict]:
+        """获取链路路由列表
+
+        Args:
+            mark_type: 过滤标记类型 ('dscp' 或 'xray_email')，None 返回全部
+
+        Returns:
+            链路路由列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if mark_type:
+                rows = cursor.execute(
+                    "SELECT * FROM chain_routing WHERE mark_type = ? ORDER BY mark_value",
+                    (mark_type,)
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM chain_routing ORDER BY mark_type, mark_value"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_chain_routing(self, chain_tag: str, mark_value: int, mark_type: str = "dscp") -> Optional[Dict]:
+        """获取单个链路路由
+
+        Args:
+            chain_tag: 链路标识
+            mark_value: 标记值
+            mark_type: 标记类型
+
+        Returns:
+            链路路由字典或 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM chain_routing WHERE chain_tag = ? AND mark_value = ? AND mark_type = ?",
+                (chain_tag, mark_value, mark_type)
+            ).fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            return None
+
+    def get_chain_routing_by_mark(self, mark_value: int, mark_type: str = "dscp") -> Optional[Dict]:
+        """根据标记值查找链路路由
+
+        用于终端节点根据 DSCP/email 标记查找应该使用的出口
+
+        Args:
+            mark_value: 标记值
+            mark_type: 标记类型
+
+        Returns:
+            链路路由字典或 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM chain_routing WHERE mark_value = ? AND mark_type = ?",
+                (mark_value, mark_type)
+            ).fetchone()
+            if row:
+                columns = [desc[0] for desc in cursor.description]
+                return dict(zip(columns, row))
+            return None
+
+    # 常量定义：保留的 DSCP 值（QoS 常用值）
+    RESERVED_DSCP_VALUES = frozenset({0, 10, 12, 14, 18, 20, 22, 26, 28, 30, 34, 36, 38, 46})
+    VALID_MARK_TYPES = frozenset({"dscp", "xray_email"})
+
+    def add_chain_routing(
+        self,
+        chain_tag: str,
+        mark_value: int,
+        egress_tag: str,
+        mark_type: str = "dscp",
+        source_node: Optional[str] = None
+    ) -> int:
+        """添加链路路由
+
+        Args:
+            chain_tag: 链路标识
+            mark_value: 标记值 (DSCP: 1-63)
+            egress_tag: 本地出口 tag
+            mark_type: 标记类型 ('dscp' 或 'xray_email')
+            source_node: 注册来源节点
+
+        Returns:
+            新记录的 ID
+
+        Raises:
+            ValueError: 如果 mark_type 无效，或 DSCP 值超出范围/被保留
+        """
+        # 验证 mark_type
+        if mark_type not in self.VALID_MARK_TYPES:
+            raise ValueError(f"Invalid mark_type: {mark_type}. Must be one of {self.VALID_MARK_TYPES}")
+
+        # 验证 DSCP 值范围和保留值
+        if mark_type == "dscp":
+            if not (1 <= mark_value <= 63):
+                raise ValueError(f"DSCP value must be 1-63, got {mark_value}")
+            if mark_value in self.RESERVED_DSCP_VALUES:
+                raise ValueError(f"DSCP value {mark_value} is reserved for QoS")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO chain_routing (chain_tag, mark_value, mark_type, egress_tag, source_node)
+                VALUES (?, ?, ?, ?, ?)
+            """, (chain_tag, mark_value, mark_type, egress_tag, source_node))
+            conn.commit()
+            return cursor.lastrowid
+
+    def add_or_update_chain_routing(
+        self,
+        chain_tag: str,
+        mark_value: int,
+        egress_tag: str,
+        mark_type: str = "dscp",
+        source_node: Optional[str] = None
+    ) -> int:
+        """添加或更新链路路由 (原子操作)
+
+        使用 INSERT OR REPLACE 确保原子性，避免竞态条件。
+        如果路由已存在（相同 chain_tag + mark_value + mark_type），则更新。
+
+        Args:
+            chain_tag: 链路标识
+            mark_value: 标记值 (DSCP: 1-63)
+            egress_tag: 本地出口 tag
+            mark_type: 标记类型 ('dscp' 或 'xray_email')
+            source_node: 注册来源节点
+
+        Returns:
+            记录的 ID
+
+        Raises:
+            ValueError: 如果 mark_type 无效，或 DSCP 值超出范围/被保留
+        """
+        # 验证 mark_type
+        if mark_type not in self.VALID_MARK_TYPES:
+            raise ValueError(f"Invalid mark_type: {mark_type}. Must be one of {self.VALID_MARK_TYPES}")
+
+        # 验证 DSCP 值范围和保留值
+        if mark_type == "dscp":
+            if not (1 <= mark_value <= 63):
+                raise ValueError(f"DSCP value must be 1-63, got {mark_value}")
+            if mark_value in self.RESERVED_DSCP_VALUES:
+                raise ValueError(f"DSCP value {mark_value} is reserved for QoS")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 INSERT OR REPLACE 实现原子 upsert
+            # chain_routing 表的 UNIQUE 约束在 (chain_tag, mark_value, mark_type) 上
+            cursor.execute("""
+                INSERT OR REPLACE INTO chain_routing
+                    (chain_tag, mark_value, mark_type, egress_tag, source_node, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (chain_tag, mark_value, mark_type, egress_tag, source_node))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_chain_routing(
+        self,
+        chain_tag: str,
+        mark_value: int,
+        mark_type: str = "dscp",
+        **kwargs
+    ) -> bool:
+        """更新链路路由
+
+        Args:
+            chain_tag: 链路标识
+            mark_value: 标记值
+            mark_type: 标记类型
+            **kwargs: 要更新的字段 (egress_tag, source_node)
+
+        Returns:
+            是否成功更新
+        """
+        allowed_fields = {"egress_tag", "source_node"}
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.extend([chain_tag, mark_value, mark_type])
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE chain_routing
+                SET {", ".join(updates)}
+                WHERE chain_tag = ? AND mark_value = ? AND mark_type = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_chain_routing(self, chain_tag: str, mark_value: int, mark_type: str = "dscp") -> bool:
+        """删除链路路由
+
+        Args:
+            chain_tag: 链路标识
+            mark_value: 标记值
+            mark_type: 标记类型
+
+        Returns:
+            是否成功删除
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM chain_routing WHERE chain_tag = ? AND mark_value = ? AND mark_type = ?",
+                (chain_tag, mark_value, mark_type)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_chain_routing_by_chain(self, chain_tag: str) -> int:
+        """删除指定链路的所有路由
+
+        Args:
+            chain_tag: 链路标识
+
+        Returns:
+            删除的记录数
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM chain_routing WHERE chain_tag = ?", (chain_tag,))
+            conn.commit()
+            return cursor.rowcount
+
+    def delete_chain_routing_by_source(self, source_node: str) -> int:
+        """删除指定来源节点注册的所有路由
+
+        用于节点断开时清理其注册的路由
+
+        Args:
+            source_node: 来源节点 tag
+
+        Returns:
+            删除的记录数
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM chain_routing WHERE source_node = ?", (source_node,))
+            conn.commit()
+            return cursor.rowcount
+
+    # ============ 终端出口缓存 (Phase 11.1) ============
+
+    def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
+        """获取终端出口缓存
+
+        Args:
+            chain_tag: 链路标识
+
+        Returns:
+            缓存记录（包含 egress_list, terminal_node, cached_at, expires_at）或 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, chain_tag, terminal_node, egress_list, cached_at, expires_at
+                FROM terminal_egress_cache
+                WHERE chain_tag = ?
+            """, (chain_tag,)).fetchone()
+
+            if not row:
+                return None
+
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def update_terminal_egress_cache(
+        self,
+        chain_tag: str,
+        terminal_node: str,
+        egress_list: List[Dict],
+        ttl_seconds: int = 300
+    ) -> bool:
+        """更新或创建终端出口缓存
+
+        Args:
+            chain_tag: 链路标识
+            terminal_node: 终端节点 tag
+            egress_list: 出口列表 (JSON 可序列化的列表)
+            ttl_seconds: 缓存过期时间（秒），默认 5 分钟，最大 86400 (24h)
+
+        Returns:
+            是否成功
+        """
+        # TTL 边界验证 (Phase 11.1)
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 0 or ttl_seconds > 86400:
+            logger.warning(f"Invalid ttl_seconds: {ttl_seconds}, using default 300")
+            ttl_seconds = 300
+
+        egress_json = json.dumps(egress_list, ensure_ascii=False)
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用 INSERT OR REPLACE 以兼容旧版 SQLite/pysqlcipher3
+            # 先删除旧记录（如果存在）
+            cursor.execute("DELETE FROM terminal_egress_cache WHERE chain_tag = ?", (chain_tag,))
+            # 插入新记录
+            cursor.execute("""
+                INSERT INTO terminal_egress_cache (chain_tag, terminal_node, egress_list, cached_at, expires_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, datetime(CURRENT_TIMESTAMP, ? || ' seconds'))
+            """, (chain_tag, terminal_node, egress_json, f"+{ttl_seconds}"))
+            conn.commit()
+            return True
+
+    def delete_terminal_egress_cache(self, chain_tag: str) -> bool:
+        """删除终端出口缓存
+
+        Args:
+            chain_tag: 链路标识
+
+        Returns:
+            是否成功删除
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM terminal_egress_cache WHERE chain_tag = ?", (chain_tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def cleanup_expired_terminal_egress_cache(self) -> int:
+        """清理过期的终端出口缓存
+
+        Returns:
+            清理的记录数
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM terminal_egress_cache
+                WHERE expires_at < CURRENT_TIMESTAMP
+            """)
+            conn.commit()
+            return cursor.rowcount
+
+    def get_all_terminal_egress_cache(self) -> List[Dict]:
+        """获取所有终端出口缓存记录
+
+        Returns:
+            所有缓存记录列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, chain_tag, terminal_node, egress_list, cached_at, expires_at
+                FROM terminal_egress_cache
+                ORDER BY chain_tag
+            """).fetchall()
+
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_next_available_dscp_value(self) -> Optional[int]:
+        """获取下一个可用的 DSCP 值
+
+        DSCP 范围: 1-63 (6 bits)
+        保留值: 0 (默认), 46 (EF), 10/12/14 (AF11-13), 18/20/22 (AF21-23),
+                26/28/30 (AF31-33), 34/36/38 (AF41-43)
+
+        使用单一 UNION 查询优化性能（从 2 次查询减少到 1 次）
+
+        Returns:
+            可用的 DSCP 值，或 None 如果已用完
+        """
+        # 使用类常量代替内联定义
+        available_range = set(range(1, 64)) - self.RESERVED_DSCP_VALUES
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            # 使用单一 UNION 查询代替两次独立查询
+            rows = cursor.execute("""
+                SELECT mark_value AS dscp FROM chain_routing WHERE mark_type = 'dscp'
+                UNION
+                SELECT dscp_value FROM node_chains WHERE dscp_value IS NOT NULL
+            """).fetchall()
+
+            used_values = {row[0] for row in rows}
+
+            # 找到第一个可用值
+            available = available_range - used_values
+            if available:
+                return min(available)
+            return None
+
+    def update_peer_node_tunnel_api_endpoint(self, tag: str, tunnel_api_endpoint: Optional[str]) -> bool:
+        """更新对等节点的隧道 API 端点
+
+        Args:
+            tag: 节点标识
+            tunnel_api_endpoint: 隧道内 API 地址 (如 10.200.200.2:36000)
+
+        Returns:
+            是否成功更新
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE peer_nodes
+                SET tunnel_api_endpoint = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE tag = ?
+            """, (tunnel_api_endpoint, tag))
+            conn.commit()
+            return cursor.rowcount > 0
 
 
 class DatabaseManager:
@@ -3522,14 +4656,23 @@ class DatabaseManager:
         tag: str,
         name: str,
         endpoint: str,
-        psk_hash: str,
-        psk_encrypted: Optional[str] = None,
+        psk_hash: str = "",  # 已废弃，保留参数兼容
+        psk_encrypted: Optional[str] = None,  # 已废弃
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
+        # 隧道状态和 IP 参数（Phase 2 配对系统需要）
+        tunnel_status: str = "disconnected",
+        tunnel_interface: Optional[str] = None,  # Phase 11-Tunnel: WireGuard 接口名
+        tunnel_local_ip: Optional[str] = None,
+        tunnel_remote_ip: Optional[str] = None,
         tunnel_port: Optional[int] = None,
+        tunnel_api_endpoint: Optional[str] = None,
+        # WireGuard 参数
         wg_private_key: Optional[str] = None,
         wg_public_key: Optional[str] = None,
+        wg_peer_public_key: Optional[str] = None,
+        # Xray 参数
         xray_protocol: str = "vless",
         xray_uuid: Optional[str] = None,
         # REALITY 配置（本节点作为服务端）
@@ -3538,22 +4681,33 @@ class DatabaseManager:
         xray_reality_short_id: Optional[str] = None,
         xray_reality_dest: str = "www.microsoft.com:443",
         xray_reality_server_names: str = '["www.microsoft.com"]',
+        # 对端 REALITY 配置
+        xray_peer_reality_public_key: Optional[str] = None,
+        xray_peer_reality_short_id: Optional[str] = None,
         # XHTTP 传输配置
         xray_xhttp_path: str = "/",
         xray_xhttp_mode: str = "auto",
         xray_xhttp_host: Optional[str] = None,
+        # 连接模式
+        connection_mode: str = "outbound",
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
-        enabled: bool = True
+        enabled: bool = True,
+        # Phase 11: 双向连接状态
+        bidirectional_status: str = "pending",
     ) -> int:
         return self.user.add_peer_node(
             tag, name, endpoint, psk_hash, psk_encrypted, description, api_port,
-            tunnel_type, tunnel_port, wg_private_key, wg_public_key,
+            tunnel_type, tunnel_status, tunnel_interface,
+            tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
+            wg_private_key, wg_public_key, wg_peer_public_key,
             xray_protocol, xray_uuid,
             xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
             xray_reality_dest, xray_reality_server_names,
+            xray_peer_reality_public_key, xray_peer_reality_short_id,
             xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
-            default_outbound, auto_reconnect, enabled
+            connection_mode, default_outbound, auto_reconnect, enabled,
+            bidirectional_status
         )
 
     def update_peer_node(self, tag: str, **kwargs) -> bool:
@@ -3576,6 +4730,125 @@ class DatabaseManager:
 
     def get_peer_nodes_with_inbound(self) -> List[Dict]:
         return self.user.get_peer_nodes_with_inbound()
+
+    # 双向连接管理 (Phase 11.1)
+    def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
+        return self.user.update_peer_bidirectional_status(tag, status)
+
+    def get_peers_pending_bidirectional(self) -> List[Dict]:
+        return self.user.get_peers_pending_bidirectional()
+
+    def get_peers_by_bidirectional_status(self, status: str) -> List[Dict]:
+        return self.user.get_peers_by_bidirectional_status(status)
+
+    # Pending Pairings (待处理配对管理, Phase 11-Tunnel)
+    def add_pending_pairing(
+        self,
+        pairing_id: str,
+        local_tag: str,
+        local_endpoint: str,
+        tunnel_type: str = "wireguard",
+        tunnel_local_ip: str = None,
+        tunnel_remote_ip: str = None,
+        tunnel_port: int = None,
+        wg_private_key: str = None,
+        wg_public_key: str = None,
+        remote_wg_private_key: str = None,
+        remote_wg_public_key: str = None,
+        interface_name: str = None,
+        expires_days: int = 7
+    ) -> int:
+        return self.user.add_pending_pairing(
+            pairing_id, local_tag, local_endpoint, tunnel_type,
+            tunnel_local_ip, tunnel_remote_ip, tunnel_port,
+            wg_private_key, wg_public_key,
+            remote_wg_private_key, remote_wg_public_key,
+            interface_name, expires_days
+        )
+
+    def get_pending_pairing(self, pairing_id: str) -> Optional[Dict]:
+        return self.user.get_pending_pairing(pairing_id)
+
+    def get_pending_pairing_by_interface(self, interface_name: str) -> Optional[Dict]:
+        return self.user.get_pending_pairing_by_interface(interface_name)
+
+    def delete_pending_pairing(self, pairing_id: str) -> bool:
+        return self.user.delete_pending_pairing(pairing_id)
+
+    def cleanup_expired_pairings(self) -> int:
+        return self.user.cleanup_expired_pairings()
+
+    def get_all_pending_pairings(self) -> List[Dict]:
+        return self.user.get_all_pending_pairings()
+
+    # Phase 11-Cascade: 级联删除通知支持
+    def log_peer_event(
+        self,
+        event_type: str,
+        peer_tag: str,
+        event_id: Optional[str] = None,
+        from_node: Optional[str] = None,
+        details: Optional[Dict] = None,
+        source_ip: Optional[str] = None
+    ) -> int:
+        return self.user.log_peer_event(event_type, peer_tag, event_id, from_node, details, source_ip)
+
+    def get_peer_events(
+        self,
+        peer_tag: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 100
+    ) -> List[Dict]:
+        return self.user.get_peer_events(peer_tag, event_type, limit)
+
+    def add_peer_tombstone(
+        self,
+        tag: str,
+        deleted_by: str = "local",
+        reason: str = "deleted",
+        ttl_hours: int = 24
+    ) -> bool:
+        return self.user.add_peer_tombstone(tag, deleted_by, reason, ttl_hours)
+
+    def get_peer_tombstone(self, tag: str) -> Optional[Dict]:
+        return self.user.get_peer_tombstone(tag)
+
+    def is_peer_tombstoned(self, tag: str) -> bool:
+        return self.user.is_peer_tombstoned(tag)
+
+    def cleanup_expired_tombstones(self) -> int:
+        return self.user.cleanup_expired_tombstones()
+
+    def get_all_tombstones(self, include_expired: bool = False) -> List[Dict]:
+        return self.user.get_all_tombstones(include_expired)
+
+    def delete_peer_tombstone(self, tag: str) -> bool:
+        return self.user.delete_peer_tombstone(tag)
+
+    def cleanup_old_peer_events(self, hours: int = 168) -> int:
+        return self.user.cleanup_old_peer_events(hours)
+
+    def is_event_processed(self, event_id: str) -> bool:
+        return self.user.is_event_processed(event_id)
+
+    def mark_event_processed(
+        self,
+        event_id: str,
+        from_node: str,
+        action: Optional[str] = None
+    ) -> bool:
+        return self.user.mark_event_processed(event_id, from_node, action)
+
+    def mark_event_if_not_processed(
+        self,
+        event_id: str,
+        from_node: str,
+        action: Optional[str] = None
+    ) -> tuple:
+        return self.user.mark_event_if_not_processed(event_id, from_node, action)
+
+    def cleanup_old_processed_events(self, hours: int = 24) -> int:
+        return self.user.cleanup_old_processed_events(hours)
 
     # Relay Routes (中继路由管理)
     def get_relay_routes(self, chain_tag: Optional[str] = None, enabled_only: bool = False) -> List[Dict]:
@@ -3616,11 +4889,20 @@ class DatabaseManager:
         entry_rules: Optional[Dict] = None,
         relay_rules: Optional[Dict] = None,
         priority: int = 0,
-        enabled: bool = True
+        enabled: bool = True,
+        # 多跳链路架构 v2 新增字段
+        exit_egress: Optional[str] = None,
+        dscp_value: Optional[int] = None,
+        chain_mark_type: str = "dscp",
+        chain_state: str = "inactive"
     ) -> int:
         return self.user.add_node_chain(
             tag, name, hops, description, hop_protocols,
-            entry_rules, relay_rules, priority, enabled
+            entry_rules, relay_rules, priority, enabled,
+            exit_egress=exit_egress,
+            dscp_value=dscp_value,
+            chain_mark_type=chain_mark_type,
+            chain_state=chain_state
         )
 
     def update_node_chain(self, tag: str, **kwargs) -> bool:
@@ -3629,8 +4911,8 @@ class DatabaseManager:
     def delete_node_chain(self, tag: str) -> bool:
         return self.user.delete_node_chain(tag)
 
-    def validate_chain_hops(self, hops: List[str]) -> tuple:
-        return self.user.validate_chain_hops(hops)
+    def validate_chain_hops(self, hops: List[str], allow_transitive: bool = False) -> tuple:
+        return self.user.validate_chain_hops(hops, allow_transitive)
 
     # Chain Registrations (级联通知用)
     def get_chain_registrations(self) -> List[Dict]:
@@ -3670,6 +4952,82 @@ class DatabaseManager:
 
     def get_chains_with_downstream_node(self, node_tag: str) -> List[Dict]:
         return self.user.get_chains_with_downstream_node(node_tag)
+
+    # Chain Routing 管理（多跳链路架构 v2）
+    def get_chain_routing_list(self, mark_type: Optional[str] = None) -> List[Dict]:
+        return self.user.get_chain_routing_list(mark_type)
+
+    def get_chain_routing(self, chain_tag: str, mark_value: int, mark_type: str = "dscp") -> Optional[Dict]:
+        return self.user.get_chain_routing(chain_tag, mark_value, mark_type)
+
+    def get_chain_routing_by_mark(self, mark_value: int, mark_type: str = "dscp") -> Optional[Dict]:
+        return self.user.get_chain_routing_by_mark(mark_value, mark_type)
+
+    def add_chain_routing(
+        self,
+        chain_tag: str,
+        mark_value: int,
+        egress_tag: str,
+        mark_type: str = "dscp",
+        source_node: Optional[str] = None
+    ) -> int:
+        return self.user.add_chain_routing(chain_tag, mark_value, egress_tag, mark_type, source_node)
+
+    def add_or_update_chain_routing(
+        self,
+        chain_tag: str,
+        mark_value: int,
+        egress_tag: str,
+        mark_type: str = "dscp",
+        source_node: Optional[str] = None
+    ) -> int:
+        return self.user.add_or_update_chain_routing(chain_tag, mark_value, egress_tag, mark_type, source_node)
+
+    def update_chain_routing(
+        self,
+        chain_tag: str,
+        mark_value: int,
+        mark_type: str = "dscp",
+        **kwargs
+    ) -> bool:
+        return self.user.update_chain_routing(chain_tag, mark_value, mark_type, **kwargs)
+
+    def delete_chain_routing(self, chain_tag: str, mark_value: int, mark_type: str = "dscp") -> bool:
+        return self.user.delete_chain_routing(chain_tag, mark_value, mark_type)
+
+    def delete_chain_routing_by_chain(self, chain_tag: str) -> int:
+        return self.user.delete_chain_routing_by_chain(chain_tag)
+
+    def delete_chain_routing_by_source(self, source_node: str) -> int:
+        return self.user.delete_chain_routing_by_source(source_node)
+
+    def get_next_available_dscp_value(self) -> Optional[int]:
+        return self.user.get_next_available_dscp_value()
+
+    def update_peer_node_tunnel_api_endpoint(self, tag: str, tunnel_api_endpoint: Optional[str]) -> bool:
+        return self.user.update_peer_node_tunnel_api_endpoint(tag, tunnel_api_endpoint)
+
+    # 终端出口缓存 (Phase 11.1)
+    def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
+        return self.user.get_terminal_egress_cache(chain_tag)
+
+    def update_terminal_egress_cache(
+        self,
+        chain_tag: str,
+        terminal_node: str,
+        egress_list: List[Dict],
+        ttl_seconds: int = 300
+    ) -> bool:
+        return self.user.update_terminal_egress_cache(chain_tag, terminal_node, egress_list, ttl_seconds)
+
+    def delete_terminal_egress_cache(self, chain_tag: str) -> bool:
+        return self.user.delete_terminal_egress_cache(chain_tag)
+
+    def cleanup_expired_terminal_egress_cache(self) -> int:
+        return self.user.cleanup_expired_terminal_egress_cache()
+
+    def get_all_terminal_egress_cache(self) -> List[Dict]:
+        return self.user.get_all_terminal_egress_cache()
 
 
 # 全局缓存

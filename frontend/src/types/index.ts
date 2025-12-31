@@ -1098,6 +1098,7 @@ export interface PeerNode {
   name: string;
   description?: string;
   endpoint: string;
+  api_port?: number;  // Phase D: API 端口 (默认 36000)
   tunnel_type: PeerTunnelType;
   tunnel_status: PeerTunnelStatus;
   tunnel_interface?: string;
@@ -1130,6 +1131,9 @@ export interface PeerNode {
   enabled: boolean;
   created_at?: string;
   updated_at?: string;
+
+  // 双向连接状态 (Phase 11.2)
+  bidirectional_status?: "pending" | "outbound_only" | "bidirectional";
 }
 
 export interface PeerNodeCreateRequest {
@@ -1137,7 +1141,7 @@ export interface PeerNodeCreateRequest {
   name: string;
   description?: string;
   endpoint: string;
-  psk: string;
+  psk?: string;  // 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
   tunnel_type: PeerTunnelType;
 
   // REALITY 服务端配置（可选，有默认值）
@@ -1156,7 +1160,7 @@ export interface PeerNodeUpdateRequest {
   name?: string;
   description?: string;
   endpoint?: string;
-  psk?: string;
+  psk?: string;  // 已废弃 - 保留兼容，不再使用
 
   // REALITY 服务端配置
   xray_reality_dest?: string;
@@ -1217,6 +1221,12 @@ export type ChainHealthStatus = "unknown" | "healthy" | "degraded" | "unhealthy"
 // Downstream status for cascade notifications
 export type DownstreamStatus = "unknown" | "connected" | "disconnected";
 
+// Chain activation state
+export type ChainState = "inactive" | "activating" | "active" | "error";
+
+// Chain mark type for multi-hop routing
+export type ChainMarkType = "dscp" | "xray_email";
+
 export interface NodeChain {
   id?: number;
   tag: string;
@@ -1232,6 +1242,11 @@ export interface NodeChain {
   last_health_check?: string;
   enabled: boolean;
   priority: number;
+  // Multi-hop chain architecture v2 fields
+  exit_egress?: string;  // Terminal node's local egress
+  dscp_value?: number;  // DSCP marking value (1-63)
+  chain_mark_type?: ChainMarkType;  // "dscp" or "xray_email"
+  chain_state?: ChainState;  // "inactive", "activating", "active", "error"
   created_at?: string;
   updated_at?: string;
 }
@@ -1246,6 +1261,10 @@ export interface NodeChainCreateRequest {
   relay_rules?: Record<string, unknown>;
   priority?: number;
   enabled?: boolean;
+  // Multi-hop chain architecture v2 fields
+  exit_egress?: string;  // Terminal node's local egress
+  dscp_value?: number;  // DSCP marking value (1-63, auto-assigned if not provided)
+  chain_mark_type?: ChainMarkType;  // "dscp" or "xray_email"
 }
 
 export interface NodeChainUpdateRequest {
@@ -1257,6 +1276,26 @@ export interface NodeChainUpdateRequest {
   relay_rules?: Record<string, unknown>;
   priority?: number;
   enabled?: boolean;
+  // Multi-hop chain architecture v2 fields
+  exit_egress?: string;  // Terminal node's local egress
+  dscp_value?: number;  // DSCP marking value (1-63)
+  chain_mark_type?: ChainMarkType;  // "dscp" or "xray_email"
+}
+
+// Terminal egress info from remote node
+export interface TerminalEgressInfo {
+  tag: string;
+  type: string;  // "pia", "custom", "warp", "direct", "openvpn", "v2ray"
+  description?: string;
+  enabled: boolean;
+}
+
+// Terminal egress list response (with cache support - Phase 11.5)
+export interface TerminalEgressListResponse {
+  egress_list: TerminalEgressInfo[];
+  node_tag: string;
+  cached?: boolean;          // Whether this is cached data
+  cached_at?: string;        // ISO timestamp when cached
 }
 
 export interface NodeChainListResponse {

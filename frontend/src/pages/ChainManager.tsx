@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -16,7 +16,11 @@ import {
   QuestionMarkCircleIcon,
   GlobeAltIcon,
   ComputerDesktopIcon,
-  ArrowRightIcon
+  ArrowRightIcon,
+  PlayIcon,
+  StopIcon,
+  SignalIcon,
+  SignalSlashIcon
 } from "@heroicons/react/24/outline";
 import { api } from "../api/client";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -28,7 +32,9 @@ import type {
   ChainHealthStatus,
   ChainHealthCheckResponse,
   ChainHopResult,
-  DownstreamStatus
+  DownstreamStatus,
+  ChainState,
+  ChainMarkType
 } from "../types";
 
 // Health status color and icon mapping
@@ -135,6 +141,45 @@ function getDownstreamStatusInfo(status: DownstreamStatus | undefined) {
   }
 }
 
+// Chain state color and icon mapping
+function getChainStateInfo(state: ChainState | undefined) {
+  switch (state) {
+    case "active":
+      return {
+        color: "text-emerald-400",
+        bgColor: "bg-emerald-500/20",
+        borderColor: "border-emerald-500/30",
+        icon: SignalIcon,
+        pulseClass: ""
+      };
+    case "activating":
+      return {
+        color: "text-amber-400",
+        bgColor: "bg-amber-500/20",
+        borderColor: "border-amber-500/30",
+        icon: ArrowPathIcon,
+        pulseClass: "animate-spin"
+      };
+    case "error":
+      return {
+        color: "text-rose-400",
+        bgColor: "bg-rose-500/20",
+        borderColor: "border-rose-500/30",
+        icon: ExclamationCircleIcon,
+        pulseClass: ""
+      };
+    case "inactive":
+    default:
+      return {
+        color: "text-slate-400",
+        bgColor: "bg-slate-500/20",
+        borderColor: "border-slate-500/30",
+        icon: SignalSlashIcon,
+        pulseClass: ""
+      };
+  }
+}
+
 // Format timestamp for display (using i18n)
 function formatTimestamp(timestamp: string | undefined, t: (key: string, options?: Record<string, unknown>) => string): string {
   if (!timestamp) return "-";
@@ -168,6 +213,16 @@ export default function ChainManager() {
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [chainToDelete, setChainToDelete] = useState<NodeChain | null>(null);
 
+  // Activation state
+  const [activatingChain, setActivatingChain] = useState<string | null>(null);
+
+  // Terminal egress state (with cache support - Phase 11.5)
+  const [terminalEgressList, setTerminalEgressList] = useState<Array<{ tag: string; type: string; description?: string; enabled: boolean }>>([]);
+  const [loadingEgress, setLoadingEgress] = useState(false);
+  const [egressCached, setEgressCached] = useState<boolean>(false);
+  const [egressCachedAt, setEgressCachedAt] = useState<string | null>(null);
+  const egressRequestRef = useRef<string | null>(null);  // Track current egress request to prevent race conditions
+
   // Form state
   const [formData, setFormData] = useState({
     tag: "",
@@ -178,7 +233,10 @@ export default function ChainManager() {
     entry_rules: "",
     relay_rules: "",
     priority: 100,
-    enabled: true
+    enabled: true,
+    // Multi-hop chain architecture v2 fields
+    exit_egress: "",
+    chain_mark_type: "dscp" as ChainMarkType
   });
 
   const loadData = useCallback(async () => {
@@ -225,8 +283,11 @@ export default function ChainManager() {
       entry_rules: "",
       relay_rules: "",
       priority: 100,
-      enabled: true
+      enabled: true,
+      exit_egress: "",
+      chain_mark_type: "dscp" as ChainMarkType
     });
+    setTerminalEgressList([]);
   }, []);
 
   // [可访问性] Escape 键关闭模态框
@@ -271,9 +332,16 @@ export default function ChainManager() {
       entry_rules: chain.entry_rules ? JSON.stringify(chain.entry_rules, null, 2) : "",
       relay_rules: chain.relay_rules ? JSON.stringify(chain.relay_rules, null, 2) : "",
       priority: chain.priority,
-      enabled: chain.enabled
+      enabled: chain.enabled,
+      exit_egress: chain.exit_egress || "",
+      chain_mark_type: chain.chain_mark_type || "dscp"
     });
+    setTerminalEgressList([]);
     setShowModal(true);
+    // Auto-load terminal egress for edit mode
+    if (chain.tag) {
+      loadTerminalEgress(chain.tag);
+    }
   };
 
   const closeModal = () => {
@@ -319,7 +387,10 @@ export default function ChainManager() {
         entry_rules: formData.entry_rules.trim() ? JSON.parse(formData.entry_rules) : undefined,
         relay_rules: formData.relay_rules.trim() ? JSON.parse(formData.relay_rules) : undefined,
         priority: formData.priority,
-        enabled: formData.enabled
+        enabled: formData.enabled,
+        // Multi-hop chain architecture v2 fields
+        exit_egress: formData.exit_egress.trim() || undefined,
+        chain_mark_type: formData.chain_mark_type
       };
 
       if (editingChain) {
@@ -388,6 +459,62 @@ export default function ChainManager() {
   const closeHealthModal = () => {
     setShowHealthModal(false);
     setHealthCheckResult(null);
+  };
+
+  // Activate chain
+  const handleActivate = async (chain: NodeChain) => {
+    setActivatingChain(chain.tag);
+    try {
+      await api.activateChain(chain.tag);
+      await loadData();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : t("chains.activateFailed");
+      setError(message);
+    } finally {
+      setActivatingChain(null);
+    }
+  };
+
+  // Deactivate chain
+  const handleDeactivate = async (chain: NodeChain) => {
+    setActivatingChain(chain.tag);
+    try {
+      await api.deactivateChain(chain.tag);
+      await loadData();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : t("chains.deactivateFailed");
+      setError(message);
+    } finally {
+      setActivatingChain(null);
+    }
+  };
+
+  // Load terminal egress list for a chain (with cache support - Phase 11.5)
+  const loadTerminalEgress = async (chainTag: string, forceRefresh: boolean = false) => {
+    // Track current request to prevent race conditions when switching chains quickly
+    egressRequestRef.current = chainTag;
+    setLoadingEgress(true);
+    try {
+      const result = await api.getTerminalEgress(chainTag, forceRefresh);
+      // Only update state if this is still the current request
+      if (egressRequestRef.current === chainTag) {
+        setTerminalEgressList(result.egress_list || []);
+        setEgressCached(result.cached || false);
+        setEgressCachedAt(result.cached_at || null);
+      }
+    } catch (err: unknown) {
+      // Only show error if this is still the current request
+      if (egressRequestRef.current === chainTag) {
+        const message = err instanceof Error ? err.message : t("chains.loadEgressFailed");
+        setError(message);
+        setEgressCached(false);
+        setEgressCachedAt(null);
+      }
+    } finally {
+      if (egressRequestRef.current === chainTag) {
+        setLoadingEgress(false);
+      }
+    }
   };
 
   const addHop = () => {
@@ -572,6 +699,8 @@ export default function ChainManager() {
             const HealthIcon = healthInfo.icon;
             const downstreamInfo = getDownstreamStatusInfo(chain.downstream_status);
             const DownstreamIcon = downstreamInfo.icon;
+            const stateInfo = getChainStateInfo(chain.chain_state);
+            const StateIcon = stateInfo.icon;
 
             return (
               <div
@@ -581,10 +710,17 @@ export default function ChainManager() {
                 {/* Header row */}
                 <div className="flex items-start justify-between gap-4 mb-4">
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3 mb-1">
+                    <div className="flex items-center gap-3 mb-1 flex-wrap">
                       <h3 className="text-lg font-semibold text-white truncate">
                         {chain.name}
                       </h3>
+                      {/* Chain state badge */}
+                      <span
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${stateInfo.bgColor} ${stateInfo.color}`}
+                      >
+                        <StateIcon className={`h-3 w-3 ${stateInfo.pulseClass}`} />
+                        {t(`chains.state.${chain.chain_state || "inactive"}`)}
+                      </span>
                       {/* Enabled/Disabled badge */}
                       <span
                         className={`px-2 py-0.5 rounded-full text-xs font-medium ${
@@ -599,6 +735,12 @@ export default function ChainManager() {
                       <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-500/20 text-blue-400">
                         {t("chains.hopCount", { count: chain.hops?.length || 0 })}
                       </span>
+                      {/* DSCP value badge (only for DSCP chains with value) */}
+                      {chain.chain_mark_type === "dscp" && chain.dscp_value && (
+                        <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-purple-500/20 text-purple-400">
+                          DSCP: {chain.dscp_value}
+                        </span>
+                      )}
                       {/* Downstream status warning badge (only show when disconnected) */}
                       {chain.downstream_status === "disconnected" && (
                         <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-rose-500/20 text-rose-400">
@@ -609,11 +751,44 @@ export default function ChainManager() {
                     </div>
                     <p className="text-sm text-slate-400 truncate">
                       {chain.description || chain.tag}
+                      {chain.exit_egress && (
+                        <span className="ml-2 text-slate-500">
+                          → {chain.exit_egress}
+                        </span>
+                      )}
                     </p>
                   </div>
 
                   {/* Actions */}
                   <div className="flex items-center gap-2">
+                    {/* Activate/Deactivate button */}
+                    {chain.chain_state === "active" ? (
+                      <button
+                        onClick={() => handleDeactivate(chain)}
+                        disabled={activatingChain === chain.tag}
+                        className="p-2 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors disabled:opacity-50"
+                        title={t("chains.deactivate")}
+                      >
+                        {activatingChain === chain.tag ? (
+                          <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <StopIcon className="h-4 w-4" />
+                        )}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => handleActivate(chain)}
+                        disabled={activatingChain === chain.tag || chain.chain_state === "activating" || !chain.enabled}
+                        className="p-2 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors disabled:opacity-50"
+                        title={t("chains.activate")}
+                      >
+                        {activatingChain === chain.tag || chain.chain_state === "activating" ? (
+                          <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <PlayIcon className="h-4 w-4" />
+                        )}
+                      </button>
+                    )}
                     <button
                       onClick={() => handleHealthCheck(chain)}
                       disabled={checkingHealth === chain.tag}
@@ -834,6 +1009,81 @@ export default function ChainManager() {
                   </div>
                 )}
               </div>
+
+              {/* Chain Mark Type (DSCP vs Xray Email) */}
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-2">
+                  {t("chains.markType")}
+                </label>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="chain_mark_type"
+                      value="dscp"
+                      checked={formData.chain_mark_type === "dscp"}
+                      onChange={e => setFormData(prev => ({ ...prev, chain_mark_type: e.target.value as ChainMarkType }))}
+                      className="w-4 h-4 text-brand"
+                    />
+                    <span className="text-white text-sm">DSCP</span>
+                    <span className="text-slate-500 text-xs">{t("chains.dscpHint")}</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="chain_mark_type"
+                      value="xray_email"
+                      checked={formData.chain_mark_type === "xray_email"}
+                      onChange={e => setFormData(prev => ({ ...prev, chain_mark_type: e.target.value as ChainMarkType }))}
+                      className="w-4 h-4 text-brand"
+                    />
+                    <span className="text-white text-sm">Xray Email</span>
+                    <span className="text-slate-500 text-xs">{t("chains.xrayEmailHint")}</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Exit Egress (for editing existing chains) - with cache indicator (Phase 11.5) */}
+              {editingChain && formData.hops.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">
+                    {t("chains.exitEgress")}
+                  </label>
+                  <div className="flex gap-2">
+                    <select
+                      value={formData.exit_egress}
+                      onChange={e => setFormData(prev => ({ ...prev, exit_egress: e.target.value }))}
+                      className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white focus:outline-none focus:border-brand"
+                    >
+                      <option value="">{t("chains.selectEgress")}</option>
+                      {terminalEgressList.map(egress => (
+                        <option key={egress.tag} value={egress.tag} disabled={!egress.enabled}>
+                          {egress.description || egress.tag} ({egress.type})
+                          {!egress.enabled && ` - ${t("chains.disabled")}`}
+                        </option>
+                      ))}
+                    </select>
+                    {/* Cache indicator */}
+                    {egressCached && (
+                      <span
+                        className="px-2 py-2 rounded-lg bg-green-500/10 text-green-400 text-xs flex items-center"
+                        title={egressCachedAt ? `${t("chains.cachedAt")}: ${new Date(egressCachedAt).toLocaleString()}` : t("chains.cached")}
+                      >
+                        {t("chains.cached")}
+                      </span>
+                    )}
+                    <button
+                      onClick={() => loadTerminalEgress(editingChain.tag, true)}
+                      disabled={loadingEgress}
+                      className="px-3 py-2 rounded-lg bg-white/5 text-slate-400 hover:text-white hover:bg-white/10 transition-colors disabled:opacity-50"
+                      title={t("chains.refreshEgress")}
+                    >
+                      <ArrowPathIcon className={`h-4 w-4 ${loadingEgress ? "animate-spin" : ""}`} />
+                    </button>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">{t("chains.exitEgressHint")}</p>
+                </div>
+              )}
 
               {/* Priority */}
               <div>

@@ -108,6 +108,13 @@ htmlcov/
 .pytest_cache/
 *.cover
 *.py,cover
+/config-node*
+
+# Temporary test scripts in root directory
+/test_*.sh
+/check_*.sh
+/fix_*.sh
+/debug_*.sh
 
 # ==========================================
 # IDE & editor
@@ -124,6 +131,7 @@ htmlcov/
 # ==========================================
 docker-compose.override.yml
 docker-compose.local.yml
+docker-compose.peer-test.yml
 
 # ==========================================
 # Claude Code

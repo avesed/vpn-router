@@ -46,6 +46,14 @@ try:
 except ImportError:
     HAS_ADBLOCK_CONVERTER = False
 
+# 尝试导入 DSCP 管理模块（多跳链路标记）
+try:
+    from dscp_manager import ENTRY_ROUTING_MARK_BASE
+    HAS_DSCP_MANAGER = True
+except ImportError:
+    HAS_DSCP_MANAGER = False
+    ENTRY_ROUTING_MARK_BASE = 100  # 默认值：routing_mark = 100 + dscp_value
+
 BASE_CONFIG = Path(os.environ.get("SING_BOX_BASE_CONFIG", "/etc/sing-box/sing-box.json"))
 PIA_PROFILES_FILE = Path(os.environ.get("PIA_PROFILES_FILE", "/etc/sing-box/pia/profiles.yml"))
 CUSTOM_RULES_FILE = Path(os.environ.get("CUSTOM_RULES_FILE", "/etc/sing-box/custom-rules.json"))
@@ -1371,6 +1379,122 @@ def ensure_v2ray_dns_servers(config: dict, v2ray_tags: List[str]) -> None:
             })
 
 
+# ============ Peer Node Outbound 支持 ============
+# Peer 节点通过 Xray 的 SOCKS5 入站连接
+# sing-box 使用 SOCKS outbound 将流量路由到 Xray，
+# Xray 再通过 VLESS+XHTTP+REALITY 连接到远程 peer
+#
+# 端口分配: 37201, 37202, ... (与 Xray peer 出站 SOCKS 入站对应)
+
+PEER_SOCKS_PORT_START = 37201
+
+
+def load_peer_nodes_for_outbound() -> List[dict]:
+    """从数据库加载需要出站连接的 peer 节点
+
+    返回启用的、已完成参数交换的 peer 节点
+    """
+    if not HAS_DATABASE:
+        return []
+    try:
+        db = get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH))
+        nodes = db.get_peer_nodes(enabled_only=True)
+        # 只返回有完整出站配置的节点
+        result = []
+        for n in nodes:
+            if n.get("xray_peer_reality_public_key") and n.get("xray_uuid"):
+                result.append(n)
+        return result
+    except Exception as e:
+        print(f"[render] 从数据库加载 peer 节点出站配置失败: {e}")
+        return []
+
+
+def ensure_peer_outbounds(config: dict, peer_nodes: List[dict]) -> List[str]:
+    """为 Xray 类型的 peer 节点创建 SOCKS outbound（连接到合并 Xray 进程的 SOCKS 入站）
+
+    这个函数处理使用 VLESS+XHTTP+REALITY 协议的 peer 节点。
+    合并架构下，主 Xray 进程为每个 peer 创建:
+    - SOCKS 入站 (37201+): 接收 sing-box 的流量
+    - VLESS 出站: 连接到远程 peer
+
+    sing-box 通过 SOCKS outbound 将流量发送到对应的 SOCKS 端口。
+
+    注意: 使用原始 tag 作为 sing-box 出站 tag，而不是 "peer-{tag}"，
+    这样用户在路由规则中可以直接使用 peer 的 tag（如 "remote-node"）。
+
+    Args:
+        config: sing-box 配置
+        peer_nodes: 有完整 Xray 出站配置的 peer 节点列表
+
+    Returns:
+        所有创建的 peer 出口 tag 列表
+    """
+    if not peer_nodes:
+        return []
+
+    outbounds = config.setdefault("outbounds", [])
+    existing_tags = {ob.get("tag") for ob in outbounds}
+    peer_tags = []
+
+    for idx, peer in enumerate(peer_nodes):
+        tag = peer.get("tag")
+        if not tag:
+            continue
+
+        # 使用原始 tag 作为 sing-box 出站 tag
+        # 这样用户可以在路由规则中直接使用 tag（如 "remote-node"）
+        outbound_tag = tag
+        peer_tags.append(outbound_tag)
+
+        # 获取 SOCKS 端口（与 xray_manager.py 中分配的端口一致）
+        socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_START + idx)
+
+        socks_outbound = {
+            "type": "socks",
+            "tag": outbound_tag,
+            "server": "127.0.0.1",
+            "server_port": socks_port
+        }
+
+        if outbound_tag in existing_tags:
+            # 更新现有 outbound
+            for i, ob in enumerate(outbounds):
+                if ob.get("tag") == outbound_tag:
+                    outbounds[i] = socks_outbound
+                    break
+        else:
+            # 在 block 之前插入
+            block_idx = next(
+                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
+                len(outbounds)
+            )
+            outbounds.insert(block_idx, socks_outbound)
+            print(f"[render] 创建 peer Xray 出站: {outbound_tag} -> SOCKS5:{socks_port}")
+
+    return peer_tags
+
+
+def ensure_peer_dns_servers(config: dict, peer_tags: List[str]) -> None:
+    """为 peer 节点出口添加 DNS 服务器"""
+    if not peer_tags:
+        return
+
+    dns = config.setdefault("dns", {})
+    servers = dns.setdefault("servers", [])
+    existing_tags = {s.get("tag") for s in servers}
+
+    for tag in peer_tags:
+        dns_tag = f"{tag}-dns"
+        if dns_tag not in existing_tags:
+            servers.append({
+                "tag": dns_tag,
+                "type": "tls",
+                "server": "1.1.1.1",
+                "detour": tag
+            })
+
+
 # ============ WARP Egress 支持 ============
 # Cloudflare WARP 通过 usque (MASQUE 协议) 提供出口
 # - 每个 WARP 出口运行独立的 usque SOCKS5 代理
@@ -1675,12 +1799,22 @@ def ensure_peer_node_outbounds(config: dict, peer_nodes: List[dict]) -> List[str
 def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[dict]) -> List[str]:
     """为多跳链路生成 sing-box outbound 配置
 
-    每条链路生成一个 outbound，绑定到第一跳的隧道接口。
-    流量通过第一跳隧道发出后，由对端节点继续转发。
+    每条链路生成一个 outbound：
+    - WireGuard 链路 (chain_mark_type=dscp)：使用 bind_interface + routing_mark
+      - bind_interface 将流量发送到第一跳隧道
+      - routing_mark 触发 iptables DSCP 标记规则
+    - Xray 链路 (chain_mark_type=xray_email)：使用 SOCKS5 桥接
+      - 流量通过 Xray 的 email 字段进行标记
+
+    DSCP 标记流程：
+    1. sing-box 设置 routing_mark = ENTRY_ROUTING_MARK_BASE + dscp_value
+    2. iptables OUTPUT 链匹配 routing_mark，设置 DSCP，清除 mark
+    3. 流量通过第一跳隧道发出，带有 DSCP 标记
+    4. 终端节点读取 DSCP，进行策略路由到正确的出口
 
     Args:
         config: sing-box 配置
-        chains: 链路列表
+        chains: 链路列表（包含 dscp_value, chain_mark_type 等字段）
         peer_nodes: 对等节点列表（用于查找第一跳接口）
 
     Returns:
@@ -1699,12 +1833,20 @@ def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[di
     for chain in chains:
         tag = chain.get("tag")
         hops = chain.get("hops", [])
+        enabled = chain.get("enabled", True)
+        chain_state = chain.get("chain_state", "inactive")
+        dscp_value = chain.get("dscp_value")
+        chain_mark_type = chain.get("chain_mark_type", "dscp")
+
+        # 跳过禁用的链路
+        if not enabled:
+            continue
 
         if isinstance(hops, str):
             try:
                 import json as json_module
                 hops = json_module.loads(hops)
-            except:
+            except Exception:
                 continue
 
         if not tag or not hops:
@@ -1722,15 +1864,32 @@ def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[di
         tunnel_interface = first_node.get("tunnel_interface")
         xray_socks_port = first_node.get("xray_socks_port")
 
-        chain_tags.append(tag)
+        outbound = None
 
         if tunnel_type == "wireguard":
+            # WireGuard 链路：使用 direct + bind_interface
+            # 验证 tunnel_interface 存在，避免生成无效配置
+            if not tunnel_interface:
+                print(f"[render] 警告: 链路 '{tag}' 第一跳 '{first_hop}' WireGuard 隧道缺少接口")
+                continue
             outbound = {
                 "type": "direct",
                 "tag": tag,
                 "bind_interface": tunnel_interface
             }
-        else:
+
+            # 如果是 DSCP 类型且有有效的 dscp_value，添加 routing_mark
+            # routing_mark 会触发 iptables DSCP 标记规则
+            if chain_mark_type == "dscp" and dscp_value is not None:
+                if 1 <= dscp_value <= 63:
+                    routing_mark = ENTRY_ROUTING_MARK_BASE + dscp_value
+                    outbound["routing_mark"] = routing_mark
+                    print(f"[render] 链路 '{tag}' 启用 DSCP 标记: dscp={dscp_value}, routing_mark={routing_mark}")
+                else:
+                    print(f"[render] 警告: 链路 '{tag}' dscp_value={dscp_value} 超出范围 (1-63)")
+
+        elif tunnel_type == "xray":
+            # Xray 链路：使用 SOCKS5 桥接
             if not xray_socks_port:
                 print(f"[render] 警告: 链路 '{tag}' 第一跳 '{first_hop}' Xray 隧道缺少 SOCKS 端口")
                 continue
@@ -1741,7 +1900,31 @@ def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[di
                 "server_port": xray_socks_port,
                 "version": "5"
             }
+            # Xray 链路使用 email 字段进行标记，由 xray_manager 处理
+            if chain_mark_type == "xray_email":
+                print(f"[render] 链路 '{tag}' 使用 Xray email 标记")
 
+        else:
+            # 未知隧道类型，使用 SOCKS 作为默认
+            if xray_socks_port:
+                outbound = {
+                    "type": "socks",
+                    "tag": tag,
+                    "server": "127.0.0.1",
+                    "server_port": xray_socks_port,
+                    "version": "5"
+                }
+            else:
+                print(f"[render] 警告: 链路 '{tag}' 隧道类型 '{tunnel_type}' 无法处理")
+                continue
+
+        if outbound is None:
+            continue
+
+        # 此时 outbound 已验证成功，可以安全添加到 chain_tags
+        chain_tags.append(tag)
+
+        # 添加或更新 outbound
         if tag in existing_tags:
             for i, ob in enumerate(outbounds):
                 if ob.get("tag") == tag:
@@ -1751,7 +1934,9 @@ def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[di
             block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
             outbounds.insert(block_idx, outbound)
 
-        print(f"[render] 创建链路出口: {tag} (hops={len(hops)}, first_hop={first_hop})")
+        hop_count = len(hops)
+        state_info = f", state={chain_state}" if chain_state != "inactive" else ""
+        print(f"[render] 创建链路出口: {tag} (hops={hop_count}, first_hop={first_hop}{state_info})")
 
     return chain_tags
 
@@ -1760,7 +1945,12 @@ def ensure_chain_outbounds(config: dict, chains: List[dict], peer_nodes: List[di
 
 
 def load_v2ray_inbound_config() -> Optional[dict]:
-    """从数据库加载 V2Ray 入口配置"""
+    """从数据库加载 V2Ray 入口配置
+
+    Returns config if V2Ray Ingress is enabled AND (has V2Ray users OR has peer inbounds).
+    This ensures the SOCKS inbound for Xray integration is created even when only peer
+    nodes are using the V2Ray Ingress (no regular V2Ray users).
+    """
     if not HAS_DATABASE:
         return None
     try:
@@ -1770,11 +1960,16 @@ def load_v2ray_inbound_config() -> Optional[dict]:
             return None
 
         users = db.get_v2ray_users(enabled_only=True)
-        if not users:
-            print("[render] 警告: V2Ray 入口没有配置用户")
+        peer_inbounds = db.get_peer_nodes_with_inbound()
+
+        if not users and not peer_inbounds:
+            print("[render] 警告: V2Ray 入口没有配置用户或对等入站节点")
             return None
 
-        return {"config": config, "users": users}
+        if not users:
+            print("[render] V2Ray 入口没有用户，但有 %d 个对等入站节点" % len(peer_inbounds))
+
+        return {"config": config, "users": users or [], "peer_inbounds": peer_inbounds or []}
     except Exception as e:
         print(f"[render] 从数据库加载 V2Ray 入口配置失败: {e}")
         return None
@@ -2516,15 +2711,32 @@ def main() -> None:
         all_egress_tags.extend(group_tags)
 
     # 加载并处理对等节点隧道（节点间互联）
-    # 每个已连接的节点生成一个 outbound，用于流量转发
-    peer_nodes = load_peer_nodes()
-    if peer_nodes:
-        print(f"[render] 处理 {len(peer_nodes)} 个已连接的对等节点")
-        peer_tags = ensure_peer_node_outbounds(config, peer_nodes)
-        all_egress_tags.extend(peer_tags)
+    # 新架构：Xray 类型的 peer 使用合并的 Xray 进程
+    # WireGuard 类型的 peer 仍使用独立接口
 
-    # 为启用入站的对等节点添加 SOCKS inbound
-    # Xray 入站监听器将流量转发到这些 SOCKS 端口
+    # 1. 处理 WireGuard 类型的 peer（需要已连接状态）
+    wg_peer_nodes = load_peer_nodes()  # 返回 tunnel_status == "connected" 的节点
+    wg_peer_tags = []
+    if wg_peer_nodes:
+        # 只处理 WireGuard 类型的已连接节点
+        wg_peers = [n for n in wg_peer_nodes if n.get("tunnel_type") == "wireguard"]
+        if wg_peers:
+            print(f"[render] 处理 {len(wg_peers)} 个 WireGuard 类型对等节点")
+            wg_peer_tags = ensure_peer_node_outbounds(config, wg_peers)
+            all_egress_tags.extend(wg_peer_tags)
+
+    # 2. 处理 Xray 类型的 peer（合并架构，不需要等待连接状态）
+    # 只要有完整的配置就可以创建出站
+    xray_peer_nodes = load_peer_nodes_for_outbound()
+    xray_peer_tags = []
+    if xray_peer_nodes:
+        print(f"[render] 处理 {len(xray_peer_nodes)} 个 Xray 类型对等节点 (合并架构)")
+        xray_peer_tags = ensure_peer_outbounds(config, xray_peer_nodes)
+        ensure_peer_dns_servers(config, xray_peer_tags)
+        all_egress_tags.extend(xray_peer_tags)
+
+    # 为启用入站的对等节点添加 SOCKS inbound（旧架构兼容）
+    # 注意：新架构下，peer 入站由主 Xray 进程处理，不需要单独的 SOCKS inbound
     ensure_peer_inbound_socks(config)
 
     # 加载并处理多跳链路（A→B→C 多节点串联）
@@ -2532,7 +2744,9 @@ def main() -> None:
     node_chains = load_node_chains()
     if node_chains:
         print(f"[render] 处理 {len(node_chains)} 条多跳链路")
-        chain_tags = ensure_chain_outbounds(config, node_chains, peer_nodes)
+        # 合并所有 peer 节点用于查找第一跳接口
+        all_peer_nodes = (wg_peer_nodes or []) + (xray_peer_nodes or [])
+        chain_tags = ensure_chain_outbounds(config, node_chains, all_peer_nodes)
         all_egress_tags.extend(chain_tags)
 
     # 收集需要测速 SOCKS inbound 的出口 tags（WireGuard + OpenVPN + V2Ray + WARP）

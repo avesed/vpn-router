@@ -96,6 +96,12 @@ test-egress/
 test-wg-client/
 xray-client-debug/
 
+# Temporary test scripts
+test_*.sh
+check_*.sh
+fix_*.sh
+debug_*.sh
+
 # ==========================================
 # WireGuard client configs
 # ==========================================

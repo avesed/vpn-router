@@ -434,9 +434,9 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     endpoint TEXT NOT NULL,                -- IP:port 或 域名:port (WireGuard/Xray 隧道端口)
     api_port INTEGER,                      -- API 端口（默认 36000，用于端口映射场景）
 
-    -- PSK 认证
-    psk_hash TEXT NOT NULL,                -- bcrypt 哈希（用于接收认证）
-    psk_encrypted TEXT,                    -- Fernet 加密后的 PSK（格式: salt:encrypted_data）
+    -- PSK 认证（已废弃，保留字段兼容旧数据）
+    psk_hash TEXT DEFAULT '',              -- bcrypt 哈希（不再使用，WireGuard 用 IP 认证，Xray 用 UUID 认证）
+    psk_encrypted TEXT,                    -- Fernet 加密后的 PSK（不再使用）
 
     -- 隧道配置
     tunnel_type TEXT DEFAULT 'wireguard' CHECK(tunnel_type IN ('wireguard', 'xray')),
@@ -445,6 +445,7 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     tunnel_local_ip TEXT,                  -- 本端隧道 IP (10.200.200.1)
     tunnel_remote_ip TEXT,                 -- 对端隧道 IP (10.200.200.2)
     tunnel_port INTEGER,                   -- 本地监听端口
+    tunnel_api_endpoint TEXT,              -- 隧道内 API 地址 (如 10.200.200.2:36000)，用于多跳链路通信
 
     -- WireGuard 专用
     wg_private_key TEXT,
@@ -492,6 +493,16 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     -- outbound: 连接到对端的主隧道端点（默认）
     -- inbound: 连接到对端的入站监听器（需要 peer_inbound_enabled=1）
 
+    -- 双向连接状态 (Phase 11.1)
+    bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
+    -- pending: 等待双向连接
+    -- outbound_only: 仅出站连接
+    -- bidirectional: 双向连接已建立
+
+    -- 预生成 WireGuard 密钥（用于双向自动连接）
+    remote_wg_private_key TEXT,              -- 为远程节点预生成的私钥
+    remote_wg_public_key TEXT,               -- 对应的公钥（放入 request code）
+
     -- 入口绑定出口（来自此节点隧道的流量默认出口）
     default_outbound TEXT,
 
@@ -506,12 +517,35 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_tag ON peer_nodes(tag);
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_enabled ON peer_nodes(enabled);
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_status ON peer_nodes(tunnel_status);
+-- 注: idx_peer_nodes_enabled_bidirectional 索引在迁移函数中创建（Phase 11.1）
+-- 避免现有数据库缺少 bidirectional_status 列时出错
 -- 唯一索引防止资源分配竞态条件
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_local_ip ON peer_nodes(tunnel_local_ip) WHERE tunnel_local_ip IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_port ON peer_nodes(tunnel_port) WHERE tunnel_port IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_xray_socks_port ON peer_nodes(xray_socks_port) WHERE xray_socks_port IS NOT NULL;
 -- 注意：inbound_port 和 inbound_socks_port 索引在 migrate_peer_nodes_inbound_fields() 中创建
 -- 因为这些是新添加的列，需要先迁移后才能创建索引
+
+-- 待处理配对表（用于离线配对流程）
+-- A 节点 generate-pair-request 时创建，B 节点通过隧道 complete-handshake 后删除
+CREATE TABLE IF NOT EXISTS pending_pairings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pairing_id TEXT NOT NULL UNIQUE,       -- 配对标识（base64 hash，用于匹配）
+    local_tag TEXT NOT NULL,               -- 本节点标识
+    local_endpoint TEXT NOT NULL,          -- 本节点端点 (IP:port)
+    tunnel_type TEXT NOT NULL DEFAULT 'wireguard',
+    tunnel_local_ip TEXT,                  -- 本端隧道 IP
+    tunnel_remote_ip TEXT,                 -- 对端隧道 IP
+    tunnel_port INTEGER,                   -- 监听端口
+    wg_private_key TEXT,                   -- 本节点私钥
+    wg_public_key TEXT,                    -- 本节点公钥
+    remote_wg_private_key TEXT,            -- 预生成的对端私钥
+    remote_wg_public_key TEXT,             -- 预生成的对端公钥
+    interface_name TEXT,                   -- WireGuard 接口名 (wg-pending-xxx)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP                   -- 过期时间（默认 7 天）
+);
+CREATE INDEX IF NOT EXISTS idx_pending_pairings_expires ON pending_pairings(expires_at);
 
 -- 多跳链路表
 CREATE TABLE IF NOT EXISTS node_chains (
@@ -532,6 +566,12 @@ CREATE TABLE IF NOT EXISTS node_chains (
     -- 中继分流规则 (JSON) - 在哪个节点出去
     relay_rules TEXT,                      -- {"node-tokyo": {"exit_domains": ["*.jp"]}}
 
+    -- 终端出口配置（多跳链路架构 v2）
+    exit_egress TEXT,                      -- 终端节点的本地出口 tag (如 "us-stream")
+    dscp_value INTEGER,                    -- DSCP 标记值 (1-63)，用于 WireGuard 链路流量识别
+    chain_mark_type TEXT DEFAULT 'dscp' CHECK(chain_mark_type IN ('dscp', 'xray_email')),
+    chain_state TEXT DEFAULT 'inactive' CHECK(chain_state IN ('inactive', 'activating', 'active', 'error')),
+
     -- 健康状态
     health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
     last_health_check TIMESTAMP,
@@ -547,6 +587,8 @@ CREATE TABLE IF NOT EXISTS node_chains (
 );
 CREATE INDEX IF NOT EXISTS idx_node_chains_tag ON node_chains(tag);
 CREATE INDEX IF NOT EXISTS idx_node_chains_enabled ON node_chains(enabled);
+-- 注: idx_node_chains_dscp_value_unique 索引在 migrate_node_chains_chain_fields() 中创建
+-- 避免现有数据库缺少 dscp_value 列时出错
 
 -- 链路注册表（记录哪些链经过当前节点，用于级联通知）
 CREATE TABLE IF NOT EXISTS chain_registrations (
@@ -574,7 +616,78 @@ CREATE TABLE IF NOT EXISTS relay_routes (
     UNIQUE(chain_tag, source_peer_tag, target_peer_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_relay_routes_chain_tag ON relay_routes(chain_tag);
-CREATE INDEX IF NOT EXISTS idx_relay_routes_enabled ON relay_routes(enabled)
+CREATE INDEX IF NOT EXISTS idx_relay_routes_enabled ON relay_routes(enabled);
+
+-- 链路路由表（终端节点的 DSCP/email 到出口映射）
+-- 用于多跳链路架构：入口节点标记流量，终端节点根据标记选择出口
+CREATE TABLE IF NOT EXISTS chain_routing (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_tag TEXT NOT NULL,               -- 链路标识（与 node_chains.tag 对应）
+    mark_value INTEGER NOT NULL,           -- 标记值：DSCP (1-63) 或 routing mark
+    mark_type TEXT NOT NULL DEFAULT 'dscp' CHECK(mark_type IN ('dscp', 'xray_email')),
+    egress_tag TEXT NOT NULL,              -- 本地出口 tag（如 "us-stream"）
+    source_node TEXT,                      -- 注册来源节点 tag（谁注册了这条路由）
+    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(chain_tag, mark_value, mark_type)
+);
+CREATE INDEX IF NOT EXISTS idx_chain_routing_mark ON chain_routing(mark_value, mark_type);
+CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_tag);
+CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag);
+CREATE INDEX IF NOT EXISTS idx_chain_routing_source_node ON chain_routing(source_node);
+
+-- 终端出口缓存表 (Phase 11.1)
+-- 入口节点缓存终端节点的出口列表，避免每次都通过隧道查询
+CREATE TABLE IF NOT EXISTS terminal_egress_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chain_tag TEXT NOT NULL UNIQUE,          -- 链路标识（与 node_chains.tag 对应）
+    terminal_node TEXT NOT NULL,             -- 终端节点 tag
+    egress_list TEXT NOT NULL,               -- JSON 数组，终端节点的可用出口
+    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP                     -- 过期时间（默认 5 分钟）
+);
+-- 注: chain_tag 上的 UNIQUE 约束已自动创建隐式索引，无需额外索引
+CREATE INDEX IF NOT EXISTS idx_terminal_egress_cache_expires ON terminal_egress_cache(expires_at);
+
+-- ============ Phase 11-Cascade: 级联删除通知支持 ============
+
+-- 对等节点事件审计日志
+-- 记录所有节点生命周期事件（删除、断开、广播等）
+CREATE TABLE IF NOT EXISTS peer_event_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL CHECK (event_type IN ('delete', 'disconnect', 'broadcast', 'received', 'port_change')),
+    peer_tag TEXT NOT NULL,                      -- 相关节点 tag
+    event_id TEXT,                               -- 事件唯一 ID (用于幂等性追踪)
+    from_node TEXT,                              -- 事件来源节点
+    details TEXT,                                -- JSON 格式的额外信息
+    source_ip TEXT,                              -- 请求来源 IP
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+-- 注: 移除 event_type 索引 (低基数字段，只有 4 种值，索引效率低)
+CREATE INDEX IF NOT EXISTS idx_peer_event_log_created_at ON peer_event_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_peer_event_log_peer_tag ON peer_event_log(peer_tag);
+
+-- 已删除节点墓碑记录
+-- 防止刚删除的节点短期内重新连接
+CREATE TABLE IF NOT EXISTS peer_tombstones (
+    tag TEXT PRIMARY KEY,                        -- 节点 tag (唯一)
+    deleted_at TEXT NOT NULL,                    -- 删除时间 (ISO 8601)
+    expires_at TEXT NOT NULL,                    -- 墓碑过期时间 (默认 24 小时后)
+    deleted_by TEXT,                             -- 删除来源: 'local' 或远程节点 tag
+    reason TEXT,                                 -- 删除原因
+    CHECK (expires_at > deleted_at)              -- 确保过期时间晚于删除时间
+);
+CREATE INDEX IF NOT EXISTS idx_peer_tombstones_expires ON peer_tombstones(expires_at);
+
+-- 已处理的对等事件 (用于幂等性)
+-- 防止重复处理相同的事件
+CREATE TABLE IF NOT EXISTS processed_peer_events (
+    event_id TEXT PRIMARY KEY,                   -- 事件 UUID (唯一)
+    processed_at TEXT NOT NULL,                  -- 处理时间 (ISO 8601)
+    from_node TEXT NOT NULL,                     -- 事件来源节点
+    action TEXT                                  -- 事件动作类型
+);
+CREATE INDEX IF NOT EXISTS idx_processed_peer_events_time ON processed_peer_events(processed_at)
 """
 
 
@@ -918,7 +1031,7 @@ def migrate_peer_nodes_tables(conn: sqlite3.Connection):
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
                 endpoint TEXT NOT NULL,
-                psk_hash TEXT NOT NULL,
+                psk_hash TEXT DEFAULT '',
                 psk_encrypted TEXT,
                 tunnel_type TEXT DEFAULT 'wireguard' CHECK(tunnel_type IN ('wireguard', 'xray')),
                 tunnel_status TEXT DEFAULT 'disconnected' CHECK(tunnel_status IN ('disconnected', 'connecting', 'connected', 'error')),
@@ -1240,6 +1353,346 @@ def migrate_peer_nodes_connection_mode(conn: sqlite3.Connection):
         print("⊘ peer_nodes.connection_mode 字段已存在，跳过迁移")
 
 
+def migrate_peer_nodes_tunnel_api_endpoint(conn: sqlite3.Connection):
+    """为 peer_nodes 表添加 tunnel_api_endpoint 字段
+
+    用于多跳链路架构：隧道建立后，通过隧道内 IP 访问远程节点 API
+    例如：10.200.200.2:36000（隧道对端的 API 地址）
+    """
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        print("⊘ peer_nodes 表不存在，跳过 tunnel_api_endpoint 迁移")
+        return
+
+    # 检查 tunnel_api_endpoint 列是否存在
+    cursor.execute("PRAGMA table_info(peer_nodes)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    if "tunnel_api_endpoint" not in columns:
+        cursor.execute("ALTER TABLE peer_nodes ADD COLUMN tunnel_api_endpoint TEXT")
+        conn.commit()
+        print("✓ 添加 peer_nodes.tunnel_api_endpoint 字段")
+    else:
+        print("⊘ peer_nodes.tunnel_api_endpoint 字段已存在，跳过迁移")
+
+
+def migrate_node_chains_chain_fields(conn: sqlite3.Connection):
+    """为 node_chains 表添加多跳链路架构 v2 字段
+
+    新增字段支持：
+    - exit_egress: 终端节点的本地出口 tag
+    - dscp_value: DSCP 标记值 (1-63)
+    - chain_mark_type: 标记类型 (dscp/xray_email)
+    - chain_state: 链路状态 (inactive/activating/active/error)
+    """
+    cursor = conn.cursor()
+
+    # 检查 node_chains 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='node_chains'")
+    if not cursor.fetchone():
+        print("⊘ node_chains 表不存在，跳过链路字段迁移")
+        return
+
+    # 检查现有列
+    cursor.execute("PRAGMA table_info(node_chains)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    migrations_done = 0
+
+    # 多跳链路架构 v2 字段
+    chain_fields = [
+        ("exit_egress", "TEXT"),
+        ("dscp_value", "INTEGER"),
+        ("chain_mark_type", "TEXT DEFAULT 'dscp'"),
+        ("chain_state", "TEXT DEFAULT 'inactive'"),
+    ]
+
+    for field_name, field_type in chain_fields:
+        if field_name not in columns:
+            cursor.execute(f"ALTER TABLE node_chains ADD COLUMN {field_name} {field_type}")
+            migrations_done += 1
+            print(f"✓ 添加 node_chains.{field_name} 字段")
+
+    if migrations_done > 0:
+        # 创建 DSCP 值 UNIQUE 索引（防止并发分配冲突）
+        # 使用 partial index：仅对非 NULL 的 dscp_value 强制唯一约束
+        # 这允许 xray_email 类型的链路不使用 DSCP（dscp_value=NULL）
+        try:
+            # 先删除旧的非唯一索引（如果存在）
+            cursor.execute("DROP INDEX IF EXISTS idx_node_chains_dscp_value")
+            # 创建新的 UNIQUE partial index
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_node_chains_dscp_value_unique
+                ON node_chains(dscp_value) WHERE dscp_value IS NOT NULL
+            """)
+            print("✓ 创建 node_chains.dscp_value UNIQUE 索引")
+        except Exception as e:
+            print(f"⊘ 创建索引时出错: {e}")
+
+        conn.commit()
+        print(f"✓ node_chains 链路字段迁移完成（{migrations_done} 个字段）")
+    else:
+        # 字段已存在，但仍需确保索引是 UNIQUE 的
+        # 处理从旧版非唯一索引升级的情况
+        try:
+            # 检查是否存在旧的非唯一索引
+            cursor.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='index' AND name='idx_node_chains_dscp_value'
+            """)
+            if cursor.fetchone():
+                cursor.execute("DROP INDEX idx_node_chains_dscp_value")
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_node_chains_dscp_value_unique
+                    ON node_chains(dscp_value) WHERE dscp_value IS NOT NULL
+                """)
+                conn.commit()
+                print("✓ 升级 node_chains.dscp_value 索引为 UNIQUE")
+            else:
+                print("⊘ node_chains 链路字段已存在，跳过迁移")
+        except Exception as e:
+            print(f"⊘ 升级索引时出错: {e}")
+
+
+def migrate_chain_routing_table(conn: sqlite3.Connection):
+    """为现有数据库添加 chain_routing 表
+
+    用于多跳链路架构：终端节点根据 DSCP/email 标记选择本地出口
+    - 入口节点设置 DSCP 标记
+    - 中继节点透传 DSCP（不修改）
+    - 终端节点读取 DSCP 并路由到对应出口
+    """
+    cursor = conn.cursor()
+
+    # 检查 chain_routing 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chain_routing'")
+    if cursor.fetchone():
+        print("⊘ chain_routing 表已存在，跳过迁移")
+        return
+
+    # 创建表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chain_routing (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_tag TEXT NOT NULL,
+            mark_value INTEGER NOT NULL,
+            mark_type TEXT NOT NULL DEFAULT 'dscp' CHECK(mark_type IN ('dscp', 'xray_email')),
+            egress_tag TEXT NOT NULL,
+            source_node TEXT,
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chain_tag, mark_value, mark_type)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_mark ON chain_routing(mark_value, mark_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_tag)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_source_node ON chain_routing(source_node)")
+    conn.commit()
+    print("✓ 创建 chain_routing 表")
+
+
+def migrate_peer_nodes_bidirectional_fields(conn: sqlite3.Connection):
+    """为 peer_nodes 表添加双向连接字段 (Phase 11.1)
+
+    支持离线配对后自动双向连接:
+    - bidirectional_status: 双向连接状态 (pending/outbound_only/bidirectional)
+    - remote_wg_private_key: 为远程节点预生成的 WireGuard 私钥
+    - remote_wg_public_key: 对应的公钥（放入 request code）
+    """
+    cursor = conn.cursor()
+
+    # 检查 peer_nodes 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_nodes'")
+    if not cursor.fetchone():
+        print("⊘ peer_nodes 表不存在，跳过双向连接字段迁移")
+        return
+
+    # 检查现有列
+    cursor.execute("PRAGMA table_info(peer_nodes)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    migrations_done = 0
+
+    # 双向连接字段
+    bidirectional_fields = [
+        ("bidirectional_status", "TEXT DEFAULT 'pending'"),
+        ("remote_wg_private_key", "TEXT"),
+        ("remote_wg_public_key", "TEXT"),
+    ]
+
+    for field_name, field_type in bidirectional_fields:
+        if field_name not in columns:
+            cursor.execute(f"ALTER TABLE peer_nodes ADD COLUMN {field_name} {field_type}")
+            migrations_done += 1
+            print(f"✓ 添加 peer_nodes.{field_name} 字段")
+
+    if migrations_done > 0:
+        conn.commit()
+        print(f"✓ peer_nodes 双向连接字段迁移完成（{migrations_done} 个字段）")
+
+    # 创建复合索引优化双向连接查询 (enabled, bidirectional_status)
+    # 用于 get_peers_pending_bidirectional() 等查询
+    try:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_peer_nodes_enabled_bidirectional
+            ON peer_nodes(enabled, bidirectional_status)
+        """)
+        conn.commit()
+        print("✓ 创建 peer_nodes (enabled, bidirectional_status) 复合索引")
+    except Exception as e:
+        print(f"⊘ 创建复合索引时出错: {e}")
+
+    if migrations_done == 0:
+        print("⊘ peer_nodes 双向连接字段已存在，跳过迁移")
+
+
+def migrate_terminal_egress_cache_table(conn: sqlite3.Connection):
+    """为现有数据库添加 terminal_egress_cache 表 (Phase 11.1)
+
+    用于缓存终端节点的出口列表，避免每次都通过隧道查询远程 API
+    - 缓存命中时直接返回本地数据
+    - 缓存过期（默认 5 分钟）后重新获取
+    - 支持强制刷新
+    """
+    cursor = conn.cursor()
+
+    # 检查 terminal_egress_cache 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='terminal_egress_cache'")
+    if cursor.fetchone():
+        print("⊘ terminal_egress_cache 表已存在，跳过迁移")
+        return
+
+    # 创建表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS terminal_egress_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_tag TEXT NOT NULL UNIQUE,
+            terminal_node TEXT NOT NULL,
+            egress_list TEXT NOT NULL,
+            cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+    """)
+    # 注: chain_tag 上的 UNIQUE 约束已自动创建隐式索引，无需额外索引
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_terminal_egress_cache_expires ON terminal_egress_cache(expires_at)")
+    conn.commit()
+    print("✓ 创建 terminal_egress_cache 表")
+
+
+def migrate_pending_pairings_table(conn: sqlite3.Connection):
+    """为现有数据库添加 pending_pairings 表
+
+    用于存储 generate-pair-request 时创建的待处理配对信息：
+    - A 节点生成配对码时创建记录和 WireGuard 接口
+    - B 节点通过隧道调用 complete-handshake 后删除记录
+    """
+    cursor = conn.cursor()
+
+    # 检查 pending_pairings 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_pairings'")
+    if cursor.fetchone():
+        print("⊘ pending_pairings 表已存在，跳过迁移")
+        return
+
+    # 创建表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_pairings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pairing_id TEXT NOT NULL UNIQUE,
+            local_tag TEXT NOT NULL,
+            local_endpoint TEXT NOT NULL,
+            tunnel_type TEXT NOT NULL DEFAULT 'wireguard',
+            tunnel_local_ip TEXT,
+            tunnel_remote_ip TEXT,
+            tunnel_port INTEGER,
+            wg_private_key TEXT,
+            wg_public_key TEXT,
+            remote_wg_private_key TEXT,
+            remote_wg_public_key TEXT,
+            interface_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_pairings_expires ON pending_pairings(expires_at)")
+    conn.commit()
+    print("✓ 创建 pending_pairings 表")
+
+
+def migrate_cascade_delete_tables(conn: sqlite3.Connection):
+    """Phase 11-Cascade: 添加级联删除通知支持表
+
+    添加三个表:
+    - peer_event_log: 审计日志，记录节点生命周期事件
+    - peer_tombstones: 墓碑记录，防止删除后短期重连
+    - processed_peer_events: 幂等性去重，防止重复处理事件
+    """
+    cursor = conn.cursor()
+    tables_created = 0
+
+    # 1. peer_event_log 表 (必须与 USER_DB_SCHEMA 保持一致)
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_event_log'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS peer_event_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL CHECK (event_type IN ('delete', 'disconnect', 'broadcast', 'received', 'port_change')),
+                peer_tag TEXT NOT NULL,
+                event_id TEXT,
+                from_node TEXT,
+                details TEXT,
+                source_ip TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            )
+        """)
+        # 注: 移除 event_type 索引 (低基数字段，只有 4 种值，索引效率低)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_event_log_created_at ON peer_event_log(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_event_log_peer_tag ON peer_event_log(peer_tag)")
+        tables_created += 1
+        print("✓ 创建 peer_event_log 表")
+
+    # 2. peer_tombstones 表 (必须与 USER_DB_SCHEMA 保持一致)
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='peer_tombstones'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS peer_tombstones (
+                tag TEXT PRIMARY KEY,
+                deleted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                deleted_by TEXT,
+                reason TEXT,
+                CHECK (expires_at > deleted_at)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_peer_tombstones_expires ON peer_tombstones(expires_at)")
+        tables_created += 1
+        print("✓ 创建 peer_tombstones 表")
+
+    # 3. processed_peer_events 表 (必须与 USER_DB_SCHEMA 保持一致)
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='processed_peer_events'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_peer_events (
+                event_id TEXT PRIMARY KEY,
+                processed_at TEXT NOT NULL,
+                from_node TEXT NOT NULL,
+                action TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_peer_events_time ON processed_peer_events(processed_at)")
+        tables_created += 1
+        print("✓ 创建 processed_peer_events 表")
+
+    if tables_created > 0:
+        conn.commit()
+    else:
+        print("⊘ 级联删除通知表已存在，跳过迁移")
+
+
 def generate_wireguard_private_key() -> str:
     """生成 WireGuard 私钥"""
     try:
@@ -1467,6 +1920,21 @@ def main():
     migrate_peer_nodes_connection_mode(conn)
     migrate_relay_routes_table(conn)
 
+    # 多跳链路架构 v2 迁移
+    migrate_peer_nodes_tunnel_api_endpoint(conn)
+    migrate_node_chains_chain_fields(conn)
+    migrate_chain_routing_table(conn)
+
+    # Phase 11.1: 双向连接和终端出口缓存
+    migrate_peer_nodes_bidirectional_fields(conn)
+    migrate_terminal_egress_cache_table(conn)
+
+    # Phase 11-Tunnel: 待处理配对表（用于隧道优先的配对流程）
+    migrate_pending_pairings_table(conn)
+
+    # Phase 11-Cascade: 级联删除通知支持表
+    migrate_cascade_delete_tables(conn)
+
     # 添加默认数据
     add_default_outbounds(conn)
 
@@ -1507,6 +1975,8 @@ def main():
         "peer_nodes": cursor.execute("SELECT COUNT(*) FROM peer_nodes").fetchone()[0],
         "node_chains": cursor.execute("SELECT COUNT(*) FROM node_chains").fetchone()[0],
         "relay_routes": cursor.execute("SELECT COUNT(*) FROM relay_routes").fetchone()[0],
+        "chain_routing": cursor.execute("SELECT COUNT(*) FROM chain_routing").fetchone()[0],
+        "terminal_egress_cache": cursor.execute("SELECT COUNT(*) FROM terminal_egress_cache").fetchone()[0],
     }
 
     db_size_bytes = user_db_path.stat().st_size
@@ -1530,6 +2000,8 @@ def main():
     print(f"对等节点:         {stats['peer_nodes']:,}")
     print(f"多跳链路:         {stats['node_chains']:,}")
     print(f"中继路由:         {stats['relay_routes']:,}")
+    print(f"链路路由规则:     {stats['chain_routing']:,}")
+    print(f"终端出口缓存:     {stats['terminal_egress_cache']:,}")
     print(f"自定义分类项目:   {stats['custom_category_items']:,}")
     print(f"数据库大小:       {db_size_kb:.2f} KB")
     print("=" * 60)

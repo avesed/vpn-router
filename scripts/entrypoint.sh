@@ -44,6 +44,10 @@ cleanup() {
     kill "${API_PID}" >/dev/null 2>&1 || true
   fi
 
+  # Cleanup DSCP rules (chain routes)
+  echo "[entrypoint] cleaning up DSCP rules..."
+  python3 /usr/local/bin/dscp_manager.py cleanup 2>/dev/null || true
+
   # Cleanup WireGuard interfaces created by this container
   cleanup_wireguard_interfaces
 
@@ -390,6 +394,19 @@ sync_ecmp_routes() {
 
 # Sync ECMP routes for outbound groups (after egress interfaces are ready)
 sync_ecmp_routes
+
+# === Chain Routes Setup for Multi-hop Chains ===
+sync_chain_routes() {
+  echo "[entrypoint] syncing chain routes for multi-hop chains"
+  if python3 /usr/local/bin/chain_route_manager.py sync 2>/dev/null; then
+    echo "[entrypoint] chain routes synced successfully"
+  else
+    echo "[entrypoint] warning: chain route sync failed or no chains configured"
+  fi
+}
+
+# Sync chain routes (for terminal node DSCP routing)
+sync_chain_routes
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then

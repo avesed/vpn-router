@@ -1217,6 +1217,29 @@
       "unknown": "未知",
       "connected": "已连接",
       "disconnected": "已断开"
+    },
+    "activate": "激活",
+    "activating": "激活中...",
+    "deactivate": "停用",
+    "activateFailed": "链路激活失败",
+    "deactivateFailed": "链路停用失败",
+    "markType": "标记类型",
+    "dscpHint": "适用于 WireGuard 隧道，使用 IP 头部 DSCP 字段标记",
+    "xrayEmailHint": "适用于 Xray 隧道，使用协议 email 字段标记",
+    "exitEgress": "终端出口",
+    "selectEgress": "选择出口...",
+    "refreshEgress": "刷新出口列表",
+    "cached": "已缓存",
+    "cachedAt": "缓存时间",
+    "exitEgressHint": "流量从终端节点的这个出口离开",
+    "loadEgressFailed": "获取终端出口列表失败",
+    "activateSuccess": "链路 '{{name}}' 已激活",
+    "deactivateSuccess": "链路 '{{name}}' 已停用",
+    "state": {
+      "inactive": "未激活",
+      "activating": "激活中",
+      "active": "已激活",
+      "error": "错误"
     }
   },
   "topology": {
@@ -1253,8 +1276,9 @@
     "description": "描述",
     "descriptionPlaceholder": "日本东京的 vpn-router 节点",
     "endpoint": "端点地址",
-    "endpointPlaceholder": "tokyo.example.com:36100",
-    "endpointHint": "IP:端口 或 域名:端口",
+    "endpointPlaceholder": "10.1.100.12:36300",
+    "endpointHint": "格式：IP:端口。Peer 隧道端口通常为 36300（非 36100 客户端入口端口）",
+    "apiPort": "API 端口",
     "psk": "预共享密钥",
     "pskPlaceholder": "至少 16 个字符",
     "pskPlaceholderEdit": "留空保持不变",
@@ -1298,6 +1322,13 @@
       "connecting": "连接中",
       "disconnected": "未连接",
       "error": "错误"
+    },
+    "bidirectional": {
+      "title": "双向连接状态",
+      "pending": "等待中",
+      "outbound_only": "仅出站",
+      "bidirectional": "双向",
+      "autoManaged": "自动管理"
     },
     "connect": "连接",
     "disconnect": "断开",

@@ -17,3 +17,6 @@ pyjwt==2.8.0
 
 # SQLCipher for encrypted SQLite database
 pysqlcipher3==1.2.0
+
+# SOCKS5 proxy support for requests library (tunnel API client)
+PySocks>=1.7.1

@@ -1217,6 +1217,29 @@
       "unknown": "Unknown",
       "connected": "Connected",
       "disconnected": "Disconnected"
+    },
+    "activate": "Activate",
+    "activating": "Activating...",
+    "deactivate": "Deactivate",
+    "activateFailed": "Failed to activate chain",
+    "deactivateFailed": "Failed to deactivate chain",
+    "markType": "Mark Type",
+    "dscpHint": "For WireGuard tunnels, uses IP header DSCP field for marking",
+    "xrayEmailHint": "For Xray tunnels, uses protocol email field for marking",
+    "exitEgress": "Exit Egress",
+    "selectEgress": "Select egress...",
+    "refreshEgress": "Refresh egress list",
+    "cached": "Cached",
+    "cachedAt": "Cached at",
+    "exitEgressHint": "Traffic exits from this egress on the terminal node",
+    "loadEgressFailed": "Failed to load terminal egress list",
+    "activateSuccess": "Chain '{{name}}' activated",
+    "deactivateSuccess": "Chain '{{name}}' deactivated",
+    "state": {
+      "inactive": "Inactive",
+      "activating": "Activating",
+      "active": "Active",
+      "error": "Error"
     }
   },
   "topology": {
@@ -1253,8 +1276,9 @@
     "description": "Description",
     "descriptionPlaceholder": "vpn-router node in Tokyo, Japan",
     "endpoint": "Endpoint",
-    "endpointPlaceholder": "tokyo.example.com:36100",
-    "endpointHint": "IP:port or domain:port",
+    "endpointPlaceholder": "10.1.100.12:36300",
+    "endpointHint": "Format: IP:port. Peer tunnel port is typically 36300 (not 36100 client ingress port)",
+    "apiPort": "API Port",
     "psk": "Pre-Shared Key",
     "pskPlaceholder": "At least 16 characters",
     "pskPlaceholderEdit": "Leave blank to keep unchanged",
@@ -1298,6 +1322,13 @@
       "connecting": "Connecting",
       "disconnected": "Disconnected",
       "error": "Error"
+    },
+    "bidirectional": {
+      "title": "Bidirectional Connection Status",
+      "pending": "Pending",
+      "outbound_only": "Outbound Only",
+      "bidirectional": "Bidirectional",
+      "autoManaged": "Auto-managed"
     },
     "connect": "Connect",
     "disconnect": "Disconnect",

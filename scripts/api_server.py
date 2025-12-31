@@ -32,10 +32,10 @@ except ImportError:
 
 import requests
 import yaml
-from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field, validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # JWT 和密码哈希支持
@@ -72,12 +72,25 @@ except ImportError:
     HAS_KEY_MANAGER = False
     print("WARNING: Key manager not available, v2.0 backup format disabled")
 
-# [安全] 导入主机名验证函数
+# [安全] 导入主机名验证函数和隧道管理函数
 try:
-    from peer_tunnel_manager import validate_hostname
+    from peer_tunnel_manager import (
+        validate_hostname,
+        create_pending_wireguard_interface,
+        teardown_pending_wireguard_interface,
+        rename_wireguard_interface,
+        update_wireguard_peer_endpoint,
+        get_interface_name,
+        create_wireguard_tunnel_with_endpoint,
+        wait_for_wireguard_handshake,
+        PEER_WG_PORT_START,
+    )
     HAS_HOSTNAME_VALIDATOR = True
+    HAS_PENDING_TUNNEL = True
 except ImportError:
     HAS_HOSTNAME_VALIDATOR = False
+    HAS_PENDING_TUNNEL = False
+    PEER_WG_PORT_START = 36300  # 回退值
     # 回退实现：基本验证
     def validate_hostname(hostname: str) -> bool:
         """回退实现：基本主机名验证"""
@@ -95,6 +108,14 @@ except ImportError:
             r'(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
         )
         return bool(hostname_pattern.match(hostname))
+
+# 离线配对系统
+try:
+    from peer_pairing import PairingCodeGenerator, PairingManager
+    HAS_PAIRING = True
+except ImportError:
+    HAS_PAIRING = False
+    print("WARNING: Peer pairing module not available")
 
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
 GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
@@ -131,6 +152,44 @@ def _get_db():
     自动使用 SQLCIPHER_KEY 环境变量进行加密。
     """
     return get_db(str(GEODATA_DB_PATH), str(USER_DB_PATH), SQLCIPHER_KEY)
+
+
+def _get_local_node_tag(db) -> str:
+    """Phase 11-Cascade: 获取本节点标识符
+
+    优先使用数据库中存储的 node_tag，如果不存在则使用 hostname。
+    返回值会被规范化为小写并替换非法字符。
+
+    Args:
+        db: 数据库连接
+
+    Returns:
+        本节点标识符
+    """
+    import socket
+    import re
+
+    # 尝试从设置中获取 node_tag
+    try:
+        settings = db.get_all_settings()
+        stored_tag = settings.get("node_tag", "").strip()
+        if stored_tag:
+            return stored_tag
+    except Exception:
+        pass
+
+    # 使用 hostname 作为后备
+    hostname = socket.gethostname()
+
+    # 规范化: 小写，只保留 a-z0-9-，确保以字母开头
+    normalized = re.sub(r'[^a-z0-9-]', '-', hostname.lower())
+    normalized = re.sub(r'-+', '-', normalized).strip('-')
+
+    # 确保以字母开头
+    if not normalized or not normalized[0].isalpha():
+        normalized = 'node-' + normalized
+
+    return normalized[:64]  # 限制长度
 
 
 def _get_available_outbounds(db) -> list:
@@ -403,7 +462,11 @@ _RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
 
 
 def _get_client_ip(request: Request) -> str:
-    """获取客户端 IP 地址"""
+    """获取客户端 IP 地址（用于普通 API 请求）
+
+    对于通过 nginx 代理的请求，优先使用 X-Forwarded-For/X-Real-IP 头。
+    注意：此函数不应用于安全敏感的隧道认证，那些场景应使用 _get_direct_client_ip()。
+    """
     # 优先使用 X-Forwarded-For（nginx 代理设置）
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
@@ -414,6 +477,21 @@ def _get_client_ip(request: Request) -> str:
         return real_ip
     # 最后使用直连 IP
     return request.client.host if request.client else "unknown"
+
+
+def _get_direct_client_ip(request: Request) -> str:
+    """获取直连客户端 IP 地址（用于隧道认证，忽略代理头）
+
+    安全关键：此函数专门用于 /api/peer-tunnel/* 端点的身份验证。
+    这些端点使用隧道 IP 作为身份证明，因此必须使用实际的 TCP 连接 IP，
+    不能信任任何可被伪造的 HTTP 头（X-Forwarded-For, X-Real-IP 等）。
+
+    Returns:
+        直接 TCP 连接的客户端 IP 地址
+    """
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
 
 
 def _check_rate_limit(client_ip: str, limit: int = _RATE_LIMIT_GENERAL) -> bool:
@@ -924,6 +1002,89 @@ class PeerNotifyRequest(BaseModel):
     initiator_tunnel_ip: Optional[str] = Field(None, description="发起方的隧道 IP")
 
 
+class ReverseSetupRequest(BaseModel):
+    """Phase 11.2: 请求建立反向连接
+
+    当节点 A 导入节点 B 的配对请求并完成配对后，
+    A 通过隧道调用 B 的此 API，请求 B 建立到 A 的反向连接。
+
+    认证方式：
+    - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
+    - Xray 隧道：通过 X-Peer-UUID header 验证
+    """
+    psk: str = Field("", description="[已废弃] PSK 不再使用，改用隧道 IP/UUID 认证")
+    node_id: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="请求方节点标识")
+    # 请求方的隧道信息（B 需要这些信息连接到 A）
+    endpoint: str = Field(..., description="请求方的 WireGuard 监听端点 (IP:port)")
+    wg_public_key: str = Field(..., description="请求方的 WireGuard 公钥")
+    tunnel_local_ip: str = Field(..., description="请求方的隧道 IP")
+
+
+class CompleteHandshakeRequest(BaseModel):
+    """Phase 11-Tunnel: 完成配对握手
+
+    当 Node B 导入 Node A 的配对请求码并建立隧道后，
+    B 通过隧道调用 A 的此 API，通知 A 完成配对。
+
+    认证方式：
+    - 通过 pairing_id 匹配 pending_pairing 记录
+    - 验证请求来自预期的隧道 IP
+    """
+    pairing_id: str = Field(..., description="配对标识（由配对码前 32 字符的 MD5 生成）")
+    node_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="请求方（Node B）的节点标识")
+    node_description: str = Field("", description="请求方节点描述")
+    endpoint: str = Field(..., description="请求方的 WireGuard 监听端点 (IP:port)")
+    tunnel_ip: str = Field(..., description="请求方的隧道 IP（应与 pending_pairing.tunnel_remote_ip 匹配）")
+    wg_public_key: str = Field(..., description="请求方的 WireGuard 公钥")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="请求方的 API 端口（默认 36000）Phase 11-Fix.K")
+
+
+class PeerEventRequest(BaseModel):
+    """Phase 11-Cascade: 对等节点事件通知
+
+    用于在节点间传播删除、断开等事件，实现级联清理。
+
+    认证方式：
+    - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
+    - Xray 隧道：通过 X-Peer-UUID header 验证
+    """
+    event_id: str = Field(
+        ...,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        description="事件唯一 ID (UUID v4)，用于幂等性去重"
+    )
+    event_type: str = Field(
+        ...,
+        pattern=r"^(delete|disconnect|broadcast|port_change)$",
+        description="事件类型: delete(删除通知), disconnect(断开通知), broadcast(广播通知), port_change(端口变更)"
+    )
+    source_node: str = Field(
+        ...,
+        pattern=r"^[a-z][a-z0-9-]*$",
+        max_length=64,
+        description="事件发起节点"
+    )
+    target_node: Optional[str] = Field(
+        None,
+        pattern=r"^[a-z][a-z0-9-]*$",
+        max_length=64,
+        description="目标节点 (broadcast 时必填)"
+    )
+    ttl: int = Field(3, ge=0, le=10, description="广播跳数限制 (0 表示不再转发)")
+    reason: str = Field("", max_length=500, description="事件原因描述")
+    details: Optional[Dict[str, Any]] = Field(None, description="附加信息 (JSON，最大 10KB)")
+
+    @validator('details')
+    def validate_details_size(cls, v):
+        """验证 details 字段不超过 10KB"""
+        if v is not None:
+            import json
+            json_size = len(json.dumps(v, separators=(',', ':')))
+            if json_size > 10240:  # 10KB
+                raise ValueError(f"details field exceeds 10KB limit ({json_size} bytes)")
+        return v
+
+
 class PeerNodeCreateRequest(BaseModel):
     """创建对等节点
 
@@ -934,7 +1095,8 @@ class PeerNodeCreateRequest(BaseModel):
     name: str = Field(..., description="节点显示名称")
     description: str = Field("", description="节点描述")
     endpoint: str = Field(..., description="节点连接地址 (IP:port 或 域名:port)")
-    psk: str = Field(..., min_length=16, description="预共享密钥（用于认证，至少 16 字符）")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="远程 API 端口（默认为 36000）")
+    psk: Optional[str] = Field(None, description="已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证")
     tunnel_type: str = Field("wireguard", pattern=r"^(wireguard|xray)$", description="隧道类型 (wireguard/xray)")
     # REALITY 配置（Dest 和 Server Names 可自定义）
     xray_reality_dest: str = Field("www.microsoft.com:443", description="REALITY Dest Server（伪装目标）")
@@ -966,6 +1128,7 @@ class PeerNodeUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, description="节点显示名称")
     description: Optional[str] = Field(None, description="节点描述")
     endpoint: Optional[str] = Field(None, description="节点连接地址")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="远程 API 端口")
     psk: Optional[str] = Field(None, min_length=16, description="预共享密钥（至少 16 字符）")
     tunnel_type: Optional[str] = Field(None, pattern=r"^(wireguard|xray)$", description="隧道类型")
     # REALITY 配置
@@ -990,6 +1153,59 @@ class PeerNodeUpdateRequest(BaseModel):
     )
 
 
+# ============ 离线配对模型 ============
+
+class GeneratePairRequestRequest(BaseModel):
+    """生成配对请求码的请求参数"""
+    node_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="本节点标识符")
+    node_description: str = Field("", description="节点描述")
+    endpoint: str = Field(..., description="隧道端点 (IP:port)")
+    tunnel_type: str = Field("wireguard", pattern=r"^(wireguard|xray)$", description="隧道类型")
+    psk: Optional[str] = Field(None, description="[已废弃] 预共享密钥（不再使用）")
+    bidirectional: bool = Field(True, description="启用双向自动连接 (Phase 11.2)")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="API 端口（默认 36000）Phase 11-Fix.K")
+
+
+class GeneratePairRequestResponse(BaseModel):
+    """生成配对请求码的响应"""
+    code: str = Field(..., description="Base64 配对请求码")
+    psk: str = Field("", description="[已废弃] 预共享密钥（不再使用）")
+    pending_request: Dict[str, Any] = Field(..., description="待处理请求信息（用于完成配对）")
+
+
+class ImportPairRequestRequest(BaseModel):
+    """导入配对请求码的请求参数"""
+    code: str = Field(..., description="Base64 配对请求码")
+    local_node_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="本节点标识符")
+    local_node_description: str = Field("", description="本节点描述")
+    local_endpoint: str = Field(..., description="本节点端点 (IP:port)")
+    psk: str = Field("", description="[已废弃] 预共享密钥（不再使用）")
+    api_port: Optional[int] = Field(None, ge=1, le=65535, description="本节点 API 端口（默认 36000）Phase 11-Fix.K")
+
+
+class ImportPairRequestResponse(BaseModel):
+    """导入配对请求码的响应"""
+    success: bool = Field(..., description="是否成功")
+    message: str = Field(..., description="结果消息")
+    response_code: Optional[str] = Field(None, description="Base64 配对响应码（隧道优先模式下为 None）")
+    created_node_tag: Optional[str] = Field(None, description="创建的节点标识符")
+    tunnel_status: Optional[str] = Field(None, description="隧道连接状态")
+    bidirectional: Optional[bool] = Field(None, description="是否为双向配对")
+
+
+class CompletePairingRequest(BaseModel):
+    """完成配对的请求参数"""
+    code: str = Field(..., description="Base64 配对响应码")
+    pending_request: Dict[str, Any] = Field(..., description="待处理请求信息（来自 generate-pair-request）")
+
+
+class CompletePairingResponse(BaseModel):
+    """完成配对的响应"""
+    success: bool = Field(..., description="是否成功")
+    message: str = Field(..., description="结果消息")
+    created_node_tag: Optional[str] = Field(None, description="创建的节点标识符")
+
+
 class NodeChainCreateRequest(BaseModel):
     """创建多跳链路"""
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="链路标识符")
@@ -1001,6 +1217,12 @@ class NodeChainCreateRequest(BaseModel):
     relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
     priority: int = Field(0, description="优先级")
     enabled: int = Field(1, ge=0, le=1, description="是否启用")
+    # Phase 6 新增字段
+    exit_egress: Optional[str] = Field(None, description="终端节点的本地出口")
+    dscp_value: Optional[int] = Field(None, ge=1, le=63, description="DSCP 标记值（1-63），不提供则自动分配")
+    chain_mark_type: str = Field("dscp", pattern=r"^(dscp|xray_email)$", description="标记类型")
+    # Phase 11-Fix.C: 传递模式验证
+    allow_transitive: bool = Field(False, description="是否允许传递验证（只验证第一跳，后续跳通过隧道验证）")
 
 
 class NodeChainUpdateRequest(BaseModel):
@@ -1013,6 +1235,13 @@ class NodeChainUpdateRequest(BaseModel):
     relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
     priority: Optional[int] = Field(None, description="优先级")
     enabled: Optional[int] = Field(None, ge=0, le=1, description="是否启用")
+    # Phase 6 新增字段
+    exit_egress: Optional[str] = Field(None, description="终端节点的本地出口")
+    dscp_value: Optional[int] = Field(None, ge=1, le=63, description="DSCP 标记值（1-63）")
+    chain_mark_type: Optional[str] = Field(None, pattern=r"^(dscp|xray_email)$", description="标记类型")
+    chain_state: Optional[str] = Field(None, pattern=r"^(inactive|activating|active|error)$", description="链路状态")
+    # Phase 11-Fix.C: 传递模式验证
+    allow_transitive: Optional[bool] = Field(None, description="是否允许传递验证（只验证第一跳，后续跳通过隧道验证）")
 
 
 # ============ 加密/解密工具 ============
@@ -1111,6 +1340,23 @@ PUBLIC_PATHS = {
     "/api/peer-chain/unregister",
     # 节点间中继查询端点（PSK 认证）
     "/api/peer-relay/status",
+    # 隧道内 API 端点（通过隧道访问，X-PSK header 认证）
+    "/api/peer-info/egress",
+    "/api/chain-routing/register",
+    "/api/chain-routing/unregister",
+    "/api/chain-routing",
+    "/api/chain-routing/status",
+    # Phase 11.2: 双向自动连接
+    "/api/peer-tunnel/reverse-setup",
+    # Phase 11-Tunnel: 隧道优先配对握手（通过隧道调用）
+    "/api/peer-tunnel/complete-handshake",
+    # Phase 11-Cascade: 级联删除通知（隧道 IP 认证）
+    "/api/peer-tunnel/peer-event",
+    # Phase 11.4: 中继路由注册（PSK 认证）
+    "/api/relay-routing/register",
+    "/api/relay-routing/unregister",
+    # Phase 11-Fix.C: 链路跳点验证（支持 PSK 远程调用）
+    "/api/chains/validate-hops",
 }
 
 
@@ -1477,6 +1723,10 @@ def _update_traffic_stats():
     global _traffic_stats, _traffic_rates, _rate_history
     global _last_history_time, _rate_samples
 
+    # 缓存清理计数器（每 300 秒 = 5 分钟清理一次）
+    _cache_cleanup_counter = 0
+    _CACHE_CLEANUP_INTERVAL = 300  # 秒
+
     while True:
         try:
             client = _get_v2ray_client()
@@ -1575,11 +1825,80 @@ def _update_traffic_stats():
                 # M5 修复: 记录用户活动更新错误
                 logging.debug(f"V2Ray user activity update failed: {type(e).__name__}: {e}")
 
+            # Phase 11.5: 定期清理过期的终端出口缓存
+            _cache_cleanup_counter += _POLL_INTERVAL
+            if _cache_cleanup_counter >= _CACHE_CLEANUP_INTERVAL:
+                _cache_cleanup_counter = 0
+                try:
+                    if HAS_DATABASE and USER_DB_PATH.exists():
+                        db = _get_db()
+                        deleted = db.cleanup_expired_terminal_egress_cache()
+                        if deleted > 0:
+                            logging.info(f"[Cache] 已清理 {deleted} 条过期的终端出口缓存")
+                except Exception as e:
+                    logging.debug(f"[Cache] 清理过期缓存失败: {e}")
+
         except Exception as e:
             # M5 修复: 使用 logging 而不是 print，记录完整异常信息
             logging.exception(f"Traffic stats thread error: {type(e).__name__}: {e}")
 
         time.sleep(_POLL_INTERVAL)
+
+
+def _bidirectional_status_checker():
+    """Phase 11-Fix.B: 后台线程定期检查 peer 双向连接状态
+
+    每 60 秒检查一次所有已连接但非 bidirectional 的节点，自动更新它们的双向状态。
+
+    状态语义:
+    - pending: 尚未检查或隧道未连接
+    - outbound_only: 隧道已连接，等待确认双向性
+    - bidirectional: 隧道已连接且确认双向通信可用
+
+    对于 WireGuard 隧道，一旦密钥交换完成（有 wg_peer_public_key），就应该是 bidirectional。
+    对于 Xray 隧道，需要检查 inbound_enabled 状态。
+    """
+    _BIDIR_CHECK_INTERVAL = 60  # 秒
+    _STARTUP_DELAY = 10  # 启动延迟，等待系统初始化
+
+    # 等待系统初始化完成
+    time.sleep(_STARTUP_DELAY)
+
+    while True:
+        try:
+            if HAS_DATABASE and USER_DB_PATH.exists():
+                db = _get_db()
+
+                # 检查所有已连接但非 bidirectional 的节点
+                # 包括 pending 和 outbound_only 状态
+                peers_to_check = db.get_peers_pending_bidirectional()  # pending
+                outbound_only_peers = db.get_peers_by_bidirectional_status("outbound_only")
+
+                # 合并去重
+                checked_tags = set()
+                all_peers = []
+                for peer in peers_to_check + outbound_only_peers:
+                    tag = peer.get("tag")
+                    if tag and tag not in checked_tags:
+                        checked_tags.add(tag)
+                        all_peers.append(peer)
+
+                for peer in all_peers:
+                    tag = peer.get("tag")
+                    tunnel_status = peer.get("tunnel_status")
+                    if tag and tunnel_status == "connected":
+                        try:
+                            _check_and_update_bidirectional_status(db, tag)
+                        except Exception as e:
+                            logging.warning(f"[bidirectional-checker] 检查节点 '{tag}' 失败: {e}")
+
+                if all_peers:
+                    logging.debug(f"[bidirectional-checker] 已检查 {len(all_peers)} 个节点")
+
+        except Exception as e:
+            logging.warning(f"[bidirectional-checker] 检查循环异常: {e}")
+
+        time.sleep(_BIDIR_CHECK_INTERVAL)
 
 
 @app.on_event("startup")
@@ -1593,6 +1912,19 @@ async def startup_event():
     traffic_thread = threading.Thread(target=_update_traffic_stats, daemon=True)
     traffic_thread.start()
     print("[Traffic] 流量统计后台线程已启动（V2Ray API 精确模式）")
+    # Phase 11-Fix.B: 启动双向状态检查后台线程
+    bidir_thread = threading.Thread(target=_bidirectional_status_checker, daemon=True)
+    bidir_thread.start()
+    print("[Bidirectional] 双向状态检查后台线程已启动（60秒间隔）")
+    # Phase 11.1: 清理过期的终端出口缓存
+    try:
+        if HAS_DATABASE and USER_DB_PATH.exists():
+            db = _get_db()
+            deleted = db.cleanup_expired_terminal_egress_cache()
+            if deleted > 0:
+                print(f"[Cache] 已清理 {deleted} 条过期的终端出口缓存")
+    except Exception as e:
+        logging.warning(f"[Cache] 清理过期缓存失败: {e}")
 
 
 def load_json_config() -> dict:
@@ -1908,6 +2240,61 @@ def save_settings(data: Dict[str, Any]) -> None:
     """保存系统设置"""
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _derive_api_port_from_endpoint(endpoint: str, node: dict = None) -> tuple:
+    """从 endpoint 推导 API 端口
+
+    Phase 11-Fix.B: 修复错误的 wg_port - 100 公式
+
+    Args:
+        endpoint: "host:port" 格式的端点地址
+        node: 可选的节点信息字典（检查 api_port 字段）
+
+    Returns:
+        (host, api_port) 元组
+    """
+    DEFAULT_API_PORT = 36000
+
+    if ":" in endpoint:
+        host, _ = endpoint.rsplit(":", 1)
+    else:
+        host = endpoint
+
+    # 优先使用显式配置的 api_port
+    if node and node.get("api_port"):
+        return (host, node["api_port"])
+
+    return (host, DEFAULT_API_PORT)
+
+
+def _get_peer_tunnel_endpoint(node: dict) -> Optional[str]:
+    """动态构建节点的隧道 API 端点
+
+    Phase A (端口变更通知): 不再依赖存储的 tunnel_api_endpoint，
+    而是从 tunnel_remote_ip + api_port 动态构建。
+
+    这解决了当节点更改 api_port 后，其他节点的存储值过时的问题。
+
+    Args:
+        node: 节点信息字典
+
+    Returns:
+        "tunnel_ip:api_port" 格式的端点地址，如果无法构建则返回 None
+    """
+    if not node:
+        return None
+
+    tunnel_remote_ip = node.get("tunnel_remote_ip")
+    if not tunnel_remote_ip:
+        return None
+
+    # Phase A 审核修复: 验证端口范围 (注意: bool 是 int 子类，需显式排除)
+    api_port = node.get("api_port")
+    if not isinstance(api_port, int) or isinstance(api_port, bool) or api_port < 1 or api_port > 65535:
+        api_port = 36000
+
+    return f"{tunnel_remote_ip}:{api_port}"
 
 
 def parse_wireguard_conf(content: str) -> Dict[str, Any]:
@@ -4600,6 +4987,11 @@ class SettingsUpdateRequest(BaseModel):
     server_endpoint: Optional[str] = Field(None, description="服务器公网地址，如 1.2.3.4 或 vpn.example.com")
 
 
+class PortChangeAnnouncementRequest(BaseModel):
+    """Phase C (端口变更通知): 端口变更广播请求"""
+    new_port: int = Field(..., ge=1, le=65535, description="新的 API 端口号")
+
+
 @app.get("/api/settings")
 def api_get_settings():
     """获取系统设置"""
@@ -4702,6 +5094,53 @@ def api_update_settings(payload: SettingsUpdateRequest):
 
     save_settings(settings)
     return {"message": "设置已保存", "settings": settings}
+
+
+@app.post("/api/settings/announce-port-change")
+def api_announce_port_change(payload: PortChangeAnnouncementRequest):
+    """Phase C (端口变更通知): 广播端口变更到所有已连接的 peer
+
+    在更改本节点 API 端口之前，调用此接口通知所有已连接的 peer 节点。
+    这样 peer 节点可以更新它们存储的 api_port 记录，确保端口更改后通信不中断。
+
+    使用流程：
+    1. 调用此 API 通知所有 peer 新端口号
+    2. 修改 WEB_PORT 环境变量
+    3. 重启容器
+
+    Returns:
+        success: 是否全部通知成功
+        total_peers: 已连接的 peer 总数
+        success_count: 通知成功的数量
+        results: 每个 peer 的通知结果详情
+    """
+    db = _get_db()
+    new_port = payload.new_port
+
+    # 获取本节点标识（用于 source_node）
+    local_node_id = _get_local_node_id()
+
+    # 广播到所有已连接的 peer
+    from tunnel_api_client import TunnelAPIClientManager
+    client_mgr = TunnelAPIClientManager(db)
+    results = client_mgr.broadcast_port_change(
+        source_node=local_node_id,
+        new_port=new_port,
+    )
+
+    success_count = sum(1 for v in results.values() if v)
+    total_peers = len(results)
+    # QA 修复: 当没有 peer 时应该返回 success=True（没有需要通知的对象）
+    all_success = (total_peers == 0) or (success_count == total_peers)
+
+    return {
+        "success": all_success,
+        "message": f"已通知 {success_count}/{total_peers} 个已连接的 peer 节点" if total_peers > 0 else "没有已连接的 peer 节点",
+        "new_port": new_port,
+        "total_peers": total_peers,
+        "success_count": success_count,
+        "results": results,
+    }
 
 
 # ============ Custom Egress APIs ============
@@ -9768,6 +10207,156 @@ def _decrypt_psk(encrypted_psk: str) -> str:
         raise ValueError(f"PSK 解密失败: {e}")
 
 
+# === Peer Tunnel IP Allocation ===
+
+# 隧道 IP 子网基址
+PEER_TUNNEL_SUBNET_BASE = "10.200.200"
+# 最大 /30 子网数量 (每个子网 4 个 IP: .0=网络, .1=主机1, .2=主机2, .3=广播)
+# 256 addresses / 4 per subnet = 64 subnets (indices 0-63)
+# Subnet 0: .0-.3 (hosts .1, .2), Subnet 63: .252-.255 (hosts .253, .254)
+MAX_PEER_TUNNEL_SUBNETS = 64
+
+
+def _extract_subnet_idx_from_ip(ip_str: str) -> int:
+    """从隧道 IP 地址提取 /30 子网索引
+
+    Args:
+        ip_str: IP 地址字符串 (如 "10.200.200.5")
+
+    Returns:
+        子网索引 (0, 1, 2, ...)，失败返回 -1
+    """
+    if not ip_str:
+        return -1
+    try:
+        # 去除可能的 CIDR 前缀
+        ip = ip_str.split("/")[0]
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return -1
+        # 验证前三个八位组匹配子网基址
+        if ".".join(parts[:3]) != PEER_TUNNEL_SUBNET_BASE:
+            return -1
+        last_octet = int(parts[3])
+        # 子网索引: .1/.2 → 0, .5/.6 → 1, .9/.10 → 2, ...
+        # 计算公式: (last_octet - 1) // 4
+        if last_octet < 1 or last_octet > 254:
+            return -1
+        return (last_octet - 1) // 4
+    except (ValueError, IndexError):
+        return -1
+
+
+def _get_next_peer_tunnel_subnet(db, local_node_tag: str = None, remote_node_tag: str = None) -> tuple:
+    """获取下一个可用的 /30 子网
+
+    Phase 11-Fix.A 增强版：支持确定性分配以避免多节点场景下的冲突。
+
+    当提供 local_node_tag 和 remote_node_tag 时，使用确定性算法：
+    1. 基于节点对的哈希值计算起始子网索引
+    2. 从该索引开始搜索可用子网
+    这确保无论连接方向如何，同一对节点始终使用相同子网。
+
+    Args:
+        db: 数据库连接
+        local_node_tag: 本地节点标识（可选，用于确定性分配）
+        remote_node_tag: 远程节点标识（可选，用于确定性分配）
+
+    Returns:
+        (subnet_idx, local_ip, peer_ip) 元组
+        如 (1, "10.200.200.5", "10.200.200.6")
+
+    Raises:
+        HTTPException: 所有子网已用尽
+    """
+    import hashlib
+
+    # 收集所有已使用的子网索引
+    used_subnets = set()
+    existing_nodes = db.get_peer_nodes()
+
+    for node in existing_nodes:
+        # 检查 tunnel_local_ip
+        local_ip = node.get("tunnel_local_ip")
+        if local_ip:
+            idx = _extract_subnet_idx_from_ip(local_ip)
+            if idx >= 0:
+                used_subnets.add(idx)
+
+        # 检查 tunnel_remote_ip (对端 IP 也占用了子网的另一半)
+        remote_ip = node.get("tunnel_remote_ip")
+        if remote_ip:
+            idx = _extract_subnet_idx_from_ip(remote_ip)
+            if idx >= 0:
+                used_subnets.add(idx)
+
+    logging.debug(f"[peer-tunnel-ip] 已使用子网: {sorted(used_subnets)}")
+
+    # 确定起始搜索索引
+    if local_node_tag and remote_node_tag:
+        # 确定性分配：基于节点对哈希值
+        # 排序确保无论连接方向如何结果一致
+        pair_key = "|".join(sorted([local_node_tag, remote_node_tag]))
+        hash_value = int(hashlib.md5(pair_key.encode()).hexdigest()[:8], 16)
+        start_idx = hash_value % MAX_PEER_TUNNEL_SUBNETS
+        logging.debug(f"[peer-tunnel-ip] 确定性分配: pair={pair_key}, start_idx={start_idx}")
+    else:
+        # 向后兼容：从 0 开始
+        start_idx = 0
+
+    # 从起始索引开始搜索可用子网
+    for offset in range(MAX_PEER_TUNNEL_SUBNETS):
+        subnet_idx = (start_idx + offset) % MAX_PEER_TUNNEL_SUBNETS
+        if subnet_idx not in used_subnets:
+            # 计算 IP 地址: .1 和 .2 为子网的两个有效主机地址
+            subnet_base = subnet_idx * 4
+            local_ip = f"{PEER_TUNNEL_SUBNET_BASE}.{subnet_base + 1}"
+            peer_ip = f"{PEER_TUNNEL_SUBNET_BASE}.{subnet_base + 2}"
+            logging.info(f"[peer-tunnel-ip] 分配子网 {subnet_idx}: {local_ip}/30 (peer: {peer_ip})")
+            return (subnet_idx, local_ip, peer_ip)
+
+    # 所有子网已用尽
+    logging.error(f"[peer-tunnel-ip] All {MAX_PEER_TUNNEL_SUBNETS} /30 subnets exhausted, used indices: {sorted(used_subnets)}")
+    raise HTTPException(
+        status_code=500,
+        detail=f"No available tunnel IP (all {MAX_PEER_TUNNEL_SUBNETS} /30 subnets exhausted)"
+    )
+
+
+def _calculate_peer_ip_from_local(local_ip: str) -> str:
+    """根据本地隧道 IP 计算对端 IP
+
+    在同一个 /30 子网中，.1 对应 .2，.2 对应 .1
+
+    Args:
+        local_ip: 本地隧道 IP (如 "10.200.200.5")
+
+    Returns:
+        对端 IP (如 "10.200.200.6")
+    """
+    try:
+        parts = local_ip.rsplit(".", 1)
+        if len(parts) != 2:
+            return None
+        base = parts[0]
+        last_octet = int(parts[1])
+
+        # 计算子网内的位置: .1, .2, .5, .6, .9, .10, ...
+        # 子网起始偏移: 0, 4, 8, 12, ...
+        subnet_offset = ((last_octet - 1) // 4) * 4
+        pos_in_subnet = last_octet - subnet_offset  # 1 或 2
+
+        if pos_in_subnet == 1:
+            peer_last = subnet_offset + 2
+        else:
+            peer_last = subnet_offset + 1
+
+        return f"{base}.{peer_last}"
+    except (ValueError, IndexError) as e:
+        logging.error(f"[peer-tunnel-ip] 计算对端 IP 失败: {local_ip}, 错误: {e}")
+        return None
+
+
 @app.post("/api/peer-auth/validate")
 def api_peer_auth_validate(request: Request, payload: PeerAuthValidateRequest):
     """验证 PSK 认证
@@ -9823,11 +10412,25 @@ def api_peer_auth_validate(request: Request, payload: PeerAuthValidateRequest):
 def _find_peer_node_by_ip(db, client_ip: str):
     """通过源 IP 查找对等节点
 
-    遍历所有节点，检查 endpoint 是否包含该 IP。
+    遍历所有节点，检查 endpoint 或 tunnel_remote_ip 是否匹配该 IP。
     支持不同 tag 的互联场景。
+
+    Phase 11-Fix.C3: 增加 tunnel_remote_ip 检查，支持隧道内 API 调用
+    当请求通过隧道到达时，client_ip 是隧道 IP（如 10.200.200.242），
+    而不是外部 endpoint IP（如 10.1.100.11）。
     """
     all_nodes = db.get_peer_nodes()
     for node in all_nodes:
+        # 优先检查 tunnel_remote_ip（隧道内请求）
+        tunnel_remote_ip = node.get("tunnel_remote_ip", "")
+        if tunnel_remote_ip:
+            # tunnel_remote_ip 格式: "10.200.200.242/30" 或 "10.200.200.242"
+            tunnel_ip_clean = tunnel_remote_ip.split("/")[0]
+            if tunnel_ip_clean == client_ip:
+                logging.debug(f"[peer-lookup] 通过 tunnel_remote_ip 找到节点: {node.get('tag')}")
+                return node
+
+        # 其次检查 endpoint（外部 IP 请求）
         endpoint = node.get("endpoint", "")
         # endpoint 格式: "ip:port" 或 "hostname:port"
         if ":" in endpoint:
@@ -9835,7 +10438,59 @@ def _find_peer_node_by_ip(db, client_ip: str):
         else:
             endpoint_host = endpoint
         if endpoint_host == client_ip:
+            logging.debug(f"[peer-lookup] 通过 endpoint 找到节点: {node.get('tag')}")
             return node
+    return None
+
+
+def _resolve_peer_node(db, node_identifier: str, fallback_ip: str = None) -> Optional[dict]:
+    """解析节点标识符到本地 peer_node
+
+    Phase 11-Fix.D: 支持多种查找方式
+
+    尝试多种查找方式:
+    1. 精确 tag 匹配
+    2. 通过 endpoint hostname 匹配
+    3. 通过 remote_hostname 字段匹配
+    4. 通过隧道 IP 匹配 (fallback)
+
+    Args:
+        db: 数据库实例
+        node_identifier: 节点标识符（可以是 tag、hostname 等）
+        fallback_ip: 回退 IP（用于最后的 IP 匹配）
+
+    Returns:
+        匹配的节点信息字典，或 None
+    """
+    # 1. 精确 tag 匹配
+    node = db.get_peer_node(node_identifier)
+    if node:
+        logging.debug(f"[resolve-peer] 精确匹配 tag: {node_identifier}")
+        return node
+
+    # 2. 遍历查找 endpoint 或 hostname
+    for peer in db.get_peer_nodes():
+        # 检查 endpoint 中的 hostname
+        endpoint = peer.get("endpoint", "")
+        if ":" in endpoint:
+            ep_host = endpoint.rsplit(":", 1)[0]
+            if ep_host == node_identifier:
+                logging.debug(f"[resolve-peer] 通过 endpoint hostname 找到: {peer.get('tag')}")
+                return peer
+
+        # 检查 remote_hostname 字段（如果有）
+        if peer.get("remote_hostname") == node_identifier:
+            logging.debug(f"[resolve-peer] 通过 remote_hostname 找到: {peer.get('tag')}")
+            return peer
+
+    # 3. Fallback: 通过 IP 查找
+    if fallback_ip:
+        node = _find_peer_node_by_ip(db, fallback_ip)
+        if node:
+            logging.debug(f"[resolve-peer] 通过 fallback IP 找到: {node.get('tag')}")
+            return node
+
+    logging.debug(f"[resolve-peer] 未找到节点: {node_identifier}")
     return None
 
 
@@ -9910,19 +10565,18 @@ def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
             for retry in range(max_retries):
                 # 每次重试重新获取可用资源
                 tunnel_port = db.get_next_peer_tunnel_port()
-                existing_nodes = db.get_peer_nodes()
-                used_ips = {n.get("tunnel_local_ip") for n in existing_nodes if n.get("tunnel_local_ip")}
 
-                # 从 10.200.200.0/24 子网分配 IP
-                local_ip = None
-                for i in range(1, 254):
-                    candidate = f"10.200.200.{i}"
-                    if candidate not in used_ips:
-                        local_ip = candidate
-                        break
-
-                if not local_ip:
-                    raise HTTPException(status_code=500, detail="No available tunnel IP")
+                # 使用新的 IP 分配函数，基于子网索引而非 IP 字符串比较
+                # 确保每个 /30 子网作为整体分配，避免冲突
+                # Phase 11-Fix.A 增强: 使用确定性分配避免多节点场景冲突
+                import socket
+                local_hostname = socket.gethostname()
+                remote_node_id = payload.node_id
+                subnet_idx, local_ip, _ = _get_next_peer_tunnel_subnet(
+                    db,
+                    local_node_tag=local_hostname,
+                    remote_node_tag=remote_node_id
+                )
 
                 try:
                     # 尝试更新节点配置（数据库有 UNIQUE 约束）
@@ -9938,7 +10592,7 @@ def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
                 except Exception as e:
                     # 检查是否是 UNIQUE 约束冲突（IP 或端口）
                     if "UNIQUE constraint failed" in str(e) or "unique constraint" in str(e).lower():
-                        logging.warning(f"[peer-auth] IP/Port 冲突 ({local_ip}:{tunnel_port})，重试 {retry + 1}/{max_retries}")
+                        logging.warning(f"[peer-auth] IP/Port 冲突 (subnet={subnet_idx}, ip={local_ip}, port={tunnel_port})，重试 {retry + 1}/{max_retries}")
                         continue
                     raise  # 其他错误直接抛出
             else:
@@ -9951,10 +10605,13 @@ def api_peer_auth_exchange(request: Request, payload: PeerAuthExchangeRequest):
         # 保存对方的公钥和端口
         remote_ip = None
         if payload.wg_public_key:
-            # 计算对方的隧道 IP（本方 IP + 1，或取下一个可用）
+            # 使用 _calculate_peer_ip_from_local() 计算对端 IP
+            # 在同一个 /30 子网中，.1 对应 .2，.2 对应 .1
             local_ip = node.get("tunnel_local_ip", "10.200.200.1")
-            local_num = int(local_ip.split(".")[-1])
-            remote_ip = f"10.200.200.{(local_num % 252) + 2}"
+            remote_ip = _calculate_peer_ip_from_local(local_ip)
+            if not remote_ip:
+                logging.error(f"[peer-auth] Failed to calculate remote IP from local_ip={local_ip}")
+                raise HTTPException(status_code=500, detail="Failed to calculate tunnel IP")
 
             db.update_peer_node(
                 node["tag"],
@@ -10246,7 +10903,753 @@ def api_peer_notify_disconnected(request: Request, payload: PeerNotifyRequest):
         return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
 
 
+@app.post("/api/peer-tunnel/reverse-setup")
+def api_peer_tunnel_reverse_setup(request: Request, payload: ReverseSetupRequest):
+    """Phase 11.2: 请求建立反向连接
+
+    当节点 A 完成配对并连接到节点 B 后，A 通过隧道调用此 API，
+    请求 B 也建立到 A 的连接，实现双向自动连接。
+
+    认证方式: PSK (无需 JWT)
+
+    流程:
+    1. A 导入 B 的配对请求，创建 peer_node
+    2. A 调用 B 的 /api/peer-auth/exchange 获取隧道参数
+    3. A 建立到 B 的隧道 (WireGuard/Xray)
+    4. A 通过隧道调用 B 的此 API
+    5. B 收到请求，使用 A 提供的参数建立反向连接
+    6. 双向连接完成，两端都更新 bidirectional_status = "bidirectional"
+    """
+    # 安全关键：使用直连 IP 进行隧道认证，忽略可伪造的代理头
+    client_ip = _get_direct_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 通过源 IP 查找对应的节点
+    # 由于这个请求来自隧道内，源 IP 应该是隧道的 remote_ip
+    node = _find_peer_node_by_ip(db, client_ip)
+    if not node:
+        # 尝试通过隧道 IP 匹配
+        nodes = db.get_peer_nodes()
+        for n in nodes:
+            if n.get("tunnel_remote_ip") == client_ip:
+                node = n
+                break
+
+    if not node:
+        # HIGH-1 修复: 通过 node_id 查找时也验证 IP
+        candidate = db.get_peer_node(payload.node_id)
+        if candidate:
+            # 验证客户端 IP 与节点的 endpoint 或 tunnel_remote_ip 匹配
+            tunnel_remote = candidate.get("tunnel_remote_ip", "")
+            endpoint = candidate.get("endpoint", "")
+            endpoint_host = endpoint.split(":")[0] if ":" in endpoint else endpoint
+            if tunnel_remote == client_ip or endpoint_host == client_ip:
+                node = candidate
+            else:
+                logging.warning(f"[reverse-setup] node_id '{payload.node_id}' IP 不匹配 "
+                              f"(client={client_ip}, tunnel_remote={tunnel_remote}, endpoint_host={endpoint_host})")
+
+    if not node:
+        logging.warning(f"[reverse-setup] 请求失败: 未找到匹配节点 (from {client_ip}, node_id={payload.node_id})")
+        raise HTTPException(status_code=401, detail="Unknown peer")
+
+    # PSK 已废弃 - 现在使用隧道 IP 认证（WireGuard）或 UUID 认证（Xray）
+    # 由于已通过 _find_peer_node_by_ip 或 tunnel_remote_ip 匹配找到节点，
+    # 对于 WireGuard 隧道来说，IP 匹配本身就是认证
+    tunnel_type = node.get("tunnel_type", "wireguard")
+    if tunnel_type == "xray":
+        # Xray 隧道需要验证 X-Peer-UUID header
+        peer_uuid = request.headers.get("X-Peer-UUID", "")
+        expected_uuid = node.get("inbound_uuid", "")  # 我们给对方分配的 UUID
+        if not peer_uuid or peer_uuid != expected_uuid:
+            logging.warning(f"[reverse-setup] Xray UUID 验证失败 (from {client_ip}, "
+                          f"got='{peer_uuid[:8]}...', expected='{expected_uuid[:8]}...')")
+            raise HTTPException(status_code=401, detail="Authentication failed")
+    # WireGuard 隧道：IP 匹配已完成认证，无需额外验证
+
+    tag = node["tag"]
+    current_status = node.get("tunnel_status", "disconnected")
+    bidirectional_status = node.get("bidirectional_status")
+
+    logging.info(f"[reverse-setup] 收到反向连接请求: 节点 '{tag}', 隧道类型={tunnel_type}, "
+                 f"当前状态={current_status}, 双向状态={bidirectional_status} (from {client_ip})")
+
+    # 更新对端的 WireGuard 参数（如果提供）
+    if tunnel_type == "wireguard" and payload.wg_public_key:
+        update_params = {
+            "wg_peer_public_key": payload.wg_public_key,
+        }
+        # 更新 endpoint（如果对方提供）
+        if payload.endpoint:
+            update_params["endpoint"] = payload.endpoint
+
+        db.update_peer_node(tag, **update_params)
+        logging.info(f"[reverse-setup] 更新节点 '{tag}' 的 WireGuard 参数")
+
+    # 如果已经是双向连接，直接返回成功
+    if bidirectional_status == "bidirectional" and current_status == "connected":
+        return {
+            "success": True,
+            "message": "Already bidirectional",
+            "status": "bidirectional",
+            "tunnel_status": current_status
+        }
+
+    # 尝试建立连接
+    try:
+        from peer_tunnel_manager import PeerTunnelManager
+        manager = PeerTunnelManager()
+
+        # 刷新节点数据（可能已更新）
+        node = db.get_peer_node(tag)
+
+        if current_status != "connected":
+            # 建立隧道连接
+            # 注：不需要再通知对方，因为对方调用了此 API 说明已经知道我们要连接
+            success = manager.connect_node(tag)
+            if success:
+                current_status = "connected"
+                logging.info(f"[reverse-setup] 节点 '{tag}' 隧道已建立")
+            else:
+                logging.warning(f"[reverse-setup] 节点 '{tag}' 隧道建立失败")
+                return {
+                    "success": False,
+                    "message": "Failed to establish tunnel",
+                    "status": bidirectional_status or "pending",
+                    "tunnel_status": current_status
+                }
+
+        # 更新双向连接状态
+        db.update_peer_node(tag, bidirectional_status="bidirectional")
+        logging.info(f"[reverse-setup] 节点 '{tag}' 双向连接已建立")
+
+        return {
+            "success": True,
+            "message": "Bidirectional connection established",
+            "status": "bidirectional",
+            "tunnel_status": "connected"
+        }
+
+    except Exception as e:
+        # HIGH-2 修复: 不暴露异常详情，只返回通用错误消息
+        logging.error(f"[reverse-setup] 节点 '{tag}' 反向连接失败: {e}")
+        return {
+            "success": False,
+            "message": "Connection failed",  # 通用错误消息，不暴露内部详情
+            "status": bidirectional_status or "pending",
+            "tunnel_status": current_status
+        }
+
+
+@app.post("/api/peer-tunnel/complete-handshake")
+def api_peer_tunnel_complete_handshake(request: Request, payload: CompleteHandshakeRequest):
+    """Phase 11-Tunnel: 完成隧道优先配对
+
+    当 Node B 导入 Node A 的配对码并建立隧道后，
+    B 通过隧道调用此 API 通知 A 完成配对流程。
+
+    认证方式:
+    - 通过 pairing_id 匹配 pending_pairing 记录
+    - 验证请求来自预期的隧道 IP (tunnel_remote_ip)
+
+    流程:
+    1. B 导入 A 的配对码
+    2. B 使用预生成密钥创建 WireGuard 接口
+    3. B 连接到 A（A 的 pending 接口正在监听）
+    4. 隧道建立后，B 通过隧道调用此 API
+    5. A 验证请求，创建 peer_node 记录
+    6. A 重命名 pending 接口为永久接口
+    7. A 更新 WireGuard peer 的 endpoint
+    8. A 删除 pending_pairing 记录
+    9. 配对完成，双方都有 peer_node 记录
+    """
+    # 安全关键：使用直连 IP 进行隧道认证，忽略可伪造的代理头
+    client_ip = _get_direct_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # Step 1: 根据 pairing_id 查找 pending_pairing 记录
+    pending = db.get_pending_pairing(payload.pairing_id)
+    if not pending:
+        logging.warning(f"[complete-handshake] 未找到待处理配对: pairing_id={payload.pairing_id} (from {client_ip})")
+        return {"success": False, "message": "Pending pairing not found"}
+
+    logging.info(f"[complete-handshake] 收到握手请求: pairing_id={payload.pairing_id}, "
+                f"from={client_ip}, node_tag={payload.node_tag}")
+
+    # Step 2: 验证请求来自预期的隧道 IP
+    # Node B 应该使用 pending.tunnel_remote_ip 作为自己的隧道 IP
+    expected_ip = pending.get("tunnel_remote_ip")
+    if expected_ip and client_ip != expected_ip:
+        logging.warning(f"[complete-handshake] IP 不匹配: expected={expected_ip}, got={client_ip}")
+        return {"success": False, "message": "IP verification failed"}
+
+    # Step 3: 验证公钥匹配（确保是预期的 Node B）
+    expected_public_key = pending.get("remote_wg_public_key")
+    if expected_public_key and payload.wg_public_key != expected_public_key:
+        logging.warning(f"[complete-handshake] 公钥不匹配")
+        return {"success": False, "message": "Public key mismatch"}
+
+    # Step 4: 检查是否已存在同名节点
+    existing = db.get_peer_node(payload.node_tag)
+    if existing:
+        logging.warning(f"[complete-handshake] 节点已存在: {payload.node_tag}")
+        return {"success": False, "message": f"Peer node '{payload.node_tag}' already exists"}
+
+    try:
+        # Step 5: 获取 pending 接口信息
+        pending_interface = pending.get("interface_name")
+        local_tag = pending.get("local_tag")  # Node A 的 tag
+        local_ip = pending.get("tunnel_local_ip")
+        remote_ip = pending.get("tunnel_remote_ip")
+        tunnel_port = pending.get("tunnel_port")
+
+        # Step 6: 重命名 pending 接口为永久接口
+        permanent_interface = get_interface_name(payload.node_tag, "wireguard")
+
+        if pending_interface and HAS_PENDING_TUNNEL:
+            success = rename_wireguard_interface(pending_interface, permanent_interface)
+            if not success:
+                logging.warning(f"[complete-handshake] 接口重命名失败: {pending_interface} -> {permanent_interface}")
+                # 继续执行，接口可能已被重命名
+
+        # Step 7: 更新 WireGuard peer 的 endpoint
+        # 这样 A 也可以主动发起连接到 B
+        if payload.endpoint and payload.wg_public_key:
+            update_wireguard_peer_endpoint(
+                interface=permanent_interface,
+                peer_public_key=payload.wg_public_key,
+                endpoint=payload.endpoint
+            )
+
+        # Step 8: 创建 peer_node 记录（在 Node A 上记录 Node B 的信息）
+        db.add_peer_node(
+            tag=payload.node_tag,
+            name=payload.node_tag,
+            description=payload.node_description or f"Paired via tunnel",
+            endpoint=payload.endpoint,
+            api_port=payload.api_port,  # Phase 11-Fix.K: 保存 API 端口
+            tunnel_type="wireguard",
+            tunnel_status="connected",
+            tunnel_interface=permanent_interface,
+            tunnel_local_ip=local_ip,
+            tunnel_remote_ip=remote_ip,
+            tunnel_port=tunnel_port,
+            wg_private_key=pending.get("wg_private_key"),
+            wg_public_key=pending.get("wg_public_key"),  # A 的公钥
+            wg_peer_public_key=payload.wg_public_key,  # B 的公钥
+            # Phase 11-Fix.K: 使用正确的 api_port
+            tunnel_api_endpoint=f"{remote_ip}:{payload.api_port or 36000}",
+            bidirectional_status="bidirectional",
+        )
+
+        logging.info(f"[complete-handshake] 创建节点成功: {payload.node_tag}")
+
+        # Step 9: 删除 pending_pairing 记录
+        db.delete_pending_pairing(payload.pairing_id)
+
+        logging.info(f"[complete-handshake] 配对完成: {payload.node_tag} (interface={permanent_interface})")
+
+        return {
+            "success": True,
+            "message": "Handshake completed",
+            "node_tag": local_tag,  # 返回 A 的 tag 给 B
+            "tunnel_status": "connected"
+        }
+
+    except Exception as e:
+        logging.error(f"[complete-handshake] 处理失败: {e}")
+        return {
+            "success": False,
+            "message": "Handshake processing failed"
+        }
+
+
+@app.post("/api/peer-tunnel/peer-event")
+def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
+    """Phase 11-Cascade: 接收对等节点事件通知
+
+    当节点删除或断开另一个节点时，通过隧道调用此 API 通知对方。
+    支持级联广播，让所有连接的节点得知变更。
+
+    认证方式：
+    - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
+    - Xray 隧道：通过 X-Peer-UUID header 验证
+
+    事件类型：
+    - delete: A 删除 B，通知 B 清理与 A 的连接
+    - disconnect: A 断开与 B 的隧道（可能重连）
+    - broadcast: A 广播某节点不可用（级联通知）
+    - port_change: A 的 API 端口变更，通知 B 更新记录 (Phase B)
+
+    流程：
+    1. 验证请求来自已连接的 peer
+    2. 检查幂等性 (event_id)
+    3. 检查墓碑状态
+    4. 处理事件（断开隧道、添加墓碑等）
+    5. 可选：广播给其他连接的 peer
+    """
+    import uuid
+    from threading import Thread
+
+    # 安全关键：使用直连 IP 进行隧道认证，忽略可伪造的代理头
+    client_ip = _get_direct_client_ip(request)
+
+    # 速率限制检查 (M-1: 防止 DoS 攻击)
+    if not _check_psk_rate_limit(client_ip):
+        logging.warning(f"[peer-event] 速率限制: {client_ip}")
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    logging.info(f"[peer-event] 收到事件: type={payload.event_type}, source={payload.source_node}, "
+                 f"target={payload.target_node}, event_id={payload.event_id[:8]}..., from={client_ip}")
+
+    # Step 1: 验证请求来自已知 peer（通过隧道 IP 或 UUID）
+    authenticated_peer = None
+    peer_uuid_header = request.headers.get("X-Peer-UUID", "")
+
+    for peer in db.get_peer_nodes():
+        # WireGuard: 检查隧道远程 IP
+        if peer.get("tunnel_remote_ip") == client_ip:
+            authenticated_peer = peer
+            break
+        # Xray: 检查 UUID
+        if peer_uuid_header and peer.get("inbound_uuid") == peer_uuid_header:
+            authenticated_peer = peer
+            break
+
+    if not authenticated_peer:
+        logging.warning(f"[peer-event] 未授权: IP={client_ip}, UUID={peer_uuid_header[:8]}...")
+        return JSONResponse(
+            status_code=403,
+            content={"success": False, "message": "Unauthorized: not from a connected peer"}
+        )
+
+    peer_tag = authenticated_peer.get("tag")
+    logging.info(f"[peer-event] 已认证 peer: {peer_tag}")
+
+    # Step 2: 前置验证（在标记事件之前验证，避免标记后验证失败）
+    if payload.event_type == "broadcast" and not payload.target_node:
+        logging.warning(f"[peer-event] 广播事件缺少 target_node")
+        return {"success": False, "message": "target_node required for broadcast event"}
+
+    # Step 3: 检查源节点是否在墓碑期（忽略来自已删除节点的事件）
+    if db.is_peer_tombstoned(payload.source_node):
+        logging.warning(f"[peer-event] 忽略来自墓碑节点的事件: {payload.source_node}")
+        return {"success": False, "message": f"Source node '{payload.source_node}' is tombstoned"}
+
+    # Step 4: 原子幂等性检查和标记（防止 TOCTOU 竞态条件）
+    was_processed, now_marked = db.mark_event_if_not_processed(
+        payload.event_id, payload.source_node, payload.event_type
+    )
+    if was_processed:
+        logging.info(f"[peer-event] 事件已处理 (幂等): {payload.event_id[:8]}...")
+        return {"success": True, "message": "Event already processed", "idempotent": True}
+
+    # Step 5: 记录事件到审计日志
+    db.log_peer_event(
+        event_type="received",
+        peer_tag=payload.source_node,
+        event_id=payload.event_id,
+        from_node=peer_tag,
+        details={"original_type": payload.event_type, "target": payload.target_node, "reason": payload.reason},
+        source_ip=client_ip
+    )
+
+    # Step 6: 根据事件类型处理
+    result = {"success": True, "actions_taken": []}
+
+    if payload.event_type == "delete":
+        # 对方节点删除了我们，我们需要清理与对方的连接
+        # 使用 peer_tag（从隧道 IP 认证的本地 peer 标识）而不是 payload.source_node
+        # 因为 payload.source_node 是对方的 hostname，可能与本地存储的 tag 不同
+        source_peer = authenticated_peer  # 直接使用已认证的 peer
+        if source_peer:
+            logging.info(f"[peer-event] 处理删除事件: 清理与 {peer_tag} 的连接 (source_node={payload.source_node})")
+
+            # 断开隧道（如果已连接）
+            if source_peer.get("tunnel_status") == "connected":
+                try:
+                    from peer_tunnel_manager import disconnect_peer_tunnel
+                    disconnect_peer_tunnel(db, peer_tag)
+                    result["actions_taken"].append(f"disconnected tunnel to {peer_tag}")
+                except Exception as e:
+                    logging.error(f"[peer-event] 断开隧道失败: {e}")
+
+            # 添加墓碑，防止对方重连 (L-2: 错误不应阻止删除操作)
+            try:
+                db.add_peer_tombstone(
+                    tag=peer_tag,
+                    deleted_by=payload.source_node,  # 记录原始 source_node 供审计
+                    reason=payload.reason or "remote_delete"
+                )
+                result["actions_taken"].append(f"tombstoned {peer_tag}")
+            except Exception as e:
+                logging.exception(f"[peer-event] 添加墓碑失败 (非致命): {e}")
+                result["actions_taken"].append(f"tombstone failed for {peer_tag}")
+
+            # 删除本地 peer_node 记录
+            db.delete_peer_node(peer_tag)
+            result["actions_taken"].append(f"deleted peer_node {peer_tag}")
+
+        result["message"] = f"Processed delete event from {peer_tag} (source={payload.source_node})"
+
+    elif payload.event_type == "disconnect":
+        # 对方断开连接（可能重连）
+        # 同样使用 peer_tag 而不是 payload.source_node
+        source_peer = authenticated_peer
+        if source_peer:
+            logging.info(f"[peer-event] 处理断开事件: 更新 {peer_tag} 状态 (source_node={payload.source_node})")
+            db.update_peer_node(peer_tag, tunnel_status="disconnected")
+            result["actions_taken"].append(f"updated status of {peer_tag}")
+
+        result["message"] = f"Processed disconnect event from {payload.source_node}"
+
+    elif payload.event_type == "broadcast":
+        # 广播事件：某节点不可用 (target_node 已在 Step 2 验证)
+        logging.info(f"[peer-event] 处理广播事件: {payload.target_node} 不可用 (来自 {payload.source_node})")
+
+        # 检查我们是否有到 target_node 的连接
+        target_peer = db.get_peer_node(payload.target_node)
+        if target_peer:
+            # 更新状态为 disconnected
+            db.update_peer_node(payload.target_node, tunnel_status="disconnected")
+            result["actions_taken"].append(f"marked {payload.target_node} as disconnected")
+
+        # 添加墓碑 (L-2: 错误不应阻止广播处理)
+        try:
+            db.add_peer_tombstone(
+                tag=payload.target_node,
+                deleted_by=payload.source_node,
+                reason=payload.reason or "broadcast_notification"
+            )
+            result["actions_taken"].append(f"tombstoned {payload.target_node}")
+        except Exception as e:
+            logging.exception(f"[peer-event] 添加墓碑失败 (非致命): {e}")
+            result["actions_taken"].append(f"tombstone failed for {payload.target_node}")
+
+        result["message"] = f"Processed broadcast: {payload.target_node} unavailable"
+
+    elif payload.event_type == "port_change":
+        # Phase B: 对方节点的 API 端口变更了
+        # 从 details 中提取新端口，更新本地记录，使缓存失效
+        new_port = None
+        if payload.details and isinstance(payload.details, dict):
+            new_port = payload.details.get("new_port")
+
+        # Phase B 审核修复: 添加 bool 类型排除 (与 Phase A 保持一致)
+        if not new_port or not isinstance(new_port, int) or isinstance(new_port, bool) or new_port < 1 or new_port > 65535:
+            logging.warning(f"[peer-event] port_change 事件缺少有效的 new_port: {payload.details}")
+            result["success"] = False
+            result["message"] = "port_change event requires valid new_port in details"
+        else:
+            logging.info(f"[peer-event] 处理端口变更事件: {peer_tag} 新端口 {new_port}")
+
+            # 更新本地 peer_node 的 api_port
+            db.update_peer_node(peer_tag, api_port=new_port)
+            result["actions_taken"].append(f"updated api_port of {peer_tag} to {new_port}")
+
+            # 使 TunnelAPIClientManager 缓存失效
+            try:
+                from tunnel_api_client import TunnelAPIClientManager
+                client_mgr = TunnelAPIClientManager(db)
+                client_mgr.invalidate_client(peer_tag)
+                result["actions_taken"].append(f"invalidated client cache for {peer_tag}")
+            except Exception as e:
+                logging.warning(f"[peer-event] 清除客户端缓存失败: {e}")
+
+            result["message"] = f"Processed port_change: {peer_tag} now uses port {new_port}"
+
+    # Step 7: 继续广播给其他连接的 peer（如果 TTL > 0）
+    if payload.ttl > 0 and payload.event_type in ("delete", "broadcast"):
+        def _broadcast_to_peers():
+            """后台线程：将事件广播给其他连接的 peer"""
+            try:
+                from tunnel_api_client import TunnelAPIClient
+
+                # 获取新的数据库连接（避免线程安全问题，不使用闭包捕获的 db）
+                thread_db = get_db(_GEOIP_PATH, _USER_DB_PATH)
+
+                broadcast_target = payload.target_node or payload.source_node
+                new_ttl = payload.ttl - 1
+
+                for other_peer in thread_db.get_peer_nodes():
+                    other_tag = other_peer.get("tag")
+
+                    # 跳过：自己、事件源、事件目标
+                    if other_tag in (payload.source_node, broadcast_target, peer_tag):
+                        continue
+
+                    # 跳过未连接的 peer
+                    if other_peer.get("tunnel_status") != "connected":
+                        continue
+
+                    try:
+                        # Phase A: 动态构建隧道 API 端点
+                        tunnel_api = _get_peer_tunnel_endpoint(other_peer)
+                        if not tunnel_api:
+                            continue
+
+                        tunnel_type = other_peer.get("tunnel_type", "wireguard")
+                        socks_port = other_peer.get("xray_socks_port") if tunnel_type == "xray" else None
+
+                        client = TunnelAPIClient(
+                            base_url=f"http://{tunnel_api}",
+                            tunnel_type=tunnel_type,
+                            socks_port=socks_port,
+                            timeout=10
+                        )
+
+                        # 发送广播事件
+                        broadcast_event = {
+                            "event_id": str(uuid.uuid4()),  # 新的事件 ID
+                            "event_type": "broadcast",
+                            "source_node": payload.source_node,  # 保持原始来源
+                            "target_node": broadcast_target,
+                            "ttl": new_ttl,
+                            "reason": payload.reason
+                        }
+
+                        resp = client.post("/api/peer-tunnel/peer-event", json=broadcast_event)
+                        if resp.get("success"):
+                            logging.info(f"[peer-event] 广播成功: {other_tag}")
+                        else:
+                            logging.warning(f"[peer-event] 广播失败: {other_tag}: {resp.get('message')}")
+
+                    except Exception as e:
+                        # M-2: 使用 exception() 记录完整堆栈
+                        logging.exception(f"[peer-event] 广播到 {other_tag} 失败: {e}")
+
+            except Exception as e:
+                # M-2: 后台线程异常需要完整堆栈跟踪以便调试
+                logging.exception(f"[peer-event] 广播线程异常: {e}")
+
+        # 在后台线程中执行广播
+        Thread(target=_broadcast_to_peers, daemon=True).start()
+        result["broadcast_scheduled"] = True
+
+    logging.info(f"[peer-event] 处理完成: {result}")
+    return result
+
+
 # ============ Peer Notification Helpers ============
+
+
+def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str, Any]) -> bool:
+    """Phase 11.2/11.3: 触发双向自动连接 (WireGuard/Xray)
+
+    在配对完成后自动执行：
+    1. 建立到远程节点的隧道连接
+    2. 通过隧道调用远程节点的 /api/peer-tunnel/reverse-setup API
+    3. 远程节点收到请求后也建立到本节点的连接
+    4. 双向连接完成
+
+    对于 WireGuard：直接通过隧道 IP 发起 HTTP 请求
+    对于 Xray：通过 SOCKS5 代理发起 HTTP 请求
+
+    Args:
+        db: 数据库实例
+        node_tag: 新创建的节点标识符
+        pending_request: 包含本节点信息的 pending_request
+
+    Returns:
+        是否成功建立双向连接
+    """
+    import requests
+    from peer_tunnel_manager import PeerTunnelManager
+
+    node = db.get_peer_node(node_tag)
+    if not node:
+        logging.error(f"[bidirectional] 节点 '{node_tag}' 不存在")
+        return False
+
+    tunnel_type = node.get("tunnel_type", "wireguard")
+
+    # PSK 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
+    # 不再需要 PSK 验证
+
+    logging.info(f"[bidirectional] 开始双向自动连接: 节点 '{node_tag}', 类型={tunnel_type}")
+
+    # Step 1: 建立到远程节点的隧道
+    try:
+        manager = PeerTunnelManager()
+        connect_success = manager.connect_node(node_tag)
+        if not connect_success:
+            logging.warning(f"[bidirectional] 节点 '{node_tag}' 连接失败")
+            db.update_peer_node(node_tag, bidirectional_status="outbound_only")
+            return False
+        logging.info(f"[bidirectional] 节点 '{node_tag}' 出站隧道已建立")
+    except Exception as e:
+        logging.error(f"[bidirectional] 建立隧道异常: {e}")
+        db.update_peer_node(node_tag, bidirectional_status="outbound_only")
+        return False
+
+    # 刷新节点数据（连接后会更新隧道信息）
+    node = db.get_peer_node(node_tag)
+
+    # Step 2: 通过外网 endpoint 调用 reverse-setup API
+    # 注意：不能用 tunnel_api_endpoint，因为此时对方的隧道接口还不存在！
+    # 我们需要用对方的外网 IP + API 端口
+    endpoint = node.get("endpoint", "")  # 格式: IP:WG_PORT (如 10.1.100.12:36300)
+
+    if not endpoint:
+        logging.warning(f"[bidirectional] 节点 '{node_tag}' 缺少 endpoint")
+        db.update_peer_node(node_tag, bidirectional_status="outbound_only")
+        return False
+
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    remote_ip, api_port = _derive_api_port_from_endpoint(endpoint, node)
+
+    reverse_setup_url = f"http://{remote_ip}:{api_port}/api/peer-tunnel/reverse-setup"
+    logging.info(f"[bidirectional] 使用外网地址调用 reverse-setup: {reverse_setup_url}")
+
+    # 准备请求参数
+    local_tag = pending_request.get("node_tag", "unknown")
+    local_endpoint = pending_request.get("endpoint", "")
+    local_wg_public_key = pending_request.get("wg_public_key", "")
+    tunnel_local_ip = node.get("tunnel_local_ip", "")
+
+    payload = {
+        "psk": "",  # PSK 已废弃 - WireGuard 用隧道 IP 认证
+        "node_id": local_tag,
+        "endpoint": local_endpoint,
+        "wg_public_key": local_wg_public_key,
+        "tunnel_local_ip": tunnel_local_ip,
+    }
+
+    # 根据隧道类型选择请求方式
+    proxies = None
+    if tunnel_type == "xray":
+        # Phase 11.3: Xray 通过 SOCKS5 代理发起请求
+        xray_socks_port = node.get("xray_socks_port")
+        # HIGH 修复: SOCKS 端口验证
+        if not xray_socks_port or not (1 <= xray_socks_port <= 65535):
+            logging.warning(f"[bidirectional] 节点 '{node_tag}' Xray 隧道 SOCKS 端口无效: {xray_socks_port}")
+            db.update_peer_node(node_tag, bidirectional_status="outbound_only")
+            return False
+        proxies = {
+            "http": f"socks5h://127.0.0.1:{xray_socks_port}",
+            "https": f"socks5h://127.0.0.1:{xray_socks_port}",
+        }
+        logging.info(f"[bidirectional] 使用 SOCKS5 代理 (端口 {xray_socks_port}) 调用 reverse-setup")
+
+    try:
+        logging.info(f"[bidirectional] 调用 reverse-setup API: {reverse_setup_url}")
+        response = requests.post(
+            reverse_setup_url,
+            json=payload,
+            timeout=30,
+            proxies=proxies,
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                db.update_peer_node(node_tag, bidirectional_status="bidirectional")
+                logging.info(f"[bidirectional] 节点 '{node_tag}' 双向连接成功")
+                return True
+            else:
+                logging.warning(f"[bidirectional] reverse-setup 返回失败: {result.get('message')}")
+        else:
+            logging.warning(f"[bidirectional] reverse-setup 请求失败: HTTP {response.status_code}")
+
+    except requests.exceptions.Timeout:
+        logging.warning(f"[bidirectional] reverse-setup 请求超时")
+    except requests.exceptions.ProxyError as e:
+        # HIGH 修复: 显式捕获 SOCKS5 代理错误（隧道未连接、Xray 未运行等）
+        logging.warning(f"[bidirectional] reverse-setup SOCKS5 代理错误 (隧道可能未连接): {e}")
+    except requests.exceptions.ConnectionError as e:
+        logging.warning(f"[bidirectional] reverse-setup 连接错误: {e}")
+    except Exception as e:
+        logging.error(f"[bidirectional] reverse-setup 异常: {e}")
+
+    # 反向连接失败，但出站连接已建立
+    db.update_peer_node(node_tag, bidirectional_status="outbound_only")
+    return False
+
+
+def _check_and_update_bidirectional_status(db, tag: str) -> str:
+    """Phase 11-Fix.B: 检查并更新双向连接状态
+
+    在手动连接成功后调用，检测是否建立了双向连接。
+
+    WireGuard 隧道: 一旦密钥交换完成且隧道连接，就是双向的
+    Xray 隧道: 需要检查 inbound_enabled 状态
+
+    Args:
+        db: 数据库实例
+        tag: 节点标识
+
+    Returns:
+        更新后的 bidirectional_status ('pending', 'outbound_only', 'bidirectional')
+    """
+    node = db.get_peer_node(tag)
+    if not node:
+        logging.warning(f"[bidirectional-check] 节点 '{tag}' 不存在")
+        return "pending"
+
+    current_status = node.get("bidirectional_status", "pending")
+    tunnel_status = node.get("tunnel_status")
+    tunnel_type = node.get("tunnel_type", "wireguard")
+
+    # 如果隧道未连接，状态保持 pending
+    if tunnel_status != "connected":
+        logging.debug(f"[bidirectional-check] 节点 '{tag}' 隧道未连接，状态保持 {current_status}")
+        return current_status
+
+    # 根据隧道类型确定双向状态
+    if tunnel_type == "wireguard":
+        # WireGuard 隧道: 密钥交换完成后，双方都有对方的公钥，隧道本身就是双向的
+        # 只需检查是否有对方的公钥（表示密钥交换成功）
+        wg_peer_public_key = node.get("wg_peer_public_key")
+        if wg_peer_public_key:
+            new_status = "bidirectional"
+        else:
+            # 没有对方公钥说明密钥交换未完成
+            new_status = "outbound_only"
+    else:
+        # Xray 隧道: 需要检查 inbound_enabled 状态
+        inbound_enabled = node.get("inbound_enabled", False)
+        if inbound_enabled:
+            new_status = "bidirectional"
+        else:
+            new_status = "outbound_only"
+
+    if new_status != current_status:
+        logging.info(f"[bidirectional-check] 节点 '{tag}' ({tunnel_type}) 状态更新: {current_status} -> {new_status}")
+        db.update_peer_bidirectional_status(tag, new_status)
+    else:
+        logging.debug(f"[bidirectional-check] 节点 '{tag}' 状态不变: {current_status}")
+
+    return new_status
 
 
 def _notify_peer_connected(db, node: dict) -> bool:
@@ -10279,18 +11682,8 @@ def _notify_peer_connected(db, node: dict) -> bool:
         logging.warning(f"[peer-notify] 解密 PSK 失败: {e}")
         return False
 
-    # 从 endpoint 推导 API URL
-    # endpoint 格式: host:wg_port, API 端口 = wg_port - 100
-    if ":" in endpoint:
-        host, wg_port_str = endpoint.rsplit(":", 1)
-        try:
-            wg_port = int(wg_port_str)
-            api_port = wg_port - 100
-        except ValueError:
-            api_port = 36000
-    else:
-        host = endpoint
-        api_port = 36000
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    host, api_port = _derive_api_port_from_endpoint(endpoint, node)
 
     notify_url = f"http://{host}:{api_port}/api/peer-notify/connected"
 
@@ -10351,17 +11744,8 @@ def _notify_peer_disconnected(db, node: dict) -> bool:
     except ValueError:
         return False
 
-    # 从 endpoint 推导 API URL
-    if ":" in endpoint:
-        host, wg_port_str = endpoint.rsplit(":", 1)
-        try:
-            wg_port = int(wg_port_str)
-            api_port = wg_port - 100
-        except ValueError:
-            api_port = 36000
-    else:
-        host = endpoint
-        api_port = 36000
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    host, api_port = _derive_api_port_from_endpoint(endpoint, node)
 
     notify_url = f"http://{host}:{api_port}/api/peer-notify/disconnected"
 
@@ -10449,21 +11833,13 @@ def _forward_downstream_disconnected(
         logging.warning(f"[cascade-notify] 无法转发: 缺少 upstream_endpoint")
         return False
 
-    # 解析端点
-    if ":" in upstream_endpoint:
-        host, port = upstream_endpoint.rsplit(":", 1)
-        try:
-            api_port = int(port)
-        except ValueError:
-            api_port = 36000
-    else:
-        host = upstream_endpoint
-        api_port = 36000
-
     # 获取本节点配置的 PSK 用于与上游通信
     # 注意：这里需要找到对应的本地节点配置来获取 PSK
     upstream_node_tag = upstream_reg.get("upstream_node_tag", "")
     local_node = db.get_peer_node(upstream_node_tag) if upstream_node_tag else None
+
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    host, api_port = _derive_api_port_from_endpoint(upstream_endpoint, local_node)
 
     if not local_node:
         logging.warning(f"[cascade-notify] 无法转发: 未找到上游节点 '{upstream_node_tag}'")
@@ -10514,7 +11890,7 @@ def _get_local_api_endpoint() -> str:
     import socket
 
     # 从设置中读取
-    settings = _load_settings()
+    settings = load_settings()
     server_endpoint = settings.get("server_endpoint", "")
     if server_endpoint:
         # 确保有端口
@@ -10928,6 +12304,740 @@ def api_peer_chain_unregister(request: Request, payload: ChainUnregisterRequest)
     return {"status": "unregistered" if deleted else "not_found", "chain_id": payload.chain_id}
 
 
+# ============ Phase 3: 隧道 API 通信 ============
+# 这些端点通过已建立的隧道访问
+# - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
+# - Xray 隧道：通过 X-Peer-UUID header 验证
+
+
+def _find_peer_by_tunnel_ip(db, client_ip: str) -> Optional[Dict]:
+    """通过隧道 IP 查找 peer 节点
+
+    WireGuard 隧道的身份验证：隧道 IP 即身份。
+    只有持有正确私钥的节点才能建立隧道，所以来自隧道 IP 的请求必然来自配对的节点。
+
+    Args:
+        db: 数据库连接
+        client_ip: 请求来源 IP
+
+    Returns:
+        找到的节点信息 dict，或 None
+    """
+    all_nodes = db.get_peer_nodes()
+    for node in all_nodes:
+        tunnel_remote_ip = node.get("tunnel_remote_ip", "")
+        if tunnel_remote_ip:
+            # tunnel_remote_ip 格式: "10.200.200.242/30" 或 "10.200.200.242"
+            tunnel_ip_clean = tunnel_remote_ip.split("/")[0]
+            if tunnel_ip_clean == client_ip:
+                return node
+    return None
+
+
+def _find_peer_by_uuid(db, peer_uuid: str) -> Optional[Dict]:
+    """通过 UUID 查找 peer 节点
+
+    Xray 隧道的身份验证：使用 peer 的 inbound_uuid 或 xray_uuid。
+
+    Args:
+        db: 数据库连接
+        peer_uuid: X-Peer-UUID header 中的 UUID
+
+    Returns:
+        找到的节点信息 dict，或 None
+    """
+    if not peer_uuid:
+        return None
+
+    all_nodes = db.get_peer_nodes()
+    for node in all_nodes:
+        # 检查 inbound_uuid（对方用来连接我们的 UUID）
+        if node.get("inbound_uuid") == peer_uuid:
+            return node
+        # 检查 xray_uuid（我们用来连接对方的 UUID，对方可能用它来标识自己）
+        if node.get("xray_uuid") == peer_uuid:
+            return node
+    return None
+
+
+def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
+    """验证隧道内 API 请求
+
+    根据隧道类型使用不同的认证方式：
+    - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
+    - Xray 隧道：通过 X-Peer-UUID header 验证
+
+    Args:
+        request: FastAPI 请求对象
+        db: 数据库连接
+
+    Returns:
+        认证成功返回节点信息 dict，失败返回 None
+    """
+    client_ip = _get_client_ip(request)
+
+    # 方式 1: WireGuard 隧道 - 通过 tunnel_remote_ip 验证
+    node = _find_peer_by_tunnel_ip(db, client_ip)
+    if node:
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        if tunnel_type == "wireguard":
+            # WireGuard 隧道：IP 即身份，无需额外验证
+            if node.get("tunnel_status") == "connected":
+                logging.debug(f"[tunnel-api] WireGuard 认证成功: {node['tag']} (IP: {client_ip})")
+                return node
+            else:
+                logging.warning(f"[tunnel-api] WireGuard 隧道未连接: {node['tag']}")
+                return None
+
+    # 方式 2: Xray 隧道 - 通过 X-Peer-UUID header 验证
+    peer_uuid = request.headers.get("X-Peer-UUID")
+    if peer_uuid:
+        node = _find_peer_by_uuid(db, peer_uuid)
+        if node:
+            tunnel_type = node.get("tunnel_type", "wireguard")
+            if tunnel_type == "xray":
+                if node.get("tunnel_status") == "connected":
+                    logging.debug(f"[tunnel-api] Xray 认证成功: {node['tag']} (UUID: {peer_uuid[:8]}...)")
+                    return node
+                else:
+                    logging.warning(f"[tunnel-api] Xray 隧道未连接: {node['tag']}")
+                    return None
+
+    # 方式 3: 兼容旧版 - 尝试通过 endpoint IP 查找（外部直连场景）
+    node = _find_peer_node_by_ip(db, client_ip)
+    if node and node.get("tunnel_status") == "connected":
+        logging.debug(f"[tunnel-api] Endpoint IP 认证成功: {node['tag']} (IP: {client_ip})")
+        return node
+
+    logging.warning(f"[tunnel-api] 认证失败 (from {client_ip}, UUID: {peer_uuid or 'none'})")
+    return None
+
+
+# 保留旧函数名作为别名，方便渐进式迁移
+_verify_psk_header = _verify_tunnel_request
+
+
+@app.get("/api/peer-info/egress")
+def api_peer_info_egress(request: Request):
+    """获取本节点的可用出口列表
+
+    供远程节点通过隧道查询，用于链路终端出口选择。
+
+    认证方式: X-PSK header
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证 PSK
+    node = _verify_psk_header(request, db)
+    if not node:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(f"[tunnel-api] 获取出口列表请求: from {node['tag']} ({client_ip})")
+
+    # 收集所有可用出口
+    egress_list = []
+
+    # 1. PIA profiles
+    for profile in db.get_pia_profiles(enabled_only=True):
+        egress_list.append({
+            "tag": profile["name"],
+            "name": profile.get("description") or profile["name"],
+            "type": "pia",
+            "enabled": True,
+            "description": f"PIA {profile.get('region_id', 'Unknown')}",
+        })
+
+    # 2. Custom WireGuard
+    for egress in db.get_custom_egress_list(enabled_only=True):
+        egress_list.append({
+            "tag": egress["tag"],
+            "name": egress.get("description") or egress["tag"],
+            "type": "custom",
+            "enabled": True,
+            "description": "Custom WireGuard",
+        })
+
+    # 3. Direct egress
+    for egress in db.get_direct_egress_list(enabled_only=True):
+        egress_list.append({
+            "tag": egress["tag"],
+            "name": egress.get("description") or egress["tag"],
+            "type": "direct",
+            "enabled": True,
+            "description": f"Direct ({egress.get('bind_interface') or egress.get('inet4_bind_address', '')})",
+        })
+
+    # 4. OpenVPN egress
+    for egress in db.get_openvpn_egress_list(enabled_only=True):
+        egress_list.append({
+            "tag": egress["tag"],
+            "name": egress.get("description") or egress["tag"],
+            "type": "openvpn",
+            "enabled": True,
+            "description": f"OpenVPN {egress.get('remote_host', '')}",
+        })
+
+    # 5. V2Ray egress
+    for egress in db.get_v2ray_egress_list(enabled_only=True):
+        egress_list.append({
+            "tag": egress["tag"],
+            "name": egress.get("description") or egress["tag"],
+            "type": "v2ray",
+            "enabled": True,
+            "description": f"V2Ray {egress.get('protocol', '')}",
+        })
+
+    # 6. WARP egress
+    for egress in db.get_warp_egress_list(enabled_only=True):
+        egress_list.append({
+            "tag": egress["tag"],
+            "name": egress.get("description") or egress["tag"],
+            "type": "warp",
+            "enabled": True,
+            "description": f"WARP {egress.get('protocol', '')}",
+        })
+
+    # 7. 添加内置 direct 出口
+    egress_list.append({
+        "tag": "direct",
+        "name": "Direct",
+        "type": "direct",
+        "enabled": True,
+        "description": "Default direct connection",
+    })
+
+    logging.info(f"[tunnel-api] 返回 {len(egress_list)} 个可用出口给节点 '{node['tag']}'")
+    return {"egress": egress_list, "node_tag": node["tag"]}
+
+
+# 链路路由有效标记类型
+VALID_MARK_TYPES = {"dscp", "xray_email"}
+
+# 标签名称正则：小写字母开头，允许小写字母、数字、连字符，最长64字符
+TAG_PATTERN = r"^[a-z][a-z0-9-]{0,63}$"
+
+# Phase 11-Fix.J: 不能作为链路终端出口的 egress 类型
+# 这些 outbound 没有 bind_interface，无法用于 DSCP 路由
+INVALID_CHAIN_TERMINAL_EGRESS = frozenset({"direct", "block", "adblock"})
+
+
+def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = False):
+    """验证 egress 是否可作为链路终端出口
+
+    Args:
+        egress_tag: 出口标识
+        for_tunnel_api: 若为 True，返回 dict 而非抛出 HTTPException
+
+    Returns:
+        for_tunnel_api=True 时返回 dict 或 None
+        for_tunnel_api=False 时无返回值或抛出异常
+    """
+    if egress_tag in INVALID_CHAIN_TERMINAL_EGRESS:
+        msg_en = (f"'{egress_tag}' cannot be used as chain terminal egress - "
+                  "requires interface binding (PIA/Custom WireGuard/OpenVPN)")
+        msg_zh = (f"'{egress_tag}' 不能作为链路终端出口 - "
+                  "请选择具有网络接口的出口 (PIA/Custom WireGuard/OpenVPN)")
+
+        if for_tunnel_api:
+            return {"success": False, "message": msg_en}
+        raise HTTPException(status_code=400, detail=msg_zh)
+    return None
+
+
+class ChainRoutingRegisterRequest(BaseModel):
+    """链路路由注册请求"""
+    chain_tag: str = Field(
+        ..., pattern=TAG_PATTERN,
+        description="链路标识 (小写字母开头，允许小写字母、数字、连字符)"
+    )
+    mark_value: int = Field(
+        ..., ge=1, le=63,
+        description="标记值 (DSCP: 1-63)"
+    )
+    mark_type: str = Field(
+        default="dscp",
+        pattern=r"^(dscp|xray_email)$",
+        description="标记类型 (dscp 或 xray_email)"
+    )
+    egress_tag: str = Field(
+        ..., pattern=TAG_PATTERN,
+        description="出口标识 (小写字母开头)"
+    )
+    source_node: Optional[str] = Field(
+        default=None, pattern=TAG_PATTERN,
+        description="来源节点标识"
+    )
+    # Phase 11-Fix.E: 支持转发注册到目标节点（用于传递模式）
+    target_node: Optional[str] = Field(
+        default=None, pattern=TAG_PATTERN,
+        description="目标节点（如果指定，将转发注册到该节点）"
+    )
+
+
+@app.post("/api/chain-routing/register")
+def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRequest):
+    """注册链路路由
+
+    当入口节点激活多跳链路时，在终端节点注册 DSCP/email 到出口的映射。
+    终端节点根据此映射选择正确的本地出口。
+
+    Phase 11-Fix.E: 支持 target_node 参数，当指定时将转发注册到目标节点。
+
+    认证方式: X-PSK header
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证 PSK
+    node = _verify_psk_header(request, db)
+    if not node:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    # Phase 11-Fix.E: 如果指定了 target_node，转发注册到目标节点
+    if payload.target_node:
+        logging.info(
+            f"[tunnel-api] 链路路由转发注册: chain={payload.chain_tag}, "
+            f"target={payload.target_node}, from {node['tag']} ({client_ip})"
+        )
+
+        # 获取目标节点信息
+        target_peer = db.get_peer_node(payload.target_node)
+        if not target_peer:
+            return {"success": False, "message": f"Target node '{payload.target_node}' not found"}
+
+        if target_peer.get("tunnel_status") != "connected":
+            return {"success": False, "message": f"Target node '{payload.target_node}' not connected"}
+
+        # 转发注册到目标节点
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+
+            target_client_mgr = TunnelAPIClientManager(db)
+            target_client = target_client_mgr.get_client(payload.target_node)
+
+            if not target_client:
+                return {"success": False, "message": f"Cannot create client for target '{payload.target_node}'"}
+
+            # 转发时不再带 target_node 参数，防止无限循环
+            success = target_client.register_chain_route(
+                chain_tag=payload.chain_tag,
+                mark_value=payload.mark_value,
+                egress_tag=payload.egress_tag,
+                mark_type=payload.mark_type,
+                source_node=payload.source_node or node["tag"],
+                target_node=None,  # 不再转发
+            )
+
+            if success:
+                logging.info(f"[tunnel-api] 链路路由转发成功: -> {payload.target_node}")
+                return {"success": True, "message": f"Chain route forwarded to '{payload.target_node}'"}
+            else:
+                return {"success": False, "message": f"Failed to forward to '{payload.target_node}'"}
+
+        except Exception as e:
+            logging.error(f"[tunnel-api] 链路路由转发失败: {e}")
+            return {"success": False, "message": f"Forward error: {str(e)}"}
+
+    logging.info(
+        f"[tunnel-api] 链路路由注册: chain={payload.chain_tag}, "
+        f"mark={payload.mark_value}, egress={payload.egress_tag}, "
+        f"from {node['tag']} ({client_ip})"
+    )
+
+    # 验证 egress_tag 存在
+    all_egress_tags = db.get_all_egress_tags()
+    all_egress_tags.add("direct")  # 添加内置 direct
+    if payload.egress_tag not in all_egress_tags:
+        logging.warning(f"[tunnel-api] 出口不存在: {payload.egress_tag}")
+        return {"success": False, "message": f"Egress '{payload.egress_tag}' not found"}
+
+    # Phase 11-Fix.J: 拒绝无法用于 DSCP 路由的出口类型
+    validation_result = _validate_chain_terminal_egress(payload.egress_tag, for_tunnel_api=True)
+    if validation_result:
+        logging.warning(f"[tunnel-api] 拒绝无效终端出口: {payload.egress_tag}")
+        return validation_result
+
+    try:
+        # Phase 11-Fix.I: 原子事务模式 - DB 写入 + iptables 规则必须同时成功
+        # Step 1: 写入数据库
+        db.add_or_update_chain_routing(
+            chain_tag=payload.chain_tag,
+            mark_value=payload.mark_value,
+            egress_tag=payload.egress_tag,
+            mark_type=payload.mark_type,
+            source_node=payload.source_node or node["tag"],
+        )
+        logging.info(
+            f"[tunnel-api] 链路路由 DB 写入成功: chain={payload.chain_tag}, "
+            f"mark={payload.mark_value} -> {payload.egress_tag}"
+        )
+
+        # Step 2: 应用 iptables/ip 路由规则
+        try:
+            from chain_route_manager import get_chain_route_manager
+
+            chain_route_mgr = get_chain_route_manager(db)
+            route_applied = chain_route_mgr.add_route(
+                chain_tag=payload.chain_tag,
+                mark_value=payload.mark_value,
+                egress_tag=payload.egress_tag,
+                mark_type=payload.mark_type,
+                source_node=payload.source_node or node["tag"],
+            )
+
+            if not route_applied:
+                # iptables 失败，回滚 DB
+                logging.error(
+                    f"[tunnel-api] iptables 规则应用失败，回滚 DB: "
+                    f"chain={payload.chain_tag}, egress={payload.egress_tag}"
+                )
+                try:
+                    db.delete_chain_routing(
+                        chain_tag=payload.chain_tag,
+                        mark_value=payload.mark_value,
+                        mark_type=payload.mark_type,
+                    )
+                except Exception as rollback_err:
+                    logging.critical(
+                        f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
+                    )
+                return {
+                    "success": False,
+                    "message": f"Failed to apply iptables rules for egress '{payload.egress_tag}'"
+                }
+
+            logging.info(
+                f"[tunnel-api] 链路路由注册完成（DB + iptables）: "
+                f"chain={payload.chain_tag}, mark={payload.mark_value}"
+            )
+            return {"success": True, "message": "Chain route registered", "iptables_applied": True}
+
+        except ImportError as e:
+            # chain_route_manager 模块不可用，回滚 DB
+            logging.error(f"[tunnel-api] chain_route_manager 导入失败: {e}")
+            try:
+                db.delete_chain_routing(
+                    chain_tag=payload.chain_tag,
+                    mark_value=payload.mark_value,
+                    mark_type=payload.mark_type,
+                )
+            except Exception as rollback_err:
+                logging.critical(
+                    f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
+                )
+            return {"success": False, "message": "Chain route manager unavailable"}
+        except Exception as e:
+            # 其他异常，回滚 DB
+            logging.error(f"[tunnel-api] iptables 应用异常: {e}")
+            try:
+                db.delete_chain_routing(
+                    chain_tag=payload.chain_tag,
+                    mark_value=payload.mark_value,
+                    mark_type=payload.mark_type,
+                )
+            except Exception as rollback_err:
+                logging.critical(
+                    f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
+                )
+            return {"success": False, "message": f"iptables error: {str(e)}"}
+
+    except sqlite3.IntegrityError as e:
+        logging.error(f"[tunnel-api] 链路路由数据库约束错误: {e}")
+        return {"success": False, "message": "Database constraint error"}
+    except sqlite3.OperationalError as e:
+        logging.error(f"[tunnel-api] 链路路由数据库操作错误: {e}")
+        return {"success": False, "message": "Database operation error"}
+    except Exception as e:
+        logging.error(f"[tunnel-api] 链路路由注册失败: {e}")
+        return {"success": False, "message": "Failed to register chain route"}
+
+
+@app.delete("/api/chain-routing/unregister")
+def api_chain_routing_unregister(
+    request: Request,
+    chain_tag: str = Query(
+        ..., pattern=TAG_PATTERN,
+        description="链路标识 (小写字母开头)"
+    ),
+    mark_value: int = Query(
+        ..., ge=1, le=63,
+        description="标记值 (1-63)"
+    ),
+    mark_type: str = Query(
+        default="dscp",
+        pattern=r"^(dscp|xray_email)$",
+        description="标记类型 (dscp 或 xray_email)"
+    ),
+    target_node: Optional[str] = Query(
+        default=None,
+        pattern=TAG_PATTERN,
+        description="目标节点 (用于传递模式转发)"
+    ),
+):
+    """注销链路路由
+
+    当链路被停用时，清理终端节点的路由映射。
+
+    认证方式: X-PSK header
+
+    Query Parameters:
+        chain_tag: 链路标识
+        mark_value: 标记值
+        mark_type: 标记类型 (默认 dscp)
+        target_node: 可选的目标节点（传递模式下转发注销请求）
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证 PSK 或 IP 认证
+    node = _verify_psk_header(request, db)
+    if not node:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(
+        f"[tunnel-api] 链路路由注销: chain={chain_tag}, "
+        f"mark={mark_value}, from {node['tag']} ({client_ip})"
+    )
+
+    # Phase 11-Fix.E: 如果指定了 target_node，转发注销到目标节点
+    if target_node:
+        target_peer = db.get_peer_node(target_node)
+        if not target_peer:
+            logging.warning(f"[tunnel-api] 转发注销失败: 目标节点 '{target_node}' 不存在")
+            return {"success": False, "message": f"Target node '{target_node}' not found"}
+
+        if target_peer.get("tunnel_status") != "connected":
+            logging.warning(f"[tunnel-api] 转发注销失败: 目标节点 '{target_node}' 隧道未连接")
+            return {"success": False, "message": f"Target node '{target_node}' tunnel not connected"}
+
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            client_mgr = TunnelAPIClientManager(db)
+            target_client = client_mgr.get_client(target_node)
+
+            if not target_client:
+                return {"success": False, "message": f"Cannot create client for '{target_node}'"}
+
+            logging.info(f"[tunnel-api] 转发链路注销到 '{target_node}'")
+            success = target_client.unregister_chain_route(
+                chain_tag=chain_tag,
+                mark_value=mark_value,
+                mark_type=mark_type,
+                target_node=None,  # 不再转发
+            )
+            return {"success": success, "message": "Forwarded to target node", "target_node": target_node}
+        except Exception as e:
+            logging.error(f"[tunnel-api] 转发注销失败: {e}")
+            return {"success": False, "message": f"Forward failed: {e}"}
+
+    try:
+        # Phase 11-Fix.I: 同时清理 DB 和 iptables 规则
+        deleted = db.delete_chain_routing(
+            chain_tag=chain_tag,
+            mark_value=mark_value,
+            mark_type=mark_type,
+        )
+        if deleted:
+            logging.info(
+                f"[tunnel-api] 链路路由 DB 删除成功: chain={chain_tag}, "
+                f"mark={mark_value}"
+            )
+
+            # 清理 iptables 规则（最佳努力，不影响 DB 删除结果）
+            iptables_cleaned = False
+            try:
+                from chain_route_manager import get_chain_route_manager
+
+                chain_route_mgr = get_chain_route_manager(db)
+                iptables_cleaned = chain_route_mgr.remove_route(
+                    chain_tag=chain_tag,
+                    mark_value=mark_value,
+                    mark_type=mark_type,
+                )
+                if iptables_cleaned:
+                    logging.info(
+                        f"[tunnel-api] iptables 规则清理成功: chain={chain_tag}, "
+                        f"mark={mark_value}"
+                    )
+                else:
+                    logging.warning(
+                        f"[tunnel-api] iptables 规则不存在或清理失败: chain={chain_tag}, "
+                        f"mark={mark_value}"
+                    )
+            except ImportError:
+                logging.warning("[tunnel-api] chain_route_manager 不可用，跳过 iptables 清理")
+            except Exception as e:
+                logging.warning(f"[tunnel-api] iptables 清理异常: {e}")
+
+            return {
+                "success": True,
+                "message": "Chain route unregistered",
+                "iptables_cleaned": iptables_cleaned
+            }
+        else:
+            logging.warning(
+                f"[tunnel-api] 链路路由不存在: chain={chain_tag}, "
+                f"mark={mark_value}"
+            )
+            return {"success": False, "message": "Chain route not found"}
+    except sqlite3.IntegrityError as e:
+        logging.error(f"[tunnel-api] 链路路由注销数据库约束错误: {e}")
+        return {"success": False, "message": "Database constraint error"}
+    except sqlite3.OperationalError as e:
+        logging.error(f"[tunnel-api] 链路路由注销数据库操作错误: {e}")
+        return {"success": False, "message": "Database operation error"}
+    except Exception as e:
+        logging.error(f"[tunnel-api] 链路路由注销失败: {e}")
+        return {"success": False, "message": "Failed to unregister chain route"}
+
+
+@app.get("/api/chain-routing")
+def api_chain_routing_list(request: Request, mark_type: Optional[str] = None):
+    """获取链路路由列表
+
+    获取此节点注册的所有链路路由。
+
+    认证方式: X-PSK header
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证 PSK
+    node = _verify_psk_header(request, db)
+    if not node:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.debug(f"[tunnel-api] 获取链路路由列表: from {node['tag']} ({client_ip})")
+
+    try:
+        routes = db.get_chain_routing_list(mark_type=mark_type)
+        return {
+            "routes": [
+                {
+                    "chain_tag": r["chain_tag"],
+                    "mark_value": r["mark_value"],
+                    "mark_type": r.get("mark_type", "dscp"),
+                    "egress_tag": r["egress_tag"],
+                    "source_node": r.get("source_node"),
+                    "registered_at": r.get("registered_at"),
+                }
+                for r in routes
+            ]
+        }
+    except sqlite3.OperationalError as e:
+        logging.error(f"[tunnel-api] 获取链路路由列表数据库操作错误: {e}")
+        raise HTTPException(status_code=500, detail="Database operation error")
+    except Exception as e:
+        logging.error(f"[tunnel-api] 获取链路路由列表失败: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get chain routing list")
+
+
+# 链路状态有效值
+VALID_CHAIN_STATUSES = {"active", "inactive", "error"}
+
+
+class ChainStatusRequest(BaseModel):
+    """链路状态通知请求"""
+    chain_tag: str = Field(
+        ..., pattern=TAG_PATTERN,
+        description="链路标识 (小写字母开头)"
+    )
+    status: str = Field(
+        ..., pattern=r"^(active|inactive|error)$",
+        description="链路状态 (active/inactive/error)"
+    )
+    message: Optional[str] = Field(
+        default=None, max_length=500,
+        description="可选状态消息"
+    )
+
+
+@app.post("/api/chain-routing/status")
+def api_chain_routing_status(request: Request, payload: ChainStatusRequest):
+    """通知链路状态变更
+
+    用于在链路状态变更时通知相关节点（如中继节点或终端节点）。
+
+    认证方式: X-PSK header
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证 PSK
+    node = _verify_psk_header(request, db)
+    if not node:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(
+        f"[tunnel-api] 链路状态通知: chain={payload.chain_tag}, "
+        f"status={payload.status}, from {node['tag']} ({client_ip})"
+    )
+
+    # 根据状态执行相应操作
+    if payload.status == "inactive":
+        # 链路停用，清理相关路由
+        deleted_count = db.delete_chain_routing_by_chain(payload.chain_tag)
+        logging.info(
+            f"[tunnel-api] 链路停用，清理 {deleted_count} 条路由: chain={payload.chain_tag}"
+        )
+        return {
+            "success": True,
+            "message": f"Chain deactivated, {deleted_count} routes removed",
+        }
+    elif payload.status == "error":
+        # 链路错误，记录日志但不自动清理
+        logging.warning(
+            f"[tunnel-api] 链路错误: chain={payload.chain_tag}, "
+            f"message={payload.message}, from {node['tag']}"
+        )
+        return {"success": True, "message": "Chain error acknowledged"}
+    else:
+        # 链路激活（active），仅记录
+        logging.info(f"[tunnel-api] 链路激活: chain={payload.chain_tag}, from {node['tag']}")
+        return {"success": True, "message": "Chain activated"}
+
+
 def _resolve_hostname(hostname: str) -> Optional[str]:
     """解析主机名为 IP 地址
 
@@ -11147,6 +13257,8 @@ def api_list_peers(enabled_only: bool = False):
         node.pop("psk_hash", None)
         node.pop("psk_encrypted", None)
         node.pop("wg_private_key", None)
+        node.pop("remote_wg_private_key", None)  # Phase 11.1: 预生成密钥不应暴露
+        node.pop("xray_reality_private_key", None)
 
     return {"nodes": nodes, "count": len(nodes)}
 
@@ -11177,6 +13289,8 @@ def api_get_peer(tag: str):
     node.pop("psk_hash", None)
     node.pop("psk_encrypted", None)
     node.pop("wg_private_key", None)
+    node.pop("remote_wg_private_key", None)  # Phase 11.1: 预生成密钥不应暴露
+    node.pop("xray_reality_private_key", None)
 
     return node
 
@@ -11197,10 +13311,38 @@ def api_create_peer(payload: PeerNodeCreateRequest):
     if db.get_peer_node(payload.tag):
         raise HTTPException(status_code=400, detail=f"节点标识 '{payload.tag}' 已存在")
 
+    # Phase 11-Cascade: 检查墓碑（防止删除后立即重建）
+    if db.is_peer_tombstoned(payload.tag):
+        raise HTTPException(
+            status_code=409,
+            detail=f"节点 '{payload.tag}' 处于墓碑期，请等待墓碑过期后再创建"
+        )
+
     # [CR-003/CR-004] 完整验证 endpoint 格式 (host:port)
     is_valid, error_msg, _, _ = _validate_endpoint(payload.endpoint)
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_msg)
+
+    # Phase 11-Fix.D: 端口配置提示
+    # 标准端口: 36300 (peer WireGuard), 36000 (API)
+    # 常见错误: 使用 36100 (WireGuard 入口端口) 而非 36300
+    try:
+        port_str = payload.endpoint.rsplit(":", 1)[1] if ":" in payload.endpoint else ""
+        port = int(port_str) if port_str else 0
+        if port and port not in (36300, 36000):
+            if port == 36100:
+                logging.warning(
+                    f"[peers] 端口配置提示: '{payload.tag}' 使用端口 {port}。"
+                    f"36100 是客户端 WireGuard 入口端口，peer 隧道通常使用 36300。"
+                    f"请确认远程节点的 peer WireGuard 监听端口配置。"
+                )
+            elif port < 36000 or port > 40000:
+                logging.info(
+                    f"[peers] 端口配置提示: '{payload.tag}' 使用非标准端口 {port}。"
+                    f"标准端口: 36300 (peer WireGuard), 36000 (API)。"
+                )
+    except (ValueError, IndexError):
+        pass  # 端口解析失败，跳过警告
 
     # 验证隧道类型
     if payload.tunnel_type not in ("wireguard", "xray"):
@@ -11212,8 +13354,13 @@ def api_create_peer(payload: PeerNodeCreateRequest):
         if payload.default_outbound not in available:
             raise HTTPException(status_code=400, detail=f"出口 '{payload.default_outbound}' 不存在")
 
-    # 使用 bcrypt 哈希 PSK，同时保存原始 PSK 用于发起连接
-    psk_hash = bcrypt.hashpw(payload.psk.encode(), bcrypt.gensalt()).decode()
+    # PSK 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
+    # 保留兼容旧版本的 PSK 处理
+    psk_hash = ""
+    psk_encrypted = None
+    if payload.psk:
+        psk_hash = bcrypt.hashpw(payload.psk.encode(), bcrypt.gensalt()).decode()
+        psk_encrypted = _encrypt_psk(payload.psk)
 
     # 为 Xray 节点自动生成 REALITY 密钥
     xray_reality_private_key = None
@@ -11238,8 +13385,9 @@ def api_create_peer(payload: PeerNodeCreateRequest):
             name=payload.name,
             description=payload.description,
             endpoint=payload.endpoint,
+            api_port=payload.api_port,
             psk_hash=psk_hash,
-            psk_encrypted=_encrypt_psk(payload.psk),  # 加密后存储
+            psk_encrypted=psk_encrypted,  # 已废弃，保留兼容
             tunnel_type=payload.tunnel_type,
             # Xray 协议固定为 VLESS
             xray_protocol="vless",
@@ -11297,6 +13445,8 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
         if not is_valid:
             raise HTTPException(status_code=400, detail=error_msg)
         update_kwargs["endpoint"] = payload.endpoint
+    if payload.api_port is not None:
+        update_kwargs["api_port"] = payload.api_port
     if payload.psk is not None:
         # 重新哈希 PSK 并加密存储
         update_kwargs["psk_hash"] = bcrypt.hashpw(payload.psk.encode(), bcrypt.gensalt()).decode()
@@ -11349,18 +13499,37 @@ def api_update_peer(tag: str, payload: PeerNodeUpdateRequest):
     if not success:
         raise HTTPException(status_code=500, detail="更新节点失败")
 
+    # Phase A 审核修复: 当 api_port 变更时，使客户端缓存失效
+    # 确保后续 API 调用使用新端口
+    if "api_port" in update_kwargs:
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            client_mgr = TunnelAPIClientManager(db)
+            client_mgr.invalidate_client(tag)
+            logging.info(f"[peers] 端口变更，清除客户端缓存: {tag}")
+        except Exception as e:
+            logging.warning(f"[peers] 清除客户端缓存失败: {e}")
+
     updated_node = db.get_peer_node(tag)
     updated_node.pop("psk_hash", None)
+    updated_node.pop("psk_encrypted", None)
     updated_node.pop("wg_private_key", None)
-    updated_node.pop("xray_reality_private_key", None)  # 不返回私钥
+    updated_node.pop("remote_wg_private_key", None)  # Phase 11.1: 预生成密钥不应暴露
+    updated_node.pop("xray_reality_private_key", None)
 
     logging.info(f"[peers] 更新节点 '{tag}'")
     return {"message": f"节点 '{tag}' 已更新", "peer": updated_node}
 
 
 @app.delete("/api/peers/{tag}")
-def api_delete_peer(tag: str):
-    """删除对等节点"""
+def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发送级联删除通知")):
+    """删除对等节点
+
+    Phase 11-Cascade: 支持级联删除通知
+    - 删除前通知目标节点（让对方清理连接）
+    - 删除后广播给所有其他连接的节点
+    - 添加墓碑防止对方重连
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -11381,12 +13550,571 @@ def api_delete_peer(tag: str):
                 detail=f"无法删除: 节点 '{tag}' 被链路 '{chain['tag']}' 使用"
             )
 
+    # Phase 11-Cascade: 获取本节点标识
+    local_node_tag = _get_local_node_tag(db)
+    cascade_results = {"notified_target": False, "broadcast_count": 0}
+
+    # Phase 11-Cascade: 在删除前通知目标节点（如果已连接）
+    if cascade and node.get("tunnel_status") == "connected":
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            api_manager = TunnelAPIClientManager(db)
+
+            # 尝试通知目标节点
+            notified = api_manager.notify_peer_delete(
+                peer_tag=tag,
+                source_node=local_node_tag,
+                reason="local_delete",
+            )
+            cascade_results["notified_target"] = notified
+
+            if notified:
+                logging.info(f"[peers] 级联通知: 已通知 {tag} 删除事件")
+            else:
+                logging.warning(f"[peers] 级联通知: 无法通知 {tag}")
+
+        except Exception as e:
+            logging.warning(f"[peers] 级联通知目标节点失败: {e}")
+
+    # 清理 WireGuard/Xray 隧道接口（无论数据库状态如何，确保内核接口被删除）
+    try:
+        from peer_tunnel_manager import PeerTunnelManager
+        manager = PeerTunnelManager()
+        manager.disconnect_node(tag)
+        logging.info(f"[peers] 删除前清理隧道接口: {tag}")
+    except Exception as e:
+        # 接口可能不存在，忽略错误继续删除
+        logging.debug(f"[peers] 清理隧道接口: {e}")
+
+    # 删除数据库记录
     success = db.delete_peer_node(tag)
     if not success:
         raise HTTPException(status_code=500, detail="删除节点失败")
 
+    # Phase 11-Cascade: 添加墓碑防止对方重连
+    try:
+        db.add_peer_tombstone(
+            tag=tag,
+            deleted_by=local_node_tag,
+            reason="local_delete",
+            ttl_hours=24
+        )
+        logging.info(f"[peers] 添加墓碑: {tag}")
+    except Exception as e:
+        logging.warning(f"[peers] 添加墓碑失败: {e}")
+
+    # Phase 11-Cascade: 广播给所有其他连接的节点
+    if cascade:
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            api_manager = TunnelAPIClientManager(db)
+
+            broadcast_results = api_manager.broadcast_delete_event(
+                deleted_node=tag,
+                source_node=local_node_tag,
+                reason="peer_deleted",
+                ttl=2,  # 广播最多传播 2 跳
+            )
+            cascade_results["broadcast_count"] = sum(1 for v in broadcast_results.values() if v)
+            cascade_results["broadcast_results"] = broadcast_results
+
+            logging.info(f"[peers] 级联广播: 通知 {cascade_results['broadcast_count']} 个节点")
+
+        except Exception as e:
+            logging.warning(f"[peers] 级联广播失败: {e}")
+
+    # 记录删除事件到审计日志
+    try:
+        db.log_peer_event(
+            event_type="delete",
+            peer_tag=tag,
+            from_node=local_node_tag,
+            details={"cascade": cascade, "cascade_results": cascade_results}
+        )
+    except Exception as e:
+        logging.debug(f"[peers] 记录删除事件失败: {e}")
+
     logging.info(f"[peers] 删除节点 '{tag}'")
-    return {"message": f"节点 '{tag}' 已删除"}
+    return {
+        "message": f"节点 '{tag}' 已删除",
+        "cascade": cascade_results if cascade else None
+    }
+
+
+# ============ 离线配对 API ============
+
+@app.post("/api/peer/generate-pair-request", response_model=GeneratePairRequestResponse)
+def api_generate_pair_request(payload: GeneratePairRequestRequest):
+    """生成配对请求码（Phase 11-Tunnel: 隧道优先模式）
+
+    生成配对请求码，同时创建 WireGuard 接口开始监听。
+    这样对端导入配对码后可以直接连接，通过隧道完成握手。
+
+    新流程：
+    1. 验证端点格式
+    2. 生成 WireGuard 密钥对（包括为对端预生成的密钥）
+    3. 分配隧道 IP 子网和监听端口
+    4. 创建 WireGuard 接口并开始监听
+    5. 保存到 pending_pairings 表
+    6. 返回配对码（对端可直接连接）
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    if not HAS_PAIRING:
+        raise HTTPException(status_code=503, detail="Pairing module not available")
+
+    # 验证端点格式 (IP:port 或 域名:port)
+    endpoint = payload.endpoint.strip()
+    if ':' not in endpoint:
+        raise HTTPException(status_code=400, detail="Endpoint must include port (e.g., '10.1.1.1:36300')")
+
+    host, port_str = endpoint.rsplit(':', 1)
+    try:
+        port = int(port_str)
+        if not (1 <= port <= 65535):
+            raise ValueError("Port out of range")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+
+    if not validate_hostname(host):
+        raise HTTPException(status_code=400, detail=f"Invalid hostname: {host}")
+
+    db = _get_db()
+    generator = PairingCodeGenerator(db)
+
+    interface_name = None  # 用于错误时清理
+
+    try:
+        # Step 1: 分配隧道 IP（需要在生成配对码之前，以便包含在配对码中）
+        # Phase 11-Fix.C: 使用确定性分配以避免多节点场景下的冲突
+        local_ip = None
+        remote_ip = None
+        if payload.tunnel_type == "wireguard" and payload.bidirectional and HAS_PENDING_TUNNEL:
+            import socket
+            local_hostname = socket.gethostname()
+            subnet_idx, local_ip, remote_ip = _get_next_peer_tunnel_subnet(
+                db,
+                local_node_tag=local_hostname,
+                remote_node_tag=payload.node_tag
+            )
+            logging.info(f"[pairing] 确定性分配隧道 IP: local={local_ip}, remote={remote_ip} (基于 {local_hostname} <-> {payload.node_tag})")
+
+        # Step 2: 生成配对码和密钥对（包含隧道 IP）
+        # Phase 11-Fix.K: 传递 api_port
+        code, psk, request_obj = generator.generate_pair_request(
+            node_tag=payload.node_tag,
+            node_description=payload.node_description,
+            endpoint=endpoint,
+            tunnel_type=payload.tunnel_type,
+            psk=payload.psk,
+            bidirectional=payload.bidirectional,
+            tunnel_local_ip=local_ip,
+            tunnel_remote_ip=remote_ip,
+            api_port=payload.api_port,
+        )
+
+        # Step 3: 为 WireGuard 隧道创建接口（只有 bidirectional + wireguard 才创建）
+        if payload.tunnel_type == "wireguard" and payload.bidirectional and HAS_PENDING_TUNNEL:
+            # Phase 11-Fix.C: 使用完整 code 生成 pairing_id + 碰撞检测
+            import secrets
+            pairing_id = hashlib.md5(code.encode()).hexdigest()  # 使用完整 code
+            # 碰撞检测：如果已存在相同 pairing_id，添加随机后缀
+            if db.get_pending_pairing(pairing_id):
+                collision_suffix = secrets.token_hex(4)
+                pairing_id = pairing_id[:24] + collision_suffix
+                logging.warning(f"[pairing] pairing_id 碰撞检测: 添加随机后缀 {collision_suffix}")
+
+            # 分配监听端口（使用 endpoint 中指定的端口）
+            listen_port = port
+
+            # 获取密钥
+            private_key = getattr(request_obj, '_private_key', None)
+            remote_public_key = request_obj.remote_wg_public_key
+
+            if not private_key or not remote_public_key:
+                raise ValueError("缺少 WireGuard 密钥")
+
+            # 创建 WireGuard 接口
+            success, interface_name, error = create_pending_wireguard_interface(
+                pairing_id=pairing_id,
+                local_ip=local_ip,
+                remote_ip=remote_ip,
+                listen_port=listen_port,
+                private_key=private_key,
+                expected_peer_public_key=remote_public_key,
+            )
+
+            if not success:
+                raise ValueError(f"创建 WireGuard 接口失败: {error}")
+
+            # 保存到 pending_pairings 表
+            db.add_pending_pairing(
+                pairing_id=pairing_id,
+                local_tag=payload.node_tag,
+                local_endpoint=endpoint,
+                tunnel_type=payload.tunnel_type,
+                tunnel_local_ip=local_ip,
+                tunnel_remote_ip=remote_ip,
+                tunnel_port=listen_port,
+                wg_private_key=private_key,
+                wg_public_key=request_obj.wg_public_key,
+                remote_wg_private_key=request_obj.remote_wg_private_key,
+                remote_wg_public_key=remote_public_key,
+                interface_name=interface_name,
+            )
+
+            logging.info(f"[pairing] 创建待处理配对: pairing_id={pairing_id}, interface={interface_name}, "
+                        f"local_ip={local_ip}, listen_port={listen_port}")
+
+        # Step 3: 构建待处理请求信息
+        pending_request = {
+            "node_tag": payload.node_tag,
+            "psk": psk,
+            "tunnel_type": payload.tunnel_type,
+            "bidirectional": payload.bidirectional,
+        }
+
+        # 保存密钥信息
+        if payload.tunnel_type == "wireguard":
+            pending_request["wg_private_key"] = getattr(request_obj, '_private_key', None)
+            pending_request["wg_public_key"] = request_obj.wg_public_key
+            if payload.bidirectional:
+                pending_request["remote_wg_private_key"] = request_obj.remote_wg_private_key
+                pending_request["remote_wg_public_key"] = request_obj.remote_wg_public_key
+        elif payload.tunnel_type == "xray":
+            pending_request["xray_private_key"] = getattr(request_obj, '_private_key', None)
+            pending_request["xray_public_key"] = request_obj.xray_reality_public_key
+            pending_request["xray_short_id"] = request_obj.xray_reality_short_id
+
+        logging.info(f"[pairing] 生成配对请求码: node_tag={payload.node_tag}, bidirectional={payload.bidirectional}")
+        return GeneratePairRequestResponse(
+            code=code,
+            psk=psk,
+            pending_request=pending_request
+        )
+
+    except HTTPException:
+        # 清理接口
+        if interface_name and HAS_PENDING_TUNNEL:
+            teardown_pending_wireguard_interface(interface_name)
+        raise
+
+    except Exception as e:
+        # 清理接口
+        if interface_name and HAS_PENDING_TUNNEL:
+            teardown_pending_wireguard_interface(interface_name)
+        logging.error(f"[pairing] 生成配对请求码失败: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate pairing code: {e}")
+
+
+@app.post("/api/peer/import-pair-request", response_model=ImportPairRequestResponse)
+def api_import_pair_request(payload: ImportPairRequestRequest):
+    """导入配对请求码
+
+    Phase 11-Tunnel: 隧道优先配对流程
+
+    导入对方发送的配对请求码，通过隧道完成配对。
+
+    新流程（隧道优先）：
+    1. 验证配对请求码
+    2. 使用预生成密钥创建 WireGuard 接口
+    3. 连接到对方端点
+    4. 通过隧道调用对方的 complete-handshake API
+    5. 创建本地 peer_node
+
+    旧流程（回退）：
+    如果配对码中没有预生成密钥，使用旧的响应码方式
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    if not HAS_PAIRING:
+        raise HTTPException(status_code=503, detail="Pairing module not available")
+
+    # 验证端点格式
+    endpoint = payload.local_endpoint.strip()
+    if ':' not in endpoint:
+        raise HTTPException(status_code=400, detail="Endpoint must include port (e.g., '10.1.1.1:36300')")
+
+    host, port_str = endpoint.rsplit(':', 1)
+    try:
+        local_listen_port = int(port_str)
+        if not (1 <= local_listen_port <= 65535):
+            raise ValueError("Port out of range")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+
+    if not validate_hostname(host):
+        raise HTTPException(status_code=400, detail=f"Invalid hostname: {host}")
+
+    db = _get_db()
+    generator = PairingCodeGenerator(db)
+
+    # Step 1: 验证配对请求码
+    is_valid, error, request_obj = generator.validate_pair_request(payload.code)
+    if not is_valid:
+        return ImportPairRequestResponse(
+            success=False,
+            message=f"Invalid pairing code: {error}",
+            response_code=None,
+            created_node_tag=None
+        )
+
+    # 检查是否已存在同名节点
+    remote_node_tag = request_obj.node_tag
+    existing = db.get_peer_node(remote_node_tag)
+    if existing:
+        return ImportPairRequestResponse(
+            success=False,
+            message=f"Peer node '{remote_node_tag}' already exists",
+            response_code=None,
+            created_node_tag=None
+        )
+
+    # Step 2: 判断使用隧道优先还是旧流程
+    is_tunnel_first = (
+        request_obj.tunnel_type == "wireguard" and
+        request_obj.bidirectional and
+        request_obj.remote_wg_private_key and
+        request_obj.remote_wg_public_key and
+        HAS_PENDING_TUNNEL
+    )
+
+    if not is_tunnel_first:
+        # 回退到旧流程（使用响应码）
+        logging.info(f"[pairing] 使用旧流程（响应码模式）: 缺少预生成密钥或非 WireGuard")
+        manager = PairingManager(db)
+        try:
+            # Phase 11-Fix.K: 传递 api_port
+            success, message, response_code = manager.import_pair_request(
+                code=payload.code,
+                local_node_tag=payload.local_node_tag,
+                local_node_description=payload.local_node_description,
+                local_endpoint=endpoint,
+                psk=payload.psk,
+                api_port=payload.api_port,
+            )
+            if not success:
+                return ImportPairRequestResponse(
+                    success=False,
+                    message=message,
+                    response_code=None,
+                    created_node_tag=None
+                )
+            return ImportPairRequestResponse(
+                success=True,
+                message=message,
+                response_code=response_code,
+                created_node_tag=remote_node_tag,
+                bidirectional=False
+            )
+        except Exception as e:
+            logging.error(f"[pairing] 旧流程导入失败: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to import pairing request: {e}")
+
+    # ===== 隧道优先流程 =====
+    logging.info(f"[pairing] 使用隧道优先流程: remote_node={remote_node_tag}")
+
+    interface_name = None
+    try:
+        # Step 3: 计算 pairing_id（与 generate-pair-request 相同的算法）
+        # Phase 11-Fix.C: 使用完整 code 计算（与生成端保持一致）
+        pairing_id = hashlib.md5(payload.code.encode()).hexdigest()
+
+        # Step 4: 获取隧道 IP（从配对码中）
+        # 注意：我们是 Node B，使用配对码中的 remote_wg_* 作为自己的密钥
+        # IP 分配：A 的 tunnel_local_ip 是 A 的 IP，A 的 tunnel_remote_ip 是给 B 预分配的 IP
+        # 所以对于 B：local_ip = A 的 tunnel_remote_ip，remote_ip = A 的 tunnel_local_ip
+        if request_obj.tunnel_local_ip and request_obj.tunnel_remote_ip:
+            # 使用配对码中的 IP（交换 local/remote）
+            local_ip = request_obj.tunnel_remote_ip  # B 使用 A 预分配的 IP
+            remote_ip = request_obj.tunnel_local_ip  # A 的 IP
+            logging.info(f"[pairing] 使用配对码中的隧道 IP: local={local_ip}, remote={remote_ip}")
+        else:
+            # 回退：使用确定性分配
+            logging.warning("[pairing] 配对码中没有隧道 IP，使用确定性分配")
+            subnet_idx, _, _ = _get_next_peer_tunnel_subnet(db, payload.local_node_tag, remote_node_tag)
+            local_ip = f"10.200.200.{subnet_idx * 4 + 2}"  # B 使用 .2
+            remote_ip = f"10.200.200.{subnet_idx * 4 + 1}"  # A 使用 .1
+
+        # Step 5: 创建 WireGuard 接口并连接
+        interface_name = get_interface_name(remote_node_tag, "wireguard")
+
+        # 使用预生成的密钥
+        local_private_key = request_obj.remote_wg_private_key
+        local_public_key = request_obj.remote_wg_public_key
+        peer_public_key = request_obj.wg_public_key  # A 的公钥
+
+        success, error = create_wireguard_tunnel_with_endpoint(
+            interface_name=interface_name,
+            local_ip=local_ip,
+            remote_ip=remote_ip,
+            listen_port=local_listen_port,
+            private_key=local_private_key,
+            peer_public_key=peer_public_key,
+            remote_endpoint=request_obj.endpoint,  # A 的端点
+        )
+
+        if not success:
+            raise ValueError(f"Failed to create WireGuard tunnel: {error}")
+
+        logging.info(f"[pairing] WireGuard 接口已创建: {interface_name}")
+
+        # Step 6: 等待握手完成
+        if not wait_for_wireguard_handshake(interface_name, timeout_seconds=15):
+            raise ValueError("WireGuard handshake timeout - remote endpoint may not be listening")
+
+        logging.info(f"[pairing] WireGuard 握手成功，开始隧道握手")
+
+        # Step 7: 通过隧道调用对方的 complete-handshake API
+        from tunnel_api_client import TunnelAPIClient
+
+        # Phase 11-Fix.K: 隧道 API 端点使用正确的 api_port
+        remote_api_port = request_obj.api_port or 36000
+        tunnel_api_endpoint = f"{remote_ip}:{remote_api_port}"
+
+        client = TunnelAPIClient(
+            node_tag=remote_node_tag,
+            tunnel_endpoint=tunnel_api_endpoint,
+            tunnel_type="wireguard",
+        )
+
+        # Phase 11-Fix.K: 传递本节点 API 端口
+        handshake_result = client.request_complete_handshake(
+            pairing_id=pairing_id,
+            local_node_tag=payload.local_node_tag,
+            local_node_description=payload.local_node_description,
+            local_endpoint=endpoint,
+            local_tunnel_ip=local_ip,
+            wg_public_key=local_public_key,
+            api_port=payload.api_port,  # Phase 11-Fix.K
+        )
+
+        if not handshake_result.get("success"):
+            raise ValueError(f"Handshake failed: {handshake_result.get('message', 'Unknown error')}")
+
+        logging.info(f"[pairing] 隧道握手完成")
+
+        # Step 8: 创建本地 peer_node
+        # Phase 11-Fix.K: 保存 api_port 到数据库
+        db.add_peer_node(
+            tag=remote_node_tag,
+            name=remote_node_tag,
+            description=request_obj.node_description or f"Paired from {request_obj.endpoint}",
+            endpoint=request_obj.endpoint,
+            api_port=request_obj.api_port,  # Phase 11-Fix.K: 保存 API 端口
+            tunnel_type="wireguard",
+            tunnel_status="connected",
+            tunnel_interface=interface_name,
+            tunnel_local_ip=local_ip,
+            tunnel_remote_ip=remote_ip,
+            tunnel_port=local_listen_port,
+            wg_private_key=local_private_key,
+            wg_public_key=local_public_key,
+            wg_peer_public_key=peer_public_key,
+            tunnel_api_endpoint=tunnel_api_endpoint,
+            bidirectional_status="bidirectional",
+        )
+
+        logging.info(f"[pairing] 隧道优先配对完成: {remote_node_tag}")
+
+        return ImportPairRequestResponse(
+            success=True,
+            message="Pairing completed via tunnel",
+            response_code=None,  # 隧道优先模式不需要响应码
+            created_node_tag=remote_node_tag,
+            tunnel_status="connected",
+            bidirectional=True
+        )
+
+    except Exception as e:
+        # 清理接口
+        if interface_name:
+            try:
+                subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
+            except Exception:
+                pass
+        logging.error(f"[pairing] 隧道优先配对失败: {e}")
+        return ImportPairRequestResponse(
+            success=False,
+            message=str(e),
+            response_code=None,
+            created_node_tag=None
+        )
+
+
+@app.post("/api/peer/complete-pairing", response_model=CompletePairingResponse)
+def api_complete_pairing(payload: CompletePairingRequest):
+    """完成配对
+
+    导入对方发送的配对响应码，完成配对流程。
+
+    流程：
+    1. 验证配对响应码
+    2. 验证 request_node_tag 匹配
+    3. 创建 peer_node
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    if not HAS_PAIRING:
+        raise HTTPException(status_code=503, detail="Pairing module not available")
+
+    db = _get_db()
+    manager = PairingManager(db)
+
+    # 验证 pending_request 包含必要字段（psk 已废弃，不再必需）
+    required_fields = ["node_tag", "tunnel_type"]
+    for field in required_fields:
+        if field not in payload.pending_request:
+            raise HTTPException(status_code=400, detail=f"Missing required field in pending_request: {field}")
+
+    try:
+        success, message = manager.complete_pairing(
+            code=payload.code,
+            pending_request=payload.pending_request,
+        )
+
+        if not success:
+            logging.warning(f"[pairing] 完成配对失败: {message}")
+            return CompletePairingResponse(
+                success=False,
+                message=message,
+                created_node_tag=None
+            )
+
+        # 从响应码中提取创建的节点 tag
+        created_node_tag = None
+        try:
+            generator = PairingCodeGenerator(db)
+            _, _, response_obj = generator.validate_pair_response(payload.code)
+            if response_obj:
+                created_node_tag = response_obj.node_tag  # 对方的 tag
+        except Exception:
+            pass
+
+        logging.info(f"[pairing] 配对完成，创建节点 '{created_node_tag}'")
+
+        # Phase 11.2: 双向自动连接
+        # 如果是双向配对，自动建立连接并请求反向连接
+        bidirectional = payload.pending_request.get("bidirectional", True)
+        if bidirectional and created_node_tag:
+            try:
+                _trigger_bidirectional_connect(db, created_node_tag, payload.pending_request)
+            except Exception as e:
+                # 自动连接失败不影响配对结果，只记录警告
+                logging.warning(f"[pairing] 双向自动连接失败: {e}")
+
+        return CompletePairingResponse(
+            success=True,
+            message=message,
+            created_node_tag=created_node_tag
+        )
+
+    except Exception as e:
+        logging.error(f"[pairing] 完成配对异常: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to complete pairing: {e}")
 
 
 @app.get("/api/peers/{tag}/status")
@@ -11437,6 +14165,65 @@ def api_get_peer_status(tag: str):
     return status
 
 
+class TunnelStatusUpdateRequest(BaseModel):
+    """手动更新隧道状态请求 (Phase 10.4)"""
+    status: str = Field(..., pattern=r"^(connected|disconnected|error)$")
+    message: Optional[str] = Field(None, max_length=500)
+
+
+@app.put("/api/peers/{tag}/tunnel-status")
+def api_update_peer_tunnel_status(tag: str, request: TunnelStatusUpdateRequest):
+    """手动设置对等节点隧道状态 (Phase 10.4)
+
+    用于调试或恢复异常状态。例如：
+    - 隧道实际已连接但状态显示错误时
+    - 需要强制重置状态进行调试时
+
+    Args:
+        tag: 节点标识
+        request: 包含 status (connected/disconnected/error) 和可选 message
+
+    Returns:
+        更新结果
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    old_status = node.get("tunnel_status", "disconnected")
+    new_status = request.status
+
+    try:
+        # 更新数据库中的隧道状态
+        update_fields = {"tunnel_status": new_status}
+        if request.message:
+            update_fields["last_error"] = request.message if new_status == "error" else None
+        elif new_status != "error":
+            # 清除旧错误消息
+            update_fields["last_error"] = None
+
+        db.update_peer_node(tag, **update_fields)
+
+        logging.info(f"[peer-status] 手动更新 {tag} 隧道状态: {old_status} -> {new_status}")
+
+        return {
+            "success": True,
+            "tag": tag,
+            "tunnel_status": new_status,
+            "previous_status": old_status,
+            "message": f"状态已更新为 {new_status}"
+        }
+
+    except Exception as e:
+        logging.error(f"[peer-status] 更新 {tag} 隧道状态失败: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update tunnel status: {e}")
+
+
 def _do_peer_exchange(db, node: dict) -> dict:
     """与远程节点执行参数交换
 
@@ -11459,23 +14246,8 @@ def _do_peer_exchange(db, node: dict) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=500, detail=f"PSK 解密失败: {e}")
 
-    # 从 endpoint 提取主机和端口
-    # endpoint 格式: "host:wg_port" 如 "10.1.1.10:36100"
-    if ":" in endpoint:
-        host, wg_port_str = endpoint.rsplit(":", 1)
-        try:
-            wg_port = int(wg_port_str)
-            # 推导 API 端口：WireGuard 端口 - 100 (36100 → 36000, 37100 → 37000)
-            api_port = wg_port - 100
-        except ValueError:
-            api_port = 36000
-    else:
-        host = endpoint
-        api_port = 36000
-
-    # 如果明确指定了 api_port，优先使用（支持端口映射场景）
-    if node.get("api_port"):
-        api_port = node["api_port"]
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    host, api_port = _derive_api_port_from_endpoint(endpoint, node)
 
     # 构建远程 API URL
     remote_api_url = f"http://{host}:{api_port}/api/peer-auth/exchange"
@@ -11560,6 +14332,22 @@ def _do_peer_exchange(db, node: dict) -> dict:
         # 注意：不存储远程的 xray_socks_port，本地 SOCKS 端口由创建隧道时分配
         # 远程的 SOCKS 端口对我们没有用处
 
+        # 存储远程 peer 的 REALITY 配置（用于本节点作为客户端连接远程 peer）
+        if data.get("xray_reality_public_key"):
+            update_data["xray_peer_reality_public_key"] = data.get("xray_reality_public_key")
+        if data.get("xray_reality_short_id"):
+            update_data["xray_peer_reality_short_id"] = data.get("xray_reality_short_id")
+        if data.get("xray_reality_dest"):
+            update_data["xray_peer_reality_dest"] = data.get("xray_reality_dest")
+        if data.get("xray_reality_server_names"):
+            # server_names 是列表，需要存储为 JSON 字符串
+            server_names = data.get("xray_reality_server_names")
+            if isinstance(server_names, list):
+                update_data["xray_peer_reality_server_names"] = json.dumps(server_names)
+            else:
+                update_data["xray_peer_reality_server_names"] = server_names
+        # 注：XHTTP 配置使用本地配置即可（通常相同）
+
     # Phase 2: 存储对端的入站信息（如果有）
     # 对端如果启用了入站，会返回入站配置
     # 我们将这些信息存储在 peer_inbound_* 字段中，供后续连接到对端入站使用
@@ -11616,7 +14404,8 @@ def api_peer_connect(tag: str):
         if not node.get("wg_private_key") or not node.get("wg_peer_public_key"):
             needs_exchange = True
     elif tunnel_type == "xray":
-        if not node.get("xray_uuid"):
+        # 需要 xray_uuid 和远程 peer 的 REALITY 公钥才能建立连接
+        if not node.get("xray_uuid") or not node.get("xray_peer_reality_public_key"):
             needs_exchange = True
 
     # 自动执行参数交换
@@ -11635,12 +14424,35 @@ def api_peer_connect(tag: str):
             # 重新获取更新后的节点信息
             node = db.get_peer_node(tag)
 
+            # Phase 11-Fix.C2: 设置 tunnel_api_endpoint 用于通过隧道调用远程 API
+            tunnel_remote_ip = node.get("tunnel_remote_ip")
+            if tunnel_remote_ip and not node.get("tunnel_api_endpoint"):
+                # Phase 11-Fix.K: 使用节点的 api_port 或默认 36000
+                remote_api_port = node.get("api_port") or 36000
+                tunnel_api_endpoint = f"{tunnel_remote_ip}:{remote_api_port}"
+                db.update_peer_node(tag, tunnel_api_endpoint=tunnel_api_endpoint)
+                logging.info(f"[peers] 设置隧道 API 端点: {tag} -> {tunnel_api_endpoint}")
+                # 刷新 node 对象
+                node = db.get_peer_node(tag)
+
             # 通知远程节点也建立隧道（双向同步）
             notify_success = False
             try:
                 notify_success = _notify_peer_connected(db, node)
             except Exception as e:
                 logging.warning(f"[peers] 通知远程节点失败: {e}")
+
+            # Phase 11-Fix.B: 连接成功后异步检查并更新双向状态
+            def _async_bidirectional_check():
+                try:
+                    # 等待一小段时间让远程节点完成连接
+                    import time
+                    time.sleep(2)
+                    _check_and_update_bidirectional_status(_get_db(), tag)
+                except Exception as e:
+                    logging.warning(f"[peers] 双向状态检查失败: {e}")
+
+            threading.Thread(target=_async_bidirectional_check, daemon=True).start()
 
             return {
                 "success": True,
@@ -11710,6 +14522,44 @@ def api_peer_disconnect(tag: str):
         raise HTTPException(status_code=500, detail=f"断开失败: {str(e)}")
 
 
+@app.post("/api/peers/{tag}/retry-bidirectional")
+def api_peer_retry_bidirectional(tag: str):
+    """Phase 11-Fix.B: 手动触发双向连接状态检测
+
+    用于手动检查并更新指定节点的双向连接状态。
+    适用于自动检测未生效或需要立即刷新状态的场景。
+
+    状态语义:
+    - pending: 尚未检查或隧道未连接
+    - outbound_only: 隧道已连接，但本地未启用 inbound
+    - bidirectional: 隧道已连接，且本地已启用 inbound
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+    node = db.get_peer_node(tag)
+
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    old_status = node.get("bidirectional_status", "pending")
+
+    try:
+        new_status = _check_and_update_bidirectional_status(db, tag)
+    except Exception as e:
+        logging.error(f"[peers] 检查节点 '{tag}' 双向状态失败: {e}")
+        raise HTTPException(status_code=500, detail=f"检查失败: {str(e)}")
+
+    return {
+        "success": True,
+        "tag": tag,
+        "old_status": old_status,
+        "new_status": new_status,
+        "changed": old_status != new_status,
+    }
+
+
 # ============ Peer Node Inbound API ============
 
 @app.post("/api/peers/{tag}/inbound/enable")
@@ -11727,6 +14577,10 @@ def api_enable_peer_inbound(tag: str):
 
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+
+    # 获取 V2Ray 入站配置的端口（合并架构使用统一端口）
+    v2ray_config = db.get_v2ray_inbound_config()
+    unified_port = v2ray_config.get("listen_port", 443) if v2ray_config else 443
 
     # 检查是否已启用
     if node.get("inbound_enabled"):
@@ -11756,8 +14610,10 @@ def api_enable_peer_inbound(tag: str):
     # 检查 REALITY 密钥（如果未配置则生成）
     if not node.get("xray_reality_private_key"):
         try:
-            from xray_manager import generate_reality_keypair
-            private_key, public_key = generate_reality_keypair()
+            from xray_manager import generate_reality_keys
+            keys = generate_reality_keys()
+            private_key = keys["private_key"]
+            public_key = keys["public_key"]
             short_id = secrets.token_hex(4)  # 8 字符 hex
         except Exception as e:
             logging.error(f"生成 REALITY 密钥失败: {e}")
@@ -11778,30 +14634,35 @@ def api_enable_peer_inbound(tag: str):
         xray_reality_short_id=short_id,
     )
 
-    # 启动入站监听器
+    # 合并架构: reload 主 Xray 进程以加载新的 peer UUID
     try:
-        from xray_peer_inbound_manager import XrayPeerInboundManager
-        manager = XrayPeerInboundManager()
-        success = manager.start_inbound(tag)
-
-        if success:
-            logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (Port: {inbound_port})")
+        import subprocess
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (合并架构, Xray reloaded)")
             return {
                 "success": True,
                 "message": "入站监听已启用",
                 "tag": tag,
-                "inbound_port": inbound_port,
+                "inbound_port": unified_port,  # 合并架构使用统一端口
                 "inbound_uuid": inbound_uuid,
                 "reality_public_key": public_key,
                 "reality_short_id": short_id,
             }
         else:
-            raise HTTPException(status_code=500, detail="启动入站监听器失败")
+            logging.error(f"[peers] Xray reload 失败: {result.stderr}")
+            raise HTTPException(status_code=500, detail=f"Xray reload 失败: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        logging.error("[peers] Xray reload 超时")
+        raise HTTPException(status_code=500, detail="Xray reload 超时")
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"[peers] 启动入站监听器失败: {e}")
-        raise HTTPException(status_code=500, detail=f"启动入站监听器失败: {str(e)}")
+        logging.error(f"[peers] 启动入站监听失败: {e}")
+        raise HTTPException(status_code=500, detail=f"启动入站监听失败: {str(e)}")
 
 
 @app.post("/api/peers/{tag}/inbound/disable")
@@ -11828,18 +14689,22 @@ def api_disable_peer_inbound(tag: str):
             "tag": tag,
         }
 
-    # 停止入站监听器
-    try:
-        from xray_peer_inbound_manager import XrayPeerInboundManager
-        manager = XrayPeerInboundManager()
-        manager.stop_inbound(tag)
-    except Exception as e:
-        logging.warning(f"[peers] 停止入站监听器时出错: {e}")
-
     # 更新数据库
     db.update_peer_node(tag, inbound_enabled=0)
 
-    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用")
+    # 合并架构: reload 主 Xray 进程以移除 peer UUID
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            logging.warning(f"[peers] Xray reload 返回非零: {result.stderr}")
+    except Exception as e:
+        logging.warning(f"[peers] Xray reload 时出错: {e}")
+
+    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用 (合并架构)")
     return {
         "success": True,
         "message": "入站监听已禁用",
@@ -11852,6 +14717,7 @@ def api_get_peer_inbound_status(tag: str):
     """获取对等节点入站状态
 
     返回入站监听器的运行状态、端口等信息。
+    合并架构: 检查主 Xray 进程状态，peer 入站共享同一进程。
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -11862,25 +14728,36 @@ def api_get_peer_inbound_status(tag: str):
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
-    # 获取进程状态
+    # 获取 V2Ray 入站配置的端口（合并架构使用统一端口）
+    v2ray_config = db.get_v2ray_inbound_config()
+    unified_port = v2ray_config.get("listen_port", 443) if v2ray_config else 443
+
+    # 合并架构: 检查主 Xray 进程状态
     process_status = "stopped"
     pid = None
     try:
-        from xray_peer_inbound_manager import XrayPeerInboundManager
-        manager = XrayPeerInboundManager()
-        status = manager.get_inbound_status(tag)
-        process_status = status.get("status", "stopped")
-        pid = status.get("pid")
+        import subprocess
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "status"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and "running" in result.stdout.lower():
+            process_status = "running"
+            # 尝试从输出提取 PID
+            import re
+            pid_match = re.search(r'PID[:\s]+(\d+)', result.stdout)
+            if pid_match:
+                pid = int(pid_match.group(1))
     except Exception as e:
-        logging.warning(f"[peers] 获取入站状态失败: {e}")
+        logging.warning(f"[peers] 获取 Xray 状态失败: {e}")
 
     return {
         "tag": tag,
         "inbound_enabled": bool(node.get("inbound_enabled")),
-        "inbound_port": node.get("inbound_port"),
+        "inbound_port": unified_port if node.get("inbound_enabled") else None,  # 合并架构使用统一端口
         "inbound_uuid": node.get("inbound_uuid"),
-        "process_status": process_status,
-        "pid": pid,
+        "process_status": process_status if node.get("inbound_enabled") else "disabled",
+        "pid": pid if node.get("inbound_enabled") else None,
         "reality_public_key": node.get("xray_reality_public_key"),
         "reality_short_id": node.get("xray_reality_short_id"),
     }
@@ -11888,18 +14765,48 @@ def api_get_peer_inbound_status(tag: str):
 
 @app.get("/api/peers/inbound/all")
 def api_get_all_peer_inbound_status():
-    """获取所有启用入站的节点状态"""
+    """获取所有启用入站的节点状态
+
+    合并架构: 所有 peer 入站共享同一个 Xray 进程。
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
+    db = _get_db()
+
+    # 获取主 Xray 进程状态
+    xray_running = False
+    xray_pid = None
     try:
-        from xray_peer_inbound_manager import XrayPeerInboundManager
-        manager = XrayPeerInboundManager()
-        statuses = manager.get_all_status()
-        return {"inbounds": statuses, "count": len(statuses)}
+        import subprocess
+        result = subprocess.run(
+            ["python3", "/usr/local/bin/xray_manager.py", "status"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and "running" in result.stdout.lower():
+            xray_running = True
+            import re
+            pid_match = re.search(r'PID[:\s]+(\d+)', result.stdout)
+            if pid_match:
+                xray_pid = int(pid_match.group(1))
     except Exception as e:
-        logging.error(f"[peers] 获取所有入站状态失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}")
+        logging.warning(f"[peers] 获取 Xray 状态失败: {e}")
+
+    # 获取所有启用入站的节点
+    nodes = db.get_peer_nodes()
+    statuses = []
+    for node in nodes:
+        if node.get("inbound_enabled"):
+            statuses.append({
+                "tag": node.get("tag"),
+                "status": "running" if xray_running else "stopped",
+                "pid": xray_pid,
+                "port": 443,  # 合并架构使用统一端口
+                "uuid": node.get("inbound_uuid"),
+                "reality_public_key": node.get("xray_reality_public_key"),
+            })
+
+    return {"inbounds": statuses, "count": len(statuses), "xray_status": "running" if xray_running else "stopped"}
 
 
 # ============ Node Chain CRUD API ============
@@ -11964,10 +14871,28 @@ def api_create_chain(payload: NodeChainCreateRequest):
     if db.get_node_chain(payload.tag):
         raise HTTPException(status_code=400, detail=f"链路标识 '{payload.tag}' 已存在")
 
-    # 验证所有跳转节点存在
-    valid, error = db.validate_chain_hops(payload.hops)
+    # Phase 11-Fix.C: 验证所有跳转节点
+    if payload.allow_transitive:
+        # 传递模式：通过隧道递归验证后续跳点
+        valid, error = _validate_chain_hops_recursive(db, payload.hops)
+    else:
+        # 严格模式：所有跳点必须在本地 peer_nodes 表
+        valid, errors = db.validate_chain_hops(payload.hops, allow_transitive=False)
+        error = "; ".join(errors) if isinstance(errors, list) and errors else (errors[0] if errors else None)
     if not valid:
         raise HTTPException(status_code=400, detail=error)
+
+    # 自动分配 DSCP 值（如果未提供）
+    dscp_value = payload.dscp_value
+    if dscp_value is None:
+        dscp_value = db.get_next_available_dscp_value()
+        if dscp_value is None:
+            raise HTTPException(status_code=409, detail="无可用的 DSCP 值（已达上限 63）")
+        logging.info(f"[chains] 自动分配 DSCP 值: {dscp_value}")
+
+    # Phase 11-Fix.J: 验证终端出口（如已指定）
+    if payload.exit_egress:
+        _validate_chain_terminal_egress(payload.exit_egress)
 
     try:
         chain_id = db.add_node_chain(
@@ -11980,6 +14905,9 @@ def api_create_chain(payload: NodeChainCreateRequest):
             relay_rules=payload.relay_rules,
             priority=payload.priority,
             enabled=payload.enabled,
+            exit_egress=payload.exit_egress,
+            dscp_value=dscp_value,
+            chain_mark_type=payload.chain_mark_type,
         )
     except Exception as e:
         logging.error(f"创建链路失败: {e}")
@@ -12023,8 +14951,15 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
     if payload.description is not None:
         update_kwargs["description"] = payload.description
     if payload.hops is not None:
-        # 验证所有跳转节点存在
-        valid, error = db.validate_chain_hops(payload.hops)
+        # Phase 11-Fix.C: 验证所有跳转节点
+        allow_transitive = payload.allow_transitive if payload.allow_transitive is not None else False
+        if allow_transitive:
+            # 传递模式：通过隧道递归验证后续跳点
+            valid, error = _validate_chain_hops_recursive(db, payload.hops)
+        else:
+            # 严格模式：所有跳点必须在本地 peer_nodes 表
+            valid, errors = db.validate_chain_hops(payload.hops, allow_transitive=False)
+            error = "; ".join(errors) if isinstance(errors, list) and errors else (errors[0] if errors else None)
         if not valid:
             raise HTTPException(status_code=400, detail=error)
         update_kwargs["hops"] = json.dumps(payload.hops)
@@ -12038,6 +14973,17 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["priority"] = payload.priority
     if payload.enabled is not None:
         update_kwargs["enabled"] = payload.enabled
+    # Phase 6 新增字段
+    if payload.exit_egress is not None:
+        # Phase 11-Fix.J: 验证终端出口
+        _validate_chain_terminal_egress(payload.exit_egress)
+        update_kwargs["exit_egress"] = payload.exit_egress
+    if payload.dscp_value is not None:
+        update_kwargs["dscp_value"] = payload.dscp_value
+    if payload.chain_mark_type is not None:
+        update_kwargs["chain_mark_type"] = payload.chain_mark_type
+    if payload.chain_state is not None:
+        update_kwargs["chain_state"] = payload.chain_state
 
     if not update_kwargs:
         return {"message": "没有需要更新的字段", "chain": chain}
@@ -12100,6 +15046,219 @@ def api_delete_chain(tag: str):
         "message": f"链路 '{tag}' 已删除",
         "unregistration_results": unregistration_results,
     }
+
+
+# ============ Phase 11-Fix.C: Chain Hops Validation API ============
+
+
+def _validate_chain_hops_recursive(db, hops: List[str], max_depth: int = 5) -> tuple:
+    """Phase 11-Fix.C: 递归验证链路跳点（支持线性拓扑）
+
+    对于 A→B→C 链路：
+    1. 验证 B 是 A 的本地 peer 且已连接
+    2. 通过 A→B 隧道调用 B 的 /api/chains/validate-hops 验证 [C]
+    3. B 验证 C 是其本地 peer 且已连接
+
+    Args:
+        db: 数据库实例
+        hops: 跳点列表（从本地节点视角）
+        max_depth: 最大递归深度（防止无限循环）
+
+    Returns:
+        (valid: bool, error: str|None)
+    """
+    if not hops:
+        return False, "hops cannot be empty"
+
+    if max_depth <= 0:
+        return False, "maximum recursion depth exceeded"
+
+    # 检测循环（重复节点）
+    seen = set()
+    for hop in hops:
+        if hop in seen:
+            return False, f"circular chain detected: duplicate node '{hop}'"
+        seen.add(hop)
+
+    # 验证第一跳是本地已连接的 peer
+    first_hop = hops[0]
+    node = db.get_peer_node(first_hop)
+    if not node:
+        return False, f"first hop '{first_hop}' not found in local peer_nodes"
+    if node.get("tunnel_status") != "connected":
+        return False, f"first hop '{first_hop}' is not connected (status: {node.get('tunnel_status')})"
+
+    # 只有一跳时，验证完成
+    if len(hops) == 1:
+        return True, None
+
+    # 有多跳时，通过隧道验证后续跳点
+    remaining_hops = hops[1:]
+    try:
+        from tunnel_api_client import TunnelAPIClientManager
+
+        client_mgr = TunnelAPIClientManager(db)
+        client = client_mgr.get_client(first_hop)
+
+        if not client:
+            return False, f"cannot connect to '{first_hop}' for remote validation"
+
+        # 调用远程节点验证剩余跳点
+        # 使用 allow_transitive=True 让远程节点也使用递归验证
+        result = client.validate_chain_hops(remaining_hops, allow_transitive=True)
+
+        if result.get("valid"):
+            logging.info(f"[chains] 递归验证通过: {hops} (via {first_hop})")
+            return True, None
+        else:
+            error = result.get("error", "remote validation failed")
+            return False, f"remote validation at '{first_hop}' failed: {error}"
+
+    except Exception as e:
+        logging.error(f"[chains] 递归验证异常: {e}")
+        return False, f"validation through tunnel failed: {str(e)}"
+
+
+def _check_chain_cycle(hops: List[str]) -> bool:
+    """Phase 11-Fix.E: 检查链路是否存在循环
+
+    Returns:
+        True 如果存在循环，False 如果没有循环
+    """
+    return len(hops) != len(set(hops))
+
+
+def _get_terminal_node_through_tunnel(db, hops: List[str]) -> tuple:
+    """Phase 11-Fix.E: 通过隧道获取终端节点信息
+
+    对于线性拓扑 A→B→C，A 只知道 B，需要通过 B 查询 C 的信息。
+
+    Args:
+        db: 数据库实例
+        hops: 跳点列表（从本地节点视角）
+
+    Returns:
+        (terminal_info: dict|None, client: TunnelAPIClient|None, clients_cache: dict)
+        terminal_info: 终端节点信息 {"tag": str, "via_relay": str|None, "direct": bool}
+        client: 用于到达终端节点的客户端（直接连接或通过中继）
+        clients_cache: 中间节点客户端缓存 {tag: client}
+    """
+    from tunnel_api_client import TunnelAPIClientManager
+
+    if not hops:
+        return None, None, {}
+
+    if _check_chain_cycle(hops):
+        logging.error(f"[chains] 检测到循环链路: {hops}")
+        return None, None, {}
+
+    terminal_tag = hops[-1]
+    client_mgr = TunnelAPIClientManager(db)
+
+    if len(hops) == 1:
+        # 直接连接
+        client = client_mgr.get_client(terminal_tag)
+        if client and client.ping():
+            return {"tag": terminal_tag, "direct": True}, client, {}
+        return None, None, {}
+
+    # 多跳：通过第一跳到达终端节点
+    first_hop_tag = hops[0]
+    first_hop_client = client_mgr.get_client(first_hop_tag)
+
+    if not first_hop_client:
+        logging.warning(f"[chains] 无法获取第一跳 '{first_hop_tag}' 的客户端")
+        return None, None, {}
+
+    if not first_hop_client.ping():
+        logging.warning(f"[chains] 第一跳 '{first_hop_tag}' 不可达")
+        return None, None, {}
+
+    # 递归验证后续跳点
+    remaining_hops = hops[1:]
+    try:
+        result = first_hop_client.validate_chain_hops(remaining_hops, allow_transitive=True)
+    except Exception as e:
+        logging.error(f"[chains] 通过 '{first_hop_tag}' 验证后续跳点失败: {e}")
+        return None, None, {}
+
+    if not result.get("valid"):
+        logging.warning(f"[chains] 后续跳点验证失败: {result.get('error')}")
+        return None, None, {}
+
+    # 验证通过，返回终端节点信息
+    terminal_info = {"tag": terminal_tag, "via_relay": first_hop_tag, "direct": False}
+    clients_cache = {first_hop_tag: first_hop_client}
+
+    logging.info(f"[chains] 传递模式: 终端节点 '{terminal_tag}' 可通过 '{first_hop_tag}' 到达")
+    return terminal_info, first_hop_client, clients_cache
+
+
+class ChainHopsValidateRequest(BaseModel):
+    """链路跳点验证请求"""
+    hops: List[str] = Field(..., min_items=1, max_items=10, description="跳点节点列表")
+    allow_transitive: bool = Field(False, description="是否允许传递模式（只验证第一跳）")
+
+
+@app.post("/api/chains/validate-hops")
+def api_validate_chain_hops(request: Request, payload: ChainHopsValidateRequest):
+    """Phase 11-Fix.C: 验证链路跳点有效性（支持远程调用）
+
+    认证方式: X-PSK header (节点间调用，无需 JWT)
+
+    当 allow_transitive=False（默认）时：
+        所有跳点必须是本地 peer_nodes 表中存在的节点
+
+    当 allow_transitive=True 时：
+        只验证第一跳是本地已连接的 peer，后续跳通过递归查询验证
+        这用于线性拓扑 A→B→C，其中 A 只知道 B，不知道 C
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # Phase 11-Fix.C 安全修复: 验证 PSK 认证
+    node = _verify_psk_header(request, db)
+    if not node:
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+    logging.info(f"[chains] 验证跳点请求: from {node['tag']} ({client_ip}), hops={payload.hops}")
+
+    # 验证 hops 格式
+    for hop in payload.hops:
+        if not hop or not isinstance(hop, str):
+            return {"valid": False, "error": "hops 包含无效条目"}
+        # 验证 tag 格式
+        if not re.match(r"^[a-z][a-z0-9-]*$", hop):
+            return {"valid": False, "error": f"hop '{hop}' 格式无效（应为小写字母开头，只含字母数字和短横线）"}
+
+    try:
+        if payload.allow_transitive:
+            # 传递模式：使用递归验证（通过隧道验证后续跳点）
+            valid, error = _validate_chain_hops_recursive(db, payload.hops)
+            if valid:
+                return {"valid": True, "error": None}
+            else:
+                return {"valid": False, "error": error}
+        else:
+            # 严格模式：所有跳点必须在本地 peer_nodes 表中
+            valid, errors = db.validate_chain_hops(payload.hops, allow_transitive=False)
+            if valid:
+                return {"valid": True, "error": None}
+            else:
+                # errors 是列表，合并为字符串
+                error_msg = "; ".join(errors) if isinstance(errors, list) else str(errors)
+                return {"valid": False, "error": error_msg}
+    except Exception as e:
+        logging.error(f"[chains] 验证跳点失败: {e}")
+        return {"valid": False, "error": f"验证失败: {str(e)}"}
 
 
 # ============ Peer Relay Status API (PSK Authenticated) ============
@@ -12226,17 +15385,8 @@ def _query_relay_status(db, relay_node: dict, target_node_tag: str) -> dict:
             "message": "无法解密 PSK"
         }
 
-    # 从 endpoint 推导 API URL
-    if ":" in endpoint:
-        host, wg_port_str = endpoint.rsplit(":", 1)
-        try:
-            wg_port = int(wg_port_str)
-            api_port = wg_port - 100
-        except ValueError:
-            api_port = 36000
-    else:
-        host = endpoint
-        api_port = 36000
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    host, api_port = _derive_api_port_from_endpoint(endpoint, relay_node)
 
     relay_url = f"http://{host}:{api_port}/api/peer-relay/status"
 
@@ -12265,6 +15415,258 @@ def _query_relay_status(db, relay_node: dict, target_node_tag: str) -> dict:
             "target_node": target_node_tag,
             "status": "unreachable",
             "message": f"无法连接中继节点"
+        }
+
+
+# ============ Phase 11.4: 中继路由 API ============
+
+
+class RelayRouteRegisterRequest(BaseModel):
+    """中继路由注册请求"""
+    psk: Optional[str] = None         # Phase 11-Fix.D: PSK 可选，支持 IP 认证
+    chain_tag: str                    # 链路标识
+    source_node: str                  # 上游节点 tag
+    target_node: str                  # 下游节点 tag
+    dscp_value: int                   # DSCP 标记值
+    mark_type: str = "dscp"           # 标记类型: 'dscp' 或 'xray_email'
+
+
+class RelayRouteUnregisterRequest(BaseModel):
+    """中继路由注销请求"""
+    psk: Optional[str] = None         # Phase 11-Fix.D: PSK 可选，支持 IP 认证
+    chain_tag: str                    # 链路标识
+
+
+@app.post("/api/relay-routing/register")
+def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequest):
+    """Phase 11.4: 在此节点注册中继转发规则
+
+    当激活多跳链路时，入口节点通过隧道调用中间节点的此端点，
+    请求中间节点配置转发规则。
+
+    认证方式: PSK 或 IP 认证 (无需 JWT)
+    - PSK 认证: 传统方式，使用预共享密钥
+    - IP 认证: v2 配对方式，通过隧道 IP 验证身份
+
+    流程:
+    1. 入口节点 A 激活链路 A → B → C
+    2. A 通过与 B 的隧道调用 B 的此 API
+    3. B 配置 iptables 规则：匹配 DSCP 标记 → 转发到 wg-peer-C
+    4. 流量到达 B 后，根据 DSCP 标记转发到 C
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证调用方身份（通过 IP 查找调用方节点）
+    caller_node = _find_peer_node_by_ip(db, client_ip)
+    if not caller_node:
+        logging.warning(f"[relay-routing] 注册失败: 未找到调用方节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown caller")
+
+    # Phase 11-Fix.D: 支持 PSK-less 的 IP 认证（v2 配对兼容）
+    has_psk = caller_node.get("psk_hash") and payload.psk
+    if has_psk:
+        # 传统 PSK 认证
+        if not _verify_psk(payload.psk, caller_node["psk_hash"]):
+            logging.warning(f"[relay-routing] PSK 验证失败 (from {client_ip})")
+            raise HTTPException(status_code=401, detail="Authentication failed")
+        logging.info(f"[relay-routing] PSK 认证成功: {caller_node['tag']}")
+    else:
+        # IP 认证 - 验证通过隧道调用（已通过 _find_peer_node_by_ip 验证）
+        # 来自已知隧道 IP 的请求被视为已认证
+        tunnel_remote_ip = caller_node.get("tunnel_remote_ip", "")
+        if tunnel_remote_ip:
+            tunnel_remote_ip = tunnel_remote_ip.split("/")[0]
+        if not (tunnel_remote_ip and tunnel_remote_ip == client_ip):
+            logging.warning(f"[relay-routing] IP 认证失败: client_ip={client_ip}, expected={tunnel_remote_ip}")
+            raise HTTPException(status_code=401, detail="Authentication failed")
+        logging.info(f"[relay-routing] IP 认证成功: {client_ip} -> {caller_node['tag']}")
+
+    caller_tag = caller_node["tag"]
+    chain_tag = payload.chain_tag
+    source_node = payload.source_node
+    target_node = payload.target_node
+    dscp_value = payload.dscp_value
+    mark_type = payload.mark_type
+
+    logging.info(f"[relay-routing] 收到中继路由注册: 链路='{chain_tag}', "
+                f"来源='{source_node}' → 目标='{target_node}', DSCP={dscp_value} (from {caller_tag})")
+
+    # 验证 DSCP 值范围
+    if not (0 <= dscp_value <= 63):
+        return {
+            "success": False,
+            "message": f"Invalid DSCP value: {dscp_value} (must be 0-63)"
+        }
+
+    # 验证标记类型
+    if mark_type not in ("dscp", "xray_email"):
+        return {
+            "success": False,
+            "message": f"Invalid mark_type: {mark_type}"
+        }
+
+    # Phase 11-Fix.D: 使用 _resolve_peer_node 支持多种命名方式
+    # source_node 可能是 tag、hostname 或 IP
+    source_peer = _resolve_peer_node(db, source_node, client_ip)
+    target_peer = _resolve_peer_node(db, target_node)
+
+    if not source_peer:
+        logging.warning(f"[relay-routing] 源节点未找到: '{source_node}' (fallback_ip={client_ip})")
+        return {
+            "success": False,
+            "message": f"Source node '{source_node}' not found"
+        }
+
+    if not target_peer:
+        logging.warning(f"[relay-routing] 目标节点未找到: '{target_node}'")
+        return {
+            "success": False,
+            "message": f"Target node '{target_node}' not found"
+        }
+
+    # 获取接口名称 - 使用解析后的 peer tag
+    source_tag = source_peer.get("tag", source_node)
+    target_tag = target_peer.get("tag", target_node)
+    source_interface = source_peer.get("tunnel_interface", f"wg-peer-{source_tag}")
+    target_interface = target_peer.get("tunnel_interface", f"wg-peer-{target_tag}")
+
+    # 配置中继路由
+    try:
+        from relay_config_manager import get_relay_manager
+
+        relay_mgr = get_relay_manager(db)
+        success = relay_mgr.setup_relay_route(
+            chain_tag=chain_tag,
+            source_interface=source_interface,
+            target_interface=target_interface,
+            dscp_value=dscp_value,
+            mark_type=mark_type
+        )
+
+        if success:
+            logging.info(f"[relay-routing] 链路 '{chain_tag}' 中继路由已配置")
+            return {
+                "success": True,
+                "message": f"Relay route configured for chain '{chain_tag}'",
+                "chain_tag": chain_tag,
+                "source_interface": source_interface,
+                "target_interface": target_interface,
+                "dscp_value": dscp_value
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Failed to configure relay route for chain '{chain_tag}'"
+            }
+
+    except ImportError:
+        logging.error("[relay-routing] 无法导入 relay_config_manager")
+        return {
+            "success": False,
+            "message": "Relay config manager not available"
+        }
+    except Exception as e:
+        logging.error(f"[relay-routing] 配置中继路由失败: {e}")
+        return {
+            "success": False,
+            "message": "Internal error"
+        }
+
+
+@app.post("/api/relay-routing/unregister")
+def api_relay_routing_unregister(request: Request, payload: RelayRouteUnregisterRequest):
+    """Phase 11.4: 注销此节点的中继转发规则
+
+    当停用多跳链路时，入口节点调用此端点请求中间节点清理转发规则。
+
+    认证方式: PSK (无需 JWT)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_psk_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证调用方身份
+    caller_node = _find_peer_node_by_ip(db, client_ip)
+    if not caller_node:
+        logging.warning(f"[relay-routing] 注销失败: 未找到调用方节点 (from {client_ip})")
+        raise HTTPException(status_code=401, detail="Unknown caller")
+
+    # Phase 11-Fix.D: 支持 PSK-less 的 IP 认证（v2 配对兼容）
+    has_psk = caller_node.get("psk_hash") and payload.psk
+    if has_psk:
+        # 传统 PSK 认证
+        if not _verify_psk(payload.psk, caller_node["psk_hash"]):
+            logging.warning(f"[relay-routing] PSK 验证失败 (from {client_ip})")
+            raise HTTPException(status_code=401, detail="Authentication failed")
+        logging.info(f"[relay-routing] PSK 认证成功: {caller_node['tag']}")
+    else:
+        # IP 认证 - 验证通过隧道调用
+        tunnel_remote_ip = caller_node.get("tunnel_remote_ip", "")
+        if tunnel_remote_ip:
+            tunnel_remote_ip = tunnel_remote_ip.split("/")[0]
+        if not (tunnel_remote_ip and tunnel_remote_ip == client_ip):
+            logging.warning(f"[relay-routing] IP 认证失败: client_ip={client_ip}, expected={tunnel_remote_ip}")
+            raise HTTPException(status_code=401, detail="Authentication failed")
+        logging.info(f"[relay-routing] IP 认证成功: {client_ip} -> {caller_node['tag']}")
+
+    caller_tag = caller_node["tag"]
+    chain_tag = payload.chain_tag
+
+    logging.info(f"[relay-routing] 收到中继路由注销: 链路='{chain_tag}' (from {caller_tag})")
+
+    # 清理中继路由
+    try:
+        from relay_config_manager import get_relay_manager
+
+        relay_mgr = get_relay_manager(db)
+        success = relay_mgr.cleanup_relay_route(chain_tag)
+
+        if success:
+            logging.info(f"[relay-routing] 链路 '{chain_tag}' 中继路由已清理")
+            return {
+                "success": True,
+                "message": f"Relay route cleaned up for chain '{chain_tag}'",
+                "chain_tag": chain_tag
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Failed to cleanup relay route for chain '{chain_tag}'"
+            }
+
+    except ImportError:
+        logging.error("[relay-routing] 无法导入 relay_config_manager")
+        return {
+            "success": False,
+            "message": "Relay config manager not available"
+        }
+    except Exception as e:
+        logging.error(f"[relay-routing] 清理中继路由失败: {e}")
+        return {
+            "success": False,
+            "message": "Internal error"
         }
 
 
@@ -12434,20 +15836,8 @@ def _query_relay_status_recursive(
             "message": "无法解密 PSK"
         }
 
-    # 从 endpoint 推导 API URL
-    if ":" in endpoint:
-        host, wg_port_str = endpoint.rsplit(":", 1)
-        try:
-            wg_port = int(wg_port_str)
-            api_port = wg_port - 100
-            # 端口验证
-            if not (1 <= api_port <= 65535):
-                api_port = 36000
-        except ValueError:
-            api_port = 36000
-    else:
-        host = endpoint
-        api_port = 36000
+    # Phase 11-Fix.B: 使用统一的 API 端口推导函数
+    host, api_port = _derive_api_port_from_endpoint(endpoint, relay_node)
 
     relay_url = f"http://{host}:{api_port}/api/peer-relay/status"
 
@@ -12492,6 +15882,650 @@ def _query_relay_status_recursive(
             "status": "unreachable",
             "message": "无法连接中继节点"
         }
+
+
+# ============ 链路激活/停用 API (Phase 6) ============
+
+@app.get("/api/chains/{tag}/terminal-egress")
+def api_get_chain_terminal_egress(tag: str, refresh: bool = False):
+    """Phase 11.5: 获取链路终端节点的可用出口列表（带缓存）
+
+    通过隧道 API 获取链路终端节点（最后一跳）上的可用出口。
+    用于在链路创建/更新时选择 exit_egress。
+
+    参数:
+        tag: 链路标识
+        refresh: 强制刷新缓存（默认 False）
+
+    返回:
+        {
+            "chain": "链路标识",
+            "terminal_node": "终端节点 tag",
+            "egress": [...],
+            "cached": true/false,      # Phase 11.5: 是否来自缓存
+            "cached_at": "timestamp"   # Phase 11.5: 缓存时间（如果 cached=true）
+        }
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 获取链路配置
+    chain = db.get_node_chain(tag)
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    # 解析 hops
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        try:
+            hops = json.loads(hops)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="链路配置格式错误")
+
+    if not hops or len(hops) < 2:
+        raise HTTPException(status_code=400, detail="链路至少需要 2 跳")
+
+    # 终端节点是最后一跳
+    terminal_tag = hops[-1]
+
+    # Phase 11.5: 检查缓存（除非强制刷新）
+    if not refresh:
+        cache = db.get_terminal_egress_cache(tag)
+        if cache:
+            from datetime import datetime
+            expires_at_str = cache.get("expires_at")
+            if expires_at_str:
+                try:
+                    expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
+                    if expires_at > datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now():
+                        # 缓存有效
+                        egress_list = json.loads(cache.get("egress_list", "[]"))
+                        logging.debug(f"[chains] 使用缓存的终端出口列表: 链路='{tag}'")
+                        return {
+                            "chain": tag,
+                            "terminal_node": cache.get("terminal_node", terminal_tag),
+                            "egress": egress_list,
+                            "cached": True,
+                            "cached_at": cache.get("cached_at"),
+                        }
+                except (ValueError, TypeError) as e:
+                    logging.warning(f"[chains] 解析缓存过期时间失败: {e}")
+
+    # 获取终端节点信息
+    terminal_node = db.get_peer_node(terminal_tag)
+    if not terminal_node:
+        raise HTTPException(status_code=404, detail=f"终端节点 '{terminal_tag}' 不存在")
+
+    # 检查隧道状态
+    if terminal_node.get("tunnel_status") != "connected":
+        raise HTTPException(
+            status_code=400,
+            detail=f"终端节点 '{terminal_tag}' 隧道未连接"
+        )
+
+    # Phase A: 动态构建隧道 API 端点
+    tunnel_api_endpoint = _get_peer_tunnel_endpoint(terminal_node)
+    if not tunnel_api_endpoint:
+        raise HTTPException(
+            status_code=400,
+            detail=f"终端节点 '{terminal_tag}' 缺少 tunnel_remote_ip，无法构建 API 端点"
+        )
+
+    # 通过隧道 API 获取出口列表
+    try:
+        from tunnel_api_client import TunnelAPIClientManager, TunnelProxyError
+
+        # Phase 10.3: 使用 TunnelAPIClientManager 自动处理隧道类型
+        client_mgr = TunnelAPIClientManager(db)
+        client = client_mgr.get_client(terminal_tag)
+
+        if not client:
+            raise HTTPException(
+                status_code=400,
+                detail=f"终端节点 '{terminal_tag}' 配置不完整或隧道未就绪"
+            )
+
+        egress_list = client.get_egress_list()
+
+        # 转换为可序列化的格式
+        egress_data = [
+            {
+                "tag": e.tag,
+                "name": e.name,
+                "type": e.type,
+                "enabled": e.enabled,
+                "description": e.description,
+            }
+            for e in egress_list
+        ]
+
+        # Phase 11.5: 更新缓存（TTL 5 分钟）
+        try:
+            db.update_terminal_egress_cache(
+                chain_tag=tag,
+                terminal_node=terminal_tag,
+                egress_list=egress_data,
+                ttl_seconds=300  # 5 分钟
+            )
+            logging.debug(f"[chains] 终端出口列表已缓存: 链路='{tag}'")
+        except Exception as cache_error:
+            logging.warning(f"[chains] 更新缓存失败: {cache_error}")
+
+        return {
+            "chain": tag,
+            "terminal_node": terminal_tag,
+            "egress": egress_data,
+            "cached": False,
+        }
+
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="tunnel_api_client 模块不可用"
+        )
+    except TunnelProxyError as e:
+        # Phase 10.3: 特别处理 SOCKS 代理错误
+        logging.error(f"[chains] SOCKS 代理错误: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"无法通过隧道连接到终端节点: {e}"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[chains] 获取终端出口列表失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="获取终端出口列表失败，请检查日志获取详细信息"
+        )
+
+
+@app.post("/api/chains/{tag}/activate")
+def api_activate_chain(tag: str):
+    """激活链路
+
+    1. 验证链路配置完整（exit_egress、dscp_value）
+    2. 更新链路状态为 'activating'
+    3. 在终端节点注册链路路由
+    4. 更新链路状态为 'active' 或 'error'
+    5. 重新生成 sing-box 配置
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 获取链路配置
+    chain = db.get_node_chain(tag)
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    # 验证必要字段
+    exit_egress = chain.get("exit_egress")
+    dscp_value = chain.get("dscp_value")
+    chain_mark_type = chain.get("chain_mark_type", "dscp")
+
+    if not exit_egress:
+        raise HTTPException(
+            status_code=400,
+            detail="链路未配置终端出口 (exit_egress)"
+        )
+
+    # Phase 11-Fix.J: 拒绝无法用于 DSCP 路由的出口类型
+    _validate_chain_terminal_egress(exit_egress)
+
+    if not dscp_value:
+        raise HTTPException(
+            status_code=400,
+            detail="链路未配置 DSCP 值 (dscp_value)"
+        )
+
+    # 检查当前状态
+    current_state = chain.get("chain_state", "inactive")
+    if current_state == "active":
+        return {
+            "message": "链路已处于激活状态",
+            "chain": tag,
+            "chain_state": "active"
+        }
+
+    # 防止并发激活：检查是否正在激活中
+    if current_state == "activating":
+        raise HTTPException(
+            status_code=409,
+            detail="链路正在激活中，请稍后再试"
+        )
+
+    # 更新为 activating
+    db.update_node_chain(tag, chain_state="activating")
+
+    # 解析 hops
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        try:
+            hops = json.loads(hops)
+        except json.JSONDecodeError:
+            db.update_node_chain(tag, chain_state="error")
+            raise HTTPException(status_code=500, detail="链路配置格式错误")
+
+    if not hops or len(hops) < 2:
+        db.update_node_chain(tag, chain_state="error")
+        raise HTTPException(status_code=400, detail="链路至少需要 2 跳")
+
+    # 终端节点是最后一跳
+    terminal_tag = hops[-1]
+
+    # 获取本地节点 ID（用于 source_node）
+    local_node_id = _get_local_node_id()
+
+    # 在终端节点注册链路路由
+    try:
+        from tunnel_api_client import TunnelAPIClientManager, TunnelProxyError
+
+        # Phase 11-Fix.E: 支持传递模式（线性拓扑 A→B→C，A 只知道 B）
+        allow_transitive = chain.get("allow_transitive", False)
+        terminal_node = db.get_peer_node(terminal_tag)
+        client_mgr = TunnelAPIClientManager(db)
+        client = None
+        via_relay = None  # 标记是否通过中继到达
+
+        if terminal_node:
+            # 直接连接模式：终端节点在本地数据库中
+            if terminal_node.get("tunnel_status") != "connected":
+                db.update_node_chain(tag, chain_state="error")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"终端节点 '{terminal_tag}' 隧道未连接"
+                )
+            client = client_mgr.get_client(terminal_tag)
+        elif allow_transitive:
+            # 传递模式：通过第一跳到达终端节点
+            logging.info(f"[chains] 使用传递模式激活链路 '{tag}'")
+            terminal_info, relay_client, _ = _get_terminal_node_through_tunnel(db, hops)
+
+            if not terminal_info:
+                db.update_node_chain(tag, chain_state="error")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"无法通过中继到达终端节点 '{terminal_tag}'（传递模式失败）"
+                )
+
+            via_relay = terminal_info.get("via_relay")
+            client = relay_client
+            logging.info(f"[chains] 传递模式激活: 通过 '{via_relay}' 代理链路注册")
+        else:
+            # 非传递模式且终端节点不存在
+            db.update_node_chain(tag, chain_state="error")
+            raise HTTPException(
+                status_code=404,
+                detail=f"终端节点 '{terminal_tag}' 不存在（启用 allow_transitive 可支持线性拓扑）"
+            )
+
+        if not client:
+            db.update_node_chain(tag, chain_state="error")
+            raise HTTPException(
+                status_code=400,
+                detail=f"终端节点 '{terminal_tag}' 配置不完整或隧道未就绪"
+            )
+
+        # 验证连通性（直接连接或通过中继）
+        target_desc = f"中继节点 '{via_relay}'" if via_relay else f"终端节点 '{terminal_tag}'"
+        logging.info(f"[chains] 验证 {target_desc} 连通性...")
+        if not client.ping():
+            db.update_node_chain(tag, chain_state="error")
+            if terminal_node:
+                client_mgr.invalidate_client(terminal_tag)
+            raise HTTPException(
+                status_code=503,
+                detail=f"无法连接到 {target_desc} API，请检查隧道连接状态"
+            )
+        logging.info(f"[chains] {target_desc} 连通性验证成功")
+
+        # 注册链路路由
+        # Phase 11-Fix.E: 传递模式下，通过中继转发注册到终端节点
+        success = client.register_chain_route(
+            chain_tag=tag,
+            mark_value=dscp_value,
+            egress_tag=exit_egress,
+            mark_type=chain_mark_type,
+            source_node=local_node_id,
+            target_node=terminal_tag if via_relay else None,  # 传递模式需要转发
+        )
+
+        if not success:
+            db.update_node_chain(tag, chain_state="error")
+            # Phase 10.3: 注册失败也清理客户端缓存，确保下次重试使用新连接
+            client_mgr.invalidate_client(terminal_tag)
+            raise HTTPException(
+                status_code=500,
+                detail="在终端节点注册链路路由失败"
+            )
+
+        # Phase 11.4: 在中间节点注册中继路由
+        # 对于链路 local -> A -> B -> C (hops = [A, B, C])
+        # - A 是中间节点，需要配置: source=local -> target=B
+        # - B 是中间节点，需要配置: source=A -> target=C
+        # - C 是终端节点，已在上面注册链路路由
+        relay_results = []
+        if len(hops) > 1:
+            logging.info(f"[chains] 配置 {len(hops) - 1} 个中间节点的中继路由...")
+
+            for i in range(len(hops) - 1):
+                relay_tag = hops[i]
+                relay_node = db.get_peer_node(relay_tag)
+
+                if not relay_node:
+                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 不存在，跳过")
+                    continue
+
+                if relay_node.get("tunnel_status") != "connected":
+                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 隧道未连接，跳过")
+                    continue
+
+                relay_client = client_mgr.get_client(relay_tag)
+                if not relay_client:
+                    logging.warning(f"[chains] 无法获取中间节点 '{relay_tag}' 的 API 客户端，跳过")
+                    continue
+
+                # 确定源节点和目标节点
+                source_node = local_node_id if i == 0 else hops[i - 1]
+                target_node = hops[i + 1]
+
+                # 解密 PSK
+                psk_encrypted = relay_node.get("psk_encrypted")
+                if not psk_encrypted:
+                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 缺少 PSK，跳过")
+                    continue
+
+                try:
+                    psk = _decrypt_psk(psk_encrypted)
+                except ValueError:
+                    logging.warning(f"[chains] 无法解密中间节点 '{relay_tag}' 的 PSK，跳过")
+                    continue
+
+                # 注册中继路由
+                relay_success = relay_client.register_relay_route(
+                    psk=psk,
+                    chain_tag=tag,
+                    source_node=source_node,
+                    target_node=target_node,
+                    dscp_value=dscp_value,
+                    mark_type=chain_mark_type,
+                )
+
+                relay_results.append({
+                    "node": relay_tag,
+                    "success": relay_success,
+                    "source": source_node,
+                    "target": target_node,
+                })
+
+                if relay_success:
+                    logging.info(f"[chains] 中间节点 '{relay_tag}' 中继路由注册成功 ({source_node} -> {target_node})")
+                else:
+                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 中继路由注册失败 ({source_node} -> {target_node})")
+
+        # 更新为 active
+        db.update_node_chain(tag, chain_state="active", enabled=1)
+
+        # 重新生成 sing-box 配置
+        reload_status = "success"
+        try:
+            _regenerate_and_reload()
+        except Exception as e:
+            logging.warning(f"[chains] 重新加载配置失败: {e}")
+            reload_status = "failed"
+
+        logging.info(f"[chains] 链路 '{tag}' 已激活")
+
+        return {
+            "message": f"链路 '{tag}' 已激活",
+            "chain": tag,
+            "chain_state": "active",
+            "terminal_node": terminal_tag,
+            "exit_egress": exit_egress,
+            "dscp_value": dscp_value,
+            "reload_status": reload_status,
+            "relay_routes": relay_results,  # Phase 11.4: 中继路由配置结果
+        }
+
+    except ImportError:
+        db.update_node_chain(tag, chain_state="error")
+        raise HTTPException(
+            status_code=500,
+            detail="tunnel_api_client 模块不可用"
+        )
+    except HTTPException:
+        raise
+    except TunnelProxyError as e:
+        # Phase 10.3: 特别处理 SOCKS 代理错误
+        db.update_node_chain(tag, chain_state="error")
+        logging.error(f"[chains] SOCKS 代理错误: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"无法通过隧道连接到终端节点: {e}"
+        )
+    except Exception as e:
+        db.update_node_chain(tag, chain_state="error")
+        logging.error(f"[chains] 激活链路失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="激活链路失败，请检查日志获取详细信息"
+        )
+
+
+@app.post("/api/chains/{tag}/deactivate")
+def api_deactivate_chain(tag: str):
+    """停用链路
+
+    1. 更新链路状态为 'inactive'
+    2. 在终端节点注销链路路由
+    3. 重新生成 sing-box 配置
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 获取链路配置
+    chain = db.get_node_chain(tag)
+    if not chain:
+        raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
+
+    # 检查当前状态
+    current_state = chain.get("chain_state", "inactive")
+    if current_state == "inactive":
+        return {
+            "message": "链路已处于停用状态",
+            "chain": tag,
+            "chain_state": "inactive"
+        }
+
+    dscp_value = chain.get("dscp_value")
+    chain_mark_type = chain.get("chain_mark_type", "dscp")
+
+    # 解析 hops
+    hops = chain.get("hops", [])
+    if isinstance(hops, str):
+        try:
+            hops = json.loads(hops)
+        except json.JSONDecodeError:
+            hops = []
+
+    # 在终端节点注销链路路由（如果有配置）
+    unregister_result = None
+    if hops and len(hops) >= 2 and dscp_value:
+        terminal_tag = hops[-1]
+        allow_transitive = chain.get("allow_transitive", False)
+
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+
+            terminal_node = db.get_peer_node(terminal_tag)
+            client_mgr = TunnelAPIClientManager(db)
+            client = None
+            via_relay = None  # Phase 11-Fix.E: 标记是否通过中继
+
+            if terminal_node and terminal_node.get("tunnel_status") == "connected":
+                # 直接连接模式：终端节点在本地数据库中
+                client = client_mgr.get_client(terminal_tag)
+            elif allow_transitive:
+                # Phase 11-Fix.E: 传递模式 - 通过第一跳到达终端节点
+                terminal_info, relay_client, _ = _get_terminal_node_through_tunnel(db, hops)
+                if terminal_info:
+                    via_relay = terminal_info.get("via_relay")
+                    client = relay_client
+                    logging.info(f"[chains] 传递模式注销: 通过 '{via_relay}' 代理")
+
+            if client:
+                success = client.unregister_chain_route(
+                    chain_tag=tag,
+                    mark_value=dscp_value,
+                    mark_type=chain_mark_type,
+                    target_node=terminal_tag if via_relay else None,  # 传递模式需要转发
+                )
+                unregister_result = "success" if success else "failed"
+                if via_relay:
+                    unregister_result += f" (via {via_relay})"
+            else:
+                unregister_result = "skipped (client unavailable)"
+
+        except ImportError:
+            unregister_result = "skipped (module unavailable)"
+        except Exception as e:
+            logging.warning(f"[chains] 注销链路路由时出错: {e}")
+            unregister_result = f"error: {e}"
+
+    # Phase 11.4: 在中间节点注销中继路由
+    relay_unregister_results = []
+    if hops and len(hops) > 1:
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+
+            client_mgr = TunnelAPIClientManager(db)
+
+            for i in range(len(hops) - 1):  # 除了终端节点
+                relay_tag = hops[i]
+                relay_node = db.get_peer_node(relay_tag)
+
+                if not relay_node:
+                    relay_unregister_results.append({
+                        "node": relay_tag,
+                        "result": "skipped (node not found)"
+                    })
+                    continue
+
+                if relay_node.get("tunnel_status") != "connected":
+                    relay_unregister_results.append({
+                        "node": relay_tag,
+                        "result": "skipped (tunnel not connected)"
+                    })
+                    continue
+
+                relay_client = client_mgr.get_client(relay_tag)
+                if not relay_client:
+                    relay_unregister_results.append({
+                        "node": relay_tag,
+                        "result": "skipped (client unavailable)"
+                    })
+                    continue
+
+                # 解密 PSK
+                psk_encrypted = relay_node.get("psk_encrypted")
+                if not psk_encrypted:
+                    relay_unregister_results.append({
+                        "node": relay_tag,
+                        "result": "skipped (no PSK)"
+                    })
+                    continue
+
+                try:
+                    psk = _decrypt_psk(psk_encrypted)
+                except ValueError:
+                    relay_unregister_results.append({
+                        "node": relay_tag,
+                        "result": "skipped (PSK decrypt failed)"
+                    })
+                    continue
+
+                # 注销中继路由
+                success = relay_client.unregister_relay_route(psk=psk, chain_tag=tag)
+                relay_unregister_results.append({
+                    "node": relay_tag,
+                    "result": "success" if success else "failed"
+                })
+
+                if success:
+                    logging.info(f"[chains] 中间节点 '{relay_tag}' 中继路由已注销")
+                else:
+                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 中继路由注销失败")
+
+        except ImportError:
+            logging.warning("[chains] tunnel_api_client 模块不可用，跳过中继路由注销")
+        except Exception as e:
+            logging.warning(f"[chains] 注销中继路由时出错: {e}")
+
+    # 更新为 inactive
+    db.update_node_chain(tag, chain_state="inactive", enabled=0)
+
+    # 重新生成 sing-box 配置
+    reload_status = "success"
+    try:
+        _regenerate_and_reload()
+    except Exception as e:
+        logging.warning(f"[chains] 重新加载配置失败: {e}")
+        reload_status = "failed"
+
+    logging.info(f"[chains] 链路 '{tag}' 已停用")
+
+    return {
+        "message": f"链路 '{tag}' 已停用",
+        "chain": tag,
+        "chain_state": "inactive",
+        "unregister_result": unregister_result,
+        "relay_unregister_results": relay_unregister_results,  # Phase 11.4
+        "reload_status": reload_status,
+    }
+
+
+def _get_local_node_id() -> str:
+    """获取本地节点标识
+
+    用于标识入口节点，作为链路路由注册的 source_node。
+    """
+    import socket
+
+    # 尝试从环境变量获取
+    node_id = os.environ.get("VPN_ROUTER_NODE_ID")
+    if node_id:
+        return node_id
+
+    # 使用主机名
+    try:
+        hostname = socket.gethostname()
+        if hostname:
+            # 清理主机名，只保留安全字符
+            import re
+            clean_name = re.sub(r'[^a-z0-9\-]', '', hostname.lower())[:32]
+            if clean_name:
+                return clean_name
+    except Exception:
+        pass
+
+    # 使用 machine-id（如果可用）
+    try:
+        machine_id_path = Path("/etc/machine-id")
+        if machine_id_path.exists():
+            machine_id = machine_id_path.read_text().strip()[:8]
+            if machine_id:
+                return f"node-{machine_id}"
+    except Exception:
+        pass
+
+    # 默认值
+    return "vpn-gateway"
 
 
 @app.post("/api/config/regenerate")
@@ -12901,7 +16935,11 @@ async def api_batch_push_rules(
             tunnel_remote_ip = node.get("tunnel_remote_ip")
             xray_socks_port = node.get("xray_socks_port")
 
-            target_url = f"http://{tunnel_remote_ip}:8000/api/rules"
+            # Phase A: 动态构建隧道 API 端点
+            tunnel_api_endpoint = _get_peer_tunnel_endpoint(node)
+            if not tunnel_api_endpoint:
+                continue  # 无法构建端点，跳过此节点
+            target_url = f"http://{tunnel_api_endpoint}/api/rules"
 
             headers = {"Content-Type": "application/json"}
             if authorization:
@@ -12979,7 +17017,11 @@ async def api_batch_reload(
             tunnel_remote_ip = node.get("tunnel_remote_ip")
             xray_socks_port = node.get("xray_socks_port")
 
-            target_url = f"http://{tunnel_remote_ip}:8000/api/config/reload"
+            # Phase A: 动态构建隧道 API 端点
+            tunnel_api_endpoint = _get_peer_tunnel_endpoint(node)
+            if not tunnel_api_endpoint:
+                continue  # 无法构建端点，跳过此节点
+            target_url = f"http://{tunnel_api_endpoint}/api/config/reload"
 
             headers = {}
             if authorization:

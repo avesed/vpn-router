@@ -15,9 +15,8 @@ import {
   SignalSlashIcon,
   ServerStackIcon,
   CheckIcon,
-  KeyIcon,
-  EyeIcon,
-  EyeSlashIcon
+  ArrowsRightLeftIcon  // For bidirectional status
+  // KeyIcon, EyeIcon, EyeSlashIcon 已移除 - PSK 输入已废弃
 } from "@heroicons/react/24/outline";
 import { api } from "../api/client";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -96,7 +95,7 @@ export default function PeerManager() {
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   // [CR-006] PSK visibility toggle for security (prevent shoulder surfing)
-  const [showPsk, setShowPsk] = useState(false);
+  // PSK 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
 
   // [CR-009] Custom delete confirmation dialog state
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -201,7 +200,7 @@ export default function PeerManager() {
     });
     setFormError(null);
     setEditingNode(null);
-    setShowPsk(false);  // [CR-006] Reset PSK visibility on form reset
+    // PSK 已废弃 - 无需重置
   };
 
   // Open add modal
@@ -260,15 +259,7 @@ export default function PeerManager() {
       return;
     }
 
-    // [安全] PSK 验证：新建时必填，编辑时如有提供则验证长度
-    if (!editingNode && formData.psk.length < 16) {
-      setFormError(t("peers.pskTooShort"));
-      return;
-    }
-    if (editingNode && formData.psk && formData.psk.length < 16) {
-      setFormError(t("peers.pskTooShort"));
-      return;
-    }
+    // PSK 验证已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
 
     setSaving(true);
     try {
@@ -293,19 +284,17 @@ export default function PeerManager() {
           xray_xhttp_mode: formData.xray_xhttp_mode || undefined,
           xray_xhttp_host: formData.xray_xhttp_host || undefined
         };
-        if (formData.psk) {
-          updateData.psk = formData.psk;
-        }
+        // PSK 已废弃 - 不再发送
         await api.updatePeerNode(editingNode.tag, updateData);
         showSuccess(t("peers.updateSuccess", { name: formData.name }));
       } else {
-        // Create new node
+        // Create new node - PSK 已废弃
         const createData: PeerNodeCreateRequest = {
           tag: formData.tag,
           name: formData.name,
           description: formData.description || undefined,
           endpoint: formData.endpoint,
-          psk: formData.psk,
+          // psk 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
           tunnel_type: formData.tunnel_type,
           // REALITY 配置（仅 Xray 隧道）
           xray_reality_dest: formData.tunnel_type === "xray" ? formData.xray_reality_dest : undefined,
@@ -508,6 +497,40 @@ export default function PeerManager() {
     );
   };
 
+  // Render bidirectional status badge (Phase 11.2)
+  const renderBidirectionalBadge = (status?: "pending" | "outbound_only" | "bidirectional") => {
+    if (!status) return null;
+
+    const config = {
+      pending: {
+        bg: "bg-yellow-500/20",
+        text: "text-yellow-400",
+        label: t("peers.bidirectional.pending")
+      },
+      outbound_only: {
+        bg: "bg-orange-500/20",
+        text: "text-orange-400",
+        label: t("peers.bidirectional.outbound_only")
+      },
+      bidirectional: {
+        bg: "bg-green-500/20",
+        text: "text-green-400",
+        label: t("peers.bidirectional.bidirectional")
+      }
+    };
+
+    const cfg = config[status];
+    return (
+      <span
+        className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium ${cfg.bg} ${cfg.text}`}
+        title={t("peers.bidirectional.title")}
+      >
+        <ArrowsRightLeftIcon className="w-3 h-3" />
+        {cfg.label}
+      </span>
+    );
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -669,8 +692,14 @@ export default function PeerManager() {
                   <span className="text-slate-500">{t("peers.endpoint")}:</span>
                   <span className="text-slate-300 font-mono">{node.endpoint}</span>
                 </div>
-                <div className="flex items-center gap-2">
+                {/* Phase D: 显示 API 端口 */}
+                <div className="flex items-center gap-2 text-sm">
+                  <span className="text-slate-500">{t("peers.apiPort")}:</span>
+                  <span className="text-slate-300 font-mono">{node.api_port || 36000}</span>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
                   {renderTunnelTypeBadge(node)}
+                  {renderBidirectionalBadge(node.bidirectional_status)}
                   {node.auto_reconnect && (
                     <span className="text-xs text-slate-500 flex items-center gap-1">
                       <ArrowPathIcon className="w-3 h-3" />
@@ -703,6 +732,12 @@ export default function PeerManager() {
                       </>
                     )}
                   </button>
+                ) : node.bidirectional_status === "bidirectional" ? (
+                  // When bidirectional, connection is auto-managed - show indicator instead of button
+                  <div className="flex-1 px-3 py-1.5 bg-slate-700/50 text-slate-400 text-sm rounded flex items-center justify-center gap-1.5">
+                    <ArrowsRightLeftIcon className="w-4 h-4" />
+                    {t("peers.bidirectional.autoManaged")}
+                  </div>
                 ) : (
                   <button
                     onClick={() => handleConnectNode(node)}
@@ -843,54 +878,7 @@ export default function PeerManager() {
                 <p className="text-xs text-slate-500 mt-1">{t("peers.endpointHint")}</p>
               </div>
 
-              {/* PSK - [CR-006] Changed to password type with visibility toggle */}
-              <div>
-                <label className="block text-sm font-medium text-slate-400 mb-2">
-                  {t("peers.psk")} {!editingNode && <span className="text-red-400">*</span>}
-                </label>
-                <div className="flex gap-2">
-                  <div className="flex-1 relative">
-                    <input
-                      type={showPsk ? "text" : "password"}
-                      name="psk"
-                      value={formData.psk}
-                      onChange={handleInputChange}
-                      placeholder={editingNode ? t("peers.pskPlaceholderEdit") : t("peers.pskPlaceholder")}
-                      autoComplete="new-password"
-                      className="w-full px-3 py-2 pr-10 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm placeholder-slate-500 focus:outline-none focus:border-brand"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowPsk(!showPsk)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 transition-colors"
-                      title={showPsk ? t("peers.hidePsk") : t("peers.showPsk")}
-                    >
-                      {showPsk ? (
-                        <EyeSlashIcon className="h-5 w-5" />
-                      ) : (
-                        <EyeIcon className="h-5 w-5" />
-                      )}
-                    </button>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      // 生成 32 字节随机密钥，Base64 编码
-                      const bytes = new Uint8Array(32);
-                      crypto.getRandomValues(bytes);
-                      const base64 = btoa(String.fromCharCode(...bytes));
-                      setFormData(prev => ({ ...prev, psk: base64 }));
-                      setShowPsk(true);  // Show PSK when generating to verify
-                    }}
-                    className="px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 transition-colors flex items-center gap-1.5"
-                    title={t("peers.generatePsk")}
-                  >
-                    <KeyIcon className="h-4 w-4" />
-                    <span className="hidden sm:inline text-sm">{t("peers.generate")}</span>
-                  </button>
-                </div>
-                <p className="text-xs text-slate-500 mt-1">{t("peers.pskHint")}</p>
-              </div>
+              {/* PSK 输入已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证 */}
 
               {/* Tunnel Type (only for new nodes) */}
               {!editingNode && (
@@ -1106,9 +1094,15 @@ export default function PeerManager() {
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-xs text-slate-500 mb-1">{t("peers.endpoint")}</label>
-                  <p className="text-white font-mono">{detailNode.endpoint}</p>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs text-slate-500 mb-1">{t("peers.endpoint")}</label>
+                    <p className="text-white font-mono">{detailNode.endpoint}</p>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-500 mb-1">{t("peers.apiPort")}</label>
+                    <p className="text-white font-mono">{detailNode.api_port || 36000}</p>
+                  </div>
                 </div>
 
                 {detailNode.description && (
