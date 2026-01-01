@@ -27,8 +27,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 
-import bcrypt
-
+# Default Web API port (configurable via environment)
+DEFAULT_WEB_PORT = int(os.environ.get("WEB_PORT", "36000"))
 
 # 配对码版本
 PAIRING_VERSION = 1
@@ -61,12 +61,38 @@ MAX_TIMESTAMP_FUTURE_OFFSET = 300
 # 隧道 IP 基础网段
 TUNNEL_IP_BASE = "10.200.200"
 
-# 隧道端口范围
-TUNNEL_PORT_BASE = 36200
-TUNNEL_PORT_MAX = 36299
+# Phase 6: 隧道端口范围（支持环境变量配置）
+TUNNEL_PORT_BASE = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
+TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
 
 # 节点描述最大长度
 MAX_DESCRIPTION_LENGTH = 256
+
+# Issue 15: 隧道 IP 验证网段
+TUNNEL_IP_SUBNET = "10.200.200.0/24"
+
+
+def _validate_tunnel_ip_in_subnet(ip: str, subnet: str = TUNNEL_IP_SUBNET) -> bool:
+    """
+    验证隧道 IP 是否在预期范围内。
+
+    Issue 15 修复：在导入配对信息时验证隧道 IP 地址合法性，
+    确保 IP 在 10.200.200.0/24 范围内。
+
+    Args:
+        ip: 要验证的 IP 地址
+        subnet: 预期的子网范围
+
+    Returns:
+        IP 是否在预期范围内
+    """
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(ip)
+        network = ipaddress.ip_network(subnet)
+        return addr in network
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -258,21 +284,8 @@ class PairingCodeGenerator:
         """
         self.db = db
 
-    def generate_psk(self) -> str:
-        """生成安全的 PSK"""
-        return secrets.token_urlsafe(32)
-
-    def hash_psk(self, psk: str) -> str:
-        """对 PSK 进行 bcrypt 哈希"""
-        salt = bcrypt.gensalt()
-        return bcrypt.hashpw(psk.encode('utf-8'), salt).decode('utf-8')
-
-    def verify_psk(self, psk: str, psk_hash: str) -> bool:
-        """验证 PSK"""
-        try:
-            return bcrypt.checkpw(psk.encode('utf-8'), psk_hash.encode('utf-8'))
-        except Exception:
-            return False
+    # NOTE: generate_psk(), hash_psk(), verify_psk() methods have been removed.
+    # PSK authentication is deprecated. Use tunnel IP authentication (WireGuard) or UUID authentication (Xray).
 
     def generate_wireguard_keypair(self) -> Tuple[str, str]:
         """生成 WireGuard 密钥对
@@ -712,6 +725,14 @@ class PairingCodeGenerator:
         if not ip_pattern.match(tunnel_remote_ip):
             return False, "Invalid tunnel_remote_ip format", None
 
+        # Issue 15 修复：验证隧道 IP 在预期子网范围内
+        if not _validate_tunnel_ip_in_subnet(tunnel_local_ip):
+            logging.warning(f"[pairing] tunnel_local_ip '{tunnel_local_ip}' 不在预期范围 {TUNNEL_IP_SUBNET}")
+            return False, f"tunnel_local_ip '{tunnel_local_ip}' is not in expected subnet {TUNNEL_IP_SUBNET}", None
+        if not _validate_tunnel_ip_in_subnet(tunnel_remote_ip):
+            logging.warning(f"[pairing] tunnel_remote_ip '{tunnel_remote_ip}' 不在预期范围 {TUNNEL_IP_SUBNET}")
+            return False, f"tunnel_remote_ip '{tunnel_remote_ip}' is not in expected subnet {TUNNEL_IP_SUBNET}", None
+
         # ========================================
         # HIGH-4 修复：时间戳验证（包括未来值检查）
         # ========================================
@@ -886,7 +907,7 @@ class PairingManager:
                     bidirectional_status = None
 
                 # Phase 11-Fix.K: 保存 api_port 并正确设置 tunnel_api_endpoint
-                remote_api_port = request.api_port or 36000
+                remote_api_port = request.api_port or DEFAULT_WEB_PORT
                 self.db.add_peer_node(
                     tag=request.node_tag,
                     name=request.node_tag,
@@ -915,8 +936,13 @@ class PairingManager:
                 private_key, public_key = self.generator.generate_xray_reality_keypair()
                 short_id = self.generator.generate_short_id()
 
+                # Phase 6 Issue 21: 为 Xray peer 生成 xray_uuid
+                # 这个 UUID 用于隧道 API 认证
+                import uuid
+                xray_uuid = str(uuid.uuid4())
+
                 # Phase 11-Fix.K: 保存 api_port 并正确设置 tunnel_api_endpoint
-                remote_api_port = request.api_port or 36000
+                remote_api_port = request.api_port or DEFAULT_WEB_PORT
                 self.db.add_peer_node(
                     tag=request.node_tag,
                     name=request.node_tag,
@@ -934,6 +960,7 @@ class PairingManager:
                     xray_reality_short_id=short_id,
                     xray_peer_reality_public_key=request.xray_reality_public_key,
                     xray_peer_reality_short_id=request.xray_reality_short_id,
+                    xray_uuid=xray_uuid,  # Phase 6 Issue 21: 存储 xray_uuid
                     tunnel_api_endpoint=f"{remote_ip}:{remote_api_port}",
                 )
         except sqlite3.IntegrityError as e:
@@ -945,8 +972,8 @@ class PairingManager:
             return False, "Failed to create peer node", None
 
         # 生成响应码
-        # Phase 11-Fix.K: 使用 api_port 或默认 36000
-        local_api_port = api_port or 36000
+        # Phase 11-Fix.K: 使用 api_port 或默认端口
+        local_api_port = api_port or DEFAULT_WEB_PORT
         response = PairingResponse(
             type="pair_response",
             version=PAIRING_VERSION,
@@ -1010,6 +1037,21 @@ class PairingManager:
 
         # PSK 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
 
+        # Issue 15 修复：验证隧道 IP 在预期范围内
+        if response.tunnel_local_ip and not _validate_tunnel_ip_in_subnet(response.tunnel_local_ip):
+            logging.warning(f"[pairing] tunnel_local_ip '{response.tunnel_local_ip}' 不在预期范围 {TUNNEL_IP_SUBNET}")
+            return False, f"Invalid tunnel_local_ip: '{response.tunnel_local_ip}' is not in expected subnet {TUNNEL_IP_SUBNET}"
+        if response.tunnel_remote_ip and not _validate_tunnel_ip_in_subnet(response.tunnel_remote_ip):
+            logging.warning(f"[pairing] tunnel_remote_ip '{response.tunnel_remote_ip}' 不在预期范围 {TUNNEL_IP_SUBNET}")
+            return False, f"Invalid tunnel_remote_ip: '{response.tunnel_remote_ip}' is not in expected subnet {TUNNEL_IP_SUBNET}"
+
+        # Issue 14 修复：如果 tunnel_api_endpoint 缺失，从 tunnel_remote_ip 和 api_port 计算
+        tunnel_api_endpoint = response.tunnel_api_endpoint
+        if not tunnel_api_endpoint and response.tunnel_remote_ip:
+            api_port = response.api_port or DEFAULT_WEB_PORT
+            tunnel_api_endpoint = f"{response.tunnel_remote_ip}:{api_port}"
+            logging.info(f"[pairing] 计算 tunnel_api_endpoint: {tunnel_api_endpoint}")
+
         # 创建 peer_node
         try:
             tunnel_type = pending_request.get("tunnel_type", "wireguard")
@@ -1029,7 +1071,7 @@ class PairingManager:
                     wg_private_key=pending_request.get("wg_private_key"),
                     wg_public_key=pending_request.get("wg_public_key"),
                     wg_peer_public_key=response.wg_public_key,
-                    tunnel_api_endpoint=response.tunnel_api_endpoint,
+                    tunnel_api_endpoint=tunnel_api_endpoint,  # Issue 14: 使用计算后的值
                 )
                 # Phase 11.2: 保存双向连接参数
                 if pending_request.get("bidirectional"):
@@ -1041,6 +1083,10 @@ class PairingManager:
                     )
             elif tunnel_type == "xray":
                 # Phase 11.3: Xray 双向自动连接
+                # Phase 6 Issue 21: 生成 xray_uuid 用于隧道 API 认证
+                import uuid
+                xray_uuid = str(uuid.uuid4())
+
                 self.db.add_peer_node(
                     tag=response.node_tag,
                     name=response.node_tag,
@@ -1057,7 +1103,8 @@ class PairingManager:
                     xray_reality_short_id=pending_request.get("xray_short_id"),
                     xray_peer_reality_public_key=response.xray_reality_public_key,
                     xray_peer_reality_short_id=response.xray_reality_short_id,
-                    tunnel_api_endpoint=response.tunnel_api_endpoint,
+                    xray_uuid=xray_uuid,  # Phase 6 Issue 21: 存储 xray_uuid
+                    tunnel_api_endpoint=tunnel_api_endpoint,  # Issue 14: 使用计算后的值
                     bidirectional_status="pending",  # Phase 11.3: 标记待双向连接
                 )
         except Exception as e:

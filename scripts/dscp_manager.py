@@ -22,6 +22,7 @@
 """
 
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -47,11 +48,11 @@ RESERVED_DSCP_VALUES: Set[int] = {
 # 可用的 DSCP 值（排除保留值）
 AVAILABLE_DSCP_VALUES: Set[int] = set(range(DSCP_MIN, DSCP_MAX + 1)) - RESERVED_DSCP_VALUES
 
-# 标记偏移量
+# 标记偏移量（可通过环境变量配置）
 # 注意: ECMP 使用 200-299 的 fwmark 和 routing table，DSCP 使用 300-363
-ENTRY_ROUTING_MARK_BASE = 100   # sing-box routing_mark = 100 + dscp (100-163)
-TERMINAL_FWMARK_BASE = 300      # 终端节点 fwmark = 300 + dscp (301-363)
-TERMINAL_TABLE_BASE = 300       # 策略路由表 = 300 + dscp (301-363)
+ENTRY_ROUTING_MARK_BASE = int(os.environ.get("ENTRY_ROUTING_MARK_BASE", "100"))   # sing-box routing_mark = 100 + dscp (100-163)
+TERMINAL_FWMARK_BASE = int(os.environ.get("TERMINAL_FWMARK_BASE", "300"))         # 终端节点 fwmark = 300 + dscp (301-363)
+TERMINAL_TABLE_BASE = int(os.environ.get("TERMINAL_TABLE_BASE", "300"))           # 策略路由表 = 300 + dscp (301-363)
 
 # iptables 链名前缀
 CHAIN_PREFIX = "CHAIN_DSCP_"
@@ -181,13 +182,26 @@ class DSCPManager:
         return True
 
     def _ip_rule_exists(self, fwmark: int, table: int) -> bool:
-        """检查 ip rule 是否存在"""
+        """Check if an ip rule with given fwmark and table exists.
+
+        Supports both hex (0x12d) and decimal (301) fwmark formats
+        as different Linux distributions use different output formats.
+        """
         success, output = self._ip(["rule", "list"])
         if not success:
             return False
-        # 查找 fwmark 规则
-        pattern = f"fwmark 0x{fwmark:x}.*lookup {table}"
-        return bool(re.search(pattern, output))
+
+        # Pattern 1: hex format (e.g., "fwmark 0x12d lookup 301")
+        hex_pattern = rf"fwmark\s+0x{fwmark:x}\s+.*lookup\s+{table}\b"
+        if re.search(hex_pattern, output, re.IGNORECASE):
+            return True
+
+        # Pattern 2: decimal format (e.g., "fwmark 301 lookup 301")
+        dec_pattern = rf"fwmark\s+{fwmark}\s+.*lookup\s+{table}\b"
+        if re.search(dec_pattern, output):
+            return True
+
+        return False
 
     def setup_entry_rules(
         self,
@@ -339,6 +353,97 @@ class DSCPManager:
             return False
 
         self._logger.info(f"[terminal] DSCP routing set successfully: dscp={dscp_value}")
+        return True
+
+    def verify_entry_rules(
+        self,
+        chain_tag: str,
+        routing_mark: int,
+        dscp_value: int,
+    ) -> bool:
+        """验证入口 DSCP 规则是否实际生效
+
+        检查 iptables OUTPUT 链中的两条规则是否存在。
+
+        Args:
+            chain_tag: 链路标识
+            routing_mark: sing-box 的 routing_mark 值
+            dscp_value: DSCP 值 (1-63)
+
+        Returns:
+            True 如果两条规则都存在，否则 False
+        """
+        # 规则 1: mark → DSCP (OUTPUT chain)
+        rule1 = [
+            "-m", "mark", "--mark", str(routing_mark),
+            "-j", "DSCP", "--set-dscp", str(dscp_value),
+        ]
+        if not self._rule_exists("mangle", "OUTPUT", rule1):
+            self._logger.error(f"[{chain_tag}] Entry rule 1 (mark→DSCP) verification failed")
+            return False
+
+        # 规则 2: clear mark (OUTPUT chain)
+        rule2 = [
+            "-m", "mark", "--mark", str(routing_mark),
+            "-j", "MARK", "--set-mark", "0",
+        ]
+        if not self._rule_exists("mangle", "OUTPUT", rule2):
+            self._logger.error(f"[{chain_tag}] Entry rule 2 (clear mark) verification failed")
+            return False
+
+        self._logger.info(f"[{chain_tag}] Entry DSCP rules verified successfully")
+        return True
+
+    def verify_terminal_rules(
+        self,
+        dscp_value: int,
+        egress_interface: str,
+        peer_interface_pattern: str = "wg-peer-+",
+    ) -> bool:
+        """验证终端 DSCP 规则是否实际生效
+
+        检查 iptables 规则、ip rule 和 ip route 是否都存在。
+
+        Args:
+            dscp_value: DSCP 值 (1-63)
+            egress_interface: 出口网络接口
+            peer_interface_pattern: 入站接口模式
+
+        Returns:
+            True 如果所有规则都存在，否则 False
+        """
+        fwmark = TERMINAL_FWMARK_BASE + dscp_value
+        table = TERMINAL_TABLE_BASE + dscp_value
+
+        # 检查 iptables 规则 (PREROUTING chain)
+        rule = [
+            "-i", peer_interface_pattern,
+            "-m", "dscp", "--dscp", str(dscp_value),
+            "-j", "MARK", "--set-mark", str(fwmark),
+        ]
+        if not self._rule_exists("mangle", "PREROUTING", rule):
+            self._logger.error(f"[dscp={dscp_value}] Terminal iptables rule verification failed")
+            return False
+
+        # 检查 ip rule
+        if not self._ip_rule_exists(fwmark, table):
+            self._logger.error(f"[dscp={dscp_value}] Terminal ip rule verification failed")
+            return False
+
+        # 检查 ip route
+        success, output = self._ip(["route", "show", "table", str(table)])
+        if not success:
+            self._logger.error(f"[dscp={dscp_value}] Terminal ip route query failed")
+            return False
+
+        # Use regex with word boundaries for exact interface matching
+        # Pattern matches "dev wg-pia-us " or "dev wg-pia-us\n" but not "dev wg-pia-us2"
+        interface_pattern = rf"\bdev\s+{re.escape(egress_interface)}\b"
+        if not re.search(interface_pattern, output):
+            self._logger.error(f"[dscp={dscp_value}] Terminal ip route verification failed: interface '{egress_interface}' not found in table {table}")
+            return False
+
+        self._logger.info(f"[dscp={dscp_value}] Terminal DSCP rules verified successfully")
         return True
 
     def cleanup_entry_rules(

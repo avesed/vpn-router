@@ -53,8 +53,8 @@ USQUE_BIN = Path("/usr/local/bin/usque")
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 
-# SOCKS5 端口范围（38001+，与 OpenVPN 37001+ 和 V2Ray 37101+ 分开）
-WARP_SOCKS_PORT_START = 38001
+# SOCKS5 端口范围（可通过环境变量配置，与 OpenVPN 37001+ 和 V2Ray 37101+ 分开）
+WARP_SOCKS_PORT_START = int(os.environ.get("WARP_MASQUE_PORT_BASE", "38001"))
 
 
 def write_pid_file_atomic(pid_path: Path, pid: int) -> None:

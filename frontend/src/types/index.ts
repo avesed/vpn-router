@@ -1141,7 +1141,7 @@ export interface PeerNodeCreateRequest {
   name: string;
   description?: string;
   endpoint: string;
-  psk?: string;  // 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
+  // NOTE: psk field removed - WireGuard uses tunnel IP authentication, Xray uses UUID authentication
   tunnel_type: PeerTunnelType;
 
   // REALITY 服务端配置（可选，有默认值）
@@ -1160,7 +1160,7 @@ export interface PeerNodeUpdateRequest {
   name?: string;
   description?: string;
   endpoint?: string;
-  psk?: string;  // 已废弃 - 保留兼容，不再使用
+  // NOTE: psk field removed - WireGuard uses tunnel IP authentication, Xray uses UUID authentication
 
   // REALITY 服务端配置
   xray_reality_dest?: string;

@@ -10,6 +10,7 @@
 """
 import ipaddress
 import json
+import logging
 import os
 import shutil
 import sys
@@ -19,6 +20,34 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import yaml
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    """Safely read an integer from environment variable with fallback.
+
+    Args:
+        name: Environment variable name
+        default: Default value if not set or invalid
+
+    Returns:
+        Integer value from environment or default
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[render] WARNING: Invalid integer value '{value}' for {name}, using default {default}")
+        return default
+
+
+# Port configuration from environment
+DEFAULT_TPROXY_PORT = _safe_int_env("TPROXY_PORT", 7893)
+DEFAULT_CLASH_API_PORT = _safe_int_env("CLASH_API_PORT", 9090)
+DEFAULT_V2RAY_STATS_PORT = _safe_int_env("V2RAY_STATS_PORT", 10085)
+PEER_SOCKS_PORT_BASE = _safe_int_env("PEER_SOCKS_PORT_BASE", 37201)
+SPEEDTEST_PORT_BASE = _safe_int_env("SPEEDTEST_PORT_BASE", 39001)
 
 # 尝试导入数据库模块（如果可用）
 try:
@@ -132,7 +161,7 @@ def create_tproxy_inbound(wg_config: dict) -> dict:
         "type": "tproxy",
         "tag": "tproxy-in",
         "listen": "0.0.0.0",
-        "listen_port": 7893,  # TPROXY 监听端口
+        "listen_port": DEFAULT_TPROXY_PORT,
         "sniff": True,
         "sniff_override_destination": False
     }
@@ -1385,8 +1414,7 @@ def ensure_v2ray_dns_servers(config: dict, v2ray_tags: List[str]) -> None:
 # Xray 再通过 VLESS+XHTTP+REALITY 连接到远程 peer
 #
 # 端口分配: 37201, 37202, ... (与 Xray peer 出站 SOCKS 入站对应)
-
-PEER_SOCKS_PORT_START = 37201
+# Note: PEER_SOCKS_PORT_BASE is defined at the top of the file from environment
 
 
 def load_peer_nodes_for_outbound() -> List[dict]:
@@ -1448,7 +1476,7 @@ def ensure_peer_outbounds(config: dict, peer_nodes: List[dict]) -> List[str]:
         peer_tags.append(outbound_tag)
 
         # 获取 SOCKS 端口（与 xray_manager.py 中分配的端口一致）
-        socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_START + idx)
+        socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_BASE + idx)
 
         socks_outbound = {
             "type": "socks",
@@ -2506,11 +2534,10 @@ def ensure_speed_test_inbounds(config: dict, egress_tags: List[str]) -> None:
     # 获取已存在的 inbound tags
     existing_inbound_tags = {ib.get("tag") for ib in inbounds}
 
-    base_port = 39001  # 测速 SOCKS 端口起始
     added_count = 0
 
     for i, tag in enumerate(sorted(egress_tags)):
-        socks_port = base_port + i
+        socks_port = SPEEDTEST_PORT_BASE + i
         inbound_tag = f"speedtest-{tag}"
 
         # 跳过已存在的 inbound
@@ -2537,7 +2564,7 @@ def ensure_speed_test_inbounds(config: dict, egress_tags: List[str]) -> None:
         added_count += 1
 
     if added_count > 0:
-        print(f"[render] 已添加 {added_count} 个测速 SOCKS inbound (端口 {base_port}-{base_port + len(egress_tags) - 1})")
+        print(f"[render] 已添加 {added_count} 个测速 SOCKS inbound (端口 {SPEEDTEST_PORT_BASE}-{SPEEDTEST_PORT_BASE + len(egress_tags) - 1})")
 
 
 def ensure_peer_inbound_socks(config: dict) -> None:
@@ -2822,11 +2849,11 @@ def main() -> None:
 
     config["experimental"] = {
         "clash_api": {
-            "external_controller": "127.0.0.1:9090",
+            "external_controller": f"127.0.0.1:{DEFAULT_CLASH_API_PORT}",
             "secret": ""
         },
         "v2ray_api": {
-            "listen": "127.0.0.1:10085",
+            "listen": f"127.0.0.1:{DEFAULT_V2RAY_STATS_PORT}",
             "stats": {
                 "enabled": True,
                 "outbounds": stats_outbounds
@@ -2837,8 +2864,8 @@ def main() -> None:
             "path": "/etc/sing-box/cache.db"
         }
     }
-    print("[render] 已启用 clash_api (127.0.0.1:9090)")
-    print(f"[render] 已启用 v2ray_api (127.0.0.1:10085) 统计 {len(stats_outbounds)} 个出口")
+    print(f"[render] 已启用 clash_api (127.0.0.1:{DEFAULT_CLASH_API_PORT})")
+    print(f"[render] 已启用 v2ray_api (127.0.0.1:{DEFAULT_V2RAY_STATS_PORT}) 统计 {len(stats_outbounds)} 个出口")
 
     # H7: 原子写入配置文件，防止 sing-box 读取到不完整配置
     config_json = json.dumps(config, indent=2)

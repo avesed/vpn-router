@@ -20,6 +20,7 @@
 """
 
 import logging
+import subprocess
 import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
@@ -59,6 +60,43 @@ class ChainRouteManager:
     def _get_route_key(self, chain_tag: str, mark_value: int, mark_type: str) -> str:
         """生成路由键"""
         return f"{chain_tag}:{mark_value}:{mark_type}"
+
+    def _interface_exists(self, interface: str) -> bool:
+        """Check if network interface exists and is UP in the system.
+
+        Uses 'ip link show' to verify interface presence and state.
+
+        Args:
+            interface: Network interface name
+
+        Returns:
+            True if interface exists and is UP, False otherwise
+        """
+        try:
+            result = subprocess.run(
+                ["ip", "link", "show", interface],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+
+            # Check interface is UP (state UP or UNKNOWN for virtual interfaces)
+            # Format: "2: wg-pia-us: <POINTOPOINT,NOARP,UP,LOWER_UP> ..."
+            output = result.stdout
+            if ",UP" in output or "state UP" in output.upper() or "state UNKNOWN" in output.upper():
+                return True
+
+            self._logger.warning(f"Interface '{interface}' exists but is not UP")
+            return False
+
+        except subprocess.TimeoutExpired:
+            self._logger.error(f"Timeout checking interface {interface}")
+            return False
+        except Exception as e:
+            self._logger.error(f"Failed to check interface {interface}: {e}")
+            return False
 
     def _get_egress_interface(self, egress_tag: str) -> Optional[str]:
         """获取出口对应的网络接口
@@ -152,6 +190,11 @@ class ChainRouteManager:
             interface = self._get_egress_interface(egress_tag)
             if not interface:
                 self._logger.error(f"Cannot find interface for egress: {egress_tag}")
+                return False
+
+            # Phase 3: 验证接口在系统中实际存在
+            if not self._interface_exists(interface):
+                self._logger.error(f"Interface '{interface}' does not exist in system")
                 return False
 
             # 设置 DSCP 路由规则

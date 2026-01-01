@@ -1,8 +1,9 @@
 """
-Unit tests for PSK authentication rate limiting (CR-005 fix).
+Unit tests for API rate limiting (CR-005 fix).
 
 Tests the rate limiting mechanism that prevents brute-force attacks
-on the PSK authentication endpoint.
+on peer-to-peer API endpoints. Note: PSK authentication has been deprecated
+in favor of tunnel-based authentication (WireGuard IP / Xray UUID).
 """
 
 import pytest
@@ -19,8 +20,9 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 class MockRateLimiter:
     """
-    Mock implementation of the PSK rate limiter for testing.
+    Mock implementation of the peer API rate limiter for testing.
     Mirrors the actual implementation in api_server.py.
+    Note: PSK authentication deprecated - now uses tunnel-based auth.
     """
 
     def __init__(self, max_attempts: int = 5, window_seconds: int = 60):

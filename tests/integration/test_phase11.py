@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import pytest
-import bcrypt
+# bcrypt import removed - PSK authentication deprecated (Phase 11-Fix.N)
 
 # 添加脚本目录到 Python 路径
 SCRIPTS_DIR = Path(__file__).parent.parent.parent / "scripts"
@@ -134,8 +134,7 @@ class TestBidirectionalConnect:
         """测试更新双向状态"""
         # 创建测试节点
         test_tag = f"test-bidir-{int(time.time())}"
-        test_psk = "test-psk-12345678"
-        psk_hash = bcrypt.hashpw(test_psk.encode(), bcrypt.gensalt()).decode()
+        # PSK deprecated - using tunnel-based authentication
 
         try:
             # 添加测试节点
@@ -143,7 +142,7 @@ class TestBidirectionalConnect:
                 tag=test_tag,
                 name="Test Bidirectional",
                 endpoint="10.0.0.100:36300",
-                psk_hash=psk_hash,
+                # psk_hash deprecated
                 tunnel_type="wireguard"
             )
 
@@ -163,8 +162,7 @@ class TestBidirectionalConnect:
     def test_get_peers_pending_bidirectional(self):
         """测试获取待双向连接的节点"""
         test_tag = f"test-pending-{int(time.time())}"
-        test_psk = "test-psk-pending"
-        psk_hash = bcrypt.hashpw(test_psk.encode(), bcrypt.gensalt()).decode()
+        # PSK deprecated - using tunnel-based authentication
 
         try:
             # 添加测试节点（默认 pending 状态）
@@ -172,7 +170,7 @@ class TestBidirectionalConnect:
                 tag=test_tag,
                 name="Test Pending",
                 endpoint="10.0.0.101:36300",
-                psk_hash=psk_hash,
+                # psk_hash deprecated
                 tunnel_type="wireguard"
             )
 

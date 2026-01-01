@@ -1563,10 +1563,11 @@ class UserDatabase:
 
     # ============ V2Ray Egress 管理（支持 VMess, VLESS, Trojan）============
 
-    V2RAY_EGRESS_SOCKS_PORT_START = 37101  # SOCKS 端口起始值（与 OpenVPN 37001 错开）
+    # SOCKS 端口起始值（可通过环境变量配置，与 OpenVPN 37001 错开）
+    V2RAY_EGRESS_SOCKS_PORT_START = int(os.environ.get("V2RAY_SOCKS_PORT_BASE", "37101"))
 
     def get_next_v2ray_egress_socks_port(self) -> int:
-        """获取下一个可用的 SOCKS 端口（从 37101 开始）"""
+        """获取下一个可用的 SOCKS 端口（从 V2RAY_EGRESS_SOCKS_PORT_START 开始）"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute(
@@ -1788,7 +1789,9 @@ class UserDatabase:
             return dict(zip(columns, row))
 
     def get_next_warp_socks_port(self) -> int:
-        """获取下一个可用的 WARP SOCKS 端口（从 38001 开始）"""
+        """获取下一个可用的 WARP SOCKS 端口（可通过环境变量配置起始端口）"""
+        # WARP SOCKS port start (configurable via environment)
+        WARP_SOCKS_PORT_START = int(os.environ.get("WARP_MASQUE_PORT_BASE", "38001"))
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute(
@@ -1796,7 +1799,7 @@ class UserDatabase:
             ).fetchone()
             max_port = row[0] if row and row[0] else None
             if max_port is None:
-                return 38001
+                return WARP_SOCKS_PORT_START
             next_port = max_port + 1
             # H10 修复: 检查端口溢出
             if next_port > 65535:
@@ -1926,20 +1929,38 @@ class UserDatabase:
                     item["weights"] = None
             return item
 
-    def get_next_routing_table(self) -> int:
-        """获取下一个可用的路由表号（从 200 开始）
+    def get_next_routing_table(self) -> Optional[int]:
+        """获取下一个可用的 ECMP 路由表号（200-299 范围）
 
-        Linux 路由表号 0-255 有特殊含义，从 200 开始避免冲突。
+        Phase 8 Fix: 添加上限验证，防止表号超出 ECMP 范围并与 DSCP/Relay/Peer 表冲突。
+
+        Returns:
+            可用的表号 (200-299)，如果范围已耗尽则返回 None
+
+        Table Ranges:
+            200-299: ECMP outbound groups
+            300-363: DSCP terminal routing
+            400-463: Relay node forwarding
+            500-599: Peer node tunnels
         """
+        ECMP_TABLE_MIN = 200
+        ECMP_TABLE_MAX = 299
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            row = cursor.execute(
-                "SELECT MAX(routing_table) FROM outbound_groups"
-            ).fetchone()
-            max_table = row[0] if row and row[0] else None
-            if max_table is None:
-                return 200
-            return max_table + 1
+            # 获取所有已使用的 ECMP 表号
+            rows = cursor.execute(
+                "SELECT routing_table FROM outbound_groups WHERE routing_table IS NOT NULL"
+            ).fetchall()
+            used_tables = {row[0] for row in rows}
+
+            # 查找第一个可用的表号（支持表号复用）
+            for table in range(ECMP_TABLE_MIN, ECMP_TABLE_MAX + 1):
+                if table not in used_tables:
+                    return table
+
+            # Phase 8: 范围耗尽，返回 None
+            return None
 
     def get_all_egress_tags(self) -> set:
         """[PERF-001] 获取所有有效的出口 tag（用于验证成员）
@@ -2091,6 +2112,13 @@ class UserDatabase:
         """
         # 自动分配路由表号
         routing_table = self.get_next_routing_table()
+
+        # Phase 8 Fix: 检查表号分配是否成功
+        if routing_table is None:
+            raise ValueError(
+                "无法分配路由表号：ECMP 表范围 (200-299) 已耗尽。"
+                "请删除不再使用的出口组以释放表号。"
+            )
 
         members_json = json.dumps(members)
         weights_json = json.dumps(weights) if weights else None
@@ -2480,7 +2508,17 @@ class UserDatabase:
 
         Raises:
             sqlite3.IntegrityError: 如果 tunnel_local_ip 或 tunnel_port 冲突（竞态条件检测）
+            ValueError: 如果 tunnel_port 超出有效范围 (36200-36299)
         """
+        # Phase 6 Fix: 验证 tunnel_port 在有效范围内（支持环境变量配置）
+        TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
+        TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
+        if tunnel_port is not None:
+            if not (TUNNEL_PORT_MIN <= tunnel_port <= TUNNEL_PORT_MAX):
+                raise ValueError(
+                    f"tunnel_port {tunnel_port} 超出有效范围 ({TUNNEL_PORT_MIN}-{TUNNEL_PORT_MAX})"
+                )
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -2577,53 +2615,73 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    def get_next_peer_tunnel_port(self) -> int:
-        """获取下一个可用的对等节点隧道端口（从 36300 开始，避免与入口端口冲突）
+    def get_next_peer_tunnel_port(self) -> Optional[int]:
+        """获取下一个可用的对等节点隧道端口
+
+        Issue 10/13 Fix: 使用正确的端口范围 (36200-36299) 并正确处理耗尽情况。
+        此范围与 CLAUDE.md 和 peer_pairing.py 中的文档保持一致。
+
+        Returns:
+            可用的端口号，如果端口范围已耗尽则返回 None
 
         Raises:
-            ValueError: 端口超出 65535 限制
+            ValueError: 端口超出配置的范围
         """
+        # Peer tunnel port range (configurable via environment)
+        TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
+        TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            row = cursor.execute(
-                "SELECT MAX(tunnel_port) FROM peer_nodes WHERE tunnel_port IS NOT NULL"
-            ).fetchone()
-            max_port = row[0] if row and row[0] else 36299
-            next_port = max(max_port + 1, 36300)
-            if next_port > 65535:
-                raise ValueError(f"Peer tunnel port overflow: {next_port} > 65535")
-            return next_port
+            # 获取所有已使用的端口
+            rows = cursor.execute(
+                "SELECT tunnel_port FROM peer_nodes WHERE tunnel_port IS NOT NULL"
+            ).fetchall()
+            used_ports = set(row[0] for row in rows)
+
+            # 从最小端口开始查找可用端口（支持端口复用）
+            for port in range(TUNNEL_PORT_MIN, TUNNEL_PORT_MAX + 1):
+                if port not in used_ports:
+                    return port
+
+            # Issue 10 Fix: 端口范围耗尽，返回 None 而非抛出异常
+            # 让调用者可以提供更友好的错误消息
+            return None
 
     def get_next_peer_xray_socks_port(self) -> int:
-        """获取下一个可用的 Xray SOCKS 端口（从 37201 开始）
+        """获取下一个可用的 Xray SOCKS 端口（可通过环境变量配置起始端口）
 
         Raises:
             ValueError: 端口超出 65535 限制
         """
+        # Peer Xray SOCKS port start (configurable via environment)
+        PEER_XRAY_SOCKS_PORT_START = int(os.environ.get("PEER_XRAY_SOCKS_PORT_START", "37201"))
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute(
                 "SELECT MAX(xray_socks_port) FROM peer_nodes WHERE xray_socks_port IS NOT NULL"
             ).fetchone()
-            max_port = row[0] if row and row[0] else 37200
-            next_port = max(max_port + 1, 37201)
+            max_port = row[0] if row and row[0] else (PEER_XRAY_SOCKS_PORT_START - 1)
+            next_port = max(max_port + 1, PEER_XRAY_SOCKS_PORT_START)
             if next_port > 65535:
                 raise ValueError(f"Peer Xray SOCKS port overflow: {next_port} > 65535")
             return next_port
 
     def get_next_peer_inbound_port(self) -> int:
-        """获取下一个可用的对等节点入站端口（从 36500 开始）
+        """获取下一个可用的对等节点入站端口（可通过环境变量配置起始端口）
 
         Raises:
             ValueError: 端口超出 65535 限制
         """
+        # Peer inbound port start (configurable via environment)
+        PEER_INBOUND_PORT_START = int(os.environ.get("PEER_INBOUND_PORT_START", "36500"))
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute(
                 "SELECT MAX(inbound_port) FROM peer_nodes WHERE inbound_port IS NOT NULL"
             ).fetchone()
-            max_port = row[0] if row and row[0] else 36499
-            next_port = max(max_port + 1, 36500)
+            max_port = row[0] if row and row[0] else (PEER_INBOUND_PORT_START - 1)
+            next_port = max(max_port + 1, PEER_INBOUND_PORT_START)
             if next_port > 65535:
                 raise ValueError(f"Peer inbound port overflow: {next_port} > 65535")
             return next_port
@@ -4522,7 +4580,7 @@ class DatabaseManager:
     def get_outbound_group(self, tag: str) -> Optional[Dict]:
         return self.user.get_outbound_group(tag)
 
-    def get_next_routing_table(self) -> int:
+    def get_next_routing_table(self) -> Optional[int]:
         return self.user.get_next_routing_table()
 
     def get_all_egress_tags(self) -> set:
@@ -4719,7 +4777,7 @@ class DatabaseManager:
     def get_connected_peer_nodes(self) -> List[Dict]:
         return self.user.get_connected_peer_nodes()
 
-    def get_next_peer_tunnel_port(self) -> int:
+    def get_next_peer_tunnel_port(self) -> Optional[int]:
         return self.user.get_next_peer_tunnel_port()
 
     def get_next_peer_xray_socks_port(self) -> int:

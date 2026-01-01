@@ -47,6 +47,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _safe_int_env(name: str, default: int) -> int:
+    """Safely read an integer from environment variable with fallback.
+
+    Args:
+        name: Environment variable name
+        default: Default value if not set or invalid
+
+    Returns:
+        Integer value from environment or default
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"Invalid integer value '{value}' for {name}, using default {default}")
+        return default
+
 # Email 格式验证（用于链路标记）
 # 允许以字母或数字开头（兼容数字开头的 chain tag）
 EMAIL_PATTERN = re.compile(r'^chain-[a-z0-9][a-z0-9\-]*@[a-z0-9][a-z0-9\-]*$')
@@ -405,11 +425,11 @@ USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 
 # Peer 节点 SOCKS5 端口范围（用于连接到远程 peer）
 # sing-box 通过这些 SOCKS 端口将流量路由到对应的 peer 出站
-PEER_SOCKS_PORT_START = 37201
+PEER_SOCKS_PORT_START = _safe_int_env("PEER_SOCKS_PORT_BASE", 37201)
 
 # 入口链路 SOCKS5 端口范围（用于链路流量入口）
 # sing-box 将链路流量路由到这些端口，Xray 添加 email 标记后转发到第一跳 peer
-CHAIN_ENTRY_SOCKS_PORT_START = 37301
+CHAIN_ENTRY_SOCKS_PORT_START = _safe_int_env("CHAIN_ENTRY_SOCKS_PORT_BASE", 37301)
 
 # TUN 配置
 DEFAULT_TUN_DEVICE = "xray-tun0"

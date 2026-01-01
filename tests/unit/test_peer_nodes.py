@@ -39,7 +39,7 @@ def sample_peer_node() -> dict:
         "name": "Tokyo Node",
         "description": "Tokyo relay server",
         "endpoint": "tokyo.example.com:36200",
-        "psk_hash": "$2b$12$examplehashexamplehashexamplehashexamplehash",
+        # psk_hash deprecated - using tunnel-based authentication
         "tunnel_type": "wireguard",
         "auto_reconnect": True,
         "enabled": True,
@@ -159,7 +159,7 @@ class TestPeerNodeCRUD:
             tag="node-tokyo",
             name="Tokyo Node",
             endpoint="tokyo.example.com:36200",
-            psk_hash="$2b$12$examplehash",
+            # psk_hash deprecated
             tunnel_type="wireguard",
         )
 
@@ -176,7 +176,7 @@ class TestPeerNodeCRUD:
             tag="node-tokyo",
             name="Tokyo Node",
             endpoint="tokyo.example.com:36200",
-            psk_hash="$2b$12$examplehash",
+            # psk_hash deprecated
         )
 
         node = db.get_peer_node("node-tokyo")
@@ -205,14 +205,14 @@ class TestPeerNodeCRUD:
             tag="node-tokyo",
             name="Tokyo Node",
             endpoint="tokyo.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
             enabled=True,
         )
         db.add_peer_node(
             tag="node-us",
             name="US Node",
             endpoint="us.example.com:36201",
-            psk_hash="hash2",
+            # psk_hash deprecated
             enabled=False,
         )
 
@@ -235,7 +235,7 @@ class TestPeerNodeCRUD:
             tag="node-tokyo",
             name="Tokyo Node",
             endpoint="tokyo.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
 
         # Update the node
@@ -274,7 +274,7 @@ class TestPeerNodeCRUD:
             tag="node-delete",
             name="Delete Me",
             endpoint="delete.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
 
         success = db.delete_peer_node("node-delete")
@@ -304,7 +304,7 @@ class TestPeerNodeCRUD:
             tag="node-connected",
             name="Connected Node",
             endpoint="connected.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
         db.update_peer_node("node-connected", tunnel_status="connected")
 
@@ -312,7 +312,7 @@ class TestPeerNodeCRUD:
             tag="node-disconnected",
             name="Disconnected Node",
             endpoint="disconnected.example.com:36201",
-            psk_hash="hash2",
+            # psk_hash deprecated
         )
 
         connected = db.get_connected_peer_nodes()
@@ -343,7 +343,7 @@ class TestPeerNodePortAllocation:
             tag="node-1",
             name="Node 1",
             endpoint="node1.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
             tunnel_port=36200,
         )
 
@@ -371,7 +371,7 @@ class TestPeerNodePortAllocation:
             tag="node-1",
             name="Node 1",
             endpoint="node1.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
         db.update_peer_node("node-1", xray_socks_port=37201)
 
@@ -394,13 +394,13 @@ class TestNodeChainCRUD:
             tag="node-tokyo",
             name="Tokyo Node",
             endpoint="tokyo.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
         db.add_peer_node(
             tag="node-us",
             name="US Node",
             endpoint="us.example.com:36201",
-            psk_hash="hash2",
+            # psk_hash deprecated
         )
 
         chain_id = db.add_node_chain(
@@ -524,13 +524,13 @@ class TestNodeChainCRUD:
             tag="node-a",
             name="Node A",
             endpoint="a.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
         db.add_peer_node(
             tag="node-b",
             name="Node B",
             endpoint="b.example.com:36201",
-            psk_hash="hash2",
+            # psk_hash deprecated
         )
 
         is_valid, missing = db.validate_chain_hops(["node-a", "node-b"])
@@ -548,7 +548,7 @@ class TestNodeChainCRUD:
             tag="node-a",
             name="Node A",
             endpoint="a.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
         )
 
         is_valid, missing = db.validate_chain_hops(["node-a", "node-b", "node-c"])
@@ -579,7 +579,7 @@ class TestPeerNodeWithXrayConfig:
             tag="node-xray",
             name="Xray Node",
             endpoint="xray.example.com:443",
-            psk_hash="hash1",
+            # psk_hash deprecated
             tunnel_type="xray",
             xray_protocol="vless",
         )
@@ -600,7 +600,7 @@ class TestPeerNodeWithXrayConfig:
             tag="node-xray",
             name="Xray Node",
             endpoint="xray.example.com:443",
-            psk_hash="hash1",
+            # psk_hash deprecated
             tunnel_type="xray",
         )
 
@@ -630,7 +630,7 @@ class TestPeerNodeWithWireGuardConfig:
             tag="node-wg",
             name="WireGuard Node",
             endpoint="wg.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
             tunnel_type="wireguard",
             wg_private_key="test-private-key",
             wg_public_key="test-public-key",
@@ -653,7 +653,7 @@ class TestPeerNodeWithWireGuardConfig:
             tag="node-wg",
             name="WireGuard Node",
             endpoint="wg.example.com:36200",
-            psk_hash="hash1",
+            # psk_hash deprecated
             tunnel_type="wireguard",
         )
 

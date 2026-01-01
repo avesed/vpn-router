@@ -74,23 +74,56 @@ PEER_TUNNEL_SUBNET = "10.200.200"
 
 # ============ Phase 11-Fix.D: 端口分配说明 ============
 #
-# 端口用途表:
-#   36000       Web UI + API（nginx）
-#   36100       WireGuard 客户端入口（WG_LISTEN_PORT 环境变量）
-#   36300+      Peer 节点 WireGuard 隧道（本常量）
-#   37101+      V2Ray 出口 SOCKS 桥接端口
-#   37201+      Peer 节点 Xray SOCKS 端口
-#   38001+      WARP MASQUE SOCKS 端口
-#   38501       Xray 入口到 sing-box SOCKS 桥接
-#   39001+      速度测试专用 SOCKS 端口
+# 端口用途表（可通过环境变量配置）:
+#   WEB_PORT (36000)              Web UI + API（nginx）
+#   WG_LISTEN_PORT (36100)        WireGuard 客户端入口
+#   PEER_TUNNEL_PORT_MIN-MAX (36200-36299)   Peer 节点 WireGuard 隧道
+#   V2RAY_SOCKS_PORT_BASE (37101+) V2Ray 出口 SOCKS 桥接端口
+#   PEER_XRAY_SOCKS_PORT_START (37201+) Peer 节点 Xray SOCKS 端口
+#   WARP_MASQUE_PORT_BASE (38001+) WARP MASQUE SOCKS 端口
+#   38501                          Xray 入口到 sing-box SOCKS 桥接
+#   SPEEDTEST_PORT_BASE (39001+)   速度测试专用 SOCKS 端口
 #
-# 重要：创建 peer 时 endpoint 应指向远程节点的 36300 端口（而非 36100）
-# 例如：10.1.100.12:36300 而非 10.1.100.12:36100
+# 重要：创建 peer 时 endpoint 应指向远程节点的 peer WireGuard 端口（而非 WG_LISTEN_PORT）
+# 例如：10.1.100.12:36200 而非 10.1.100.12:36100
 #
 # ============================================
 
-PEER_WG_PORT_START = 36300
-PEER_XRAY_SOCKS_PORT_START = 37201
+# Phase 6 Fix: Peer tunnel port range (must match db_helper.py and CLAUDE.md)
+# Valid range: 36200-36299 (100 ports for peer tunnels)
+PEER_TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
+PEER_TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
+PEER_XRAY_SOCKS_PORT_START = int(os.environ.get("PEER_XRAY_SOCKS_PORT_START", "37201"))
+
+# Phase 8 Fix: Peer tunnel routing table range (500-599)
+# Derived from port: table = PEER_TABLE_BASE + (port - PEER_TUNNEL_PORT_MIN)
+PEER_TABLE_BASE = 500
+
+
+def get_peer_routing_table(tunnel_port: int) -> int:
+    """Phase 8 Fix: 从隧道端口计算路由表号（确定性，无冲突）
+
+    端口 36200-36299 映射到路由表 500-599。
+    每个 peer 有唯一端口，因此路由表号也唯一。
+
+    Args:
+        tunnel_port: 隧道监听端口 (36200-36299)
+
+    Returns:
+        路由表号 (500-599)
+
+    Raises:
+        ValueError: 端口超出有效范围
+    """
+    if not isinstance(tunnel_port, int) or isinstance(tunnel_port, bool):
+        raise ValueError(f"tunnel_port 必须是整数，收到 {type(tunnel_port).__name__}")
+    if not (PEER_TUNNEL_PORT_MIN <= tunnel_port <= PEER_TUNNEL_PORT_MAX):
+        raise ValueError(
+            f"tunnel_port {tunnel_port} 超出有效范围 "
+            f"({PEER_TUNNEL_PORT_MIN}-{PEER_TUNNEL_PORT_MAX})"
+        )
+    return PEER_TABLE_BASE + (tunnel_port - PEER_TUNNEL_PORT_MIN)
+
 
 # 重连配置
 RECONNECT_INTERVAL = 30  # 快速重连间隔（秒）
@@ -506,8 +539,8 @@ def create_wireguard_tunnel_with_endpoint(
         )
 
         # 设置策略路由
-        iface_hash = hash(interface_name) % 100
-        table_num = 500 + iface_hash
+        # Phase 8 Fix: 使用端口派生的确定性路由表号（替代 hash() 的非确定性行为）
+        table_num = get_peer_routing_table(listen_port)
         subprocess.run(
             ["ip", "route", "add", "default", "via", remote_ip, "dev", interface_name, "table", str(table_num)],
             check=False, timeout=10
@@ -662,8 +695,11 @@ class PeerTunnelManager:
         local_ip = node["tunnel_local_ip"]
         remote_ip = node.get("tunnel_remote_ip", f"{PEER_TUNNEL_SUBNET}.2")
         endpoint = node["endpoint"]
-        # 使用 or 操作符处理 None 值，确保有默认端口
-        port = node.get("tunnel_port") or PEER_WG_PORT_START
+        # Phase 8 Fix: tunnel_port 必须在创建节点时分配，缺失则报错
+        port = node.get("tunnel_port")
+        if not port:
+            logger.error(f"[{tag}] tunnel_port 未分配，请检查节点创建流程")
+            return False
         private_key = node["wg_private_key"]
         peer_public_key = node["wg_peer_public_key"]
 
@@ -735,13 +771,9 @@ class PeerTunnelManager:
 
             # 设置策略路由: 从本地隧道 IP 发出的流量通过对端转发
             # 这允许 sing-box 使用 bind_interface 时流量正确路由
-            # 路由表分配：
-            #   - ECMP 使用 200-299
-            #   - DSCP 终端路由使用 300-399 (300 + dscp_value)
-            #   - 中继路由使用 400-463
-            #   - 对等节点隧道使用 500-599
-            iface_num = int(interface.split('-')[-1].replace('node', '')) if 'node' in interface else hash(interface) % 100
-            table_num = 500 + iface_num
+            # Phase 8 Fix: 使用端口派生的确定性路由表号
+            # 路由表分配：ECMP 200-299, DSCP 300-363, 中继 400-463, 对等 500-599
+            table_num = get_peer_routing_table(port)
 
             # 添加默认路由到策略路由表
             subprocess.run(
@@ -792,23 +824,24 @@ class PeerTunnelManager:
             local_ip = node.get("tunnel_local_ip") if node else None
 
             # 清理策略路由规则
-            if local_ip:
-                # 计算 table 号 (与设置时相同的逻辑)
-                # 对等节点隧道使用路由表 500-599
-                iface_num = int(interface.split('-')[-1].replace('node', '')) if 'node' in interface else hash(interface) % 100
-                table_num = 500 + iface_num
-
-                # 删除策略规则
-                subprocess.run(
-                    ["ip", "rule", "del", "from", local_ip, "lookup", str(table_num)],
-                    check=False, timeout=10
-                )
-                # 删除路由表
-                subprocess.run(
-                    ["ip", "route", "flush", "table", str(table_num)],
-                    check=False, timeout=10
-                )
-                logger.info(f"[{tag}] 清理策略路由: from {local_ip} table {table_num}")
+            if local_ip and node:
+                # Phase 8 Fix: 使用端口派生的确定性路由表号
+                tunnel_port = node.get("tunnel_port")
+                if tunnel_port:
+                    table_num = get_peer_routing_table(tunnel_port)
+                    # 删除策略规则
+                    subprocess.run(
+                        ["ip", "rule", "del", "from", local_ip, "lookup", str(table_num)],
+                        check=False, timeout=10
+                    )
+                    # 删除路由表
+                    subprocess.run(
+                        ["ip", "route", "flush", "table", str(table_num)],
+                        check=False, timeout=10
+                    )
+                    logger.info(f"[{tag}] 清理策略路由: from {local_ip} table {table_num}")
+                else:
+                    logger.warning(f"[{tag}] tunnel_port 未设置，跳过策略路由清理（可能有残留规则）")
 
             # 清理 DSCP iptables 规则（多跳链路相关）
             try:
@@ -1695,14 +1728,8 @@ class PeerTunnelManager:
             logger.info(f"[{node_tag}] 发现 {len(registrations)} 条注册的上游链路，发送断连通知")
 
             for reg in registrations:
-                upstream_psk = reg.get("upstream_psk")
-                if not upstream_psk:
-                    logger.warning(f"[{node_tag}] 链路 {reg['chain_id']} 缺少上游 PSK，跳过通知")
-                    continue
-
                 success = self._notify_upstream_disconnected(
                     upstream_endpoint=reg["upstream_endpoint"],
-                    upstream_psk=upstream_psk,
                     chain_id=reg["chain_id"],
                     disconnected_node=node_tag
                 )
@@ -1714,15 +1741,15 @@ class PeerTunnelManager:
     def _notify_upstream_disconnected(
         self,
         upstream_endpoint: str,
-        upstream_psk: str,
         chain_id: str,
         disconnected_node: str
     ) -> bool:
         """向上游节点发送断连通知
 
+        认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+
         Args:
             upstream_endpoint: 上游节点端点 (IP:port)
-            upstream_psk: 上游节点 PSK（用于认证）
             chain_id: 链路 ID
             disconnected_node: 断开的下游节点标签
 
@@ -1753,7 +1780,6 @@ class PeerTunnelManager:
 
         url = f"http://{upstream_endpoint}/api/peer-notify/downstream-disconnected"
         payload = {
-            "psk": upstream_psk,
             "node_id": local_node_id,
             "chain_id": chain_id,
             "disconnected_node": disconnected_node,

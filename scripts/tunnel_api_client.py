@@ -29,6 +29,7 @@
 
 import json
 import logging
+import os
 import socket
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -38,9 +39,32 @@ from urllib.parse import urljoin
 import requests
 
 
+def _safe_int_env(name: str, default: int) -> int:
+    """Safely read an integer from environment variable with fallback.
+
+    Args:
+        name: Environment variable name
+        default: Default value if not set or invalid
+
+    Returns:
+        Integer value from environment or default
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning(f"Invalid integer value '{value}' for {name}, using default {default}")
+        return default
+
+
 # 默认超时时间（秒）
 DEFAULT_TIMEOUT = 10
 DEFAULT_CONNECT_TIMEOUT = 5
+
+# Default web port from environment (for API endpoint fallback)
+DEFAULT_WEB_PORT = _safe_int_env("WEB_PORT", 36000)
 
 
 @dataclass
@@ -74,7 +98,7 @@ class TunnelAPIError(Exception):
 
 
 class TunnelAuthError(TunnelAPIError):
-    """认证错误 (401/403) - PSK 不匹配或节点配置错误"""
+    """认证错误 (401/403) - 隧道 IP/UUID 不匹配或节点配置错误"""
     pass
 
 
@@ -237,7 +261,7 @@ class TunnelAPIClient:
             elif method.upper() == "PUT":
                 response = requests.put(url, json=data, params=params, **request_kwargs)
             elif method.upper() == "DELETE":
-                response = requests.delete(url, params=params, **request_kwargs)
+                response = requests.delete(url, json=data, params=params, **request_kwargs)
             else:
                 raise TunnelAPIError(f"Unsupported HTTP method: {method}")
 
@@ -315,6 +339,73 @@ class TunnelAPIClient:
             logging.warning(f"[tunnel-api] Ping failed for {self.node_tag}: {e}")
             return False
 
+    def get(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 GET 请求
+
+        Phase 2: 通用 GET 方法，用于隧道优先通信。
+
+        Args:
+            path: API 路径 (如 /api/peer-info/egress)
+            params: URL 参数
+
+        Returns:
+            响应 JSON 数据
+
+        Raises:
+            TunnelAPIError: API 调用失败
+        """
+        return self._make_request("GET", path, params=params)
+
+    def post(
+        self,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 POST 请求
+
+        Phase 2: 通用 POST 方法，用于隧道优先通信。
+
+        Args:
+            path: API 路径 (如 /api/peer-notify/connected)
+            json: 请求体数据
+            params: URL 参数
+
+        Returns:
+            响应 JSON 数据
+
+        Raises:
+            TunnelAPIError: API 调用失败
+        """
+        return self._make_request("POST", path, data=json, params=params)
+
+    def delete(
+        self,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 DELETE 请求
+
+        Phase 2: 通用 DELETE 方法，用于隧道优先通信。
+
+        Args:
+            path: API 路径 (如 /api/peer-chain/unregister)
+            json: 请求体数据
+            params: URL 参数
+
+        Returns:
+            响应 JSON 数据
+
+        Raises:
+            TunnelAPIError: API 调用失败
+        """
+        return self._make_request("DELETE", path, data=json, params=params)
+
     def get_egress_list(self) -> List[EgressInfo]:
         """获取远程节点的可用出口列表
 
@@ -340,6 +431,55 @@ class TunnelAPIClient:
         except TunnelAPIError as e:
             logging.error(f"[tunnel-api] 获取出口列表失败 ({self.node_tag}): {e}")
             raise
+
+    def get_forwarded_egress_list(self, target_tag: str) -> List[EgressInfo]:
+        """Phase 4: 通过当前节点转发获取目标节点的出口列表
+
+        用于传递模式：当本节点是中继时，转发查询到终端节点。
+
+        例如：A 要获取 C 的出口列表，但 A 只连接到 B，B 连接到 C。
+        A 调用 B 的 forward-egress/C 端点，B 转发请求到 C 并返回结果。
+
+        Args:
+            target_tag: 目标节点标识（终端节点）
+
+        Returns:
+            目标节点的出口列表
+
+        Raises:
+            TunnelAPIError: 如果转发失败
+        """
+        try:
+            result = self._make_request("GET", f"/api/peer/forward-egress/{target_tag}")
+
+            if not result.get("success"):
+                error_msg = result.get("error") or result.get("detail") or "Unknown error"
+                raise TunnelAPIError(f"Forward egress failed: {error_msg}")
+
+            egress_data = result.get("egress", [])
+            egress_list = [
+                EgressInfo(
+                    tag=e.get("tag", ""),
+                    name=e.get("name", ""),
+                    type=e.get("type", "unknown"),
+                    enabled=e.get("enabled", False),
+                    description=e.get("description"),
+                )
+                for e in egress_data
+            ]
+
+            forwarded_by = result.get("forwarded_by", self.node_tag)
+            logging.info(
+                f"[tunnel-api] 转发获取 {target_tag} 出口列表成功: "
+                f"{len(egress_list)} 个 (via {forwarded_by})"
+            )
+            return egress_list
+
+        except TunnelAPIError:
+            raise
+        except Exception as e:
+            logging.error(f"[tunnel-api] 转发获取出口列表失败 ({target_tag} via {self.node_tag}): {e}")
+            raise TunnelAPIError(f"Forward egress request failed: {e}")
 
     def register_chain_route(
         self,
@@ -559,7 +699,6 @@ class TunnelAPIClient:
 
     def request_reverse_setup(
         self,
-        psk: str,
         node_id: str,
         endpoint: str,
         wg_public_key: str,
@@ -570,8 +709,9 @@ class TunnelAPIClient:
         在配对完成后，通过隧道调用远程节点的 reverse-setup API，
         请求远程节点也建立到本节点的隧道连接，实现双向通信。
 
+        认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+
         Args:
-            psk: 预共享密钥
             node_id: 本节点标识
             endpoint: 本节点的隧道监听端点 (IP:port)
             wg_public_key: 本节点的 WireGuard 公钥
@@ -582,7 +722,6 @@ class TunnelAPIClient:
         """
         try:
             data = {
-                "psk": psk,
                 "node_id": node_id,
                 "endpoint": endpoint,
                 "wg_public_key": wg_public_key,
@@ -605,7 +744,6 @@ class TunnelAPIClient:
 
     def register_relay_route(
         self,
-        psk: Optional[str],  # Phase 11-Fix.D: PSK 改为可选，支持 IP 认证
         chain_tag: str,
         source_node: str,
         target_node: str,
@@ -616,8 +754,9 @@ class TunnelAPIClient:
 
         用于多跳链路激活：请求中间节点配置 DSCP 匹配 + 策略路由。
 
+        认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+
         Args:
-            psk: 预共享密钥（可选，为 None 时使用 IP 认证）
             chain_tag: 链路标识
             source_node: 流量来源节点 tag（上游）
             target_node: 流量目标节点 tag（下游）
@@ -635,9 +774,6 @@ class TunnelAPIClient:
                 "dscp_value": dscp_value,
                 "mark_type": mark_type,
             }
-            # Phase 11-Fix.D: 仅在提供 PSK 时包含
-            if psk:
-                data["psk"] = psk
             result = self._make_request("POST", "/api/relay-routing/register", data=data)
             success = result.get("success", False)
 
@@ -652,13 +788,14 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 注册中继路由失败 ({self.node_tag}): {e}")
             return False
 
-    def unregister_relay_route(self, psk: Optional[str], chain_tag: str) -> bool:
+    def unregister_relay_route(self, chain_tag: str) -> bool:
         """Phase 11.4: 在远程节点注销中继转发规则
 
         用于多跳链路停用：请求中间节点清理转发规则。
 
+        认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+
         Args:
-            psk: 预共享密钥（可选，为 None 时使用 IP 认证）
             chain_tag: 链路标识
 
         Returns:
@@ -668,9 +805,6 @@ class TunnelAPIClient:
             data = {
                 "chain_tag": chain_tag,
             }
-            # Phase 11-Fix.D: 仅在提供 PSK 时包含
-            if psk:
-                data["psk"] = psk
             result = self._make_request("POST", "/api/relay-routing/unregister", data=data)
             success = result.get("success", False)
 
@@ -982,7 +1116,7 @@ class TunnelAPIClientManager:
         # Phase A 审核修复: 验证端口范围 (注意: bool 是 int 子类，需显式排除)
         api_port = node.get("api_port")
         if not isinstance(api_port, int) or isinstance(api_port, bool) or api_port < 1 or api_port > 65535:
-            api_port = 36000
+            api_port = DEFAULT_WEB_PORT
         tunnel_api_endpoint = f"{tunnel_remote_ip}:{api_port}"
 
         # 获取隧道类型（默认 wireguard）

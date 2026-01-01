@@ -61,12 +61,12 @@ export default function PeerManager() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
   // Form state
+  // NOTE: psk field removed - WireGuard uses tunnel IP authentication, Xray uses UUID authentication
   const [formData, setFormData] = useState<{
     tag: string;
     name: string;
     description: string;
     endpoint: string;
-    psk: string;
     tunnel_type: PeerTunnelType;
     // REALITY 配置（Xray 隧道用）
     xray_reality_dest: string;
@@ -81,7 +81,6 @@ export default function PeerManager() {
     name: "",
     description: "",
     endpoint: "",
-    psk: "",
     tunnel_type: "wireguard",
     // REALITY 默认值
     xray_reality_dest: "www.microsoft.com:443",
@@ -94,8 +93,6 @@ export default function PeerManager() {
   });
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  // [CR-006] PSK visibility toggle for security (prevent shoulder surfing)
-  // PSK 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
 
   // [CR-009] Custom delete confirmation dialog state
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -187,7 +184,6 @@ export default function PeerManager() {
       name: "",
       description: "",
       endpoint: "",
-      psk: "",
       tunnel_type: "wireguard",
       // REALITY 默认值
       xray_reality_dest: "www.microsoft.com:443",
@@ -217,7 +213,6 @@ export default function PeerManager() {
       name: node.name,
       description: node.description || "",
       endpoint: node.endpoint,
-      psk: "",
       tunnel_type: node.tunnel_type,
       // REALITY 配置
       xray_reality_dest: node.xray_reality_dest || "www.microsoft.com:443",
@@ -284,17 +279,15 @@ export default function PeerManager() {
           xray_xhttp_mode: formData.xray_xhttp_mode || undefined,
           xray_xhttp_host: formData.xray_xhttp_host || undefined
         };
-        // PSK 已废弃 - 不再发送
         await api.updatePeerNode(editingNode.tag, updateData);
         showSuccess(t("peers.updateSuccess", { name: formData.name }));
       } else {
-        // Create new node - PSK 已废弃
+        // Create new node
         const createData: PeerNodeCreateRequest = {
           tag: formData.tag,
           name: formData.name,
           description: formData.description || undefined,
           endpoint: formData.endpoint,
-          // psk 已废弃 - WireGuard 用隧道 IP 认证，Xray 用 UUID 认证
           tunnel_type: formData.tunnel_type,
           // REALITY 配置（仅 Xray 隧道）
           xray_reality_dest: formData.tunnel_type === "xray" ? formData.xray_reality_dest : undefined,
