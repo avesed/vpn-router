@@ -571,6 +571,8 @@ CREATE TABLE IF NOT EXISTS node_chains (
     dscp_value INTEGER,                    -- DSCP 标记值 (1-63)，用于 WireGuard 链路流量识别
     chain_mark_type TEXT DEFAULT 'dscp' CHECK(chain_mark_type IN ('dscp', 'xray_email')),
     chain_state TEXT DEFAULT 'inactive' CHECK(chain_state IN ('inactive', 'activating', 'active', 'error')),
+    allow_transitive INTEGER DEFAULT 0,    -- Phase 11-Fix.Q: 传递模式验证（只验证第一跳）
+    last_error TEXT,                       -- Phase 5: 最后错误信息
 
     -- 健康状态
     health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
@@ -1108,6 +1110,10 @@ def migrate_peer_nodes_tables(conn: sqlite3.Connection):
         if "disconnected_node" not in columns:
             cursor.execute("ALTER TABLE node_chains ADD COLUMN disconnected_node TEXT")
             print("✓ 添加 node_chains.disconnected_node 列")
+        # Phase 5: last_error 列
+        if "last_error" not in columns:
+            cursor.execute("ALTER TABLE node_chains ADD COLUMN last_error TEXT")
+            print("✓ 添加 node_chains.last_error 列")
         if "downstream_status" in columns and "disconnected_node" in columns:
             print("⊘ node_chains 表已存在，跳过")
 
@@ -1408,6 +1414,8 @@ def migrate_node_chains_chain_fields(conn: sqlite3.Connection):
         ("dscp_value", "INTEGER"),
         ("chain_mark_type", "TEXT DEFAULT 'dscp'"),
         ("chain_state", "TEXT DEFAULT 'inactive'"),
+        ("allow_transitive", "INTEGER DEFAULT 0"),  # Phase 11-Fix.Q: 传递模式验证
+        ("last_error", "TEXT"),  # Phase 5: 错误原因记录
     ]
 
     for field_name, field_type in chain_fields:

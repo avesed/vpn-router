@@ -51,12 +51,25 @@ server {
         proxy_send_timeout 30s;
     }
 
-    # Peer tunnel endpoints - SECURITY CRITICAL (H-2)
+    # Peer tunnel endpoints - SECURITY CRITICAL (H-2, Phase 11-Fix.P)
     # These endpoints use tunnel IP as identity proof, only allow from:
     # - WireGuard peer tunnel subnet (10.200.200.0/24) - 64 subnets x 4 IPs = 256 addresses
     # - Localhost for internal testing (127.0.0.1)
     # Note: Xray tunnels use SOCKS5 proxy (127.0.0.1), so localhost covers them too
-    location ~ ^/api/peer-tunnel/ {
+    #
+    # Protected endpoints:
+    # - /api/peer-tunnel/*     : Handshake, reverse setup, peer events
+    # - /api/peer-notify/*     : Connection status notifications
+    # - /api/peer-chain/*      : Chain registration from peers
+    # - /api/peer-info/*       : Egress info queries from peers
+    # - /api/peer-relay/*      : Relay status queries
+    # - /api/chain-routing/*   : DSCP chain route registration (includes exact /api/chain-routing)
+    # - /api/relay-routing/*   : Relay route registration
+    # - /api/peer/forward-egress/* : Forwarded egress queries
+    # - /api/chains/validate-hops : Chain hop validation (exact match, no trailing path)
+    #
+    # Regex note: (/.*)?$ makes trailing path optional to cover both /api/chain-routing and /api/chain-routing/register
+    location ~ ^/api/(peer-tunnel|peer-notify|peer-chain|peer-info|peer-relay|chain-routing|relay-routing|peer/forward-egress|chains/validate-hops)(/.*)?$ {
         # IP allowlist - only trusted tunnel sources (principle of least privilege)
         allow 10.200.200.0/24;
         allow 127.0.0.1;

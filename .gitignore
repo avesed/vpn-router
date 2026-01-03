@@ -19,6 +19,12 @@ vite.config.js
 vite.config.d.ts
 
 # ==========================================
+# Generated config files (from templates)
+# ==========================================
+# nginx.conf is generated from nginx.conf.template by entrypoint.sh
+/frontend/nginx.conf
+
+# ==========================================
 # Environment & secrets
 # ==========================================
 .env
@@ -140,6 +146,13 @@ docker-compose.peer-test.yml
 CLAUDE.md
 CODE_REVIEW_REPORT.md
 REVIEW_REPORT.md
+
+# ==========================================
+# Rust (rust-router)
+# ==========================================
+/rust-router/target/
+**/*.rs.bk
+*.rlib
 
 # ==========================================
 # Misc

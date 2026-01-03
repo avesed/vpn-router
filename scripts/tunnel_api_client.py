@@ -59,9 +59,10 @@ def _safe_int_env(name: str, default: int) -> int:
         return default
 
 
-# 默认超时时间（秒）
-DEFAULT_TIMEOUT = 10
-DEFAULT_CONNECT_TIMEOUT = 5
+# Phase 11-Fix.V.5: 可配置的超时时间（秒）
+# 通过环境变量可调整，适应不同网络环境
+DEFAULT_TIMEOUT = _safe_int_env("TUNNEL_API_TIMEOUT", 15)  # 从 10s 增加到 15s
+DEFAULT_CONNECT_TIMEOUT = _safe_int_env("TUNNEL_API_CONNECT_TIMEOUT", 8)  # 从 5s 增加到 8s
 
 # Default web port from environment (for API endpoint fallback)
 DEFAULT_WEB_PORT = _safe_int_env("WEB_PORT", 36000)
@@ -75,6 +76,7 @@ class EgressInfo:
     type: str  # "pia", "custom", "direct", "warp", "v2ray", "openvpn"
     enabled: bool
     description: Optional[str] = None
+    protocol: Optional[str] = None  # Phase 11-Fix.Q: WARP protocol (wireguard/masque)
 
 
 @dataclass
@@ -300,9 +302,13 @@ class TunnelAPIClient:
                     )
 
             # 解析 JSON 响应
+            # Phase 11-Fix.U: 确保 message 字段始终存在，避免调用方出现 None
             if response.text:
-                return response.json()
-            return {}
+                result = response.json()
+                if 'message' not in result:
+                    result['message'] = 'Success' if result.get('success', True) else 'Request failed'
+                return result
+            return {'success': True, 'message': 'Empty response'}
 
         except requests.exceptions.ProxyError as e:
             # SOCKS 代理错误 - 隧道可能未连接
@@ -423,6 +429,7 @@ class TunnelAPIClient:
                     type=item.get("type", "unknown"),
                     enabled=item.get("enabled", True),
                     description=item.get("description"),
+                    protocol=item.get("protocol"),  # Phase 11-Fix.Q
                 ))
 
             logging.info(f"[tunnel-api] 获取 {self.node_tag} 出口列表: {len(egress_list)} 个")
@@ -464,6 +471,7 @@ class TunnelAPIClient:
                     type=e.get("type", "unknown"),
                     enabled=e.get("enabled", False),
                     description=e.get("description"),
+                    protocol=e.get("protocol"),  # Phase 11-Fix.Q
                 )
                 for e in egress_data
             ]
@@ -544,6 +552,7 @@ class TunnelAPIClient:
         mark_value: int,
         mark_type: str = "dscp",
         target_node: Optional[str] = None,  # Phase 11-Fix.E: 支持转发注销
+        source_node: Optional[str] = None,  # Phase 11-Fix.V.3: 入口节点标识
     ) -> bool:
         """在终端节点注销链路路由
 
@@ -552,8 +561,9 @@ class TunnelAPIClient:
         Args:
             chain_tag: 链路标识
             mark_value: 标记值
-            mark_type: 标记类型 ('dscp' 或 'xray_email')
+            mark_type: 标记类型（仅支持 'dscp'，Xray 隧道不支持多跳链路）
             target_node: 可选的目标节点（用于传递模式，让中继转发注销请求）
+            source_node: 来源节点标识（入口节点），用于链路成员验证
 
         Returns:
             是否成功注销
@@ -567,6 +577,9 @@ class TunnelAPIClient:
             # Phase 11-Fix.E: 传递模式下，通过中继转发注销请求
             if target_node:
                 params["target_node"] = target_node
+            # Phase 11-Fix.V.3: 传递入口节点标识
+            if source_node:
+                params["source_node"] = source_node
 
             result = self._make_request("DELETE", "/api/chain-routing/unregister", params=params)
             success = result.get("success", False)
@@ -742,6 +755,56 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 请求反向连接失败 ({self.node_tag}): {e}")
             return False
 
+    def prepare_relay_route(
+        self,
+        chain_tag: str,
+        source_node: str,
+        target_node: str,
+        dscp_value: int,
+        mark_type: str = "dscp",
+    ) -> Dict[str, Any]:
+        """Phase 11-Fix.T: 2PC 准备阶段 - 验证中继路由可注册性
+
+        在实际注册前调用，验证所有条件但不应用 iptables 规则。
+
+        Args:
+            chain_tag: 链路标识
+            source_node: 流量来源节点 tag（上游）
+            target_node: 流量目标节点 tag（下游）
+            dscp_value: DSCP 标记值 (0-63)
+            mark_type: 标记类型
+
+        Returns:
+            {"prepared": True, "transaction_id": "..."} - 准备成功
+            {"prepared": False, "error": "..."} - 准备失败
+        """
+        try:
+            data = {
+                "chain_tag": chain_tag,
+                "source_node": source_node,
+                "target_node": target_node,
+                "dscp_value": dscp_value,
+                "mark_type": mark_type,
+            }
+            result = self._make_request("POST", "/api/relay-routing/prepare", data=data)
+            prepared = result.get("prepared", False)
+
+            if prepared:
+                tx_id = result.get("transaction_id", "unknown")
+                logging.info(
+                    f"[tunnel-api-2pc] PREPARE 成功: 链路='{chain_tag}' tx={tx_id} ({self.node_tag})"
+                )
+            else:
+                logging.warning(
+                    f"[tunnel-api-2pc] PREPARE 失败 ({self.node_tag}): {result.get('error')}"
+                )
+
+            return result
+
+        except TunnelAPIError as e:
+            logging.error(f"[tunnel-api-2pc] PREPARE 异常 ({self.node_tag}): {e}")
+            return {"prepared": False, "error": str(e)}
+
     def register_relay_route(
         self,
         chain_tag: str,
@@ -788,7 +851,11 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 注册中继路由失败 ({self.node_tag}): {e}")
             return False
 
-    def unregister_relay_route(self, chain_tag: str) -> bool:
+    def unregister_relay_route(
+        self,
+        chain_tag: str,
+        source_node: Optional[str] = None,  # Phase 11-Fix.V.3: 入口节点标识
+    ) -> bool:
         """Phase 11.4: 在远程节点注销中继转发规则
 
         用于多跳链路停用：请求中间节点清理转发规则。
@@ -797,6 +864,7 @@ class TunnelAPIClient:
 
         Args:
             chain_tag: 链路标识
+            source_node: 来源节点标识（入口节点），用于链路成员验证
 
         Returns:
             是否成功清理
@@ -805,6 +873,9 @@ class TunnelAPIClient:
             data = {
                 "chain_tag": chain_tag,
             }
+            # Phase 11-Fix.V.3: 传递入口节点标识
+            if source_node:
+                data["source_node"] = source_node
             result = self._make_request("POST", "/api/relay-routing/unregister", data=data)
             success = result.get("success", False)
 

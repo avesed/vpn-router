@@ -791,6 +791,97 @@ def _parse_chain_hops(chain: Dict[str, Any], raise_on_error: bool = True) -> Lis
     return []
 
 
+def _verify_chain_membership(
+    db,
+    chain_tag: str,
+    requesting_node_tag: str,
+    source_node: Optional[str] = None
+) -> tuple:
+    """Phase 11-Fix.V.3: 验证请求节点是否为链路成员
+
+    安全检查：确保只有链路中的节点可以注册/注销链路路由，
+    防止恶意节点注册任意路由。
+
+    Phase 11-Fix.V.3 修复:
+    - 安全修复: hops 解析失败时 fail-closed（原来是 fail-open）
+    - 功能修复: 支持入口节点调用（入口节点不在 hops 中，但是 source_node）
+    - Chain 不存在时: 如果 source_node 匹配请求节点，允许（入口节点直接调用终端）
+
+    Args:
+        db: 数据库连接
+        chain_tag: 链路标签
+        requesting_node_tag: 发起请求的节点标签
+        source_node: 可选，请求中指定的来源节点（入口节点标识）
+
+    Returns:
+        (is_member: bool, error_message: Optional[str])
+        - (True, None): 验证通过
+        - (False, "Chain not found"): 链路不存在且不是入口节点调用
+        - (False, "Invalid configuration"): hops 配置无效
+        - (False, "Not authorized"): 节点无权限
+    """
+    chain = db.get_node_chain(chain_tag)
+
+    if not chain:
+        # Chain 不存在于本地数据库
+        # 场景 1: 入口节点直接调用终端节点
+        # 如果 source_node 与 requesting_node_tag 匹配，说明是入口节点直接调用
+        if source_node and source_node == requesting_node_tag:
+            logging.info(
+                f"[chain-auth] 允许入口节点 '{source_node}' 在终端注册链路 '{chain_tag}' "
+                "(chain 仅存在于入口节点)"
+            )
+            return True, None
+
+        # 场景 2: 中继节点转发请求（Phase 11-Fix.Z）
+        # 当中继节点（如 node2）代表入口节点（如 node1）向终端节点（如 node3）转发请求时：
+        # - requesting_node_tag = "node2"（通过隧道认证的实际调用者）
+        # - source_node = "node1"（原始入口节点）
+        # 如果 requesting_node_tag 是已连接的 peer，且 source_node 已指定，允许转发
+        if source_node and source_node != requesting_node_tag:
+            relay_peer = db.get_peer_node(requesting_node_tag)
+            if relay_peer and relay_peer.get("tunnel_status") == "connected":
+                logging.info(
+                    f"[chain-auth] 允许中继节点 '{requesting_node_tag}' 代表入口节点 '{source_node}' "
+                    f"在终端注册链路 '{chain_tag}'"
+                )
+                return True, None
+
+        # Fail-closed: 拒绝未授权的请求
+        logging.warning(
+            f"[chain-auth] 链路 '{chain_tag}' 不存在，拒绝节点 '{requesting_node_tag}' 的请求"
+        )
+        return False, f"Chain '{chain_tag}' not found"
+
+    # 解析 hops
+    hops = _parse_chain_hops(chain, raise_on_error=False)
+
+    # Phase 11-Fix.V.3 安全修复: fail-closed（原来是 fail-open 安全漏洞）
+    if not hops:
+        logging.error(
+            f"[chain-auth] 链路 '{chain_tag}' hops 解析失败，拒绝访问 (fail-closed)"
+        )
+        return False, f"Chain '{chain_tag}' has invalid hops configuration"
+
+    # 检查请求节点是否在 hops 中（中继/终端节点）
+    if requesting_node_tag in hops:
+        return True, None
+
+    # 检查是否为入口节点（入口节点创建链路但不在 hops 中）
+    # source_node 参数允许入口节点标识自己
+    if source_node and source_node == requesting_node_tag:
+        logging.debug(
+            f"[chain-auth] 允许入口节点 '{source_node}' 操作链路 '{chain_tag}'"
+        )
+        return True, None
+
+    logging.warning(
+        f"[chain-auth] 节点 '{requesting_node_tag}' 不是链路 '{chain_tag}' 的成员. "
+        f"链路成员: {hops}, source_node: {source_node}"
+    )
+    return False, f"Node '{requesting_node_tag}' is not authorized for chain '{chain_tag}'"
+
+
 def _validate_tunnel_ip(ip: str, subnet: str = "10.200.200.0/24") -> bool:
     """
     验证隧道 IP 是否在预期范围内。
@@ -1408,7 +1499,7 @@ class NodeChainCreateRequest(BaseModel):
     # Phase 6 新增字段
     exit_egress: Optional[str] = Field(None, description="终端节点的本地出口")
     dscp_value: Optional[int] = Field(None, ge=1, le=63, description="DSCP 标记值（1-63），不提供则自动分配")
-    chain_mark_type: str = Field("dscp", pattern=r"^(dscp|xray_email)$", description="标记类型")
+    chain_mark_type: str = Field("dscp", pattern=r"^dscp$", description="标记类型（仅支持 DSCP，Xray 隧道不支持多跳链路）")
     # Phase 11-Fix.C: 传递模式验证
     allow_transitive: bool = Field(False, description="是否允许传递验证（只验证第一跳，后续跳通过隧道验证）")
 
@@ -1427,7 +1518,7 @@ class NodeChainUpdateRequest(BaseModel):
     # Phase 6 新增字段
     exit_egress: Optional[str] = Field(None, description="终端节点的本地出口")
     dscp_value: Optional[int] = Field(None, ge=1, le=63, description="DSCP 标记值（1-63）")
-    chain_mark_type: Optional[str] = Field(None, pattern=r"^(dscp|xray_email)$", description="标记类型")
+    chain_mark_type: Optional[str] = Field(None, pattern=r"^dscp$", description="标记类型（仅支持 DSCP）")
     chain_state: Optional[str] = Field(None, pattern=r"^(inactive|activating|active|error)$", description="链路状态")
     # Phase 11-Fix.C: 传递模式验证
     allow_transitive: Optional[bool] = Field(None, description="是否允许传递验证（只验证第一跳，后续跳通过隧道验证）")
@@ -1540,6 +1631,7 @@ PUBLIC_PATHS = {
     # Phase 11-Cascade: 级联删除通知（隧道 IP 认证）
     "/api/peer-tunnel/peer-event",
     # Phase 11.4: 中继路由注册（PSK 认证）
+    "/api/relay-routing/prepare",
     "/api/relay-routing/register",
     "/api/relay-routing/unregister",
     # Phase 11-Fix.C: 链路跳点验证（支持 PSK 远程调用）
@@ -1630,7 +1722,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # 检查是否已设置密码，未设置则允许访问
         try:
             db = _get_db()
-            if not db.user.is_admin_setup():
+            if not db.is_admin_setup():
                 return await call_next(request)
         except Exception as e:
             # 数据库错误时拒绝访问（安全优先，fail-closed）
@@ -1652,7 +1744,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header.split(" ")[1]
-        secret = db.user.get_or_create_jwt_secret()
+        secret = db.get_or_create_jwt_secret()
 
         if not _verify_token(token, secret):
             return Response(
@@ -2098,6 +2190,57 @@ def _bidirectional_status_checker():
         time.sleep(_BIDIR_CHECK_INTERVAL)
 
 
+def _recover_orphaned_chains():
+    """Phase 11-Fix.T: 启动时恢复孤立的链路状态
+
+    在服务器崩溃或异常关闭后，链路可能卡在 'activating' 状态。
+    此函数将这些链路重置为 'error' 状态，并记录错误消息，
+    用户可以随后手动激活或删除。
+
+    Returns:
+        int: 恢复的链路数量
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return 0
+
+    try:
+        db = _get_db()
+        recovered_count = 0
+
+        # 获取所有链路
+        # Phase 11-Fix.U: 修复方法名 list_node_chains -> get_node_chains
+        chains = db.get_node_chains()
+        for chain in chains:
+            chain_state = chain.get("chain_state", "inactive")
+            tag = chain.get("tag", "unknown")
+
+            # 恢复卡在 'activating' 状态的链路
+            if chain_state == "activating":
+                logging.warning(
+                    f"[chain-recovery] 链路 '{tag}' 卡在 'activating' 状态，"
+                    f"重置为 'error' 状态（服务重启恢复）"
+                )
+                # Phase 11-Fix.U: 使用原子事务同时更新状态和错误消息
+                # 避免非原子的 update_node_chain 导致的潜在竞态条件
+                success, error = db.atomic_chain_state_transition(
+                    tag=tag,
+                    expected_state="activating",
+                    new_state="error",
+                    last_error="服务重启时恢复 - 链路在激活过程中被中断"
+                )
+                if success:
+                    recovered_count += 1
+                else:
+                    # 状态已被其他进程更改（可能已被用户手动处理）
+                    logging.info(f"[chain-recovery] 链路 '{tag}' 状态转换失败: {error}")
+
+        return recovered_count
+
+    except Exception as e:
+        logging.error(f"[chain-recovery] 链路恢复失败: {e}")
+        return 0
+
+
 @app.on_event("startup")
 async def startup_event():
     """应用启动时加载数据"""
@@ -2122,6 +2265,10 @@ async def startup_event():
                 print(f"[Cache] 已清理 {deleted} 条过期的终端出口缓存")
     except Exception as e:
         logging.warning(f"[Cache] 清理过期缓存失败: {e}")
+    # Phase 11-Fix.T: 恢复卡在 'activating' 状态的孤立链路
+    recovered = _recover_orphaned_chains()
+    if recovered > 0:
+        print(f"[Chain Recovery] 已恢复 {recovered} 条孤立链路（重置为 error 状态）")
 
 
 def load_json_config() -> dict:
@@ -2589,7 +2736,7 @@ def api_auth_status():
     """
     try:
         db = _get_db()
-        is_setup = db.user.is_admin_setup()
+        is_setup = db.is_admin_setup()
     except Exception:
         is_setup = False
 
@@ -2607,7 +2754,7 @@ def api_auth_setup(request: SetupRequest):
     """
     db = _get_db()
 
-    if db.user.is_admin_setup():
+    if db.is_admin_setup():
         raise HTTPException(
             status_code=400,
             detail="Admin password already set"
@@ -2620,10 +2767,10 @@ def api_auth_setup(request: SetupRequest):
         )
 
     password_hash = _hash_password(request.password)
-    db.user.set_admin_password(password_hash)
+    db.set_admin_password(password_hash)
 
     # 创建并返回 token
-    secret = db.user.get_or_create_jwt_secret()
+    secret = db.get_or_create_jwt_secret()
     token, expires_in = _create_token(secret)
 
     return {
@@ -2639,20 +2786,20 @@ def api_auth_login(request: LoginRequest):
     """登录获取 JWT token"""
     db = _get_db()
 
-    if not db.user.is_admin_setup():
+    if not db.is_admin_setup():
         raise HTTPException(
             status_code=400,
             detail="Admin password not set, use /api/auth/setup first"
         )
 
-    password_hash = db.user.get_admin_password_hash()
+    password_hash = db.get_admin_password_hash()
     if not password_hash or not _verify_password(request.password, password_hash):
         raise HTTPException(
             status_code=401,
             detail="Invalid credentials"
         )
 
-    secret = db.user.get_or_create_jwt_secret()
+    secret = db.get_or_create_jwt_secret()
     token, expires_in = _create_token(secret)
 
     return {
@@ -2667,7 +2814,7 @@ def api_auth_refresh(request: Request):
     """刷新 JWT token（延长会话）"""
     # 验证当前 token（由中间件完成）
     db = _get_db()
-    secret = db.user.get_or_create_jwt_secret()
+    secret = db.get_or_create_jwt_secret()
     token, expires_in = _create_token(secret)
 
     return {
@@ -3913,7 +4060,8 @@ def api_reload_singbox():
     """重新加载 sing-box 配置"""
     result = reload_singbox()
     if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("message"))
+        # Phase 11-Fix.U: 防御性默认值
+        raise HTTPException(status_code=500, detail=result.get("message", "Reload failed"))
     return result
 
 
@@ -4875,7 +5023,8 @@ def api_apply_ingress_config():
     config = load_ingress_config()
     result = apply_ingress_config(config)
     if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("message"))
+        # Phase 11-Fix.U: 防御性默认值
+        raise HTTPException(status_code=500, detail=result.get("message", "Apply config failed"))
     return result
 
 
@@ -7978,9 +8127,10 @@ def _test_direct_connection(tag: str, test_url: str, timeout_sec: float) -> dict
         ]
 
         # 如果是 direct-* 类型，尝试获取绑定配置
+        # Phase 11-Fix.U: 修复方法名 get_direct_egress_by_tag -> get_direct_egress
         if tag.startswith("direct-") and HAS_DATABASE:
             db = _get_db()
-            direct_egress = db.get_direct_egress_by_tag(tag)
+            direct_egress = db.get_direct_egress(tag)
             if direct_egress:
                 if direct_egress.get("bind_interface"):
                     curl_cmd.extend(["--interface", direct_egress["bind_interface"]])
@@ -8337,9 +8487,10 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
         proxy_info = "直连"
     elif tag.startswith("direct-"):
         # Direct 出口：绑定接口
+        # Phase 11-Fix.U: 修复方法名 get_direct_egress_by_tag -> get_direct_egress
         if HAS_DATABASE:
             db = _get_db()
-            direct_egress = db.get_direct_egress_by_tag(tag)
+            direct_egress = db.get_direct_egress(tag)
             if direct_egress:
                 if direct_egress.get("bind_interface"):
                     curl_cmd.extend(["--interface", direct_egress["bind_interface"]])
@@ -8683,7 +8834,7 @@ def _full_regenerate_after_import():
     # 4. Xray 入口（检查 V2Ray ingress 是否启用）
     try:
         db = _get_db()
-        v2ray_config = db.user.get_v2ray_inbound_config()
+        v2ray_config = db.get_v2ray_inbound_config()
         if v2ray_config and v2ray_config.get("enabled"):
             result = subprocess.run(
                 ["python3", "/usr/local/bin/xray_manager.py", "restart"],
@@ -8702,7 +8853,7 @@ def _full_regenerate_after_import():
     # 5. Xray 出口（检查 V2Ray egress）
     try:
         db = _get_db()
-        v2ray_egress = db.user.get_v2ray_egress_list()
+        v2ray_egress = db.get_v2ray_egress_list()
         if v2ray_egress:
             result = subprocess.run(
                 ["python3", "/usr/local/bin/xray_egress_manager.py", "daemon"],
@@ -8719,7 +8870,7 @@ def _full_regenerate_after_import():
     # 6. OpenVPN 隧道
     try:
         db = _get_db()
-        openvpn_list = db.user.get_openvpn_egress_list()
+        openvpn_list = db.get_openvpn_egress_list()
         if openvpn_list:
             result = subprocess.run(
                 ["python3", "/usr/local/bin/openvpn_manager.py", "daemon"],
@@ -8735,7 +8886,7 @@ def _full_regenerate_after_import():
     # 7. WARP 代理
     try:
         db = _get_db()
-        warp_list = db.user.get_warp_egress_list()
+        warp_list = db.get_warp_egress_list()
         if warp_list:
             result = subprocess.run(
                 ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
@@ -10684,18 +10835,54 @@ def api_peer_notify_disconnected(request: Request, payload: PeerNotifyRequest):
         manager = PeerTunnelManager()
         success = manager.disconnect_node(tag)
 
+        # Phase 5: 更新使用该节点的链路状态
+        chain_result = _update_chains_for_disconnected_peer(db, tag)
+        chains_updated = chain_result.get("updated", [])
+
+        # Phase 11-Fix.V.5: 使客户端缓存失效
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            client_mgr = TunnelAPIClientManager(db)
+            client_mgr.invalidate_client(tag)
+        except Exception as cache_err:
+            logging.debug(f"[peer-notify] 清除客户端缓存失败: {cache_err}")
+
         if success:
             logging.info(f"[peer-notify] 节点 '{tag}' 隧道已断开（响应远程通知）")
-            return {"success": True, "message": "Tunnel disconnected", "status": "disconnected"}
+            return {
+                "success": True,
+                "message": "Tunnel disconnected",
+                "status": "disconnected",
+                "chains_updated": chains_updated,  # Phase 5
+            }
         else:
             # 断开失败也更新状态（可能接口已经不存在）
             db.update_peer_node(tag, tunnel_status="disconnected")
-            return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
+            return {
+                "success": True,
+                "message": "Tunnel marked as disconnected",
+                "status": "disconnected",
+                "chains_updated": chains_updated,  # Phase 5
+            }
     except Exception as e:
         logging.warning(f"[peer-notify] 节点 '{tag}' 断开异常: {e}")
         # 异常情况下也标记为断开
         db.update_peer_node(tag, tunnel_status="disconnected")
-        return {"success": True, "message": "Tunnel marked as disconnected", "status": "disconnected"}
+        # Phase 11-Fix.V.5: 使客户端缓存失效
+        try:
+            from tunnel_api_client import TunnelAPIClientManager
+            client_mgr = TunnelAPIClientManager(db)
+            client_mgr.invalidate_client(tag)
+        except Exception:
+            pass
+        # Phase 5: 即使断开异常，也要更新链路状态
+        chain_result = _update_chains_for_disconnected_peer(db, tag)
+        return {
+            "success": True,
+            "message": "Tunnel marked as disconnected",
+            "status": "disconnected",
+            "chains_updated": chain_result.get("updated", []),  # Phase 5
+        }
 
 
 @app.post("/api/peer-tunnel/reverse-setup")
@@ -11126,6 +11313,11 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
             db.update_peer_node(peer_tag, tunnel_status="disconnected")
             result["actions_taken"].append(f"updated status of {peer_tag}")
 
+            # Phase 5: 更新使用该节点的链路状态
+            chain_result = _update_chains_for_disconnected_peer(db, peer_tag)
+            if chain_result.get("updated"):
+                result["actions_taken"].append(f"updated {len(chain_result['updated'])} chains to error state")
+
         result["message"] = f"Processed disconnect event from {payload.source_node}"
 
     elif payload.event_type == "broadcast":
@@ -11240,7 +11432,8 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
                         if resp.get("success"):
                             logging.info(f"[peer-event] 广播成功: {other_tag}")
                         else:
-                            logging.warning(f"[peer-event] 广播失败: {other_tag}: {resp.get('message')}")
+                            # Phase 11-Fix.U: 防御性默认值
+                            logging.warning(f"[peer-event] 广播失败: {other_tag}: {resp.get('message', 'Unknown error')}")
 
                     except Exception as e:
                         # M-2: 使用 exception() 记录完整堆栈
@@ -11503,7 +11696,8 @@ def _notify_peer_connected(db, node: dict) -> bool:
                 logging.info(f"[peer-notify] 远程节点 '{tag}' 已通过隧道确认建立隧道")
                 return True
             else:
-                logging.warning(f"[peer-notify] 隧道通知 '{tag}' 失败: {resp.get('message')}, 尝试 LAN 回退")
+                # Phase 11-Fix.U: 防御性默认值
+                logging.warning(f"[peer-notify] 隧道通知 '{tag}' 失败: {resp.get('message', 'Unknown error')}, 尝试 LAN 回退")
         except Exception as e:
             logging.warning(f"[peer-notify] 隧道调用 '{tag}' 失败: {e}, 尝试 LAN 回退")
 
@@ -11584,7 +11778,8 @@ def _notify_peer_disconnected(db, node: dict) -> bool:
                 logging.info(f"[peer-notify] 远程节点 '{tag}' 已通过隧道确认断开")
                 return True
             else:
-                logging.warning(f"[peer-notify] 隧道断开通知 '{tag}' 失败: {resp.get('message')}, 尝试 LAN 回退")
+                # Phase 11-Fix.U: 防御性默认值
+                logging.warning(f"[peer-notify] 隧道断开通知 '{tag}' 失败: {resp.get('message', 'Unknown error')}, 尝试 LAN 回退")
         except Exception as e:
             logging.warning(f"[peer-notify] 隧道调用 '{tag}' 失败: {e}, 尝试 LAN 回退")
 
@@ -11725,7 +11920,8 @@ def _forward_downstream_disconnected(
             logging.info(f"[cascade-notify] 上游节点 '{upstream_node_tag}' 已通过隧道收到通知")
             return True
         else:
-            logging.warning(f"[cascade-notify] 上游节点响应: {resp.get('message')}")
+            # Phase 11-Fix.U: 防御性默认值
+            logging.warning(f"[cascade-notify] 上游节点响应: {resp.get('message', 'Unknown error')}")
             return False
     except Exception as e:
         logging.warning(f"[cascade-notify] 转发失败: {e}")
@@ -11843,7 +12039,8 @@ def _register_chain_with_peers(db, chain: dict) -> dict:
                 logging.info(f"[chain-register] 节点 '{intermediate_tag}' 通过隧道注册成功")
                 results[intermediate_tag] = True
             else:
-                logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 注册失败: {resp.get('message')}")
+                # Phase 11-Fix.U: 防御性默认值
+                logging.warning(f"[chain-register] 节点 '{intermediate_tag}' 注册失败: {resp.get('message', 'Unknown error')}")
                 results[intermediate_tag] = False
         except Exception as e:
             logging.warning(f"[chain-register] 向 '{intermediate_tag}' 注册失败: {e}")
@@ -11918,7 +12115,8 @@ def _unregister_chain_from_peers(db, chain: dict) -> dict:
                 logging.info(f"[chain-unregister] 节点 '{intermediate_tag}' 通过隧道注销成功")
                 results[intermediate_tag] = True
             else:
-                logging.warning(f"[chain-unregister] 节点 '{intermediate_tag}' 注销失败: {resp.get('message')}")
+                # Phase 11-Fix.U: 防御性默认值
+                logging.warning(f"[chain-unregister] 节点 '{intermediate_tag}' 注销失败: {resp.get('message', 'Unknown error')}")
                 results[intermediate_tag] = False
         except Exception as e:
             logging.warning(f"[chain-unregister] 向 '{intermediate_tag}' 注销失败: {e}")
@@ -12385,6 +12583,7 @@ def api_peer_info_egress(request: Request):
             "type": "warp",
             "enabled": True,
             "description": f"WARP {egress.get('protocol', '')}",
+            "protocol": egress.get("protocol", "wireguard"),  # Phase 11-Fix.Q: 用于 MASQUE 检测
         })
 
     # 7. 添加内置 direct 出口
@@ -12411,11 +12610,131 @@ TAG_PATTERN = r"^[a-z][a-z0-9-]{0,63}$"
 INVALID_CHAIN_TERMINAL_EGRESS = frozenset({"direct", "block", "adblock"})
 
 
+def _validate_chain_terminal_egress_static(egress_tag: str):
+    """静态验证 egress 是否可作为链路终端出口
+
+    Phase 11-Fix.Q: 仅执行静态检查，不查询数据库。
+    用于链路创建/更新时的快速验证。
+    完整验证在链路激活时通过 _validate_remote_terminal_egress() 执行。
+
+    Args:
+        egress_tag: 出口标识
+
+    Raises:
+        HTTPException: 如果 egress 在静态无效列表中
+    """
+    if egress_tag in INVALID_CHAIN_TERMINAL_EGRESS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{egress_tag}' 不能作为链路终端出口 - "
+                   "请选择具有网络接口的出口 (PIA/Custom WireGuard/OpenVPN)"
+        )
+
+
+def _validate_remote_terminal_egress(
+    db,
+    chain_hops: list,
+    exit_egress: str,
+    allow_transitive: bool = False
+) -> Optional[str]:
+    """Phase 11-Fix.Q: 远程验证终端节点出口
+
+    通过隧道查询终端节点的出口列表，验证 exit_egress 存在且兼容 DSCP 路由。
+
+    Args:
+        db: 数据库实例
+        chain_hops: 链路节点列表（最后一个是终端节点）
+        exit_egress: 要验证的出口标识
+        allow_transitive: 是否使用传递模式（通过中间节点转发查询）
+
+    Returns:
+        错误消息（如有），None 表示验证通过
+    """
+    if not chain_hops or len(chain_hops) < 2:
+        return "Chain must have at least 2 hops"
+
+    terminal_tag = chain_hops[-1]
+
+    # 静态检查
+    if exit_egress in INVALID_CHAIN_TERMINAL_EGRESS:
+        return f"'{exit_egress}' cannot be used as chain terminal egress"
+
+    # 尝试通过隧道查询终端节点的出口列表
+    try:
+        from tunnel_api_client import TunnelAPIClientManager
+        client_mgr = TunnelAPIClientManager(db)
+
+        egress_list = []
+
+        if allow_transitive and len(chain_hops) > 2:
+            # 传递模式：通过第一个中间节点转发查询
+            first_hop = chain_hops[0]
+            first_client = client_mgr.get_client(first_hop)
+            if first_client:
+                try:
+                    egress_list = first_client.get_forwarded_egress_list(terminal_tag)
+                except Exception as e:
+                    logging.warning(f"[validate-egress] 转发查询失败: {e}")
+        else:
+            # 直接模式：查询第一跳（如果第一跳就是终端，或使用直连）
+            # 优先尝试直接连接终端节点
+            terminal_client = client_mgr.get_client(terminal_tag)
+            if terminal_client:
+                try:
+                    egress_list = terminal_client.get_egress_list()
+                except Exception as e:
+                    logging.warning(f"[validate-egress] 直接查询失败: {e}")
+
+            # 如果直连失败，尝试通过第一跳转发
+            if not egress_list and len(chain_hops) > 1:
+                first_hop = chain_hops[0]
+                first_client = client_mgr.get_client(first_hop)
+                if first_client:
+                    try:
+                        egress_list = first_client.get_forwarded_egress_list(terminal_tag)
+                    except Exception as e:
+                        logging.warning(f"[validate-egress] 转发查询也失败: {e}")
+
+        if not egress_list:
+            # 无法连接终端节点 - 在激活时这是一个问题
+            return f"Cannot reach terminal node '{terminal_tag}' to validate egress"
+
+        # 检查 exit_egress 是否存在于终端节点
+        egress_tags = [e.tag for e in egress_list]
+        if exit_egress not in egress_tags:
+            return f"Egress '{exit_egress}' not found on terminal node '{terminal_tag}'"
+
+        # 检查出口类型是否兼容 DSCP 路由
+        for egress in egress_list:
+            if egress.tag == exit_egress:
+                if egress.type in ("v2ray", "socks"):
+                    return f"Egress '{exit_egress}' is SOCKS-based ({egress.type}), incompatible with DSCP routing"
+                # Phase 11-Fix.Q: 使用 protocol 字段检测 WARP MASQUE
+                if egress.type == "warp" and egress.protocol == "masque":
+                    return f"WARP MASQUE egress '{exit_egress}' is SOCKS-based, incompatible with DSCP routing"
+                break
+
+        logging.info(f"[validate-egress] 终端出口验证通过: {exit_egress} on {terminal_tag}")
+        return None  # 验证通过
+
+    except ImportError as e:
+        logging.error(f"[validate-egress] 无法导入 TunnelAPIClientManager: {e}")
+        return "Internal error: TunnelAPIClientManager unavailable"
+    except Exception as e:
+        logging.error(f"[validate-egress] 验证失败: {e}")
+        return f"Failed to validate egress on terminal node: {str(e)}"
+
+
 def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = False):
-    """验证 egress 是否可作为链路终端出口
+    """验证 egress 是否可作为链路终端出口（本地验证）
 
     Phase 4 Issue 24 修复: 增加对 V2Ray 和 WARP MASQUE 出口的检查
     这些出口基于 SOCKS 代理，无法接收 DSCP 标记的流量。
+
+    注意：此函数查询 LOCAL 数据库，适用于：
+    - 终端节点上的 /api/chain-routing/register 端点（for_tunnel_api=True）
+
+    对于入口节点的链路激活，应使用 _validate_remote_terminal_egress() 替代。
 
     Args:
         egress_tag: 出口标识
@@ -12515,8 +12834,8 @@ class ChainRoutingRegisterRequest(BaseModel):
     )
     mark_type: str = Field(
         default="dscp",
-        pattern=r"^(dscp|xray_email)$",
-        description="标记类型 (dscp 或 xray_email)"
+        pattern=r"^dscp$",
+        description="标记类型（仅支持 DSCP）"
     )
     egress_tag: str = Field(
         ..., pattern=TAG_PATTERN,
@@ -12559,6 +12878,14 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
     node = _verify_tunnel_header(request, db)
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+    # Phase 11-Fix.V.3: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        logging.warning(f"[tunnel-api] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
 
     # Phase 11-Fix.E: 如果指定了 target_node，转发注册到目标节点
     if payload.target_node:
@@ -12732,13 +13059,19 @@ def api_chain_routing_unregister(
     ),
     mark_type: str = Query(
         default="dscp",
-        pattern=r"^(dscp|xray_email)$",
-        description="标记类型 (dscp 或 xray_email)"
+        pattern=r"^dscp$",
+        description="标记类型（仅支持 DSCP，Xray 隧道不支持多跳链路）"
     ),
     target_node: Optional[str] = Query(
         default=None,
         pattern=TAG_PATTERN,
         description="目标节点 (用于传递模式转发)"
+    ),
+    # Phase 11-Fix.V.3: 添加 source_node 参数支持入口节点验证
+    source_node: Optional[str] = Query(
+        default=None,
+        pattern=TAG_PATTERN,
+        description="来源节点标识（入口节点）"
     ),
 ):
     """注销链路路由
@@ -12768,6 +13101,14 @@ def api_chain_routing_unregister(
     node = _verify_tunnel_header(request, db)
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+    # Phase 11-Fix.V.3: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, chain_tag, node["tag"], source_node=source_node
+    )
+    if not is_member:
+        logging.warning(f"[tunnel-api] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
 
     logging.info(
         f"[tunnel-api] 链路路由注销: chain={chain_tag}, "
@@ -12799,6 +13140,7 @@ def api_chain_routing_unregister(
                 mark_value=mark_value,
                 mark_type=mark_type,
                 target_node=None,  # 不再转发
+                source_node=source_node,  # Phase 11-Fix.V.3: 传递原始入口节点
             )
             return {"success": success, "message": "Forwarded to target node", "target_node": target_node}
         except Exception as e:
@@ -13179,6 +13521,58 @@ def _update_stale_peer_status(db, node: dict, real_status: str) -> None:
             logging.info(f"[peers] 节点 '{tag}' 状态已更新为 disconnected（实时检测）")
         except Exception as e:
             logging.warning(f"[peers] 更新节点 '{tag}' 状态失败: {e}")
+
+
+def _update_chains_for_disconnected_peer(db, peer_tag: str) -> dict:
+    """Phase 5: 当节点断开时，更新受影响的链路状态
+
+    查找使用该节点的所有活跃链路，并将其状态更新为 'error'。
+    这确保了链路状态与实际隧道状态保持一致。
+
+    Args:
+        db: 数据库实例
+        peer_tag: 断开的节点标签
+
+    Returns:
+        更新结果: {"updated": [链路列表], "errors": [错误列表]}
+    """
+    result = {"updated": [], "errors": []}
+
+    try:
+        # 使用已有的 get_chains_with_downstream_node 查找受影响的链路
+        affected_chains = db.get_chains_with_downstream_node(peer_tag)
+
+        for chain in affected_chains:
+            chain_tag = chain.get("tag")
+            chain_state = chain.get("chain_state", "inactive")
+
+            # 只更新活跃的链路
+            if chain_state in ("active", "activating"):
+                try:
+                    db.update_node_chain(
+                        chain_tag,
+                        chain_state="error",
+                        last_error=f"Peer node '{peer_tag}' disconnected"
+                    )
+                    result["updated"].append(chain_tag)
+                    logging.warning(
+                        f"[chains] 链路 '{chain_tag}' 状态更新为 error: "
+                        f"节点 '{peer_tag}' 已断开连接"
+                    )
+                except Exception as e:
+                    result["errors"].append({"chain": chain_tag, "error": str(e)})
+                    logging.error(f"[chains] 更新链路 '{chain_tag}' 状态失败: {e}")
+
+        if result["updated"]:
+            logging.info(
+                f"[chains] 因节点 '{peer_tag}' 断开，已更新 {len(result['updated'])} 条链路状态"
+            )
+
+    except Exception as e:
+        logging.error(f"[chains] 查找受影响链路失败: {e}")
+        result["errors"].append({"chain": None, "error": str(e)})
+
+    return result
 
 
 @app.get("/api/peers")
@@ -14348,12 +14742,24 @@ def api_peer_disconnect(tag: str):
         success = manager.disconnect_node(tag)
 
         if success:
+            # Phase 11-Fix.V.5: 使客户端缓存失效
+            try:
+                from tunnel_api_client import TunnelAPIClientManager
+                client_mgr = TunnelAPIClientManager(db)
+                client_mgr.invalidate_client(tag)
+            except Exception as cache_err:
+                logging.warning(f"[peers] 清除客户端缓存失败: {cache_err}")
+
+            # Phase 5: 更新使用该节点的链路状态
+            chain_update_result = _update_chains_for_disconnected_peer(db, tag)
+
             return {
                 "success": True,
                 "message": "隧道已断开" + ("，远程节点已同步" if notify_success else ""),
                 "tag": tag,
                 "tunnel_status": "disconnected",
                 "remote_notified": notify_success,
+                "chains_updated": chain_update_result.get("updated", []),  # Phase 5
             }
         else:
             raise HTTPException(status_code=500, detail="断开隧道失败")
@@ -14733,6 +15139,18 @@ def api_create_chain(payload: NodeChainCreateRequest):
     if not valid:
         raise HTTPException(status_code=400, detail=error)
 
+    # Phase 11-Fix.P: 拒绝使用 Xray 隧道的多跳链路
+    # Xray 中继不支持，多跳链路应使用 WireGuard 隧道
+    for hop in payload.hops:
+        peer = db.get_peer_node(hop)
+        if peer and peer.get("tunnel_type") == "xray":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Multi-hop chains with Xray tunnels not supported. "
+                       f"Node '{hop}' uses Xray tunnel type. "
+                       f"Use WireGuard tunnels for multi-hop chains."
+            )
+
     # 自动分配 DSCP 值（如果未提供）
     dscp_value = payload.dscp_value
     if dscp_value is None:
@@ -14741,9 +15159,10 @@ def api_create_chain(payload: NodeChainCreateRequest):
             raise HTTPException(status_code=409, detail="无可用的 DSCP 值（已达上限 63）")
         logging.info(f"[chains] 自动分配 DSCP 值: {dscp_value}")
 
-    # Phase 11-Fix.J: 验证终端出口（如已指定）
+    # Phase 11-Fix.J + Phase 11-Fix.Q: 静态验证终端出口（如已指定）
+    # 完整验证在链路激活时通过远程查询终端节点执行
     if payload.exit_egress:
-        _validate_chain_terminal_egress(payload.exit_egress)
+        _validate_chain_terminal_egress_static(payload.exit_egress)
 
     try:
         chain_id = db.add_node_chain(
@@ -14759,6 +15178,7 @@ def api_create_chain(payload: NodeChainCreateRequest):
             exit_egress=payload.exit_egress,
             dscp_value=dscp_value,
             chain_mark_type=payload.chain_mark_type,
+            allow_transitive=payload.allow_transitive,  # Phase 11-Fix.Q
         )
     except Exception as e:
         logging.error(f"创建链路失败: {e}")
@@ -14831,6 +15251,18 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
             error = "; ".join(errors) if isinstance(errors, list) and errors else (errors[0] if errors else None)
         if not valid:
             raise HTTPException(status_code=400, detail=error)
+
+        # Phase 11-Fix.P: 拒绝使用 Xray 隧道的多跳链路（与 api_create_chain 保持一致）
+        for hop in payload.hops:
+            peer = db.get_peer_node(hop)
+            if peer and peer.get("tunnel_type") == "xray":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Multi-hop chains with Xray tunnels not supported. "
+                           f"Node '{hop}' uses Xray tunnel type. "
+                           f"Use WireGuard tunnels for multi-hop chains."
+                )
+
         update_kwargs["hops"] = json.dumps(payload.hops)
     if payload.hop_protocols is not None:
         update_kwargs["hop_protocols"] = json.dumps(payload.hop_protocols) if payload.hop_protocols else None
@@ -14844,8 +15276,9 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["enabled"] = payload.enabled
     # Phase 6 新增字段
     if payload.exit_egress is not None:
-        # Phase 11-Fix.J: 验证终端出口
-        _validate_chain_terminal_egress(payload.exit_egress)
+        # Phase 11-Fix.J + Phase 11-Fix.Q: 静态验证终端出口
+        # 完整验证在链路激活时通过远程查询终端节点执行
+        _validate_chain_terminal_egress_static(payload.exit_egress)
         update_kwargs["exit_egress"] = payload.exit_egress
     if payload.dscp_value is not None:
         update_kwargs["dscp_value"] = payload.dscp_value
@@ -14853,6 +15286,8 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["chain_mark_type"] = payload.chain_mark_type
     if payload.chain_state is not None:
         update_kwargs["chain_state"] = payload.chain_state
+    if payload.allow_transitive is not None:
+        update_kwargs["allow_transitive"] = 1 if payload.allow_transitive else 0
 
     if not update_kwargs:
         return {"message": "没有需要更新的字段", "chain": chain}
@@ -14889,7 +15324,12 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
 
 @app.delete("/api/chains/{tag}")
 def api_delete_chain(tag: str):
-    """删除链路"""
+    """删除链路
+
+    Phase 5: 增强状态检查
+    - 拒绝删除正在激活中的链路（防止竞态条件）
+    - 自动停用并注销活跃链路
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -14900,10 +15340,19 @@ def api_delete_chain(tag: str):
     if not chain:
         raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
 
-    # 如果链路是启用状态，先向中间节点注销
+    # Phase 5: 检查链路状态，拒绝删除正在激活中的链路
+    chain_state = chain.get("chain_state", "inactive")
+    if chain_state == "activating":
+        raise HTTPException(
+            status_code=409,
+            detail="链路正在激活中，请稍后再试或先停用链路"
+        )
+
+    # Phase 5: 如果链路是 active 状态，使用 chain_state 而非 enabled 字段
+    # 这确保状态检查的一致性
     unregistration_results = {}
-    if chain.get("enabled"):
-        logging.info(f"[chains] 删除前注销链路 '{tag}' 的中间节点注册")
+    if chain_state == "active" or chain.get("enabled"):
+        logging.info(f"[chains] 删除前停用并注销链路 '{tag}' (state={chain_state})")
         unregistration_results = _unregister_chain_from_peers(db, chain)
 
     success = db.delete_node_chain(tag)
@@ -15300,7 +15749,7 @@ class RelayRouteRegisterRequest(BaseModel):
     source_node: str = Field(..., description="上游节点 tag")
     target_node: str = Field(..., description="下游节点 tag")
     dscp_value: int = Field(..., description="DSCP 标记值")
-    mark_type: str = Field("dscp", description="标记类型: 'dscp' 或 'xray_email'")
+    mark_type: str = Field("dscp", pattern=r"^dscp$", description="标记类型（仅支持 DSCP）")
 
 
 class RelayRouteUnregisterRequest(BaseModel):
@@ -15309,6 +15758,114 @@ class RelayRouteUnregisterRequest(BaseModel):
     认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
     """
     chain_tag: str = Field(..., description="链路标识")
+    # Phase 11-Fix.V.3: 添加 source_node 支持入口节点验证
+    source_node: Optional[str] = Field(None, description="来源节点标识（入口节点）")
+
+
+@app.post("/api/relay-routing/prepare")
+def api_relay_routing_prepare(request: Request, payload: RelayRouteRegisterRequest):
+    """Phase 11-Fix.T: 2PC 准备阶段 - 验证中继路由可注册性
+
+    在实际注册前调用，验证所有条件但不应用 iptables 规则。
+    用于实现两阶段提交：先在所有节点准备成功，再统一注册。
+
+    认证方式: 隧道 IP/UUID 认证 (无需 JWT)
+
+    Returns:
+        {"prepared": True, "transaction_id": "..."} - 准备成功
+        {"prepared": False, "error": "..."} - 准备失败
+    """
+    import uuid as uuid_module
+
+    client_ip = _get_client_ip(request)
+
+    # 速率限制检查
+    if not _check_api_rate_limit(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests, please try again later"
+        )
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    db = _get_db()
+
+    # 验证调用方身份（通过 IP 查找调用方节点）
+    caller_node = _find_peer_node_by_ip(db, client_ip)
+    if not caller_node:
+        return {"prepared": False, "error": f"Unknown caller IP: {client_ip}"}
+
+    # 隧道 IP 认证
+    tunnel_remote_ip = caller_node.get("tunnel_remote_ip", "")
+    if tunnel_remote_ip:
+        tunnel_remote_ip = tunnel_remote_ip.split("/")[0]
+    if not (tunnel_remote_ip and tunnel_remote_ip == client_ip):
+        return {"prepared": False, "error": "Tunnel IP authentication failed"}
+
+    # Phase 11-Fix.V.3: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, caller_node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        return {"prepared": False, "error": membership_error}
+
+    # 验证 DSCP 值范围
+    if not (0 <= payload.dscp_value <= 63):
+        return {"prepared": False, "error": f"Invalid DSCP value: {payload.dscp_value} (must be 0-63)"}
+
+    # 验证标记类型
+    if payload.mark_type != "dscp":
+        return {"prepared": False, "error": f"Invalid mark_type: {payload.mark_type}. Only 'dscp' is supported."}
+
+    # 验证源节点和目标节点存在且已连接
+    source_peer = _resolve_peer_node(db, payload.source_node, client_ip)
+    target_peer = _resolve_peer_node(db, payload.target_node)
+
+    if not source_peer:
+        return {"prepared": False, "error": f"Source node '{payload.source_node}' not found"}
+
+    if not target_peer:
+        return {"prepared": False, "error": f"Target node '{payload.target_node}' not found"}
+
+    # 验证节点使用 WireGuard 隧道（Xray 不支持 DSCP 中继）
+    source_tunnel_type = source_peer.get("tunnel_type", "wireguard")
+    target_tunnel_type = target_peer.get("tunnel_type", "wireguard")
+
+    if source_tunnel_type == "xray":
+        return {
+            "prepared": False,
+            "error": f"Source node '{payload.source_node}' uses Xray tunnel (DSCP not preserved)"
+        }
+
+    if target_tunnel_type == "xray":
+        return {
+            "prepared": False,
+            "error": f"Target node '{payload.target_node}' uses Xray tunnel (DSCP not preserved)"
+        }
+
+    # 验证目标节点隧道已连接
+    if target_peer.get("tunnel_status") != "connected":
+        return {
+            "prepared": False,
+            "error": f"Target node '{payload.target_node}' tunnel not connected"
+        }
+
+    # 生成事务 ID（用于关联 prepare 和 commit）
+    transaction_id = str(uuid_module.uuid4())[:8]
+
+    logging.info(
+        f"[relay-routing-2pc] PREPARE 成功: chain={payload.chain_tag}, "
+        f"tx={transaction_id}, from {caller_node['tag']} ({client_ip})"
+    )
+
+    return {
+        "prepared": True,
+        "transaction_id": transaction_id,
+        "chain_tag": payload.chain_tag,
+        "source_node": payload.source_node,
+        "target_node": payload.target_node,
+    }
 
 
 @app.post("/api/relay-routing/register")
@@ -15357,6 +15914,14 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
         raise HTTPException(status_code=401, detail="Authentication failed")
     logging.info(f"[relay-routing] IP 认证成功: {client_ip} -> {caller_node['tag']}")
 
+    # Phase 11-Fix.V.3: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, caller_node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        logging.warning(f"[relay-routing] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
+
     caller_tag = caller_node["tag"]
     chain_tag = payload.chain_tag
     source_node = payload.source_node
@@ -15374,11 +15939,11 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
             "message": f"Invalid DSCP value: {dscp_value} (must be 0-63)"
         }
 
-    # 验证标记类型
-    if mark_type not in ("dscp", "xray_email"):
+    # 验证标记类型 (Phase 11-Fix.P: 仅支持 DSCP)
+    if mark_type != "dscp":
         return {
             "success": False,
-            "message": f"Invalid mark_type: {mark_type}"
+            "message": f"Invalid mark_type: {mark_type}. Only 'dscp' is supported for relay routing."
         }
 
     # Phase 11-Fix.D: 使用 _resolve_peer_node 支持多种命名方式
@@ -15398,6 +15963,27 @@ def api_relay_routing_register(request: Request, payload: RelayRouteRegisterRequ
         return {
             "success": False,
             "message": f"Target node '{target_node}' not found"
+        }
+
+    # Phase 11-Fix.P: 验证节点使用 WireGuard 隧道（非 Xray）
+    # Xray 隧道使用 SOCKS5 代理，无法保留 DSCP 标记，因此不支持中继路由
+    source_tunnel_type = source_peer.get("tunnel_type", "wireguard")
+    target_tunnel_type = target_peer.get("tunnel_type", "wireguard")
+
+    if source_tunnel_type == "xray":
+        logging.warning(f"[relay-routing] 源节点 '{source_node}' 使用 Xray 隧道，不支持中继路由")
+        return {
+            "success": False,
+            "message": f"Source node '{source_node}' uses Xray tunnel. "
+                       f"Relay routing requires WireGuard tunnels (DSCP not preserved through SOCKS5)."
+        }
+
+    if target_tunnel_type == "xray":
+        logging.warning(f"[relay-routing] 目标节点 '{target_node}' 使用 Xray 隧道，不支持中继路由")
+        return {
+            "success": False,
+            "message": f"Target node '{target_node}' uses Xray tunnel. "
+                       f"Relay routing requires WireGuard tunnels (DSCP not preserved through SOCKS5)."
         }
 
     # 获取接口名称 - 使用解析后的 peer tag
@@ -15455,7 +16041,7 @@ def api_relay_routing_unregister(request: Request, payload: RelayRouteUnregister
 
     当停用多跳链路时，入口节点调用此端点请求中间节点清理转发规则。
 
-    认证方式: PSK (无需 JWT)
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
     """
     client_ip = _get_client_ip(request)
 
@@ -15485,6 +16071,14 @@ def api_relay_routing_unregister(request: Request, payload: RelayRouteUnregister
         logging.warning(f"[relay-routing] IP 认证失败: client_ip={client_ip}, expected={tunnel_remote_ip}")
         raise HTTPException(status_code=401, detail="Authentication failed")
     logging.info(f"[relay-routing] IP 认证成功: {client_ip} -> {caller_node['tag']}")
+
+    # Phase 11-Fix.V.3: 验证请求节点是否为链路成员（传入 source_node 支持入口节点）
+    is_member, membership_error = _verify_chain_membership(
+        db, payload.chain_tag, caller_node["tag"], source_node=payload.source_node
+    )
+    if not is_member:
+        logging.warning(f"[relay-routing] 链路成员验证失败: {membership_error}")
+        raise HTTPException(status_code=403, detail=membership_error)
 
     caller_tag = caller_node["tag"]
     chain_tag = payload.chain_tag
@@ -16088,8 +16682,8 @@ def api_activate_chain(tag: str):
             detail="链路未配置终端出口 (exit_egress)"
         )
 
-    # Phase 11-Fix.J: 拒绝无法用于 DSCP 路由的出口类型
-    _validate_chain_terminal_egress(exit_egress)
+    # Phase 11-Fix.J + Phase 11-Fix.Q: 静态验证（完整验证在 hops 解析后）
+    _validate_chain_terminal_egress_static(exit_egress)
 
     if not dscp_value:
         raise HTTPException(
@@ -16106,15 +16700,39 @@ def api_activate_chain(tag: str):
             "chain_state": "active"
         }
 
-    # 防止并发激活：检查是否正在激活中
-    if current_state == "activating":
-        raise HTTPException(
-            status_code=409,
-            detail="链路正在激活中，请稍后再试"
-        )
+    # Phase 11-Fix.T: 使用原子状态转换防止并发激活竞态条件
+    # 替代原有的 check-then-act 模式，确保只有一个请求能成功转换状态
+    success, error = db.atomic_chain_state_transition(
+        tag=tag,
+        expected_state="inactive",
+        new_state="activating",
+        timeout_ms=30000  # 30秒锁等待超时
+    )
 
-    # 更新为 activating
-    db.update_node_chain(tag, chain_state="activating")
+    if not success:
+        if "Expected state" in (error or ""):
+            # 状态不匹配 - 可能是并发请求或已激活
+            if "activating" in (error or ""):
+                raise HTTPException(
+                    status_code=409,
+                    detail="链路正在激活中，请稍后再试"
+                )
+            elif "active" in (error or ""):
+                return {
+                    "message": "链路已处于激活状态",
+                    "chain": tag,
+                    "chain_state": "active"
+                }
+            elif "error" in (error or ""):
+                raise HTTPException(
+                    status_code=400,
+                    detail="链路处于错误状态，请先重置后再激活"
+                )
+        # 其他错误（数据库错误、链路不存在等）
+        raise HTTPException(
+            status_code=500,
+            detail=f"状态转换失败: {error}"
+        )
 
     # Phase 6 Issue 29: 使用 activation_success 标记追踪激活是否成功
     activation_success = False
@@ -16129,9 +16747,18 @@ def api_activate_chain(tag: str):
         # 终端节点是最后一跳
         terminal_tag = hops[-1]
 
+        # Phase 11-Fix.Q: 远程验证终端节点出口存在且兼容 DSCP 路由
+        allow_transitive = chain.get("allow_transitive", False)
+        egress_error = _validate_remote_terminal_egress(db, hops, exit_egress, allow_transitive)
+        if egress_error:
+            raise HTTPException(
+                status_code=400,
+                detail=f"终端出口验证失败: {egress_error}"
+            )
+
         # Phase 4 Issue 25 修复: 预检查所有中继节点的连接状态
         # 如果任何中继节点未连接，拒绝激活（避免链路部分生效导致流量丢失）
-        allow_transitive = chain.get("allow_transitive", False)
+        # allow_transitive 已在 Phase 11-Fix.Q 中定义
         if not allow_transitive:
             # 非传递模式下，所有中继节点必须已连接
             for i in range(len(hops) - 1):  # 除了终端节点
@@ -16229,56 +16856,128 @@ def api_activate_chain(tag: str):
                 detail="在终端节点注册链路路由失败"
             )
 
-        # Phase 11.4: 在中间节点注册中继路由
+        # Phase 11.4 + Phase 11-Fix.T: 使用 2PC 模式在中间节点注册中继路由
         # 对于链路 local -> A -> B -> C (hops = [A, B, C])
         # - A 是中间节点，需要配置: source=local -> target=B
         # - B 是中间节点，需要配置: source=A -> target=C
         # - C 是终端节点，已在上面注册链路路由
+        #
+        # 2PC 流程:
+        # 1. PREPARE: 在所有中间节点验证配置可行性
+        # 2. COMMIT: 如果全部准备成功，执行实际注册
+        # 3. ABORT: 如果任何准备失败，中止而不应用任何更改
         relay_results = []
-        if len(hops) > 1:
-            logging.info(f"[chains] 配置 {len(hops) - 1} 个中间节点的中继路由...")
+        relay_configs = []  # 收集要配置的中继节点信息
 
+        if len(hops) > 1:
+            logging.info(f"[chains-2pc] 准备配置 {len(hops) - 1} 个中间节点的中继路由...")
+
+            # Phase 1: 收集所有中继节点配置
             for i in range(len(hops) - 1):
                 relay_tag = hops[i]
                 relay_node = db.get_peer_node(relay_tag)
 
                 if not relay_node:
-                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 不存在，跳过")
+                    logging.warning(f"[chains-2pc] 中间节点 '{relay_tag}' 不存在，跳过")
                     continue
 
                 if relay_node.get("tunnel_status") != "connected":
-                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 隧道未连接，跳过")
+                    logging.warning(f"[chains-2pc] 中间节点 '{relay_tag}' 隧道未连接，跳过")
                     continue
 
                 relay_client = client_mgr.get_client(relay_tag)
                 if not relay_client:
-                    logging.warning(f"[chains] 无法获取中间节点 '{relay_tag}' 的 API 客户端，跳过")
+                    logging.warning(f"[chains-2pc] 无法获取中间节点 '{relay_tag}' 的 API 客户端，跳过")
                     continue
 
                 # 确定源节点和目标节点
                 source_node = local_node_id if i == 0 else hops[i - 1]
                 target_node = hops[i + 1]
 
-                # 注册中继路由（认证通过隧道 IP/UUID）
-                relay_success = relay_client.register_relay_route(
-                    chain_tag=tag,
-                    source_node=source_node,
-                    target_node=target_node,
-                    dscp_value=dscp_value,
-                    mark_type=chain_mark_type,
-                )
-
-                relay_results.append({
-                    "node": relay_tag,
-                    "success": relay_success,
+                relay_configs.append({
+                    "tag": relay_tag,
+                    "client": relay_client,
                     "source": source_node,
                     "target": target_node,
                 })
 
-                if relay_success:
-                    logging.info(f"[chains] 中间节点 '{relay_tag}' 中继路由注册成功 ({source_node} -> {target_node})")
-                else:
-                    logging.warning(f"[chains] 中间节点 '{relay_tag}' 中继路由注册失败 ({source_node} -> {target_node})")
+            # Phase 2: PREPARE - 在所有节点验证
+            if relay_configs:
+                logging.info(f"[chains-2pc] PREPARE 阶段: 验证 {len(relay_configs)} 个中继节点...")
+                prepare_results = []
+
+                for config in relay_configs:
+                    prepare_result = config["client"].prepare_relay_route(
+                        chain_tag=tag,
+                        source_node=config["source"],
+                        target_node=config["target"],
+                        dscp_value=dscp_value,
+                        mark_type=chain_mark_type,
+                    )
+                    prepare_results.append({
+                        "tag": config["tag"],
+                        "prepared": prepare_result.get("prepared", False),
+                        "error": prepare_result.get("error"),
+                        "transaction_id": prepare_result.get("transaction_id"),
+                    })
+
+                # 检查是否所有节点都准备成功
+                failed_prepares = [p for p in prepare_results if not p["prepared"]]
+                if failed_prepares:
+                    # ABORT: 有节点准备失败，回滚终端路由
+                    failed_nodes = [p["tag"] for p in failed_prepares]
+                    failed_errors = [f"{p['tag']}: {p['error']}" for p in failed_prepares]
+                    logging.error(
+                        f"[chains-2pc] PREPARE 失败，中止激活: {failed_errors}"
+                    )
+
+                    # 回滚已注册的终端路由
+                    try:
+                        if client:
+                            client.unregister_chain_route(
+                                chain_tag=tag,
+                                mark_value=dscp_value,
+                                mark_type=chain_mark_type,
+                                target_node=terminal_tag if via_relay else None,
+                                source_node=local_node_id,  # Phase 11-Fix.V.3
+                            )
+                    except Exception as rollback_err:
+                        logging.warning(f"[chains-2pc] 回滚终端路由时出错: {rollback_err}")
+
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"中继节点准备失败 (2PC ABORT): {', '.join(failed_nodes)}"
+                    )
+
+                logging.info(f"[chains-2pc] PREPARE 成功，进入 COMMIT 阶段...")
+
+                # Phase 3: COMMIT - 执行实际注册
+                for config in relay_configs:
+                    relay_success = config["client"].register_relay_route(
+                        chain_tag=tag,
+                        source_node=config["source"],
+                        target_node=config["target"],
+                        dscp_value=dscp_value,
+                        mark_type=chain_mark_type,
+                    )
+
+                    relay_results.append({
+                        "node": config["tag"],
+                        "success": relay_success,
+                        "source": config["source"],
+                        "target": config["target"],
+                    })
+
+                    if relay_success:
+                        logging.info(
+                            f"[chains-2pc] COMMIT 成功: '{config['tag']}' "
+                            f"({config['source']} -> {config['target']})"
+                        )
+                    else:
+                        logging.warning(
+                            f"[chains-2pc] COMMIT 失败: '{config['tag']}' "
+                            f"({config['source']} -> {config['target']})"
+                        )
 
         # Phase 5 Issue 28: 检查中继结果，如果全部失败则中止激活
         if relay_results:
@@ -16298,6 +16997,7 @@ def api_activate_chain(tag: str):
                             mark_value=dscp_value,
                             mark_type=chain_mark_type,
                             target_node=terminal_tag if via_relay else None,
+                            source_node=local_node_id,  # Phase 11-Fix.V.3
                         )
                 except Exception as rollback_err:
                     logging.warning(f"[chains] 回滚终端路由时出错: {rollback_err}")
@@ -16337,6 +17037,7 @@ def api_activate_chain(tag: str):
                         mark_value=dscp_value,
                         mark_type=chain_mark_type,
                         target_node=terminal_tag if via_relay else None,
+                        source_node=local_node_id,  # Phase 11-Fix.V.3
                     )
                 # 注销中继路由
                 for relay_result in relay_results:
@@ -16344,7 +17045,10 @@ def api_activate_chain(tag: str):
                         relay_tag = relay_result["node"]
                         relay_client = client_mgr.get_client(relay_tag)
                         if relay_client:
-                            relay_client.unregister_relay_route(chain_tag=tag)
+                            relay_client.unregister_relay_route(
+                                chain_tag=tag,
+                                source_node=local_node_id,  # Phase 11-Fix.V.3
+                            )
             except Exception as rollback_err:
                 logging.warning(f"[chains] 回滚链路路由时出错: {rollback_err}")
 
@@ -16367,13 +17071,17 @@ def api_activate_chain(tag: str):
                         mark_value=dscp_value,
                         mark_type=chain_mark_type,
                         target_node=terminal_tag if via_relay else None,
+                        source_node=local_node_id,  # Phase 11-Fix.V.3
                     )
                 for relay_result in relay_results:
                     if relay_result.get("success"):
                         relay_tag = relay_result["node"]
                         relay_client = client_mgr.get_client(relay_tag)
                         if relay_client:
-                            relay_client.unregister_relay_route(chain_tag=tag)
+                            relay_client.unregister_relay_route(
+                                chain_tag=tag,
+                                source_node=local_node_id,  # Phase 11-Fix.V.3
+                            )
             except Exception as rollback_err:
                 logging.warning(f"[chains] 回滚链路路由时出错: {rollback_err}")
 
@@ -16388,8 +17096,8 @@ def api_activate_chain(tag: str):
             f"routing_mark={routing_mark}, dscp={dscp_value}"
         )
 
-        # 更新为 active
-        db.update_node_chain(tag, chain_state="active", enabled=1)
+        # 更新为 active（清除之前的错误信息）
+        db.update_node_chain(tag, chain_state="active", enabled=1, last_error=None)
 
         # Phase 6 Issue 29: 标记激活成功
         activation_success = True
@@ -16439,9 +17147,10 @@ def api_activate_chain(tag: str):
         )
     finally:
         # Phase 6 Issue 29: 确保状态不会卡在 'activating'
+        # Phase 6: 同时保存错误信息到 last_error 字段便于调试
         if not activation_success:
             try:
-                db.update_node_chain(tag, chain_state="error")
+                db.update_node_chain(tag, chain_state="error", last_error="Activation failed (see logs)")
             except Exception as e:
                 logging.error(f"[chains] 更新链路 '{tag}' 状态失败: {e}")
 
@@ -16466,14 +17175,74 @@ def api_deactivate_chain(tag: str):
     if not chain:
         raise HTTPException(status_code=404, detail=f"链路 '{tag}' 不存在")
 
-    # 检查当前状态
+    # Phase 11-Fix.V.4: 使用原子状态转换防止并发停用竞态条件
+    # 尝试从 "active" 或 "error" 转换到 "inactive"
     current_state = chain.get("chain_state", "inactive")
+
     if current_state == "inactive":
         return {
             "message": "链路已处于停用状态",
             "chain": tag,
             "chain_state": "inactive"
         }
+
+    if current_state == "activating":
+        raise HTTPException(
+            status_code=409,
+            detail="链路正在激活中，请稍后再试"
+        )
+
+    # 原子转换: active → inactive 或 error → inactive
+    transition_success = False
+    if current_state == "active":
+        success, error = db.atomic_chain_state_transition(
+            tag=tag,
+            expected_state="active",
+            new_state="inactive",
+            timeout_ms=30000
+        )
+        if success:
+            transition_success = True
+            logging.info(f"[chains] 链路 '{tag}' 状态已原子转换: active → inactive")
+        else:
+            # 可能被其他请求先处理了，重新获取状态
+            chain = db.get_node_chain(tag)
+            current_state = chain.get("chain_state", "inactive") if chain else "inactive"
+            logging.warning(f"[chains] 原子转换失败: {error}，当前状态: {current_state}")
+
+    if not transition_success and current_state == "error":
+        success, error = db.atomic_chain_state_transition(
+            tag=tag,
+            expected_state="error",
+            new_state="inactive",
+            timeout_ms=30000
+        )
+        if success:
+            transition_success = True
+            logging.info(f"[chains] 链路 '{tag}' 状态已原子转换: error → inactive")
+        else:
+            chain = db.get_node_chain(tag)
+            current_state = chain.get("chain_state", "inactive") if chain else "inactive"
+            logging.warning(f"[chains] 原子转换失败: {error}，当前状态: {current_state}")
+
+    # 如果转换失败，检查最终状态
+    if not transition_success:
+        if current_state == "inactive":
+            return {
+                "message": "链路已处于停用状态（并发请求已处理）",
+                "chain": tag,
+                "chain_state": "inactive"
+            }
+        elif current_state == "activating":
+            raise HTTPException(
+                status_code=409,
+                detail="链路正在激活中，请稍后再试"
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"状态转换失败: 当前状态 '{current_state}'"
+            )
 
     dscp_value = chain.get("dscp_value")
     chain_mark_type = chain.get("chain_mark_type", "dscp")
@@ -16514,6 +17283,9 @@ def api_deactivate_chain(tag: str):
     # Issue 11/12 修复：使用统一的 hops 解析函数
     hops = _parse_chain_hops(chain, raise_on_error=False)
 
+    # Phase 11-Fix.V.3: 获取本地节点 ID（用于 source_node 参数）
+    local_node_id = _get_local_node_id()
+
     # 在终端节点注销链路路由（如果有配置）
     unregister_result = None
     if hops and len(hops) >= 2 and dscp_value:
@@ -16545,6 +17317,7 @@ def api_deactivate_chain(tag: str):
                     mark_value=dscp_value,
                     mark_type=chain_mark_type,
                     target_node=terminal_tag if via_relay else None,  # 传递模式需要转发
+                    source_node=local_node_id,  # Phase 11-Fix.V.3: 入口节点标识
                 )
                 unregister_result = "success" if success else "failed"
                 cleanup_results["terminal"]["status"] = "success" if success else "failed"
@@ -16600,7 +17373,11 @@ def api_deactivate_chain(tag: str):
                     continue
 
                 # 注销中继路由（认证通过隧道 IP/UUID）
-                success = relay_client.unregister_relay_route(chain_tag=tag)
+                # Phase 11-Fix.V.3: 传递入口节点标识
+                success = relay_client.unregister_relay_route(
+                    chain_tag=tag,
+                    source_node=local_node_id,
+                )
                 relay_result = {
                     "node": relay_tag,
                     "result": "success" if success else "failed"
@@ -16618,8 +17395,9 @@ def api_deactivate_chain(tag: str):
         except Exception as e:
             logging.warning(f"[chains] 注销中继路由时出错: {e}")
 
-    # 更新为 inactive
-    db.update_node_chain(tag, chain_state="inactive", enabled=0)
+    # Phase 11-Fix.V.4: 状态已在开始时原子转换为 inactive
+    # 这里只需清除 enabled 标志和错误信息
+    db.update_node_chain(tag, enabled=0, last_error=None)
 
     # 重新生成 sing-box 配置
     reload_status = "success"

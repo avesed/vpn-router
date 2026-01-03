@@ -3445,7 +3445,8 @@ class UserDatabase:
         exit_egress: Optional[str] = None,
         dscp_value: Optional[int] = None,
         chain_mark_type: str = "dscp",
-        chain_state: str = "inactive"
+        chain_state: str = "inactive",
+        allow_transitive: bool = False  # Phase 11-Fix.Q: 传递模式验证
     ) -> int:
         """添加多跳链路
 
@@ -3463,6 +3464,7 @@ class UserDatabase:
             dscp_value: DSCP 标记值 1-63（多跳链路架构 v2）
             chain_mark_type: 标记类型 'dscp' 或 'xray_email'
             chain_state: 链路状态 'inactive'/'activating'/'active'/'error'
+            allow_transitive: 是否允许传递验证（只验证第一跳）
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
@@ -3470,8 +3472,9 @@ class UserDatabase:
                 INSERT INTO node_chains (
                     tag, name, description, hops, hop_protocols,
                     entry_rules, relay_rules, priority, enabled,
-                    exit_egress, dscp_value, chain_mark_type, chain_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_egress, dscp_value, chain_mark_type, chain_state,
+                    allow_transitive
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, name, description,
                 json.dumps(hops),
@@ -3479,7 +3482,8 @@ class UserDatabase:
                 json.dumps(entry_rules) if entry_rules else None,
                 json.dumps(relay_rules) if relay_rules else None,
                 priority, 1 if enabled else 0,
-                exit_egress, dscp_value, chain_mark_type, chain_state
+                exit_egress, dscp_value, chain_mark_type, chain_state,
+                1 if allow_transitive else 0
             ))
             conn.commit()
             return cursor.lastrowid
@@ -3492,7 +3496,9 @@ class UserDatabase:
             "last_health_check", "priority", "enabled",
             "downstream_status", "disconnected_node",  # 级联通知字段
             # 多跳链路架构 v2 字段
-            "exit_egress", "dscp_value", "chain_mark_type", "chain_state"
+            "exit_egress", "dscp_value", "chain_mark_type", "chain_state",
+            "allow_transitive",  # Phase 11-Fix.Q: 传递模式验证
+            "last_error"  # Phase 5: 错误原因记录
         }
         updates = []
         values = []
@@ -3515,6 +3521,115 @@ class UserDatabase:
             """, values)
             conn.commit()
             return cursor.rowcount > 0
+
+    def atomic_chain_state_transition(
+        self,
+        tag: str,
+        expected_state: str,
+        new_state: str,
+        timeout_ms: int = 30000,
+        last_error: Optional[str] = None
+    ) -> tuple:
+        """Phase 11-Fix.T/U: 原子性链路状态转换
+
+        使用 BEGIN EXCLUSIVE 事务确保并发安全。解决两个并发请求同时
+        读取 'inactive' 状态然后都尝试写入 'activating' 的竞态条件。
+
+        Phase 11-Fix.U 修改:
+        - 使用专用连接避免 TLS 连接池隐式事务状态冲突
+        - 添加 last_error 参数支持在同一事务中设置错误消息
+
+        Args:
+            tag: 链路标签
+            expected_state: 期望的当前状态
+            new_state: 要转换到的新状态
+            timeout_ms: 获取锁的超时时间（毫秒）
+            last_error: 可选的错误消息，将在同一事务中原子设置
+
+        Returns:
+            (success: bool, error_message: Optional[str])
+            - (True, None): 转换成功
+            - (False, "Chain not found"): 链路不存在
+            - (False, "Expected state 'X', found 'Y'"): 状态不匹配
+            - (False, "Database error: ..."): 数据库错误
+        """
+        # Phase 11-Fix.U: 使用专用连接避免 TLS 连接池冲突
+        # TLS 缓存连接可能有待处理的隐式事务，导致 BEGIN EXCLUSIVE 或 COMMIT 失败
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=timeout_ms / 1000.0,  # SQLite timeout 是秒
+            check_same_thread=False
+        )
+        try:
+            # 应用 SQLCipher 加密和性能 PRAGMA
+            self._apply_encryption(conn)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # 设置锁等待超时
+            cursor.execute(f"PRAGMA busy_timeout = {timeout_ms}")
+
+            # 开始排他事务 - 阻止其他写操作
+            cursor.execute("BEGIN EXCLUSIVE")
+
+            # 检查当前状态
+            cursor.execute(
+                "SELECT chain_state FROM node_chains WHERE tag = ?",
+                (tag,)
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                # Phase 11-Fix.V.2: 使用 conn.rollback() 统一事务管理
+                conn.rollback()
+                return False, f"Chain '{tag}' not found"
+
+            current_state = row[0] or "inactive"
+
+            if current_state != expected_state:
+                # Phase 11-Fix.V.2: 使用 conn.rollback() 统一事务管理
+                conn.rollback()
+                return False, f"Expected state '{expected_state}', found '{current_state}'"
+
+            # Phase 11-Fix.U: 原子更新状态和 last_error（如果提供）
+            if last_error is not None:
+                cursor.execute(
+                    """UPDATE node_chains
+                       SET chain_state = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE tag = ?""",
+                    (new_state, last_error, tag)
+                )
+            else:
+                cursor.execute(
+                    """UPDATE node_chains
+                       SET chain_state = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE tag = ?""",
+                    (new_state, tag)
+                )
+            # Phase 11-Fix.V.2: 使用 conn.commit() 统一事务管理
+            conn.commit()
+
+            logger.info(
+                f"[db] Chain '{tag}' state transition: {expected_state} -> {new_state}"
+                + (f" (last_error: {last_error[:50]}...)" if last_error and len(last_error) > 50
+                   else (f" (last_error: {last_error})" if last_error else ""))
+            )
+            return True, None
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception as rollback_err:
+                # Phase 11-Fix.V.2: 记录 rollback 失败（连接将在 finally 中关闭）
+                logger.warning(f"[db] Rollback failed during error recovery: {rollback_err}")
+            logger.error(f"[db] atomic_chain_state_transition failed: {e}")
+            return False, f"Database error: {str(e)}"
+        finally:
+            # Phase 11-Fix.U: 专用连接在使用后关闭，不污染 TLS 连接池
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def delete_node_chain(self, tag: str) -> bool:
         """删除多跳链路
@@ -4377,6 +4492,23 @@ class DatabaseManager:
     def get_all_settings(self) -> Dict[str, str]:
         return self.user.get_all_settings()
 
+    # Admin Authentication
+    def is_admin_setup(self) -> bool:
+        """检查管理员密码是否已设置"""
+        return self.user.is_admin_setup()
+
+    def set_admin_password(self, password_hash: str) -> bool:
+        """设置或更新管理员密码哈希"""
+        return self.user.set_admin_password(password_hash)
+
+    def get_admin_password_hash(self) -> Optional[str]:
+        """获取管理员密码哈希"""
+        return self.user.get_admin_password_hash()
+
+    def get_or_create_jwt_secret(self) -> str:
+        """获取 JWT 密钥，不存在则创建"""
+        return self.user.get_or_create_jwt_secret()
+
     # Custom Egress
     def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
         return self.user.get_custom_egress_list(enabled_only)
@@ -4952,7 +5084,8 @@ class DatabaseManager:
         exit_egress: Optional[str] = None,
         dscp_value: Optional[int] = None,
         chain_mark_type: str = "dscp",
-        chain_state: str = "inactive"
+        chain_state: str = "inactive",
+        allow_transitive: bool = False  # Phase 11-Fix.Q: 传递模式验证
     ) -> int:
         return self.user.add_node_chain(
             tag, name, hops, description, hop_protocols,
@@ -4960,11 +5093,25 @@ class DatabaseManager:
             exit_egress=exit_egress,
             dscp_value=dscp_value,
             chain_mark_type=chain_mark_type,
-            chain_state=chain_state
+            chain_state=chain_state,
+            allow_transitive=allow_transitive
         )
 
     def update_node_chain(self, tag: str, **kwargs) -> bool:
         return self.user.update_node_chain(tag, **kwargs)
+
+    def atomic_chain_state_transition(
+        self,
+        tag: str,
+        expected_state: str,
+        new_state: str,
+        timeout_ms: int = 30000,
+        last_error: Optional[str] = None
+    ) -> tuple:
+        """Phase 11-Fix.T/U: 原子性链路状态转换（代理方法）"""
+        return self.user.atomic_chain_state_transition(
+            tag, expected_state, new_state, timeout_ms, last_error
+        )
 
     def delete_node_chain(self, tag: str) -> bool:
         return self.user.delete_node_chain(tag)

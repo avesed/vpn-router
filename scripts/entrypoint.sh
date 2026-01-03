@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Phase 11-Fix.Y: Unified iptables backend selection
+# Problem: iptables-nft and iptables-legacy can coexist with separate rule sets
+# causing TPROXY rules to be invisible to the kernel if set on wrong backend.
+# Solution: Detect and use the backend that the kernel is actually using.
+select_iptables_backend() {
+  # Check which backend the kernel is using by looking at existing rules
+  # If nft has rules with packet counts > 0, kernel is using nft
+  local nft_pkts legacy_pkts
+  nft_pkts=$(iptables-nft -t mangle -L -v -n 2>/dev/null | grep -E "^[[:space:]]*[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+  legacy_pkts=$(iptables-legacy -t mangle -L -v -n 2>/dev/null | grep -E "^[[:space:]]*[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+
+  if [ "$nft_pkts" -gt "$legacy_pkts" ] 2>/dev/null; then
+    echo "iptables-nft"
+  elif [ "$legacy_pkts" -gt 0 ] 2>/dev/null; then
+    echo "iptables-legacy"
+  else
+    # Default to nft as it's the modern default
+    echo "iptables-nft"
+  fi
+}
+
+# Select and export iptables backend
+IPTABLES_BACKEND=$(select_iptables_backend)
+IPTABLES="${IPTABLES_BACKEND}"
+IP6TABLES="${IPTABLES_BACKEND/iptables/ip6tables}"
+echo "[entrypoint] Using iptables backend: ${IPTABLES_BACKEND}"
+
+# Helper function to run iptables with correct backend
+run_iptables() {
+  ${IPTABLES} "$@"
+}
+
 cleanup() {
   echo "[entrypoint] cleanup: stopping all managed processes..."
 
@@ -88,9 +120,21 @@ cleanup_wireguard_interfaces() {
 
   # Cleanup iptables rules (TPROXY and NAT)
   echo "[entrypoint] cleaning up iptables rules..."
-  iptables -t mangle -F PREROUTING 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -s "10.25.0.0/24" ! -o "wg-ingress" -j MASQUERADE 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -s "10.24.0.0/24" ! -o "xray-tun0" -j MASQUERADE 2>/dev/null || true
+  ${IPTABLES} -t mangle -F PREROUTING 2>/dev/null || true
+  # Phase 11-Fix.X: Cleanup DIVERT chain
+  ${IPTABLES} -t mangle -F DIVERT 2>/dev/null || true
+  ${IPTABLES} -t mangle -X DIVERT 2>/dev/null || true
+  ${IPTABLES} -t nat -D POSTROUTING -s "10.25.0.0/24" ! -o "wg-ingress" -j MASQUERADE 2>/dev/null || true
+  ${IPTABLES} -t nat -D POSTROUTING -s "10.24.0.0/24" ! -o "xray-tun0" -j MASQUERADE 2>/dev/null || true
+
+  # Phase 11-Fix.W: Cleanup route_localnet security rules (raw table)
+  # Phase 11-Fix.X: Fixed syntax to match the updated setup rules
+  ${IPTABLES} -t raw -D PREROUTING -d 127.0.0.0/8 -i lo -j ACCEPT 2>/dev/null || true
+  ${IPTABLES} -t raw -D PREROUTING -d 127.0.0.0/8 -i wg-ingress -j ACCEPT 2>/dev/null || true
+  ${IPTABLES} -t raw -D PREROUTING -d 127.0.0.0/8 -j DROP 2>/dev/null || true
+  ${IPTABLES} -t raw -D PREROUTING -i xray-tun0 -d 127.0.0.0/8 -j ACCEPT 2>/dev/null || true
+  # Note: Do NOT reset route_localnet sysctl - it's a host setting with network_mode: host
+  # Resetting could break other services on the host
 
   # Cleanup ip rules
   ip rule del fwmark 1 lookup 100 2>/dev/null || true
@@ -253,6 +297,15 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
 
+# Phase 11-Fix.W: CRITICAL - Enable route_localnet for TPROXY
+# TPROXY uses --on-ip 127.0.0.1 to redirect traffic to sing-box on loopback
+# Without this, kernel treats 127.0.0.0/8 as "martian" and silently drops packets
+# This was the root cause of the "TPROXY black hole" bug where iptables counters
+# increased but sing-box never received the traffic
+sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.route_localnet=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.lo.route_localnet=1 >/dev/null 2>&1 || true
+
 if [ "${DISABLE_IPV6:-1}" = "1" ]; then
   sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null || true
   sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null || true
@@ -306,7 +359,47 @@ else:
 " 2>/dev/null || echo "10.25.0.0/24")
 
   echo "[entrypoint] WireGuard subnet: ${WG_SUBNET}"
+
+  # Phase 11-Fix.W: Set interface-specific sysctl after interface creation
+  # These settings are critical for TPROXY to work correctly on this interface
+  sysctl -w net.ipv4.conf.${WG_INTERFACE}.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.${WG_INTERFACE}.route_localnet=1 >/dev/null 2>&1 || true
+  echo "[entrypoint] interface sysctl configured for ${WG_INTERFACE}"
+
   echo "[entrypoint] kernel WireGuard interface ready"
+}
+
+# Phase 11-Fix.W: Check TPROXY kernel prerequisites
+check_tproxy_prerequisites() {
+  echo "[entrypoint] checking TPROXY prerequisites..."
+
+  local modules=("xt_TPROXY" "nf_tproxy_ipv4")
+  local all_ok=true
+
+  for module in "${modules[@]}"; do
+    # Check if module is already loaded
+    if lsmod | grep -q "^${module}\b" 2>/dev/null; then
+      continue
+    fi
+
+    # Try to load module
+    if modprobe "${module}" 2>/dev/null; then
+      echo "[entrypoint] loaded module ${module}"
+      continue
+    fi
+
+    # Module might be built-in, test TPROXY functionality
+    if ! ${IPTABLES} -t mangle -m TPROXY -h >/dev/null 2>&1; then
+      echo "[entrypoint] WARNING: ${module} not available, TPROXY may not work" >&2
+      all_ok=false
+    fi
+  done
+
+  if [ "$all_ok" = true ]; then
+    echo "[entrypoint] TPROXY prerequisites check passed"
+  else
+    echo "[entrypoint] WARNING: Some TPROXY modules missing, functionality may be degraded" >&2
+  fi
 }
 
 setup_tproxy_routing() {
@@ -317,6 +410,20 @@ setup_tproxy_routing() {
   # This allows sing-box to send responses with non-local source IPs
   sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
   sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1 || true
+
+  # Phase 11-Fix.W: Security protection for route_localnet
+  # Block external traffic to loopback (prevent route_localnet abuse)
+  # Only allow traffic from lo or WireGuard interface to reach 127.0.0.0/8
+  # Use raw table for earliest interception with minimal overhead
+  # Phase 11-Fix.X: Fixed syntax - iptables doesn't support multiple -i conditions
+  # Use ACCEPT rules for allowed interfaces, then DROP the rest
+  ${IPTABLES} -t raw -D PREROUTING -d 127.0.0.0/8 -i lo -j ACCEPT 2>/dev/null || true
+  ${IPTABLES} -t raw -D PREROUTING -d 127.0.0.0/8 -i ${WG_INTERFACE} -j ACCEPT 2>/dev/null || true
+  ${IPTABLES} -t raw -D PREROUTING -d 127.0.0.0/8 -j DROP 2>/dev/null || true
+  ${IPTABLES} -t raw -A PREROUTING -d 127.0.0.0/8 -i lo -j ACCEPT
+  ${IPTABLES} -t raw -A PREROUTING -d 127.0.0.0/8 -i ${WG_INTERFACE} -j ACCEPT
+  ${IPTABLES} -t raw -A PREROUTING -d 127.0.0.0/8 -j DROP
+  echo "[entrypoint] route_localnet security rules configured (raw table)"
 
   # Setup routing table for TPROXY marked packets
   # Marked packets go to local (loopback) for TPROXY processing
@@ -334,30 +441,71 @@ setup_tproxy_routing() {
   ip rule add fwmark ${TPROXY_MARK} lookup ${TPROXY_TABLE}
   ip route add local 0.0.0.0/0 dev lo table ${TPROXY_TABLE}
 
+  # Phase 11-Fix.X: DIVERT chain for established connections
+  # This is CRITICAL for TPROXY to work correctly!
+  # Without this, return traffic from established connections cannot find
+  # its way back to the transparent proxy socket, causing a "black hole".
+  # Reference: https://www.kernel.org/doc/Documentation/networking/tproxy.txt
+  ${IPTABLES} -t mangle -N DIVERT 2>/dev/null || true
+  ${IPTABLES} -t mangle -F DIVERT
+  ${IPTABLES} -t mangle -A DIVERT -j MARK --set-mark ${TPROXY_MARK}
+  ${IPTABLES} -t mangle -A DIVERT -j ACCEPT
+  echo "[entrypoint] DIVERT chain created for TPROXY established connections"
+
   # M12: 幂等的 iptables 规则设置 - 先删除再添加，避免重复
   # Skip traffic to WireGuard server itself (local subnet)
-  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN
+  ${IPTABLES} -t mangle -D PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN 2>/dev/null || true
+  ${IPTABLES} -t mangle -A PREROUTING -i "${WG_INTERFACE}" -d "${WG_SUBNET}" -j RETURN
+
+  # Phase 11-Fix.X: Socket match for established connections (MUST be before TPROXY!)
+  # This catches return packets for established transparent proxy connections.
+  # The -m socket module checks if the packet belongs to an existing socket.
+  # IMPORTANT: --transparent flag is required to match sockets with IP_TRANSPARENT option
+  ${IPTABLES} -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p tcp -m socket --transparent -j DIVERT 2>/dev/null || true
+  ${IPTABLES} -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p udp -m socket --transparent -j DIVERT 2>/dev/null || true
+  ${IPTABLES} -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p tcp -m socket --transparent -j DIVERT
+  ${IPTABLES} -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p udp -m socket --transparent -j DIVERT
+  echo "[entrypoint] Socket match rules added (before TPROXY)"
 
   # TPROXY TCP traffic from WireGuard interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p tcp \
+  ${IPTABLES} -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p tcp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p tcp \
+  ${IPTABLES} -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p tcp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   # TPROXY UDP traffic from WireGuard interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p udp \
+  ${IPTABLES} -t mangle -D PREROUTING -i "${WG_INTERFACE}" -p udp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p udp \
+  ${IPTABLES} -t mangle -A PREROUTING -i "${WG_INTERFACE}" -p udp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   echo "[entrypoint] TPROXY configured: ${WG_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
 
   # NAT/MASQUERADE for WireGuard ingress traffic going to internet
   # Without this, responses from internet can't route back to private WG IPs
-  iptables -t nat -D POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE 2>/dev/null || true
-  iptables -t nat -A POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE
+  ${IPTABLES} -t nat -D POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE 2>/dev/null || true
+  ${IPTABLES} -t nat -A POSTROUTING -s "${WG_SUBNET}" ! -o "${WG_INTERFACE}" -j MASQUERADE
   echo "[entrypoint] NAT configured: ${WG_SUBNET} -> MASQUERADE (for internet access)"
+
+  # Phase 11-Fix.W: Verify TPROXY routing is correctly configured
+  local route_check
+  route_check=$(ip route show table ${TPROXY_TABLE} 2>/dev/null)
+  if ! echo "${route_check}" | grep -q "local"; then
+    echo "[entrypoint] ERROR: TPROXY routing table ${TPROXY_TABLE} not configured correctly" >&2
+    echo "[entrypoint] Expected 'local 0.0.0.0/0 dev lo' in table ${TPROXY_TABLE}" >&2
+    return 1
+  fi
+
+  # Verify ip rule exists
+  # Note: ip rule show outputs:
+  #   - fwmark as hex (0x1) or decimal (1)
+  #   - table as number (100) or name (tproxy) depending on /etc/iproute2/rt_tables
+  if ! ip rule show | grep -qE "fwmark.*(0x)?${TPROXY_MARK}.*lookup.*(${TPROXY_TABLE}|tproxy)"; then
+    echo "[entrypoint] ERROR: TPROXY ip rule not configured (fwmark ${TPROXY_MARK} -> table ${TPROXY_TABLE})" >&2
+    return 1
+  fi
+
+  echo "[entrypoint] TPROXY routing verified: table ${TPROXY_TABLE} OK, ip rule OK"
 }
 
 # Setup kernel WireGuard ingress before other services
@@ -405,8 +553,23 @@ sync_chain_routes() {
   fi
 }
 
+# === DSCP Rules Restoration (Phase 11-Fix.P) ===
+# Restore entry node DSCP rules from persisted state
+restore_dscp_rules() {
+  echo "[entrypoint] restoring DSCP rules from persisted state"
+  # Note: Don't suppress stderr (2>/dev/null) - errors are logged to /var/log/dscp-restore.log for debugging
+  if python3 /usr/local/bin/dscp_manager.py restore 2>>/var/log/dscp-restore.log; then
+    echo "[entrypoint] DSCP rules restored successfully"
+  else
+    echo "[entrypoint] warning: DSCP rule restore failed or no persisted state (check /var/log/dscp-restore.log)"
+  fi
+}
+
 # Sync chain routes (for terminal node DSCP routing)
 sync_chain_routes
+
+# Restore entry node DSCP rules (Phase 11-Fix.P)
+restore_dscp_rules
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
@@ -483,28 +646,40 @@ else:
   echo "[entrypoint] setting up TPROXY routing for Xray traffic"
   echo "[entrypoint] Xray TUN interface: ${XRAY_INTERFACE}, subnet: ${XRAY_SUBNET}"
 
+  # Phase 11-Fix.W: Set interface-specific sysctl for Xray TUN interface
+  # Same settings as WireGuard interface for TPROXY compatibility
+  sysctl -w net.ipv4.conf.${XRAY_INTERFACE}.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.${XRAY_INTERFACE}.route_localnet=1 >/dev/null 2>&1 || true
+  echo "[entrypoint] interface sysctl configured for ${XRAY_INTERFACE}"
+
+  # Phase 11-Fix.W: Add Xray interface to route_localnet security whitelist
+  # Insert ACCEPT rule before the DROP rule to allow Xray TUN traffic to 127.0.0.0/8
+  ${IPTABLES} -t raw -D PREROUTING -i ${XRAY_INTERFACE} -d 127.0.0.0/8 -j ACCEPT 2>/dev/null || true
+  ${IPTABLES} -t raw -I PREROUTING -i ${XRAY_INTERFACE} -d 127.0.0.0/8 -j ACCEPT
+  echo "[entrypoint] route_localnet security whitelist updated for ${XRAY_INTERFACE}"
+
   # M12: 幂等的 iptables 规则设置 - 先删除再添加，避免重复
   # Skip traffic to Xray server subnet (local subnet)
-  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN
+  ${IPTABLES} -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN 2>/dev/null || true
+  ${IPTABLES} -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -d "${XRAY_SUBNET}" -j RETURN
 
   # TPROXY TCP traffic from Xray TUN interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
+  ${IPTABLES} -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
+  ${IPTABLES} -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   # TPROXY UDP traffic from Xray TUN interface to sing-box
-  iptables -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p udp \
+  ${IPTABLES} -t mangle -D PREROUTING -i "${XRAY_INTERFACE}" -p udp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK} 2>/dev/null || true
-  iptables -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p udp \
+  ${IPTABLES} -t mangle -A PREROUTING -i "${XRAY_INTERFACE}" -p udp \
     -j TPROXY --on-port ${TPROXY_PORT} --on-ip 127.0.0.1 --tproxy-mark ${TPROXY_MARK}
 
   echo "[entrypoint] Xray TPROXY configured: ${XRAY_INTERFACE} -> 127.0.0.1:${TPROXY_PORT}"
 
   # NAT/MASQUERADE for Xray V2Ray ingress traffic going to internet
-  iptables -t nat -D POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE 2>/dev/null || true
-  iptables -t nat -A POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE
+  ${IPTABLES} -t nat -D POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE 2>/dev/null || true
+  ${IPTABLES} -t nat -A POSTROUTING -s "${XRAY_SUBNET}" ! -o "${XRAY_INTERFACE}" -j MASQUERADE
   echo "[entrypoint] NAT configured: ${XRAY_SUBNET} -> MASQUERADE (for internet access)"
 }
 
@@ -724,6 +899,9 @@ handle_signals() {
 trap handle_signals SIGTERM SIGINT
 
 start_singbox "${CONFIG_PATH}"
+
+# Phase 11-Fix.W: Check TPROXY kernel prerequisites before setting up routing
+check_tproxy_prerequisites
 
 # Setup TPROXY routing for WireGuard traffic (no need to wait for sing-box)
 setup_tproxy_routing

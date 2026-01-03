@@ -156,11 +156,22 @@ def create_tproxy_inbound(wg_config: dict) -> dict:
 
     # TPROXY 入口配置
     # 监听 TCP 和 UDP 流量
-    # 使用 0.0.0.0 而不是 :: 确保 IPv4 TPROXY 流量正确接收
+    #
+    # Phase 11-Fix.Y: 必须使用 0.0.0.0 而不是 127.0.0.1
+    # 在 macvlan/bridge 模式下，sing-box 监听 127.0.0.1 会导致黑洞，
+    # 即使 iptables TPROXY --on-ip 127.0.0.1 规则正确设置。
+    # 使用 0.0.0.0 可以同时兼容 host 模式和 macvlan 模式。
+    #
+    # 技术原因：TPROXY 流量的目标地址是原始目标（如 8.8.8.8），不是 127.0.0.1。
+    # --on-ip 127.0.0.1 只是告诉内核使用 127.0.0.1 作为本地投递地址，
+    # 但 socket 匹配需要 sing-box 在 0.0.0.0 上监听才能接收任意目标地址的流量。
+    #
+    # 可通过环境变量 TPROXY_LISTEN_ADDR 覆盖（默认 0.0.0.0）
+    tproxy_listen = os.environ.get("TPROXY_LISTEN_ADDR", "0.0.0.0")
     tproxy_inbound = {
         "type": "tproxy",
         "tag": "tproxy-in",
-        "listen": "0.0.0.0",
+        "listen": tproxy_listen,
         "listen_port": DEFAULT_TPROXY_PORT,
         "sniff": True,
         "sniff_override_destination": False

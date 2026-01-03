@@ -130,6 +130,45 @@ RECONNECT_INTERVAL = 30  # 快速重连间隔（秒）
 HEALTH_CHECK_INTERVAL = 60  # 健康检查间隔（秒）
 MAX_FAST_RECONNECT_ATTEMPTS = 5  # 快速重连最大尝试次数
 SLOW_RECONNECT_INTERVAL = 600  # 慢速重连间隔（秒）= 10 分钟
+# Phase 11-Fix.T: 抖动配置（防止 thundering herd）
+JITTER_FACTOR = 0.25  # 抖动因子：±25% 随机偏移
+EXPONENTIAL_BACKOFF_BASE = 2  # 指数退避基数
+MAX_BACKOFF_INTERVAL = 1800  # 最大退避间隔（30 分钟）
+
+
+def calculate_jittered_backoff(attempt: int, base_interval: float) -> float:
+    """Phase 11-Fix.T: 计算带抖动的指数退避间隔
+
+    防止多个节点同时重连导致的 "thundering herd" 问题。
+
+    算法:
+    - 指数退避: interval = base * (2 ^ attempt)
+    - 添加随机抖动: final = interval * (1 ± jitter_factor)
+    - 限制最大值: min(final, MAX_BACKOFF_INTERVAL)
+
+    Args:
+        attempt: 当前尝试次数 (0-based)
+        base_interval: 基础间隔（秒）
+
+    Returns:
+        带抖动的退避间隔（秒）
+    """
+    import random
+
+    # 指数退避（但在快速重连阶段使用固定间隔）
+    if attempt < MAX_FAST_RECONNECT_ATTEMPTS:
+        interval = base_interval
+    else:
+        # 慢速重连阶段使用指数退避
+        backoff_multiplier = EXPONENTIAL_BACKOFF_BASE ** (attempt - MAX_FAST_RECONNECT_ATTEMPTS)
+        interval = SLOW_RECONNECT_INTERVAL * min(backoff_multiplier, 4)  # 最多 4x
+
+    # 添加随机抖动（±25%）
+    jitter = interval * JITTER_FACTOR * (2 * random.random() - 1)
+    final_interval = interval + jitter
+
+    # 限制最大值
+    return min(final_interval, MAX_BACKOFF_INTERVAL)
 
 
 def write_pid_file_atomic(pid_path: Path, pid: int) -> None:
@@ -1822,18 +1861,30 @@ class PeerTunnelManager:
         now = time.time()
         for tag, tunnel in list(self.tunnels.items()):
             if tunnel.status != "connected":
-                # 尝试重连
+                # Phase 11-Fix.T: 使用抖动退避计算重连间隔
+                required_interval = calculate_jittered_backoff(
+                    tunnel.reconnect_attempts,
+                    RECONNECT_INTERVAL
+                )
+                time_since_last = now - tunnel.last_reconnect_time
+
                 if tunnel.reconnect_attempts < MAX_FAST_RECONNECT_ATTEMPTS:
-                    # 快速重连阶段（前 5 次）
-                    logger.info(f"[{tag}] 快速重连 ({tunnel.reconnect_attempts + 1}/{MAX_FAST_RECONNECT_ATTEMPTS})")
-                    tunnel.reconnect_attempts += 1
-                    tunnel.last_reconnect_time = now
-                    self.connect_node(tag)
+                    # 快速重连阶段（前 5 次）- 使用基础间隔 + 抖动
+                    if time_since_last >= required_interval or tunnel.reconnect_attempts == 0:
+                        logger.info(
+                            f"[{tag}] 快速重连 ({tunnel.reconnect_attempts + 1}/"
+                            f"{MAX_FAST_RECONNECT_ATTEMPTS})，间隔={required_interval:.1f}s"
+                        )
+                        tunnel.reconnect_attempts += 1
+                        tunnel.last_reconnect_time = now
+                        self.connect_node(tag)
                 else:
-                    # 慢速重连阶段（超过 5 次，每 10 分钟一次，不限次数）
-                    time_since_last = now - tunnel.last_reconnect_time
-                    if time_since_last >= SLOW_RECONNECT_INTERVAL:
-                        logger.info(f"[{tag}] 慢速重连（第 {tunnel.reconnect_attempts + 1} 次，每 10 分钟尝试）")
+                    # 慢速重连阶段 - 使用指数退避 + 抖动
+                    if time_since_last >= required_interval:
+                        logger.info(
+                            f"[{tag}] 慢速重连（第 {tunnel.reconnect_attempts + 1} 次，"
+                            f"下次间隔≈{required_interval:.0f}s）"
+                        )
                         tunnel.reconnect_attempts += 1
                         tunnel.last_reconnect_time = now
                         self.connect_node(tag)

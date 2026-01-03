@@ -21,13 +21,15 @@
     manager.cleanup_chain_rules("us-stream")
 """
 
+import json
 import logging
 import os
 import re
 import subprocess
 import threading
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # DSCP 值范围和保留值
 DSCP_MIN = 1
@@ -65,6 +67,9 @@ MAX_INTERFACE_NAME_LEN = 15
 CHAIN_TAG_PATTERN = re.compile(r'^[a-z][a-z0-9\-]*$')
 MAX_CHAIN_TAG_LEN = 64
 
+# 持久化状态文件路径 (Phase 11-Fix.P)
+DSCP_STATE_FILE = Path(os.environ.get("DSCP_STATE_FILE", "/etc/sing-box/dscp-state.json"))
+
 
 @dataclass
 class DSCPRule:
@@ -85,8 +90,109 @@ class DSCPManager:
 
     def __init__(self):
         self._rules: Dict[str, DSCPRule] = {}  # chain_tag -> rule info
+        self._terminal_rules: Dict[int, Dict[str, Any]] = {}  # dscp_value -> terminal rule info
         self._logger = logging.getLogger("dscp-manager")
         self._lock = threading.Lock()  # 保护 _rules 的线程锁
+
+    def _persist_state(self) -> bool:
+        """持久化当前规则状态到 JSON 文件 (Phase 11-Fix.P)
+
+        使用原子写入确保数据一致性。
+        注意：锁保护整个操作以避免竞争条件。
+
+        Returns:
+            是否成功
+        """
+        try:
+            with self._lock:
+                state = {
+                    "entry_rules": {
+                        tag: asdict(rule) for tag, rule in self._rules.items()
+                    },
+                    "terminal_rules": self._terminal_rules.copy(),
+                }
+
+                # 原子写入：先写临时文件，再重命名（在锁内执行）
+                tmp_file = DSCP_STATE_FILE.with_suffix(".tmp")
+                DSCP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                tmp_file.write_text(json.dumps(state, indent=2))
+                tmp_file.rename(DSCP_STATE_FILE)
+
+                self._logger.debug(f"DSCP state persisted: {len(state['entry_rules'])} entry rules, {len(state['terminal_rules'])} terminal rules")
+            return True
+        except Exception as e:
+            self._logger.error(f"Failed to persist DSCP state: {e}")
+            return False
+
+    def load_persisted_state(self) -> int:
+        """从持久化文件加载并恢复 DSCP 规则 (Phase 11-Fix.P)
+
+        在容器启动时调用，恢复之前的 DSCP 规则状态。
+
+        Returns:
+            恢复的规则数量
+        """
+        if not DSCP_STATE_FILE.exists():
+            self._logger.info("No persisted DSCP state found")
+            return 0
+
+        try:
+            state = json.loads(DSCP_STATE_FILE.read_text())
+            restored_count = 0
+
+            # 恢复入口规则
+            entry_rules = state.get("entry_rules", {})
+            for chain_tag, rule_data in entry_rules.items():
+                routing_mark = rule_data.get("routing_mark")
+                dscp_value = rule_data.get("dscp_value")
+
+                if routing_mark is None or dscp_value is None:
+                    self._logger.warning(f"Skipping invalid entry rule: {chain_tag}")
+                    continue
+
+                # 重新应用规则
+                if self.setup_entry_rules(chain_tag, routing_mark, dscp_value, persist=False):
+                    # 验证规则确实生效
+                    if self.verify_entry_rules(chain_tag, routing_mark, dscp_value):
+                        restored_count += 1
+                        self._logger.info(f"Restored entry rule: chain={chain_tag}, dscp={dscp_value}")
+                    else:
+                        # 使用 warning 而非 error：规则可能在链路激活时重新创建
+                        self._logger.warning(f"Entry rule restored but verification failed: {chain_tag} (will be re-created on chain activation)")
+                else:
+                    self._logger.warning(f"Failed to restore entry rule: {chain_tag} (will be re-created on chain activation)")
+
+            # 恢复终端规则
+            terminal_rules = state.get("terminal_rules", {})
+            for dscp_str, rule_data in terminal_rules.items():
+                dscp_value = int(dscp_str)
+                egress_interface = rule_data.get("egress_interface")
+                peer_interface_pattern = rule_data.get("peer_interface_pattern", "wg-peer-+")
+
+                if not egress_interface:
+                    self._logger.warning(f"Skipping invalid terminal rule: dscp={dscp_value}")
+                    continue
+
+                # 重新应用规则
+                if self.setup_terminal_rules(dscp_value, egress_interface, peer_interface_pattern, persist=False):
+                    # 验证规则确实生效
+                    if self.verify_terminal_rules(dscp_value, egress_interface, peer_interface_pattern):
+                        restored_count += 1
+                        self._logger.info(f"Restored terminal rule: dscp={dscp_value}, egress={egress_interface}")
+                    else:
+                        self._logger.warning(f"Terminal rule restored but verification failed: dscp={dscp_value} (interface may not exist yet)")
+                else:
+                    self._logger.warning(f"Failed to restore terminal rule: dscp={dscp_value} (interface may not exist yet)")
+
+            self._logger.info(f"DSCP state restoration complete: {restored_count} rules restored")
+            return restored_count
+
+        except json.JSONDecodeError as e:
+            self._logger.error(f"Failed to parse DSCP state file: {e}")
+            return 0
+        except Exception as e:
+            self._logger.error(f"Failed to load DSCP state: {e}")
+            return 0
 
     def _validate_interface_name(self, name: str) -> bool:
         """验证网络接口名称
@@ -120,12 +226,18 @@ class DSCPManager:
     def _run_command(self, cmd: List[str], check: bool = True) -> Tuple[bool, str]:
         """执行系统命令
 
+        Phase 11-Fix.V.1: 修复 check=False 时总是返回 True 的问题
+
         Args:
             cmd: 命令列表
-            check: 是否检查返回码
+            check: 是否记录错误日志（不影响返回值的正确性）
+                   - True: 命令失败时记录警告日志
+                   - False: 静默失败，不记录日志（用于探测性检查如 iptables -C）
 
         Returns:
             (success, output/error)
+            - success: 始终反映实际命令执行结果 (returncode == 0)
+            - output: 成功时返回 stdout，失败时返回 stderr
         """
         try:
             result = subprocess.run(
@@ -134,13 +246,64 @@ class DSCPManager:
                 text=True,
                 timeout=30,
             )
-            if check and result.returncode != 0:
-                return False, result.stderr.strip()
-            return True, result.stdout.strip()
+            # 修复: 始终根据返回码判断成功与否
+            success = (result.returncode == 0)
+            if not success:
+                error_msg = result.stderr.strip() or f"Command failed with exit code {result.returncode}"
+                if check:
+                    # 仅在 check=True 时记录错误日志
+                    self._logger.warning(f"Command failed: {' '.join(cmd)}: {error_msg}")
+                return False, error_msg
+            return True, (result.stdout or "").strip()
         except subprocess.TimeoutExpired:
+            if check:
+                self._logger.error(f"Command timeout: {' '.join(cmd)}")
             return False, "Command timeout"
         except Exception as e:
+            if check:
+                self._logger.error(f"Command exception: {' '.join(cmd)}: {e}")
             return False, str(e)
+
+    def _ensure_kernel_modules(self) -> bool:
+        """Phase 11-Fix.T: 确保 DSCP 相关内核模块已加载
+
+        DSCP 操作需要以下内核模块:
+        - xt_DSCP: 用于设置 DSCP 值 (-j DSCP --set-dscp)
+        - xt_dscp: 用于匹配 DSCP 值 (-m dscp --dscp)
+        - xt_mark: 用于设置/匹配 fwmark
+
+        Returns:
+            True 如果所有模块可用，False 如果加载失败
+        """
+        required_modules = ["xt_DSCP", "xt_dscp", "xt_mark"]
+
+        for module in required_modules:
+            # 检查模块是否已加载
+            check_cmd = ["lsmod"]
+            success, output = self._run_command(check_cmd, check=False)
+            if success and module.lower() in output.lower():
+                continue
+
+            # 尝试加载模块
+            self._logger.info(f"Loading kernel module: {module}")
+            load_cmd = ["modprobe", module]
+            success, error = self._run_command(load_cmd, check=False)
+            if not success:
+                # 模块可能内置于内核（不需要单独加载）
+                # 尝试使用 iptables 命令来验证功能可用性
+                test_cmd = ["iptables", "-t", "mangle", "-L", "-n"]
+                test_success, _ = self._run_command(test_cmd, check=False)
+                if not test_success:
+                    self._logger.error(
+                        f"Kernel module {module} not available and cannot load: {error}"
+                    )
+                    return False
+                else:
+                    self._logger.debug(
+                        f"Module {module} may be built-in or alias, iptables works"
+                    )
+
+        return True
 
     def _iptables(self, args: List[str], check: bool = True) -> Tuple[bool, str]:
         """执行 iptables 命令"""
@@ -149,6 +312,50 @@ class DSCPManager:
     def _ip(self, args: List[str], check: bool = True) -> Tuple[bool, str]:
         """执行 ip 命令"""
         return self._run_command(["ip"] + args, check)
+
+    def _get_interface_gateway(self, interface: str) -> Optional[str]:
+        """获取指定接口的默认网关 IP
+
+        Phase 11-Fix.Y: 对于物理接口（如 eth0），需要获取网关才能正确设置路由。
+        WireGuard 接口是点对点隧道，不需要网关。
+
+        Args:
+            interface: 接口名称（如 eth0, ens192）
+
+        Returns:
+            网关 IP 地址，如果无法获取则返回 None
+        """
+        # WireGuard 接口不需要网关（点对点隧道）
+        if interface.startswith("wg-"):
+            return None
+
+        # 方法 1: 从 main 路由表获取该接口的默认路由网关
+        # 命令: ip route show dev eth0 default
+        # 输出示例: default via 10.1.100.2 proto static
+        success, output = self._ip(["route", "show", "dev", interface, "default"], check=False)
+        if success and output:
+            # 解析 "default via X.X.X.X ..."
+            match = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)', output)
+            if match:
+                gateway = match.group(1)
+                self._logger.debug(f"Found gateway {gateway} for interface {interface}")
+                return gateway
+
+        # 方法 2: 从所有默认路由中查找该接口的网关
+        # 命令: ip route show default
+        # 输出示例: default via 10.1.100.2 dev eth0 proto static
+        success, output = self._ip(["route", "show", "default"], check=False)
+        if success and output:
+            for line in output.split('\n'):
+                if f"dev {interface}" in line:
+                    match = re.search(r'default\s+via\s+(\d+\.\d+\.\d+\.\d+)', line)
+                    if match:
+                        gateway = match.group(1)
+                        self._logger.debug(f"Found gateway {gateway} for interface {interface} from default routes")
+                        return gateway
+
+        self._logger.warning(f"Could not find gateway for interface {interface}")
+        return None
 
     def _rule_exists(self, table: str, chain: str, rule_spec: List[str]) -> bool:
         """检查 iptables 规则是否存在"""
@@ -208,6 +415,8 @@ class DSCPManager:
         chain_tag: str,
         routing_mark: int,
         dscp_value: int,
+        verify: bool = False,
+        persist: bool = True,
     ) -> bool:
         """设置入口节点的 DSCP 标记规则
 
@@ -217,10 +426,17 @@ class DSCPManager:
             chain_tag: 链路标识
             routing_mark: sing-box outbound 的 routing_mark 值
             dscp_value: 要设置的 DSCP 值 (1-63)
+            verify: 是否在设置后验证规则 (Phase 11-Fix.P)
+            persist: 是否持久化状态 (Phase 11-Fix.P)
 
         Returns:
             是否成功
         """
+        # Phase 11-Fix.T: 确保内核模块可用
+        if not self._ensure_kernel_modules():
+            self._logger.error("DSCP kernel modules not available")
+            return False
+
         # 输入验证
         if not self._validate_chain_tag(chain_tag):
             self._logger.error(f"Invalid chain_tag format: {chain_tag}")
@@ -270,6 +486,18 @@ class DSCPManager:
                 table=TERMINAL_TABLE_BASE + dscp_value,
             )
 
+        # Phase 11-Fix.P: 持久化状态
+        if persist:
+            self._persist_state()
+
+        # Phase 11-Fix.P: 验证规则
+        if verify:
+            if not self.verify_entry_rules(chain_tag, routing_mark, dscp_value):
+                self._logger.error(f"[entry] DSCP rules verification failed: chain={chain_tag}")
+                # 回滚规则
+                self.cleanup_entry_rules(chain_tag, routing_mark, dscp_value, persist=persist)
+                return False
+
         self._logger.info(f"[entry] DSCP rules set successfully: chain={chain_tag}")
         return True
 
@@ -278,6 +506,8 @@ class DSCPManager:
         dscp_value: int,
         egress_interface: str,
         peer_interface_pattern: str = "wg-peer-+",
+        verify: bool = False,
+        persist: bool = True,
     ) -> bool:
         """设置终端节点的 DSCP 路由规则
 
@@ -287,10 +517,17 @@ class DSCPManager:
             dscp_value: 要匹配的 DSCP 值 (1-63)
             egress_interface: 出口网络接口（如 wg-pia-us-stream）
             peer_interface_pattern: 入站接口模式（默认 wg-peer-+，匹配所有对端隧道）
+            verify: 是否在设置后验证规则 (Phase 11-Fix.P)
+            persist: 是否持久化状态 (Phase 11-Fix.P)
 
         Returns:
             是否成功
         """
+        # Phase 11-Fix.T: 确保内核模块可用
+        if not self._ensure_kernel_modules():
+            self._logger.error("DSCP kernel modules not available")
+            return False
+
         # 输入验证
         if not (DSCP_MIN <= dscp_value <= DSCP_MAX):
             self._logger.error(f"Invalid DSCP value: {dscp_value}, must be {DSCP_MIN}-{DSCP_MAX}")
@@ -337,13 +574,35 @@ class DSCPManager:
                 return False
             added_ip_rule = True
 
-        # 策略路由 3: ip route add default dev <egress> table <table>
+        # 策略路由 3: ip route add default [via <gateway>] dev <egress> table <table>
+        # Phase 11-Fix.Y: 对于物理接口需要指定网关，否则会创建 scope link 路由导致 "no route to host"
         # 先清除旧路由（只删除 default，不 flush 整个表）
         self._ip(["route", "del", "default", "table", str(table)], check=False)
 
-        success, error = self._ip([
-            "route", "add", "default", "dev", egress_interface, "table", str(table)
-        ])
+        # 获取接口网关（物理接口需要，WireGuard 接口不需要）
+        gateway = self._get_interface_gateway(egress_interface)
+
+        if gateway:
+            # 物理接口：使用网关
+            # ip route add default via 10.1.100.2 dev eth0 table 301
+            route_cmd = [
+                "route", "add", "default", "via", gateway,
+                "dev", egress_interface, "table", str(table)
+            ]
+            self._logger.info(
+                f"[terminal] Adding route with gateway: default via {gateway} dev {egress_interface} table {table}"
+            )
+        else:
+            # WireGuard 接口：点对点隧道，不需要网关
+            # ip route add default dev wg-pia-us table 301
+            route_cmd = [
+                "route", "add", "default", "dev", egress_interface, "table", str(table)
+            ]
+            self._logger.info(
+                f"[terminal] Adding route without gateway: default dev {egress_interface} table {table}"
+            )
+
+        success, error = self._ip(route_cmd)
         if not success:
             self._logger.error(f"Failed to add route: {error}")
             # 回滚已添加的规则
@@ -351,6 +610,27 @@ class DSCPManager:
                 self._ip(["rule", "del", "fwmark", str(fwmark), "table", str(table)], check=False)
             self._delete_rule_if_exists("mangle", "PREROUTING", rule1)
             return False
+
+        # Phase 11-Fix.P: 记录终端规则用于持久化
+        with self._lock:
+            self._terminal_rules[dscp_value] = {
+                "egress_interface": egress_interface,
+                "peer_interface_pattern": peer_interface_pattern,
+                "fwmark": fwmark,
+                "table": table,
+            }
+
+        # Phase 11-Fix.P: 持久化状态
+        if persist:
+            self._persist_state()
+
+        # Phase 11-Fix.P: 验证规则
+        if verify:
+            if not self.verify_terminal_rules(dscp_value, egress_interface, peer_interface_pattern):
+                self._logger.error(f"[terminal] DSCP routing verification failed: dscp={dscp_value}")
+                # 回滚规则
+                self.cleanup_terminal_rules(dscp_value, peer_interface_pattern, persist=persist)
+                return False
 
         self._logger.info(f"[terminal] DSCP routing set successfully: dscp={dscp_value}")
         return True
@@ -451,6 +731,7 @@ class DSCPManager:
         chain_tag: str,
         routing_mark: int,
         dscp_value: int,
+        persist: bool = True,
     ) -> bool:
         """清理入口节点的 DSCP 规则
 
@@ -458,6 +739,7 @@ class DSCPManager:
             chain_tag: 链路标识
             routing_mark: routing_mark 值
             dscp_value: DSCP 值
+            persist: 是否持久化状态 (Phase 11-Fix.P)
 
         Returns:
             是否成功
@@ -482,6 +764,10 @@ class DSCPManager:
             if chain_tag in self._rules:
                 del self._rules[chain_tag]
 
+        # Phase 11-Fix.P: 持久化状态
+        if persist:
+            self._persist_state()
+
         self._logger.info(f"[entry] DSCP rules cleaned up: chain={chain_tag}")
         return True
 
@@ -489,12 +775,14 @@ class DSCPManager:
         self,
         dscp_value: int,
         peer_interface_pattern: str = "wg-peer-+",
+        persist: bool = True,
     ) -> bool:
         """清理终端节点的 DSCP 路由规则
 
         Args:
             dscp_value: DSCP 值
             peer_interface_pattern: 入站接口模式
+            persist: 是否持久化状态 (Phase 11-Fix.P)
 
         Returns:
             是否成功
@@ -521,6 +809,15 @@ class DSCPManager:
             "-j", "MARK", "--set-mark", str(fwmark),
         ]
         self._delete_rule_if_exists("mangle", "PREROUTING", rule1)
+
+        # Phase 11-Fix.P: 移除终端规则记录
+        with self._lock:
+            if dscp_value in self._terminal_rules:
+                del self._terminal_rules[dscp_value]
+
+        # Phase 11-Fix.P: 持久化状态
+        if persist:
+            self._persist_state()
 
         self._logger.info(f"[terminal] DSCP routing cleaned up: dscp={dscp_value}")
         return True
@@ -571,6 +868,16 @@ class DSCPManager:
         # 清空记录（线程安全）
         with self._lock:
             self._rules.clear()
+            self._terminal_rules.clear()
+
+        # Phase 11-Fix.P: 持久化空状态（删除状态文件）
+        if DSCP_STATE_FILE.exists():
+            try:
+                DSCP_STATE_FILE.unlink()
+                self._logger.info("DSCP state file removed")
+            except Exception as e:
+                self._logger.warning(f"Failed to remove DSCP state file: {e}")
+
         self._logger.info("All DSCP rules cleaned up")
         return success
 
@@ -686,6 +993,7 @@ if __name__ == "__main__":
         print("Usage: dscp_manager.py <command> [args]")
         print("Commands:")
         print("  cleanup              - Clean up all DSCP rules")
+        print("  restore              - Restore DSCP rules from persisted state (Phase 11-Fix.P)")
         print("  entry <tag> <mark> <dscp>  - Set entry node rules")
         print("  terminal <dscp> <interface> - Set terminal node rules")
         print("  list                 - List active rules")
@@ -696,6 +1004,11 @@ if __name__ == "__main__":
     if command == "cleanup":
         manager.cleanup_all_rules()
         print("All DSCP rules cleaned up")
+
+    elif command == "restore":
+        # Phase 11-Fix.P: 从持久化状态恢复 DSCP 规则
+        count = manager.load_persisted_state()
+        print(f"DSCP rules restored: {count} rules")
 
     elif command == "entry" and len(sys.argv) == 5:
         tag = sys.argv[2]

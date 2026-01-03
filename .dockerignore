@@ -132,3 +132,4 @@ Dockerfile.dev
 tmp/
 *.tmp
 *.bak
+/frontend/nginx.conf
