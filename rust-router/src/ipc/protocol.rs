@@ -96,7 +96,10 @@ pub enum IpcResponse {
     OutboundInfo(OutboundInfo),
 
     /// List of outbounds
-    OutboundList(Vec<OutboundInfo>),
+    OutboundList {
+        /// List of outbound information
+        outbounds: Vec<OutboundInfo>,
+    },
 
     /// Success response (for commands that don't return data)
     Success {

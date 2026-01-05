@@ -273,7 +273,7 @@ impl IpcHandler {
             })
             .collect();
 
-        IpcResponse::OutboundList(outbounds)
+        IpcResponse::OutboundList { outbounds }
     }
 
     /// Handle shutdown command
@@ -337,9 +337,9 @@ mod tests {
         let handler = create_test_handler();
         let response = handler.handle(IpcCommand::ListOutbounds).await;
 
-        if let IpcResponse::OutboundList(list) = response {
-            assert_eq!(list.len(), 1);
-            assert_eq!(list[0].tag, "direct");
+        if let IpcResponse::OutboundList { outbounds } = response {
+            assert_eq!(outbounds.len(), 1);
+            assert_eq!(outbounds[0].tag, "direct");
         } else {
             panic!("Expected OutboundList response");
         }
