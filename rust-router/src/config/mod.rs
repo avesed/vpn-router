@@ -17,4 +17,5 @@ mod types;
 pub use loader::{create_default_config, load_config, load_config_str, load_config_with_env};
 pub use types::{
     Config, ConnectionConfig, IpcConfig, ListenConfig, LogConfig, OutboundConfig, OutboundType,
+    RuleConfig, RulesConfig,
 };

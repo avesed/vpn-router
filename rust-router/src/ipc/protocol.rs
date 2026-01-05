@@ -71,6 +71,41 @@ pub enum IpcCommand {
         /// Optional drain timeout in seconds
         drain_timeout_secs: Option<u32>,
     },
+
+    /// Test rule matching (for debugging/parity testing)
+    ///
+    /// This command tests the rule engine against a specific connection.
+    /// It is primarily used for debugging and parity testing with the
+    /// Python reference implementation.
+    TestMatch {
+        /// Domain name (optional)
+        domain: Option<String>,
+        /// Destination IP address (optional)
+        dest_ip: Option<String>,
+        /// Destination port
+        dest_port: u16,
+        /// Transport protocol (tcp/udp)
+        protocol: String,
+        /// Sniffed protocol (optional: tls/http/quic)
+        #[serde(default)]
+        sniffed_protocol: Option<String>,
+    },
+
+    /// Get rule engine statistics
+    ///
+    /// Returns statistics about the current routing configuration,
+    /// including rule counts and version information.
+    GetRuleStats,
+
+    /// Reload rules from configuration
+    ///
+    /// Reloads the rule engine configuration from the specified path.
+    /// If no path is provided, uses the current configuration.
+    ReloadRules {
+        /// Optional path to configuration file (uses current config if None)
+        #[serde(default)]
+        config_path: Option<String>,
+    },
 }
 
 /// IPC response types
@@ -100,6 +135,12 @@ pub enum IpcResponse {
         /// List of outbound information
         outbounds: Vec<OutboundInfo>,
     },
+
+    /// Test match result
+    TestMatchResult(TestMatchResult),
+
+    /// Rule engine statistics response
+    RuleStats(RuleStatsResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -214,6 +255,48 @@ pub struct OutboundInfo {
     pub bind_interface: Option<String>,
     /// Routing mark (if any)
     pub routing_mark: Option<u32>,
+}
+
+/// Result of a test match operation
+///
+/// Used for debugging and parity testing to verify the rule engine
+/// produces the same results as the reference implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestMatchResult {
+    /// The matched outbound tag
+    pub outbound: String,
+    /// The type of match that occurred (domain, geoip, port, protocol, or null for default)
+    pub match_type: Option<String>,
+    /// The routing mark to apply (if any)
+    pub routing_mark: Option<u32>,
+    /// Whether the outbound is a chain
+    pub is_chain: bool,
+    /// Time taken for matching in microseconds
+    pub match_time_us: u64,
+}
+
+/// Rule engine statistics response
+///
+/// Contains statistics about the current routing configuration,
+/// including counts of different rule types and configuration version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleStatsResponse {
+    /// Number of domain rules (exact, suffix, keyword, regex)
+    pub domain_rules: u64,
+    /// Number of GeoIP/CIDR rules
+    pub geoip_rules: u64,
+    /// Number of port rules
+    pub port_rules: u64,
+    /// Number of protocol rules
+    pub protocol_rules: u64,
+    /// Number of registered chains for multi-hop routing
+    pub chain_count: u64,
+    /// Configuration version (incremented on each reload)
+    pub config_version: u64,
+    /// ISO 8601 timestamp of last configuration reload (or None if never reloaded)
+    pub last_reload: Option<String>,
+    /// Default outbound tag
+    pub default_outbound: String,
 }
 
 /// IPC error
@@ -341,5 +424,118 @@ mod tests {
 
         let error = IpcResponse::error(ErrorCode::NotFound, "test");
         assert!(error.is_error());
+    }
+
+    #[test]
+    fn test_test_match_command_serialization() {
+        let cmd = IpcCommand::TestMatch {
+            domain: Some("google.com".into()),
+            dest_ip: Some("8.8.8.8".into()),
+            dest_port: 443,
+            protocol: "tcp".into(),
+            sniffed_protocol: Some("tls".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"test_match\""));
+        assert!(json.contains("google.com"));
+        assert!(json.contains("8.8.8.8"));
+        assert!(json.contains("443"));
+        assert!(json.contains("tcp"));
+        assert!(json.contains("tls"));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::TestMatch { domain, dest_ip, dest_port, protocol, sniffed_protocol } => {
+                assert_eq!(domain, Some("google.com".into()));
+                assert_eq!(dest_ip, Some("8.8.8.8".into()));
+                assert_eq!(dest_port, 443);
+                assert_eq!(protocol, "tcp");
+                assert_eq!(sniffed_protocol, Some("tls".into()));
+            }
+            _ => panic!("Expected TestMatch command"),
+        }
+    }
+
+    #[test]
+    fn test_test_match_result_serialization() {
+        let result = TestMatchResult {
+            outbound: "proxy".into(),
+            match_type: Some("domain".into()),
+            routing_mark: Some(773),
+            is_chain: true,
+            match_time_us: 42,
+        };
+        let resp = IpcResponse::TestMatchResult(result);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"test_match_result\""));
+        assert!(json.contains("\"outbound\":\"proxy\""));
+        assert!(json.contains("\"match_type\":\"domain\""));
+        assert!(json.contains("\"routing_mark\":773"));
+        assert!(json.contains("\"is_chain\":true"));
+    }
+
+    #[test]
+    fn test_get_rule_stats_command_serialization() {
+        let cmd = IpcCommand::GetRuleStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_rule_stats\""));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetRuleStats));
+    }
+
+    #[test]
+    fn test_reload_rules_command_serialization() {
+        // With config path
+        let cmd = IpcCommand::ReloadRules {
+            config_path: Some("/etc/rust-router/rules.json".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reload_rules\""));
+        assert!(json.contains("config_path"));
+
+        // Without config path
+        let cmd = IpcCommand::ReloadRules { config_path: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::ReloadRules { config_path } => {
+                assert!(config_path.is_none());
+            }
+            _ => panic!("Expected ReloadRules command"),
+        }
+    }
+
+    #[test]
+    fn test_rule_stats_response_serialization() {
+        let stats = RuleStatsResponse {
+            domain_rules: 1000,
+            geoip_rules: 250,
+            port_rules: 15,
+            protocol_rules: 2,
+            chain_count: 5,
+            config_version: 42,
+            last_reload: Some("2026-01-05T12:00:00Z".into()),
+            default_outbound: "direct".into(),
+        };
+        let resp = IpcResponse::RuleStats(stats);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"rule_stats\""));
+        assert!(json.contains("\"domain_rules\":1000"));
+        assert!(json.contains("\"geoip_rules\":250"));
+        assert!(json.contains("\"chain_count\":5"));
+        assert!(json.contains("\"config_version\":42"));
+        assert!(json.contains("\"default_outbound\":\"direct\""));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::RuleStats(s) = parsed {
+            assert_eq!(s.domain_rules, 1000);
+            assert_eq!(s.config_version, 42);
+        } else {
+            panic!("Expected RuleStats response");
+        }
     }
 }

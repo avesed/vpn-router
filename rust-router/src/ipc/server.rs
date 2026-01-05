@@ -296,7 +296,7 @@ mod tests {
             Duration::from_millis(300),
         ));
 
-        Arc::new(IpcHandler::new(connection_manager, outbound_manager))
+        Arc::new(IpcHandler::new_with_default_rules(connection_manager, outbound_manager))
     }
 
     #[tokio::test]

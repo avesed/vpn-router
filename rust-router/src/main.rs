@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
     );
 
     // Create IPC handler and server
-    let ipc_handler = Arc::new(IpcHandler::new(
+    let ipc_handler = Arc::new(IpcHandler::new_with_default_rules(
         Arc::clone(&connection_manager),
         Arc::clone(&outbound_manager),
     ));

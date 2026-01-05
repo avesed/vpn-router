@@ -31,6 +31,10 @@ pub enum RustRouterError {
     #[error("Connection error: {0}")]
     Connection(#[from] ConnectionError),
 
+    /// Rule engine errors
+    #[error("Rule error: {0}")]
+    Rule(#[from] RuleError),
+
     /// I/O errors not covered by other categories
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -46,6 +50,7 @@ impl RustRouterError {
             Self::Outbound(e) => e.is_recoverable(),
             Self::Ipc(e) => e.is_recoverable(),
             Self::Connection(e) => e.is_recoverable(),
+            Self::Rule(e) => e.is_recoverable(),
             Self::Io(e) => matches!(
                 e.kind(),
                 io::ErrorKind::TimedOut
@@ -363,6 +368,105 @@ impl ConnectionError {
     /// Create a transfer error
     pub fn transfer(msg: impl Into<String>) -> Self {
         Self::TransferError(msg.into())
+    }
+}
+
+/// Rule engine errors
+#[derive(Debug, Error)]
+pub enum RuleError {
+    /// Invalid rule type string
+    #[error("Invalid rule type: {0}")]
+    InvalidRuleType(String),
+
+    /// Invalid port range (start > end)
+    #[error("Invalid port range: {start}-{end} (start must be <= end)")]
+    InvalidPortRange {
+        /// Start of the range
+        start: u16,
+        /// End of the range
+        end: u16,
+    },
+
+    /// Invalid rule target value
+    #[error("Invalid rule target: {0}")]
+    InvalidTarget(String),
+
+    /// Empty rule set when rules are required
+    #[error("Empty rule set")]
+    EmptyRuleSet,
+
+    /// Duplicate rule ID in rule set
+    #[error("Duplicate rule ID: {0}")]
+    DuplicateRuleId(u64),
+
+    /// Invalid regex pattern
+    #[error("Invalid regex pattern: {0}")]
+    InvalidRegex(String),
+
+    /// Rule compilation error
+    #[error("Rule compilation error: {0}")]
+    CompilationError(String),
+
+    /// `GeoIP` directory not configured for lazy loading
+    #[error("GeoIP directory not configured")]
+    GeoIpNotConfigured,
+
+    /// Failed to load `GeoIP` data for a country
+    #[error("Failed to load GeoIP data for country '{0}': {1}")]
+    GeoIpLoadError(String, String),
+
+    /// Failed to parse `GeoIP` data
+    #[error("Failed to parse GeoIP data for country '{0}': {1}")]
+    GeoIpParseError(String, String),
+
+    /// Unknown country code in `GeoIP` rules
+    #[error("Unknown GeoIP country code: {0}")]
+    UnknownCountry(String),
+
+    /// Invalid CIDR notation
+    #[error("Invalid CIDR notation: {0}")]
+    InvalidCidr(String),
+
+    /// DSCP value out of range (must be 1-63)
+    #[error("DSCP value {0} out of range (must be 1-63)")]
+    DscpOutOfRange(u8),
+
+    /// DSCP value already in use by another chain
+    #[error("DSCP value {0} is already in use by another chain")]
+    DscpInUse(u8),
+
+    /// Chain tag already registered
+    #[error("Duplicate chain tag: {0}")]
+    DuplicateChain(String),
+
+    /// Maximum number of chains reached (63)
+    #[error("Maximum number of chains reached (63)")]
+    MaxChainsReached,
+}
+
+impl RuleError {
+    /// Rule errors are generally not recoverable at runtime
+    ///
+    /// These typically indicate configuration issues that need to be fixed
+    /// before the rules can be loaded.
+    #[must_use]
+    pub const fn is_recoverable(&self) -> bool {
+        false
+    }
+
+    /// Create an invalid target error
+    pub fn invalid_target(msg: impl Into<String>) -> Self {
+        Self::InvalidTarget(msg.into())
+    }
+
+    /// Create an invalid rule type error
+    pub fn invalid_type(type_str: impl Into<String>) -> Self {
+        Self::InvalidRuleType(type_str.into())
+    }
+
+    /// Create a compilation error
+    pub fn compilation(msg: impl Into<String>) -> Self {
+        Self::CompilationError(msg.into())
     }
 }
 

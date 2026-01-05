@@ -43,12 +43,21 @@ bytes = "1"
 # Concurrent data structures
 dashmap = "5"
 
+# Caching with LRU eviction
+moka = { version = "0.12", features = ["sync"] }
+
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
+
+# Rule matching
+regex = "1"
+ipnet = "2"
+aho-corasick = "1"
 
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "rust-router"
@@ -78,3 +87,7 @@ opt-level = 1
 
 [profile.test]
 opt-level = 1
+
+[[bench]]
+name = "rule_matching"
+harness = false

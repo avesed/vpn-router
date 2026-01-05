@@ -33,6 +33,10 @@ pub struct Config {
     /// Connection limits
     #[serde(default)]
     pub connection: ConnectionConfig,
+
+    /// Routing rules configuration
+    #[serde(default)]
+    pub rules: RulesConfig,
 }
 
 impl Config {
@@ -74,6 +78,9 @@ impl Config {
         // Validate IPC config
         self.ipc.validate()?;
 
+        // Validate rules config
+        self.rules.validate(&tags)?;
+
         Ok(())
     }
 
@@ -87,6 +94,7 @@ impl Config {
             ipc: IpcConfig::default(),
             log: LogConfig::default(),
             connection: ConnectionConfig::default(),
+            rules: RulesConfig::default(),
         }
     }
 }
@@ -429,6 +437,118 @@ impl Default for ConnectionConfig {
     }
 }
 
+/// Routing rules configuration
+///
+/// Defines routing rules and paths to geodata files for rule matching.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RulesConfig {
+    /// List of routing rules
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+
+    /// Path to domain catalog JSON file (for GeoSite matching)
+    #[serde(default)]
+    pub domain_catalog_path: Option<PathBuf>,
+
+    /// Path to GeoIP catalog directory (for GeoIP matching)
+    #[serde(default)]
+    pub geoip_catalog_path: Option<PathBuf>,
+}
+
+impl RulesConfig {
+    /// Validate rules configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConfigError::ValidationError` if:
+    /// - A rule references an outbound that doesn't exist
+    /// - A rule has an invalid type
+    pub fn validate(
+        &self,
+        valid_outbounds: &std::collections::HashSet<&str>,
+    ) -> Result<(), ConfigError> {
+        for (index, rule) in self.rules.iter().enumerate() {
+            // Validate rule type
+            if !is_valid_rule_type(&rule.rule_type) {
+                return Err(ConfigError::ValidationError(format!(
+                    "Rule {} has invalid type: {}",
+                    index, rule.rule_type
+                )));
+            }
+
+            // Validate outbound exists
+            if !valid_outbounds.contains(rule.outbound.as_str()) {
+                return Err(ConfigError::ValidationError(format!(
+                    "Rule {} references unknown outbound: {}",
+                    index, rule.outbound
+                )));
+            }
+
+            // Validate target is not empty
+            if rule.target.trim().is_empty() {
+                return Err(ConfigError::ValidationError(format!(
+                    "Rule {} has empty target",
+                    index
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Single rule configuration (loaded from JSON)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RuleConfig {
+    /// Unique identifier for this rule
+    #[serde(default)]
+    pub id: u64,
+
+    /// Rule type: "domain", "domain_suffix", "domain_keyword", "domain_regex",
+    /// "geoip", "geosite", "ip_cidr", "port", "protocol"
+    #[serde(rename = "type")]
+    pub rule_type: String,
+
+    /// Target value (domain, country code, CIDR, etc.)
+    pub target: String,
+
+    /// Outbound tag to route matching traffic to
+    pub outbound: String,
+
+    /// Priority (lower values matched first)
+    #[serde(default)]
+    pub priority: i32,
+
+    /// Whether this rule is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Optional tag for grouping (e.g., "__adblock__")
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// Check if a rule type string is valid
+fn is_valid_rule_type(rule_type: &str) -> bool {
+    matches!(
+        rule_type.to_lowercase().as_str(),
+        "domain"
+            | "domain_suffix"
+            | "domain_keyword"
+            | "domain_regex"
+            | "geoip"
+            | "country"
+            | "geosite"
+            | "domain_list"
+            | "ip_cidr"
+            | "ip"
+            | "port"
+            | "port_range"
+            | "protocol"
+            | "network"
+    )
+}
+
 // Default value functions for serde
 const fn default_true() -> bool {
     true
@@ -526,6 +646,7 @@ mod tests {
             ipc: IpcConfig::default(),
             log: LogConfig::default(),
             connection: ConnectionConfig::default(),
+            rules: RulesConfig::default(),
         };
         assert!(config.validate().is_err());
     }
@@ -539,8 +660,90 @@ mod tests {
             ipc: IpcConfig::default(),
             log: LogConfig::default(),
             connection: ConnectionConfig::default(),
+            rules: RulesConfig::default(),
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_rules_config_validation() {
+        // Valid rule referencing existing outbound
+        let rules = RulesConfig {
+            rules: vec![RuleConfig {
+                id: 1,
+                rule_type: "domain".into(),
+                target: "example.com".into(),
+                outbound: "direct".into(),
+                priority: 0,
+                enabled: true,
+                tag: None,
+            }],
+            domain_catalog_path: None,
+            geoip_catalog_path: None,
+        };
+
+        let config = Config {
+            listen: ListenConfig::default(),
+            outbounds: vec![OutboundConfig::direct("direct")],
+            default_outbound: "direct".into(),
+            ipc: IpcConfig::default(),
+            log: LogConfig::default(),
+            connection: ConnectionConfig::default(),
+            rules,
+        };
+        assert!(config.validate().is_ok());
+
+        // Invalid: rule references non-existent outbound
+        let rules = RulesConfig {
+            rules: vec![RuleConfig {
+                id: 1,
+                rule_type: "domain".into(),
+                target: "example.com".into(),
+                outbound: "nonexistent".into(),
+                priority: 0,
+                enabled: true,
+                tag: None,
+            }],
+            domain_catalog_path: None,
+            geoip_catalog_path: None,
+        };
+
+        let config = Config {
+            listen: ListenConfig::default(),
+            outbounds: vec![OutboundConfig::direct("direct")],
+            default_outbound: "direct".into(),
+            ipc: IpcConfig::default(),
+            log: LogConfig::default(),
+            connection: ConnectionConfig::default(),
+            rules,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_rules_config_serialization() {
+        let rules = RulesConfig {
+            rules: vec![RuleConfig {
+                id: 1,
+                rule_type: "domain_suffix".into(),
+                target: ".google.com".into(),
+                outbound: "proxy".into(),
+                priority: 10,
+                enabled: true,
+                tag: Some("search".into()),
+            }],
+            domain_catalog_path: Some("/etc/rust-router/domain-catalog.json".into()),
+            geoip_catalog_path: None,
+        };
+
+        let json = serde_json::to_string_pretty(&rules).unwrap();
+        assert!(json.contains("\"type\": \"domain_suffix\""));
+        assert!(json.contains("\".google.com\""));
+
+        let parsed: RulesConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].rule_type, "domain_suffix");
+        assert_eq!(parsed.rules[0].target, ".google.com");
     }
 
     #[test]

@@ -54,7 +54,7 @@
 //! - [`io`]: I/O utilities for bidirectional copy
 //! - [`ipc`]: IPC server and protocol
 //! - [`outbound`]: Outbound implementations
-//! - [`sniff`]: Protocol sniffing (TLS SNI)
+//! - [`sniff`]: Protocol sniffing (TLS SNI, QUIC SNI)
 //! - [`tproxy`]: TPROXY socket and listener
 
 #![warn(clippy::pedantic)]
@@ -67,16 +67,32 @@ pub mod error;
 pub mod io;
 pub mod ipc;
 pub mod outbound;
+pub mod rules;
 pub mod sniff;
 pub mod tproxy;
 
 // Re-export commonly used types at the crate root
-pub use config::{Config, ListenConfig, OutboundConfig};
-pub use connection::{ConnectionManager, ConnectionStats};
-pub use error::{ConfigError, ConnectionError, IpcError, OutboundError, RustRouterError, TproxyError};
+pub use config::{Config, ListenConfig, OutboundConfig, RuleConfig, RulesConfig};
+pub use connection::{
+    ConnectionManager, ConnectionStats, UdpSession, UdpSessionConfig, UdpSessionKey,
+    UdpSessionManager, UdpSessionSnapshot, UdpSessionStats,
+};
+pub use error::{
+    ConfigError, ConnectionError, IpcError, OutboundError, RuleError, RustRouterError, TproxyError,
+};
 pub use ipc::{IpcClient, IpcCommand, IpcResponse, IpcServer};
 pub use outbound::{BlockOutbound, DirectOutbound, Outbound, OutboundManager};
-pub use sniff::{sniff_tls_sni, Protocol, SniffResult};
+pub use rules::{
+    dscp_to_routing_mark, dscp_to_routing_table, is_dscp_terminal_table, is_ecmp_table,
+    is_peer_table, is_relay_table, is_reserved_dscp, is_valid_dscp, routing_mark_to_dscp, tables,
+    ChainMark, CompiledRuleSet, ConnectionInfo, CountryInfo, DomainMatcher, DomainMatcherBuilder,
+    FwmarkRouter, FwmarkRouterBuilder, GeoIpMatcher, GeoIpMatcherBuilder, MatchResult, MatchedRule,
+    PortRange, RoutingConfig, RoutingSnapshot, RoutingSnapshotBuilder, Rule, RuleEngine, RuleType,
+    SnapshotStats, DSCP_MAX, DSCP_MIN, ENTRY_ROUTING_MARK_BASE, MAX_CHAINS, RESERVED_DSCP_VALUES,
+};
+pub use sniff::{
+    sniff_tls_sni, Protocol, QuicPacketType, QuicSniffResult, QuicSniffer, QuicVersion, SniffResult,
+};
 pub use tproxy::{TproxyConnection, TproxyListener};
 
 /// Crate version
