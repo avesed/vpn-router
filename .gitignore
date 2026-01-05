@@ -160,3 +160,4 @@ REVIEW_REPORT.md
 .cache/
 tmp/
 *.tmp
+review-reports/

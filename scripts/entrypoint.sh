@@ -166,6 +166,18 @@ DEFAULT_CONFIG_DIR="/opt/default-config"
 export WEB_PORT="${WEB_PORT:-36000}"
 export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
 
+# Rust Router configuration
+# Set USE_RUST_ROUTER=true to use rust-router instead of sing-box for TPROXY
+# If rust-router fails to start, it will automatically fall back to sing-box
+USE_RUST_ROUTER="${USE_RUST_ROUTER:-false}"
+RUST_ROUTER_BIN="${RUST_ROUTER_BIN:-/usr/local/bin/rust-router}"
+RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG:-/etc/rust-router/config.json}"
+RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET:-/var/run/rust-router.sock}"
+RUST_ROUTER_LOG="${RUST_ROUTER_LOG:-/var/log/rust-router.log}"
+
+# Track which router is active (sing-box or rust-router)
+ACTIVE_ROUTER="sing-box"
+
 # Check for port conflicts before starting services
 check_port_conflicts() {
   local port="$1"
@@ -314,11 +326,18 @@ fi
 /usr/local/bin/fetch-geodata.sh "${RULESET_DIR}" "${GEO_DATA_READY_FLAG}"
 
 # === Kernel WireGuard Setup ===
-# Creates wg-ingress interface and configures TPROXY to sing-box
+# Creates wg-ingress interface and configures TPROXY to router
 
 WG_INTERFACE="${WG_INTERFACE:-wg-ingress}"
 WG_SUBNET="${WG_SUBNET:-10.25.0.0/24}"
-TPROXY_PORT="${TPROXY_PORT:-7893}"
+
+# Set TPROXY port based on which router will be used
+# rust-router uses 7894, sing-box uses 7893
+if [ "${USE_RUST_ROUTER}" = "true" ]; then
+  TPROXY_PORT="${TPROXY_PORT:-7894}"
+else
+  TPROXY_PORT="${TPROXY_PORT:-7893}"
+fi
 TPROXY_MARK="1"
 TPROXY_TABLE="100"
 
@@ -865,11 +884,10 @@ start_warp_manager
 start_health_checker
 start_peer_tunnel_manager
 
-echo "[entrypoint] starting sing-box with ${CONFIG_PATH}"
-
-# 启动 sing-box 并监控，支持 API 触发的重启
-# 不使用 exec，以便 API 可以重启 sing-box 而不影响容器
+# Router startup logic - supports both sing-box and rust-router
+# rust-router provides high-performance Rust implementation with fallback to sing-box
 SINGBOX_PID=""
+RUST_ROUTER_PID=""
 
 start_singbox() {
   local config="$1"
@@ -884,21 +902,103 @@ start_singbox() {
   echo "[entrypoint] starting sing-box with ${config}"
   sing-box run -c "${config}" &
   SINGBOX_PID=$!
+  ACTIVE_ROUTER="sing-box"
+}
+
+start_rust_router() {
+  # Check if rust-router binary exists
+  if [ ! -x "${RUST_ROUTER_BIN}" ]; then
+    echo "[entrypoint] rust-router binary not found at ${RUST_ROUTER_BIN}" >&2
+    return 1
+  fi
+
+  # Check if config exists
+  if [ ! -f "${RUST_ROUTER_CONFIG}" ]; then
+    echo "[entrypoint] rust-router config not found at ${RUST_ROUTER_CONFIG}" >&2
+    return 1
+  fi
+
+  echo "[entrypoint] starting rust-router with ${RUST_ROUTER_CONFIG}"
+
+  # Set environment variables for rust-router
+  export RUST_ROUTER_LISTEN="0.0.0.0:${TPROXY_PORT}"
+  export RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG}"
+  export RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET}"
+  export RUST_LOG="${RUST_LOG:-info}"
+
+  # Start rust-router
+  "${RUST_ROUTER_BIN}" >> "${RUST_ROUTER_LOG}" 2>&1 &
+  RUST_ROUTER_PID=$!
+
+  # Wait briefly to check if it started successfully
+  sleep 1
+  if ! kill -0 "${RUST_ROUTER_PID}" 2>/dev/null; then
+    echo "[entrypoint] rust-router failed to start, check ${RUST_ROUTER_LOG}" >&2
+    RUST_ROUTER_PID=""
+    return 1
+  fi
+
+  echo "[entrypoint] rust-router started (PID: ${RUST_ROUTER_PID})"
+  ACTIVE_ROUTER="rust-router"
+  return 0
+}
+
+fallback_to_singbox() {
+  echo "[entrypoint] falling back to sing-box"
+
+  # Update TPROXY port for sing-box
+  TPROXY_PORT="${TPROXY_PORT:-7893}"
+  export TPROXY_PORT
+
+  # Start sing-box
+  start_singbox "${CONFIG_PATH}"
+
+  # Re-setup TPROXY routing with new port if already configured
+  if [ "${TPROXY_CONFIGURED:-false}" = "true" ]; then
+    echo "[entrypoint] reconfiguring TPROXY for sing-box port ${TPROXY_PORT}"
+    setup_tproxy_routing
+    setup_xray_tproxy
+  fi
 }
 
 handle_signals() {
   echo "[entrypoint] received signal, shutting down..."
+
+  # Stop rust-router if running
+  if [ -n "${RUST_ROUTER_PID:-}" ] && kill -0 "${RUST_ROUTER_PID}" 2>/dev/null; then
+    echo "[entrypoint] stopping rust-router"
+    kill "${RUST_ROUTER_PID}" 2>/dev/null || true
+    wait "${RUST_ROUTER_PID}" 2>/dev/null || true
+  fi
+
+  # Stop sing-box if running
   if [ -n "${SINGBOX_PID:-}" ] && kill -0 "${SINGBOX_PID}" 2>/dev/null; then
+    echo "[entrypoint] stopping sing-box"
     kill "${SINGBOX_PID}" 2>/dev/null || true
     wait "${SINGBOX_PID}" 2>/dev/null || true
   fi
+
   cleanup
   exit 0
 }
 
 trap handle_signals SIGTERM SIGINT
 
-start_singbox "${CONFIG_PATH}"
+# Start the appropriate router based on configuration
+if [ "${USE_RUST_ROUTER}" = "true" ]; then
+  echo "[entrypoint] rust-router enabled via USE_RUST_ROUTER=true"
+  if start_rust_router; then
+    echo "[entrypoint] rust-router started successfully"
+  else
+    echo "[entrypoint] rust-router failed to start, falling back to sing-box" >&2
+    # Reset TPROXY port for sing-box fallback
+    TPROXY_PORT="7893"
+    start_singbox "${CONFIG_PATH}"
+  fi
+else
+  echo "[entrypoint] starting sing-box (default router)"
+  start_singbox "${CONFIG_PATH}"
+fi
 
 # Phase 11-Fix.W: Check TPROXY kernel prerequisites before setting up routing
 check_tproxy_prerequisites
@@ -1005,21 +1105,44 @@ while true; do
     start_peer_tunnel_manager
   fi
 
-  # Check sing-box
-  if ! kill -0 "${SINGBOX_PID}" 2>/dev/null; then
-    wait "${SINGBOX_PID}" 2>/dev/null || true
-    EXIT_CODE=$?
-    echo "[entrypoint] sing-box exited with code ${EXIT_CODE}"
+  # Check router (rust-router or sing-box depending on which is active)
+  if [ "${ACTIVE_ROUTER}" = "rust-router" ]; then
+    # Check rust-router
+    if [ -n "${RUST_ROUTER_PID}" ] && ! kill -0 "${RUST_ROUTER_PID}" 2>/dev/null; then
+      wait "${RUST_ROUTER_PID}" 2>/dev/null || true
+      EXIT_CODE=$?
+      echo "[entrypoint] rust-router exited with code ${EXIT_CODE}"
 
-    # 检查是否有生成的配置
-    if [ -f "${GENERATED_CONFIG_PATH}" ]; then
-      echo "[entrypoint] restarting sing-box with generated config"
-      start_singbox "${GENERATED_CONFIG_PATH}"
-    else
-      echo "[entrypoint] sing-box exited, no generated config available"
-      # 等待一段时间后尝试重新启动
-      sleep 5
-      start_singbox "${BASE_CONFIG_PATH}"
+      # Try to restart rust-router
+      if start_rust_router; then
+        echo "[entrypoint] rust-router restarted successfully"
+      else
+        echo "[entrypoint] rust-router restart failed, falling back to sing-box" >&2
+        # Fall back to sing-box
+        TPROXY_PORT="7893"
+        start_singbox "${GENERATED_CONFIG_PATH:-${BASE_CONFIG_PATH}}"
+        # Reconfigure TPROXY for new port
+        setup_tproxy_routing
+        setup_xray_tproxy
+      fi
+    fi
+  else
+    # Check sing-box
+    if [ -n "${SINGBOX_PID}" ] && ! kill -0 "${SINGBOX_PID}" 2>/dev/null; then
+      wait "${SINGBOX_PID}" 2>/dev/null || true
+      EXIT_CODE=$?
+      echo "[entrypoint] sing-box exited with code ${EXIT_CODE}"
+
+      # 检查是否有生成的配置
+      if [ -f "${GENERATED_CONFIG_PATH}" ]; then
+        echo "[entrypoint] restarting sing-box with generated config"
+        start_singbox "${GENERATED_CONFIG_PATH}"
+      else
+        echo "[entrypoint] sing-box exited, no generated config available"
+        # 等待一段时间后尝试重新启动
+        sleep 5
+        start_singbox "${BASE_CONFIG_PATH}"
+      fi
     fi
   fi
   sleep 1

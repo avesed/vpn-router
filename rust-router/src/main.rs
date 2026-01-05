@@ -1,31 +1,315 @@
 //! rust-router: High-performance transparent proxy router
 //!
 //! This is the main entry point for the production router.
-//! For Phase 0 validation, use the PoC binaries:
-//!   - tproxy_poc: TCP TPROXY validation
-//!   - udp_tproxy_poc: UDP TPROXY validation
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Run with default configuration
+//! sudo ./rust-router
+//!
+//! # Run with custom configuration
+//! sudo ./rust-router -c /path/to/config.json
+//!
+//! # Run with environment overrides
+//! RUST_ROUTER_LOG_LEVEL=debug sudo ./rust-router
+//! ```
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tokio::signal;
+use tracing::{error, info, warn, Level};
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_target(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+use rust_router::config::{load_config_with_env, Config};
+use rust_router::connection::{run_accept_loop, ConnectionManager};
+use rust_router::ipc::{IpcHandler, IpcServer};
+use rust_router::outbound::{OutboundManager, OutboundManagerBuilder};
+use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener};
 
-    info!("rust-router v{}", env!("CARGO_PKG_VERSION"));
-    info!("Phase 0: Use tproxy_poc or udp_tproxy_poc for validation");
+/// Command-line arguments
+struct Args {
+    /// Configuration file path
+    config_path: PathBuf,
+    /// Generate default configuration
+    generate_config: bool,
+    /// Check configuration only
+    check_config: bool,
+}
 
-    // TODO: Phase 1+ implementation
-    // - TPROXY listener
-    // - Rule engine
-    // - Outbound manager
-    // - IPC server
+impl Args {
+    fn parse() -> Self {
+        let mut args = std::env::args().skip(1);
+        let mut config_path = PathBuf::from("/etc/rust-router/config.json");
+        let mut generate_config = false;
+        let mut check_config = false;
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-c" | "--config" => {
+                    if let Some(path) = args.next() {
+                        config_path = PathBuf::from(path);
+                    }
+                }
+                "-g" | "--generate-config" => {
+                    generate_config = true;
+                }
+                "--check" => {
+                    check_config = true;
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                "-v" | "--version" => {
+                    println!("rust-router v{}", rust_router::VERSION);
+                    std::process::exit(0);
+                }
+                _ => {
+                    eprintln!("Unknown argument: {}", arg);
+                    print_help();
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Self {
+            config_path,
+            generate_config,
+            check_config,
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        r#"rust-router v{}
+
+High-performance transparent proxy router with TPROXY support.
+
+USAGE:
+    rust-router [OPTIONS]
+
+OPTIONS:
+    -c, --config <PATH>     Configuration file path [default: /etc/rust-router/config.json]
+    -g, --generate-config   Generate default configuration and exit
+    --check                 Check configuration and exit
+    -h, --help             Print help information
+    -v, --version          Print version information
+
+ENVIRONMENT:
+    RUST_ROUTER_LISTEN_ADDR      Override listen address
+    RUST_ROUTER_LOG_LEVEL        Override log level (trace, debug, info, warn, error)
+    RUST_ROUTER_MAX_CONNECTIONS  Override maximum connections
+    RUST_ROUTER_IPC_SOCKET       Override IPC socket path
+
+REQUIREMENTS:
+    - Linux kernel with TPROXY support
+    - CAP_NET_ADMIN capability (or root)
+    - iptables TPROXY rules configured
+
+EXAMPLE:
+    # Configure iptables for TPROXY
+    iptables -t mangle -A PREROUTING -i wg-ingress -p tcp -j TPROXY \
+        --on-ip 127.0.0.1 --on-port 7893 --tproxy-mark 0x1
+    ip rule add fwmark 0x1 lookup 100
+    ip route add local 0.0.0.0/0 dev lo table 100
+
+    # Run the router
+    sudo rust-router -c /etc/rust-router/config.json
+"#,
+        rust_router::VERSION
+    );
+}
+
+/// Initialize logging
+fn init_logging(config: &Config) {
+    let level = match config.log.level.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => Level::INFO,
+    };
+
+    let filter = EnvFilter::from_default_env()
+        .add_directive(level.into())
+        .add_directive("hyper=warn".parse().unwrap())
+        .add_directive("tokio=warn".parse().unwrap());
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(config.log.target)
+        .with_span_events(FmtSpan::CLOSE);
+
+    if config.log.format == "json" {
+        subscriber.json().init();
+    } else {
+        subscriber.init();
+    }
+}
+
+/// Check system prerequisites
+fn check_prerequisites() -> Result<()> {
+    // Check for root/capabilities
+    if !is_root() && !has_net_admin_capability() {
+        warn!("Not running as root and CAP_NET_ADMIN not detected");
+        warn!("TPROXY requires CAP_NET_ADMIN capability");
+        // Don't fail - let the socket creation fail with a clearer error
+    }
 
     Ok(())
+}
+
+/// Build outbound manager from configuration
+fn build_outbound_manager(config: &Config) -> Arc<OutboundManager> {
+    let mut builder = OutboundManagerBuilder::new();
+    builder.add_all_from_config(&config.outbounds);
+    let manager = builder.build();
+
+    info!(
+        "Initialized {} outbounds: {:?}",
+        manager.len(),
+        manager.tags()
+    );
+
+    Arc::new(manager)
+}
+
+/// Main application entry point
+#[tokio::main]
+async fn main() -> Result<()> {
+    let start_time = Instant::now();
+
+    // Parse arguments
+    let args = Args::parse();
+
+    // Handle generate-config
+    if args.generate_config {
+        rust_router::config::create_default_config(&args.config_path)?;
+        println!("Generated default configuration at {:?}", args.config_path);
+        return Ok(());
+    }
+
+    // Load configuration
+    let config = load_config_with_env(&args.config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration from {:?}: {}", args.config_path, e))?;
+
+    // Handle check-config
+    if args.check_config {
+        println!("Configuration is valid");
+        return Ok(());
+    }
+
+    // Initialize logging
+    init_logging(&config);
+
+    info!("rust-router v{}", rust_router::VERSION);
+    info!("Configuration loaded from {:?}", args.config_path);
+
+    // Check prerequisites
+    check_prerequisites()?;
+
+    // Build outbound manager
+    let outbound_manager = build_outbound_manager(&config);
+
+    // Create connection manager
+    let connection_manager = Arc::new(ConnectionManager::new(
+        &config.connection,
+        Arc::clone(&outbound_manager),
+        config.default_outbound.clone(),
+        config.listen.sniff_timeout(),
+    ));
+
+    // Create TPROXY listener
+    let listener = TproxyListener::bind(&config.listen)
+        .map_err(|e| anyhow::anyhow!("Failed to create TPROXY listener: {}", e))?;
+
+    info!(
+        "TPROXY listener ready on {} (TCP: {}, UDP: {})",
+        config.listen.address, config.listen.tcp_enabled, config.listen.udp_enabled
+    );
+
+    // Create IPC handler and server
+    let ipc_handler = Arc::new(IpcHandler::new(
+        Arc::clone(&connection_manager),
+        Arc::clone(&outbound_manager),
+    ));
+
+    let ipc_server = IpcServer::new(config.ipc.clone(), Arc::clone(&ipc_handler));
+    let ipc_shutdown = ipc_server.shutdown_sender();
+
+    // Spawn IPC server
+    let ipc_handle = tokio::spawn(async move {
+        if let Err(e) = ipc_server.run().await {
+            error!("IPC server error: {}", e);
+        }
+    });
+
+    info!(
+        "Startup complete in {:.2}ms",
+        start_time.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Run accept loop with signal handling
+    let accept_result = tokio::select! {
+        result = run_accept_loop(listener, Arc::clone(&connection_manager)) => {
+            result
+        }
+        _ = signal::ctrl_c() => {
+            info!("Received SIGINT, initiating shutdown...");
+            Ok(())
+        }
+        _ = wait_for_sigterm() => {
+            info!("Received SIGTERM, initiating shutdown...");
+            Ok(())
+        }
+    };
+
+    // Graceful shutdown
+    info!("Shutting down...");
+
+    // Stop accepting new connections
+    connection_manager.shutdown().await;
+
+    // Stop IPC server
+    let _ = ipc_shutdown.send(());
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ipc_handle,
+    ).await;
+
+    // Log final stats
+    let stats = connection_manager.stats_snapshot();
+    info!(
+        "Final stats: {} total connections, {} completed, {} errored, {} rejected",
+        stats.total_accepted, stats.completed, stats.errored, stats.rejected
+    );
+    info!(
+        "Transferred: {} bytes rx, {} bytes tx",
+        stats.bytes_rx, stats.bytes_tx
+    );
+
+    info!("Shutdown complete");
+
+    accept_result.map_err(|e| anyhow::anyhow!("Accept loop error: {}", e))
+}
+
+/// Wait for SIGTERM signal
+#[cfg(unix)]
+async fn wait_for_sigterm() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    sigterm.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() {
+    // On non-Unix platforms, just wait forever
+    std::future::pending::<()>().await
 }
