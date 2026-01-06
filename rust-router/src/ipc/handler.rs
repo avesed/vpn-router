@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::protocol::{
     ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse, PoolStatsResponse,
-    RuleStatsResponse, ServerCapabilities, ServerStatus, Socks5PoolStats,
+    PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus, Socks5PoolStats,
 };
 use crate::config::{load_config_with_env, OutboundConfig};
 use crate::connection::ConnectionManager;
@@ -172,6 +172,8 @@ impl IpcHandler {
                 tag,
                 egress_type,
             } => self.handle_notify_egress_change(action, tag, egress_type),
+
+            IpcCommand::GetPrometheusMetrics => self.handle_get_prometheus_metrics(),
         }
     }
 
@@ -1008,6 +1010,369 @@ impl IpcHandler {
             action, tag, egress_type
         ))
     }
+
+    /// Handle get Prometheus metrics command
+    ///
+    /// Generates metrics in Prometheus text exposition format.
+    fn handle_get_prometheus_metrics(&self) -> IpcResponse {
+        let mut output = String::with_capacity(8192);
+
+        // Collect timestamp
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Get global connection stats
+        let stats = self.connection_manager.stats_snapshot();
+
+        // === Core Metrics ===
+        write_metric_header(
+            &mut output,
+            "rust_router_connections_total",
+            "Total number of connections accepted",
+            "counter",
+        );
+        write_metric_value(&mut output, "rust_router_connections_total", None, stats.total_accepted);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_connections_active",
+            "Currently active connections",
+            "gauge",
+        );
+        write_metric_value(&mut output, "rust_router_connections_active", None, stats.active);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_connections_completed_total",
+            "Total connections completed successfully",
+            "counter",
+        );
+        write_metric_value(&mut output, "rust_router_connections_completed_total", None, stats.completed);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_connections_errored_total",
+            "Total connections that errored",
+            "counter",
+        );
+        write_metric_value(&mut output, "rust_router_connections_errored_total", None, stats.errored);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_bytes_rx_total",
+            "Total bytes received (client to upstream)",
+            "counter",
+        );
+        write_metric_value(&mut output, "rust_router_bytes_rx_total", None, stats.bytes_rx);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_bytes_tx_total",
+            "Total bytes transmitted (upstream to client)",
+            "counter",
+        );
+        write_metric_value(&mut output, "rust_router_bytes_tx_total", None, stats.bytes_tx);
+
+        // === Per-Outbound Metrics ===
+        let outbounds = self.outbound_manager.all();
+
+        // Connections per outbound
+        write_metric_header(
+            &mut output,
+            "rust_router_outbound_connections_total",
+            "Total connections per outbound",
+            "counter",
+        );
+        for outbound in &outbounds {
+            let outbound_stats = outbound.stats().snapshot();
+            write_metric_value(
+                &mut output,
+                "rust_router_outbound_connections_total",
+                Some(&[("outbound", outbound.tag())]),
+                outbound_stats.connections,
+            );
+        }
+
+        write_metric_header(
+            &mut output,
+            "rust_router_outbound_connections_active",
+            "Active connections per outbound",
+            "gauge",
+        );
+        for outbound in &outbounds {
+            let outbound_stats = outbound.stats().snapshot();
+            write_metric_value(
+                &mut output,
+                "rust_router_outbound_connections_active",
+                Some(&[("outbound", outbound.tag())]),
+                outbound_stats.active,
+            );
+        }
+
+        write_metric_header(
+            &mut output,
+            "rust_router_outbound_bytes_rx_total",
+            "Total bytes received per outbound",
+            "counter",
+        );
+        for outbound in &outbounds {
+            let outbound_stats = outbound.stats().snapshot();
+            write_metric_value(
+                &mut output,
+                "rust_router_outbound_bytes_rx_total",
+                Some(&[("outbound", outbound.tag())]),
+                outbound_stats.bytes_rx,
+            );
+        }
+
+        write_metric_header(
+            &mut output,
+            "rust_router_outbound_bytes_tx_total",
+            "Total bytes transmitted per outbound",
+            "counter",
+        );
+        for outbound in &outbounds {
+            let outbound_stats = outbound.stats().snapshot();
+            write_metric_value(
+                &mut output,
+                "rust_router_outbound_bytes_tx_total",
+                Some(&[("outbound", outbound.tag())]),
+                outbound_stats.bytes_tx,
+            );
+        }
+
+        write_metric_header(
+            &mut output,
+            "rust_router_outbound_errors_total",
+            "Total errors per outbound",
+            "counter",
+        );
+        for outbound in &outbounds {
+            let outbound_stats = outbound.stats().snapshot();
+            write_metric_value(
+                &mut output,
+                "rust_router_outbound_errors_total",
+                Some(&[("outbound", outbound.tag())]),
+                outbound_stats.errors,
+            );
+        }
+
+        // Outbound health status
+        write_metric_header(
+            &mut output,
+            "rust_router_outbound_health",
+            "Outbound health status (1 = current status)",
+            "gauge",
+        );
+        for outbound in &outbounds {
+            let health = outbound.health_status();
+            let health_str = health.to_string();
+            // Output 1 for current status, 0 for others
+            for status in &["healthy", "degraded", "unhealthy", "unknown"] {
+                let value = if *status == health_str { 1u64 } else { 0u64 };
+                write_metric_value(
+                    &mut output,
+                    "rust_router_outbound_health",
+                    Some(&[("outbound", outbound.tag()), ("status", status)]),
+                    value,
+                );
+            }
+        }
+
+        // === Rule Engine Metrics ===
+        let rule_snapshot = self.rule_engine.load();
+        let rule_stats = rule_snapshot.stats();
+
+        write_metric_header(
+            &mut output,
+            "rust_router_rules_domain_count",
+            "Number of domain rules",
+            "gauge",
+        );
+        write_metric_value(
+            &mut output,
+            "rust_router_rules_domain_count",
+            None,
+            rule_stats.domain_rules as u64,
+        );
+
+        write_metric_header(
+            &mut output,
+            "rust_router_rules_geoip_count",
+            "Number of GeoIP/CIDR rules",
+            "gauge",
+        );
+        write_metric_value(
+            &mut output,
+            "rust_router_rules_geoip_count",
+            None,
+            rule_stats.geoip_rules as u64,
+        );
+
+        // Count port and protocol rules from compiled rules
+        let mut port_rules = 0u64;
+        let mut protocol_rules = 0u64;
+        for rule in rule_snapshot.rules.iter() {
+            match rule.rule_type {
+                crate::rules::RuleType::Port => port_rules += 1,
+                crate::rules::RuleType::Protocol => protocol_rules += 1,
+                _ => {}
+            }
+        }
+
+        write_metric_header(
+            &mut output,
+            "rust_router_rules_port_count",
+            "Number of port rules",
+            "gauge",
+        );
+        write_metric_value(&mut output, "rust_router_rules_port_count", None, port_rules);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_rules_protocol_count",
+            "Number of protocol rules",
+            "gauge",
+        );
+        write_metric_value(&mut output, "rust_router_rules_protocol_count", None, protocol_rules);
+
+        write_metric_header(
+            &mut output,
+            "rust_router_rules_chain_count",
+            "Number of registered chains for multi-hop routing",
+            "gauge",
+        );
+        write_metric_value(
+            &mut output,
+            "rust_router_rules_chain_count",
+            None,
+            rule_stats.chains as u64,
+        );
+
+        write_metric_header(
+            &mut output,
+            "rust_router_config_version",
+            "Configuration version (incremented on each reload)",
+            "gauge",
+        );
+        write_metric_value(
+            &mut output,
+            "rust_router_config_version",
+            None,
+            self.config_version.load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        // === SOCKS5 Connection Pool Metrics ===
+        let has_socks5 = outbounds.iter().any(|o| o.outbound_type() == "socks5");
+        if has_socks5 {
+            write_metric_header(
+                &mut output,
+                "rust_router_pool_size",
+                "SOCKS5 connection pool total size",
+                "gauge",
+            );
+            write_metric_header(
+                &mut output,
+                "rust_router_pool_available",
+                "SOCKS5 connection pool available connections",
+                "gauge",
+            );
+            write_metric_header(
+                &mut output,
+                "rust_router_pool_waiting",
+                "SOCKS5 connection pool waiting requests",
+                "gauge",
+            );
+
+            for outbound in &outbounds {
+                if outbound.outbound_type() == "socks5" {
+                    if let Some(pool_info) = outbound.pool_stats_info() {
+                        write_metric_value(
+                            &mut output,
+                            "rust_router_pool_size",
+                            Some(&[("outbound", outbound.tag())]),
+                            pool_info.size as u64,
+                        );
+                        write_metric_value(
+                            &mut output,
+                            "rust_router_pool_available",
+                            Some(&[("outbound", outbound.tag())]),
+                            pool_info.available as u64,
+                        );
+                        write_metric_value(
+                            &mut output,
+                            "rust_router_pool_waiting",
+                            Some(&[("outbound", outbound.tag())]),
+                            pool_info.waiting as u64,
+                        );
+                    }
+                }
+            }
+        }
+
+        // === System Metrics ===
+        write_metric_header(
+            &mut output,
+            "rust_router_uptime_seconds",
+            "Time since server start in seconds",
+            "gauge",
+        );
+        write_metric_value(
+            &mut output,
+            "rust_router_uptime_seconds",
+            None,
+            self.start_time.elapsed().as_secs(),
+        );
+
+        write_metric_header(
+            &mut output,
+            "rust_router_info",
+            "Server information (always 1)",
+            "gauge",
+        );
+        write_metric_value(
+            &mut output,
+            "rust_router_info",
+            Some(&[("version", &self.version)]),
+            1u64,
+        );
+
+        IpcResponse::PrometheusMetrics(PrometheusMetricsResponse {
+            metrics_text: output,
+            timestamp_ms,
+        })
+    }
+}
+
+/// Write a metric header (HELP and TYPE lines)
+fn write_metric_header(output: &mut String, name: &str, help: &str, metric_type: &str) {
+    use std::fmt::Write;
+    let _ = writeln!(output, "# HELP {} {}", name, help);
+    let _ = writeln!(output, "# TYPE {} {}", name, metric_type);
+}
+
+/// Write a metric value with optional labels
+fn write_metric_value(output: &mut String, name: &str, labels: Option<&[(&str, &str)]>, value: u64) {
+    use std::fmt::Write;
+    if let Some(labels) = labels {
+        let label_str: String = labels
+            .iter()
+            .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = writeln!(output, "{}{{{}}} {}", name, label_str, value);
+    } else {
+        let _ = writeln!(output, "{} {}", name, value);
+    }
+}
+
+/// Escape label values for Prometheus format
+fn escape_label_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Format Unix timestamp as simplified ISO 8601
@@ -1912,5 +2277,197 @@ mod tests {
         } else {
             panic!("Expected Success response");
         }
+    }
+
+    // =========================================================================
+    // Prometheus Metrics Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_prometheus_metrics_basic() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetPrometheusMetrics).await;
+
+        if let IpcResponse::PrometheusMetrics(metrics) = response {
+            // Check timestamp is reasonable
+            assert!(metrics.timestamp_ms > 0);
+
+            // Check core metrics are present
+            assert!(metrics.metrics_text.contains("rust_router_connections_total"));
+            assert!(metrics.metrics_text.contains("rust_router_connections_active"));
+            assert!(metrics.metrics_text.contains("rust_router_connections_completed_total"));
+            assert!(metrics.metrics_text.contains("rust_router_connections_errored_total"));
+            assert!(metrics.metrics_text.contains("rust_router_bytes_rx_total"));
+            assert!(metrics.metrics_text.contains("rust_router_bytes_tx_total"));
+
+            // Check system metrics
+            assert!(metrics.metrics_text.contains("rust_router_uptime_seconds"));
+            assert!(metrics.metrics_text.contains("rust_router_info"));
+
+            // Check rule metrics
+            assert!(metrics.metrics_text.contains("rust_router_rules_domain_count"));
+            assert!(metrics.metrics_text.contains("rust_router_rules_geoip_count"));
+            assert!(metrics.metrics_text.contains("rust_router_config_version"));
+        } else {
+            panic!("Expected PrometheusMetrics response, got: {:?}", response);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_metrics_has_outbound_metrics() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetPrometheusMetrics).await;
+
+        if let IpcResponse::PrometheusMetrics(metrics) = response {
+            // Check outbound metrics with labels
+            assert!(metrics.metrics_text.contains("rust_router_outbound_connections_total"));
+            assert!(metrics.metrics_text.contains("rust_router_outbound_connections_active"));
+            assert!(metrics.metrics_text.contains("rust_router_outbound_bytes_rx_total"));
+            assert!(metrics.metrics_text.contains("rust_router_outbound_bytes_tx_total"));
+            assert!(metrics.metrics_text.contains("rust_router_outbound_errors_total"));
+            assert!(metrics.metrics_text.contains("rust_router_outbound_health"));
+
+            // Check the "direct" outbound is labeled
+            assert!(metrics.metrics_text.contains(r#"outbound="direct""#));
+        } else {
+            panic!("Expected PrometheusMetrics response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_metrics_format() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetPrometheusMetrics).await;
+
+        if let IpcResponse::PrometheusMetrics(metrics) = response {
+            // Check HELP and TYPE comments are present
+            assert!(metrics.metrics_text.contains("# HELP rust_router_connections_total"));
+            assert!(metrics.metrics_text.contains("# TYPE rust_router_connections_total counter"));
+            assert!(metrics.metrics_text.contains("# HELP rust_router_connections_active"));
+            assert!(metrics.metrics_text.contains("# TYPE rust_router_connections_active gauge"));
+            assert!(metrics.metrics_text.contains("# TYPE rust_router_info gauge"));
+        } else {
+            panic!("Expected PrometheusMetrics response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_metrics_with_rules() {
+        let handler = create_test_handler_with_rules();
+        let response = handler.handle(IpcCommand::GetPrometheusMetrics).await;
+
+        if let IpcResponse::PrometheusMetrics(metrics) = response {
+            // Check rule metrics are present
+            assert!(metrics.metrics_text.contains("rust_router_rules_domain_count"));
+            assert!(metrics.metrics_text.contains("rust_router_rules_geoip_count"));
+            assert!(metrics.metrics_text.contains("rust_router_rules_port_count"));
+            assert!(metrics.metrics_text.contains("rust_router_rules_protocol_count"));
+            assert!(metrics.metrics_text.contains("rust_router_rules_chain_count"));
+
+            // The test handler has rules, so counts should be > 0 in output
+            // Just verify the lines are there with numeric values
+            let lines: Vec<&str> = metrics.metrics_text.lines().collect();
+            let domain_count_line = lines.iter().find(|l| l.starts_with("rust_router_rules_domain_count "));
+            assert!(domain_count_line.is_some(), "Domain count metric line should exist");
+        } else {
+            panic!("Expected PrometheusMetrics response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_metrics_health_labels() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetPrometheusMetrics).await;
+
+        if let IpcResponse::PrometheusMetrics(metrics) = response {
+            // Check health metrics have status labels
+            assert!(metrics.metrics_text.contains(r#"status="healthy""#));
+            // All possible statuses should be represented
+            assert!(metrics.metrics_text.contains(r#"status="degraded""#));
+            assert!(metrics.metrics_text.contains(r#"status="unhealthy""#));
+            assert!(metrics.metrics_text.contains(r#"status="unknown""#));
+        } else {
+            panic!("Expected PrometheusMetrics response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_prometheus_metrics_version_info() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetPrometheusMetrics).await;
+
+        if let IpcResponse::PrometheusMetrics(metrics) = response {
+            // Check info metric has version label
+            assert!(metrics.metrics_text.contains("rust_router_info{version="));
+            // The value should be 1
+            let lines: Vec<&str> = metrics.metrics_text.lines().collect();
+            let info_line = lines.iter().find(|l| l.starts_with("rust_router_info{"));
+            assert!(info_line.is_some());
+            assert!(info_line.unwrap().ends_with(" 1"));
+        } else {
+            panic!("Expected PrometheusMetrics response");
+        }
+    }
+
+    #[test]
+    fn test_escape_label_value() {
+        // Test basic escaping
+        assert_eq!(escape_label_value("simple"), "simple");
+        assert_eq!(escape_label_value(r#"with"quote"#), r#"with\"quote"#);
+        assert_eq!(escape_label_value("with\\backslash"), "with\\\\backslash");
+        assert_eq!(escape_label_value("with\nnewline"), "with\\nnewline");
+
+        // Test combined
+        assert_eq!(
+            escape_label_value("a\"b\\c\nd"),
+            "a\\\"b\\\\c\\nd"
+        );
+    }
+
+    #[test]
+    fn test_write_metric_header() {
+        let mut output = String::new();
+        write_metric_header(&mut output, "test_metric", "Test description", "counter");
+
+        assert!(output.contains("# HELP test_metric Test description"));
+        assert!(output.contains("# TYPE test_metric counter"));
+    }
+
+    #[test]
+    fn test_write_metric_value_without_labels() {
+        let mut output = String::new();
+        write_metric_value(&mut output, "test_metric", None, 42);
+
+        assert_eq!(output.trim(), "test_metric 42");
+    }
+
+    #[test]
+    fn test_write_metric_value_with_labels() {
+        let mut output = String::new();
+        write_metric_value(
+            &mut output,
+            "test_metric",
+            Some(&[("label1", "value1"), ("label2", "value2")]),
+            123,
+        );
+
+        assert!(output.contains("test_metric{"));
+        assert!(output.contains(r#"label1="value1""#));
+        assert!(output.contains(r#"label2="value2""#));
+        assert!(output.contains("} 123"));
+    }
+
+    #[test]
+    fn test_write_metric_value_escapes_labels() {
+        let mut output = String::new();
+        write_metric_value(
+            &mut output,
+            "test_metric",
+            Some(&[("outbound", "test\"quoted")]),
+            1,
+        );
+
+        // The quote should be escaped
+        assert!(output.contains(r#"outbound="test\"quoted""#));
     }
 }

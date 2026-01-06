@@ -212,6 +212,11 @@ pub enum IpcCommand {
         /// Egress type (pia, custom, warp, v2ray, direct, openvpn)
         egress_type: String,
     },
+
+    /// Get Prometheus-formatted metrics
+    ///
+    /// Returns all metrics in Prometheus text exposition format for scraping.
+    GetPrometheusMetrics,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -316,6 +321,9 @@ pub enum IpcResponse {
 
     /// Drain outbound result
     DrainResult(DrainResponse),
+
+    /// Prometheus metrics response
+    PrometheusMetrics(PrometheusMetricsResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -563,6 +571,17 @@ pub struct DrainResponse {
     pub force_closed_count: u64,
     /// Time taken to drain in milliseconds
     pub drain_time_ms: u64,
+}
+
+/// Response for GetPrometheusMetrics command
+///
+/// Contains metrics in Prometheus text exposition format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrometheusMetricsResponse {
+    /// Prometheus text format metrics
+    pub metrics_text: String,
+    /// Timestamp of metrics collection (Unix epoch milliseconds)
+    pub timestamp_ms: u64,
 }
 
 /// IPC error
@@ -962,6 +981,43 @@ mod tests {
             assert_eq!(oh.outbounds[1].error, Some("Connection timeout".into()));
         } else {
             panic!("Expected OutboundHealth response");
+        }
+    }
+
+    #[test]
+    fn test_get_prometheus_metrics_command_serialization() {
+        let cmd = IpcCommand::GetPrometheusMetrics;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_prometheus_metrics\""));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetPrometheusMetrics));
+    }
+
+    #[test]
+    fn test_prometheus_metrics_response_serialization() {
+        let metrics_text = r#"# HELP rust_router_connections_total Total connections
+# TYPE rust_router_connections_total counter
+rust_router_connections_total 12345
+"#;
+        let resp = PrometheusMetricsResponse {
+            metrics_text: metrics_text.to_string(),
+            timestamp_ms: 1704499200000,
+        };
+        let ipc_resp = IpcResponse::PrometheusMetrics(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"prometheus_metrics\""));
+        assert!(json.contains("\"timestamp_ms\":1704499200000"));
+        assert!(json.contains("rust_router_connections_total"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::PrometheusMetrics(pm) = parsed {
+            assert_eq!(pm.timestamp_ms, 1704499200000);
+            assert!(pm.metrics_text.contains("rust_router_connections_total"));
+        } else {
+            panic!("Expected PrometheusMetrics response");
         }
     }
 }

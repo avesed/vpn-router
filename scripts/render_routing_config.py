@@ -579,7 +579,7 @@ class RustRouterConfigGenerator:
             config: Routing configuration
 
         Returns:
-            Dict suitable for JSON serialization
+            Dict suitable for JSON serialization matching rust-router's Config struct
         """
         outbounds = []
 
@@ -598,21 +598,60 @@ class RustRouterConfigGenerator:
                 "enabled": rule.enabled,
             })
 
+        tproxy_port = safe_int_env("RUST_ROUTER_PORT", DEFAULT_TPROXY_PORT)
+        listen_addr = os.environ.get("RUST_ROUTER_LISTEN_ADDR", "127.0.0.1")
+        socket_path = os.environ.get("RUST_ROUTER_SOCKET", "/var/run/rust-router.sock")
+
         return {
-            "version": "3.5",  # Phase 3.5
-            "tproxy_port": safe_int_env("RUST_ROUTER_PORT", DEFAULT_TPROXY_PORT),
+            # ListenConfig - required
+            "listen": {
+                "address": f"{listen_addr}:{tproxy_port}",
+                "tcp_enabled": True,
+                "udp_enabled": True,
+                "tcp_backlog": 1024,
+                "udp_timeout_secs": 300,
+                "reuse_port": True,
+                "sniff_timeout_ms": 300,
+            },
+            # Outbounds - required
             "outbounds": outbounds,
-            "routing": {
+            # Default outbound - required (top-level, not in routing)
+            "default_outbound": config.default_outbound,
+            # IpcConfig - required
+            "ipc": {
+                "socket_path": socket_path,
+                "socket_mode": 432,  # 0o660
+                "enabled": True,
+                "max_message_size": 1048576,  # 1MB
+            },
+            # LogConfig - optional with defaults
+            "log": {
+                "level": os.environ.get("RUST_LOG", "info"),
+            },
+            # ConnectionConfig - optional with defaults
+            "connection": {
+                "max_connections": safe_int_env("RUST_ROUTER_MAX_CONNECTIONS", 65536),
+                "connection_timeout_secs": 30,
+                "idle_timeout_secs": 300,
+            },
+            # RulesConfig - optional with defaults
+            "rules": {
                 "rules": rules,
-                "default_outbound": config.default_outbound,
+                "geoip_db_path": os.environ.get("GEOIP_DB_PATH", "/etc/sing-box/geoip.db"),
+                "domain_catalog_path": os.environ.get("DOMAIN_CATALOG_PATH", "/etc/sing-box/domain-catalog.json"),
             },
         }
 
     def _convert_outbound(self, ob: OutboundConfig) -> Optional[Dict[str, Any]]:
-        """Convert OutboundConfig to rust-router format"""
+        """Convert OutboundConfig to rust-router format.
+
+        Note: rust-router currently only supports Direct and Block outbound types
+        in config. WireGuard-based outbounds use Direct with bind_interface.
+        SOCKS5 outbounds (V2Ray, WARP MASQUE) are not yet supported and will be skipped.
+        """
         if ob.egress_type == EgressType.DIRECT:
-            result = {
-                "type": "direct",
+            result: Dict[str, Any] = {
+                "type": "direct",  # lowercase to match serde deserialization
                 "tag": ob.tag,
                 "enabled": ob.enabled,
             }
@@ -624,43 +663,34 @@ class RustRouterConfigGenerator:
 
         elif ob.egress_type == EgressType.BLOCK:
             return {
-                "type": "block",
+                "type": "block",  # lowercase to match serde deserialization
                 "tag": ob.tag,
                 "enabled": ob.enabled,
             }
 
         elif ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER):
             # WireGuard-based: use direct with bind_interface
+            # rust-router treats these as direct outbounds bound to WireGuard interfaces
             result = {
-                "type": "wireguard",
+                "type": "direct",  # lowercase to match serde deserialization
                 "tag": ob.tag,
                 "enabled": ob.enabled,
-                "interface": ob.interface,
+                "bind_interface": ob.interface,  # The wg-pia-*/wg-eg-*/wg-warp-* interface
             }
             if ob.routing_mark:
                 result["routing_mark"] = ob.routing_mark
-            if ob.routing_table:
-                result["routing_table"] = ob.routing_table
             return result
 
         elif ob.egress_type in (EgressType.V2RAY, EgressType.WARP_MASQUE):
-            # SOCKS5-based
-            result = {
-                "type": "socks5",
-                "tag": ob.tag,
-                "enabled": ob.enabled,
-                "server_addr": f"{ob.socks_addr}:{ob.socks_port}",
-            }
-            if ob.username:
-                result["username"] = ob.username
-            if ob.password:
-                result["password"] = ob.password
-            return result
+            # SOCKS5-based outbounds are not yet supported in rust-router config
+            # These will need to be added via IPC when that's implemented
+            logger.warning(f"SOCKS5 outbound '{ob.tag}' not yet supported in rust-router, skipping")
+            return None
 
         elif ob.egress_type == EgressType.OPENVPN:
-            # OpenVPN: direct with bind_interface
+            # OpenVPN: direct with bind_interface (the tun device)
             return {
-                "type": "direct",
+                "type": "direct",  # lowercase to match serde deserialization
                 "tag": ob.tag,
                 "enabled": ob.enabled,
                 "bind_interface": ob.bind_interface,

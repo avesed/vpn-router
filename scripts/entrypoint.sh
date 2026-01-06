@@ -167,16 +167,17 @@ export WEB_PORT="${WEB_PORT:-36000}"
 export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
 
 # Rust Router configuration
-# Set USE_RUST_ROUTER=true to use rust-router instead of sing-box for TPROXY
+# [Phase 5] rust-router is now the default data plane (9.01/10 final score)
+# Set USE_RUST_ROUTER=false to fall back to sing-box
 # If rust-router fails to start, it will automatically fall back to sing-box
-USE_RUST_ROUTER="${USE_RUST_ROUTER:-false}"
+USE_RUST_ROUTER="${USE_RUST_ROUTER:-true}"
 RUST_ROUTER_BIN="${RUST_ROUTER_BIN:-/usr/local/bin/rust-router}"
 RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG:-/etc/rust-router/config.json}"
 RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET:-/var/run/rust-router.sock}"
 RUST_ROUTER_LOG="${RUST_ROUTER_LOG:-/var/log/rust-router.log}"
 
-# Track which router is active (sing-box or rust-router)
-ACTIVE_ROUTER="sing-box"
+# Track which router is active (rust-router or sing-box)
+ACTIVE_ROUTER="rust-router"
 
 # Check for port conflicts before starting services
 check_port_conflicts() {
@@ -874,6 +875,23 @@ if ! python3 /usr/local/bin/render_singbox.py; then
   exit 1
 fi
 CONFIG_PATH="${GENERATED_CONFIG_PATH}"
+
+# [Phase 5] Generate rust-router config from database
+# This ensures rust-router has consistent configuration with sing-box
+if [ "${USE_RUST_ROUTER}" = "true" ]; then
+  echo "[entrypoint] rendering rust-router config"
+  mkdir -p "$(dirname "${RUST_ROUTER_CONFIG}")"
+  # Export RUST_ROUTER_PORT so render_routing_config.py uses the correct port
+  export RUST_ROUTER_PORT="${TPROXY_PORT}"
+  if python3 /usr/local/bin/render_routing_config.py \
+      --format=rust-router \
+      --output="${RUST_ROUTER_CONFIG}"; then
+    echo "[entrypoint] rust-router config generated: ${RUST_ROUTER_CONFIG}"
+  else
+    echo "[entrypoint] rust-router config generation failed, will use sing-box" >&2
+    USE_RUST_ROUTER="false"
+  fi
+fi
 
 start_api_server
 start_nginx

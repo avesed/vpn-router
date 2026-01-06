@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Rust Router IPC Client (v3.0 - Phase 3.4)
+Rust Router IPC Client (v3.1 - Phase 3.4 + Prometheus Metrics)
 
 Async client for communicating with rust-router via Unix socket.
 Used by api_server.py and RustRouterManager for configuration sync.
 
-Protocol v3.0 Features (Phase 3.4):
+Protocol v3.1 Features (Phase 3.4 + Prometheus Metrics):
 - Length-prefixed JSON framing (4 bytes BE + JSON) - matches Rust IPC protocol
 - WireGuard outbound management (AddWireguardOutbound)
 - SOCKS5 outbound management (AddSocks5Outbound)
@@ -13,6 +13,7 @@ Protocol v3.0 Features (Phase 3.4):
 - Routing rule updates (UpdateRouting, SetDefaultOutbound)
 - Outbound health monitoring (GetOutboundHealth)
 - Egress change notifications (NotifyEgressChange)
+- Prometheus metrics retrieval (GetPrometheusMetrics)
 - Connection retry with exponential backoff
 - Graceful degradation when rust-router unavailable
 
@@ -116,6 +117,13 @@ class UpdateRoutingResult:
     version: int = 0
     rule_count: int = 0
     default_outbound: str = ""
+
+
+@dataclass
+class PrometheusMetricsResponse:
+    """Prometheus metrics response from rust-router"""
+    metrics_text: str
+    timestamp_ms: int
 
 
 @dataclass
@@ -748,6 +756,28 @@ class RustRouterClient:
         return result
 
     # =========================================================================
+    # Prometheus Metrics
+    # =========================================================================
+
+    async def get_prometheus_metrics(self) -> Optional[PrometheusMetricsResponse]:
+        """Get Prometheus-format metrics from rust-router.
+
+        Returns:
+            PrometheusMetricsResponse with metrics_text and timestamp_ms,
+            or None if the request fails
+        """
+        response = await self._send_command({"type": "get_prometheus_metrics"})
+        if not response.success:
+            return None
+
+        if response.data:
+            return PrometheusMetricsResponse(
+                metrics_text=response.data.get("metrics_text", ""),
+                timestamp_ms=response.data.get("timestamp_ms", 0),
+            )
+        return None
+
+    # =========================================================================
     # Egress Change Notifications
     # =========================================================================
 
@@ -842,6 +872,15 @@ async def is_available(socket_path: Optional[str] = None) -> bool:
     if not Path(socket_path).exists():
         return False
     return await ping(socket_path)
+
+
+async def get_prometheus_metrics(socket_path: Optional[str] = None) -> Optional[PrometheusMetricsResponse]:
+    """Get Prometheus metrics from rust-router"""
+    try:
+        async with RustRouterClient(socket_path) as client:
+            return await client.get_prometheus_metrics()
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -976,6 +1015,21 @@ if __name__ == "__main__":
             result = UpdateRoutingResult(success=True, version=5, rule_count=100)
             self.assertTrue(result.success)
             self.assertEqual(result.version, 5)
+
+        def test_prometheus_metrics_response(self):
+            """Test PrometheusMetricsResponse"""
+            metrics = PrometheusMetricsResponse(
+                metrics_text="# HELP test_metric\ntest_metric 42\n",
+                timestamp_ms=1704067200000
+            )
+            self.assertEqual(metrics.metrics_text, "# HELP test_metric\ntest_metric 42\n")
+            self.assertEqual(metrics.timestamp_ms, 1704067200000)
+
+        def test_prometheus_metrics_response_empty(self):
+            """Test PrometheusMetricsResponse with empty metrics"""
+            metrics = PrometheusMetricsResponse(metrics_text="", timestamp_ms=0)
+            self.assertEqual(metrics.metrics_text, "")
+            self.assertEqual(metrics.timestamp_ms, 0)
 
     class TestExceptions(unittest.TestCase):
         """Test exception hierarchy"""
@@ -1314,6 +1368,65 @@ if __name__ == "__main__":
             self.assertEqual(call_args["domain"], "google.com")
             self.assertEqual(call_args["sniffed_protocol"], "tls")
 
+        async def test_get_prometheus_metrics_success(self):
+            """Test get_prometheus_metrics with successful response"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="prometheus_metrics",
+                    data={
+                        "metrics_text": "# HELP rust_router_connections_total\nrust_router_connections_total 100\n",
+                        "timestamp_ms": 1704067200000
+                    }
+                )
+            )
+            self.client._connected = True
+
+            result = await self.client.get_prometheus_metrics()
+            self.assertIsNotNone(result)
+            self.assertIn("rust_router_connections_total", result.metrics_text)
+            self.assertEqual(result.timestamp_ms, 1704067200000)
+
+        async def test_get_prometheus_metrics_failure(self):
+            """Test get_prometheus_metrics with failed response"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(success=False, response_type="error", error="Connection failed")
+            )
+            self.client._connected = True
+
+            result = await self.client.get_prometheus_metrics()
+            self.assertIsNone(result)
+
+        async def test_get_prometheus_metrics_command_format(self):
+            """Test get_prometheus_metrics command format"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="prometheus_metrics",
+                    data={"metrics_text": "", "timestamp_ms": 0}
+                )
+            )
+            self.client._connected = True
+
+            await self.client.get_prometheus_metrics()
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "get_prometheus_metrics")
+
+        async def test_get_prometheus_metrics_empty_data(self):
+            """Test get_prometheus_metrics with empty data field"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="prometheus_metrics",
+                    data=None
+                )
+            )
+            self.client._connected = True
+
+            result = await self.client.get_prometheus_metrics()
+            self.assertIsNone(result)
+
     class TestConvenienceFunctions(unittest.IsolatedAsyncioTestCase):
         """Test convenience functions"""
 
@@ -1337,9 +1450,14 @@ if __name__ == "__main__":
             result = await reload_config("/etc/config.json", "/nonexistent/socket.sock")
             self.assertFalse(result)
 
+        async def test_get_prometheus_metrics_unavailable(self):
+            """Test get_prometheus_metrics when server unavailable"""
+            result = await get_prometheus_metrics("/nonexistent/socket.sock")
+            self.assertIsNone(result)
+
     # CLI entry point
     parser = argparse.ArgumentParser(
-        description="Rust Router IPC Client (v3.0 - Phase 3.4)",
+        description="Rust Router IPC Client (v3.1 - Phase 3.4 + Prometheus Metrics)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1349,6 +1467,7 @@ Examples:
   %(prog)s outbound-stats              # Get per-outbound traffic stats
   %(prog)s list-outbounds              # List all outbounds
   %(prog)s health                      # Get outbound health status
+  %(prog)s metrics                     # Get Prometheus metrics
   %(prog)s reload -c /path/to/cfg      # Reload configuration
   %(prog)s shutdown                    # Request graceful shutdown
   %(prog)s test                        # Run comprehensive unit tests
@@ -1362,7 +1481,7 @@ Examples:
     parser.add_argument(
         "command",
         choices=["ping", "status", "stats", "outbound-stats", "list-outbounds",
-                 "health", "reload", "shutdown", "test"],
+                 "health", "metrics", "reload", "shutdown", "test"],
         help="Command to execute"
     )
     parser.add_argument(
@@ -1491,6 +1610,14 @@ Examples:
                             print(f"  error: {h.error}")
                         if h.last_check:
                             print(f"  last_check: {h.last_check}")
+                    return 0
+
+                elif args.command == "metrics":
+                    metrics = await client.get_prometheus_metrics()
+                    if metrics is None:
+                        error("Error: Failed to retrieve Prometheus metrics")
+                        return 1
+                    print(metrics.metrics_text, end="")
                     return 0
 
                 elif args.command == "reload":

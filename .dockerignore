@@ -123,6 +123,7 @@ debug_*.sh
 # ==========================================
 docker-compose.override.yml
 docker-compose.local.yml
+docker-compose.peer-test.yml
 Dockerfile.dev
 
 # ==========================================
@@ -133,9 +134,18 @@ xray-lite/xray-*
 xray-lite/upx
 
 # ==========================================
-# Rust router build artifacts
+# Rust router build artifacts (rebuilt in Docker)
 # ==========================================
 rust-router/target/
+
+# rust-router tests (not needed in production container)
+rust-router/tests/
+rust-router/review-reports/
+rust-router/docs/
+
+# rust-router generated config (created at runtime)
+config/rust-router.json
+config/rust-router.generated.json
 
 # ==========================================
 # Review reports (not needed in container)
@@ -149,4 +159,11 @@ review-reports/
 tmp/
 *.tmp
 *.bak
+*.sock
 /frontend/nginx.conf
+
+# ==========================================
+# Config directories not needed in build
+# ==========================================
+config-node*/
+test-config-rust/
