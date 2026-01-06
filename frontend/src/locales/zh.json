@@ -829,7 +829,9 @@
     "updateSuccess": "V2Ray 出口 '{{tag}}' 已更新",
     "deleteSuccess": "V2Ray 出口 '{{tag}}' 已删除",
     "confirmDelete": "确定要删除 V2Ray 出口 '{{tag}}' 吗？",
-    "fillRequiredFields": "请填写标识和服务器地址"
+    "fillRequiredFields": "请填写标识和服务器地址",
+    "deprecatedProtocol": "即将弃用",
+    "deprecatedProtocolTooltip": "VMess/Trojan 协议即将弃用，请迁移到 VLESS。"
   },
   "v2rayIngress": {
     "inbound": "V2Ray 入口",
@@ -928,7 +930,9 @@
     "configOption4": "VMess / Trojan",
     "configOption4Desc": "兼容旧版客户端，Trojan 需要设置密码",
     "supportedClients": "支持的客户端",
-    "clientList": "v2rayN (Windows)、v2rayNG (Android)、Shadowrocket (iOS)、Clash 等"
+    "clientList": "v2rayN (Windows)、v2rayNG (Android)、Shadowrocket (iOS)、Clash 等",
+    "deprecationWarning": "警告: VMess/Trojan 协议即将弃用，将在未来版本中移除。请迁移到 VLESS 协议。",
+    "deprecationMigrationDoc": "详见迁移指南: docs/VMESS_TROJAN_MIGRATION.md"
   },
   "language": {
     "title": "语言",

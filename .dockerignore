@@ -126,6 +126,23 @@ docker-compose.local.yml
 Dockerfile.dev
 
 # ==========================================
+# xray-lite build artifacts (rebuilt in Docker)
+# ==========================================
+xray-lite/xray
+xray-lite/xray-*
+xray-lite/upx
+
+# ==========================================
+# Rust router build artifacts
+# ==========================================
+rust-router/target/
+
+# ==========================================
+# Review reports (not needed in container)
+# ==========================================
+review-reports/
+
+# ==========================================
 # Misc
 # ==========================================
 .cache/

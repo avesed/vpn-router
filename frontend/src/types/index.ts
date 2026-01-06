@@ -620,8 +620,11 @@ export interface SpeedTestResponse {
 }
 
 // ============ V2Ray Egress Types ============
+// [Phase XL] Only VLESS is supported for new configs
+// VMess/Trojan kept in type for backwards compat (reading existing data)
 
 export type V2RayProtocol = "vmess" | "vless" | "trojan";
+export type V2RayProtocolSupported = "vless"; // Only VLESS supported in xray-lite
 export type V2RayTransport = "tcp" | "ws" | "grpc" | "h2" | "quic" | "httpupgrade" | "xhttp";
 
 export interface V2RayTransportConfig {
@@ -877,11 +880,13 @@ export interface RealityKeyPair {
 }
 
 // V2Ray protocol options for UI
+// [Phase XL] Only VLESS is supported - VMess/Trojan removed from xray-lite
 export const V2RAY_PROTOCOLS = [
-  { value: "vmess", label: "VMess", description: "VMess protocol" },
-  { value: "vless", label: "VLESS", description: "VLESS protocol (recommended)" },
-  { value: "trojan", label: "Trojan", description: "Trojan protocol" },
+  { value: "vless", label: "VLESS", description: "VLESS protocol with REALITY/XTLS-Vision" },
 ] as const;
+
+// Legacy protocol type for displaying existing configs (read-only)
+export type V2RayProtocolLegacy = "vmess" | "vless" | "trojan";
 
 export const V2RAY_TRANSPORTS = [
   { value: "tcp", label: "TCP", description: "Raw TCP" },

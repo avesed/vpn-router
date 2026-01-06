@@ -829,7 +829,9 @@
     "updateSuccess": "V2Ray egress '{{tag}}' updated",
     "deleteSuccess": "V2Ray egress '{{tag}}' deleted",
     "confirmDelete": "Are you sure you want to delete V2Ray egress '{{tag}}'?",
-    "fillRequiredFields": "Please fill in tag and server address"
+    "fillRequiredFields": "Please fill in tag and server address",
+    "deprecatedProtocol": "Deprecated",
+    "deprecatedProtocolTooltip": "VMess/Trojan protocols are deprecated. Please migrate to VLESS."
   },
   "v2rayIngress": {
     "inbound": "V2Ray Inbound",
@@ -928,7 +930,9 @@
     "configOption4": "VMess / Trojan",
     "configOption4Desc": "Compatible with legacy clients, Trojan requires password",
     "supportedClients": "Supported Clients",
-    "clientList": "v2rayN (Windows), v2rayNG (Android), Shadowrocket (iOS), Clash, etc."
+    "clientList": "v2rayN (Windows), v2rayNG (Android), Shadowrocket (iOS), Clash, etc.",
+    "deprecationWarning": "Warning: VMess/Trojan protocols are deprecated and will be removed in a future release. Please migrate to VLESS protocol.",
+    "deprecationMigrationDoc": "See migration guide: docs/VMESS_TROJAN_MIGRATION.md"
   },
   "language": {
     "title": "Language",

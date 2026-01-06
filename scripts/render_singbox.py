@@ -1286,9 +1286,25 @@ def load_v2ray_egress() -> List[dict]:
 
 
 def _build_v2ray_outbound(egress: dict) -> dict:
-    """构建 V2Ray outbound 配置（支持 VMess, VLESS, Trojan）"""
+    """构建 V2Ray outbound 配置 - VLESS only (VMess/Trojan removed in Xray-lite)"""
     protocol = egress.get("protocol")
     tag = egress.get("tag")
+
+    # [Xray-lite] 仅支持 VLESS
+    if protocol == "vmess":
+        raise ValueError(
+            f"VMess protocol is no longer supported in Xray-lite. "
+            f"Egress '{tag}' uses VMess. Please migrate to VLESS. "
+            "See docs/VMESS_TROJAN_MIGRATION.md"
+        )
+    elif protocol == "trojan":
+        raise ValueError(
+            f"Trojan protocol is no longer supported in Xray-lite. "
+            f"Egress '{tag}' uses Trojan. Please migrate to VLESS. "
+            "See docs/VMESS_TROJAN_MIGRATION.md"
+        )
+    elif protocol != "vless":
+        raise ValueError(f"Unsupported protocol: {protocol}. Only 'vless' is supported.")
 
     outbound = {
         "type": protocol,
@@ -1297,18 +1313,10 @@ def _build_v2ray_outbound(egress: dict) -> dict:
         "server_port": egress.get("server_port", 443),
     }
 
-    # Protocol-specific auth
-    if protocol == "vmess":
-        outbound["uuid"] = egress.get("uuid")
-        outbound["security"] = egress.get("security", "auto")
-        if egress.get("alter_id"):
-            outbound["alter_id"] = egress.get("alter_id")
-    elif protocol == "vless":
-        outbound["uuid"] = egress.get("uuid")
-        if egress.get("flow"):
-            outbound["flow"] = egress.get("flow")
-    elif protocol == "trojan":
-        outbound["password"] = egress.get("password")
+    # VLESS auth
+    outbound["uuid"] = egress.get("uuid")
+    if egress.get("flow"):
+        outbound["flow"] = egress.get("flow")
 
     # TLS configuration
     if egress.get("tls_enabled"):
@@ -2041,21 +2049,26 @@ def ensure_v2ray_inbound(config: dict) -> bool:
         return False
 
     # 以下是旧的 sing-box 内置 V2Ray 支持（保留供参考但不再使用）
+    # [Xray-lite] 现仅支持 VLESS，VMess/Trojan 已移除
     inbounds = config.setdefault("inbounds", [])
     users = v2ray_config["users"]
     protocol = cfg.get("protocol")
 
-    # Build users list
+    # [Xray-lite] 验证协议 - 仅支持 VLESS
+    if protocol != "vless":
+        raise ValueError(
+            f"Only VLESS protocol is supported in Xray-lite. "
+            f"Current protocol: {protocol}. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
+
+    # Build users list - VLESS only
     users_config = []
     for user in users:
-        user_cfg = {"name": user.get("name")}
-        if protocol in ("vmess", "vless"):
-            user_cfg["uuid"] = user.get("uuid")
-        elif protocol == "trojan":
-            user_cfg["password"] = user.get("password")
-        if protocol == "vmess" and user.get("alter_id"):
-            user_cfg["alter_id"] = user.get("alter_id")
-        if protocol == "vless" and user.get("flow"):
+        user_cfg = {
+            "name": user.get("name"),
+            "uuid": user.get("uuid")
+        }
+        if user.get("flow"):
             user_cfg["flow"] = user.get("flow")
         users_config.append(user_cfg)
 
@@ -2720,7 +2733,7 @@ def main() -> None:
         ensure_openvpn_dns_servers(config, openvpn_tags)
         all_egress_tags.extend(openvpn_tags)
 
-    # 加载并处理 V2Ray 出口（支持 VMess, VLESS, Trojan）
+    # 加载并处理 V2Ray 出口 - VLESS only (VMess/Trojan removed in Xray-lite)
     # 使用 Xray 进程处理所有 V2Ray 出口，通过 SOCKS5 代理桥接
     # Xray 提供 sing-box 不支持的功能：XHTTP, REALITY, XTLS-Vision
     v2ray_egress = load_v2ray_egress()

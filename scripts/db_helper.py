@@ -1561,7 +1561,7 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
-    # ============ V2Ray Egress 管理（支持 VMess, VLESS, Trojan）============
+    # ============ V2Ray Egress 管理 (VLESS only - Xray-lite) ============
 
     # SOCKS 端口起始值（可通过环境变量配置，与 OpenVPN 37001 错开）
     V2RAY_EGRESS_SOCKS_PORT_START = int(os.environ.get("V2RAY_SOCKS_PORT_BASE", "37101"))
@@ -1692,6 +1692,13 @@ class UserDatabase:
         Returns:
             新创建记录的 ID
         """
+        # [Xray-lite] 仅支持 VLESS 协议
+        if protocol != "vless":
+            raise ValueError(
+                f"Only 'vless' protocol is supported in Xray-lite. Got: '{protocol}'. "
+                "VMess and Trojan have been removed. See docs/VMESS_TROJAN_MIGRATION.md"
+            )
+
         # 自动分配 SOCKS 端口
         socks_port = self.get_next_v2ray_egress_socks_port()
         tls_alpn_json = json.dumps(tls_alpn) if tls_alpn else None

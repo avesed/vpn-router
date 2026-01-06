@@ -1007,27 +1007,18 @@ class XrayManager:
             }
 
         elif protocol == "vmess":
-            clients = []
-            for user in users:
-                email = user.get("email") or user.get("name") or "user"
-                clients.append({
-                    "id": user.get("uuid"),
-                    "alterId": user.get("alter_id", 0),
-                    "email": email,
-                    "level": 0  # 关联到 policy.levels.0 以启用 per-user 统计
-                })
-            inbound["settings"] = {"clients": clients}
+            # [REMOVED in Xray-lite] VMess 协议已从 Xray-lite 中移除
+            raise ValueError(
+                "VMess protocol is no longer supported in Xray-lite. "
+                "Please migrate to VLESS protocol. See docs/VMESS_TROJAN_MIGRATION.md"
+            )
 
         elif protocol == "trojan":
-            clients = []
-            for user in users:
-                email = user.get("email") or user.get("name") or "user"
-                clients.append({
-                    "password": user.get("password"),
-                    "email": email,
-                    "level": 0  # 关联到 policy.levels.0 以启用 per-user 统计
-                })
-            inbound["settings"] = {"clients": clients}
+            # [REMOVED in Xray-lite] Trojan 协议已从 Xray-lite 中移除
+            raise ValueError(
+                "Trojan protocol is no longer supported in Xray-lite. "
+                "Please migrate to VLESS protocol. See docs/VMESS_TROJAN_MIGRATION.md"
+            )
 
         # 流设置
         transport_type = config.get("transport_type", "tcp")

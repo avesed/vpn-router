@@ -59,7 +59,8 @@ except ImportError:
     print("WARNING: Database helper not available, falling back to JSON storage")
 
 try:
-    from v2ray_uri_parser import parse_v2ray_uri, generate_vmess_uri, generate_vless_uri, generate_trojan_uri
+    # [Xray-lite] Only import VLESS-related functions; VMess/Trojan removed
+    from v2ray_uri_parser import parse_v2ray_uri, generate_vless_uri
     HAS_V2RAY_PARSER = True
 except ImportError:
     HAS_V2RAY_PARSER = False
@@ -1137,18 +1138,15 @@ class BackupImportRequest(BaseModel):
 # ============ V2Ray Egress/Inbound Models ============
 
 class V2RayEgressCreateRequest(BaseModel):
-    """创建 V2Ray 出口 (VMess/VLESS/Trojan)"""
+    """创建 V2Ray 出口 (VLESS only - VMess/Trojan removed in Xray-lite)"""
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
     description: str = Field("", description="描述")
-    protocol: str = Field(..., description="协议 (vmess/vless/trojan)")
+    protocol: str = Field("vless", description="协议 (仅支持 vless)")
     server: str = Field(..., description="服务器地址")
     server_port: int = Field(443, ge=1, le=65535, description="服务器端口")
-    # Auth
-    uuid: Optional[str] = Field(None, description="UUID (VMess/VLESS)")
-    password: Optional[str] = Field(None, description="密码 (Trojan)")
-    # VMess specific
-    security: str = Field("auto", description="VMess 加密方式")
-    alter_id: int = Field(0, ge=0, description="VMess alterId")
+    # Auth (VLESS)
+    uuid: Optional[str] = Field(None, description="UUID (VLESS)")
+    # [REMOVED] password, security, alter_id - VMess/Trojan fields removed in Xray-lite
     # VLESS specific
     flow: Optional[str] = Field(None, description="VLESS flow (xtls-rprx-vision)")
     # TLS
@@ -1173,15 +1171,13 @@ class V2RayEgressCreateRequest(BaseModel):
 
 
 class V2RayEgressUpdateRequest(BaseModel):
-    """更新 V2Ray 出口"""
+    """更新 V2Ray 出口 (VLESS only - Xray-lite)"""
     description: Optional[str] = None
     protocol: Optional[str] = None
     server: Optional[str] = None
     server_port: Optional[int] = Field(None, ge=1, le=65535)
     uuid: Optional[str] = None
-    password: Optional[str] = None
-    security: Optional[str] = None
-    alter_id: Optional[int] = Field(None, ge=0)
+    # [REMOVED in Xray-lite] password, security, alter_id - VMess/Trojan fields removed
     flow: Optional[str] = None
     tls_enabled: Optional[bool] = None
     tls_sni: Optional[str] = None
@@ -1202,13 +1198,13 @@ class V2RayEgressUpdateRequest(BaseModel):
 
 
 class V2RayURIParseRequest(BaseModel):
-    """解析 V2Ray URI (vmess://, vless://, trojan://)"""
-    uri: str = Field(..., description="V2Ray 分享链接")
+    """解析 V2Ray URI (仅支持 vless:// - VMess/Trojan removed in Xray-lite)"""
+    uri: str = Field(..., description="V2Ray 分享链接 (vless:// only)")
 
 
 class V2RayInboundUpdateRequest(BaseModel):
-    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
-    protocol: str = Field("vless", description="协议 (vmess/vless/trojan)")
+    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）- VLESS only"""
+    protocol: str = Field("vless", description="协议 (仅支持 vless)")
     listen_address: str = Field("0.0.0.0", description="监听地址")
     listen_port: int = Field(443, ge=1, le=65535, description="监听端口")
     tls_enabled: bool = Field(True, description="启用 TLS")
@@ -1238,21 +1234,19 @@ class V2RayInboundUpdateRequest(BaseModel):
 
 
 class V2RayUserCreateRequest(BaseModel):
-    """创建 V2Ray 用户"""
+    """创建 V2Ray 用户 (VLESS only - Xray-lite)"""
     name: str = Field(..., pattern=r"^[a-zA-Z][a-zA-Z0-9_-]*$", description="用户名")
     email: Optional[str] = Field(None, description="邮箱")
-    uuid: Optional[str] = Field(None, description="UUID (VMess/VLESS，不填自动生成)")
-    password: Optional[str] = Field(None, description="密码 (Trojan)")
-    alter_id: int = Field(0, ge=0, description="VMess alterId")
-    flow: Optional[str] = Field(None, description="VLESS flow")
+    uuid: Optional[str] = Field(None, description="UUID (VLESS，不填自动生成)")
+    # [REMOVED in Xray-lite] password, alter_id - VMess/Trojan fields removed
+    flow: Optional[str] = Field(None, description="VLESS flow (xtls-rprx-vision)")
 
 
 class V2RayUserUpdateRequest(BaseModel):
-    """更新 V2Ray 用户"""
+    """更新 V2Ray 用户 (VLESS only - Xray-lite)"""
     email: Optional[str] = None
     uuid: Optional[str] = None
-    password: Optional[str] = None
-    alter_id: Optional[int] = Field(None, ge=0)
+    # [REMOVED in Xray-lite] password, alter_id - VMess/Trojan fields removed
     flow: Optional[str] = None
     enabled: Optional[int] = Field(None, ge=0, le=1)
 
@@ -6390,9 +6384,13 @@ def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
     """创建 V2Ray 出口"""
     db = _get_db()
 
-    # 验证协议
-    if payload.protocol not in ("vmess", "vless", "trojan"):
-        raise HTTPException(status_code=400, detail=f"Invalid protocol: {payload.protocol}")
+    # 验证协议 - [Xray-lite] 仅支持 VLESS
+    if payload.protocol != "vless":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid protocol: {payload.protocol}. Only 'vless' is supported in Xray-lite. "
+            "VMess and Trojan have been removed. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
 
     # 检查 tag 是否已存在
     if db.get_v2ray_egress(payload.tag):
@@ -6411,11 +6409,9 @@ def api_create_v2ray_egress(payload: V2RayEgressCreateRequest):
     if payload.tag in pia_tags:
         raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with PIA profile")
 
-    # 验证认证信息
-    if payload.protocol in ("vmess", "vless") and not payload.uuid:
-        raise HTTPException(status_code=400, detail=f"{payload.protocol.upper()} requires UUID")
-    if payload.protocol == "trojan" and not payload.password:
-        raise HTTPException(status_code=400, detail="Trojan requires password")
+    # 验证认证信息 - VLESS 需要 UUID
+    if not payload.uuid:
+        raise HTTPException(status_code=400, detail="VLESS requires UUID")
 
     # 构建 transport_config JSON
     transport_config_json = json.dumps(payload.transport_config) if payload.transport_config else None
@@ -7518,20 +7514,18 @@ def api_get_v2ray_inbound():
 
 @app.put("/api/ingress/v2ray")
 def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
-    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）"""
+    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）- VLESS only"""
     db = _get_db()
 
-    # 验证协议
-    if payload.protocol not in ("vmess", "vless", "trojan"):
-        raise HTTPException(status_code=400, detail=f"Invalid protocol: {payload.protocol}")
+    # 验证协议 - [Xray-lite] 仅支持 VLESS
+    if payload.protocol != "vless":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid protocol: {payload.protocol}. Only 'vless' is supported in Xray-lite. "
+            "VMess and Trojan have been removed. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
 
-    # XTLS-Vision 只支持 VLESS
-    if payload.xtls_vision_enabled and payload.protocol != "vless":
-        raise HTTPException(status_code=400, detail="XTLS-Vision is only available for VLESS protocol")
-
-    # REALITY 只支持 VLESS
-    if payload.reality_enabled and payload.protocol != "vless":
-        raise HTTPException(status_code=400, detail="REALITY is only available for VLESS protocol")
+    # Note: XTLS-Vision and REALITY checks removed - they are implicitly VLESS-only now
 
     # REALITY 需要密钥和目标服务器
     if payload.reality_enabled:
@@ -7830,22 +7824,28 @@ def api_get_v2ray_user_share_uri(user_id: int):
     else:
         server_flow = ""
 
-    # 构建分享链接
+    # 构建分享链接 - [Xray-lite] 仅支持 VLESS
     if protocol == "vmess":
-        share_config["uuid"] = user.get("uuid")
-        share_config["alter_id"] = user.get("alter_id", 0)
-        share_config["security"] = user.get("security", "auto")
-        uri = generate_vmess_uri(share_config)
+        # [REMOVED in Xray-lite]
+        raise HTTPException(
+            status_code=400,
+            detail="VMess protocol is no longer supported in Xray-lite. "
+            "Please migrate to VLESS. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     elif protocol == "vless":
         share_config["uuid"] = user.get("uuid")
         # Flow 从服务端配置获取，不再从用户配置获取
         share_config["flow"] = server_flow
         uri = generate_vless_uri(share_config)
     elif protocol == "trojan":
-        share_config["password"] = user.get("password")
-        uri = generate_trojan_uri(share_config)
+        # [REMOVED in Xray-lite]
+        raise HTTPException(
+            status_code=400,
+            detail="Trojan protocol is no longer supported in Xray-lite. "
+            "Please migrate to VLESS. See docs/VMESS_TROJAN_MIGRATION.md"
+        )
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported protocol: {protocol}")
+        raise HTTPException(status_code=400, detail=f"Unsupported protocol: {protocol}. Only 'vless' is supported.")
 
     return {"uri": uri, "protocol": protocol, "user": user.get("name")}
 
@@ -10242,13 +10242,23 @@ def api_import_backup(payload: BackupImportRequest):
                     db.delete_v2ray_egress(eg["tag"])
 
             existing_tags = {eg["tag"] for eg in db.get_v2ray_egress_list(enabled_only=False)}
+            skipped_count = 0
             for eg in backup_data["v2ray_egress"]:
                 tag = eg.get("tag", "")
+                protocol = eg.get("protocol", "vless")
+
+                # [Xray-lite] Skip VMess/Trojan egress from backup - only VLESS supported
+                if protocol != "vless":
+                    print(f"[backup] Skipping unsupported protocol '{protocol}' for egress '{tag}' - "
+                          "only VLESS is supported in Xray-lite. See docs/VMESS_TROJAN_MIGRATION.md")
+                    skipped_count += 1
+                    continue
+
                 if tag and tag not in existing_tags:
                     sens = sensitive_by_tag.get(tag, {})
                     db.add_v2ray_egress(
                         tag=tag,
-                        protocol=eg.get("protocol", "vless"),
+                        protocol=protocol,
                         server=eg.get("server", ""),
                         server_port=eg.get("server_port", 443),
                         description=eg.get("description", ""),

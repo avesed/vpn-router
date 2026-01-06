@@ -1,43 +1,59 @@
 # ==========================================
-# Stage 1: Download Xray binary
+# Stage 1: Build xray-lite from source
 # ==========================================
-FROM debian:12-slim AS xray-downloader
+# [Phase XL] Build minimized Xray supporting only VLESS + XHTTP + REALITY
+# This reduces binary from ~21MB to ~5.7MB (with UPX --best --lzma)
+# See xray-lite/README.md for details on removed protocols
+FROM golang:1.25-bookworm AS xray-builder
 
-ARG XRAY_VERSION=25.12.8
 ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    unzip \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Download and extract Xray with checksum verification (C5 security fix)
-# amd64 -> Xray-linux-64.zip
-# arm64 -> Xray-linux-arm64-v8a.zip
-# SHA256 checksums from official Xray release
-RUN XRAY_ARCH="" && \
-    if [ "$TARGETARCH" = "amd64" ]; then XRAY_ARCH="64"; \
-    elif [ "$TARGETARCH" = "arm64" ]; then XRAY_ARCH="arm64-v8a"; \
-    else echo "Unsupported architecture: $TARGETARCH" && exit 1; fi && \
-    XRAY_ZIP="Xray-linux-${XRAY_ARCH}.zip" && \
-    XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${XRAY_ZIP}" && \
-    CHECKSUM_URL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/${XRAY_ZIP}.dgst" && \
-    curl -fsSL -o /tmp/xray.zip "${XRAY_URL}" && \
-    curl -fsSL -o /tmp/xray.zip.dgst "${CHECKSUM_URL}" && \
-    cd /tmp && \
-    EXPECTED_SHA256=$(grep "SHA2-256" xray.zip.dgst | awk '{print $2}') && \
-    ACTUAL_SHA256=$(sha256sum xray.zip | awk '{print $1}') && \
-    if [ "${EXPECTED_SHA256}" != "${ACTUAL_SHA256}" ]; then \
-        echo "Xray checksum verification FAILED!" && \
-        echo "Expected: ${EXPECTED_SHA256}" && \
-        echo "Actual:   ${ACTUAL_SHA256}" && \
-        exit 1; \
+# Download UPX for binary compression (~70% size reduction)
+# UPX not available in Debian bookworm repos, downloading from GitHub
+# SHA256 checksums verified from official UPX releases (supply chain security)
+RUN UPX_VERSION="4.2.4" && \
+    UPX_ARCH="amd64" && \
+    UPX_SHA256="75cab4e57ab72fb4585ee45ff36388d280c7afd72aa03e8d4b9c3cbddb474193" && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        UPX_ARCH="arm64"; \
+        UPX_SHA256="6bfeae6714e34a82e63245289888719c41fd6af29f749a44ae3d3d166ba6a1c9"; \
     fi && \
-    echo "Xray checksum verified successfully" && \
-    unzip xray.zip && \
-    chmod +x xray && \
-    mv xray /usr/local/bin/xray
+    apt-get update && apt-get install -y --no-install-recommends curl xz-utils && \
+    curl -fsSL -o /tmp/upx.tar.xz "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-${UPX_ARCH}_linux.tar.xz" && \
+    echo "${UPX_SHA256}  /tmp/upx.tar.xz" | sha256sum -c - && \
+    tar -xJf /tmp/upx.tar.xz -C /tmp && \
+    mv /tmp/upx-${UPX_VERSION}-${UPX_ARCH}_linux/upx /usr/local/bin/upx && \
+    chmod +x /usr/local/bin/upx && \
+    rm -rf /tmp/upx* && \
+    apt-get remove -y curl xz-utils && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy xray-lite source code (minimized Xray fork)
+COPY xray-lite/ .
+
+# Build release binary with optimizations:
+# - CGO_ENABLED=0: Static binary, no libc dependency
+# - netgo: Pure Go DNS resolver (no cgo)
+# - -s -w: Strip symbols and DWARF debug info
+# - -trimpath: Remove local paths from binary
+# - -buildid=: Empty build ID for reproducibility
+RUN BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && \
+    LDFLAGS="-s -w -buildid= -X github.com/xtls/xray-core/core.build=${BUILD_DATE}" && \
+    echo "Building xray-lite for ${TARGETARCH}..." && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+        -tags="netgo" \
+        -ldflags="${LDFLAGS}" \
+        -trimpath \
+        -o /xray \
+        ./main && \
+    echo "Build complete, size before UPX:" && \
+    ls -lh /xray && \
+    echo "Applying UPX compression (--best --lzma)..." && \
+    upx --best --lzma /xray && \
+    echo "Final size after UPX:" && \
+    ls -lh /xray
 
 # ==========================================
 # Stage 2: Download usque binary (WARP MASQUE)
@@ -161,8 +177,9 @@ RUN set -eux; \
 COPY --from=singbox-builder /sing-box /usr/local/bin/sing-box
 RUN chmod +x /usr/local/bin/sing-box
 
-# Copy Xray binary for V2Ray ingress (XTLS-Vision, REALITY support)
-COPY --from=xray-downloader /usr/local/bin/xray /usr/local/bin/xray
+# Copy xray-lite binary (minimized Xray: VLESS + XHTTP + REALITY only)
+# [Phase XL] ~5.7MB vs ~25MB official Xray binary (77% size reduction)
+COPY --from=xray-builder /xray /usr/local/bin/xray
 RUN chmod +x /usr/local/bin/xray
 
 # Copy usque binary for WARP MASQUE protocol support

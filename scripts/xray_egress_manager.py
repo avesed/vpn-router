@@ -147,26 +147,20 @@ class XrayEgressManager:
                 outbound["settings"]["vnext"][0]["users"][0]["flow"] = egress["flow"]
 
         elif protocol == "vmess":
-            outbound["settings"] = {
-                "vnext": [{
-                    "address": server,
-                    "port": server_port,
-                    "users": [{
-                        "id": egress.get("uuid"),
-                        "alterId": egress.get("alter_id", 0),
-                        "security": egress.get("security", "auto")
-                    }]
-                }]
-            }
+            # [REMOVED in Xray-lite] VMess 协议已从 Xray-lite 中移除
+            raise ValueError(
+                f"VMess protocol is no longer supported in Xray-lite. "
+                f"Egress '{tag}' uses VMess. Please migrate to VLESS protocol. "
+                "See docs/VMESS_TROJAN_MIGRATION.md"
+            )
 
         elif protocol == "trojan":
-            outbound["settings"] = {
-                "servers": [{
-                    "address": server,
-                    "port": server_port,
-                    "password": egress.get("password")
-                }]
-            }
+            # [REMOVED in Xray-lite] Trojan 协议已从 Xray-lite 中移除
+            raise ValueError(
+                f"Trojan protocol is no longer supported in Xray-lite. "
+                f"Egress '{tag}' uses Trojan. Please migrate to VLESS protocol. "
+                "See docs/VMESS_TROJAN_MIGRATION.md"
+            )
 
         # 流设置
         transport_type = egress.get("transport_type", "tcp")
