@@ -1,0 +1,393 @@
+{
+  "version": "1.0",
+  "description": "Failover scenario test vectors for health checks, IPC, and shutdown",
+  "generated_at": "2026-01-06T00:00:00Z",
+  "total_cases": 30,
+  "categories": {
+    "health_check": 8,
+    "ipc_protocol": 10,
+    "graceful_shutdown": 6,
+    "connection_drain": 6
+  },
+  "test_cases": [
+    {
+      "id": "health_001",
+      "category": "health_check",
+      "description": "Ping returns Pong",
+      "input": {
+        "command": "Ping"
+      },
+      "expected": {
+        "response_type": "Pong"
+      }
+    },
+    {
+      "id": "health_002",
+      "category": "health_check",
+      "description": "Status returns server info",
+      "input": {
+        "command": "Status"
+      },
+      "expected": {
+        "response_type": "Status",
+        "fields": ["version", "uptime_secs", "active_connections", "shutting_down"]
+      }
+    },
+    {
+      "id": "health_003",
+      "category": "health_check",
+      "description": "GetCapabilities returns supported features",
+      "input": {
+        "command": "GetCapabilities"
+      },
+      "expected": {
+        "response_type": "Capabilities",
+        "fields": ["supports_tcp", "supports_udp", "max_connections"]
+      }
+    },
+    {
+      "id": "health_004",
+      "category": "health_check",
+      "description": "GetStats returns connection statistics",
+      "input": {
+        "command": "GetStats"
+      },
+      "expected": {
+        "response_type": "Stats",
+        "fields": ["total_accepted", "active", "total_bytes_in", "total_bytes_out"]
+      }
+    },
+    {
+      "id": "health_005",
+      "category": "health_check",
+      "description": "GetOutboundHealth returns per-outbound health",
+      "input": {
+        "command": "GetOutboundHealth"
+      },
+      "expected": {
+        "response_type": "OutboundHealth",
+        "fields": ["outbounds", "overall_health"]
+      }
+    },
+    {
+      "id": "health_006",
+      "category": "health_check",
+      "description": "Healthy outbound has status 'healthy'",
+      "input": {
+        "outbound_tag": "direct",
+        "check_type": "health_status"
+      },
+      "expected": {
+        "status": "healthy"
+      }
+    },
+    {
+      "id": "health_007",
+      "category": "health_check",
+      "description": "Unknown outbound returns error",
+      "input": {
+        "command": "GetOutbound",
+        "tag": "nonexistent"
+      },
+      "expected": {
+        "response_type": "Error",
+        "error_code": "NotFound"
+      }
+    },
+    {
+      "id": "health_008",
+      "category": "health_check",
+      "description": "Ping latency should be under 100ms",
+      "input": {
+        "command": "Ping",
+        "measure_latency": true
+      },
+      "expected": {
+        "max_latency_ms": 100
+      }
+    },
+    {
+      "id": "ipc_001",
+      "category": "ipc_protocol",
+      "description": "ListOutbounds returns all outbounds",
+      "input": {
+        "command": "ListOutbounds"
+      },
+      "expected": {
+        "response_type": "OutboundList",
+        "min_outbounds": 1
+      }
+    },
+    {
+      "id": "ipc_002",
+      "category": "ipc_protocol",
+      "description": "GetOutbound returns outbound info",
+      "input": {
+        "command": "GetOutbound",
+        "tag": "direct"
+      },
+      "expected": {
+        "response_type": "OutboundInfo",
+        "tag": "direct"
+      }
+    },
+    {
+      "id": "ipc_003",
+      "category": "ipc_protocol",
+      "description": "AddOutbound creates new outbound",
+      "input": {
+        "command": "AddOutbound",
+        "config": {
+          "tag": "test-out",
+          "outbound_type": "direct"
+        }
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "ipc_004",
+      "category": "ipc_protocol",
+      "description": "AddOutbound fails for duplicate tag",
+      "input": {
+        "command": "AddOutbound",
+        "config": {
+          "tag": "direct",
+          "outbound_type": "direct"
+        }
+      },
+      "expected": {
+        "response_type": "Error",
+        "error_code": "AlreadyExists"
+      }
+    },
+    {
+      "id": "ipc_005",
+      "category": "ipc_protocol",
+      "description": "RemoveOutbound deletes outbound",
+      "input": {
+        "command": "RemoveOutbound",
+        "tag": "test-out"
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "ipc_006",
+      "category": "ipc_protocol",
+      "description": "RemoveOutbound fails for nonexistent",
+      "input": {
+        "command": "RemoveOutbound",
+        "tag": "nonexistent"
+      },
+      "expected": {
+        "response_type": "Error",
+        "error_code": "NotFound"
+      }
+    },
+    {
+      "id": "ipc_007",
+      "category": "ipc_protocol",
+      "description": "EnableOutbound enables outbound",
+      "input": {
+        "command": "EnableOutbound",
+        "tag": "direct"
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "ipc_008",
+      "category": "ipc_protocol",
+      "description": "DisableOutbound disables outbound",
+      "input": {
+        "command": "DisableOutbound",
+        "tag": "direct"
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "ipc_009",
+      "category": "ipc_protocol",
+      "description": "GetRuleStats returns rule statistics",
+      "input": {
+        "command": "GetRuleStats"
+      },
+      "expected": {
+        "response_type": "RuleStats",
+        "fields": ["domain_rules", "geoip_rules", "config_version", "default_outbound"]
+      }
+    },
+    {
+      "id": "ipc_010",
+      "category": "ipc_protocol",
+      "description": "SetDefaultOutbound changes default",
+      "input": {
+        "command": "SetDefaultOutbound",
+        "tag": "proxy"
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "shutdown_001",
+      "category": "graceful_shutdown",
+      "description": "Shutdown with timeout returns success",
+      "input": {
+        "command": "Shutdown",
+        "drain_timeout_secs": 30
+      },
+      "expected": {
+        "response_type": "Success",
+        "message_contains": "Shutdown"
+      }
+    },
+    {
+      "id": "shutdown_002",
+      "category": "graceful_shutdown",
+      "description": "Shutdown without timeout uses default",
+      "input": {
+        "command": "Shutdown",
+        "drain_timeout_secs": null
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "shutdown_003",
+      "category": "graceful_shutdown",
+      "description": "Shutdown with zero timeout",
+      "input": {
+        "command": "Shutdown",
+        "drain_timeout_secs": 0
+      },
+      "expected": {
+        "response_type": "Success"
+      }
+    },
+    {
+      "id": "shutdown_004",
+      "category": "graceful_shutdown",
+      "description": "Server status shows shutting_down after shutdown",
+      "input": {
+        "sequence": ["Shutdown", "Status"]
+      },
+      "expected": {
+        "status_shutting_down": true
+      }
+    },
+    {
+      "id": "shutdown_005",
+      "category": "graceful_shutdown",
+      "description": "Server stops accepting after shutdown",
+      "input": {
+        "sequence": ["Shutdown", "Status"]
+      },
+      "expected": {
+        "status_accepting": false
+      }
+    },
+    {
+      "id": "shutdown_006",
+      "category": "graceful_shutdown",
+      "description": "Connections drain before exit",
+      "input": {
+        "scenario": "drain_before_exit",
+        "active_connections": 10,
+        "drain_timeout_secs": 5
+      },
+      "expected": {
+        "connections_drained": true
+      }
+    },
+    {
+      "id": "drain_001",
+      "category": "connection_drain",
+      "description": "DrainOutbound succeeds for existing outbound",
+      "input": {
+        "command": "DrainOutbound",
+        "tag": "direct",
+        "timeout_secs": 5
+      },
+      "expected": {
+        "response_type": "DrainResult",
+        "success": true
+      }
+    },
+    {
+      "id": "drain_002",
+      "category": "connection_drain",
+      "description": "DrainOutbound fails for nonexistent",
+      "input": {
+        "command": "DrainOutbound",
+        "tag": "nonexistent",
+        "timeout_secs": 5
+      },
+      "expected": {
+        "response_type": "Error",
+        "error_code": "NotFound"
+      }
+    },
+    {
+      "id": "drain_003",
+      "category": "connection_drain",
+      "description": "DrainOutbound with zero timeout",
+      "input": {
+        "command": "DrainOutbound",
+        "tag": "direct",
+        "timeout_secs": 0
+      },
+      "expected": {
+        "response_type": "DrainResult",
+        "success": true,
+        "max_drain_time_ms": 100
+      }
+    },
+    {
+      "id": "drain_004",
+      "category": "connection_drain",
+      "description": "Drain returns drained count",
+      "input": {
+        "command": "DrainOutbound",
+        "tag": "proxy",
+        "timeout_secs": 5
+      },
+      "expected": {
+        "response_type": "DrainResult",
+        "fields": ["success", "drained_count", "force_closed_count", "drain_time_ms"]
+      }
+    },
+    {
+      "id": "drain_005",
+      "category": "connection_drain",
+      "description": "Drain disables outbound",
+      "input": {
+        "sequence": ["DrainOutbound", "GetOutbound"],
+        "tag": "test-drain"
+      },
+      "expected": {
+        "outbound_removed": true
+      }
+    },
+    {
+      "id": "drain_006",
+      "category": "connection_drain",
+      "description": "Force close after timeout",
+      "input": {
+        "scenario": "active_connections",
+        "active_count": 5,
+        "timeout_secs": 1
+      },
+      "expected": {
+        "force_closed_count": 5
+      }
+    }
+  ]
+}

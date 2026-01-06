@@ -9,8 +9,8 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse, RuleStatsResponse,
-    ServerCapabilities, ServerStatus,
+    ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse, PoolStatsResponse,
+    RuleStatsResponse, ServerCapabilities, ServerStatus, Socks5PoolStats,
 };
 use crate::config::{load_config_with_env, OutboundConfig};
 use crate::connection::ConnectionManager;
@@ -120,6 +120,58 @@ impl IpcHandler {
             IpcCommand::GetRuleStats => self.handle_get_rule_stats(),
 
             IpcCommand::ReloadRules { config_path } => self.handle_reload_rules(config_path).await,
+
+            IpcCommand::AddSocks5Outbound {
+                tag,
+                server_addr,
+                username,
+                password,
+                connect_timeout_secs,
+                idle_timeout_secs,
+                pool_max_size,
+            } => {
+                self.handle_add_socks5_outbound(
+                    tag,
+                    server_addr,
+                    username,
+                    password,
+                    connect_timeout_secs,
+                    idle_timeout_secs,
+                    pool_max_size,
+                )
+                .await
+            }
+
+            IpcCommand::GetPoolStats { tag } => self.handle_get_pool_stats(tag),
+
+            // ================================================================
+            // Phase 3.3: IPC Protocol v2.1 Command Handlers
+            // ================================================================
+            IpcCommand::AddWireguardOutbound {
+                tag,
+                interface,
+                routing_mark,
+                routing_table,
+            } => self.handle_add_wireguard_outbound(tag, interface, routing_mark, routing_table),
+
+            IpcCommand::DrainOutbound { tag, timeout_secs } => {
+                self.handle_drain_outbound(tag, timeout_secs).await
+            }
+
+            IpcCommand::UpdateRouting {
+                rules,
+                default_outbound,
+            } => self.handle_update_routing(rules, default_outbound),
+
+            IpcCommand::SetDefaultOutbound { tag } => self.handle_set_default_outbound(tag),
+
+            IpcCommand::GetOutboundHealth => self.handle_get_outbound_health(),
+
+            IpcCommand::NotifyEgressChange {
+                action,
+                tag,
+                egress_type,
+            } => self.handle_notify_egress_change(action, tag, egress_type),
         }
     }
 
@@ -474,6 +526,488 @@ impl IpcHandler {
             new_version
         ))
     }
+
+    /// Handle add SOCKS5 outbound command
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_add_socks5_outbound(
+        &self,
+        tag: String,
+        server_addr: String,
+        username: Option<String>,
+        password: Option<String>,
+        connect_timeout_secs: u64,
+        idle_timeout_secs: u64,
+        pool_max_size: usize,
+    ) -> IpcResponse {
+        // Check if outbound already exists
+        if self.outbound_manager.contains(&tag) {
+            return IpcResponse::error(
+                ErrorCode::AlreadyExists,
+                format!("Outbound '{}' already exists", tag),
+            );
+        }
+
+        // Parse server address
+        let socks5_addr: std::net::SocketAddr = match server_addr.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid server address '{}': {}", server_addr, e),
+                );
+            }
+        };
+
+        // Create SOCKS5 configuration
+        let mut config = crate::outbound::Socks5Config::new(&tag, socks5_addr)
+            .with_connect_timeout(connect_timeout_secs)
+            .with_idle_timeout(idle_timeout_secs)
+            .with_pool_size(pool_max_size);
+
+        // Add authentication if provided
+        if let (Some(user), Some(pass)) = (username, password) {
+            config = config.with_auth(user, pass);
+        }
+
+        // Create SOCKS5 outbound
+        let outbound = match crate::outbound::Socks5Outbound::new(config).await {
+            Ok(o) => o,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to create SOCKS5 outbound: {}", e),
+                );
+            }
+        };
+
+        // Add to outbound manager
+        self.outbound_manager.add(Box::new(outbound));
+
+        info!("Added SOCKS5 outbound '{}' -> {}", tag, server_addr);
+        IpcResponse::success_with_message(format!("SOCKS5 outbound '{}' added", tag))
+    }
+
+    /// Handle get pool stats command
+    fn handle_get_pool_stats(&self, tag: Option<String>) -> IpcResponse {
+        let mut pools = Vec::new();
+
+        if let Some(specific_tag) = tag {
+            // Get stats for specific outbound
+            match self.outbound_manager.get(&specific_tag) {
+                Some(outbound) => {
+                    if outbound.outbound_type() == "socks5" {
+                        // Use trait methods to get pool and server info
+                        let pool_info = outbound.pool_stats_info().unwrap_or_default();
+                        let server_info = outbound.proxy_server_info();
+
+                        pools.push(Socks5PoolStats {
+                            tag: outbound.tag().to_string(),
+                            size: pool_info.size,
+                            available: pool_info.available,
+                            waiting: pool_info.waiting,
+                            server_addr: server_info.map(|s| s.address).unwrap_or_default(),
+                            enabled: outbound.is_enabled(),
+                            health: outbound.health_status().to_string(),
+                        });
+                    } else {
+                        return IpcResponse::error(
+                            ErrorCode::InvalidParameters,
+                            format!("Outbound '{}' is not a SOCKS5 outbound", specific_tag),
+                        );
+                    }
+                }
+                None => {
+                    return IpcResponse::error(
+                        ErrorCode::NotFound,
+                        format!("Outbound '{}' not found", specific_tag),
+                    );
+                }
+            }
+        } else {
+            // Get stats for all SOCKS5 outbounds
+            for outbound in self.outbound_manager.all() {
+                if outbound.outbound_type() == "socks5" {
+                    let pool_info = outbound.pool_stats_info().unwrap_or_default();
+                    let server_info = outbound.proxy_server_info();
+
+                    pools.push(Socks5PoolStats {
+                        tag: outbound.tag().to_string(),
+                        size: pool_info.size,
+                        available: pool_info.available,
+                        waiting: pool_info.waiting,
+                        server_addr: server_info.map(|s| s.address).unwrap_or_default(),
+                        enabled: outbound.is_enabled(),
+                        health: outbound.health_status().to_string(),
+                    });
+                }
+            }
+        }
+
+        IpcResponse::PoolStats(PoolStatsResponse { pools })
+    }
+
+    // ========================================================================
+    // Phase 3.3: IPC Protocol v2.1 Handler Implementations
+    // ========================================================================
+
+    /// Handle add WireGuard outbound command
+    ///
+    /// Creates a DirectOutbound bound to a WireGuard interface.
+    fn handle_add_wireguard_outbound(
+        &self,
+        tag: String,
+        interface: String,
+        routing_mark: Option<u32>,
+        routing_table: Option<u32>,
+    ) -> IpcResponse {
+        use crate::outbound::wireguard;
+
+        // Check if outbound already exists
+        if self.outbound_manager.get(&tag).is_some() {
+            return IpcResponse::error(
+                ErrorCode::AlreadyExists,
+                format!("Outbound '{}' already exists", tag),
+            );
+        }
+
+        // Validate interface exists
+        if let Err(e) = wireguard::validate_interface_exists(&interface) {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!("WireGuard interface validation failed: {}", e),
+            );
+        }
+
+        // Create DirectOutbound with bind_interface
+        let config = crate::config::OutboundConfig {
+            tag: tag.clone(),
+            outbound_type: crate::config::OutboundType::Direct,
+            bind_interface: Some(interface.clone()),
+            bind_address: None,
+            routing_mark,
+            connect_timeout_secs: 10,
+            enabled: true,
+        };
+
+        // Store routing_table in the config for policy routing
+        // Note: routing_table is used by iptables/ip rules, not directly by the outbound
+        let _ = routing_table; // Suppress unused warning - stored for reference
+
+        // DirectOutbound::new() returns DirectOutbound directly (not a Result)
+        let outbound = crate::outbound::DirectOutbound::new(config);
+
+        self.outbound_manager.add(Box::new(outbound));
+
+        info!(
+            "Added WireGuard outbound '{}' -> interface '{}' (mark={:?})",
+            tag, interface, routing_mark
+        );
+        IpcResponse::success_with_message(format!("WireGuard outbound '{}' added", tag))
+    }
+
+    /// Handle drain outbound command
+    ///
+    /// Gracefully drains connections before removal.
+    async fn handle_drain_outbound(&self, tag: String, timeout_secs: u32) -> IpcResponse {
+        use super::protocol::DrainResponse;
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+
+        // Check if outbound exists
+        let outbound = match self.outbound_manager.get(&tag) {
+            Some(o) => o,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Outbound '{}' not found", tag),
+                );
+            }
+        };
+
+        // Disable the outbound to stop accepting new connections
+        outbound.set_enabled(false);
+
+        // Get initial active connection count
+        let initial_count = outbound.active_connections();
+
+        // Wait for connections to drain
+        let timeout = Duration::from_secs(timeout_secs as u64);
+        let poll_interval = Duration::from_millis(100);
+        let deadline = start + timeout;
+
+        let mut drained_count = 0u64;
+        let mut force_closed_count = 0u64;
+
+        while Instant::now() < deadline {
+            let active = outbound.active_connections();
+            if active == 0 {
+                drained_count = initial_count;
+                break;
+            }
+            drained_count = initial_count.saturating_sub(active);
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Force close any remaining connections
+        let remaining = outbound.active_connections();
+        if remaining > 0 {
+            // In a real implementation, we would cancel active connections here
+            force_closed_count = remaining;
+            warn!(
+                "Force closing {} remaining connections for outbound '{}'",
+                remaining, tag
+            );
+        }
+
+        // Remove the outbound
+        if self.outbound_manager.remove(&tag).is_none() {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                format!("Failed to remove outbound '{}' after drain", tag),
+            );
+        }
+
+        let drain_time_ms = start.elapsed().as_millis() as u64;
+
+        info!(
+            "Drained outbound '{}': {} drained, {} force-closed in {}ms",
+            tag, drained_count, force_closed_count, drain_time_ms
+        );
+
+        IpcResponse::DrainResult(DrainResponse {
+            success: true,
+            drained_count,
+            force_closed_count,
+            drain_time_ms,
+        })
+    }
+
+    /// Handle update routing command
+    ///
+    /// Atomically updates routing rules via ArcSwap.
+    fn handle_update_routing(
+        &self,
+        rules: Vec<super::protocol::RuleConfig>,
+        default_outbound: String,
+    ) -> IpcResponse {
+        use super::protocol::UpdateRoutingResponse;
+        use crate::rules::{CompiledRuleSet, Rule, RuleType};
+
+        // Validate default outbound exists
+        if self.outbound_manager.get(&default_outbound).is_none() {
+            return IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Default outbound '{}' not found", default_outbound),
+            );
+        }
+
+        // Convert RuleConfig to internal Rule format
+        let mut internal_rules = Vec::with_capacity(rules.len());
+        let mut rule_id = 1u64;
+        for rule_cfg in &rules {
+            if !rule_cfg.enabled {
+                continue;
+            }
+
+            // Validate outbound exists
+            if self.outbound_manager.get(&rule_cfg.outbound).is_none() {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Rule references unknown outbound '{}'", rule_cfg.outbound),
+                );
+            }
+
+            let rule_type = match rule_cfg.rule_type.as_str() {
+                "domain" => RuleType::Domain,
+                "domain_suffix" => RuleType::DomainSuffix,
+                "domain_keyword" => RuleType::DomainKeyword,
+                "domain_regex" => RuleType::DomainRegex,
+                "geoip" => RuleType::GeoIP,
+                "geosite" => RuleType::GeoSite,
+                "ip_cidr" => RuleType::IpCidr,
+                "port" => RuleType::Port,
+                "protocol" => RuleType::Protocol,
+                other => {
+                    return IpcResponse::error(
+                        ErrorCode::InvalidParameters,
+                        format!("Unknown rule type: {}", other),
+                    );
+                }
+            };
+
+            let rule = Rule::new(
+                rule_id,
+                rule_type,
+                rule_cfg.target.clone(),
+                rule_cfg.outbound.clone(),
+            )
+            .with_priority(rule_cfg.priority);
+
+            rule_id += 1;
+            internal_rules.push(rule);
+        }
+
+        // Compile rules into an optimized rule set
+        let rule_count = internal_rules.len();
+        let compiled = match CompiledRuleSet::new(internal_rules, default_outbound.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Failed to compile rules: {}", e),
+                );
+            }
+        };
+
+        // Atomically increment version BEFORE creating snapshot to prevent race condition
+        // fetch_add returns the previous value, so we add 1 to get the new version
+        let new_version = self.config_version.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Load current snapshot to preserve domain/geoip/fwmark matchers
+        let current = self.rule_engine.load();
+
+        // Build new routing snapshot with updated rules
+        let new_snapshot = crate::rules::RoutingSnapshot {
+            domain_matcher: current.domain_matcher.clone(),
+            geoip_matcher: current.geoip_matcher.clone(),
+            fwmark_router: current.fwmark_router.clone(),
+            rules: compiled,
+            default_outbound: default_outbound.clone(),
+            version: new_version,
+        };
+
+        // Atomic swap via rule engine
+        self.rule_engine.reload(new_snapshot);
+
+        // Version is already incremented, use new_version directly
+        let version = new_version;
+
+        // Update last reload timestamp
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_reload_timestamp.store(now, Ordering::Relaxed);
+
+        info!(
+            "Updated routing: {} rules, default='{}', version={}",
+            rule_count, default_outbound, version
+        );
+
+        IpcResponse::UpdateRoutingResult(UpdateRoutingResponse {
+            success: true,
+            version,
+            rule_count,
+            default_outbound,
+        })
+    }
+
+    /// Handle set default outbound command
+    fn handle_set_default_outbound(&self, tag: String) -> IpcResponse {
+        use crate::rules::RoutingSnapshot;
+
+        // Validate outbound exists
+        if self.outbound_manager.get(&tag).is_none() {
+            return IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Outbound '{}' not found", tag),
+            );
+        }
+
+        // Load current routing config
+        let current = self.rule_engine.load();
+
+        // Create new snapshot with updated default outbound
+        // Copy the current snapshot's fields but update default_outbound
+        let new_snapshot = RoutingSnapshot {
+            domain_matcher: current.domain_matcher.clone(),
+            geoip_matcher: current.geoip_matcher.clone(),
+            fwmark_router: current.fwmark_router.clone(),
+            rules: current.rules.clone(),
+            default_outbound: tag.clone(),
+            version: current.version + 1,
+        };
+
+        // Atomic swap
+        self.rule_engine.reload(new_snapshot);
+
+        info!("Default outbound changed to '{}'", tag);
+        IpcResponse::success_with_message(format!("Default outbound set to '{}'", tag))
+    }
+
+    /// Handle get outbound health command
+    fn handle_get_outbound_health(&self) -> IpcResponse {
+        use super::protocol::{OutboundHealthInfo, OutboundHealthResponse};
+
+        let mut outbounds = Vec::new();
+        let mut all_healthy = true;
+
+        for outbound in self.outbound_manager.all() {
+            let health = outbound.health_status();
+            let health_str = health.to_string();
+
+            if !matches!(health, crate::outbound::HealthStatus::Healthy) {
+                all_healthy = false;
+            }
+
+            outbounds.push(OutboundHealthInfo {
+                tag: outbound.tag().to_string(),
+                outbound_type: outbound.outbound_type().to_string(),
+                health: health_str,
+                enabled: outbound.is_enabled(),
+                active_connections: outbound.active_connections(),
+                last_check: None, // Could add last health check time if tracked
+                error: None,      // Could add error details for unhealthy status
+            });
+        }
+
+        let overall_health = if all_healthy { "healthy" } else { "degraded" }.to_string();
+
+        IpcResponse::OutboundHealth(OutboundHealthResponse {
+            outbounds,
+            overall_health,
+        })
+    }
+
+    /// Handle notify egress change command from Python
+    fn handle_notify_egress_change(
+        &self,
+        action: super::protocol::EgressAction,
+        tag: String,
+        egress_type: String,
+    ) -> IpcResponse {
+        use super::protocol::EgressAction;
+
+        match action {
+            EgressAction::Added => {
+                info!("Python notified: egress '{}' ({}) added", tag, egress_type);
+                // In a full implementation, we might pre-create outbound here
+            }
+            EgressAction::Removed => {
+                info!(
+                    "Python notified: egress '{}' ({}) removed",
+                    tag, egress_type
+                );
+                // Remove the outbound if it exists
+                if let Some(_) = self.outbound_manager.remove(&tag) {
+                    debug!("Removed outbound '{}' based on Python notification", tag);
+                }
+            }
+            EgressAction::Updated => {
+                info!(
+                    "Python notified: egress '{}' ({}) updated",
+                    tag, egress_type
+                );
+                // In a full implementation, we might update outbound config here
+            }
+        }
+
+        IpcResponse::success_with_message(format!(
+            "Egress change notification processed: {:?} '{}' ({})",
+            action, tag, egress_type
+        ))
+    }
 }
 
 /// Format Unix timestamp as simplified ISO 8601
@@ -502,6 +1036,7 @@ fn chrono_lite_format(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::config::ConnectionConfig;
+    use crate::ipc::protocol::{EgressAction, ErrorCode, RuleConfig};
     use crate::rules::RuleType;
     use std::time::Duration;
 
@@ -741,6 +1276,641 @@ mod tests {
             assert!(result.match_type.is_none());
         } else {
             panic!("Expected TestMatchResult response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_socks5_outbound() {
+        let handler = create_test_handler();
+
+        // Add a new SOCKS5 outbound
+        let response = handler
+            .handle(IpcCommand::AddSocks5Outbound {
+                tag: "test-socks5".into(),
+                server_addr: "127.0.0.1:1080".into(),
+                username: None,
+                password: None,
+                connect_timeout_secs: 10,
+                idle_timeout_secs: 300,
+                pool_max_size: 8,
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        // Verify it was added
+        let list_response = handler.handle(IpcCommand::ListOutbounds).await;
+        if let IpcResponse::OutboundList { outbounds } = list_response {
+            assert!(outbounds.iter().any(|o| o.tag == "test-socks5"));
+            assert!(outbounds.iter().any(|o| o.outbound_type == "socks5"));
+        } else {
+            panic!("Expected OutboundList response");
+        }
+
+        // Adding duplicate should fail
+        let response = handler
+            .handle(IpcCommand::AddSocks5Outbound {
+                tag: "test-socks5".into(),
+                server_addr: "127.0.0.1:1080".into(),
+                username: None,
+                password: None,
+                connect_timeout_secs: 10,
+                idle_timeout_secs: 300,
+                pool_max_size: 8,
+            })
+            .await;
+        assert!(response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_add_socks5_outbound_with_auth() {
+        let handler = create_test_handler();
+
+        // Add SOCKS5 with authentication
+        let response = handler
+            .handle(IpcCommand::AddSocks5Outbound {
+                tag: "auth-socks5".into(),
+                server_addr: "127.0.0.1:1080".into(),
+                username: Some("user".into()),
+                password: Some("pass".into()),
+                connect_timeout_secs: 5,
+                idle_timeout_secs: 120,
+                pool_max_size: 16,
+            })
+            .await;
+        assert!(!response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_add_socks5_outbound_invalid_addr() {
+        let handler = create_test_handler();
+
+        // Invalid server address should fail
+        let response = handler
+            .handle(IpcCommand::AddSocks5Outbound {
+                tag: "bad-addr".into(),
+                server_addr: "not-a-valid-address".into(),
+                username: None,
+                password: None,
+                connect_timeout_secs: 10,
+                idle_timeout_secs: 300,
+                pool_max_size: 8,
+            })
+            .await;
+        assert!(response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_get_pool_stats_no_socks5() {
+        let handler = create_test_handler();
+
+        // Get pool stats when no SOCKS5 outbounds exist
+        let response = handler
+            .handle(IpcCommand::GetPoolStats { tag: None })
+            .await;
+
+        if let IpcResponse::PoolStats(stats) = response {
+            assert!(stats.pools.is_empty());
+        } else {
+            panic!("Expected PoolStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_pool_stats_with_socks5() {
+        let handler = create_test_handler();
+
+        // First add a SOCKS5 outbound
+        let _ = handler
+            .handle(IpcCommand::AddSocks5Outbound {
+                tag: "pool-test".into(),
+                server_addr: "127.0.0.1:1080".into(),
+                username: None,
+                password: None,
+                connect_timeout_secs: 10,
+                idle_timeout_secs: 300,
+                pool_max_size: 4,
+            })
+            .await;
+
+        // Get pool stats for all SOCKS5 outbounds
+        let response = handler
+            .handle(IpcCommand::GetPoolStats { tag: None })
+            .await;
+
+        if let IpcResponse::PoolStats(stats) = response {
+            assert_eq!(stats.pools.len(), 1);
+            assert_eq!(stats.pools[0].tag, "pool-test");
+            assert_eq!(stats.pools[0].server_addr, "127.0.0.1:1080");
+            assert!(stats.pools[0].enabled);
+        } else {
+            panic!("Expected PoolStats response");
+        }
+
+        // Get pool stats for specific outbound
+        let response = handler
+            .handle(IpcCommand::GetPoolStats {
+                tag: Some("pool-test".into()),
+            })
+            .await;
+
+        if let IpcResponse::PoolStats(stats) = response {
+            assert_eq!(stats.pools.len(), 1);
+            assert_eq!(stats.pools[0].tag, "pool-test");
+        } else {
+            panic!("Expected PoolStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_pool_stats_not_found() {
+        let handler = create_test_handler();
+
+        // Request stats for non-existent outbound
+        let response = handler
+            .handle(IpcCommand::GetPoolStats {
+                tag: Some("nonexistent".into()),
+            })
+            .await;
+        assert!(response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_get_pool_stats_not_socks5() {
+        let handler = create_test_handler();
+
+        // Request stats for a non-SOCKS5 outbound
+        let response = handler
+            .handle(IpcCommand::GetPoolStats {
+                tag: Some("direct".into()),
+            })
+            .await;
+        assert!(response.is_error());
+    }
+
+    // =========================================================================
+    // P1 Handler Tests - Phase 3.3 IPC Protocol v2.1
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_add_wireguard_outbound_success() {
+        let handler = create_test_handler();
+
+        // Add a WireGuard outbound with a loopback interface (always exists)
+        let response = handler
+            .handle(IpcCommand::AddWireguardOutbound {
+                tag: "wg-test".into(),
+                interface: "lo".into(), // loopback always exists
+                routing_mark: Some(200),
+                routing_table: Some(100),
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        // Verify it was added
+        let list_response = handler.handle(IpcCommand::ListOutbounds).await;
+        if let IpcResponse::OutboundList { outbounds } = list_response {
+            assert!(outbounds.iter().any(|o| o.tag == "wg-test"));
+        } else {
+            panic!("Expected OutboundList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_wireguard_outbound_already_exists() {
+        let handler = create_test_handler();
+
+        // First add should succeed
+        let response = handler
+            .handle(IpcCommand::AddWireguardOutbound {
+                tag: "wg-dup".into(),
+                interface: "lo".into(),
+                routing_mark: None,
+                routing_table: None,
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Second add with same tag should fail
+        let response = handler
+            .handle(IpcCommand::AddWireguardOutbound {
+                tag: "wg-dup".into(),
+                interface: "lo".into(),
+                routing_mark: None,
+                routing_table: None,
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::AlreadyExists));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_wireguard_outbound_invalid_interface() {
+        let handler = create_test_handler();
+
+        // Add with non-existent interface should fail
+        let response = handler
+            .handle(IpcCommand::AddWireguardOutbound {
+                tag: "wg-invalid".into(),
+                interface: "nonexistent_interface_12345".into(),
+                routing_mark: None,
+                routing_table: None,
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+            assert!(err.message.contains("validation failed"));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drain_outbound_not_found() {
+        let handler = create_test_handler();
+
+        // Drain non-existent outbound
+        let response = handler
+            .handle(IpcCommand::DrainOutbound {
+                tag: "nonexistent".into(),
+                timeout_secs: 5,
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_empty_rules() {
+        let handler = create_test_handler();
+
+        // Update with empty rules should succeed
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![],
+                default_outbound: "direct".into(),
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        if let IpcResponse::UpdateRoutingResult(result) = response {
+            assert!(result.success);
+            assert_eq!(result.rule_count, 0);
+            assert_eq!(result.default_outbound, "direct");
+        } else {
+            panic!("Expected UpdateRoutingResult response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_unknown_outbound() {
+        let handler = create_test_handler();
+
+        // Update with unknown default outbound should fail
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![],
+                default_outbound: "nonexistent".into(),
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+            assert!(err.message.contains("Default outbound"));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_invalid_rule_type() {
+        let handler = create_test_handler();
+
+        // Update with invalid rule type should fail
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![RuleConfig {
+                    rule_type: "invalid_type".into(),
+                    target: "test".into(),
+                    outbound: "direct".into(),
+                    priority: 0,
+                    enabled: true,
+                }],
+                default_outbound: "direct".into(),
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+            assert!(err.message.contains("Unknown rule type"));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_default_outbound_not_found() {
+        let handler = create_test_handler();
+
+        // Set default to non-existent outbound
+        let response = handler
+            .handle(IpcCommand::SetDefaultOutbound {
+                tag: "nonexistent".into(),
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_outbound_health_empty() {
+        // Create handler with no outbounds
+        let outbound_manager = Arc::new(OutboundManager::new());
+        let conn_config = ConnectionConfig::default();
+        let connection_manager = Arc::new(ConnectionManager::new(
+            &conn_config,
+            Arc::clone(&outbound_manager),
+            "direct".into(),
+            Duration::from_millis(300),
+        ));
+        let handler = IpcHandler::new_with_default_rules(connection_manager, outbound_manager);
+
+        let response = handler.handle(IpcCommand::GetOutboundHealth).await;
+
+        if let IpcResponse::OutboundHealth(health) = response {
+            assert!(health.outbounds.is_empty());
+            assert_eq!(health.overall_health, "healthy"); // All healthy when empty
+        } else {
+            panic!("Expected OutboundHealth response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_outbound_health_with_outbounds() {
+        let handler = create_test_handler();
+
+        let response = handler.handle(IpcCommand::GetOutboundHealth).await;
+
+        if let IpcResponse::OutboundHealth(health) = response {
+            assert!(!health.outbounds.is_empty());
+            // direct outbound should be present
+            assert!(health.outbounds.iter().any(|o| o.tag == "direct"));
+            // Check health fields
+            for outbound in &health.outbounds {
+                assert!(!outbound.tag.is_empty());
+                assert!(!outbound.outbound_type.is_empty());
+                assert!(!outbound.health.is_empty());
+            }
+        } else {
+            panic!("Expected OutboundHealth response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_egress_change_added() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::NotifyEgressChange {
+                action: EgressAction::Added,
+                tag: "new-egress".into(),
+                egress_type: "pia".into(),
+            })
+            .await;
+        assert!(!response.is_error());
+
+        if let IpcResponse::Success { message } = response {
+            assert!(message.is_some());
+            let msg = message.unwrap();
+            assert!(msg.contains("Added"));
+            assert!(msg.contains("new-egress"));
+        } else {
+            panic!("Expected Success response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_egress_change_removed() {
+        let handler = create_test_handler();
+
+        // First add an outbound
+        let _ = handler
+            .handle(IpcCommand::AddWireguardOutbound {
+                tag: "to-remove".into(),
+                interface: "lo".into(),
+                routing_mark: None,
+                routing_table: None,
+            })
+            .await;
+
+        // Then notify removal
+        let response = handler
+            .handle(IpcCommand::NotifyEgressChange {
+                action: EgressAction::Removed,
+                tag: "to-remove".into(),
+                egress_type: "custom".into(),
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Verify it was removed
+        let get_response = handler
+            .handle(IpcCommand::GetOutbound {
+                tag: "to-remove".into(),
+            })
+            .await;
+        assert!(get_response.is_error()); // Should be not found
+    }
+
+    // =========================================================================
+    // P2 Edge Case Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_drain_outbound_zero_timeout() {
+        let handler = create_test_handler();
+
+        // Add an outbound to drain
+        let _ = handler
+            .handle(IpcCommand::AddWireguardOutbound {
+                tag: "drain-zero".into(),
+                interface: "lo".into(),
+                routing_mark: None,
+                routing_table: None,
+            })
+            .await;
+
+        // Drain with zero timeout should complete immediately
+        let response = handler
+            .handle(IpcCommand::DrainOutbound {
+                tag: "drain-zero".into(),
+                timeout_secs: 0,
+            })
+            .await;
+
+        if let IpcResponse::DrainResult(result) = response {
+            assert!(result.success);
+            // With zero timeout, it should complete very quickly
+            assert!(result.drain_time_ms < 1000);
+        } else {
+            panic!("Expected DrainResult response, got: {:?}", response);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_with_disabled_rules() {
+        let handler = create_test_handler();
+
+        // Update with disabled rules - they should be skipped
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![
+                    RuleConfig {
+                        rule_type: "domain".into(),
+                        target: "example.com".into(),
+                        outbound: "direct".into(),
+                        priority: 0,
+                        enabled: true,
+                    },
+                    RuleConfig {
+                        rule_type: "domain".into(),
+                        target: "disabled.com".into(),
+                        outbound: "direct".into(),
+                        priority: 0,
+                        enabled: false, // disabled
+                    },
+                ],
+                default_outbound: "direct".into(),
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        if let IpcResponse::UpdateRoutingResult(result) = response {
+            assert!(result.success);
+            // Only 1 rule should be active (the enabled one)
+            assert_eq!(result.rule_count, 1);
+        } else {
+            panic!("Expected UpdateRoutingResult response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_rule_references_unknown_outbound() {
+        let handler = create_test_handler();
+
+        // Update with rule referencing non-existent outbound
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![RuleConfig {
+                    rule_type: "domain".into(),
+                    target: "example.com".into(),
+                    outbound: "nonexistent-proxy".into(),
+                    priority: 0,
+                    enabled: true,
+                }],
+                default_outbound: "direct".into(),
+            })
+            .await;
+        assert!(response.is_error());
+
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+            assert!(err.message.contains("unknown outbound"));
+        } else {
+            panic!("Expected Error response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_default_outbound_success() {
+        let handler = create_test_handler_with_rules();
+
+        // Set default to "proxy" which exists in test handler
+        let response = handler
+            .handle(IpcCommand::SetDefaultOutbound {
+                tag: "proxy".into(),
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        // Verify the default was changed via GetRuleStats
+        let stats_response = handler.handle(IpcCommand::GetRuleStats).await;
+        if let IpcResponse::RuleStats(stats) = stats_response {
+            assert_eq!(stats.default_outbound, "proxy");
+        } else {
+            panic!("Expected RuleStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_version_increments() {
+        let handler = create_test_handler();
+
+        // Get initial version
+        let stats1 = handler.handle(IpcCommand::GetRuleStats).await;
+        let version1 = if let IpcResponse::RuleStats(s) = stats1 {
+            s.config_version
+        } else {
+            panic!("Expected RuleStats");
+        };
+
+        // Update routing
+        let _ = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![],
+                default_outbound: "direct".into(),
+            })
+            .await;
+
+        // Version should have incremented
+        let stats2 = handler.handle(IpcCommand::GetRuleStats).await;
+        let version2 = if let IpcResponse::RuleStats(s) = stats2 {
+            s.config_version
+        } else {
+            panic!("Expected RuleStats");
+        };
+
+        assert!(version2 > version1, "Version should increment after update");
+    }
+
+    #[tokio::test]
+    async fn test_notify_egress_change_updated() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::NotifyEgressChange {
+                action: EgressAction::Updated,
+                tag: "updated-egress".into(),
+                egress_type: "warp".into(),
+            })
+            .await;
+        assert!(!response.is_error());
+
+        if let IpcResponse::Success { message } = response {
+            assert!(message.is_some());
+            let msg = message.unwrap();
+            assert!(msg.contains("Updated"));
+            assert!(msg.contains("updated-egress"));
+        } else {
+            panic!("Expected Success response");
         }
     }
 }

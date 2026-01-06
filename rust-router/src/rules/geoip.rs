@@ -152,6 +152,33 @@ impl std::fmt::Debug for GeoIpMatcher {
     }
 }
 
+impl Clone for GeoIpMatcher {
+    fn clone(&self) -> Self {
+        // Clone the RwLock contents by acquiring a read lock
+        // If the lock is poisoned, log an error and use empty data as fallback
+        let country_cidrs_data = match self.country_cidrs.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                tracing::error!(
+                    "GeoIpMatcher clone encountered poisoned lock, using recovered data. \
+                     This indicates a prior panic while holding the lock."
+                );
+                // Recover the data from the poisoned guard - this is safe because
+                // we're only reading, and the data structure itself is still valid
+                poisoned.into_inner().clone()
+            }
+        };
+
+        Self {
+            cidr_rules: self.cidr_rules.clone(),
+            country_rules: self.country_rules.clone(),
+            country_cidrs: RwLock::new(country_cidrs_data),
+            geoip_dir: self.geoip_dir.clone(),
+            available_countries: self.available_countries.clone(),
+        }
+    }
+}
+
 impl GeoIpMatcher {
     /// Create a new builder for constructing a `GeoIpMatcher`
     ///

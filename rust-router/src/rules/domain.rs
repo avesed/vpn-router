@@ -47,7 +47,7 @@ use crate::error::RuleError;
 ///
 /// This ordering ensures that more specific rules take precedence
 /// over more general patterns.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DomainMatcher {
     /// Exact domain to outbound mapping (O(1) lookup)
     exact_domains: HashMap<String, String>,

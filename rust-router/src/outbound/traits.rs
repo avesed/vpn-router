@@ -12,6 +12,26 @@ use tokio::net::TcpStream;
 use crate::connection::OutboundStats;
 use crate::error::OutboundError;
 
+/// Connection pool statistics (for pooled outbound types like SOCKS5)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolStatsInfo {
+    /// Current pool size (all connections)
+    pub size: usize,
+    /// Available connections in pool
+    pub available: usize,
+    /// Number of waiters for connections
+    pub waiting: usize,
+}
+
+/// Server address information for proxy outbounds
+#[derive(Debug, Clone)]
+pub struct ProxyServerInfo {
+    /// Server address as string
+    pub address: String,
+    /// Whether authentication is configured
+    pub has_auth: bool,
+}
+
 /// Health status of an outbound
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthStatus {
@@ -128,8 +148,28 @@ pub trait Outbound: Send + Sync {
     /// Check if this outbound is enabled
     fn is_enabled(&self) -> bool;
 
+    /// Set the enabled state
+    fn set_enabled(&self, enabled: bool);
+
+    /// Get the count of active connections through this outbound
+    fn active_connections(&self) -> u64;
+
     /// Get the outbound type name
     fn outbound_type(&self) -> &str;
+
+    /// Get connection pool statistics (for pooled outbound types)
+    ///
+    /// Returns `None` for non-pooled outbound types like Direct.
+    fn pool_stats_info(&self) -> Option<PoolStatsInfo> {
+        None
+    }
+
+    /// Get proxy server information (for proxy outbound types like SOCKS5)
+    ///
+    /// Returns `None` for non-proxy outbound types like Direct.
+    fn proxy_server_info(&self) -> Option<ProxyServerInfo> {
+        None
+    }
 }
 
 /// Extension trait for additional outbound functionality

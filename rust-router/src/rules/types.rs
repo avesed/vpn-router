@@ -443,6 +443,7 @@ impl<'de> Deserialize<'de> for PortRange {
 ///
 /// Note: Full matching logic (domain, IP) will be implemented in Phase 2.2/2.3.
 /// Currently only provides priority-based iteration.
+#[derive(Clone)]
 pub struct CompiledRuleSet {
     /// Rules sorted by priority (ascending = higher priority first)
     rules: Vec<Rule>,

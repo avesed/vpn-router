@@ -106,6 +106,165 @@ pub enum IpcCommand {
         #[serde(default)]
         config_path: Option<String>,
     },
+
+    /// Add a SOCKS5 outbound with connection pool
+    ///
+    /// Creates a new SOCKS5 client outbound with deadpool connection pooling.
+    /// Supports optional username/password authentication (RFC 1929).
+    AddSocks5Outbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// SOCKS5 server address (host:port)
+        server_addr: String,
+        /// Optional username for authentication
+        #[serde(default)]
+        username: Option<String>,
+        /// Optional password for authentication
+        #[serde(default)]
+        password: Option<String>,
+        /// Connection timeout in seconds (default: 10)
+        #[serde(default = "default_connect_timeout")]
+        connect_timeout_secs: u64,
+        /// Idle timeout in seconds (default: 300)
+        #[serde(default = "default_idle_timeout")]
+        idle_timeout_secs: u64,
+        /// Maximum pool size (default: 32)
+        #[serde(default = "default_pool_size")]
+        pool_max_size: usize,
+    },
+
+    /// Get connection pool statistics for a SOCKS5 outbound
+    ///
+    /// Returns pool statistics including current size, available connections,
+    /// and number of waiters.
+    GetPoolStats {
+        /// Outbound tag (if None, returns stats for all SOCKS5 outbounds)
+        #[serde(default)]
+        tag: Option<String>,
+    },
+
+    // ========================================================================
+    // Phase 3.3: IPC Protocol v2.1 Commands
+    // ========================================================================
+
+    /// Add a WireGuard outbound using DirectOutbound with bind_interface
+    ///
+    /// Creates a direct outbound bound to a WireGuard interface (e.g., wg-pia-us-east).
+    /// The interface must already exist (created by Python setup_kernel_wg_egress.py).
+    AddWireguardOutbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// WireGuard interface name (e.g., "wg-pia-us-east")
+        interface: String,
+        /// Optional routing mark for policy routing
+        #[serde(default)]
+        routing_mark: Option<u32>,
+        /// Optional routing table for policy routing
+        #[serde(default)]
+        routing_table: Option<u32>,
+    },
+
+    /// Drain an outbound gracefully before removal
+    ///
+    /// Waits for existing connections to complete (up to timeout),
+    /// then removes the outbound. New connections are rejected during drain.
+    DrainOutbound {
+        /// Outbound tag to drain
+        tag: String,
+        /// Timeout in seconds (connections are forcefully closed after this)
+        #[serde(default = "default_drain_timeout")]
+        timeout_secs: u32,
+    },
+
+    /// Update routing rules atomically
+    ///
+    /// Replaces the current routing configuration with new rules.
+    /// Uses ArcSwap for lock-free hot-reload.
+    UpdateRouting {
+        /// New routing rules
+        rules: Vec<RuleConfig>,
+        /// Default outbound for unmatched traffic
+        default_outbound: String,
+    },
+
+    /// Set the default outbound for unmatched traffic
+    ///
+    /// Changes only the default outbound without modifying rules.
+    SetDefaultOutbound {
+        /// New default outbound tag
+        tag: String,
+    },
+
+    /// Get health status for all outbounds
+    ///
+    /// Returns a map of outbound tags to their current health status.
+    GetOutboundHealth,
+
+    /// Notify about egress configuration change from Python
+    ///
+    /// Python sends this when egress is added/removed/updated so rust-router
+    /// can update its state accordingly.
+    NotifyEgressChange {
+        /// Action type: added, removed, updated
+        action: EgressAction,
+        /// Outbound tag affected
+        tag: String,
+        /// Egress type (pia, custom, warp, v2ray, direct, openvpn)
+        egress_type: String,
+    },
+}
+
+/// Default connect timeout for SOCKS5 connections
+fn default_connect_timeout() -> u64 {
+    10
+}
+
+/// Default idle timeout for SOCKS5 connections
+fn default_idle_timeout() -> u64 {
+    300
+}
+
+/// Default pool size for SOCKS5 connections
+fn default_pool_size() -> usize {
+    32
+}
+
+/// Default drain timeout in seconds
+fn default_drain_timeout() -> u32 {
+    30
+}
+
+/// Egress action type for NotifyEgressChange
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressAction {
+    /// Egress was added
+    Added,
+    /// Egress was removed
+    Removed,
+    /// Egress was updated (config changed)
+    Updated,
+}
+
+/// Rule configuration for UpdateRouting
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    /// Rule type (domain, domain_suffix, domain_keyword, geoip, port, protocol)
+    pub rule_type: String,
+    /// Target value (e.g., "google.com", "CN", "443", "tcp")
+    pub target: String,
+    /// Outbound tag to route to
+    pub outbound: String,
+    /// Rule priority (lower = higher priority)
+    #[serde(default)]
+    pub priority: i32,
+    /// Whether the rule is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// IPC response types
@@ -141,6 +300,22 @@ pub enum IpcResponse {
 
     /// Rule engine statistics response
     RuleStats(RuleStatsResponse),
+
+    /// Connection pool statistics response
+    PoolStats(PoolStatsResponse),
+
+    // ========================================================================
+    // Phase 3.3: IPC Protocol v2.1 Response Types
+    // ========================================================================
+
+    /// Outbound health status response
+    OutboundHealth(OutboundHealthResponse),
+
+    /// Update routing result
+    UpdateRoutingResult(UpdateRoutingResponse),
+
+    /// Drain outbound result
+    DrainResult(DrainResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -219,12 +394,17 @@ pub struct ServerCapabilities {
 impl Default for ServerCapabilities {
     fn default() -> Self {
         Self {
-            outbound_types: vec!["direct".into(), "block".into()],
+            outbound_types: vec![
+                "direct".into(),
+                "block".into(),
+                "socks5".into(),
+                "wireguard".into(), // Phase 3.3: WireGuard via DirectOutbound
+            ],
             hot_reload: true,
             tls_sniffing: true,
             udp_support: false, // Phase 1: TCP only
             max_connections: 65536,
-            protocol_version: 1,
+            protocol_version: 3, // Phase 3.3: IPC v2.1 with drain, health, routing updates
         }
     }
 }
@@ -297,6 +477,92 @@ pub struct RuleStatsResponse {
     pub last_reload: Option<String>,
     /// Default outbound tag
     pub default_outbound: String,
+}
+
+/// Connection pool statistics for a single SOCKS5 outbound
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Socks5PoolStats {
+    /// Outbound tag
+    pub tag: String,
+    /// Current pool size (all connections)
+    pub size: usize,
+    /// Available connections in pool
+    pub available: usize,
+    /// Number of waiters for connections
+    pub waiting: usize,
+    /// Server address
+    pub server_addr: String,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Health status
+    pub health: String,
+}
+
+/// Connection pool statistics response
+///
+/// Contains pool statistics for one or more SOCKS5 outbounds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolStatsResponse {
+    /// Pool statistics per outbound
+    pub pools: Vec<Socks5PoolStats>,
+}
+
+// ============================================================================
+// Phase 3.3: IPC Protocol v2.1 Response Structs
+// ============================================================================
+
+/// Health status for a single outbound
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundHealthInfo {
+    /// Outbound tag
+    pub tag: String,
+    /// Outbound type (direct, socks5, block)
+    pub outbound_type: String,
+    /// Health status (healthy, degraded, unhealthy, unknown)
+    pub health: String,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Active connection count
+    pub active_connections: u64,
+    /// Last health check time (ISO 8601)
+    pub last_check: Option<String>,
+    /// Error message if unhealthy
+    pub error: Option<String>,
+}
+
+/// Response for GetOutboundHealth command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundHealthResponse {
+    /// Health status for each outbound
+    pub outbounds: Vec<OutboundHealthInfo>,
+    /// Overall system health (all healthy = healthy)
+    pub overall_health: String,
+}
+
+/// Response for UpdateRouting command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRoutingResponse {
+    /// Whether the update was successful
+    pub success: bool,
+    /// New configuration version
+    pub version: u64,
+    /// Number of rules applied
+    pub rule_count: usize,
+    /// New default outbound
+    pub default_outbound: String,
+}
+
+/// Response for DrainOutbound command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainResponse {
+    /// Whether drain completed successfully
+    pub success: bool,
+    /// Number of connections that were drained
+    pub drained_count: u64,
+    /// Number of connections that were forcefully closed
+    pub force_closed_count: u64,
+    /// Time taken to drain in milliseconds
+    pub drain_time_ms: u64,
 }
 
 /// IPC error
@@ -536,6 +802,166 @@ mod tests {
             assert_eq!(s.config_version, 42);
         } else {
             panic!("Expected RuleStats response");
+        }
+    }
+
+    // =========================================================================
+    // P0 Serialization Tests - Phase 3.3 IPC Protocol v2.1
+    // =========================================================================
+
+    #[test]
+    fn test_egress_action_serialization() {
+        // Test Added variant
+        let action = EgressAction::Added;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"added\"");
+        let parsed: EgressAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, EgressAction::Added);
+
+        // Test Removed variant
+        let action = EgressAction::Removed;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"removed\"");
+        let parsed: EgressAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, EgressAction::Removed);
+
+        // Test Updated variant
+        let action = EgressAction::Updated;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"updated\"");
+        let parsed: EgressAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, EgressAction::Updated);
+    }
+
+    #[test]
+    fn test_rule_config_serialization() {
+        // Test with all fields
+        let rule = RuleConfig {
+            rule_type: "domain_suffix".into(),
+            target: "google.com".into(),
+            outbound: "proxy".into(),
+            priority: 10,
+            enabled: true,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(json.contains("\"rule_type\":\"domain_suffix\""));
+        assert!(json.contains("\"target\":\"google.com\""));
+        assert!(json.contains("\"outbound\":\"proxy\""));
+        assert!(json.contains("\"priority\":10"));
+        assert!(json.contains("\"enabled\":true"));
+
+        // Deserialize back
+        let parsed: RuleConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rule_type, "domain_suffix");
+        assert_eq!(parsed.target, "google.com");
+        assert_eq!(parsed.outbound, "proxy");
+        assert_eq!(parsed.priority, 10);
+        assert!(parsed.enabled);
+
+        // Test default values
+        let json_minimal = r#"{"rule_type":"geoip","target":"CN","outbound":"cn-proxy"}"#;
+        let parsed: RuleConfig = serde_json::from_str(json_minimal).unwrap();
+        assert_eq!(parsed.priority, 0); // default
+        assert!(parsed.enabled); // default_enabled()
+    }
+
+    #[test]
+    fn test_drain_response_serialization() {
+        let resp = DrainResponse {
+            success: true,
+            drained_count: 15,
+            force_closed_count: 2,
+            drain_time_ms: 1500,
+        };
+        let ipc_resp = IpcResponse::DrainResult(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"drain_result\""));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"drained_count\":15"));
+        assert!(json.contains("\"force_closed_count\":2"));
+        assert!(json.contains("\"drain_time_ms\":1500"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DrainResult(dr) = parsed {
+            assert!(dr.success);
+            assert_eq!(dr.drained_count, 15);
+            assert_eq!(dr.force_closed_count, 2);
+            assert_eq!(dr.drain_time_ms, 1500);
+        } else {
+            panic!("Expected DrainResult response");
+        }
+    }
+
+    #[test]
+    fn test_update_routing_response_serialization() {
+        let resp = UpdateRoutingResponse {
+            success: true,
+            version: 42,
+            rule_count: 100,
+            default_outbound: "direct".into(),
+        };
+        let ipc_resp = IpcResponse::UpdateRoutingResult(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"update_routing_result\""));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"version\":42"));
+        assert!(json.contains("\"rule_count\":100"));
+        assert!(json.contains("\"default_outbound\":\"direct\""));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UpdateRoutingResult(ur) = parsed {
+            assert!(ur.success);
+            assert_eq!(ur.version, 42);
+            assert_eq!(ur.rule_count, 100);
+            assert_eq!(ur.default_outbound, "direct");
+        } else {
+            panic!("Expected UpdateRoutingResult response");
+        }
+    }
+
+    #[test]
+    fn test_outbound_health_response_serialization() {
+        let health = OutboundHealthResponse {
+            outbounds: vec![
+                OutboundHealthInfo {
+                    tag: "direct".into(),
+                    outbound_type: "direct".into(),
+                    health: "healthy".into(),
+                    enabled: true,
+                    active_connections: 10,
+                    last_check: Some("2026-01-06T12:00:00Z".into()),
+                    error: None,
+                },
+                OutboundHealthInfo {
+                    tag: "proxy".into(),
+                    outbound_type: "socks5".into(),
+                    health: "degraded".into(),
+                    enabled: true,
+                    active_connections: 5,
+                    last_check: Some("2026-01-06T12:00:00Z".into()),
+                    error: Some("Connection timeout".into()),
+                },
+            ],
+            overall_health: "degraded".into(),
+        };
+        let ipc_resp = IpcResponse::OutboundHealth(health);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"outbound_health\""));
+        assert!(json.contains("\"overall_health\":\"degraded\""));
+        assert!(json.contains("\"tag\":\"direct\""));
+        assert!(json.contains("\"tag\":\"proxy\""));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::OutboundHealth(oh) = parsed {
+            assert_eq!(oh.outbounds.len(), 2);
+            assert_eq!(oh.overall_health, "degraded");
+            assert_eq!(oh.outbounds[0].tag, "direct");
+            assert_eq!(oh.outbounds[1].error, Some("Connection timeout".into()));
+        } else {
+            panic!("Expected OutboundHealth response");
         }
     }
 }

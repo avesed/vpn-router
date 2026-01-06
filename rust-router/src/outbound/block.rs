@@ -90,6 +90,14 @@ impl Outbound for BlockOutbound {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn active_connections(&self) -> u64 {
+        0 // Block outbound doesn't maintain connections
+    }
+
     fn outbound_type(&self) -> &str {
         "block"
     }

@@ -81,7 +81,12 @@ pub use error::{
     ConfigError, ConnectionError, IpcError, OutboundError, RuleError, RustRouterError, TproxyError,
 };
 pub use ipc::{IpcClient, IpcCommand, IpcResponse, IpcServer};
-pub use outbound::{BlockOutbound, DirectOutbound, Outbound, OutboundManager};
+pub use outbound::{
+    get_egress_interface_name, get_egress_type, get_interface_info, interface_exists,
+    is_egress_interface, list_egress_interfaces, parse_interface_name, validate_interface_exists,
+    BlockOutbound, DirectOutbound, EgressType, InterfaceInfo, Outbound, OutboundManager,
+    CUSTOM_PREFIX, INTERFACE_MAX_LEN, PEER_PREFIX, PIA_PREFIX, WARP_PREFIX,
+};
 pub use rules::{
     dscp_to_routing_mark, dscp_to_routing_table, is_dscp_terminal_table, is_ecmp_table,
     is_peer_table, is_relay_table, is_reserved_dscp, is_valid_dscp, routing_mark_to_dscp, tables,
