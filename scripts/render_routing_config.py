@@ -582,21 +582,38 @@ class RustRouterConfigGenerator:
             Dict suitable for JSON serialization matching rust-router's Config struct
         """
         outbounds = []
+        valid_outbound_tags: set[str] = set()
 
         for ob in config.outbounds:
             outbound_dict = self._convert_outbound(ob)
             if outbound_dict:
                 outbounds.append(outbound_dict)
+                valid_outbound_tags.add(outbound_dict["tag"])
 
+        # Filter rules to only include those with valid outbounds
+        # For rules referencing skipped outbounds (e.g., SOCKS5), use default outbound
         rules = []
+        skipped_count = 0
         for rule in config.rules:
+            outbound = rule.outbound
+            if outbound not in valid_outbound_tags:
+                # Rule references a skipped outbound, reroute to default
+                skipped_count += 1
+                outbound = config.default_outbound
+                # Skip if default outbound is also invalid (shouldn't happen)
+                if outbound not in valid_outbound_tags:
+                    continue
+
             rules.append({
-                "rule_type": rule.rule_type.value,
+                "type": rule.rule_type.value,  # Rust uses #[serde(rename = "type")]
                 "target": rule.target,
-                "outbound": rule.outbound,
+                "outbound": outbound,
                 "priority": rule.priority,
                 "enabled": rule.enabled,
             })
+
+        if skipped_count > 0:
+            logger.info(f"Remapped {skipped_count} rules from skipped outbounds to default")
 
         tproxy_port = safe_int_env("RUST_ROUTER_PORT", DEFAULT_TPROXY_PORT)
         listen_addr = os.environ.get("RUST_ROUTER_LISTEN_ADDR", "127.0.0.1")
