@@ -972,7 +972,7 @@ fallback_to_singbox() {
   start_singbox "${CONFIG_PATH}"
 
   # Re-setup TPROXY routing with new port if already configured
-  if [ "${TPROXY_CONFIGURED:-false}" = "true" ]; then
+  if [ "${TPROXY_CONFIGURED:-false}" = "true" ] && [ "${SKIP_TPROXY_SETUP:-false}" != "true" ]; then
     echo "[entrypoint] reconfiguring TPROXY for sing-box port ${TPROXY_PORT}"
     setup_tproxy_routing
     setup_xray_tproxy
@@ -1019,13 +1019,18 @@ else
 fi
 
 # Phase 11-Fix.W: Check TPROXY kernel prerequisites before setting up routing
-check_tproxy_prerequisites
+# SKIP_TPROXY_SETUP=true to disable automatic TPROXY rules (for manual debugging)
+if [ "${SKIP_TPROXY_SETUP:-false}" = "true" ]; then
+  echo "[entrypoint] SKIP_TPROXY_SETUP=true, skipping automatic TPROXY setup"
+else
+  check_tproxy_prerequisites
 
-# Setup TPROXY routing for WireGuard traffic (no need to wait for sing-box)
-setup_tproxy_routing
+  # Setup TPROXY routing for WireGuard traffic (no need to wait for sing-box)
+  setup_tproxy_routing
 
-# Setup TPROXY routing for Xray V2Ray ingress traffic
-setup_xray_tproxy
+  # Setup TPROXY routing for Xray V2Ray ingress traffic
+  setup_xray_tproxy
+fi
 
 # Log rotation configuration
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"  # 10 MB default
@@ -1140,8 +1145,10 @@ while true; do
         TPROXY_PORT="7893"
         start_singbox "${GENERATED_CONFIG_PATH:-${BASE_CONFIG_PATH}}"
         # Reconfigure TPROXY for new port
-        setup_tproxy_routing
-        setup_xray_tproxy
+        if [ "${SKIP_TPROXY_SETUP:-false}" != "true" ]; then
+          setup_tproxy_routing
+          setup_xray_tproxy
+        fi
       fi
     fi
   else

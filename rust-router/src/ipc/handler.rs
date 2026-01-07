@@ -242,6 +242,104 @@ impl IpcHandler {
             IpcCommand::GetUdpWorkerStats => self.handle_get_udp_worker_stats(),
 
             IpcCommand::GetBufferPoolStats => self.handle_get_buffer_pool_stats(),
+
+            // ================================================================
+            // Phase 6.0: IPC Protocol v3.2 Command Handlers (Stubs)
+            // ================================================================
+
+            // WireGuard Tunnel Management (Phase 6 - userspace WireGuard)
+            IpcCommand::CreateWgTunnel { tag, config: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("CreateWgTunnel not yet implemented: {}", tag))
+            }
+            IpcCommand::RemoveWgTunnel { tag, drain_timeout_secs: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("RemoveWgTunnel not yet implemented: {}", tag))
+            }
+            IpcCommand::GetWgTunnelStatus { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GetWgTunnelStatus not yet implemented: {}", tag))
+            }
+            IpcCommand::ListWgTunnels => {
+                IpcResponse::error(ErrorCode::OperationFailed, "ListWgTunnels not yet implemented")
+            }
+
+            // ECMP Group Management
+            IpcCommand::CreateEcmpGroup { tag, config: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("CreateEcmpGroup not yet implemented: {}", tag))
+            }
+            IpcCommand::RemoveEcmpGroup { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("RemoveEcmpGroup not yet implemented: {}", tag))
+            }
+            IpcCommand::GetEcmpGroupStatus { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GetEcmpGroupStatus not yet implemented: {}", tag))
+            }
+            IpcCommand::ListEcmpGroups => {
+                IpcResponse::error(ErrorCode::OperationFailed, "ListEcmpGroups not yet implemented")
+            }
+
+            // Peer Management
+            IpcCommand::GeneratePairRequest { local_tag, .. } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GeneratePairRequest not yet implemented: {}", local_tag))
+            }
+            IpcCommand::ImportPairRequest { code: _, local_tag, .. } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("ImportPairRequest not yet implemented: {}", local_tag))
+            }
+            IpcCommand::CompleteHandshake { code: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, "CompleteHandshake not yet implemented")
+            }
+            IpcCommand::ConnectPeer { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("ConnectPeer not yet implemented: {}", tag))
+            }
+            IpcCommand::DisconnectPeer { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("DisconnectPeer not yet implemented: {}", tag))
+            }
+            IpcCommand::GetPeerStatus { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GetPeerStatus not yet implemented: {}", tag))
+            }
+            IpcCommand::GetPeerTunnelHealth { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GetPeerTunnelHealth not yet implemented: {}", tag))
+            }
+            IpcCommand::ListPeers => {
+                IpcResponse::error(ErrorCode::OperationFailed, "ListPeers not yet implemented")
+            }
+            IpcCommand::RemovePeer { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("RemovePeer not yet implemented: {}", tag))
+            }
+
+            // Chain Management
+            IpcCommand::CreateChain { tag, config: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("CreateChain not yet implemented: {}", tag))
+            }
+            IpcCommand::RemoveChain { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("RemoveChain not yet implemented: {}", tag))
+            }
+            IpcCommand::ActivateChain { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("ActivateChain not yet implemented: {}", tag))
+            }
+            IpcCommand::DeactivateChain { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("DeactivateChain not yet implemented: {}", tag))
+            }
+            IpcCommand::GetChainStatus { tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GetChainStatus not yet implemented: {}", tag))
+            }
+            IpcCommand::ListChains => {
+                IpcResponse::error(ErrorCode::OperationFailed, "ListChains not yet implemented")
+            }
+            IpcCommand::GetChainRole { chain_tag } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("GetChainRole not yet implemented: {}", chain_tag))
+            }
+            IpcCommand::UpdateChainState { tag, state: _, last_error: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("UpdateChainState not yet implemented: {}", tag))
+            }
+
+            // Two-Phase Commit
+            IpcCommand::PrepareChainRoute { chain_tag, config: _, source_node: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("PrepareChainRoute not yet implemented: {}", chain_tag))
+            }
+            IpcCommand::CommitChainRoute { chain_tag, source_node: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("CommitChainRoute not yet implemented: {}", chain_tag))
+            }
+            IpcCommand::AbortChainRoute { chain_tag, source_node: _ } => {
+                IpcResponse::error(ErrorCode::OperationFailed, format!("AbortChainRoute not yet implemented: {}", chain_tag))
+            }
         }
     }
 

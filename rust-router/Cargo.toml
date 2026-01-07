@@ -64,6 +64,18 @@ aho-corasick = "1"
 # Cryptographic hashing
 md-5 = "0.10"
 
+# Base64 encoding
+base64 = "0.22"
+
+# WireGuard userspace implementation
+boringtun = "0.6"
+
+# Random number generation
+rand = "0.8"
+
+# Parking lot for efficient synchronization
+parking_lot = "0.12"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

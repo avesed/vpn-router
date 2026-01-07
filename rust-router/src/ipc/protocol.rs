@@ -258,6 +258,281 @@ pub enum IpcCommand {
     /// Returns statistics about the lock-free UDP buffer pool including
     /// allocations, reuses, returns, and drops.
     GetBufferPoolStats,
+
+    // ========================================================================
+    // Phase 6.0: IPC Protocol v3.0 - WireGuard Tunnel Management
+    // ========================================================================
+
+    /// Create a userspace WireGuard tunnel
+    ///
+    /// Creates a new WireGuard tunnel using boringtun (Phase 6).
+    CreateWgTunnel {
+        /// Unique tag for this tunnel
+        tag: String,
+        /// WireGuard tunnel configuration
+        config: WgTunnelConfig,
+    },
+
+    /// Remove a WireGuard tunnel
+    ///
+    /// Removes a userspace WireGuard tunnel with optional drain timeout.
+    RemoveWgTunnel {
+        /// Tunnel tag to remove
+        tag: String,
+        /// Optional drain timeout in seconds (default: 30)
+        #[serde(default)]
+        drain_timeout_secs: Option<u32>,
+    },
+
+    /// Get WireGuard tunnel status
+    ///
+    /// Returns status information for a specific WireGuard tunnel.
+    GetWgTunnelStatus {
+        /// Tunnel tag
+        tag: String,
+    },
+
+    /// List all WireGuard tunnels
+    ///
+    /// Returns a list of all userspace WireGuard tunnels.
+    ListWgTunnels,
+
+    // ========================================================================
+    // Phase 6.0: IPC Protocol v3.0 - ECMP Group Management
+    // ========================================================================
+
+    /// Create an ECMP (Equal-Cost Multi-Path) load balancing group
+    ///
+    /// Creates a new ECMP group for distributing traffic across multiple outbounds.
+    CreateEcmpGroup {
+        /// Unique tag for this group
+        tag: String,
+        /// ECMP group configuration
+        config: EcmpGroupConfig,
+    },
+
+    /// Remove an ECMP group
+    ///
+    /// Removes an ECMP load balancing group.
+    RemoveEcmpGroup {
+        /// Group tag to remove
+        tag: String,
+    },
+
+    /// Get ECMP group status
+    ///
+    /// Returns status information for a specific ECMP group.
+    GetEcmpGroupStatus {
+        /// Group tag
+        tag: String,
+    },
+
+    /// List all ECMP groups
+    ///
+    /// Returns a list of all ECMP load balancing groups.
+    ListEcmpGroups,
+
+    // ========================================================================
+    // Phase 6.0: IPC Protocol v3.2 - Peer Management
+    // ========================================================================
+
+    /// Generate offline pairing request code
+    ///
+    /// Generates a Base64-encoded pairing request for offline node pairing.
+    /// Supports bidirectional pairing with pre-generated remote keys.
+    GeneratePairRequest {
+        /// Local node tag
+        local_tag: String,
+        /// Local node description
+        local_description: String,
+        /// Local endpoint (IP:port or hostname:port)
+        local_endpoint: String,
+        /// Local Web API port (default: 36000)
+        local_api_port: u16,
+        /// Whether to enable bidirectional auto-connect
+        bidirectional: bool,
+        /// Tunnel type (WireGuard or Xray)
+        tunnel_type: TunnelType,
+    },
+
+    /// Import pairing request from another node
+    ///
+    /// Imports and processes a pairing request code from another node.
+    /// Returns a response code to complete the handshake.
+    ImportPairRequest {
+        /// Base64-encoded pairing request code
+        code: String,
+        /// Local node tag
+        local_tag: String,
+        /// Local node description
+        local_description: String,
+        /// Local endpoint (IP:port or hostname:port)
+        local_endpoint: String,
+        /// Local Web API port (default: 36000)
+        local_api_port: u16,
+    },
+
+    /// Complete the pairing handshake
+    ///
+    /// Completes the pairing process with the response code.
+    CompleteHandshake {
+        /// Base64-encoded pairing response code
+        code: String,
+    },
+
+    /// Connect to a configured peer node
+    ///
+    /// Initiates connection to a previously configured peer.
+    ConnectPeer {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// Disconnect from a peer node
+    ///
+    /// Disconnects from a connected peer.
+    DisconnectPeer {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// Get peer node status
+    ///
+    /// Returns status information for a specific peer.
+    GetPeerStatus {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// Get peer tunnel health status
+    ///
+    /// Returns health information based on WireGuard handshake for a peer.
+    GetPeerTunnelHealth {
+        /// Peer node tag
+        tag: String,
+    },
+
+    /// List all peer nodes
+    ///
+    /// Returns a list of all configured peer nodes.
+    ListPeers,
+
+    /// Remove a peer node configuration
+    ///
+    /// Removes a peer node and its associated tunnel.
+    RemovePeer {
+        /// Peer node tag
+        tag: String,
+    },
+
+    // ========================================================================
+    // Phase 6.0: IPC Protocol v3.2 - Chain Management
+    // ========================================================================
+
+    /// Create a multi-node routing chain
+    ///
+    /// Creates a new chain for multi-hop traffic routing with DSCP marking.
+    CreateChain {
+        /// Unique tag for this chain
+        tag: String,
+        /// Chain configuration
+        config: ChainConfig,
+    },
+
+    /// Remove a routing chain
+    ///
+    /// Removes a chain and cleans up associated routes.
+    RemoveChain {
+        /// Chain tag to remove
+        tag: String,
+    },
+
+    /// Activate a routing chain
+    ///
+    /// Activates a chain using Two-Phase Commit protocol for distributed activation.
+    ActivateChain {
+        /// Chain tag to activate
+        tag: String,
+    },
+
+    /// Deactivate a routing chain
+    ///
+    /// Deactivates a chain and removes its routing rules.
+    DeactivateChain {
+        /// Chain tag to deactivate
+        tag: String,
+    },
+
+    /// Get chain status
+    ///
+    /// Returns status information for a specific chain.
+    GetChainStatus {
+        /// Chain tag
+        tag: String,
+    },
+
+    /// List all routing chains
+    ///
+    /// Returns a list of all configured chains.
+    ListChains,
+
+    /// Get local node's role in a chain
+    ///
+    /// Returns the role (entry/relay/terminal) of the local node in a chain.
+    GetChainRole {
+        /// Chain tag
+        chain_tag: String,
+    },
+
+    /// Update chain state in database
+    ///
+    /// Updates the chain state for persistence and recovery.
+    UpdateChainState {
+        /// Chain tag
+        tag: String,
+        /// New chain state
+        state: ChainState,
+        /// Optional error message
+        #[serde(default)]
+        last_error: Option<String>,
+    },
+
+    // ========================================================================
+    // Phase 6.0: IPC Protocol v3.2 - Two-Phase Commit Commands
+    // ========================================================================
+
+    /// Phase 1: Prepare chain route (validate only, no apply)
+    ///
+    /// Validates chain configuration on this node without applying rules.
+    /// Part of the Two-Phase Commit protocol for distributed chain activation.
+    PrepareChainRoute {
+        /// Chain tag
+        chain_tag: String,
+        /// Chain configuration to validate
+        config: ChainConfig,
+        /// Node that initiated this request
+        source_node: String,
+    },
+
+    /// Phase 2a: Commit chain route (apply rules)
+    ///
+    /// Applies chain routing rules after successful PREPARE on all nodes.
+    CommitChainRoute {
+        /// Chain tag
+        chain_tag: String,
+        /// Node that initiated this request
+        source_node: String,
+    },
+
+    /// Phase 2b: Abort chain route (rollback any state)
+    ///
+    /// Rolls back any prepared state after a PREPARE failure.
+    AbortChainRoute {
+        /// Chain tag
+        chain_tag: String,
+        /// Node that initiated this request
+        source_node: String,
+    },
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -389,6 +664,43 @@ pub enum IpcResponse {
 
     /// UDP buffer pool statistics response
     BufferPoolStats(BufferPoolStatsResponse),
+
+    // ========================================================================
+    // Phase 6.0: IPC Protocol v3.2 Response Types
+    // ========================================================================
+
+    /// WireGuard tunnel status response
+    WgTunnelStatus(WgTunnelStatus),
+
+    /// WireGuard tunnel list response
+    WgTunnelList(WgTunnelListResponse),
+
+    /// ECMP group status response
+    EcmpGroupStatus(EcmpGroupStatus),
+
+    /// ECMP group list response
+    EcmpGroupList(EcmpGroupListResponse),
+
+    /// Peer status response
+    PeerStatus(PeerStatus),
+
+    /// Peer list response
+    PeerList(PeerListResponse),
+
+    /// Pairing operation response
+    Pairing(PairingResponse),
+
+    /// Chain status response
+    ChainStatus(ChainStatus),
+
+    /// Chain list response
+    ChainList(ChainListResponse),
+
+    /// Chain role response
+    ChainRole(ChainRoleResponse),
+
+    /// Two-Phase Commit prepare response
+    PrepareResult(PrepareResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -813,6 +1125,634 @@ pub struct BufferPoolStatsResponse {
     pub available: bool,
     /// Buffer pool statistics
     pub stats: Option<BufferPoolInfo>,
+}
+
+// ============================================================================
+// Phase 6.0: IPC Protocol v3.2 Types
+// ============================================================================
+
+/// Tunnel type for peer connections
+///
+/// Defines the type of tunnel used for peer-to-peer connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelType {
+    /// WireGuard tunnel (userspace via boringtun)
+    WireGuard,
+    /// Xray tunnel (via SOCKS5 bridge)
+    Xray,
+}
+
+impl Default for TunnelType {
+    fn default() -> Self {
+        Self::WireGuard
+    }
+}
+
+impl std::fmt::Display for TunnelType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WireGuard => write!(f, "wireguard"),
+            Self::Xray => write!(f, "xray"),
+        }
+    }
+}
+
+/// WireGuard tunnel configuration
+///
+/// Configuration for creating a userspace WireGuard tunnel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgTunnelConfig {
+    /// WireGuard private key (Base64 encoded)
+    pub private_key: String,
+    /// Peer public key (Base64 encoded)
+    pub peer_public_key: String,
+    /// Peer endpoint (IP:port)
+    pub peer_endpoint: String,
+    /// Allowed IPs for this tunnel
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// Local tunnel IP (e.g., "10.200.200.1/32")
+    #[serde(default)]
+    pub local_ip: Option<String>,
+    /// Listen port for incoming connections
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+    /// Persistent keepalive interval in seconds
+    #[serde(default)]
+    pub persistent_keepalive: Option<u16>,
+    /// MTU for the tunnel
+    #[serde(default)]
+    pub mtu: Option<u16>,
+}
+
+/// WireGuard tunnel status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgTunnelStatus {
+    /// Tunnel tag
+    pub tag: String,
+    /// Whether the tunnel is active
+    pub active: bool,
+    /// Local tunnel IP
+    pub local_ip: Option<String>,
+    /// Peer endpoint
+    pub peer_endpoint: String,
+    /// Last handshake timestamp (Unix epoch seconds)
+    pub last_handshake: Option<u64>,
+    /// Bytes transmitted
+    pub tx_bytes: u64,
+    /// Bytes received
+    pub rx_bytes: u64,
+    /// Active connections using this tunnel
+    pub active_connections: u64,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
+/// ECMP (Equal-Cost Multi-Path) load balancing algorithm
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EcmpAlgorithm {
+    /// Round-robin distribution
+    RoundRobin,
+    /// Random selection
+    Random,
+    /// Hash-based (consistent hashing by source IP)
+    SourceHash,
+    /// Weighted random selection
+    Weighted,
+    /// Least connections
+    LeastConnections,
+}
+
+impl Default for EcmpAlgorithm {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+/// ECMP group member configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpMemberConfig {
+    /// Outbound tag
+    pub outbound: String,
+    /// Weight for weighted algorithms (default: 1)
+    #[serde(default = "default_ecmp_weight")]
+    pub weight: u32,
+    /// Whether this member is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_ecmp_weight() -> u32 {
+    1
+}
+
+/// ECMP group configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpGroupConfig {
+    /// Group description (optional)
+    #[serde(default)]
+    pub description: String,
+    /// Load balancing algorithm
+    #[serde(default)]
+    pub algorithm: EcmpAlgorithm,
+    /// Group members (outbounds)
+    pub members: Vec<EcmpMemberConfig>,
+    /// Whether to skip unhealthy members
+    #[serde(default = "default_enabled")]
+    pub skip_unhealthy: bool,
+    /// Health check interval in seconds
+    #[serde(default = "default_health_interval")]
+    pub health_check_interval_secs: u32,
+    /// Routing mark for Linux policy routing (200-299)
+    #[serde(default)]
+    pub routing_mark: Option<u32>,
+    /// Routing table for policy routing
+    #[serde(default)]
+    pub routing_table: Option<u32>,
+}
+
+fn default_health_interval() -> u32 {
+    30
+}
+
+/// ECMP group status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpGroupStatus {
+    /// Group tag
+    pub tag: String,
+    /// Load balancing algorithm
+    pub algorithm: EcmpAlgorithm,
+    /// Member status
+    pub members: Vec<EcmpMemberStatus>,
+    /// Total active connections
+    pub active_connections: u64,
+    /// Total connections handled
+    pub total_connections: u64,
+}
+
+/// ECMP member status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpMemberStatus {
+    /// Outbound tag
+    pub outbound: String,
+    /// Weight
+    pub weight: u32,
+    /// Whether enabled
+    pub enabled: bool,
+    /// Health status
+    pub health: String,
+    /// Active connections
+    pub active_connections: u64,
+    /// Total connections
+    pub total_connections: u64,
+}
+
+// ============================================================================
+// Phase 6.0: Peer Management Types
+// ============================================================================
+
+/// Peer node configuration
+///
+/// Configuration for a peer node in a multi-node setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// Unique peer tag
+    pub tag: String,
+    /// Human-readable description
+    pub description: String,
+    /// Peer endpoint (IP:port or hostname:port)
+    pub endpoint: String,
+    /// Tunnel type (WireGuard or Xray)
+    pub tunnel_type: TunnelType,
+    /// Web API port on the peer (default: 36000)
+    #[serde(default = "default_api_port")]
+    pub api_port: u16,
+
+    // WireGuard-specific fields
+    /// Peer's WireGuard public key
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Local WireGuard private key for this peer
+    #[serde(default)]
+    pub wg_local_private_key: Option<String>,
+    /// Local tunnel IP
+    #[serde(default)]
+    pub tunnel_local_ip: Option<String>,
+    /// Remote tunnel IP
+    #[serde(default)]
+    pub tunnel_remote_ip: Option<String>,
+    /// Tunnel port
+    #[serde(default)]
+    pub tunnel_port: Option<u16>,
+    /// Persistent keepalive interval
+    #[serde(default)]
+    pub persistent_keepalive: Option<u16>,
+
+    // Xray-specific fields
+    /// Xray user UUID
+    #[serde(default)]
+    pub xray_uuid: Option<String>,
+    /// Xray server name for TLS
+    #[serde(default)]
+    pub xray_server_name: Option<String>,
+    /// Xray public key for REALITY
+    #[serde(default)]
+    pub xray_public_key: Option<String>,
+    /// Xray short ID
+    #[serde(default)]
+    pub xray_short_id: Option<String>,
+    /// Local SOCKS5 port for Xray
+    #[serde(default)]
+    pub xray_local_socks_port: Option<u16>,
+}
+
+fn default_api_port() -> u16 {
+    36000
+}
+
+/// Peer connection state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerState {
+    /// Not connected
+    Disconnected,
+    /// Connection in progress
+    Connecting,
+    /// Successfully connected
+    Connected,
+    /// Connection failed
+    Failed,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self::Disconnected
+    }
+}
+
+impl std::fmt::Display for PeerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => write!(f, "disconnected"),
+            Self::Connecting => write!(f, "connecting"),
+            Self::Connected => write!(f, "connected"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// Peer node status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// Peer tag
+    pub tag: String,
+    /// Current connection state
+    pub state: PeerState,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Local tunnel IP
+    pub tunnel_local_ip: Option<String>,
+    /// Remote tunnel IP
+    pub tunnel_remote_ip: Option<String>,
+    /// Web API port
+    pub api_port: u16,
+    /// Last WireGuard handshake (Unix epoch seconds)
+    pub last_handshake: Option<u64>,
+    /// Bytes transmitted
+    pub tx_bytes: u64,
+    /// Bytes received
+    pub rx_bytes: u64,
+    /// Number of reconnection attempts
+    pub reconnect_attempts: u32,
+    /// Consecutive health check failures (for hysteresis)
+    pub consecutive_failures: u32,
+    /// Last error message
+    pub last_error: Option<String>,
+}
+
+// ============================================================================
+// Phase 6.0: Chain Management Types
+// ============================================================================
+
+/// Chain node role
+///
+/// Defines the role of a node in a multi-hop chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainRole {
+    /// Entry node: Receives traffic and marks with DSCP
+    Entry,
+    /// Relay node: Forwards traffic based on DSCP
+    Relay,
+    /// Terminal node: Final destination, removes DSCP and exits
+    Terminal,
+}
+
+impl std::fmt::Display for ChainRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Entry => write!(f, "entry"),
+            Self::Relay => write!(f, "relay"),
+            Self::Terminal => write!(f, "terminal"),
+        }
+    }
+}
+
+/// Chain activation state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainState {
+    /// Chain is not active
+    Inactive,
+    /// Chain activation is in progress (2PC)
+    Activating,
+    /// Chain is active and routing traffic
+    Active,
+    /// Chain is in error state
+    Error,
+}
+
+impl Default for ChainState {
+    fn default() -> Self {
+        Self::Inactive
+    }
+}
+
+impl std::fmt::Display for ChainState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inactive => write!(f, "inactive"),
+            Self::Activating => write!(f, "activating"),
+            Self::Active => write!(f, "active"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// Chain hop configuration
+///
+/// Configuration for a single hop in a multi-hop chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainHop {
+    /// Node tag (must be a configured peer or local node)
+    pub node_tag: String,
+    /// Role of this node in the chain
+    pub role: ChainRole,
+    /// Tunnel type to use for this hop
+    pub tunnel_type: TunnelType,
+}
+
+/// Chain configuration
+///
+/// Configuration for a multi-node routing chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// Unique chain tag
+    pub tag: String,
+    /// Human-readable description
+    pub description: String,
+    /// DSCP value for marking (1-63)
+    pub dscp_value: u8,
+    /// Ordered list of hops in the chain
+    pub hops: Vec<ChainHop>,
+    /// Routing rules that use this chain
+    #[serde(default)]
+    pub rules: Vec<String>,
+    /// Exit egress on the terminal node
+    pub exit_egress: String,
+    /// Allow transitive routing (skip remote egress validation)
+    #[serde(default)]
+    pub allow_transitive: bool,
+}
+
+/// Two-Phase Commit prepare status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrepareStatus {
+    /// Not yet prepared
+    Pending,
+    /// Successfully prepared (validated)
+    Prepared,
+    /// Successfully committed (rules applied)
+    Committed,
+    /// Aborted (rolled back)
+    Aborted,
+}
+
+impl Default for PrepareStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// Hop status in a chain
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HopStatus {
+    /// Node tag
+    pub node_tag: String,
+    /// Node role
+    pub role: ChainRole,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Whether the peer is connected
+    pub peer_connected: bool,
+    /// Two-Phase Commit status
+    #[serde(default)]
+    pub prepare_status: Option<PrepareStatus>,
+}
+
+/// Chain status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainStatus {
+    /// Chain tag
+    pub tag: String,
+    /// Current chain state
+    pub state: ChainState,
+    /// DSCP value
+    pub dscp_value: u8,
+    /// Local node's role (None if not in chain)
+    pub my_role: Option<ChainRole>,
+    /// Status of each hop
+    pub hop_status: Vec<HopStatus>,
+    /// Active connections using this chain
+    pub active_connections: u64,
+    /// Last error message
+    pub last_error: Option<String>,
+}
+
+// ============================================================================
+// Phase 6.0: Pairing Types
+// ============================================================================
+
+/// Offline pairing request
+///
+/// Contains all information needed for offline node pairing.
+/// Encoded as Base64 JSON for exchange via QR code or text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairRequest {
+    /// Protocol version (2 for v3.2)
+    pub version: u8,
+    /// Node tag
+    pub node_tag: String,
+    /// Node description
+    pub node_description: String,
+    /// Endpoint (IP:port with tunnel port)
+    pub endpoint: String,
+    /// Web API port
+    pub api_port: u16,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Creation timestamp (Unix epoch seconds)
+    pub timestamp: u64,
+    /// Whether bidirectional auto-connect is requested
+    pub bidirectional: bool,
+
+    // WireGuard fields
+    /// Local WireGuard public key
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Tunnel IP assigned to this node
+    #[serde(default)]
+    pub tunnel_ip: Option<String>,
+
+    // Bidirectional: Pre-generated keys for remote node
+    /// Pre-generated remote WireGuard private key (for bidirectional)
+    #[serde(default)]
+    pub remote_wg_private_key: Option<String>,
+    /// Pre-generated remote WireGuard public key (for bidirectional)
+    #[serde(default)]
+    pub remote_wg_public_key: Option<String>,
+
+    // Xray fields
+    /// Xray user UUID
+    #[serde(default)]
+    pub xray_uuid: Option<String>,
+    /// Xray server name
+    #[serde(default)]
+    pub xray_server_name: Option<String>,
+    /// Xray public key
+    #[serde(default)]
+    pub xray_public_key: Option<String>,
+    /// Xray short ID
+    #[serde(default)]
+    pub xray_short_id: Option<String>,
+}
+
+/// Offline pairing response
+///
+/// Response to a pairing request, completing the handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairResponse {
+    /// Protocol version
+    pub version: u8,
+    /// Original request node tag
+    pub request_node_tag: String,
+    /// Responding node tag
+    pub node_tag: String,
+    /// Responding node description
+    pub node_description: String,
+    /// Responding node endpoint
+    pub endpoint: String,
+    /// Web API port
+    pub api_port: u16,
+    /// Tunnel type
+    pub tunnel_type: TunnelType,
+    /// Response timestamp
+    pub timestamp: u64,
+
+    // WireGuard fields
+    /// Responding node's WireGuard public key
+    #[serde(default)]
+    pub wg_public_key: Option<String>,
+    /// Local tunnel IP (assigned to responding node)
+    #[serde(default)]
+    pub tunnel_local_ip: Option<String>,
+    /// Remote tunnel IP (assigned to requesting node)
+    #[serde(default)]
+    pub tunnel_remote_ip: Option<String>,
+
+    // Tunnel API endpoint for post-tunnel communication
+    /// API endpoint accessible via tunnel
+    #[serde(default)]
+    pub tunnel_api_endpoint: Option<String>,
+
+    // Xray fields
+    /// Xray user UUID for authentication
+    #[serde(default)]
+    pub xray_uuid: Option<String>,
+}
+
+// ============================================================================
+// Phase 6.0: IPC Response Types
+// ============================================================================
+
+/// Response containing a WireGuard tunnel list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgTunnelListResponse {
+    /// List of tunnel statuses
+    pub tunnels: Vec<WgTunnelStatus>,
+}
+
+/// Response containing an ECMP group list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcmpGroupListResponse {
+    /// List of group statuses
+    pub groups: Vec<EcmpGroupStatus>,
+}
+
+/// Response containing a peer list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerListResponse {
+    /// List of peer statuses
+    pub peers: Vec<PeerStatus>,
+}
+
+/// Response containing a chain list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainListResponse {
+    /// List of chain statuses
+    pub chains: Vec<ChainStatus>,
+}
+
+/// Response for pairing operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingResponse {
+    /// Whether the operation succeeded
+    pub success: bool,
+    /// Base64-encoded code (for generate/import)
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Message
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Peer tag (for import/complete)
+    #[serde(default)]
+    pub peer_tag: Option<String>,
+}
+
+/// Response for chain role query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainRoleResponse {
+    /// Chain tag
+    pub chain_tag: String,
+    /// Local node's role (None if not in chain)
+    pub role: Option<ChainRole>,
+    /// Whether this node is in the chain
+    pub in_chain: bool,
+}
+
+/// Response for Two-Phase Commit prepare
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareResponse {
+    /// Whether prepare succeeded
+    pub success: bool,
+    /// Error message if failed
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Node that responded
+    pub node: String,
 }
 
 /// IPC error
@@ -1555,5 +2495,587 @@ rust_router_connections_total 12345
         assert!(json.contains("\"worker_stats\":null"));
         assert!(json.contains("\"buffer_pool_stats\":null"));
         assert!(json.contains("\"processor_stats\":null"));
+    }
+
+    // =========================================================================
+    // Phase 6.0 Serialization Tests - IPC Protocol v3.2
+    // =========================================================================
+
+    #[test]
+    fn test_tunnel_type_serialization() {
+        let wg = TunnelType::WireGuard;
+        let json = serde_json::to_string(&wg).unwrap();
+        assert_eq!(json, "\"wire_guard\"");
+
+        let xray = TunnelType::Xray;
+        let json = serde_json::to_string(&xray).unwrap();
+        assert_eq!(json, "\"xray\"");
+
+        // Deserialize back
+        let parsed: TunnelType = serde_json::from_str("\"wire_guard\"").unwrap();
+        assert_eq!(parsed, TunnelType::WireGuard);
+
+        let parsed: TunnelType = serde_json::from_str("\"xray\"").unwrap();
+        assert_eq!(parsed, TunnelType::Xray);
+
+        // Test default
+        assert_eq!(TunnelType::default(), TunnelType::WireGuard);
+    }
+
+    #[test]
+    fn test_peer_state_serialization() {
+        let state = PeerState::Connected;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"connected\"");
+
+        let state = PeerState::Disconnected;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"disconnected\"");
+
+        let state = PeerState::Connecting;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"connecting\"");
+
+        let state = PeerState::Failed;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"failed\"");
+
+        // Test default
+        assert_eq!(PeerState::default(), PeerState::Disconnected);
+    }
+
+    #[test]
+    fn test_chain_role_serialization() {
+        let role = ChainRole::Entry;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"entry\"");
+
+        let role = ChainRole::Relay;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"relay\"");
+
+        let role = ChainRole::Terminal;
+        let json = serde_json::to_string(&role).unwrap();
+        assert_eq!(json, "\"terminal\"");
+    }
+
+    #[test]
+    fn test_chain_state_serialization() {
+        let state = ChainState::Inactive;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"inactive\"");
+
+        let state = ChainState::Activating;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"activating\"");
+
+        let state = ChainState::Active;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"active\"");
+
+        let state = ChainState::Error;
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"error\"");
+
+        // Test default
+        assert_eq!(ChainState::default(), ChainState::Inactive);
+    }
+
+    #[test]
+    fn test_ecmp_algorithm_serialization() {
+        let algo = EcmpAlgorithm::RoundRobin;
+        let json = serde_json::to_string(&algo).unwrap();
+        assert_eq!(json, "\"round_robin\"");
+
+        let algo = EcmpAlgorithm::Weighted;
+        let json = serde_json::to_string(&algo).unwrap();
+        assert_eq!(json, "\"weighted\"");
+
+        // Test default
+        assert_eq!(EcmpAlgorithm::default(), EcmpAlgorithm::RoundRobin);
+    }
+
+    #[test]
+    fn test_prepare_status_serialization() {
+        let status = PrepareStatus::Pending;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"pending\"");
+
+        let status = PrepareStatus::Prepared;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"prepared\"");
+
+        let status = PrepareStatus::Committed;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"committed\"");
+
+        let status = PrepareStatus::Aborted;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"aborted\"");
+
+        // Test default
+        assert_eq!(PrepareStatus::default(), PrepareStatus::Pending);
+    }
+
+    #[test]
+    fn test_wg_tunnel_config_serialization() {
+        let config = WgTunnelConfig {
+            private_key: "cGFzc3dvcmQ=".into(),
+            peer_public_key: "cGVlcmtleQ==".into(),
+            peer_endpoint: "10.0.0.1:51820".into(),
+            allowed_ips: vec!["10.200.200.0/24".into()],
+            local_ip: Some("10.200.200.1/32".into()),
+            listen_port: Some(36200),
+            persistent_keepalive: Some(25),
+            mtu: Some(1420),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"private_key\":\"cGFzc3dvcmQ=\""));
+        assert!(json.contains("\"peer_endpoint\":\"10.0.0.1:51820\""));
+        assert!(json.contains("\"listen_port\":36200"));
+        assert!(json.contains("\"mtu\":1420"));
+
+        let parsed: WgTunnelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.peer_endpoint, "10.0.0.1:51820");
+        assert_eq!(parsed.mtu, Some(1420));
+    }
+
+    #[test]
+    fn test_chain_config_serialization() {
+        let config = ChainConfig {
+            tag: "test-chain".into(),
+            description: "Test chain".into(),
+            dscp_value: 10,
+            hops: vec![
+                ChainHop {
+                    node_tag: "node-a".into(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "node-b".into(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            ],
+            rules: vec!["rule1".into()],
+            exit_egress: "direct".into(),
+            allow_transitive: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"tag\":\"test-chain\""));
+        assert!(json.contains("\"dscp_value\":10"));
+        assert!(json.contains("\"exit_egress\":\"direct\""));
+        assert!(json.contains("\"role\":\"entry\""));
+        assert!(json.contains("\"role\":\"terminal\""));
+
+        let parsed: ChainConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tag, "test-chain");
+        assert_eq!(parsed.dscp_value, 10);
+        assert_eq!(parsed.hops.len(), 2);
+        assert_eq!(parsed.hops[0].role, ChainRole::Entry);
+    }
+
+    #[test]
+    fn test_pair_request_serialization() {
+        let request = PairRequest {
+            version: 2,
+            node_tag: "node-a".into(),
+            node_description: "Test node A".into(),
+            endpoint: "192.168.1.100:36200".into(),
+            api_port: 36000,
+            tunnel_type: TunnelType::WireGuard,
+            timestamp: 1704067200,
+            bidirectional: true,
+            wg_public_key: Some("cHVibGljX2tleQ==".into()),
+            tunnel_ip: Some("10.200.200.1".into()),
+            remote_wg_private_key: None,
+            remote_wg_public_key: None,
+            xray_uuid: None,
+            xray_server_name: None,
+            xray_public_key: None,
+            xray_short_id: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"version\":2"));
+        assert!(json.contains("\"node_tag\":\"node-a\""));
+        assert!(json.contains("\"bidirectional\":true"));
+        assert!(json.contains("\"api_port\":36000"));
+
+        let parsed: PairRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.api_port, 36000);
+        assert!(parsed.bidirectional);
+    }
+
+    #[test]
+    fn test_generate_pair_request_command_serialization() {
+        let cmd = IpcCommand::GeneratePairRequest {
+            local_tag: "local-node".into(),
+            local_description: "My local node".into(),
+            local_endpoint: "1.2.3.4:36200".into(),
+            local_api_port: 36000,
+            bidirectional: true,
+            tunnel_type: TunnelType::WireGuard,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"generate_pair_request\""));
+        assert!(json.contains("\"local_tag\":\"local-node\""));
+        assert!(json.contains("\"bidirectional\":true"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GeneratePairRequest { local_tag, bidirectional, .. } = parsed {
+            assert_eq!(local_tag, "local-node");
+            assert!(bidirectional);
+        } else {
+            panic!("Expected GeneratePairRequest command");
+        }
+    }
+
+    #[test]
+    fn test_create_chain_command_serialization() {
+        let cmd = IpcCommand::CreateChain {
+            tag: "my-chain".into(),
+            config: ChainConfig {
+                tag: "my-chain".into(),
+                description: "My test chain".into(),
+                dscp_value: 5,
+                hops: vec![],
+                rules: vec![],
+                exit_egress: "proxy".into(),
+                allow_transitive: false,
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"create_chain\""));
+        assert!(json.contains("\"tag\":\"my-chain\""));
+        assert!(json.contains("\"dscp_value\":5"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::CreateChain { tag, config } = parsed {
+            assert_eq!(tag, "my-chain");
+            assert_eq!(config.dscp_value, 5);
+        } else {
+            panic!("Expected CreateChain command");
+        }
+    }
+
+    #[test]
+    fn test_prepare_chain_route_command_serialization() {
+        let cmd = IpcCommand::PrepareChainRoute {
+            chain_tag: "chain-1".into(),
+            config: ChainConfig {
+                tag: "chain-1".into(),
+                description: "Chain 1".into(),
+                dscp_value: 10,
+                hops: vec![],
+                rules: vec![],
+                exit_egress: "direct".into(),
+                allow_transitive: false,
+            },
+            source_node: "entry-node".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"prepare_chain_route\""));
+        assert!(json.contains("\"chain_tag\":\"chain-1\""));
+        assert!(json.contains("\"source_node\":\"entry-node\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::PrepareChainRoute { chain_tag, source_node, .. } = parsed {
+            assert_eq!(chain_tag, "chain-1");
+            assert_eq!(source_node, "entry-node");
+        } else {
+            panic!("Expected PrepareChainRoute command");
+        }
+    }
+
+    #[test]
+    fn test_chain_status_response_serialization() {
+        let status = ChainStatus {
+            tag: "my-chain".into(),
+            state: ChainState::Active,
+            dscp_value: 10,
+            my_role: Some(ChainRole::Entry),
+            hop_status: vec![
+                HopStatus {
+                    node_tag: "node-a".into(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                    peer_connected: true,
+                    prepare_status: Some(PrepareStatus::Committed),
+                },
+                HopStatus {
+                    node_tag: "node-b".into(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                    peer_connected: true,
+                    prepare_status: Some(PrepareStatus::Committed),
+                },
+            ],
+            active_connections: 5,
+            last_error: None,
+        };
+        let ipc_resp = IpcResponse::ChainStatus(status);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"chain_status\""));
+        assert!(json.contains("\"state\":\"active\""));
+        assert!(json.contains("\"my_role\":\"entry\""));
+        assert!(json.contains("\"peer_connected\":true"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::ChainStatus(s) = parsed {
+            assert_eq!(s.tag, "my-chain");
+            assert_eq!(s.state, ChainState::Active);
+            assert_eq!(s.hop_status.len(), 2);
+        } else {
+            panic!("Expected ChainStatus response");
+        }
+    }
+
+    #[test]
+    fn test_peer_status_response_serialization() {
+        let status = PeerStatus {
+            tag: "peer-1".into(),
+            state: PeerState::Connected,
+            tunnel_type: TunnelType::WireGuard,
+            tunnel_local_ip: Some("10.200.200.1".into()),
+            tunnel_remote_ip: Some("10.200.200.2".into()),
+            api_port: 36000,
+            last_handshake: Some(1704067200),
+            tx_bytes: 1000,
+            rx_bytes: 2000,
+            reconnect_attempts: 0,
+            consecutive_failures: 0,
+            last_error: None,
+        };
+        let ipc_resp = IpcResponse::PeerStatus(status);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"peer_status\""));
+        assert!(json.contains("\"state\":\"connected\""));
+        assert!(json.contains("\"api_port\":36000"));
+        assert!(json.contains("\"tx_bytes\":1000"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::PeerStatus(s) = parsed {
+            assert_eq!(s.tag, "peer-1");
+            assert_eq!(s.state, PeerState::Connected);
+            assert_eq!(s.api_port, 36000);
+        } else {
+            panic!("Expected PeerStatus response");
+        }
+    }
+
+    #[test]
+    fn test_ecmp_group_config_serialization() {
+        let config = EcmpGroupConfig {
+            description: "Test ECMP group".into(),
+            algorithm: EcmpAlgorithm::Weighted,
+            members: vec![
+                EcmpMemberConfig {
+                    outbound: "proxy-1".into(),
+                    weight: 2,
+                    enabled: true,
+                },
+                EcmpMemberConfig {
+                    outbound: "proxy-2".into(),
+                    weight: 1,
+                    enabled: true,
+                },
+            ],
+            skip_unhealthy: true,
+            health_check_interval_secs: 30,
+            routing_mark: Some(200),
+            routing_table: Some(200),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"algorithm\":\"weighted\""));
+        assert!(json.contains("\"weight\":2"));
+        assert!(json.contains("\"skip_unhealthy\":true"));
+
+        let parsed: EcmpGroupConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.algorithm, EcmpAlgorithm::Weighted);
+        assert_eq!(parsed.members.len(), 2);
+        assert_eq!(parsed.members[0].weight, 2);
+    }
+
+    #[test]
+    fn test_wg_tunnel_commands_serialization() {
+        // CreateWgTunnel
+        let cmd = IpcCommand::CreateWgTunnel {
+            tag: "wg-test".into(),
+            config: WgTunnelConfig {
+                private_key: "key".into(),
+                peer_public_key: "peer".into(),
+                peer_endpoint: "1.2.3.4:51820".into(),
+                allowed_ips: vec![],
+                local_ip: None,
+                listen_port: None,
+                persistent_keepalive: None,
+                mtu: None,
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"create_wg_tunnel\""));
+
+        // RemoveWgTunnel
+        let cmd = IpcCommand::RemoveWgTunnel {
+            tag: "wg-test".into(),
+            drain_timeout_secs: Some(30),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_wg_tunnel\""));
+        assert!(json.contains("\"drain_timeout_secs\":30"));
+
+        // GetWgTunnelStatus
+        let cmd = IpcCommand::GetWgTunnelStatus { tag: "wg-test".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_wg_tunnel_status\""));
+
+        // ListWgTunnels
+        let cmd = IpcCommand::ListWgTunnels;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_wg_tunnels\""));
+    }
+
+    #[test]
+    fn test_peer_commands_serialization() {
+        // ConnectPeer
+        let cmd = IpcCommand::ConnectPeer { tag: "peer-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"connect_peer\""));
+
+        // DisconnectPeer
+        let cmd = IpcCommand::DisconnectPeer { tag: "peer-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"disconnect_peer\""));
+
+        // GetPeerStatus
+        let cmd = IpcCommand::GetPeerStatus { tag: "peer-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_peer_status\""));
+
+        // ListPeers
+        let cmd = IpcCommand::ListPeers;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_peers\""));
+
+        // RemovePeer
+        let cmd = IpcCommand::RemovePeer { tag: "peer-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_peer\""));
+    }
+
+    #[test]
+    fn test_chain_commands_serialization() {
+        // ActivateChain
+        let cmd = IpcCommand::ActivateChain { tag: "chain-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"activate_chain\""));
+
+        // DeactivateChain
+        let cmd = IpcCommand::DeactivateChain { tag: "chain-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"deactivate_chain\""));
+
+        // GetChainStatus
+        let cmd = IpcCommand::GetChainStatus { tag: "chain-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_chain_status\""));
+
+        // ListChains
+        let cmd = IpcCommand::ListChains;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_chains\""));
+
+        // GetChainRole
+        let cmd = IpcCommand::GetChainRole { chain_tag: "chain-1".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_chain_role\""));
+    }
+
+    #[test]
+    fn test_two_phase_commit_commands_serialization() {
+        // CommitChainRoute
+        let cmd = IpcCommand::CommitChainRoute {
+            chain_tag: "chain-1".into(),
+            source_node: "entry".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"commit_chain_route\""));
+        assert!(json.contains("\"source_node\":\"entry\""));
+
+        // AbortChainRoute
+        let cmd = IpcCommand::AbortChainRoute {
+            chain_tag: "chain-1".into(),
+            source_node: "entry".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"abort_chain_route\""));
+    }
+
+    #[test]
+    fn test_pairing_response_serialization() {
+        let resp = PairingResponse {
+            success: true,
+            code: Some("YmFzZTY0Y29kZQ==".into()),
+            message: Some("Pairing code generated".into()),
+            peer_tag: None,
+        };
+        let ipc_resp = IpcResponse::Pairing(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"pairing\""));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"code\":\"YmFzZTY0Y29kZQ==\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::Pairing(p) = parsed {
+            assert!(p.success);
+            assert_eq!(p.code, Some("YmFzZTY0Y29kZQ==".into()));
+        } else {
+            panic!("Expected Pairing response");
+        }
+    }
+
+    #[test]
+    fn test_chain_role_response_serialization() {
+        let resp = ChainRoleResponse {
+            chain_tag: "chain-1".into(),
+            role: Some(ChainRole::Entry),
+            in_chain: true,
+        };
+        let ipc_resp = IpcResponse::ChainRole(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"chain_role\""));
+        assert!(json.contains("\"role\":\"entry\""));
+        assert!(json.contains("\"in_chain\":true"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::ChainRole(r) = parsed {
+            assert_eq!(r.role, Some(ChainRole::Entry));
+            assert!(r.in_chain);
+        } else {
+            panic!("Expected ChainRole response");
+        }
+    }
+
+    #[test]
+    fn test_prepare_response_serialization() {
+        let resp = PrepareResponse {
+            success: true,
+            message: None,
+            node: "relay-node".into(),
+        };
+        let ipc_resp = IpcResponse::PrepareResult(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"prepare_result\""));
+        assert!(json.contains("\"node\":\"relay-node\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::PrepareResult(p) = parsed {
+            assert!(p.success);
+            assert_eq!(p.node, "relay-node");
+        } else {
+            panic!("Expected PrepareResult response");
+        }
     }
 }

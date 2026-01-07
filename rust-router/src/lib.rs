@@ -61,15 +61,19 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
 
+pub mod chain;
 pub mod config;
 pub mod connection;
+pub mod ecmp;
 pub mod error;
 pub mod io;
 pub mod ipc;
 pub mod outbound;
+pub mod peer;
 pub mod rules;
 pub mod sniff;
 pub mod tproxy;
+pub mod tunnel;
 
 // Re-export commonly used types at the crate root
 pub use config::{Config, ListenConfig, OutboundConfig, RuleConfig, RulesConfig};
@@ -104,6 +108,10 @@ pub use sniff::{
 };
 pub use tproxy::{
     TproxyConnection, TproxyListener, TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo,
+};
+pub use peer::{
+    validate_chain_tag, validate_dscp_value, validate_endpoint, validate_peer_tag,
+    validate_tunnel_ip, validate_wg_key, ValidationError, WG_KEY_LENGTH,
 };
 
 /// Crate version

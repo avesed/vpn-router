@@ -39,5 +39,12 @@ pub use handler::IpcHandler;
 pub use protocol::{
     decode_message, encode_message, ErrorCode, IpcCommand, IpcError, IpcResponse, OutboundInfo,
     OutboundStatsResponse, ServerCapabilities, ServerStatus, LENGTH_PREFIX_SIZE, MAX_MESSAGE_SIZE,
+    // Phase 6.0: IPC Protocol v3.2 types
+    TunnelType, WgTunnelConfig, WgTunnelStatus, WgTunnelListResponse,
+    EcmpAlgorithm, EcmpMemberConfig, EcmpGroupConfig, EcmpGroupStatus, EcmpMemberStatus, EcmpGroupListResponse,
+    PeerConfig, PeerState, PeerStatus, PeerListResponse,
+    ChainRole, ChainState, ChainHop, ChainConfig, HopStatus, ChainStatus, ChainListResponse,
+    PrepareStatus, ChainRoleResponse, PrepareResponse, PairingResponse,
+    PairRequest, PairResponse,
 };
 pub use server::{IpcClient, IpcServer};

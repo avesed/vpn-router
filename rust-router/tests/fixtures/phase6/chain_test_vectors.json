@@ -1,0 +1,363 @@
+{
+  "description": "Phase 6 Chain Routing Test Vectors",
+  "version": "1.0.0",
+  "generated": "2026-01-07",
+  "test_vectors": [
+    {
+      "name": "valid_2_node_chain",
+      "description": "Valid 2-node chain (entry + terminal)",
+      "input": {
+        "tag": "chain-2node",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_3_node_chain",
+      "description": "Valid 3-node chain with relay",
+      "input": {
+        "tag": "chain-abc",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-c", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_5_node_chain",
+      "description": "Valid 5-node chain with multiple relays",
+      "input": {
+        "tag": "chain-5hop",
+        "dscp_value": 20,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-c", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-d", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-e", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "jp-tokyo"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_10_node_chain",
+      "description": "Maximum 10-node chain",
+      "input": {
+        "tag": "chain-max",
+        "dscp_value": 63,
+        "hops": [
+          {"node_tag": "node-1", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-2", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-3", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-4", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-5", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-6", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-7", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-8", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-9", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-10", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "de-frankfurt"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_mixed_tunnel_types",
+      "description": "Chain with mixed WireGuard and Xray tunnels",
+      "input": {
+        "tag": "chain-mixed",
+        "dscp_value": 15,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "relay", "tunnel_type": "xray"},
+          {"node_tag": "node-c", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "uk-london"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_dscp_min",
+      "description": "Chain with minimum DSCP value (1)",
+      "input": {
+        "tag": "chain-dscp-min",
+        "dscp_value": 1,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-west"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_dscp_max",
+      "description": "Chain with maximum DSCP value (63)",
+      "input": {
+        "tag": "chain-dscp-max",
+        "dscp_value": 63,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "au-sydney"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "invalid_dscp_zero",
+      "description": "DSCP value 0 is reserved and invalid",
+      "input": {
+        "tag": "chain-dscp0",
+        "dscp_value": 0,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "InvalidDscpValue"
+    },
+    {
+      "name": "invalid_dscp_over_max",
+      "description": "DSCP value above 63 is invalid",
+      "input": {
+        "tag": "chain-dscp64",
+        "dscp_value": 64,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "InvalidDscpValue"
+    },
+    {
+      "name": "invalid_empty_hops",
+      "description": "Chain with no hops",
+      "input": {
+        "tag": "chain-empty",
+        "dscp_value": 10,
+        "hops": [],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "ChainTooShort"
+    },
+    {
+      "name": "invalid_single_hop",
+      "description": "Chain with only one hop (need at least 2)",
+      "input": {
+        "tag": "chain-single",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "ChainTooShort"
+    },
+    {
+      "name": "invalid_too_many_hops",
+      "description": "Chain with more than 10 hops",
+      "input": {
+        "tag": "chain-11hop",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-1", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-2", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-3", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-4", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-5", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-6", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-7", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-8", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-9", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-10", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-11", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "ChainTooLong"
+    },
+    {
+      "name": "invalid_direct_egress",
+      "description": "Direct egress not allowed in chains",
+      "input": {
+        "tag": "chain-direct",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "direct"
+      },
+      "expected": "error",
+      "expected_error": "DirectNotAllowed"
+    },
+    {
+      "name": "invalid_empty_tag",
+      "description": "Chain with empty tag",
+      "input": {
+        "tag": "",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "EmptyTag"
+    },
+    {
+      "name": "invalid_tag_too_long",
+      "description": "Chain tag exceeding 64 characters",
+      "input": {
+        "tag": "this-chain-tag-is-way-too-long-and-exceeds-the-maximum-allowed-length-of-64-chars",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "TagTooLong"
+    },
+    {
+      "name": "invalid_no_terminal",
+      "description": "Chain without terminal node",
+      "input": {
+        "tag": "chain-no-terminal",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "relay", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "NoTerminal"
+    },
+    {
+      "name": "invalid_no_entry",
+      "description": "Chain without entry node",
+      "input": {
+        "tag": "chain-no-entry",
+        "dscp_value": 10,
+        "hops": [
+          {"node_tag": "node-a", "role": "relay", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "NoEntry"
+    },
+    {
+      "name": "valid_with_allow_transitive",
+      "description": "Chain with allow_transitive flag",
+      "input": {
+        "tag": "chain-transitive",
+        "dscp_value": 25,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "remote-egress",
+        "allow_transitive": true
+      },
+      "expected": "success"
+    },
+    {
+      "name": "valid_xray_chain",
+      "description": "Chain using only Xray tunnels",
+      "input": {
+        "tag": "chain-xray",
+        "dscp_value": 30,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "xray"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "xray"}
+        ],
+        "exit_egress": "sg-singapore"
+      },
+      "expected": "success"
+    },
+    {
+      "name": "chain_state_inactive",
+      "description": "Test chain in inactive state",
+      "input": {
+        "tag": "chain-inactive",
+        "dscp_value": 35,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east",
+        "expected_state": "inactive"
+      },
+      "expected": "success",
+      "test_type": "state_check"
+    },
+    {
+      "name": "chain_activation_success",
+      "description": "Test successful chain activation",
+      "input": {
+        "tag": "chain-activate",
+        "dscp_value": 40,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "success",
+      "test_type": "activation"
+    },
+    {
+      "name": "chain_deactivation_success",
+      "description": "Test successful chain deactivation",
+      "input": {
+        "tag": "chain-deactivate",
+        "dscp_value": 45,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-b", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "success",
+      "test_type": "deactivation"
+    },
+    {
+      "name": "invalid_duplicate_node_tag",
+      "description": "Chain with duplicate node tag in hops",
+      "input": {
+        "tag": "chain-duplicate",
+        "dscp_value": 50,
+        "hops": [
+          {"node_tag": "node-a", "role": "entry", "tunnel_type": "wire_guard"},
+          {"node_tag": "node-a", "role": "terminal", "tunnel_type": "wire_guard"}
+        ],
+        "exit_egress": "us-east"
+      },
+      "expected": "error",
+      "expected_error": "DuplicateNodeTag"
+    }
+  ]
+}
