@@ -9,12 +9,14 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    BufferPoolInfo, BufferPoolStatsResponse, ErrorCode, IpcCommand, IpcResponse, OutboundInfo,
-    OutboundStatsResponse, PoolStatsResponse, PrometheusMetricsResponse, RuleStatsResponse,
+    BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainListResponse, ChainRoleResponse,
+    ChainState, ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
+    PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
     ServerCapabilities, ServerStatus, Socks5PoolStats, UdpProcessorInfo, UdpSessionInfo,
     UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
     UdpWorkerPoolInfo, UdpWorkerStatsResponse,
 };
+use crate::chain::ChainManager;
 use crate::config::{load_config_with_env, OutboundConfig};
 use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::io::UdpBufferPool;
@@ -60,6 +62,16 @@ pub struct IpcHandler {
 
     /// UDP buffer pool for lock-free buffer management
     udp_buffer_pool: Option<Arc<UdpBufferPool>>,
+
+    // ========================================================================
+    // Phase 6.6: Chain Management Components
+    // ========================================================================
+
+    /// Chain manager for multi-hop routing (Phase 6.6)
+    chain_manager: Option<Arc<ChainManager>>,
+
+    /// Local node tag for chain identification
+    local_node_tag: String,
 }
 
 impl IpcHandler {
@@ -81,6 +93,8 @@ impl IpcHandler {
             udp_session_manager: None,
             udp_worker_pool: None,
             udp_buffer_pool: None,
+            chain_manager: None,
+            local_node_tag: String::from("local"),
         }
     }
 
@@ -108,7 +122,77 @@ impl IpcHandler {
             udp_session_manager: Some(udp_session_manager),
             udp_worker_pool: Some(udp_worker_pool),
             udp_buffer_pool: Some(udp_buffer_pool),
+            chain_manager: None,
+            local_node_tag: String::from("local"),
         }
+    }
+
+    /// Create a new IPC handler with chain manager
+    ///
+    /// This enables chain management commands (Phase 6.6).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_chain_manager(
+        connection_manager: Arc<ConnectionManager>,
+        outbound_manager: Arc<OutboundManager>,
+        rule_engine: Arc<RuleEngine>,
+        chain_manager: Arc<ChainManager>,
+        local_node_tag: String,
+    ) -> Self {
+        Self {
+            connection_manager,
+            outbound_manager,
+            rule_engine,
+            start_time: Instant::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            config_version: AtomicU64::new(1),
+            last_reload_timestamp: AtomicU64::new(0),
+            udp_enabled: false,
+            udp_session_manager: None,
+            udp_worker_pool: None,
+            udp_buffer_pool: None,
+            chain_manager: Some(chain_manager),
+            local_node_tag,
+        }
+    }
+
+    /// Create a new IPC handler with all components
+    ///
+    /// This enables both UDP and chain management functionality.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        connection_manager: Arc<ConnectionManager>,
+        outbound_manager: Arc<OutboundManager>,
+        rule_engine: Arc<RuleEngine>,
+        udp_session_manager: Arc<UdpSessionManager>,
+        udp_worker_pool: Arc<UdpWorkerPool>,
+        udp_buffer_pool: Arc<UdpBufferPool>,
+        chain_manager: Arc<ChainManager>,
+        local_node_tag: String,
+    ) -> Self {
+        Self {
+            connection_manager,
+            outbound_manager,
+            rule_engine,
+            start_time: Instant::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            config_version: AtomicU64::new(1),
+            last_reload_timestamp: AtomicU64::new(0),
+            udp_enabled: true,
+            udp_session_manager: Some(udp_session_manager),
+            udp_worker_pool: Some(udp_worker_pool),
+            udp_buffer_pool: Some(udp_buffer_pool),
+            chain_manager: Some(chain_manager),
+            local_node_tag,
+        }
+    }
+
+    /// Set the chain manager after construction
+    ///
+    /// This allows adding chain management capability to an existing handler.
+    pub fn with_chain_manager(mut self, chain_manager: Arc<ChainManager>, local_node_tag: String) -> Self {
+        self.chain_manager = Some(chain_manager);
+        self.local_node_tag = local_node_tag;
+        self
     }
 
     /// Create a new IPC handler with a default (empty) rule engine
@@ -126,6 +210,16 @@ impl IpcHandler {
         let rule_engine = Arc::new(RuleEngine::new(snapshot));
 
         Self::new(connection_manager, outbound_manager, rule_engine)
+    }
+
+    /// Get a reference to the chain manager (if available)
+    pub fn chain_manager(&self) -> Option<&Arc<ChainManager>> {
+        self.chain_manager.as_ref()
+    }
+
+    /// Get the local node tag
+    pub fn local_node_tag(&self) -> &str {
+        &self.local_node_tag
     }
 
     /// Handle an IPC command and return a response
@@ -304,41 +398,45 @@ impl IpcHandler {
                 IpcResponse::error(ErrorCode::OperationFailed, format!("RemovePeer not yet implemented: {}", tag))
             }
 
-            // Chain Management
-            IpcCommand::CreateChain { tag, config: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("CreateChain not yet implemented: {}", tag))
+            // ================================================================
+            // Phase 6.6.5: Chain Management Command Handlers
+            // ================================================================
+            IpcCommand::CreateChain { tag, config } => {
+                self.handle_create_chain(tag, config).await
             }
             IpcCommand::RemoveChain { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("RemoveChain not yet implemented: {}", tag))
+                self.handle_remove_chain(&tag).await
             }
             IpcCommand::ActivateChain { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("ActivateChain not yet implemented: {}", tag))
+                self.handle_activate_chain(&tag).await
             }
             IpcCommand::DeactivateChain { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("DeactivateChain not yet implemented: {}", tag))
+                self.handle_deactivate_chain(&tag).await
             }
             IpcCommand::GetChainStatus { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GetChainStatus not yet implemented: {}", tag))
+                self.handle_get_chain_status(&tag)
             }
             IpcCommand::ListChains => {
-                IpcResponse::error(ErrorCode::OperationFailed, "ListChains not yet implemented")
+                self.handle_list_chains()
             }
             IpcCommand::GetChainRole { chain_tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GetChainRole not yet implemented: {}", chain_tag))
+                self.handle_get_chain_role(&chain_tag)
             }
-            IpcCommand::UpdateChainState { tag, state: _, last_error: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("UpdateChainState not yet implemented: {}", tag))
+            IpcCommand::UpdateChainState { tag, state, last_error } => {
+                self.handle_update_chain_state(&tag, state, last_error)
             }
 
-            // Two-Phase Commit
-            IpcCommand::PrepareChainRoute { chain_tag, config: _, source_node: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("PrepareChainRoute not yet implemented: {}", chain_tag))
+            // ================================================================
+            // Phase 6.6.5: Two-Phase Commit Command Handlers
+            // ================================================================
+            IpcCommand::PrepareChainRoute { chain_tag, config, source_node } => {
+                self.handle_prepare_chain_route(&chain_tag, config, &source_node).await
             }
-            IpcCommand::CommitChainRoute { chain_tag, source_node: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("CommitChainRoute not yet implemented: {}", chain_tag))
+            IpcCommand::CommitChainRoute { chain_tag, source_node } => {
+                self.handle_commit_chain_route(&chain_tag, &source_node).await
             }
-            IpcCommand::AbortChainRoute { chain_tag, source_node: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("AbortChainRoute not yet implemented: {}", chain_tag))
+            IpcCommand::AbortChainRoute { chain_tag, source_node } => {
+                self.handle_abort_chain_route(&chain_tag, &source_node).await
             }
         }
     }
@@ -1754,6 +1852,372 @@ impl IpcHandler {
             }),
         }
     }
+
+    // ========================================================================
+    // Phase 6.6.5: Chain Management Handler Implementations
+    // ========================================================================
+
+    /// Handle CreateChain command
+    ///
+    /// Creates a new chain with the given configuration.
+    async fn handle_create_chain(&self, tag: String, config: ChainConfig) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        // Ensure the config tag matches the command tag
+        let mut final_config = config;
+        if final_config.tag != tag {
+            final_config.tag = tag.clone();
+        }
+
+        match chain_manager.create_chain(final_config).await {
+            Ok(dscp_value) => {
+                info!("Created chain '{}' with DSCP value {}", tag, dscp_value);
+                IpcResponse::success_with_message(format!(
+                    "Chain '{}' created with DSCP value {}",
+                    tag, dscp_value
+                ))
+            }
+            Err(e) => {
+                warn!("Failed to create chain '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle RemoveChain command
+    ///
+    /// Removes an existing chain.
+    async fn handle_remove_chain(&self, tag: &str) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.remove_chain(tag).await {
+            Ok(()) => {
+                info!("Removed chain '{}'", tag);
+                IpcResponse::success_with_message(format!("Chain '{}' removed", tag))
+            }
+            Err(e) => {
+                warn!("Failed to remove chain '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle ActivateChain command
+    ///
+    /// Activates a chain using Two-Phase Commit protocol.
+    async fn handle_activate_chain(&self, tag: &str) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.activate_chain(tag).await {
+            Ok(()) => {
+                info!("Activated chain '{}'", tag);
+                IpcResponse::success_with_message(format!("Chain '{}' activated", tag))
+            }
+            Err(e) => {
+                warn!("Failed to activate chain '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle DeactivateChain command
+    ///
+    /// Deactivates an active chain.
+    async fn handle_deactivate_chain(&self, tag: &str) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.deactivate_chain(tag).await {
+            Ok(()) => {
+                info!("Deactivated chain '{}'", tag);
+                IpcResponse::success_with_message(format!("Chain '{}' deactivated", tag))
+            }
+            Err(e) => {
+                warn!("Failed to deactivate chain '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle GetChainStatus command
+    ///
+    /// Returns status information for a specific chain.
+    fn handle_get_chain_status(&self, tag: &str) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.get_chain_status(tag) {
+            Some(status) => IpcResponse::ChainStatus(status),
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Chain '{}' not found", tag),
+            ),
+        }
+    }
+
+    /// Handle ListChains command
+    ///
+    /// Returns a list of all configured chains.
+    fn handle_list_chains(&self) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::ChainList(ChainListResponse { chains: vec![] });
+        };
+
+        let chains = chain_manager.list_chains();
+        IpcResponse::ChainList(ChainListResponse { chains })
+    }
+
+    /// Handle GetChainRole command
+    ///
+    /// Returns the local node's role in a specific chain.
+    fn handle_get_chain_role(&self, chain_tag: &str) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        if !chain_manager.chain_exists(chain_tag) {
+            return IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Chain '{}' not found", chain_tag),
+            );
+        }
+
+        let role = chain_manager.get_chain_role(chain_tag);
+        IpcResponse::ChainRole(ChainRoleResponse {
+            chain_tag: chain_tag.to_string(),
+            role: role.clone(),
+            in_chain: role.is_some(),
+        })
+    }
+
+    /// Handle UpdateChainState command
+    ///
+    /// Updates the state of a chain (used for persistence and recovery).
+    fn handle_update_chain_state(
+        &self,
+        tag: &str,
+        state: ChainState,
+        last_error: Option<String>,
+    ) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.update_chain_state(tag, state.clone(), last_error) {
+            Ok(()) => {
+                debug!("Updated chain '{}' state to {:?}", tag, state);
+                IpcResponse::success_with_message(format!(
+                    "Chain '{}' state updated to {}",
+                    tag, state
+                ))
+            }
+            Err(e) => {
+                warn!("Failed to update chain '{}' state: {}", tag, e);
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    // ========================================================================
+    // Phase 6.6.5: Two-Phase Commit Handler Implementations
+    // ========================================================================
+
+    /// Handle PrepareChainRoute command (2PC Phase 1)
+    ///
+    /// Validates chain configuration without applying routing rules.
+    /// Called by the coordinator to prepare remote nodes.
+    async fn handle_prepare_chain_route(
+        &self,
+        chain_tag: &str,
+        config: ChainConfig,
+        source_node: &str,
+    ) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::PrepareResult(PrepareResponse {
+                success: false,
+                message: Some("Chain manager not available".to_string()),
+                node: self.local_node_tag.clone(),
+            });
+        };
+
+        match chain_manager.handle_prepare_request(chain_tag, config, source_node).await {
+            Ok(()) => {
+                debug!(
+                    "PREPARE succeeded for chain '{}' from node '{}'",
+                    chain_tag, source_node
+                );
+                IpcResponse::PrepareResult(PrepareResponse {
+                    success: true,
+                    message: Some(format!("Prepared for chain '{}'", chain_tag)),
+                    node: self.local_node_tag.clone(),
+                })
+            }
+            Err(e) => {
+                warn!(
+                    "PREPARE failed for chain '{}' from node '{}': {}",
+                    chain_tag, source_node, e
+                );
+                IpcResponse::PrepareResult(PrepareResponse {
+                    success: false,
+                    message: Some(e.to_string()),
+                    node: self.local_node_tag.clone(),
+                })
+            }
+        }
+    }
+
+    /// Handle CommitChainRoute command (2PC Phase 2a)
+    ///
+    /// Applies routing rules after all nodes have been prepared.
+    /// Called by the coordinator to commit remote nodes.
+    async fn handle_commit_chain_route(
+        &self,
+        chain_tag: &str,
+        source_node: &str,
+    ) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.handle_commit_request(chain_tag, source_node).await {
+            Ok(()) => {
+                info!(
+                    "COMMIT succeeded for chain '{}' from node '{}'",
+                    chain_tag, source_node
+                );
+                IpcResponse::success_with_message(format!("Committed chain '{}'", chain_tag))
+            }
+            Err(e) => {
+                warn!(
+                    "COMMIT failed for chain '{}' from node '{}': {}",
+                    chain_tag, source_node, e
+                );
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle AbortChainRoute command (2PC Phase 2b)
+    ///
+    /// Rolls back prepared state when 2PC fails.
+    /// Called by the coordinator to abort remote nodes.
+    async fn handle_abort_chain_route(
+        &self,
+        chain_tag: &str,
+        source_node: &str,
+    ) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        match chain_manager.handle_abort_request(chain_tag, source_node).await {
+            Ok(()) => {
+                info!(
+                    "ABORT handled for chain '{}' from node '{}'",
+                    chain_tag, source_node
+                );
+                IpcResponse::success_with_message(format!("Aborted chain '{}'", chain_tag))
+            }
+            Err(e) => {
+                // ABORT should generally succeed even if there's nothing to abort
+                warn!(
+                    "ABORT had errors for chain '{}' from node '{}': {}",
+                    chain_tag, source_node, e
+                );
+                // Still return success - abort is best-effort
+                IpcResponse::success_with_message(format!(
+                    "Abort processed for chain '{}' (with warnings)",
+                    chain_tag
+                ))
+            }
+        }
+    }
+
+    /// Convert ChainError to IPC ErrorCode
+    fn chain_error_to_code(err: &crate::chain::ChainError) -> ErrorCode {
+        use crate::chain::ChainError;
+        match err {
+            ChainError::NotFound(_) => ErrorCode::NotFound,
+            ChainError::AlreadyExists(_) => ErrorCode::AlreadyExists,
+            ChainError::AlreadyActivating(_)
+            | ChainError::AlreadyActive(_)
+            | ChainError::CannotRemoveActiveChain(_) => ErrorCode::OperationFailed,
+            ChainError::InvalidTag(_)
+            | ChainError::InvalidDescription(_)
+            | ChainError::InvalidDscp(_)
+            | ChainError::NoHops
+            | ChainError::NoTerminal
+            | ChainError::TooManyHops(_)
+            | ChainError::DirectNotAllowed
+            | ChainError::SocksEgressNotAllowed(_)
+            | ChainError::XrayRelayNotAllowed
+            | ChainError::InvalidHopSequence(_) => ErrorCode::InvalidParameters,
+            ChainError::DscpConflict(_) | ChainError::DscpExhausted => ErrorCode::OperationFailed,
+            ChainError::PeerNotFound(_)
+            | ChainError::PeerNotConnected(_)
+            | ChainError::EgressNotFound(_) => ErrorCode::NotFound,
+            ChainError::NotInChain => ErrorCode::PermissionDenied,
+            ChainError::PrepareFailed(_, _)
+            | ChainError::CommitFailed(_, _)
+            | ChainError::RemoteValidationFailed(_)
+            | ChainError::RuleEngine(_)
+            | ChainError::LockError(_)
+            | ChainError::Internal(_) => ErrorCode::InternalError,
+        }
+    }
 }
 
 /// Write a metric header (HELP and TYPE lines)
@@ -2995,5 +3459,593 @@ mod tests {
         } else {
             panic!("Expected BufferPoolStats response");
         }
+    }
+
+    // ========================================================================
+    // Phase 6.6.5: Chain Management Tests
+    // ========================================================================
+
+    use crate::chain::ChainManager;
+    use crate::ipc::protocol::{ChainHop, ChainRole, TunnelType};
+
+    fn create_test_handler_with_chain_manager() -> IpcHandler {
+        let outbound_manager = Arc::new(OutboundManager::new());
+        outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple("direct")));
+        outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple("pia-us-east")));
+
+        let conn_config = ConnectionConfig::default();
+        let connection_manager = Arc::new(ConnectionManager::new(
+            &conn_config,
+            Arc::clone(&outbound_manager),
+            "direct".into(),
+            Duration::from_millis(300),
+        ));
+
+        let chain_manager = Arc::new(ChainManager::new("local-node".to_string()));
+
+        IpcHandler::new_with_chain_manager(
+            connection_manager,
+            outbound_manager,
+            Arc::new(RuleEngine::new(
+                RoutingSnapshotBuilder::new()
+                    .default_outbound("direct")
+                    .version(1)
+                    .build()
+                    .unwrap(),
+            )),
+            chain_manager,
+            "local-node".to_string(),
+        )
+    }
+
+    fn create_test_chain_config(tag: &str) -> ChainConfig {
+        ChainConfig {
+            tag: tag.to_string(),
+            description: "Test chain".to_string(),
+            dscp_value: 0, // Auto-allocate
+            hops: vec![
+                ChainHop {
+                    node_tag: "local-node".to_string(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "remote-node".to_string(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            ],
+            rules: vec![],
+            exit_egress: "pia-us-east".to_string(),
+            allow_transitive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_chain_success() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-1");
+
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-1".to_string(),
+                config,
+            })
+            .await;
+
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+    }
+
+    #[tokio::test]
+    async fn test_create_chain_already_exists() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-2");
+
+        // First creation should succeed
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-2".to_string(),
+                config: config.clone(),
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Second creation should fail
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-2".to_string(),
+                config,
+            })
+            .await;
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::AlreadyExists));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_chain_direct_egress_rejected() {
+        let handler = create_test_handler_with_chain_manager();
+        let mut config = create_test_chain_config("test-chain-3");
+        config.exit_egress = "direct".to_string();
+
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-3".to_string(),
+                config,
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+            assert!(err.message.contains("direct"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_chain_empty_hops_rejected() {
+        let handler = create_test_handler_with_chain_manager();
+        let mut config = create_test_chain_config("test-chain-4");
+        config.hops = vec![];
+
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-4".to_string(),
+                config,
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_chain_success() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-5");
+
+        // Create chain first
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-5".to_string(),
+                config,
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Remove chain
+        let response = handler
+            .handle(IpcCommand::RemoveChain {
+                tag: "test-chain-5".to_string(),
+            })
+            .await;
+        assert!(!response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_remove_chain_not_found() {
+        let handler = create_test_handler_with_chain_manager();
+
+        let response = handler
+            .handle(IpcCommand::RemoveChain {
+                tag: "nonexistent".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_status_success() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-6");
+
+        // Create chain first
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-6".to_string(),
+                config,
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Get status
+        let response = handler
+            .handle(IpcCommand::GetChainStatus {
+                tag: "test-chain-6".to_string(),
+            })
+            .await;
+
+        if let IpcResponse::ChainStatus(status) = response {
+            assert_eq!(status.tag, "test-chain-6");
+            assert!(matches!(status.state, crate::ipc::protocol::ChainState::Inactive));
+            assert!(status.dscp_value >= 1 && status.dscp_value <= 63);
+        } else {
+            panic!("Expected ChainStatus response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_status_not_found() {
+        let handler = create_test_handler_with_chain_manager();
+
+        let response = handler
+            .handle(IpcCommand::GetChainStatus {
+                tag: "nonexistent".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_chains_empty() {
+        let handler = create_test_handler_with_chain_manager();
+
+        let response = handler.handle(IpcCommand::ListChains).await;
+
+        if let IpcResponse::ChainList(list) = response {
+            assert!(list.chains.is_empty());
+        } else {
+            panic!("Expected ChainList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_chains_with_chains() {
+        let handler = create_test_handler_with_chain_manager();
+
+        // Create two chains
+        for i in 7..=8 {
+            let config = create_test_chain_config(&format!("test-chain-{}", i));
+            let response = handler
+                .handle(IpcCommand::CreateChain {
+                    tag: format!("test-chain-{}", i),
+                    config,
+                })
+                .await;
+            assert!(!response.is_error());
+        }
+
+        // List chains
+        let response = handler.handle(IpcCommand::ListChains).await;
+
+        if let IpcResponse::ChainList(list) = response {
+            assert_eq!(list.chains.len(), 2);
+        } else {
+            panic!("Expected ChainList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_role_found() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-9");
+
+        // Create chain
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-9".to_string(),
+                config,
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Get role
+        let response = handler
+            .handle(IpcCommand::GetChainRole {
+                chain_tag: "test-chain-9".to_string(),
+            })
+            .await;
+
+        if let IpcResponse::ChainRole(role_response) = response {
+            assert_eq!(role_response.chain_tag, "test-chain-9");
+            assert!(role_response.in_chain);
+            assert!(matches!(role_response.role, Some(ChainRole::Entry)));
+        } else {
+            panic!("Expected ChainRole response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_chain_role_not_found() {
+        let handler = create_test_handler_with_chain_manager();
+
+        let response = handler
+            .handle(IpcCommand::GetChainRole {
+                chain_tag: "nonexistent".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chain_manager_not_available() {
+        // Use regular handler without chain manager
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test".to_string(),
+                config: create_test_chain_config("test"),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("Chain manager not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_chains_without_chain_manager() {
+        let handler = create_test_handler();
+
+        let response = handler.handle(IpcCommand::ListChains).await;
+
+        // Should return empty list instead of error
+        if let IpcResponse::ChainList(list) = response {
+            assert!(list.chains.is_empty());
+        } else {
+            panic!("Expected ChainList response");
+        }
+    }
+
+    // ========================================================================
+    // Phase 6.6.5: Two-Phase Commit Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_prepare_chain_route_success() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-10");
+
+        let response = handler
+            .handle(IpcCommand::PrepareChainRoute {
+                chain_tag: "test-chain-10".to_string(),
+                config,
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+
+        if let IpcResponse::PrepareResult(prepare) = response {
+            assert!(prepare.success);
+            assert_eq!(prepare.node, "local-node");
+        } else {
+            panic!("Expected PrepareResult response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_chain_route_invalid_config() {
+        let handler = create_test_handler_with_chain_manager();
+        let mut config = create_test_chain_config("test-chain-11");
+        config.exit_egress = "direct".to_string(); // Invalid
+
+        let response = handler
+            .handle(IpcCommand::PrepareChainRoute {
+                chain_tag: "test-chain-11".to_string(),
+                config,
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+
+        if let IpcResponse::PrepareResult(prepare) = response {
+            assert!(!prepare.success);
+            assert!(prepare.message.unwrap().contains("direct"));
+        } else {
+            panic!("Expected PrepareResult response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_chain_route_after_prepare() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-12");
+
+        // Prepare first
+        let response = handler
+            .handle(IpcCommand::PrepareChainRoute {
+                chain_tag: "test-chain-12".to_string(),
+                config,
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+        if let IpcResponse::PrepareResult(prepare) = response {
+            assert!(prepare.success);
+        }
+
+        // Commit
+        let response = handler
+            .handle(IpcCommand::CommitChainRoute {
+                chain_tag: "test-chain-12".to_string(),
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+
+        assert!(!response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_abort_chain_route() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-13");
+
+        // Prepare first
+        let response = handler
+            .handle(IpcCommand::PrepareChainRoute {
+                chain_tag: "test-chain-13".to_string(),
+                config,
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+        if let IpcResponse::PrepareResult(prepare) = response {
+            assert!(prepare.success);
+        }
+
+        // Abort
+        let response = handler
+            .handle(IpcCommand::AbortChainRoute {
+                chain_tag: "test-chain-13".to_string(),
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+
+        // Abort should always succeed
+        assert!(!response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_abort_nonexistent_chain() {
+        let handler = create_test_handler_with_chain_manager();
+
+        // Abort non-existent chain should still succeed (best-effort)
+        let response = handler
+            .handle(IpcCommand::AbortChainRoute {
+                chain_tag: "nonexistent".to_string(),
+                source_node: "coordinator-node".to_string(),
+            })
+            .await;
+
+        // Abort should return success even for non-existent chains
+        assert!(!response.is_error());
+    }
+
+    #[tokio::test]
+    async fn test_update_chain_state() {
+        let handler = create_test_handler_with_chain_manager();
+        let config = create_test_chain_config("test-chain-14");
+
+        // Create chain
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-14".to_string(),
+                config,
+            })
+            .await;
+        assert!(!response.is_error());
+
+        // Update state
+        let response = handler
+            .handle(IpcCommand::UpdateChainState {
+                tag: "test-chain-14".to_string(),
+                state: crate::ipc::protocol::ChainState::Error,
+                last_error: Some("Test error".to_string()),
+            })
+            .await;
+
+        assert!(!response.is_error());
+
+        // Verify state was updated
+        let response = handler
+            .handle(IpcCommand::GetChainStatus {
+                tag: "test-chain-14".to_string(),
+            })
+            .await;
+
+        if let IpcResponse::ChainStatus(status) = response {
+            assert!(matches!(status.state, crate::ipc::protocol::ChainState::Error));
+            assert_eq!(status.last_error, Some("Test error".to_string()));
+        } else {
+            panic!("Expected ChainStatus response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chain_with_too_many_hops_rejected() {
+        let handler = create_test_handler_with_chain_manager();
+        let mut config = create_test_chain_config("test-chain-15");
+
+        // Add 11 hops (max is 10)
+        config.hops = (0..11)
+            .map(|i| {
+                let role = if i == 0 {
+                    ChainRole::Entry
+                } else if i == 10 {
+                    ChainRole::Terminal
+                } else {
+                    ChainRole::Relay
+                };
+                ChainHop {
+                    node_tag: format!("node-{}", i),
+                    role,
+                    tunnel_type: TunnelType::WireGuard,
+                }
+            })
+            .collect();
+
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-15".to_string(),
+                config,
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chain_xray_relay_rejected() {
+        let handler = create_test_handler_with_chain_manager();
+        let mut config = create_test_chain_config("test-chain-16");
+
+        // Add Xray relay (not allowed)
+        config.hops = vec![
+            ChainHop {
+                node_tag: "local-node".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "relay-node".to_string(),
+                role: ChainRole::Relay,
+                tunnel_type: TunnelType::Xray, // Xray relay not allowed
+            },
+            ChainHop {
+                node_tag: "terminal-node".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ];
+
+        let response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain-16".to_string(),
+                config,
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+            assert!(err.message.contains("Xray"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_chain_manager_builder() {
+        let handler = create_test_handler();
+        let chain_manager = Arc::new(ChainManager::new("test-node".to_string()));
+
+        let handler = handler.with_chain_manager(chain_manager, "test-node".to_string());
+
+        assert!(handler.chain_manager().is_some());
+        assert_eq!(handler.local_node_tag(), "test-node");
     }
 }

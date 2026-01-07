@@ -57,6 +57,7 @@
 //! - [`sniff`]: Protocol sniffing (TLS SNI, QUIC SNI)
 //! - [`tproxy`]: TPROXY socket and listener
 //! - [`ingress`]: WireGuard ingress management (Phase 6.3)
+//! - [`egress`]: WireGuard egress management (Phase 6.4)
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -66,6 +67,7 @@ pub mod chain;
 pub mod config;
 pub mod connection;
 pub mod ecmp;
+pub mod egress;
 pub mod error;
 pub mod ingress;
 pub mod io;
@@ -118,6 +120,14 @@ pub use peer::{
 pub use ingress::{
     IngressError, IngressProcessor, RoutingDecision, WgIngressConfig, WgIngressManager,
     WgIngressStats,
+};
+pub use egress::{
+    EgressError, EgressResult, EgressTunnelStatus, EgressTunnelType, WgEgressConfig,
+    WgEgressManager, WgEgressStats, WgReplyHandler,
+};
+pub use chain::{
+    ChainError, ChainManager, DscpAllocator, DscpRoutingCallback, NoOpRoutingCallback,
+    PeerConnectivityCallback,
 };
 
 /// Crate version

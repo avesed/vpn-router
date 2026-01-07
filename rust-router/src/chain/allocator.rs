@@ -143,6 +143,7 @@ impl DscpAllocator {
     /// let dscp = allocator.allocate().expect("Should allocate DSCP");
     /// assert!(dscp >= 1 && dscp <= 63);
     /// ```
+    #[must_use = "The allocated DSCP value must be stored and later released"]
     pub fn allocate(&self) -> Result<u8, DscpAllocatorError> {
         let mut allocated = self
             .allocated
@@ -181,6 +182,7 @@ impl DscpAllocator {
     /// let allocator = DscpAllocator::new();
     /// allocator.reserve(42).expect("Should reserve DSCP");
     /// ```
+    #[must_use = "The reservation result should be checked for success or failure"]
     pub fn reserve(&self, dscp: u8) -> Result<(), DscpAllocatorError> {
         if dscp < MIN_DSCP || dscp > MAX_DSCP {
             return Err(DscpAllocatorError::OutOfRange(dscp));

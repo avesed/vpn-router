@@ -104,7 +104,7 @@ impl From<std::io::Error> for WgTunnelError {
 }
 
 /// Statistics for a WireGuard tunnel
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WgTunnelStats {
     /// Bytes transmitted
     pub tx_bytes: u64,

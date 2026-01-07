@@ -5,10 +5,10 @@
 //!
 //! # Phase 6 Implementation Status
 //!
-//! - [ ] 6.6.3 PREPARE phase implementation
-//! - [ ] 6.6.3 COMMIT phase implementation
-//! - [ ] 6.6.3 ABORT/rollback implementation
-//! - [ ] 6.6.3 Timeout handling
+//! - [x] 6.6.3 PREPARE phase implementation
+//! - [x] 6.6.3 COMMIT phase implementation
+//! - [x] 6.6.3 ABORT/rollback implementation
+//! - [x] 6.6.3 Timeout handling
 //!
 //! # Protocol Overview
 //!
@@ -29,20 +29,23 @@
 //! # Example
 //!
 //! ```ignore
-//! use rust_router::chain::two_phase::TwoPhaseCommit;
+//! use rust_router::chain::two_phase::{TwoPhaseCommit, NoOpNetworkClient};
 //!
-//! let coordinator = TwoPhaseCommit::new_coordinator(chain_config);
+//! let client = Arc::new(NoOpNetworkClient);
+//! let coordinator = TwoPhaseCommit::new(
+//!     "my-chain".to_string(),
+//!     chain_config,
+//!     vec!["node-a".to_string(), "node-b".to_string()],
+//! ).with_network_client(client);
 //!
 //! // Phase 1: Prepare all nodes
-//! for node in chain.nodes() {
-//!     coordinator.prepare(node).await?;
-//! }
-//!
-//! // Phase 2: Commit all nodes
-//! if coordinator.all_prepared() {
-//!     coordinator.commit_all().await?;
+//! let errors = coordinator.prepare_all().await;
+//! if errors.is_empty() {
+//!     // Phase 2: Commit all nodes
+//!     let errors = coordinator.commit_all().await;
 //! } else {
-//!     coordinator.abort_all().await?;
+//!     // Abort on failure
+//!     coordinator.abort_all().await;
 //! }
 //! ```
 //!
@@ -57,6 +60,11 @@
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.6.3
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::time::timeout;
 
 use crate::ipc::ChainConfig;
 
@@ -115,6 +123,10 @@ pub enum TwoPhaseError {
     #[error("COMMIT failed on {node}: {reason}")]
     CommitFailed { node: String, reason: String },
 
+    /// ABORT failed
+    #[error("ABORT failed on {node}: {reason}")]
+    AbortFailed { node: String, reason: String },
+
     /// Timeout waiting for response
     #[error("Timeout waiting for {node} during {phase}")]
     Timeout { node: String, phase: String },
@@ -147,12 +159,167 @@ pub struct ParticipantState {
     pub error: Option<String>,
 }
 
+/// Network client trait for 2PC operations
+///
+/// This trait abstracts network communication for the 2PC protocol,
+/// allowing for mock implementations in tests and real network
+/// implementations in production.
+#[async_trait]
+pub trait ChainNetworkClient: Send + Sync {
+    /// Send PREPARE request to a node
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - Node tag to send to
+    /// * `config` - Chain configuration
+    ///
+    /// # Returns
+    ///
+    /// Ok if the node is prepared, Err with reason otherwise.
+    async fn send_prepare(&self, node: &str, config: &ChainConfig) -> Result<(), String>;
+
+    /// Send COMMIT request to a node
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - Node tag to send to
+    /// * `chain_tag` - Chain tag being committed
+    ///
+    /// # Returns
+    ///
+    /// Ok if commit successful, Err with reason otherwise.
+    async fn send_commit(&self, node: &str, chain_tag: &str) -> Result<(), String>;
+
+    /// Send ABORT request to a node
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - Node tag to send to
+    /// * `chain_tag` - Chain tag being aborted
+    ///
+    /// # Returns
+    ///
+    /// Ok if abort successful, Err with reason otherwise.
+    async fn send_abort(&self, node: &str, chain_tag: &str) -> Result<(), String>;
+}
+
+/// No-op network client for single-node testing
+///
+/// This implementation always succeeds immediately, useful for
+/// testing chain activation on a single node without network.
+pub struct NoOpNetworkClient;
+
+#[async_trait]
+impl ChainNetworkClient for NoOpNetworkClient {
+    async fn send_prepare(&self, _node: &str, _config: &ChainConfig) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn send_commit(&self, _node: &str, _chain_tag: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn send_abort(&self, _node: &str, _chain_tag: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Mock network client for testing failures
+///
+/// Allows configuring which nodes will fail at which phase.
+#[derive(Default)]
+pub struct MockNetworkClient {
+    /// Nodes that will fail during PREPARE
+    pub prepare_failures: std::sync::Mutex<HashMap<String, String>>,
+    /// Nodes that will fail during COMMIT
+    pub commit_failures: std::sync::Mutex<HashMap<String, String>>,
+    /// Nodes that will fail during ABORT
+    pub abort_failures: std::sync::Mutex<HashMap<String, String>>,
+    /// Artificial delay for network operations (milliseconds)
+    pub delay_ms: std::sync::atomic::AtomicU64,
+}
+
+impl MockNetworkClient {
+    /// Create a new mock client
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a node that will fail PREPARE
+    pub fn fail_prepare(&self, node: &str, reason: &str) {
+        if let Ok(mut failures) = self.prepare_failures.lock() {
+            failures.insert(node.to_string(), reason.to_string());
+        }
+    }
+
+    /// Add a node that will fail COMMIT
+    pub fn fail_commit(&self, node: &str, reason: &str) {
+        if let Ok(mut failures) = self.commit_failures.lock() {
+            failures.insert(node.to_string(), reason.to_string());
+        }
+    }
+
+    /// Add a node that will fail ABORT
+    pub fn fail_abort(&self, node: &str, reason: &str) {
+        if let Ok(mut failures) = self.abort_failures.lock() {
+            failures.insert(node.to_string(), reason.to_string());
+        }
+    }
+
+    /// Set artificial delay for operations
+    pub fn set_delay(&self, delay_ms: u64) {
+        self.delay_ms.store(delay_ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl ChainNetworkClient for MockNetworkClient {
+    async fn send_prepare(&self, node: &str, _config: &ChainConfig) -> Result<(), String> {
+        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        if let Ok(failures) = self.prepare_failures.lock() {
+            if let Some(reason) = failures.get(node) {
+                return Err(reason.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_commit(&self, node: &str, _chain_tag: &str) -> Result<(), String> {
+        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        if let Ok(failures) = self.commit_failures.lock() {
+            if let Some(reason) = failures.get(node) {
+                return Err(reason.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_abort(&self, node: &str, _chain_tag: &str) -> Result<(), String> {
+        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        if let Ok(failures) = self.abort_failures.lock() {
+            if let Some(reason) = failures.get(node) {
+                return Err(reason.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Two-Phase Commit coordinator
 ///
 /// Manages the 2PC protocol for a single chain activation transaction.
-///
-/// TODO(Phase 6.6): Implement full 2PC coordination
-#[allow(dead_code)]
 pub struct TwoPhaseCommit {
     /// Chain tag being activated
     chain_tag: String,
@@ -164,6 +331,8 @@ pub struct TwoPhaseCommit {
     transaction_state: TwoPhaseState,
     /// Timeout for operations in seconds
     timeout_secs: u64,
+    /// Network client for sending messages
+    network_client: Option<Arc<dyn ChainNetworkClient>>,
 }
 
 impl TwoPhaseCommit {
@@ -205,12 +374,19 @@ impl TwoPhaseCommit {
             participants,
             transaction_state: TwoPhaseState::Pending,
             timeout_secs: DEFAULT_2PC_TIMEOUT_SECS,
+            network_client: None,
         }
     }
 
     /// Set the operation timeout
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Set the network client
+    pub fn with_network_client(mut self, client: Arc<dyn ChainNetworkClient>) -> Self {
+        self.network_client = Some(client);
         self
     }
 
@@ -239,11 +415,23 @@ impl TwoPhaseCommit {
         self.participants.values()
     }
 
+    /// Get number of participants
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+
     /// Check if all participants are prepared
     pub fn all_prepared(&self) -> bool {
         self.participants
             .values()
             .all(|p| p.state == TwoPhaseState::Prepared)
+    }
+
+    /// Check if all participants are committed
+    pub fn all_committed(&self) -> bool {
+        self.participants
+            .values()
+            .all(|p| p.state == TwoPhaseState::Committed)
     }
 
     /// Check if any participant has failed
@@ -262,71 +450,326 @@ impl TwoPhaseCommit {
             .collect()
     }
 
+    /// Get list of failed nodes
+    pub fn failed_nodes(&self) -> Vec<String> {
+        self.participants
+            .values()
+            .filter(|p| matches!(p.state, TwoPhaseState::Failed(_)))
+            .map(|p| p.node_tag.clone())
+            .collect()
+    }
+
+    /// Check if transaction is finalized (committed or aborted)
+    fn is_finalized(&self) -> bool {
+        matches!(
+            self.transaction_state,
+            TwoPhaseState::Committed | TwoPhaseState::Aborted
+        )
+    }
+
     /// Send PREPARE to a participant
+    ///
+    /// Updates participant state through the prepare sequence:
+    /// Pending -> Preparing -> Prepared/Failed
     ///
     /// # Arguments
     ///
     /// * `node_tag` - Node to prepare
-    ///
-    /// TODO(Phase 6.6): Implement PREPARE sending
-    pub async fn prepare(&mut self, _node_tag: &str) -> Result<(), TwoPhaseError> {
-        unimplemented!("Phase 6.6: prepare not yet implemented")
+    pub async fn prepare(&mut self, node_tag: &str) -> Result<(), TwoPhaseError> {
+        // Check transaction not already finalized
+        if self.is_finalized() {
+            return Err(TwoPhaseError::AlreadyFinalized {
+                state: self.transaction_state.to_string(),
+            });
+        }
+
+        // Get participant
+        let participant = self
+            .participants
+            .get_mut(node_tag)
+            .ok_or_else(|| TwoPhaseError::ParticipantNotFound(node_tag.to_string()))?;
+
+        // Check participant is in valid state
+        match &participant.state {
+            TwoPhaseState::Pending => {}
+            TwoPhaseState::Prepared => return Ok(()), // Already prepared
+            state => {
+                return Err(TwoPhaseError::InvalidTransition {
+                    from: state.clone(),
+                    to: TwoPhaseState::Preparing,
+                });
+            }
+        }
+
+        // Update state to Preparing
+        participant.state = TwoPhaseState::Preparing;
+
+        // Send PREPARE via network client
+        let result = if let Some(client) = &self.network_client {
+            let timeout_duration = Duration::from_secs(self.timeout_secs);
+            match timeout(timeout_duration, client.send_prepare(node_tag, &self.config)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(TwoPhaseError::PrepareFailed {
+                    node: node_tag.to_string(),
+                    reason,
+                }),
+                Err(_) => Err(TwoPhaseError::Timeout {
+                    node: node_tag.to_string(),
+                    phase: "PREPARE".to_string(),
+                }),
+            }
+        } else {
+            // No network client - assume local operation succeeds
+            Ok(())
+        };
+
+        // Update participant state based on result
+        // Need to get participant again due to borrow checker
+        let participant = self.participants.get_mut(node_tag).unwrap();
+        match &result {
+            Ok(()) => {
+                participant.state = TwoPhaseState::Prepared;
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                participant.state = TwoPhaseState::Failed(reason.clone());
+                participant.error = Some(reason);
+            }
+        }
+
+        result
     }
 
     /// Send PREPARE to all participants
     ///
+    /// Runs PREPARE sequentially on all participants. Updates transaction_state
+    /// to Preparing, then to Prepared if all succeed, or to Failed if any fail.
+    ///
+    /// Note: Sequential execution is used due to Rust's borrowing rules with
+    /// `&mut self`. For production parallel execution, consider using message
+    /// passing or restructuring to avoid mutable borrows.
+    ///
     /// # Returns
     ///
-    /// List of nodes that failed to prepare
-    ///
-    /// TODO(Phase 6.6): Implement PREPARE all
+    /// List of errors for nodes that failed to prepare.
     pub async fn prepare_all(&mut self) -> Vec<TwoPhaseError> {
-        unimplemented!("Phase 6.6: prepare_all not yet implemented")
+        // Check transaction not already finalized
+        if self.is_finalized() {
+            return vec![TwoPhaseError::AlreadyFinalized {
+                state: self.transaction_state.to_string(),
+            }];
+        }
+
+        // Update transaction state
+        self.transaction_state = TwoPhaseState::Preparing;
+
+        // Get all participant tags to prepare
+        let node_tags: Vec<String> = self.participants.keys().cloned().collect();
+
+        // Prepare participants sequentially
+        let mut errors = Vec::new();
+        for tag in node_tags {
+            if let Err(e) = self.prepare(&tag).await {
+                errors.push(e);
+            }
+        }
+
+        // Update transaction state based on results
+        if errors.is_empty() && self.all_prepared() {
+            self.transaction_state = TwoPhaseState::Prepared;
+        } else {
+            self.transaction_state = TwoPhaseState::Failed("Not all participants prepared".to_string());
+        }
+
+        errors
     }
 
     /// Send COMMIT to a participant
     ///
+    /// Only allowed if participant is in Prepared state.
+    /// Updates state: Prepared -> Committing -> Committed/Failed
+    ///
     /// # Arguments
     ///
     /// * `node_tag` - Node to commit
-    ///
-    /// TODO(Phase 6.6): Implement COMMIT sending
-    pub async fn commit(&mut self, _node_tag: &str) -> Result<(), TwoPhaseError> {
-        unimplemented!("Phase 6.6: commit not yet implemented")
+    pub async fn commit(&mut self, node_tag: &str) -> Result<(), TwoPhaseError> {
+        // Get participant
+        let participant = self
+            .participants
+            .get_mut(node_tag)
+            .ok_or_else(|| TwoPhaseError::ParticipantNotFound(node_tag.to_string()))?;
+
+        // Check participant is Prepared
+        match &participant.state {
+            TwoPhaseState::Prepared => {}
+            TwoPhaseState::Committed => return Ok(()), // Already committed
+            state => {
+                return Err(TwoPhaseError::InvalidTransition {
+                    from: state.clone(),
+                    to: TwoPhaseState::Committing,
+                });
+            }
+        }
+
+        // Update state to Committing
+        participant.state = TwoPhaseState::Committing;
+
+        // Send COMMIT via network client
+        let result = if let Some(client) = &self.network_client {
+            let timeout_duration = Duration::from_secs(self.timeout_secs);
+            match timeout(timeout_duration, client.send_commit(node_tag, &self.chain_tag)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(TwoPhaseError::CommitFailed {
+                    node: node_tag.to_string(),
+                    reason,
+                }),
+                Err(_) => Err(TwoPhaseError::Timeout {
+                    node: node_tag.to_string(),
+                    phase: "COMMIT".to_string(),
+                }),
+            }
+        } else {
+            // No network client - assume local operation succeeds
+            Ok(())
+        };
+
+        // Update participant state based on result
+        let participant = self.participants.get_mut(node_tag).unwrap();
+        match &result {
+            Ok(()) => {
+                participant.state = TwoPhaseState::Committed;
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                participant.state = TwoPhaseState::Failed(reason.clone());
+                participant.error = Some(reason);
+            }
+        }
+
+        result
     }
 
     /// Send COMMIT to all prepared participants
     ///
+    /// Only proceeds if all participants are prepared.
+    /// Commits sequentially on all prepared nodes.
+    ///
     /// # Returns
     ///
-    /// List of nodes that failed to commit
-    ///
-    /// TODO(Phase 6.6): Implement COMMIT all
+    /// List of errors for nodes that failed to commit.
     pub async fn commit_all(&mut self) -> Vec<TwoPhaseError> {
-        unimplemented!("Phase 6.6: commit_all not yet implemented")
+        // Check all prepared first
+        if !self.all_prepared() {
+            return vec![TwoPhaseError::NotAllPrepared];
+        }
+
+        // Update transaction state
+        self.transaction_state = TwoPhaseState::Committing;
+
+        // Get all prepared participant tags
+        let node_tags = self.prepared_nodes();
+
+        // Commit sequentially
+        let mut errors = Vec::new();
+        for tag in node_tags {
+            if let Err(e) = self.commit(&tag).await {
+                errors.push(e);
+            }
+        }
+
+        // Update transaction state
+        if errors.is_empty() && self.all_committed() {
+            self.transaction_state = TwoPhaseState::Committed;
+        } else {
+            // Partial commit - some nodes committed, some failed
+            // Transaction is in inconsistent state
+            self.transaction_state = TwoPhaseState::Failed("Partial commit".to_string());
+        }
+
+        errors
     }
 
     /// Send ABORT to a participant
     ///
+    /// Marks the participant as Aborted. Can be called from any non-committed state.
+    ///
     /// # Arguments
     ///
     /// * `node_tag` - Node to abort
-    ///
-    /// TODO(Phase 6.6): Implement ABORT sending
-    pub async fn abort(&mut self, _node_tag: &str) -> Result<(), TwoPhaseError> {
-        unimplemented!("Phase 6.6: abort not yet implemented")
+    pub async fn abort(&mut self, node_tag: &str) -> Result<(), TwoPhaseError> {
+        // Get participant
+        let participant = self
+            .participants
+            .get_mut(node_tag)
+            .ok_or_else(|| TwoPhaseError::ParticipantNotFound(node_tag.to_string()))?;
+
+        // Can't abort if already committed
+        match &participant.state {
+            TwoPhaseState::Committed => {
+                return Err(TwoPhaseError::InvalidTransition {
+                    from: participant.state.clone(),
+                    to: TwoPhaseState::Aborted,
+                });
+            }
+            TwoPhaseState::Aborted => return Ok(()), // Already aborted
+            _ => {}
+        }
+
+        // Send ABORT via network client
+        let result = if let Some(client) = &self.network_client {
+            let timeout_duration = Duration::from_secs(self.timeout_secs);
+            match timeout(timeout_duration, client.send_abort(node_tag, &self.chain_tag)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(TwoPhaseError::AbortFailed {
+                    node: node_tag.to_string(),
+                    reason,
+                }),
+                Err(_) => Err(TwoPhaseError::Timeout {
+                    node: node_tag.to_string(),
+                    phase: "ABORT".to_string(),
+                }),
+            }
+        } else {
+            Ok(())
+        };
+
+        // Always mark as Aborted (best-effort)
+        let participant = self.participants.get_mut(node_tag).unwrap();
+        participant.state = TwoPhaseState::Aborted;
+
+        result
     }
 
     /// Send ABORT to all participants
     ///
-    /// Best-effort abort - continues even if some nodes fail.
+    /// Best-effort abort - continues even if some nodes fail to respond.
+    /// Updates transaction_state to Aborted.
     ///
-    /// TODO(Phase 6.6): Implement ABORT all
+    /// Note: Aborts are executed sequentially due to Rust's borrowing rules
+    /// with `&mut self`. For abort operations, sequential execution is acceptable
+    /// since abort is best-effort and we continue regardless of individual failures.
     pub async fn abort_all(&mut self) {
-        unimplemented!("Phase 6.6: abort_all not yet implemented")
+        // Get all participant tags (except already committed)
+        let node_tags: Vec<String> = self
+            .participants
+            .iter()
+            .filter(|(_, p)| p.state != TwoPhaseState::Committed)
+            .map(|(tag, _)| tag.clone())
+            .collect();
+
+        // Abort sequentially (best-effort - ignore individual failures)
+        for tag in node_tags {
+            let _ = self.abort(&tag).await;
+        }
+
+        // Update transaction state
+        self.transaction_state = TwoPhaseState::Aborted;
     }
 
     /// Record PREPARE success for a participant
+    ///
+    /// Used when handling incoming PREPARE responses without going through
+    /// the network client.
     pub fn record_prepare_success(&mut self, node_tag: &str) -> Result<(), TwoPhaseError> {
         let participant = self
             .participants
@@ -359,6 +802,29 @@ impl TwoPhaseCommit {
         participant.state = TwoPhaseState::Committed;
         Ok(())
     }
+
+    /// Record COMMIT failure for a participant
+    pub fn record_commit_failure(&mut self, node_tag: &str, reason: String) -> Result<(), TwoPhaseError> {
+        let participant = self
+            .participants
+            .get_mut(node_tag)
+            .ok_or_else(|| TwoPhaseError::ParticipantNotFound(node_tag.to_string()))?;
+
+        participant.state = TwoPhaseState::Failed(reason.clone());
+        participant.error = Some(reason);
+        Ok(())
+    }
+
+    /// Record ABORT for a participant
+    pub fn record_abort(&mut self, node_tag: &str) -> Result<(), TwoPhaseError> {
+        let participant = self
+            .participants
+            .get_mut(node_tag)
+            .ok_or_else(|| TwoPhaseError::ParticipantNotFound(node_tag.to_string()))?;
+
+        participant.state = TwoPhaseState::Aborted;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -389,6 +855,10 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // Coordinator creation tests
+    // =========================================================================
+
     #[test]
     fn test_new_coordinator() {
         let config = create_test_config();
@@ -400,8 +870,39 @@ mod tests {
 
         assert_eq!(coordinator.chain_tag(), "test-chain");
         assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Pending);
-        assert_eq!(coordinator.participants().count(), 2);
+        assert_eq!(coordinator.participant_count(), 2);
     }
+
+    #[test]
+    fn test_coordinator_with_timeout() {
+        let config = create_test_config();
+        let coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        )
+        .with_timeout(60);
+
+        assert_eq!(coordinator.timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_coordinator_with_network_client() {
+        let config = create_test_config();
+        let client = Arc::new(NoOpNetworkClient);
+        let coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        )
+        .with_network_client(client);
+
+        assert!(coordinator.network_client.is_some());
+    }
+
+    // =========================================================================
+    // State query tests
+    // =========================================================================
 
     #[test]
     fn test_all_prepared() {
@@ -419,6 +920,24 @@ mod tests {
 
         coordinator.record_prepare_success("node-b").unwrap();
         assert!(coordinator.all_prepared());
+    }
+
+    #[test]
+    fn test_all_committed() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        );
+
+        assert!(!coordinator.all_committed());
+
+        coordinator.record_commit_success("node-a").unwrap();
+        assert!(!coordinator.all_committed());
+
+        coordinator.record_commit_success("node-b").unwrap();
+        assert!(coordinator.all_committed());
     }
 
     #[test]
@@ -456,6 +975,25 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_nodes() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        );
+
+        assert!(coordinator.failed_nodes().is_empty());
+
+        coordinator
+            .record_prepare_failure("node-a", "error".to_string())
+            .unwrap();
+        let failed = coordinator.failed_nodes();
+        assert_eq!(failed.len(), 1);
+        assert!(failed.contains(&"node-a".to_string()));
+    }
+
+    #[test]
     fn test_participant_not_found() {
         let config = create_test_config();
         let mut coordinator = TwoPhaseCommit::new(
@@ -474,11 +1012,590 @@ mod tests {
     #[test]
     fn test_two_phase_state_display() {
         assert_eq!(TwoPhaseState::Pending.to_string(), "pending");
+        assert_eq!(TwoPhaseState::Preparing.to_string(), "preparing");
         assert_eq!(TwoPhaseState::Prepared.to_string(), "prepared");
+        assert_eq!(TwoPhaseState::Committing.to_string(), "committing");
         assert_eq!(TwoPhaseState::Committed.to_string(), "committed");
+        assert_eq!(TwoPhaseState::Aborted.to_string(), "aborted");
         assert_eq!(
             TwoPhaseState::Failed("error".to_string()).to_string(),
             "failed: error"
         );
+    }
+
+    // =========================================================================
+    // PREPARE tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_prepare_single_no_client() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        let result = coordinator.prepare("node-a").await;
+        assert!(result.is_ok());
+
+        let participant = coordinator.get_participant("node-a").unwrap();
+        assert_eq!(participant.state, TwoPhaseState::Prepared);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_single_with_noop_client() {
+        let config = create_test_config();
+        let client = Arc::new(NoOpNetworkClient);
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        )
+        .with_network_client(client);
+
+        let result = coordinator.prepare("node-a").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_single_failure() {
+        let config = create_test_config();
+        let mock = Arc::new(MockNetworkClient::new());
+        mock.fail_prepare("node-a", "Connection refused");
+
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        )
+        .with_network_client(mock);
+
+        let result = coordinator.prepare("node-a").await;
+        assert!(matches!(result, Err(TwoPhaseError::PrepareFailed { .. })));
+
+        let participant = coordinator.get_participant("node-a").unwrap();
+        assert!(matches!(participant.state, TwoPhaseState::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_idempotent() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.prepare("node-a").await.unwrap();
+        // Second prepare should succeed (already prepared)
+        let result = coordinator.prepare("node-a").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_all_success() {
+        let config = create_test_config();
+        let client = Arc::new(NoOpNetworkClient);
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(client);
+
+        let errors = coordinator.prepare_all().await;
+        assert!(errors.is_empty());
+        assert!(coordinator.all_prepared());
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Prepared);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_all_partial_failure() {
+        let config = create_test_config();
+        let mock = Arc::new(MockNetworkClient::new());
+        mock.fail_prepare("node-b", "Connection refused");
+
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(mock);
+
+        let errors = coordinator.prepare_all().await;
+        assert_eq!(errors.len(), 1);
+        assert!(!coordinator.all_prepared());
+        assert!(matches!(
+            coordinator.transaction_state(),
+            TwoPhaseState::Failed(_)
+        ));
+    }
+
+    // =========================================================================
+    // COMMIT tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_commit_single_success() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        let result = coordinator.commit("node-a").await;
+        assert!(result.is_ok());
+
+        let participant = coordinator.get_participant("node-a").unwrap();
+        assert_eq!(participant.state, TwoPhaseState::Committed);
+    }
+
+    #[tokio::test]
+    async fn test_commit_not_prepared() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        let result = coordinator.commit("node-a").await;
+        assert!(matches!(result, Err(TwoPhaseError::InvalidTransition { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_commit_idempotent() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        coordinator.commit("node-a").await.unwrap();
+
+        // Second commit should succeed (already committed)
+        let result = coordinator.commit("node-a").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_commit_single_failure() {
+        let config = create_test_config();
+        let mock = Arc::new(MockNetworkClient::new());
+        mock.fail_commit("node-a", "Commit failed");
+
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        )
+        .with_network_client(mock);
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        let result = coordinator.commit("node-a").await;
+        assert!(matches!(result, Err(TwoPhaseError::CommitFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_commit_all_success() {
+        let config = create_test_config();
+        let client = Arc::new(NoOpNetworkClient);
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(client);
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        coordinator.record_prepare_success("node-b").unwrap();
+
+        let errors = coordinator.commit_all().await;
+        assert!(errors.is_empty());
+        assert!(coordinator.all_committed());
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Committed);
+    }
+
+    #[tokio::test]
+    async fn test_commit_all_not_all_prepared() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        );
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        // node-b not prepared
+
+        let errors = coordinator.commit_all().await;
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0], TwoPhaseError::NotAllPrepared));
+    }
+
+    #[tokio::test]
+    async fn test_commit_all_partial_failure() {
+        let config = create_test_config();
+        let mock = Arc::new(MockNetworkClient::new());
+        mock.fail_commit("node-b", "Commit failed");
+
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(mock);
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        coordinator.record_prepare_success("node-b").unwrap();
+
+        let errors = coordinator.commit_all().await;
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            coordinator.transaction_state(),
+            TwoPhaseState::Failed(_)
+        ));
+    }
+
+    // =========================================================================
+    // ABORT tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_abort_single_success() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        let result = coordinator.abort("node-a").await;
+        assert!(result.is_ok());
+
+        let participant = coordinator.get_participant("node-a").unwrap();
+        assert_eq!(participant.state, TwoPhaseState::Aborted);
+    }
+
+    #[tokio::test]
+    async fn test_abort_already_committed() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.record_commit_success("node-a").unwrap();
+        let result = coordinator.abort("node-a").await;
+        assert!(matches!(result, Err(TwoPhaseError::InvalidTransition { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_abort_idempotent() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.abort("node-a").await.unwrap();
+        // Second abort should succeed
+        let result = coordinator.abort("node-a").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_abort_all() {
+        let config = create_test_config();
+        let client = Arc::new(NoOpNetworkClient);
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(client);
+
+        coordinator.record_prepare_success("node-a").unwrap();
+        coordinator.record_prepare_success("node-b").unwrap();
+
+        coordinator.abort_all().await;
+
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Aborted);
+        for participant in coordinator.participants() {
+            assert_eq!(participant.state, TwoPhaseState::Aborted);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_abort_all_skips_committed() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        );
+
+        coordinator.record_commit_success("node-a").unwrap();
+        coordinator.record_prepare_success("node-b").unwrap();
+
+        coordinator.abort_all().await;
+
+        // node-a should still be committed
+        let participant_a = coordinator.get_participant("node-a").unwrap();
+        assert_eq!(participant_a.state, TwoPhaseState::Committed);
+
+        // node-b should be aborted
+        let participant_b = coordinator.get_participant("node-b").unwrap();
+        assert_eq!(participant_b.state, TwoPhaseState::Aborted);
+    }
+
+    // =========================================================================
+    // Full 2PC flow tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_full_2pc_success() {
+        let config = create_test_config();
+        let client = Arc::new(NoOpNetworkClient);
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(client);
+
+        // Phase 1: Prepare
+        let prepare_errors = coordinator.prepare_all().await;
+        assert!(prepare_errors.is_empty());
+        assert!(coordinator.all_prepared());
+
+        // Phase 2: Commit
+        let commit_errors = coordinator.commit_all().await;
+        assert!(commit_errors.is_empty());
+        assert!(coordinator.all_committed());
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Committed);
+    }
+
+    #[tokio::test]
+    async fn test_full_2pc_prepare_failure_abort() {
+        let config = create_test_config();
+        let mock = Arc::new(MockNetworkClient::new());
+        mock.fail_prepare("node-b", "Validation failed");
+
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        )
+        .with_network_client(mock);
+
+        // Phase 1: Prepare - one node fails
+        let prepare_errors = coordinator.prepare_all().await;
+        assert!(!prepare_errors.is_empty());
+
+        // Abort all
+        coordinator.abort_all().await;
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Aborted);
+    }
+
+    // =========================================================================
+    // Timeout tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_prepare_timeout() {
+        let config = create_test_config();
+        let mock = Arc::new(MockNetworkClient::new());
+        mock.set_delay(2000); // 2 second delay
+
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        )
+        .with_timeout(1) // 1 second timeout
+        .with_network_client(mock);
+
+        let result = coordinator.prepare("node-a").await;
+        assert!(matches!(result, Err(TwoPhaseError::Timeout { .. })));
+    }
+
+    // =========================================================================
+    // Record methods tests
+    // =========================================================================
+
+    #[test]
+    fn test_record_methods() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        // Test record_prepare_success
+        coordinator.record_prepare_success("node-a").unwrap();
+        assert_eq!(
+            coordinator.get_participant("node-a").unwrap().state,
+            TwoPhaseState::Prepared
+        );
+
+        // Test record_commit_success
+        coordinator.record_commit_success("node-a").unwrap();
+        assert_eq!(
+            coordinator.get_participant("node-a").unwrap().state,
+            TwoPhaseState::Committed
+        );
+    }
+
+    #[test]
+    fn test_record_failure_methods() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string(), "node-b".to_string()],
+        );
+
+        // Test record_prepare_failure
+        coordinator
+            .record_prepare_failure("node-a", "error1".to_string())
+            .unwrap();
+        let participant = coordinator.get_participant("node-a").unwrap();
+        assert!(matches!(participant.state, TwoPhaseState::Failed(_)));
+        assert_eq!(participant.error, Some("error1".to_string()));
+
+        // Test record_commit_failure
+        coordinator.record_prepare_success("node-b").unwrap();
+        coordinator
+            .record_commit_failure("node-b", "error2".to_string())
+            .unwrap();
+        let participant = coordinator.get_participant("node-b").unwrap();
+        assert!(matches!(participant.state, TwoPhaseState::Failed(_)));
+        assert_eq!(participant.error, Some("error2".to_string()));
+    }
+
+    #[test]
+    fn test_record_abort() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.record_abort("node-a").unwrap();
+        assert_eq!(
+            coordinator.get_participant("node-a").unwrap().state,
+            TwoPhaseState::Aborted
+        );
+    }
+
+    // =========================================================================
+    // Already finalized tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_prepare_after_committed() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.transaction_state = TwoPhaseState::Committed;
+
+        let result = coordinator.prepare("node-a").await;
+        assert!(matches!(result, Err(TwoPhaseError::AlreadyFinalized { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_all_after_aborted() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec!["node-a".to_string()],
+        );
+
+        coordinator.transaction_state = TwoPhaseState::Aborted;
+
+        let errors = coordinator.prepare_all().await;
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0], TwoPhaseError::AlreadyFinalized { .. }));
+    }
+
+    // =========================================================================
+    // Mock network client tests
+    // =========================================================================
+
+    #[test]
+    fn test_mock_network_client_setup() {
+        let mock = MockNetworkClient::new();
+
+        mock.fail_prepare("node-a", "error1");
+        mock.fail_commit("node-b", "error2");
+        mock.fail_abort("node-c", "error3");
+        mock.set_delay(100);
+
+        assert!(mock.prepare_failures.lock().unwrap().contains_key("node-a"));
+        assert!(mock.commit_failures.lock().unwrap().contains_key("node-b"));
+        assert!(mock.abort_failures.lock().unwrap().contains_key("node-c"));
+        assert_eq!(mock.delay_ms.load(std::sync::atomic::Ordering::SeqCst), 100);
+    }
+
+    // =========================================================================
+    // Edge case tests
+    // =========================================================================
+
+    #[test]
+    fn test_empty_participants() {
+        let config = create_test_config();
+        let coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec![],
+        );
+
+        assert_eq!(coordinator.participant_count(), 0);
+        assert!(coordinator.all_prepared()); // vacuously true
+        assert!(coordinator.all_committed()); // vacuously true
+        assert!(!coordinator.any_failed());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_all_empty() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec![],
+        );
+
+        let errors = coordinator.prepare_all().await;
+        assert!(errors.is_empty());
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Prepared);
+    }
+
+    #[tokio::test]
+    async fn test_commit_all_empty() {
+        let config = create_test_config();
+        let mut coordinator = TwoPhaseCommit::new(
+            "test-chain".to_string(),
+            config,
+            vec![],
+        );
+
+        let errors = coordinator.commit_all().await;
+        assert!(errors.is_empty());
+        assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Committed);
     }
 }

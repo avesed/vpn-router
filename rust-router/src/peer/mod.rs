@@ -44,8 +44,11 @@ pub use validation::{
 // Re-export PeerManager and related types
 pub use manager::{PeerError, PeerManager};
 
-// Re-export pairing types
-pub use pairing::{PairRequest, PairRequestConfig, PairResponse, PairingError};
+// Re-export pairing types and functions
+pub use pairing::{
+    decode_pair_request, encode_pair_request, decode_pair_response, encode_pair_response,
+    PairRequest, PairRequestConfig, PairResponse, PairingError,
+};
 
 // Re-export allocators
 pub use ip_allocator::{IpAllocatorError, TunnelIpAllocator};

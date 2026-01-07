@@ -17,6 +17,9 @@ tokio-util = { version = "0.7", features = ["codec"] }
 # Async trait support
 async-trait = "0.1"
 
+# Async utilities
+futures = "0.3"
+
 # Networking
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"

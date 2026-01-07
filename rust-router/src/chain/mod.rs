@@ -20,10 +20,10 @@
 //!
 //! # Phase 6 Implementation Status
 //!
-//! - [ ] 6.6.1 ChainManager structure
-//! - [ ] 6.6.2 DSCP packet modification
-//! - [ ] 6.6.3 Two-Phase Commit protocol
-//! - [ ] 6.6.4 DSCP allocation
+//! - [x] 6.6.1 ChainManager structure
+//! - [x] 6.6.2 Chain activation/deactivation with 2PC
+//! - [x] 6.6.3 Two-Phase Commit protocol
+//! - [x] 6.6.4 DSCP allocation
 //!
 //! # Chain Routing Architecture
 //!
@@ -48,5 +48,11 @@ pub mod two_phase;
 // Re-export commonly used types
 pub use allocator::{DscpAllocator, DscpAllocatorError};
 pub use dscp::{get_dscp, set_dscp, DscpError};
-pub use manager::{ChainError, ChainManager};
-pub use two_phase::{TwoPhaseCommit, TwoPhaseError, TwoPhaseState};
+pub use manager::{
+    AlwaysConnectedCallback, ChainError, ChainManager, DscpRoutingCallback, NoOpRoutingCallback,
+    PeerConnectivityCallback,
+};
+pub use two_phase::{
+    ChainNetworkClient, MockNetworkClient, NoOpNetworkClient, ParticipantState, TwoPhaseCommit,
+    TwoPhaseError, TwoPhaseState,
+};
