@@ -1463,6 +1463,19 @@ impl WgTunnel for UserspaceWgTunnel {
         Some(self.peer_addr_parsed)
     }
 
+    /// Get the UDP socket for batch I/O operations (Phase 6.8)
+    ///
+    /// Returns an Arc-wrapped UdpSocket if the tunnel is connected.
+    /// This allows batch send/receive operations using `sendmmsg`/`recvmmsg`.
+    ///
+    /// # Safety
+    ///
+    /// The returned socket should not be used for direct send/receive operations
+    /// without proper WireGuard encryption/decryption handling.
+    fn socket(&self) -> Option<Arc<UdpSocket>> {
+        self.shared.socket.try_read().ok().and_then(|guard| guard.clone())
+    }
+
     fn last_handshake(&self) -> Option<u64> {
         if self.shared.stats.last_handshake_valid.load(Ordering::Relaxed) {
             Some(self.shared.stats.last_handshake.load(Ordering::Relaxed))

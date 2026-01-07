@@ -34,6 +34,9 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use tokio::net::UdpSocket;
 
 use crate::tunnel::config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConfig};
 
@@ -216,6 +219,23 @@ pub trait WgTunnel: Send + Sync {
     /// For multi-peer (ingress) mode, this may return None and callers
     /// should use `get_peer()` to get individual peer endpoints.
     fn peer_endpoint(&self) -> Option<SocketAddr>;
+
+    /// Get the UDP socket for batch I/O operations (Phase 6.8)
+    ///
+    /// Returns an Arc-wrapped UdpSocket if the tunnel is connected.
+    /// This allows batch send/receive operations using `sendmmsg`/`recvmmsg`.
+    ///
+    /// # Safety
+    ///
+    /// The returned socket should not be used for direct send/receive operations
+    /// without proper WireGuard encryption/decryption handling.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None`. Implementations supporting batch I/O should override.
+    fn socket(&self) -> Option<Arc<UdpSocket>> {
+        None
+    }
 
     /// Get the last handshake timestamp
     ///

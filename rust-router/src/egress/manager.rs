@@ -64,6 +64,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +81,10 @@ use super::reply::WgReplyHandler;
 use crate::tunnel::config::WgTunnelConfig;
 use crate::tunnel::traits::{WgTunnel, WgTunnelError, WgTunnelStats};
 use crate::tunnel::userspace::UserspaceWgTunnel;
+
+// Phase 6.8: Batch I/O imports (Linux only)
+#[cfg(target_os = "linux")]
+use crate::io::BatchSender;
 
 /// Default drain timeout when removing tunnels
 pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 5;
@@ -902,6 +907,240 @@ impl WgEgressManager {
             .filter(|(_, managed)| managed.config.tunnel_type.short_name() == tunnel_type_filter)
             .map(|(tag, _)| tag.clone())
             .collect()
+    }
+
+    /// Send multiple packets through an egress tunnel using batch I/O (Linux only)
+    ///
+    /// On Linux, this uses `sendmmsg` to send multiple packets in a single syscall,
+    /// providing significant throughput improvement over individual sends.
+    ///
+    /// On non-Linux platforms, falls back to sequential sends.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Tag of the tunnel to use
+    /// * `packets` - Vector of plaintext IP packets to send
+    ///
+    /// # Returns
+    ///
+    /// Number of packets successfully sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The manager is shutting down
+    /// - The tunnel is not found
+    /// - The tunnel is draining
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let packets = vec![
+    ///     vec![/* packet 1 data */],
+    ///     vec![/* packet 2 data */],
+    /// ];
+    /// let sent = manager.send_batch("my-tunnel", packets).await?;
+    /// println!("Sent {} packets", sent);
+    /// ```
+    pub async fn send_batch(&self, tag: &str, packets: Vec<Vec<u8>>) -> EgressResult<usize> {
+        // Check shutdown state
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EgressError::ShuttingDown);
+        }
+
+        if packets.is_empty() {
+            return Ok(0);
+        }
+
+        trace!(
+            "Sending batch of {} packets through tunnel '{}'",
+            packets.len(),
+            tag
+        );
+
+        // Get tunnel Arc (release lock quickly before async operation)
+        let (tunnel, use_batch_io, batch_size, peer_public_key) = {
+            let tunnels = self.tunnels.read();
+            match tunnels.get(tag) {
+                Some(managed) => {
+                    if managed.is_draining() {
+                        return Err(EgressError::send_failed(format!(
+                            "Tunnel '{}' is draining, no new traffic allowed",
+                            tag
+                        )));
+                    }
+                    (
+                        managed.tunnel.clone(),
+                        managed.config.use_batch_io,
+                        managed.config.batch_size,
+                        managed.config.peer_public_key.clone(),
+                    )
+                }
+                None => return Err(EgressError::tunnel_not_found(tag)),
+            }
+        };
+        // Lock is now released
+
+        // Phase 6.8: Use batch I/O on Linux when enabled
+        #[cfg(target_os = "linux")]
+        {
+            if use_batch_io {
+                return self
+                    .send_batch_linux(tag, packets, tunnel, batch_size, &peer_public_key)
+                    .await;
+            }
+        }
+
+        // Fallback: sequential sends
+        let _ = (use_batch_io, batch_size, peer_public_key); // Suppress unused warning on non-Linux
+        self.send_batch_sequential(tag, packets, tunnel).await
+    }
+
+    /// Sequential batch send (fallback for non-Linux or when batch I/O is disabled)
+    async fn send_batch_sequential(
+        &self,
+        tag: &str,
+        packets: Vec<Vec<u8>>,
+        tunnel: Arc<UserspaceWgTunnel>,
+    ) -> EgressResult<usize> {
+        let mut sent_count = 0;
+
+        for packet in packets {
+            match tunnel.send(&packet).await {
+                Ok(()) => {
+                    self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .bytes_sent
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    sent_count += 1;
+                }
+                Err(e) => {
+                    self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "send_batch: failed to send packet {} through tunnel '{}': {}",
+                        sent_count, tag, e
+                    );
+                    // Continue trying to send remaining packets
+                }
+            }
+        }
+
+        Ok(sent_count)
+    }
+
+    /// Batch send using sendmmsg (Linux only)
+    ///
+    /// Encrypts packets via the WireGuard tunnel and sends them in batches
+    /// using the sendmmsg syscall for improved throughput.
+    #[cfg(target_os = "linux")]
+    async fn send_batch_linux(
+        &self,
+        tag: &str,
+        packets: Vec<Vec<u8>>,
+        tunnel: Arc<UserspaceWgTunnel>,
+        batch_size: usize,
+        peer_public_key: &str,
+    ) -> EgressResult<usize> {
+        use crate::tunnel::traits::WgTunnel;
+        use std::os::unix::io::AsRawFd;
+
+        // Get the socket file descriptor from the tunnel
+        let socket = tunnel
+            .socket()
+            .ok_or_else(|| EgressError::send_failed("Tunnel socket not available"))?;
+
+        // Get the peer endpoint
+        let peer_endpoint: SocketAddr = tunnel
+            .peer_endpoint()
+            .ok_or_else(|| EgressError::send_failed("Tunnel peer endpoint not available"))?;
+
+        let fd = socket.as_raw_fd();
+        let mut batch_sender = BatchSender::new(fd);
+
+        let mut sent_count = 0;
+        let mut total_bytes = 0u64;
+
+        // Process packets in batches
+        for chunk in packets.chunks(batch_size) {
+            // Encrypt all packets in this batch
+            let mut encrypted_batch: Vec<(Vec<u8>, SocketAddr)> = Vec::with_capacity(chunk.len());
+
+            for packet in chunk {
+                match tunnel.encrypt(packet, peer_public_key) {
+                    Ok(encrypted) => {
+                        total_bytes += encrypted.len() as u64;
+                        encrypted_batch.push((encrypted, peer_endpoint));
+                    }
+                    Err(e) => {
+                        self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "send_batch_linux: failed to encrypt packet for tunnel '{}': {}",
+                            tag, e
+                        );
+                        // Continue with other packets
+                    }
+                }
+            }
+
+            if encrypted_batch.is_empty() {
+                continue;
+            }
+
+            // Convert to the format expected by BatchSender
+            let send_data: Vec<(&[u8], SocketAddr)> = encrypted_batch
+                .iter()
+                .map(|(data, addr)| (data.as_slice(), *addr))
+                .collect();
+
+            // Send the batch
+            match batch_sender.send_batch(&send_data) {
+                Ok(count) => {
+                    sent_count += count;
+                    self.stats
+                        .packets_sent
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    trace!(
+                        "send_batch_linux: sent {}/{} packets through tunnel '{}'",
+                        count,
+                        send_data.len(),
+                        tag
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Socket buffer full, try again later
+                    warn!(
+                        "send_batch_linux: socket buffer full for tunnel '{}', {} packets dropped",
+                        tag,
+                        send_data.len()
+                    );
+                    self.stats
+                        .send_errors
+                        .fetch_add(send_data.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    self.stats
+                        .send_errors
+                        .fetch_add(send_data.len() as u64, Ordering::Relaxed);
+                    warn!(
+                        "send_batch_linux: sendmmsg failed for tunnel '{}': {}",
+                        tag, e
+                    );
+                }
+            }
+        }
+
+        self.stats.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
+
+        debug!(
+            "send_batch_linux: sent {} packets ({} bytes) through tunnel '{}', batch stats: ops={}, avg_per_batch={:.1}",
+            sent_count,
+            total_bytes,
+            tag,
+            batch_sender.stats().batch_operations,
+            batch_sender.stats().avg_packets_per_batch()
+        );
+
+        Ok(sent_count)
     }
 }
 

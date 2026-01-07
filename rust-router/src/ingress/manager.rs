@@ -91,6 +91,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
+// Phase 6.8: Batch I/O imports (Linux only)
+#[cfg(target_os = "linux")]
+use crate::io::{BatchConfig, BatchReceiver};
+
 use super::config::{WgIngressConfig, WgIngressPeerConfig};
 use super::error::{IngressError, IngressResult};
 use super::processor::{IngressProcessor, RoutingDecision};
@@ -857,7 +861,53 @@ impl WgIngressManager {
     /// 3. Validates the source IP against the peer's allowed_ips (AFTER decryption)
     /// 4. Processes the decrypted packet through the rule engine
     /// 5. Sends handshake responses back to the client if needed
+    ///
+    /// # Phase 6.8: Batch I/O
+    ///
+    /// On Linux, when `use_batch_io` is enabled, uses `recvmmsg` to receive
+    /// multiple packets per syscall for improved throughput.
     async fn packet_loop(
+        socket: Arc<UdpSocket>,
+        processor: Arc<IngressProcessor>,
+        stats: Arc<StatsInner>,
+        config: WgIngressConfig,
+        peers: HashMap<String, Arc<RegisteredPeer>>,
+        packet_tx: mpsc::Sender<ProcessedPacket>,
+        shutdown_rx: oneshot::Receiver<()>,
+    ) {
+        // Phase 6.8: Use batch I/O on Linux when enabled
+        #[cfg(target_os = "linux")]
+        {
+            if config.use_batch_io {
+                Self::packet_loop_batch(
+                    socket,
+                    processor,
+                    stats,
+                    config,
+                    peers,
+                    packet_tx,
+                    shutdown_rx,
+                )
+                .await;
+                return;
+            }
+        }
+
+        // Fallback: single-packet I/O
+        Self::packet_loop_single(
+            socket,
+            processor,
+            stats,
+            config,
+            peers,
+            packet_tx,
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    /// Single-packet I/O loop (fallback for non-Linux or when batch I/O is disabled)
+    async fn packet_loop_single(
         socket: Arc<UdpSocket>,
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
@@ -881,97 +931,17 @@ impl WgIngressManager {
                 result = socket.recv_from(&mut recv_buf) => {
                     match result {
                         Ok((len, src_addr)) => {
-                            let encrypted_data = &recv_buf[..len];
-
-                            // Update stats for received bytes (encrypted)
-                            stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                            stats.rx_packets.fetch_add(1, Ordering::Relaxed);
-
-                            // Try to identify peer and decrypt packet
-                            // WireGuard uses the receiver's public key index to identify
-                            // which peer sent the packet, but boringtun handles this internally
-                            let (decrypted_data, peer_public_key, peer_ref) =
-                                match Self::identify_and_decrypt(&peers, encrypted_data, &mut decrypt_buf, &stats) {
-                                    Some(result) => result,
-                                    None => {
-                                        trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
-                                        stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                                        continue;
-                                    }
-                                };
-
-                            // Handle handshake responses
-                            if let Some(response) = decrypted_data.response {
-                                if let Err(e) = socket.send_to(&response, src_addr).await {
-                                    warn!(error = %e, "Failed to send handshake response");
-                                } else {
-                                    trace!(src_addr = %src_addr, "Sent handshake response");
-                                    stats.handshake_count.fetch_add(1, Ordering::Relaxed);
-                                    peer_ref.update_handshake();
-                                    peer_ref.is_connected.store(true, Ordering::Relaxed);
-                                }
-                            }
-
-                            // If this was just a handshake packet, no data to process
-                            if decrypted_data.needs_response && decrypted_data.data.is_empty() {
-                                continue;
-                            }
-
-                            // Validate source IP AFTER decryption against peer's allowed_ips
-                            // This is critical for security - we validate the inner packet's source
-                            if let Some(inner_src_ip) = Self::extract_source_ip(&decrypted_data.data) {
-                                // First check against peer's allowed_ips
-                                if !peer_ref.is_source_ip_allowed(inner_src_ip) {
-                                    trace!(
-                                        src_ip = %inner_src_ip,
-                                        peer = %peer_public_key,
-                                        "Inner packet source IP not in peer's allowed_ips"
-                                    );
-                                    stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-
-                                // Also check against global allowed subnet
-                                if !config.is_ip_allowed(inner_src_ip) {
-                                    trace!(
-                                        src_ip = %inner_src_ip,
-                                        subnet = %config.allowed_subnet,
-                                        "Inner packet source IP not in allowed subnet"
-                                    );
-                                    stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                            } else if !decrypted_data.data.is_empty() {
-                                // Could not extract source IP from decrypted packet
-                                trace!("Could not extract source IP from decrypted packet");
-                                stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-
-                            // Update peer activity
-                            peer_ref.update_activity();
-                            peer_ref.rx_bytes.fetch_add(decrypted_data.data.len() as u64, Ordering::Relaxed);
-
-                            // Process decrypted packet through rule engine
-                            match processor.process(&decrypted_data.data, &peer_public_key) {
-                                Ok(routing) => {
-                                    let processed = ProcessedPacket {
-                                        data: decrypted_data.data,
-                                        routing,
-                                        peer_public_key,
-                                        src_addr,
-                                    };
-
-                                    if packet_tx.send(processed).await.is_err() {
-                                        debug!("Packet channel closed");
-                                        stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                Err(e) => {
-                                    trace!(error = %e, "Failed to process packet");
-                                    stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
+                            Self::process_single_packet(
+                                &recv_buf[..len],
+                                src_addr,
+                                &socket,
+                                &processor,
+                                &stats,
+                                &config,
+                                &peers,
+                                &packet_tx,
+                                &mut decrypt_buf,
+                            ).await;
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to receive packet");
@@ -981,7 +951,192 @@ impl WgIngressManager {
             }
         }
 
-        debug!("Packet loop exited");
+        debug!("Packet loop (single) exited");
+    }
+
+    /// Batch I/O loop using recvmmsg (Linux only)
+    #[cfg(target_os = "linux")]
+    async fn packet_loop_batch(
+        socket: Arc<UdpSocket>,
+        processor: Arc<IngressProcessor>,
+        stats: Arc<StatsInner>,
+        config: WgIngressConfig,
+        peers: HashMap<String, Arc<RegisteredPeer>>,
+        packet_tx: mpsc::Sender<ProcessedPacket>,
+        mut shutdown_rx: oneshot::Receiver<()>,
+    ) {
+        use std::os::unix::io::AsRawFd;
+
+        let batch_size = config.batch_size.min(256);
+        let batch_config = BatchConfig::new(batch_size)
+            .with_buffer_size(UDP_RECV_BUFFER_SIZE)
+            .non_blocking();
+
+        let fd = socket.as_raw_fd();
+        let mut batch_receiver = BatchReceiver::new(fd, batch_config);
+        let mut decrypt_buf = vec![0u8; UDP_RECV_BUFFER_SIZE + WG_TRANSPORT_OVERHEAD];
+
+        info!(
+            batch_size = batch_size,
+            "Using batch I/O for ingress receive loop"
+        );
+
+        loop {
+            // Wait for socket to be readable
+            tokio::select! {
+                biased;
+
+                _ = &mut shutdown_rx => {
+                    debug!("Received shutdown signal");
+                    break;
+                }
+
+                result = socket.readable() => {
+                    if let Err(e) = result {
+                        warn!(error = %e, "Socket readable check failed");
+                        continue;
+                    }
+
+                    // Try to receive a batch of packets
+                    match batch_receiver.recv_batch() {
+                        Ok(packets) => {
+                            for received in packets {
+                                Self::process_single_packet(
+                                    &received.data[..received.len],
+                                    received.src_addr,
+                                    &socket,
+                                    &processor,
+                                    &stats,
+                                    &config,
+                                    &peers,
+                                    &packet_tx,
+                                    &mut decrypt_buf,
+                                ).await;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // No packets available, continue waiting
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Batch receive failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Packet loop (batch) exited, stats: batches={}, packets={}",
+            batch_receiver.stats().batch_operations,
+            batch_receiver.stats().packets_processed
+        );
+    }
+
+    /// Process a single received packet
+    ///
+    /// This helper is used by both single-packet and batch I/O loops.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_single_packet(
+        encrypted_data: &[u8],
+        src_addr: SocketAddr,
+        socket: &Arc<UdpSocket>,
+        processor: &Arc<IngressProcessor>,
+        stats: &Arc<StatsInner>,
+        config: &WgIngressConfig,
+        peers: &HashMap<String, Arc<RegisteredPeer>>,
+        packet_tx: &mpsc::Sender<ProcessedPacket>,
+        decrypt_buf: &mut [u8],
+    ) {
+        // Update stats for received bytes (encrypted)
+        stats.rx_bytes.fetch_add(encrypted_data.len() as u64, Ordering::Relaxed);
+        stats.rx_packets.fetch_add(1, Ordering::Relaxed);
+
+        // Try to identify peer and decrypt packet
+        // WireGuard uses the receiver's public key index to identify
+        // which peer sent the packet, but boringtun handles this internally
+        let (decrypted_data, peer_public_key, peer_ref) =
+            match Self::identify_and_decrypt(peers, encrypted_data, decrypt_buf, stats) {
+                Some(result) => result,
+                None => {
+                    trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
+                    stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+        // Handle handshake responses
+        if let Some(response) = decrypted_data.response {
+            if let Err(e) = socket.send_to(&response, src_addr).await {
+                warn!(error = %e, "Failed to send handshake response");
+            } else {
+                trace!(src_addr = %src_addr, "Sent handshake response");
+                stats.handshake_count.fetch_add(1, Ordering::Relaxed);
+                peer_ref.update_handshake();
+                peer_ref.is_connected.store(true, Ordering::Relaxed);
+            }
+        }
+
+        // If this was just a handshake packet, no data to process
+        if decrypted_data.needs_response && decrypted_data.data.is_empty() {
+            return;
+        }
+
+        // Validate source IP AFTER decryption against peer's allowed_ips
+        // This is critical for security - we validate the inner packet's source
+        if let Some(inner_src_ip) = Self::extract_source_ip(&decrypted_data.data) {
+            // First check against peer's allowed_ips
+            if !peer_ref.is_source_ip_allowed(inner_src_ip) {
+                trace!(
+                    src_ip = %inner_src_ip,
+                    peer = %peer_public_key,
+                    "Inner packet source IP not in peer's allowed_ips"
+                );
+                stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            // Also check against global allowed subnet
+            if !config.is_ip_allowed(inner_src_ip) {
+                trace!(
+                    src_ip = %inner_src_ip,
+                    subnet = %config.allowed_subnet,
+                    "Inner packet source IP not in allowed subnet"
+                );
+                stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        } else if !decrypted_data.data.is_empty() {
+            // Could not extract source IP from decrypted packet
+            trace!("Could not extract source IP from decrypted packet");
+            stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Update peer activity
+        peer_ref.update_activity();
+        peer_ref.rx_bytes.fetch_add(decrypted_data.data.len() as u64, Ordering::Relaxed);
+
+        // Process decrypted packet through rule engine
+        match processor.process(&decrypted_data.data, &peer_public_key) {
+            Ok(routing) => {
+                let processed = ProcessedPacket {
+                    data: decrypted_data.data,
+                    routing,
+                    peer_public_key,
+                    src_addr,
+                };
+
+                if packet_tx.send(processed).await.is_err() {
+                    debug!("Packet channel closed");
+                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                trace!(error = %e, "Failed to process packet");
+                stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Identify the peer that sent a packet and decrypt it
