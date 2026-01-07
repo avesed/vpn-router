@@ -2,6 +2,8 @@
 //!
 //! This module provides the `BlockOutbound` type which blocks/drops
 //! all connections. Used for ad-blocking and access control.
+//!
+//! Supports both TCP and UDP protocols (both are blocked).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,10 +13,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tracing::debug;
 
-use super::traits::{HealthStatus, Outbound, OutboundConnection};
+use super::traits::{HealthStatus, Outbound, OutboundConnection, UdpOutboundHandle};
 use crate::config::OutboundConfig;
 use crate::connection::OutboundStats;
-use crate::error::OutboundError;
+use crate::error::{OutboundError, UdpError};
 
 /// Block outbound - drops all connections
 ///
@@ -101,6 +103,28 @@ impl Outbound for BlockOutbound {
     fn outbound_type(&self) -> &str {
         "block"
     }
+
+    // === UDP Methods (Phase 5.1) ===
+
+    async fn connect_udp(
+        &self,
+        addr: SocketAddr,
+        _timeout: Duration,
+    ) -> Result<UdpOutboundHandle, UdpError> {
+        // Record the blocked UDP connection
+        self.stats.record_connection();
+
+        debug!("Blocking UDP connection to {} via {}", addr, self.tag);
+
+        // Return an error indicating the connection was blocked
+        Err(UdpError::blocked(&self.tag, addr))
+    }
+
+    fn supports_udp(&self) -> bool {
+        // Block outbound "supports" UDP in that it handles UDP requests
+        // (by blocking them), so routing can direct UDP to it
+        true
+    }
 }
 
 impl std::fmt::Debug for BlockOutbound {
@@ -171,5 +195,33 @@ mod tests {
 
         outbound.set_enabled(true);
         assert!(outbound.is_enabled());
+    }
+
+    // === UDP Tests ===
+
+    #[test]
+    fn test_block_supports_udp() {
+        let outbound = BlockOutbound::new("block");
+        // Block supports UDP (by blocking it)
+        assert!(outbound.supports_udp());
+    }
+
+    #[tokio::test]
+    async fn test_connect_udp_blocks() {
+        let outbound = BlockOutbound::new("test-block-udp");
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+
+        let result = outbound.connect_udp(addr, Duration::from_secs(1)).await;
+
+        assert!(result.is_err());
+        if let Err(UdpError::Blocked { tag, addr: blocked_addr }) = result {
+            assert_eq!(tag, "test-block-udp");
+            assert_eq!(blocked_addr, addr);
+        } else {
+            panic!("Expected Blocked error, got {:?}", result);
+        }
+
+        // Stats should show the blocked connection
+        assert_eq!(outbound.stats.connections(), 1);
     }
 }

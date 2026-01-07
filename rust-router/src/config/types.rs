@@ -128,6 +128,19 @@ pub struct ListenConfig {
     /// Sniff timeout in milliseconds (for TLS SNI detection)
     #[serde(default = "default_sniff_timeout_ms")]
     pub sniff_timeout_ms: u64,
+
+    /// Number of UDP workers (default: num_cpus)
+    ///
+    /// Each worker binds to the same address with SO_REUSEPORT.
+    /// The kernel distributes packets across workers based on 4-tuple hash.
+    #[serde(default)]
+    pub udp_workers: Option<usize>,
+
+    /// UDP buffer pool size (total buffers across all workers)
+    ///
+    /// Buffers are reused to reduce allocation overhead.
+    #[serde(default = "default_udp_buffer_pool_size")]
+    pub udp_buffer_pool_size: usize,
 }
 
 impl ListenConfig {
@@ -177,6 +190,8 @@ impl Default for ListenConfig {
             udp_timeout_secs: 300,
             reuse_port: true,
             sniff_timeout_ms: 300,
+            udp_workers: None,
+            udp_buffer_pool_size: default_udp_buffer_pool_size(),
         }
     }
 }
@@ -564,6 +579,10 @@ const fn default_udp_timeout_secs() -> u64 {
 
 const fn default_sniff_timeout_ms() -> u64 {
     300
+}
+
+const fn default_udp_buffer_pool_size() -> usize {
+    1024 // Default 1024 buffers in pool
 }
 
 const fn default_connect_timeout_secs() -> u64 {

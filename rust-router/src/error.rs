@@ -35,6 +35,10 @@ pub enum RustRouterError {
     #[error("Rule error: {0}")]
     Rule(#[from] RuleError),
 
+    /// UDP errors
+    #[error("UDP error: {0}")]
+    Udp(#[from] UdpError),
+
     /// I/O errors not covered by other categories
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -51,6 +55,7 @@ impl RustRouterError {
             Self::Ipc(e) => e.is_recoverable(),
             Self::Connection(e) => e.is_recoverable(),
             Self::Rule(e) => e.is_recoverable(),
+            Self::Udp(e) => e.is_recoverable(),
             Self::Io(e) => matches!(
                 e.kind(),
                 io::ErrorKind::TimedOut
@@ -368,6 +373,178 @@ impl ConnectionError {
     /// Create a transfer error
     pub fn transfer(msg: impl Into<String>) -> Self {
         Self::TransferError(msg.into())
+    }
+}
+
+/// UDP-specific errors
+#[derive(Debug, Error)]
+pub enum UdpError {
+    /// Failed to receive UDP packet
+    #[error("Failed to receive UDP packet: {0}")]
+    RecvError(String),
+
+    /// Failed to send UDP packet
+    #[error("Failed to send UDP packet to {addr}: {reason}")]
+    SendError { addr: SocketAddr, reason: String },
+
+    /// Failed to get original destination from cmsg
+    #[error("Failed to get original destination: {0}")]
+    OriginalDstError(String),
+
+    /// Session not found
+    #[error("UDP session not found: {client} -> {dest}")]
+    SessionNotFound {
+        client: SocketAddr,
+        dest: SocketAddr,
+    },
+
+    /// Failed to create reply socket
+    #[error("Failed to create reply socket bound to {addr}: {reason}")]
+    ReplySocketError { addr: SocketAddr, reason: String },
+
+    /// Outbound does not support UDP
+    #[error("Outbound '{tag}' does not support UDP")]
+    UdpNotSupported { tag: String },
+
+    /// Outbound not found
+    #[error("Outbound '{tag}' not found")]
+    OutboundNotFound { tag: String },
+
+    /// UDP traffic was blocked by a block outbound
+    #[error("UDP traffic to {addr} blocked by outbound '{tag}'")]
+    Blocked { tag: String, addr: SocketAddr },
+
+    /// Outbound is disabled
+    #[error("Outbound '{tag}' is disabled")]
+    OutboundDisabled { tag: String },
+
+    /// Socket operation failed
+    #[error("UDP socket operation failed: {option}: {reason}")]
+    SocketOption { option: String, reason: String },
+
+    /// Permission denied (CAP_NET_ADMIN required)
+    #[error("Permission denied: UDP TPROXY requires CAP_NET_ADMIN capability")]
+    PermissionDenied,
+
+    /// Listener not ready
+    #[error("UDP listener not ready")]
+    NotReady,
+
+    // === SOCKS5 UDP ASSOCIATE Errors ===
+
+    /// SOCKS5 UDP association failed
+    #[error("SOCKS5 UDP association failed: {reason}")]
+    Socks5UdpAssociationFailed { reason: String },
+
+    /// SOCKS5 UDP relay error
+    #[error("SOCKS5 UDP relay error: {reason}")]
+    Socks5UdpRelayError { reason: String },
+
+    /// SOCKS5 UDP packet format error
+    #[error("SOCKS5 UDP packet format error: {reason}")]
+    Socks5PacketFormatError { reason: String },
+
+    /// SOCKS5 control connection closed
+    #[error("SOCKS5 control connection closed")]
+    Socks5ControlConnectionClosed,
+
+    /// SOCKS5 fragmented packet (not supported)
+    #[error("SOCKS5 fragmented UDP packet not supported (FRAG={frag})")]
+    Socks5FragmentedPacket { frag: u8 },
+
+    /// I/O error
+    #[error("UDP I/O error: {0}")]
+    IoError(#[from] io::Error),
+}
+
+impl UdpError {
+    /// Check if this error is recoverable
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            Self::RecvError(_) => true,
+            Self::SendError { .. } => true,
+            Self::OriginalDstError(_) => true,
+            Self::SessionNotFound { .. } => true,
+            Self::ReplySocketError { .. } => false,
+            Self::UdpNotSupported { .. } => false,
+            Self::OutboundNotFound { .. } => false,
+            Self::Blocked { .. } => false,
+            Self::OutboundDisabled { .. } => true,
+            Self::SocketOption { .. } => false,
+            Self::PermissionDenied => false,
+            Self::NotReady => true,
+            // SOCKS5 UDP errors
+            Self::Socks5UdpAssociationFailed { .. } => true, // Can retry
+            Self::Socks5UdpRelayError { .. } => true,        // Can retry
+            Self::Socks5PacketFormatError { .. } => false,   // Bad packet
+            Self::Socks5ControlConnectionClosed => false,    // Need new association
+            Self::Socks5FragmentedPacket { .. } => false,    // Not supported
+            Self::IoError(e) => matches!(
+                e.kind(),
+                io::ErrorKind::Interrupted
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+            ),
+        }
+    }
+
+    /// Create a blocked error
+    pub fn blocked(tag: impl Into<String>, addr: SocketAddr) -> Self {
+        Self::Blocked {
+            tag: tag.into(),
+            addr,
+        }
+    }
+
+    /// Create an outbound disabled error
+    pub fn outbound_disabled(tag: impl Into<String>) -> Self {
+        Self::OutboundDisabled { tag: tag.into() }
+    }
+
+    /// Create a socket option error
+    pub fn socket_option(option: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::SocketOption {
+            option: option.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a send error
+    pub fn send(addr: SocketAddr, reason: impl Into<String>) -> Self {
+        Self::SendError {
+            addr,
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a reply socket error
+    pub fn reply_socket(addr: SocketAddr, reason: impl Into<String>) -> Self {
+        Self::ReplySocketError {
+            addr,
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a SOCKS5 UDP association failed error
+    pub fn socks5_association_failed(reason: impl Into<String>) -> Self {
+        Self::Socks5UdpAssociationFailed {
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a SOCKS5 UDP relay error
+    pub fn socks5_relay_error(reason: impl Into<String>) -> Self {
+        Self::Socks5UdpRelayError {
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a SOCKS5 packet format error
+    pub fn socks5_packet_format(reason: impl Into<String>) -> Self {
+        Self::Socks5PacketFormatError {
+            reason: reason.into(),
+        }
     }
 }
 

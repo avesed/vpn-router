@@ -9,13 +9,18 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse, PoolStatsResponse,
-    PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus, Socks5PoolStats,
+    BufferPoolInfo, BufferPoolStatsResponse, ErrorCode, IpcCommand, IpcResponse, OutboundInfo,
+    OutboundStatsResponse, PoolStatsResponse, PrometheusMetricsResponse, RuleStatsResponse,
+    ServerCapabilities, ServerStatus, Socks5PoolStats, UdpProcessorInfo, UdpSessionInfo,
+    UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
+    UdpWorkerPoolInfo, UdpWorkerStatsResponse,
 };
 use crate::config::{load_config_with_env, OutboundConfig};
-use crate::connection::ConnectionManager;
+use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
+use crate::io::UdpBufferPool;
 use crate::outbound::OutboundManager;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
+use crate::tproxy::UdpWorkerPool;
 
 /// IPC command handler
 pub struct IpcHandler {
@@ -39,6 +44,22 @@ pub struct IpcHandler {
 
     /// Last reload timestamp (Unix epoch milliseconds)
     last_reload_timestamp: AtomicU64,
+
+    // ========================================================================
+    // Phase 5.5: UDP Components (Optional)
+    // ========================================================================
+
+    /// Whether UDP is enabled
+    udp_enabled: bool,
+
+    /// UDP session manager for tracking sessions
+    udp_session_manager: Option<Arc<UdpSessionManager>>,
+
+    /// UDP worker pool for multi-core packet processing
+    udp_worker_pool: Option<Arc<UdpWorkerPool>>,
+
+    /// UDP buffer pool for lock-free buffer management
+    udp_buffer_pool: Option<Arc<UdpBufferPool>>,
 }
 
 impl IpcHandler {
@@ -56,6 +77,37 @@ impl IpcHandler {
             version: env!("CARGO_PKG_VERSION").to_string(),
             config_version: AtomicU64::new(1),
             last_reload_timestamp: AtomicU64::new(0),
+            udp_enabled: false,
+            udp_session_manager: None,
+            udp_worker_pool: None,
+            udp_buffer_pool: None,
+        }
+    }
+
+    /// Create a new IPC handler with UDP components
+    ///
+    /// This enables UDP statistics and session management via IPC.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_udp(
+        connection_manager: Arc<ConnectionManager>,
+        outbound_manager: Arc<OutboundManager>,
+        rule_engine: Arc<RuleEngine>,
+        udp_session_manager: Arc<UdpSessionManager>,
+        udp_worker_pool: Arc<UdpWorkerPool>,
+        udp_buffer_pool: Arc<UdpBufferPool>,
+    ) -> Self {
+        Self {
+            connection_manager,
+            outbound_manager,
+            rule_engine,
+            start_time: Instant::now(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            config_version: AtomicU64::new(1),
+            last_reload_timestamp: AtomicU64::new(0),
+            udp_enabled: true,
+            udp_session_manager: Some(udp_session_manager),
+            udp_worker_pool: Some(udp_worker_pool),
+            udp_buffer_pool: Some(udp_buffer_pool),
         }
     }
 
@@ -174,6 +226,22 @@ impl IpcHandler {
             } => self.handle_notify_egress_change(action, tag, egress_type),
 
             IpcCommand::GetPrometheusMetrics => self.handle_get_prometheus_metrics(),
+
+            // ================================================================
+            // Phase 5.5: UDP IPC Command Handlers
+            // ================================================================
+            IpcCommand::GetUdpStats => self.handle_get_udp_stats(),
+
+            IpcCommand::ListUdpSessions { limit } => self.handle_list_udp_sessions(limit),
+
+            IpcCommand::GetUdpSession {
+                client_addr,
+                dest_addr,
+            } => self.handle_get_udp_session(&client_addr, &dest_addr),
+
+            IpcCommand::GetUdpWorkerStats => self.handle_get_udp_worker_stats(),
+
+            IpcCommand::GetBufferPoolStats => self.handle_get_buffer_pool_stats(),
         }
     }
 
@@ -1344,6 +1412,250 @@ impl IpcHandler {
             timestamp_ms,
         })
     }
+
+    // ========================================================================
+    // Phase 5.5: UDP IPC Handler Implementations
+    // ========================================================================
+
+    /// Handle GetUdpStats command
+    ///
+    /// Returns comprehensive UDP statistics including session manager, worker pool,
+    /// and buffer pool stats.
+    fn handle_get_udp_stats(&self) -> IpcResponse {
+        // Get session manager stats (available even if UDP workers not running)
+        let session_stats = if let Some(ref manager) = self.udp_session_manager {
+            let stats = manager.stats();
+            UdpSessionStatsInfo {
+                session_count: stats.session_count,
+                max_sessions: stats.max_sessions,
+                total_created: stats.total_created,
+                total_evicted: stats.total_evicted,
+                utilization_percent: stats.utilization(),
+                idle_timeout_secs: stats.idle_timeout_secs,
+                ttl_secs: stats.ttl_secs,
+            }
+        } else {
+            // Default empty stats when no session manager
+            UdpSessionStatsInfo {
+                session_count: 0,
+                max_sessions: 65536,
+                total_created: 0,
+                total_evicted: 0,
+                utilization_percent: 0.0,
+                idle_timeout_secs: 300,
+                ttl_secs: 600,
+            }
+        };
+
+        // Get worker pool stats
+        let worker_stats = self.udp_worker_pool.as_ref().map(|pool| {
+            let stats = pool.stats_snapshot();
+            UdpWorkerPoolInfo {
+                packets_processed: stats.packets_processed,
+                bytes_received: stats.bytes_received,
+                workers_active: stats.workers_active,
+                workers_total: stats.workers_total,
+                worker_errors: stats.worker_errors,
+            }
+        });
+
+        // Get buffer pool stats
+        let buffer_pool_stats = self.udp_buffer_pool.as_ref().map(|pool| {
+            let stats = pool.stats().snapshot();
+            BufferPoolInfo {
+                capacity: pool.capacity(),
+                buffer_size: pool.buffer_size(),
+                available: pool.available(),
+                allocations: stats.allocations,
+                reuses: stats.reuses,
+                returns: stats.returns,
+                drops: stats.drops,
+                efficiency: stats.efficiency(),
+            }
+        });
+
+        // Get processor stats from worker pool (Phase 5.5 fix)
+        let processor_stats = self.udp_worker_pool.as_ref().map(|pool| {
+            let stats = pool.processor_stats();
+            UdpProcessorInfo {
+                packets_processed: stats.packets_processed,
+                packets_forwarded: stats.packets_forwarded,
+                packets_failed: stats.packets_failed,
+                sessions_created: stats.sessions_created,
+                sessions_reused: stats.sessions_reused,
+                bytes_sent: stats.bytes_sent,
+                quic_packets: stats.quic_packets,
+                quic_sni_extracted: stats.quic_sni_extracted,
+                rule_matches: stats.rule_matches,
+                active_sessions: pool.active_sessions(),
+            }
+        });
+
+        IpcResponse::UdpStats(UdpStatsResponse {
+            udp_enabled: self.udp_enabled,
+            session_stats,
+            worker_stats,
+            buffer_pool_stats,
+            processor_stats,
+        })
+    }
+
+    /// Handle ListUdpSessions command
+    ///
+    /// Returns a list of active UDP session snapshots with optional limit.
+    fn handle_list_udp_sessions(&self, limit: usize) -> IpcResponse {
+        let Some(ref manager) = self.udp_session_manager else {
+            return IpcResponse::UdpSessions(UdpSessionsResponse {
+                sessions: vec![],
+                total_count: 0,
+                truncated: false,
+            });
+        };
+
+        // Get all session snapshots
+        let all_sessions = manager.all_sessions();
+        let total_count = all_sessions.len() as u64;
+
+        // Apply limit and convert to response format
+        let truncated = limit < all_sessions.len();
+        let sessions: Vec<UdpSessionInfo> = all_sessions
+            .into_iter()
+            .take(limit)
+            .map(|s| UdpSessionInfo {
+                client_addr: s.client_addr.to_string(),
+                dest_addr: s.dest_addr.to_string(),
+                outbound: s.outbound,
+                routing_mark: s.routing_mark,
+                sniffed_domain: s.sniffed_domain,
+                bytes_sent: s.bytes_sent,
+                bytes_recv: s.bytes_recv,
+                packets_sent: s.packets_sent,
+                packets_recv: s.packets_recv,
+                age_secs: s.age_secs,
+            })
+            .collect();
+
+        IpcResponse::UdpSessions(UdpSessionsResponse {
+            sessions,
+            total_count,
+            truncated,
+        })
+    }
+
+    /// Handle GetUdpSession command
+    ///
+    /// Returns detailed information about a specific UDP session.
+    fn handle_get_udp_session(&self, client_addr: &str, dest_addr: &str) -> IpcResponse {
+        // Validate addresses first (before checking if UDP is enabled)
+        let client: std::net::SocketAddr = match client_addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid client address: {}", client_addr),
+                );
+            }
+        };
+
+        let dest: std::net::SocketAddr = match dest_addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid destination address: {}", dest_addr),
+                );
+            }
+        };
+
+        let Some(ref manager) = self.udp_session_manager else {
+            return IpcResponse::UdpSession(UdpSessionResponse {
+                found: false,
+                session: None,
+            });
+        };
+
+        // Create session key and look up
+        let key = UdpSessionKey::new(client, dest);
+        match manager.get(&key) {
+            Some(session) => {
+                let snapshot = session.snapshot();
+                IpcResponse::UdpSession(UdpSessionResponse {
+                    found: true,
+                    session: Some(UdpSessionInfo {
+                        client_addr: snapshot.client_addr.to_string(),
+                        dest_addr: snapshot.dest_addr.to_string(),
+                        outbound: snapshot.outbound,
+                        routing_mark: snapshot.routing_mark,
+                        sniffed_domain: snapshot.sniffed_domain,
+                        bytes_sent: snapshot.bytes_sent,
+                        bytes_recv: snapshot.bytes_recv,
+                        packets_sent: snapshot.packets_sent,
+                        packets_recv: snapshot.packets_recv,
+                        age_secs: snapshot.age_secs,
+                    }),
+                })
+            }
+            None => IpcResponse::UdpSession(UdpSessionResponse {
+                found: false,
+                session: None,
+            }),
+        }
+    }
+
+    /// Handle GetUdpWorkerStats command
+    ///
+    /// Returns statistics about the UDP worker pool.
+    fn handle_get_udp_worker_stats(&self) -> IpcResponse {
+        match &self.udp_worker_pool {
+            Some(pool) => {
+                let stats = pool.stats_snapshot();
+                IpcResponse::UdpWorkerStats(UdpWorkerStatsResponse {
+                    running: pool.is_running(),
+                    num_workers: pool.num_workers(),
+                    stats: Some(UdpWorkerPoolInfo {
+                        packets_processed: stats.packets_processed,
+                        bytes_received: stats.bytes_received,
+                        workers_active: stats.workers_active,
+                        workers_total: stats.workers_total,
+                        worker_errors: stats.worker_errors,
+                    }),
+                })
+            }
+            None => IpcResponse::UdpWorkerStats(UdpWorkerStatsResponse {
+                running: false,
+                num_workers: 0,
+                stats: None,
+            }),
+        }
+    }
+
+    /// Handle GetBufferPoolStats command
+    ///
+    /// Returns statistics about the lock-free UDP buffer pool.
+    fn handle_get_buffer_pool_stats(&self) -> IpcResponse {
+        match &self.udp_buffer_pool {
+            Some(pool) => {
+                let stats = pool.stats().snapshot();
+                IpcResponse::BufferPoolStats(BufferPoolStatsResponse {
+                    available: true,
+                    stats: Some(BufferPoolInfo {
+                        capacity: pool.capacity(),
+                        buffer_size: pool.buffer_size(),
+                        available: pool.available(),
+                        allocations: stats.allocations,
+                        reuses: stats.reuses,
+                        returns: stats.returns,
+                        drops: stats.drops,
+                        efficiency: stats.efficiency(),
+                    }),
+                })
+            }
+            None => IpcResponse::BufferPoolStats(BufferPoolStatsResponse {
+                available: false,
+                stats: None,
+            }),
+        }
+    }
 }
 
 /// Write a metric header (HELP and TYPE lines)
@@ -2469,5 +2781,121 @@ mod tests {
 
         // The quote should be escaped
         assert!(output.contains(r#"outbound="test\"quoted""#));
+    }
+
+    // =========================================================================
+    // Phase 5.5: UDP IPC Handler Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_udp_stats_no_udp() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetUdpStats).await;
+
+        if let IpcResponse::UdpStats(stats) = response {
+            assert!(!stats.udp_enabled);
+            assert!(stats.worker_stats.is_none());
+            assert!(stats.buffer_pool_stats.is_none());
+            assert!(stats.processor_stats.is_none());
+            // Session stats should have default values
+            assert_eq!(stats.session_stats.session_count, 0);
+        } else {
+            panic!("Expected UdpStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_udp_sessions_no_udp() {
+        let handler = create_test_handler();
+        let response = handler
+            .handle(IpcCommand::ListUdpSessions { limit: 100 })
+            .await;
+
+        if let IpcResponse::UdpSessions(sessions) = response {
+            assert!(sessions.sessions.is_empty());
+            assert_eq!(sessions.total_count, 0);
+            assert!(!sessions.truncated);
+        } else {
+            panic!("Expected UdpSessions response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_udp_session_no_udp() {
+        let handler = create_test_handler();
+        let response = handler
+            .handle(IpcCommand::GetUdpSession {
+                client_addr: "192.168.1.100:12345".into(),
+                dest_addr: "8.8.8.8:53".into(),
+            })
+            .await;
+
+        if let IpcResponse::UdpSession(session) = response {
+            assert!(!session.found);
+            assert!(session.session.is_none());
+        } else {
+            panic!("Expected UdpSession response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_udp_session_invalid_client_addr() {
+        let handler = create_test_handler();
+        let response = handler
+            .handle(IpcCommand::GetUdpSession {
+                client_addr: "not-an-address".into(),
+                dest_addr: "8.8.8.8:53".into(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+            assert!(err.message.contains("Invalid client address"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_udp_session_invalid_dest_addr() {
+        let handler = create_test_handler();
+        let response = handler
+            .handle(IpcCommand::GetUdpSession {
+                client_addr: "192.168.1.100:12345".into(),
+                dest_addr: "not-an-address".into(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::InvalidParameters));
+            assert!(err.message.contains("Invalid destination address"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_udp_worker_stats_no_udp() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetUdpWorkerStats).await;
+
+        if let IpcResponse::UdpWorkerStats(stats) = response {
+            assert!(!stats.running);
+            assert_eq!(stats.num_workers, 0);
+            assert!(stats.stats.is_none());
+        } else {
+            panic!("Expected UdpWorkerStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_buffer_pool_stats_no_udp() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetBufferPoolStats).await;
+
+        if let IpcResponse::BufferPoolStats(stats) = response {
+            assert!(!stats.available);
+            assert!(stats.stats.is_none());
+        } else {
+            panic!("Expected BufferPoolStats response");
+        }
     }
 }

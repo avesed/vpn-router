@@ -42,6 +42,10 @@ bytes = "1"
 
 # Concurrent data structures
 dashmap = "5"
+crossbeam-queue = "0.3"
+
+# CPU detection
+num_cpus = "1.16"
 
 # Caching with LRU eviction
 moka = { version = "0.12", features = ["sync"] }

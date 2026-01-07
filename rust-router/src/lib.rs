@@ -74,18 +74,22 @@ pub mod tproxy;
 // Re-export commonly used types at the crate root
 pub use config::{Config, ListenConfig, OutboundConfig, RuleConfig, RulesConfig};
 pub use connection::{
-    ConnectionManager, ConnectionStats, UdpSession, UdpSessionConfig, UdpSessionKey,
-    UdpSessionManager, UdpSessionSnapshot, UdpSessionStats,
+    ConnectionManager, ConnectionStats, ProcessResult, ReplyHandlerConfig, ReplyHandlerStats,
+    ReplyHandlerStatsSnapshot, UdpPacketProcessor, UdpProcessorConfig, UdpProcessorStats,
+    UdpProcessorStatsSnapshot, UdpReplyHandler, UdpSession, UdpSessionConfig, UdpSessionKey,
+    UdpSessionManager, UdpSessionSnapshot, UdpSessionStats, UdpSessionWrapper,
 };
 pub use error::{
     ConfigError, ConnectionError, IpcError, OutboundError, RuleError, RustRouterError, TproxyError,
+    UdpError,
 };
 pub use ipc::{IpcClient, IpcCommand, IpcResponse, IpcServer};
 pub use outbound::{
     get_egress_interface_name, get_egress_type, get_interface_info, interface_exists,
     is_egress_interface, list_egress_interfaces, parse_interface_name, validate_interface_exists,
-    BlockOutbound, DirectOutbound, EgressType, InterfaceInfo, Outbound, OutboundManager,
-    CUSTOM_PREFIX, INTERFACE_MAX_LEN, PEER_PREFIX, PIA_PREFIX, WARP_PREFIX,
+    BlockOutbound, DirectOutbound, DirectUdpHandle, EgressType, InterfaceInfo, Outbound,
+    OutboundManager, Socks5UdpHandle, UdpOutboundHandle, CUSTOM_PREFIX, INTERFACE_MAX_LEN,
+    PEER_PREFIX, PIA_PREFIX, WARP_PREFIX,
 };
 pub use rules::{
     dscp_to_routing_mark, dscp_to_routing_table, is_dscp_terminal_table, is_ecmp_table,
@@ -98,7 +102,9 @@ pub use rules::{
 pub use sniff::{
     sniff_tls_sni, Protocol, QuicPacketType, QuicSniffResult, QuicSniffer, QuicVersion, SniffResult,
 };
-pub use tproxy::{TproxyConnection, TproxyListener};
+pub use tproxy::{
+    TproxyConnection, TproxyListener, TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo,
+};
 
 /// Crate version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

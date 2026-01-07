@@ -217,6 +217,47 @@ pub enum IpcCommand {
     ///
     /// Returns all metrics in Prometheus text exposition format for scraping.
     GetPrometheusMetrics,
+
+    // ========================================================================
+    // Phase 5.5: UDP IPC Commands
+    // ========================================================================
+
+    /// Get UDP statistics (sessions, packets, worker pool stats).
+    ///
+    /// Returns comprehensive UDP statistics including session manager stats,
+    /// worker pool stats, and buffer pool stats.
+    GetUdpStats,
+
+    /// List active UDP sessions.
+    ///
+    /// Returns snapshots of active UDP sessions with optional limit.
+    ListUdpSessions {
+        /// Maximum number of sessions to return (default: 100)
+        #[serde(default = "default_udp_session_limit")]
+        limit: usize,
+    },
+
+    /// Get a specific UDP session by client and destination address.
+    ///
+    /// Returns detailed information about a single UDP session.
+    GetUdpSession {
+        /// Client address (e.g., "192.168.1.100:12345")
+        client_addr: String,
+        /// Destination address (e.g., "8.8.8.8:443")
+        dest_addr: String,
+    },
+
+    /// Get UDP worker pool statistics.
+    ///
+    /// Returns statistics about the UDP worker pool including active workers,
+    /// packets processed, and bytes received.
+    GetUdpWorkerStats,
+
+    /// Get UDP buffer pool statistics.
+    ///
+    /// Returns statistics about the lock-free UDP buffer pool including
+    /// allocations, reuses, returns, and drops.
+    GetBufferPoolStats,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -237,6 +278,11 @@ fn default_pool_size() -> usize {
 /// Default drain timeout in seconds
 fn default_drain_timeout() -> u32 {
     30
+}
+
+/// Default limit for UDP session listing
+fn default_udp_session_limit() -> usize {
+    100
 }
 
 /// Egress action type for NotifyEgressChange
@@ -324,6 +370,25 @@ pub enum IpcResponse {
 
     /// Prometheus metrics response
     PrometheusMetrics(PrometheusMetricsResponse),
+
+    // ========================================================================
+    // Phase 5.5: UDP IPC Response Types
+    // ========================================================================
+
+    /// UDP statistics response
+    UdpStats(UdpStatsResponse),
+
+    /// UDP sessions list response
+    UdpSessions(UdpSessionsResponse),
+
+    /// Single UDP session response
+    UdpSession(UdpSessionResponse),
+
+    /// UDP worker pool statistics response
+    UdpWorkerStats(UdpWorkerStatsResponse),
+
+    /// UDP buffer pool statistics response
+    BufferPoolStats(BufferPoolStatsResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -582,6 +647,172 @@ pub struct PrometheusMetricsResponse {
     pub metrics_text: String,
     /// Timestamp of metrics collection (Unix epoch milliseconds)
     pub timestamp_ms: u64,
+}
+
+// ============================================================================
+// Phase 5.5: UDP IPC Response Structs
+// ============================================================================
+
+/// Comprehensive UDP statistics response
+///
+/// Combines session manager stats, worker pool stats, and buffer pool stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpStatsResponse {
+    /// Whether UDP is enabled
+    pub udp_enabled: bool,
+    /// Session manager statistics
+    pub session_stats: UdpSessionStatsInfo,
+    /// Worker pool statistics (None if UDP not enabled)
+    pub worker_stats: Option<UdpWorkerPoolInfo>,
+    /// Buffer pool statistics (None if UDP not enabled)
+    pub buffer_pool_stats: Option<BufferPoolInfo>,
+    /// Processor statistics (None if UDP not enabled)
+    pub processor_stats: Option<UdpProcessorInfo>,
+}
+
+/// UDP session manager statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionStatsInfo {
+    /// Current number of active sessions
+    pub session_count: u64,
+    /// Maximum allowed sessions
+    pub max_sessions: u64,
+    /// Total sessions created
+    pub total_created: u64,
+    /// Total sessions evicted
+    pub total_evicted: u64,
+    /// Cache utilization percentage
+    pub utilization_percent: f64,
+    /// Idle timeout in seconds
+    pub idle_timeout_secs: u64,
+    /// TTL in seconds
+    pub ttl_secs: u64,
+}
+
+/// UDP worker pool statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpWorkerPoolInfo {
+    /// Total packets processed
+    pub packets_processed: u64,
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Number of active workers
+    pub workers_active: u32,
+    /// Total workers spawned
+    pub workers_total: u32,
+    /// Number of worker errors
+    pub worker_errors: u64,
+}
+
+/// UDP buffer pool statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferPoolInfo {
+    /// Pool capacity
+    pub capacity: usize,
+    /// Buffer size in bytes
+    pub buffer_size: usize,
+    /// Currently available buffers
+    pub available: usize,
+    /// Number of new buffer allocations
+    pub allocations: u64,
+    /// Number of buffer reuses from pool
+    pub reuses: u64,
+    /// Number of buffers returned to pool
+    pub returns: u64,
+    /// Number of buffers dropped (pool was full)
+    pub drops: u64,
+    /// Pool efficiency (reuses / (reuses + allocations))
+    pub efficiency: f64,
+}
+
+/// UDP packet processor statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpProcessorInfo {
+    /// Packets processed
+    pub packets_processed: u64,
+    /// Packets forwarded successfully
+    pub packets_forwarded: u64,
+    /// Packets that failed processing
+    pub packets_failed: u64,
+    /// Sessions created
+    pub sessions_created: u64,
+    /// Sessions reused
+    pub sessions_reused: u64,
+    /// Total bytes sent
+    pub bytes_sent: u64,
+    /// QUIC packets detected
+    pub quic_packets: u64,
+    /// QUIC SNI successfully extracted
+    pub quic_sni_extracted: u64,
+    /// Rule matches
+    pub rule_matches: u64,
+    /// Currently active sessions in the processor cache
+    pub active_sessions: u64,
+}
+
+/// UDP sessions list response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionsResponse {
+    /// List of session snapshots
+    pub sessions: Vec<UdpSessionInfo>,
+    /// Total session count (may differ from len if limit applied)
+    pub total_count: u64,
+    /// Whether the list was truncated due to limit
+    pub truncated: bool,
+}
+
+/// Individual UDP session information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionInfo {
+    /// Client address
+    pub client_addr: String,
+    /// Destination address
+    pub dest_addr: String,
+    /// Outbound tag
+    pub outbound: String,
+    /// Routing mark (for chain routing / DSCP)
+    pub routing_mark: Option<u32>,
+    /// Sniffed domain (from QUIC SNI)
+    pub sniffed_domain: Option<String>,
+    /// Bytes sent (client -> upstream)
+    pub bytes_sent: u64,
+    /// Bytes received (upstream -> client)
+    pub bytes_recv: u64,
+    /// Packets sent
+    pub packets_sent: u64,
+    /// Packets received
+    pub packets_recv: u64,
+    /// Session age in seconds
+    pub age_secs: u64,
+}
+
+/// Single UDP session response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpSessionResponse {
+    /// Whether the session was found
+    pub found: bool,
+    /// Session information (None if not found)
+    pub session: Option<UdpSessionInfo>,
+}
+
+/// UDP worker pool statistics response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UdpWorkerStatsResponse {
+    /// Whether UDP workers are running
+    pub running: bool,
+    /// Number of workers
+    pub num_workers: usize,
+    /// Worker pool statistics
+    pub stats: Option<UdpWorkerPoolInfo>,
+}
+
+/// UDP buffer pool statistics response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferPoolStatsResponse {
+    /// Whether buffer pool is available
+    pub available: bool,
+    /// Buffer pool statistics
+    pub stats: Option<BufferPoolInfo>,
 }
 
 /// IPC error
@@ -1019,5 +1250,310 @@ rust_router_connections_total 12345
         } else {
             panic!("Expected PrometheusMetrics response");
         }
+    }
+
+    // =========================================================================
+    // Phase 5.5: UDP IPC Protocol Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_udp_stats_command_serialization() {
+        let cmd = IpcCommand::GetUdpStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_udp_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetUdpStats));
+    }
+
+    #[test]
+    fn test_list_udp_sessions_command_serialization() {
+        // With explicit limit
+        let cmd = IpcCommand::ListUdpSessions { limit: 50 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_udp_sessions\""));
+        assert!(json.contains("\"limit\":50"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::ListUdpSessions { limit } = parsed {
+            assert_eq!(limit, 50);
+        } else {
+            panic!("Expected ListUdpSessions command");
+        }
+
+        // With default limit
+        let json_default = r#"{"type":"list_udp_sessions"}"#;
+        let parsed: IpcCommand = serde_json::from_str(json_default).unwrap();
+        if let IpcCommand::ListUdpSessions { limit } = parsed {
+            assert_eq!(limit, 100); // default_udp_session_limit()
+        } else {
+            panic!("Expected ListUdpSessions command");
+        }
+    }
+
+    #[test]
+    fn test_get_udp_session_command_serialization() {
+        let cmd = IpcCommand::GetUdpSession {
+            client_addr: "192.168.1.100:12345".into(),
+            dest_addr: "8.8.8.8:443".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_udp_session\""));
+        assert!(json.contains("192.168.1.100:12345"));
+        assert!(json.contains("8.8.8.8:443"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetUdpSession { client_addr, dest_addr } = parsed {
+            assert_eq!(client_addr, "192.168.1.100:12345");
+            assert_eq!(dest_addr, "8.8.8.8:443");
+        } else {
+            panic!("Expected GetUdpSession command");
+        }
+    }
+
+    #[test]
+    fn test_get_udp_worker_stats_command_serialization() {
+        let cmd = IpcCommand::GetUdpWorkerStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_udp_worker_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetUdpWorkerStats));
+    }
+
+    #[test]
+    fn test_get_buffer_pool_stats_command_serialization() {
+        let cmd = IpcCommand::GetBufferPoolStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_buffer_pool_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetBufferPoolStats));
+    }
+
+    #[test]
+    fn test_udp_stats_response_serialization() {
+        let resp = UdpStatsResponse {
+            udp_enabled: true,
+            session_stats: UdpSessionStatsInfo {
+                session_count: 100,
+                max_sessions: 65536,
+                total_created: 500,
+                total_evicted: 400,
+                utilization_percent: 0.15,
+                idle_timeout_secs: 300,
+                ttl_secs: 600,
+            },
+            worker_stats: Some(UdpWorkerPoolInfo {
+                packets_processed: 10000,
+                bytes_received: 1_500_000,
+                workers_active: 4,
+                workers_total: 4,
+                worker_errors: 5,
+            }),
+            buffer_pool_stats: Some(BufferPoolInfo {
+                capacity: 1024,
+                buffer_size: 65535,
+                available: 800,
+                allocations: 224,
+                reuses: 9776,
+                returns: 9800,
+                drops: 0,
+                efficiency: 0.9776,
+            }),
+            processor_stats: Some(UdpProcessorInfo {
+                packets_processed: 10000,
+                packets_forwarded: 9995,
+                packets_failed: 5,
+                sessions_created: 500,
+                sessions_reused: 9500,
+                bytes_sent: 1_200_000,
+                quic_packets: 8000,
+                quic_sni_extracted: 7500,
+                rule_matches: 6000,
+                active_sessions: 450,
+            }),
+        };
+        let ipc_resp = IpcResponse::UdpStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_stats\""));
+        assert!(json.contains("\"udp_enabled\":true"));
+        assert!(json.contains("\"session_count\":100"));
+        assert!(json.contains("\"packets_processed\":10000"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UdpStats(stats) = parsed {
+            assert!(stats.udp_enabled);
+            assert_eq!(stats.session_stats.session_count, 100);
+            assert!(stats.worker_stats.is_some());
+            assert_eq!(stats.worker_stats.as_ref().unwrap().packets_processed, 10000);
+        } else {
+            panic!("Expected UdpStats response");
+        }
+    }
+
+    #[test]
+    fn test_udp_sessions_response_serialization() {
+        let resp = UdpSessionsResponse {
+            sessions: vec![
+                UdpSessionInfo {
+                    client_addr: "192.168.1.100:12345".into(),
+                    dest_addr: "8.8.8.8:443".into(),
+                    outbound: "direct".into(),
+                    routing_mark: None,
+                    sniffed_domain: Some("example.com".into()),
+                    bytes_sent: 1000,
+                    bytes_recv: 5000,
+                    packets_sent: 10,
+                    packets_recv: 50,
+                    age_secs: 30,
+                },
+            ],
+            total_count: 100,
+            truncated: true,
+        };
+        let ipc_resp = IpcResponse::UdpSessions(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_sessions\""));
+        assert!(json.contains("\"total_count\":100"));
+        assert!(json.contains("\"truncated\":true"));
+        assert!(json.contains("example.com"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UdpSessions(sessions) = parsed {
+            assert_eq!(sessions.sessions.len(), 1);
+            assert_eq!(sessions.total_count, 100);
+            assert!(sessions.truncated);
+            assert_eq!(sessions.sessions[0].sniffed_domain, Some("example.com".into()));
+        } else {
+            panic!("Expected UdpSessions response");
+        }
+    }
+
+    #[test]
+    fn test_udp_session_response_serialization() {
+        // Found case
+        let resp = UdpSessionResponse {
+            found: true,
+            session: Some(UdpSessionInfo {
+                client_addr: "192.168.1.100:12345".into(),
+                dest_addr: "8.8.8.8:443".into(),
+                outbound: "proxy".into(),
+                routing_mark: Some(200),
+                sniffed_domain: None,
+                bytes_sent: 500,
+                bytes_recv: 2000,
+                packets_sent: 5,
+                packets_recv: 20,
+                age_secs: 15,
+            }),
+        };
+        let ipc_resp = IpcResponse::UdpSession(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_session\""));
+        assert!(json.contains("\"found\":true"));
+        assert!(json.contains("\"routing_mark\":200"));
+
+        // Not found case
+        let resp_not_found = UdpSessionResponse {
+            found: false,
+            session: None,
+        };
+        let ipc_resp_not_found = IpcResponse::UdpSession(resp_not_found);
+        let json_not_found = serde_json::to_string(&ipc_resp_not_found).unwrap();
+        assert!(json_not_found.contains("\"found\":false"));
+        assert!(json_not_found.contains("\"session\":null"));
+    }
+
+    #[test]
+    fn test_udp_worker_stats_response_serialization() {
+        let resp = UdpWorkerStatsResponse {
+            running: true,
+            num_workers: 4,
+            stats: Some(UdpWorkerPoolInfo {
+                packets_processed: 50000,
+                bytes_received: 10_000_000,
+                workers_active: 4,
+                workers_total: 4,
+                worker_errors: 2,
+            }),
+        };
+        let ipc_resp = IpcResponse::UdpWorkerStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"udp_worker_stats\""));
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"num_workers\":4"));
+        assert!(json.contains("\"packets_processed\":50000"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::UdpWorkerStats(stats) = parsed {
+            assert!(stats.running);
+            assert_eq!(stats.num_workers, 4);
+            assert_eq!(stats.stats.as_ref().unwrap().packets_processed, 50000);
+        } else {
+            panic!("Expected UdpWorkerStats response");
+        }
+    }
+
+    #[test]
+    fn test_buffer_pool_stats_response_serialization() {
+        let resp = BufferPoolStatsResponse {
+            available: true,
+            stats: Some(BufferPoolInfo {
+                capacity: 2048,
+                buffer_size: 65535,
+                available: 1500,
+                allocations: 548,
+                reuses: 99452,
+                returns: 100000,
+                drops: 0,
+                efficiency: 0.9945,
+            }),
+        };
+        let ipc_resp = IpcResponse::BufferPoolStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"buffer_pool_stats\""));
+        assert!(json.contains("\"available\":true"));
+        assert!(json.contains("\"capacity\":2048"));
+        assert!(json.contains("\"efficiency\":0.9945"));
+
+        // Deserialize back
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::BufferPoolStats(stats) = parsed {
+            assert!(stats.available);
+            assert_eq!(stats.stats.as_ref().unwrap().capacity, 2048);
+            assert!((stats.stats.as_ref().unwrap().efficiency - 0.9945).abs() < 0.0001);
+        } else {
+            panic!("Expected BufferPoolStats response");
+        }
+    }
+
+    #[test]
+    fn test_udp_stats_disabled_serialization() {
+        // Test UDP disabled case
+        let resp = UdpStatsResponse {
+            udp_enabled: false,
+            session_stats: UdpSessionStatsInfo {
+                session_count: 0,
+                max_sessions: 65536,
+                total_created: 0,
+                total_evicted: 0,
+                utilization_percent: 0.0,
+                idle_timeout_secs: 300,
+                ttl_secs: 600,
+            },
+            worker_stats: None,
+            buffer_pool_stats: None,
+            processor_stats: None,
+        };
+        let ipc_resp = IpcResponse::UdpStats(resp);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"udp_enabled\":false"));
+        assert!(json.contains("\"worker_stats\":null"));
+        assert!(json.contains("\"buffer_pool_stats\":null"));
+        assert!(json.contains("\"processor_stats\":null"));
     }
 }

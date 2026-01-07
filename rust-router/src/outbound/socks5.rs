@@ -62,63 +62,11 @@ use super::traits::{HealthStatus, Outbound, OutboundConnection};
 use crate::connection::OutboundStats;
 use crate::error::OutboundError;
 
-// ============================================================================
-// SOCKS5 Protocol Constants (RFC 1928)
-// ============================================================================
-
-/// SOCKS5 protocol version
-const SOCKS5_VERSION: u8 = 0x05;
-
-/// No authentication required
-const AUTH_METHOD_NONE: u8 = 0x00;
-
-/// Username/password authentication (RFC 1929)
-const AUTH_METHOD_PASSWORD: u8 = 0x02;
-
-/// No acceptable methods
-const AUTH_METHOD_NO_ACCEPTABLE: u8 = 0xFF;
-
-/// Username/password auth version (RFC 1929)
-const AUTH_PASSWORD_VERSION: u8 = 0x01;
-
-/// CONNECT command
-const CMD_CONNECT: u8 = 0x01;
-
-/// Address type: IPv4
-const ATYP_IPV4: u8 = 0x01;
-
-/// Address type: Domain name
-const ATYP_DOMAIN: u8 = 0x03;
-
-/// Address type: IPv6
-const ATYP_IPV6: u8 = 0x04;
-
-/// Reply: Succeeded
-const REPLY_SUCCEEDED: u8 = 0x00;
-
-/// Reply: General SOCKS server failure
-const REPLY_GENERAL_FAILURE: u8 = 0x01;
-
-/// Reply: Connection not allowed by ruleset
-const REPLY_NOT_ALLOWED: u8 = 0x02;
-
-/// Reply: Network unreachable
-const REPLY_NETWORK_UNREACHABLE: u8 = 0x03;
-
-/// Reply: Host unreachable
-const REPLY_HOST_UNREACHABLE: u8 = 0x04;
-
-/// Reply: Connection refused
-const REPLY_CONNECTION_REFUSED: u8 = 0x05;
-
-/// Reply: TTL expired
-const REPLY_TTL_EXPIRED: u8 = 0x06;
-
-/// Reply: Command not supported
-const REPLY_COMMAND_NOT_SUPPORTED: u8 = 0x07;
-
-/// Reply: Address type not supported
-const REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
+// Import shared SOCKS5 constants from the common module
+use super::socks5_common::{
+    reply_message, ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_METHOD_NONE, AUTH_METHOD_NO_ACCEPTABLE,
+    AUTH_METHOD_PASSWORD, AUTH_PASSWORD_VERSION, CMD_CONNECT, REPLY_SUCCEEDED, SOCKS5_VERSION,
+};
 
 // ============================================================================
 // Error Types
@@ -173,22 +121,6 @@ impl From<Socks5Error> for OutboundError {
             addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
             reason: e.to_string(),
         }
-    }
-}
-
-/// Convert reply code to human-readable message
-fn reply_message(code: u8) -> &'static str {
-    match code {
-        REPLY_SUCCEEDED => "succeeded",
-        REPLY_GENERAL_FAILURE => "general SOCKS server failure",
-        REPLY_NOT_ALLOWED => "connection not allowed by ruleset",
-        REPLY_NETWORK_UNREACHABLE => "network unreachable",
-        REPLY_HOST_UNREACHABLE => "host unreachable",
-        REPLY_CONNECTION_REFUSED => "connection refused",
-        REPLY_TTL_EXPIRED => "TTL expired",
-        REPLY_COMMAND_NOT_SUPPORTED => "command not supported",
-        REPLY_ADDRESS_TYPE_NOT_SUPPORTED => "address type not supported",
-        _ => "unknown error",
     }
 }
 
@@ -1032,6 +964,61 @@ impl Outbound for Socks5Outbound {
             has_auth: self.config.has_auth(),
         })
     }
+
+    // === UDP Methods (Phase 5.2) ===
+
+    async fn connect_udp(
+        &self,
+        addr: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<super::traits::UdpOutboundHandle, crate::error::UdpError> {
+        use super::socks5_udp::{Socks5Auth, Socks5UdpAssociation};
+        use super::traits::{Socks5UdpHandle, UdpOutboundHandle};
+        use crate::error::UdpError;
+
+        if !self.is_enabled() {
+            return Err(UdpError::OutboundDisabled {
+                tag: self.config.tag.clone(),
+            });
+        }
+
+        // Convert config auth to SOCKS5 UDP auth format
+        let auth = if self.config.has_auth() {
+            Some(Socks5Auth::new(
+                self.config.username.clone().unwrap_or_default(),
+                self.config.password.clone().unwrap_or_default(),
+            ))
+        } else {
+            None
+        };
+
+        // Establish UDP ASSOCIATE
+        let association = Socks5UdpAssociation::establish(
+            self.config.socks5_addr,
+            auth,
+            connect_timeout,
+        )
+        .await
+        .map_err(|e| UdpError::Socks5UdpAssociationFailed {
+            reason: e.to_string(),
+        })?;
+
+        debug!(
+            "SOCKS5 UDP association established for {} via {} (relay: {})",
+            addr,
+            self.config.tag,
+            association.relay_addr()
+        );
+
+        Ok(UdpOutboundHandle::Socks5(Socks5UdpHandle::new(
+            std::sync::Arc::new(association),
+            addr,
+        )))
+    }
+
+    fn supports_udp(&self) -> bool {
+        true
+    }
 }
 
 impl fmt::Debug for Socks5Outbound {
@@ -1056,6 +1043,9 @@ impl fmt::Debug for Socks5Outbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbound::socks5_common::{
+        REPLY_CONNECTION_REFUSED, REPLY_HOST_UNREACHABLE, REPLY_NETWORK_UNREACHABLE,
+    };
 
     // ========================================================================
     // Protocol Constants Tests
@@ -1087,15 +1077,8 @@ mod tests {
 
     #[test]
     fn test_reply_codes() {
+        // Only REPLY_SUCCEEDED is imported, other codes tested in socks5_common
         assert_eq!(REPLY_SUCCEEDED, 0x00);
-        assert_eq!(REPLY_GENERAL_FAILURE, 0x01);
-        assert_eq!(REPLY_NOT_ALLOWED, 0x02);
-        assert_eq!(REPLY_NETWORK_UNREACHABLE, 0x03);
-        assert_eq!(REPLY_HOST_UNREACHABLE, 0x04);
-        assert_eq!(REPLY_CONNECTION_REFUSED, 0x05);
-        assert_eq!(REPLY_TTL_EXPIRED, 0x06);
-        assert_eq!(REPLY_COMMAND_NOT_SUPPORTED, 0x07);
-        assert_eq!(REPLY_ADDRESS_TYPE_NOT_SUPPORTED, 0x08);
     }
 
     // ========================================================================
@@ -1108,47 +1091,22 @@ mod tests {
     }
 
     #[test]
-    fn test_reply_message_general_failure() {
-        assert_eq!(reply_message(REPLY_GENERAL_FAILURE), "general SOCKS server failure");
+    fn test_reply_message_all_codes() {
+        // Comprehensive tests are in socks5_common module
+        // Here we just verify the function works via import
+        assert_eq!(reply_message(0x01), "general SOCKS server failure");
+        assert_eq!(reply_message(0x02), "connection not allowed by ruleset");
+        assert_eq!(reply_message(0x03), "network unreachable");
+        assert_eq!(reply_message(0x04), "host unreachable");
+        assert_eq!(reply_message(0x05), "connection refused");
     }
 
     #[test]
-    fn test_reply_message_not_allowed() {
-        assert_eq!(reply_message(REPLY_NOT_ALLOWED), "connection not allowed by ruleset");
-    }
-
-    #[test]
-    fn test_reply_message_network_unreachable() {
-        assert_eq!(reply_message(REPLY_NETWORK_UNREACHABLE), "network unreachable");
-    }
-
-    #[test]
-    fn test_reply_message_host_unreachable() {
-        assert_eq!(reply_message(REPLY_HOST_UNREACHABLE), "host unreachable");
-    }
-
-    #[test]
-    fn test_reply_message_connection_refused() {
-        assert_eq!(reply_message(REPLY_CONNECTION_REFUSED), "connection refused");
-    }
-
-    #[test]
-    fn test_reply_message_ttl_expired() {
-        assert_eq!(reply_message(REPLY_TTL_EXPIRED), "TTL expired");
-    }
-
-    #[test]
-    fn test_reply_message_command_not_supported() {
-        assert_eq!(reply_message(REPLY_COMMAND_NOT_SUPPORTED), "command not supported");
-    }
-
-    #[test]
-    fn test_reply_message_address_type_not_supported() {
-        assert_eq!(reply_message(REPLY_ADDRESS_TYPE_NOT_SUPPORTED), "address type not supported");
-    }
-
-    #[test]
-    fn test_reply_message_unknown() {
+    fn test_reply_message_additional_codes() {
+        // Use raw values since constants aren't imported
+        assert_eq!(reply_message(0x06), "TTL expired");
+        assert_eq!(reply_message(0x07), "command not supported");
+        assert_eq!(reply_message(0x08), "address type not supported");
         assert_eq!(reply_message(0x99), "unknown error");
     }
 
@@ -1815,5 +1773,394 @@ mod tests {
             Err(OutboundError::ConnectionFailed { .. }) => {}
             _ => panic!("Expected Timeout or ConnectionFailed error"),
         }
+    }
+
+    // ========================================================================
+    // NEW-7: Domain BND.ADDR Tests
+    // ========================================================================
+    // These tests verify that the SOCKS5 client correctly parses domain name
+    // responses in the BND.ADDR field (ATYP=0x03) per RFC 1928 Section 6.
+    //
+    // Some SOCKS5 servers return domain names instead of IP addresses in the
+    // bound address field. The client must read and skip the domain correctly.
+
+    /// Mock server that returns a domain name in BND.ADDR
+    async fn run_mock_socks5_server_with_domain_reply(
+        listener: tokio::net::TcpListener,
+        domain: &[u8],
+        port: u16,
+    ) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        // Read method selection: VER | NMETHODS
+        let mut header = [0u8; 2];
+        socket.read_exact(&mut header).await.unwrap();
+        let nmethods = header[1] as usize;
+        let mut methods = vec![0u8; nmethods];
+        socket.read_exact(&mut methods).await.unwrap();
+
+        // Reply with no auth
+        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+
+        // Read CONNECT request header: VER | CMD | RSV | ATYP
+        let mut connect_buf = [0u8; 4];
+        socket.read_exact(&mut connect_buf).await.unwrap();
+
+        // Read rest based on ATYP
+        match connect_buf[3] {
+            ATYP_IPV4 => {
+                let mut addr_buf = [0u8; 6];
+                socket.read_exact(&mut addr_buf).await.unwrap();
+            }
+            ATYP_IPV6 => {
+                let mut addr_buf = [0u8; 18];
+                socket.read_exact(&mut addr_buf).await.unwrap();
+            }
+            _ => panic!("Unexpected ATYP in request"),
+        }
+
+        // Build reply with domain BND.ADDR
+        // VER | REP | RSV | ATYP | LEN | DOMAIN | PORT
+        let mut reply = vec![SOCKS5_VERSION, REPLY_SUCCEEDED, 0x00, ATYP_DOMAIN];
+        reply.push(domain.len() as u8);
+        reply.extend_from_slice(domain);
+        reply.push((port >> 8) as u8);
+        reply.push((port & 0xFF) as u8);
+
+        socket.write_all(&reply).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_domain_bnd_addr_basic() {
+        // NEW-7 TEST: Server returns a domain name in BND.ADDR
+        // The client should parse it correctly and return a placeholder address
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_domain_reply(
+                listener,
+                b"proxy.example.com",
+                8080,
+            ).await;
+        });
+
+        let config = Socks5Config::new("test-domain", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        // Connection should succeed - domain BND.ADDR is valid
+        assert!(result.is_ok(), "Domain BND.ADDR should be parsed successfully");
+        let conn = result.unwrap();
+        assert_eq!(conn.remote_addr(), dest);
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_domain_bnd_addr_single_char() {
+        // NEW-7 TEST: Minimum valid domain (1 character)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_domain_reply(listener, b"x", 443).await;
+        });
+
+        let config = Socks5Config::new("test-domain-short", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "Single char domain should work");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_domain_bnd_addr_max_length() {
+        // NEW-7 TEST: Maximum domain length (255 bytes per RFC 1928)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        // Create max length domain (255 characters)
+        let max_domain = vec![b'a'; 255];
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_domain_reply(listener, &max_domain, 80).await;
+        });
+
+        let config = Socks5Config::new("test-domain-max", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "Max length domain (255) should work");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_domain_bnd_addr_with_dots() {
+        // NEW-7 TEST: Typical FQDN with multiple labels
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_domain_reply(
+                listener,
+                b"relay.us-east-1.socks.example.com",
+                1080,
+            ).await;
+        });
+
+        let config = Socks5Config::new("test-domain-fqdn", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "FQDN with dots should work");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_domain_bnd_addr_port_boundary_low() {
+        // NEW-7 TEST: Domain with port 1 (minimum valid port)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_domain_reply(listener, b"localhost", 1).await;
+        });
+
+        let config = Socks5Config::new("test-domain-port1", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "Domain with port 1 should work");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_domain_bnd_addr_port_boundary_high() {
+        // NEW-7 TEST: Domain with port 65535 (maximum valid port)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_domain_reply(listener, b"localhost", 65535).await;
+        });
+
+        let config = Socks5Config::new("test-domain-port-max", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "Domain with port 65535 should work");
+
+        let _ = server.await;
+    }
+
+    /// Mock server that returns IPv6 in BND.ADDR
+    async fn run_mock_socks5_server_with_ipv6_reply(
+        listener: tokio::net::TcpListener,
+        ipv6: Ipv6Addr,
+        port: u16,
+    ) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        // Method selection
+        let mut header = [0u8; 2];
+        socket.read_exact(&mut header).await.unwrap();
+        let nmethods = header[1] as usize;
+        let mut methods = vec![0u8; nmethods];
+        socket.read_exact(&mut methods).await.unwrap();
+        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+
+        // CONNECT request
+        let mut connect_buf = [0u8; 4];
+        socket.read_exact(&mut connect_buf).await.unwrap();
+        match connect_buf[3] {
+            ATYP_IPV4 => {
+                let mut addr_buf = [0u8; 6];
+                socket.read_exact(&mut addr_buf).await.unwrap();
+            }
+            ATYP_IPV6 => {
+                let mut addr_buf = [0u8; 18];
+                socket.read_exact(&mut addr_buf).await.unwrap();
+            }
+            _ => panic!("Unexpected ATYP"),
+        }
+
+        // Reply with IPv6 BND.ADDR
+        let mut reply = vec![SOCKS5_VERSION, REPLY_SUCCEEDED, 0x00, ATYP_IPV6];
+        reply.extend_from_slice(&ipv6.octets());
+        reply.push((port >> 8) as u8);
+        reply.push((port & 0xFF) as u8);
+
+        socket.write_all(&reply).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_ipv6_bnd_addr() {
+        // NEW-7 TEST: Server returns IPv6 in BND.ADDR (ATYP=0x04)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_ipv6_reply(
+                listener,
+                "2001:db8::1".parse().unwrap(),
+                8080,
+            ).await;
+        });
+
+        let config = Socks5Config::new("test-ipv6", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "IPv6 BND.ADDR should work");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_ipv6_bnd_addr_loopback() {
+        // NEW-7 TEST: IPv6 loopback ::1 in BND.ADDR
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_ipv6_reply(
+                listener,
+                Ipv6Addr::LOCALHOST,
+                1080,
+            ).await;
+        });
+
+        let config = Socks5Config::new("test-ipv6-lo", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_ok(), "IPv6 loopback BND.ADDR should work");
+
+        let _ = server.await;
+    }
+
+    /// Mock server that returns invalid ATYP in BND.ADDR
+    async fn run_mock_socks5_server_with_invalid_atyp(
+        listener: tokio::net::TcpListener,
+        invalid_atyp: u8,
+    ) {
+        let (mut socket, _) = listener.accept().await.unwrap();
+
+        // Method selection
+        let mut header = [0u8; 2];
+        socket.read_exact(&mut header).await.unwrap();
+        let nmethods = header[1] as usize;
+        let mut methods = vec![0u8; nmethods];
+        socket.read_exact(&mut methods).await.unwrap();
+        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+
+        // CONNECT request
+        let mut connect_buf = [0u8; 4];
+        socket.read_exact(&mut connect_buf).await.unwrap();
+        match connect_buf[3] {
+            ATYP_IPV4 => {
+                let mut addr_buf = [0u8; 6];
+                socket.read_exact(&mut addr_buf).await.unwrap();
+            }
+            _ => {}
+        }
+
+        // Reply with invalid ATYP
+        let reply = [SOCKS5_VERSION, REPLY_SUCCEEDED, 0x00, invalid_atyp, 0, 0];
+        socket.write_all(&reply).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_invalid_atyp_bnd_addr() {
+        // NEW-7 TEST: Server returns invalid ATYP (0x05) - should fail
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_invalid_atyp(listener, 0x05).await;
+        });
+
+        let config = Socks5Config::new("test-invalid-atyp", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_err(), "Invalid ATYP should fail");
+        if let Err(OutboundError::ConnectionFailed { reason, .. }) = result {
+            assert!(
+                reason.contains("Invalid address type") || reason.contains("0x05"),
+                "Error should mention invalid address type: {}",
+                reason
+            );
+        } else {
+            panic!("Expected ConnectionFailed error");
+        }
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_atyp_zero_invalid() {
+        // NEW-7 TEST: ATYP=0x00 is invalid per RFC 1928
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_invalid_atyp(listener, 0x00).await;
+        });
+
+        let config = Socks5Config::new("test-atyp-zero", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_err(), "ATYP=0x00 should fail");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_socks5_atyp_two_invalid() {
+        // NEW-7 TEST: ATYP=0x02 is reserved/invalid per RFC 1928
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            run_mock_socks5_server_with_invalid_atyp(listener, 0x02).await;
+        });
+
+        let config = Socks5Config::new("test-atyp-two", server_addr).with_pool_size(1);
+        let outbound = Socks5Outbound::new(config).await.unwrap();
+
+        let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let result = outbound.connect(dest, Duration::from_secs(5)).await;
+
+        assert!(result.is_err(), "ATYP=0x02 should fail");
+
+        let _ = server.await;
     }
 }

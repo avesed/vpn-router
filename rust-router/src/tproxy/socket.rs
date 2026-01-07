@@ -5,16 +5,23 @@
 //! - `IP_TRANSPARENT`: Allows binding to non-local addresses and receiving TPROXY traffic
 //! - `SO_ORIGINAL_DST`: Retrieves the original destination from TCP TPROXY connections
 //! - `IP_RECVORIGDSTADDR`: Enables receiving original destination in UDP cmsg
+//!
+//! # Socket Provider Trait
+//!
+//! For testability, this module provides a [`SocketProvider`] trait that abstracts
+//! socket creation. Production code uses [`RealSocketProvider`], while tests can
+//! use mock implementations.
 
 use std::io;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::Arc;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::debug;
 
-use crate::error::TproxyError;
+use crate::error::{TproxyError, UdpError};
 
 /// Linux kernel constant: IP_TRANSPARENT socket option (SOL_IP level)
 /// Allows the socket to:
@@ -30,6 +37,212 @@ pub const SO_ORIGINAL_DST: libc::c_int = 80;
 /// Linux kernel constant: IP_RECVORIGDSTADDR (SOL_IP level)
 /// When enabled, UDP packets include the original destination in ancillary data (cmsg).
 pub const IP_RECVORIGDSTADDR: libc::c_int = 20;
+
+// =============================================================================
+// Socket Provider Trait
+// =============================================================================
+
+/// Trait for abstracting socket creation for dependency injection and testing.
+///
+/// This trait allows production code to use real TPROXY sockets while tests
+/// can substitute mock implementations that don't require `CAP_NET_ADMIN`.
+///
+/// # Example
+///
+/// ```ignore
+/// use rust_router::tproxy::{SocketProvider, RealSocketProvider};
+///
+/// // Production code
+/// let provider = RealSocketProvider::new();
+/// let socket = provider.create_tproxy_udp_socket()?;
+///
+/// // Test code can use a mock implementation
+/// #[cfg(test)]
+/// let provider = MockSocketProvider::new();
+/// ```
+pub trait SocketProvider: Send + Sync {
+    /// Create a TPROXY-enabled UDP socket.
+    ///
+    /// The returned socket should have:
+    /// - `IP_TRANSPARENT` enabled
+    /// - `IP_RECVORIGDSTADDR` enabled
+    /// - `SO_REUSEADDR` and `SO_REUSEPORT` enabled
+    /// - Non-blocking mode enabled
+    ///
+    /// # Errors
+    ///
+    /// Returns `TproxyError` if socket creation or option setting fails.
+    fn create_tproxy_udp_socket(&self) -> Result<Socket, TproxyError>;
+
+    /// Create a reply socket for sending UDP responses with spoofed source.
+    ///
+    /// The returned socket should have:
+    /// - `IP_TRANSPARENT` enabled (to allow binding to non-local addresses)
+    /// - `SO_REUSEADDR` enabled
+    /// - Non-blocking mode enabled
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - The address to bind to (typically the original destination)
+    ///
+    /// # Errors
+    ///
+    /// Returns `UdpError` if socket creation, binding, or option setting fails.
+    fn create_reply_socket(&self, bind_addr: SocketAddr) -> Result<Socket, UdpError>;
+}
+
+/// Real socket provider that creates actual TPROXY sockets.
+///
+/// This is the default production implementation that uses the real
+/// `IP_TRANSPARENT` socket option and requires `CAP_NET_ADMIN` capability.
+#[derive(Debug, Clone, Default)]
+pub struct RealSocketProvider;
+
+impl RealSocketProvider {
+    /// Create a new real socket provider.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl SocketProvider for RealSocketProvider {
+    fn create_tproxy_udp_socket(&self) -> Result<Socket, TproxyError> {
+        create_tproxy_udp_socket()
+    }
+
+    fn create_reply_socket(&self, bind_addr: SocketAddr) -> Result<Socket, UdpError> {
+        // Create UDP socket
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to create socket: {e}"))
+        })?;
+
+        // Set IP_TRANSPARENT to allow binding to non-local addresses
+        set_ip_transparent(&socket).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to set IP_TRANSPARENT: {e}"))
+        })?;
+
+        // Set SO_REUSEADDR
+        socket.set_reuse_address(true).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to set SO_REUSEADDR: {e}"))
+        })?;
+
+        // Bind to the "original destination" (a non-local address)
+        socket.bind(&bind_addr.into()).map_err(|e| {
+            UdpError::reply_socket(
+                bind_addr,
+                format!(
+                    "Failed to bind to {bind_addr} (need ip_nonlocal_bind=1 and CAP_NET_ADMIN): {e}"
+                ),
+            )
+        })?;
+
+        // Set non-blocking for tokio
+        socket.set_nonblocking(true).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to set non-blocking: {e}"))
+        })?;
+
+        debug!("Created reply socket bound to {}", bind_addr);
+
+        Ok(socket)
+    }
+}
+
+/// Get the default socket provider (production implementation).
+///
+/// Returns an `Arc<dyn SocketProvider>` for use in production code.
+#[must_use]
+pub fn default_socket_provider() -> Arc<dyn SocketProvider> {
+    Arc::new(RealSocketProvider::new())
+}
+
+// =============================================================================
+// Mock Socket Provider (for testing)
+// =============================================================================
+
+/// Mock socket provider for testing without `CAP_NET_ADMIN`.
+///
+/// This provider creates regular UDP sockets without TPROXY options,
+/// allowing unit tests to run without elevated privileges.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct MockSocketProvider {
+    /// Whether to simulate permission denied errors
+    pub simulate_permission_denied: bool,
+}
+
+#[cfg(test)]
+impl MockSocketProvider {
+    /// Create a new mock socket provider.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            simulate_permission_denied: false,
+        }
+    }
+
+    /// Create a mock provider that simulates permission denied errors.
+    #[must_use]
+    pub const fn permission_denied() -> Self {
+        Self {
+            simulate_permission_denied: true,
+        }
+    }
+}
+
+#[cfg(test)]
+impl SocketProvider for MockSocketProvider {
+    fn create_tproxy_udp_socket(&self) -> Result<Socket, TproxyError> {
+        if self.simulate_permission_denied {
+            return Err(TproxyError::PermissionDenied);
+        }
+
+        // Create a regular UDP socket (without TPROXY options)
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .map_err(|e| TproxyError::SocketCreation(e.to_string()))?;
+
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| TproxyError::socket_option("SO_REUSEADDR", e.to_string()))?;
+
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| TproxyError::socket_option("O_NONBLOCK", e.to_string()))?;
+
+        Ok(socket)
+    }
+
+    fn create_reply_socket(&self, bind_addr: SocketAddr) -> Result<Socket, UdpError> {
+        if self.simulate_permission_denied {
+            return Err(UdpError::reply_socket(bind_addr, "Permission denied (mock)"));
+        }
+
+        // Create a regular UDP socket bound to 127.0.0.1:0 for testing
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to create socket: {e}"))
+        })?;
+
+        socket.set_reuse_address(true).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to set SO_REUSEADDR: {e}"))
+        })?;
+
+        // For mock, bind to localhost with port 0 instead of the non-local address
+        let mock_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        socket.bind(&mock_bind.into()).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to bind: {e}"))
+        })?;
+
+        socket.set_nonblocking(true).map_err(|e| {
+            UdpError::reply_socket(bind_addr, format!("Failed to set non-blocking: {e}"))
+        })?;
+
+        Ok(socket)
+    }
+}
+
+// =============================================================================
+// Socket Creation Functions
+// =============================================================================
 
 /// Create a TCP socket with IP_TRANSPARENT enabled for TPROXY.
 ///
@@ -299,14 +512,10 @@ mod tests {
         // or succeed if running with CAP_NET_ADMIN
         let result = create_tproxy_tcp_socket();
         match result {
-            Ok(_) => {
-                // Running with sufficient privileges
-            }
-            Err(TproxyError::PermissionDenied) => {
-                // Expected when running without CAP_NET_ADMIN
-            }
+            // Running with sufficient privileges or expected permission denied
+            Ok(_) | Err(TproxyError::PermissionDenied) => {}
             Err(e) => {
-                panic!("Unexpected error: {}", e);
+                panic!("Unexpected error: {e}");
             }
         }
     }
@@ -315,5 +524,91 @@ mod tests {
     fn test_has_net_admin_capability() {
         // Just verify it returns a boolean without crashing
         let _ = has_net_admin_capability();
+    }
+
+    // =============================================================================
+    // SocketProvider Tests
+    // =============================================================================
+
+    #[test]
+    fn test_real_socket_provider_new() {
+        let provider = RealSocketProvider::new();
+        // Just verify it can be created
+        let _ = provider;
+    }
+
+    #[test]
+    fn test_real_socket_provider_default() {
+        let _provider: RealSocketProvider = RealSocketProvider::default();
+    }
+
+    #[test]
+    fn test_default_socket_provider() {
+        let provider = default_socket_provider();
+        // Verify it returns an Arc<dyn SocketProvider>
+        let _ = provider;
+    }
+
+    #[test]
+    fn test_mock_socket_provider_new() {
+        let provider = MockSocketProvider::new();
+        assert!(!provider.simulate_permission_denied);
+    }
+
+    #[test]
+    fn test_mock_socket_provider_permission_denied() {
+        let provider = MockSocketProvider::permission_denied();
+        assert!(provider.simulate_permission_denied);
+    }
+
+    #[test]
+    fn test_mock_socket_provider_create_udp_socket() {
+        let provider = MockSocketProvider::new();
+        let result = provider.create_tproxy_udp_socket();
+        assert!(result.is_ok(), "Mock socket creation should succeed");
+    }
+
+    #[test]
+    fn test_mock_socket_provider_create_udp_socket_permission_denied() {
+        let provider = MockSocketProvider::permission_denied();
+        let result = provider.create_tproxy_udp_socket();
+        assert!(matches!(result, Err(TproxyError::PermissionDenied)));
+    }
+
+    #[test]
+    fn test_mock_socket_provider_create_reply_socket() {
+        let provider = MockSocketProvider::new();
+        let bind_addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let result = provider.create_reply_socket(bind_addr);
+        // Mock provider binds to localhost:0 instead, so this should succeed
+        assert!(result.is_ok(), "Mock reply socket creation should succeed");
+    }
+
+    #[test]
+    fn test_mock_socket_provider_create_reply_socket_permission_denied() {
+        let provider = MockSocketProvider::permission_denied();
+        let bind_addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let result = provider.create_reply_socket(bind_addr);
+        assert!(matches!(result, Err(UdpError::ReplySocketError { .. })));
+    }
+
+    #[test]
+    fn test_socket_provider_trait_object() {
+        // Verify the trait can be used as a trait object
+        fn use_provider(provider: &dyn SocketProvider) -> Result<Socket, TproxyError> {
+            provider.create_tproxy_udp_socket()
+        }
+
+        let mock = MockSocketProvider::new();
+        let result = use_provider(&mock);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_socket_provider_arc() {
+        // Verify the trait can be used with Arc
+        let provider: Arc<dyn SocketProvider> = Arc::new(MockSocketProvider::new());
+        let result = provider.create_tproxy_udp_socket();
+        assert!(result.is_ok());
     }
 }

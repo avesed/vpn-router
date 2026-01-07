@@ -194,6 +194,8 @@ impl TproxyListenerBuilder {
             udp_timeout_secs: 300,
             reuse_port: self.reuse_port,
             sniff_timeout_ms: 300,
+            udp_workers: None,
+            udp_buffer_pool_size: 1024,
         };
 
         TproxyListener::bind(&config)

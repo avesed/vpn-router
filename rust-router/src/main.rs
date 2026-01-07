@@ -26,10 +26,14 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
 use rust_router::config::{load_config_with_env, Config};
-use rust_router::connection::{run_accept_loop, ConnectionManager};
+use rust_router::connection::{
+    run_accept_loop, ConnectionManager, UdpPacketProcessor, UdpProcessorConfig,
+    UdpSessionConfig, UdpSessionManager,
+};
 use rust_router::ipc::{IpcHandler, IpcServer};
 use rust_router::outbound::{OutboundManager, OutboundManagerBuilder};
-use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener};
+use rust_router::rules::{RuleEngine, RoutingSnapshotBuilder};
+use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig};
 
 /// Command-line arguments
 struct Args {
@@ -218,6 +222,14 @@ async fn main() -> Result<()> {
     // Build outbound manager
     let outbound_manager = build_outbound_manager(&config);
 
+    // Create rule engine with default routing snapshot
+    let routing_snapshot = RoutingSnapshotBuilder::new()
+        .default_outbound(&config.default_outbound)
+        .version(1)
+        .build()
+        .expect("Failed to create default routing snapshot");
+    let rule_engine = Arc::new(RuleEngine::new(routing_snapshot));
+
     // Create connection manager
     let connection_manager = Arc::new(ConnectionManager::new(
         &config.connection,
@@ -226,20 +238,85 @@ async fn main() -> Result<()> {
         config.listen.sniff_timeout(),
     ));
 
-    // Create TPROXY listener
+    // Create TPROXY listener (TCP)
     let listener = TproxyListener::bind(&config.listen)
         .map_err(|e| anyhow::anyhow!("Failed to create TPROXY listener: {}", e))?;
 
+    // Create UDP components (if enabled)
+    let (udp_session_manager, udp_worker_pool, udp_buffer_pool) = if config.listen.udp_enabled {
+        // Note: UdpSessionManager is kept for backwards compatibility with IPC handler interface
+        // The actual session tracking happens inside UdpPacketProcessor's handle_cache
+        let session_manager = Arc::new(UdpSessionManager::new(UdpSessionConfig::default()));
+
+        // Create UDP packet processor
+        let processor_config = UdpProcessorConfig::default();
+        let processor = Arc::new(UdpPacketProcessor::new(processor_config));
+
+        // Determine worker count
+        let num_workers = config.listen.udp_workers.unwrap_or_else(num_cpus::get);
+
+        // Create worker pool with custom configuration and rule engine integration
+        let pool_config = UdpWorkerPoolConfig::default()
+            .with_workers(num_workers)
+            .with_buffer_pool_capacity(config.listen.udp_buffer_pool_size / num_workers.max(1));
+
+        // Pass rule_engine and outbound_manager for proper UDP routing
+        let worker_pool = UdpWorkerPool::with_config(
+            &config.listen,
+            pool_config,
+            processor,
+            Arc::clone(&rule_engine),
+            Arc::clone(&outbound_manager),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create UDP worker pool: {}", e))?;
+
+        // Get buffer pool from worker pool
+        let buffer_pool = Arc::clone(worker_pool.buffer_pool());
+
+        info!(
+            "UDP worker pool created with {} workers (rule engine integrated)",
+            worker_pool.num_workers()
+        );
+
+        // Wrap in Arc for sharing with IPC handler
+        let worker_pool_arc = Arc::new(worker_pool);
+
+        (
+            Some(session_manager),
+            Some(worker_pool_arc),
+            Some(buffer_pool),
+        )
+    } else {
+        (None, None, None)
+    };
+
     info!(
-        "TPROXY listener ready on {} (TCP: {}, UDP: {})",
-        config.listen.address, config.listen.tcp_enabled, config.listen.udp_enabled
+        "rust-router ready on {} (TCP: {}, UDP: {}, UDP workers: {})",
+        config.listen.address,
+        config.listen.tcp_enabled,
+        config.listen.udp_enabled,
+        config.listen.udp_workers.unwrap_or(0)
     );
 
-    // Create IPC handler and server
-    let ipc_handler = Arc::new(IpcHandler::new_with_default_rules(
-        Arc::clone(&connection_manager),
-        Arc::clone(&outbound_manager),
-    ));
+    // Create IPC handler with or without UDP components
+    let ipc_handler = if let (Some(session_mgr), Some(worker_pool), Some(buffer_pool)) =
+        (&udp_session_manager, &udp_worker_pool, &udp_buffer_pool)
+    {
+        Arc::new(IpcHandler::new_with_udp(
+            Arc::clone(&connection_manager),
+            Arc::clone(&outbound_manager),
+            Arc::clone(&rule_engine),
+            Arc::clone(session_mgr),
+            Arc::clone(worker_pool),
+            Arc::clone(buffer_pool),
+        ))
+    } else {
+        Arc::new(IpcHandler::new(
+            Arc::clone(&connection_manager),
+            Arc::clone(&outbound_manager),
+            Arc::clone(&rule_engine),
+        ))
+    };
 
     let ipc_server = IpcServer::new(config.ipc.clone(), Arc::clone(&ipc_handler));
     let ipc_shutdown = ipc_server.shutdown_sender();
@@ -284,10 +361,40 @@ async fn main() -> Result<()> {
         ipc_handle,
     ).await;
 
-    // Log final stats
+    // Shutdown UDP worker pool if enabled
+    // We need to drop the IPC handler's reference first by dropping ipc_handler
+    drop(ipc_handler);
+
+    if let Some(worker_pool_arc) = udp_worker_pool {
+        // Log UDP stats before shutdown
+        let udp_stats = worker_pool_arc.stats_snapshot();
+        info!(
+            "UDP stats: {} packets processed, {} bytes received, {} worker errors",
+            udp_stats.packets_processed, udp_stats.bytes_received, udp_stats.worker_errors
+        );
+
+        // Try to get exclusive ownership for graceful shutdown
+        match Arc::try_unwrap(worker_pool_arc) {
+            Ok(mut pool) => {
+                info!("Shutting down UDP worker pool...");
+                pool.shutdown().await;
+            }
+            Err(arc) => {
+                // Other references exist (shouldn't happen after dropping ipc_handler)
+                // Drop will send shutdown signal but won't wait
+                warn!(
+                    "UDP worker pool has {} references, shutdown signal sent via Drop",
+                    Arc::strong_count(&arc)
+                );
+                drop(arc);
+            }
+        }
+    }
+
+    // Log final TCP stats
     let stats = connection_manager.stats_snapshot();
     info!(
-        "Final stats: {} total connections, {} completed, {} errored, {} rejected",
+        "Final TCP stats: {} total connections, {} completed, {} errored, {} rejected",
         stats.total_accepted, stats.completed, stats.errored, stats.rejected
     );
     info!(

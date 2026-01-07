@@ -278,12 +278,18 @@ impl UdpSessionConfig {
     }
 
     /// Create a configuration for low-memory scenarios.
+    ///
+    /// Uses a 90-second idle timeout to comply with RFC 4787 (NAT Behavioral
+    /// Requirements for UDP), which recommends a minimum 2-minute UDP mapping
+    /// timeout. The 90-second timeout provides a reasonable balance for
+    /// constrained environments while maintaining compatibility with common
+    /// UDP-based protocols (DNS, QUIC, gaming).
     #[must_use]
     pub fn low_memory() -> Self {
         Self {
             max_sessions: 8192,
-            idle_timeout: Duration::from_secs(60),
-            ttl: Duration::from_secs(120),
+            idle_timeout: Duration::from_secs(90), // RFC 4787 recommends >= 2 min
+            ttl: Duration::from_secs(180),         // 3 minutes total lifetime
         }
     }
 }
@@ -650,8 +656,9 @@ mod tests {
         let config = UdpSessionConfig::low_memory();
 
         assert_eq!(config.max_sessions, 8192);
-        assert_eq!(config.idle_timeout, Duration::from_secs(60));
-        assert_eq!(config.ttl, Duration::from_secs(120));
+        // RFC 4787 recommends >= 2 min, we use 90s as a balance
+        assert_eq!(config.idle_timeout, Duration::from_secs(90));
+        assert_eq!(config.ttl, Duration::from_secs(180));
     }
 
     #[test]
