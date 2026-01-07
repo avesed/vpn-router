@@ -52,7 +52,9 @@
 //! - [x] 6.1 Handshake handling
 //! - [x] 6.1 Packet encryption/decryption
 //! - [x] 6.1 Timer task (keepalive, rekey)
-//! - [ ] 6.2 Tunnel abstraction trait (extended)
+//! - [x] 6.2 Tunnel abstraction trait (extended)
+//! - [x] 6.2 Configuration types and validation
+//! - [x] 6.2 Peer management (single-peer egress mode)
 //! - [ ] 6.3 WireGuard ingress
 //! - [ ] 6.4 WireGuard egress
 //!
@@ -100,8 +102,10 @@ pub mod traits;
 pub mod userspace;
 
 // Re-export commonly used types
-pub use config::{WgPeerConfig, WgTunnelConfig};
-pub use traits::{WgTunnel, WgTunnelBuilder, WgTunnelError, WgTunnelStats};
+pub use config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConfig, WG_REKEY_INTERVAL_SECS};
+pub use traits::{
+    BoxFuture, DecryptResult, WgTunnel, WgTunnelBuilder, WgTunnelError, WgTunnelStats,
+};
 pub use userspace::{
     derive_public_key, generate_private_key, validate_key, UserspaceWgTunnel, DEFAULT_MTU,
     MIN_BUFFER_SIZE, WG_HANDSHAKE_INIT_SIZE, WG_HANDSHAKE_RESPONSE_SIZE, WG_TRANSPORT_OVERHEAD,

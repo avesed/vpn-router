@@ -58,7 +58,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Rule matching
 regex = "1"
-ipnet = "2"
+ipnet = { version = "2", features = ["serde"] }
 aho-corasick = "1"
 
 # Cryptographic hashing

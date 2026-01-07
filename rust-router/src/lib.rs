@@ -56,6 +56,7 @@
 //! - [`outbound`]: Outbound implementations
 //! - [`sniff`]: Protocol sniffing (TLS SNI, QUIC SNI)
 //! - [`tproxy`]: TPROXY socket and listener
+//! - [`ingress`]: WireGuard ingress management (Phase 6.3)
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -66,6 +67,7 @@ pub mod config;
 pub mod connection;
 pub mod ecmp;
 pub mod error;
+pub mod ingress;
 pub mod io;
 pub mod ipc;
 pub mod outbound;
@@ -112,6 +114,10 @@ pub use tproxy::{
 pub use peer::{
     validate_chain_tag, validate_dscp_value, validate_endpoint, validate_peer_tag,
     validate_tunnel_ip, validate_wg_key, ValidationError, WG_KEY_LENGTH,
+};
+pub use ingress::{
+    IngressError, IngressProcessor, RoutingDecision, WgIngressConfig, WgIngressManager,
+    WgIngressStats,
 };
 
 /// Crate version
