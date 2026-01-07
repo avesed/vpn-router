@@ -332,6 +332,16 @@ pub enum IpcCommand {
     /// Returns a list of all ECMP load balancing groups.
     ListEcmpGroups,
 
+    /// Update ECMP group members
+    ///
+    /// Replaces the members of an existing ECMP group.
+    UpdateEcmpGroupMembers {
+        /// Group tag to update
+        tag: String,
+        /// New members list
+        members: Vec<EcmpMemberConfig>,
+    },
+
     // ========================================================================
     // Phase 6.0: IPC Protocol v3.2 - Peer Management
     // ========================================================================
@@ -495,6 +505,27 @@ pub enum IpcCommand {
         /// Optional error message
         #[serde(default)]
         last_error: Option<String>,
+    },
+
+    /// Update an existing chain configuration
+    ///
+    /// Updates a chain configuration. Chain must be inactive to update.
+    /// Only specified fields are updated; others retain their current values.
+    UpdateChain {
+        /// Chain tag to update
+        tag: String,
+        /// New hops (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hops: Option<Vec<ChainHop>>,
+        /// New exit egress (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_egress: Option<String>,
+        /// New description (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// New allow_transitive flag (if provided)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_transitive: Option<bool>,
     },
 
     // ========================================================================
@@ -2991,6 +3022,62 @@ rust_router_connections_total 12345
         let cmd = IpcCommand::GetChainRole { chain_tag: "chain-1".into() };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"get_chain_role\""));
+
+        // UpdateChain
+        let cmd = IpcCommand::UpdateChain {
+            tag: "chain-1".into(),
+            hops: None,
+            exit_egress: Some("pia-uk".into()),
+            description: Some("Updated".into()),
+            allow_transitive: Some(true),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"update_chain\""));
+        assert!(json.contains("\"exit_egress\":\"pia-uk\""));
+        assert!(json.contains("\"allow_transitive\":true"));
+        // Skip serializing None fields
+        assert!(!json.contains("\"hops\""));
+
+        // UpdateChain with hops
+        let cmd = IpcCommand::UpdateChain {
+            tag: "chain-2".into(),
+            hops: Some(vec![ChainHop {
+                node_tag: "terminal".into(),
+                tunnel_type: TunnelType::WireGuard,
+                role: ChainRole::Terminal,
+            }]),
+            exit_egress: None,
+            description: None,
+            allow_transitive: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"update_chain\""));
+        assert!(json.contains("\"hops\":"));
+        assert!(json.contains("\"node_tag\":\"terminal\""));
+    }
+
+    #[test]
+    fn test_update_ecmp_group_members_serialization() {
+        let cmd = IpcCommand::UpdateEcmpGroupMembers {
+            tag: "group-1".into(),
+            members: vec![
+                EcmpMemberConfig {
+                    outbound: "proxy-1".into(),
+                    weight: 2,
+                    enabled: true,
+                },
+                EcmpMemberConfig {
+                    outbound: "proxy-2".into(),
+                    weight: 3,
+                    enabled: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"update_ecmp_group_members\""));
+        assert!(json.contains("\"tag\":\"group-1\""));
+        assert!(json.contains("\"outbound\":\"proxy-1\""));
+        assert!(json.contains("\"weight\":2"));
     }
 
     #[test]

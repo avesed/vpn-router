@@ -41,6 +41,12 @@ from rust_router_client import (
     IpcResponse,
     UpdateRoutingResult,
     is_available,
+    # Phase 6 types
+    PeerInfo,
+    EcmpGroupInfo,
+    EcmpMemberInfo,
+    ChainInfo,
+    ChainRoleInfo,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +75,10 @@ class SyncResult:
     outbounds_removed: int = 0
     outbounds_updated: int = 0
     rules_synced: int = 0
+    # Phase 6 fields
+    peers_synced: int = 0
+    ecmp_groups_synced: int = 0
+    chains_synced: int = 0
     errors: List[str] = field(default_factory=list)
 
 
@@ -395,17 +405,562 @@ class RustRouterManager:
         return result
 
     # =========================================================================
+    # Peer Node Sync (Phase 6)
+    # =========================================================================
+
+    async def sync_peers(self) -> SyncResult:
+        """Sync peer nodes from database to rust-router.
+
+        This method:
+        1. Gets all peer nodes from database
+        2. Gets current peers from rust-router
+        3. Adds missing peers, connects peers that should be connected
+
+        Returns:
+            SyncResult with statistics and errors
+        """
+        result = SyncResult(success=True)
+
+        async with self._sync_lock:
+            try:
+                if not await self.is_available():
+                    result.success = False
+                    result.errors.append("rust-router is not available")
+                    return result
+
+                db = self._get_db()
+                peers = db.get_peer_nodes(enabled_only=False)
+
+                async with await self._get_client() as client:
+                    # Get current peers from rust-router
+                    current_peers = await client.list_peers()
+                    current_tags = {p.tag for p in current_peers}
+
+                    # Track synced peers
+                    synced = 0
+
+                    for peer in peers:
+                        tag = peer.get("tag", "")
+                        if not tag:
+                            continue
+
+                        enabled = peer.get("enabled", False)
+                        tunnel_status = peer.get("tunnel_status", "disconnected")
+                        auto_connect = peer.get("auto_connect", True)
+
+                        # Skip if peer already exists and no action needed
+                        if tag in current_tags:
+                            # Check if we need to connect
+                            if enabled and auto_connect and tunnel_status == "disconnected":
+                                connect_response = await client.connect_peer(tag)
+                                if connect_response.success:
+                                    logger.debug(f"Connected peer {tag}")
+                            synced += 1
+                            continue
+
+                        # Peer doesn't exist in rust-router - skip creation
+                        # Peer creation is done via the pairing flow, not sync
+                        # We only sync connection state
+                        logger.debug(f"Peer {tag} not found in rust-router (created via pairing flow)")
+
+                    result.peers_synced = synced
+
+                logger.info(f"Peer sync complete: peers_synced={result.peers_synced}")
+
+            except Exception as e:
+                result.success = False
+                result.errors.append(f"Peer sync failed: {e}")
+                logger.error(f"Peer sync failed: {e}")
+
+        return result
+
+    async def notify_peer_added(self, peer_tag: str) -> bool:
+        """Notify rust-router that a peer was added.
+
+        Note: Peer addition is handled via the pairing flow in rust-router.
+        This method is primarily for logging and future extensions.
+
+        Args:
+            peer_tag: The peer tag that was added
+
+        Returns:
+            True if notification was processed (rust-router available)
+        """
+        if not await self.is_available():
+            logger.debug(f"Skipping peer added notification: rust-router not available")
+            return False
+
+        # Peers are created via pairing flow, not via notification
+        # This is a no-op but kept for API consistency
+        logger.debug(f"Peer {peer_tag} added (pairing handled by rust-router)")
+        return True
+
+    async def notify_peer_removed(self, peer_tag: str) -> bool:
+        """Notify rust-router that a peer was removed.
+
+        Args:
+            peer_tag: The peer tag to remove
+
+        Returns:
+            True if notification was successful
+        """
+        if not await self.is_available():
+            logger.debug(f"Skipping peer removed notification: rust-router not available")
+            return False
+
+        try:
+            async with await self._get_client() as client:
+                response = await client.remove_peer(peer_tag)
+                if not response.success:
+                    logger.warning(f"Failed to remove peer {peer_tag}: {response.error}")
+                return response.success
+
+        except Exception as e:
+            logger.error(f"Failed to notify peer removed: {e}")
+            return False
+
+    async def notify_peer_updated(self, peer_tag: str) -> bool:
+        """Notify rust-router that a peer configuration was updated.
+
+        Args:
+            peer_tag: The peer tag that was updated
+
+        Returns:
+            True if notification was successful
+        """
+        if not await self.is_available():
+            logger.debug(f"Skipping peer updated notification: rust-router not available")
+            return False
+
+        try:
+            db = self._get_db()
+            peer = db.get_peer_node(peer_tag)
+            if not peer:
+                logger.warning(f"Peer {peer_tag} not found in database")
+                return False
+
+            async with await self._get_client() as client:
+                enabled = peer.get("enabled", False)
+                auto_connect = peer.get("auto_connect", True)
+                tunnel_status = peer.get("tunnel_status", "disconnected")
+
+                # If peer should be connected but isn't, connect
+                if enabled and auto_connect and tunnel_status == "disconnected":
+                    connect_response = await client.connect_peer(peer_tag)
+                    if not connect_response.success:
+                        logger.warning(f"Failed to connect peer {peer_tag}: {connect_response.error}")
+                        return False
+                # If peer should be disconnected, disconnect
+                elif not enabled or not auto_connect:
+                    # Check current status from rust-router
+                    status_response = await client.get_peer_status(peer_tag)
+                    if status_response.success and status_response.data:
+                        current_status = status_response.data.get("tunnel_status", "disconnected")
+                        if current_status == "connected":
+                            disconnect_response = await client.disconnect_peer(peer_tag)
+                            if not disconnect_response.success:
+                                logger.warning(f"Failed to disconnect peer {peer_tag}: {disconnect_response.error}")
+                                return False
+
+                return True
+
+        except Exception as e:
+            logger.error(f"Failed to notify peer updated: {e}")
+            return False
+
+    # =========================================================================
+    # ECMP Group Sync (Phase 6)
+    # =========================================================================
+
+    async def sync_ecmp_groups(self) -> SyncResult:
+        """Sync ECMP groups from database to rust-router.
+
+        This method:
+        1. Gets all ECMP groups from database (db.get_outbound_groups())
+        2. Gets current groups from rust-router
+        3. Creates missing groups, updates existing groups
+
+        Returns:
+            SyncResult with statistics and errors
+        """
+        result = SyncResult(success=True)
+
+        async with self._sync_lock:
+            try:
+                if not await self.is_available():
+                    result.success = False
+                    result.errors.append("rust-router is not available")
+                    return result
+
+                db = self._get_db()
+                groups = db.get_outbound_groups(enabled_only=False)
+
+                async with await self._get_client() as client:
+                    # Get current groups from rust-router
+                    current_groups = await client.list_ecmp_groups()
+                    current_tags = {g.tag for g in current_groups}
+
+                    synced = 0
+
+                    for group in groups:
+                        tag = group.get("tag", "")
+                        if not tag:
+                            continue
+
+                        enabled = group.get("enabled", False)
+                        if not enabled:
+                            # If group is disabled and exists, remove it
+                            if tag in current_tags:
+                                await client.remove_ecmp_group(tag)
+                            continue
+
+                        # Prepare group configuration
+                        algorithm = group.get("algorithm", "five_tuple_hash")
+                        description = group.get("description", "")
+                        routing_table = group.get("routing_table")
+
+                        # Get members from the group dict (already parsed JSON)
+                        members_list = group.get("members", [])
+                        weights_list = group.get("weights") or []
+
+                        # Build member dicts
+                        members = []
+                        for i, member_tag in enumerate(members_list):
+                            weight = weights_list[i] if i < len(weights_list) else 1
+                            members.append({"tag": member_tag, "weight": weight})
+
+                        if tag in current_tags:
+                            # Update existing group's members
+                            update_response = await client.update_ecmp_group_members(tag, members)
+                            if not update_response.success:
+                                result.errors.append(f"Failed to update ECMP group {tag}: {update_response.error}")
+                        else:
+                            # Create new group
+                            create_response = await client.create_ecmp_group(
+                                tag=tag,
+                                members=members,
+                                algorithm=algorithm,
+                                description=description,
+                                routing_table=routing_table,
+                                health_check=True,
+                            )
+                            if not create_response.success:
+                                result.errors.append(f"Failed to create ECMP group {tag}: {create_response.error}")
+                            else:
+                                synced += 1
+
+                    # Remove groups that exist in rust-router but not in database
+                    db_tags = {g.get("tag", "") for g in groups if g.get("enabled", False)}
+                    for current_tag in current_tags:
+                        if current_tag not in db_tags:
+                            await client.remove_ecmp_group(current_tag)
+
+                    result.ecmp_groups_synced = synced
+
+                if result.errors:
+                    result.success = False
+
+                logger.info(f"ECMP group sync complete: groups_synced={result.ecmp_groups_synced}")
+
+            except Exception as e:
+                result.success = False
+                result.errors.append(f"ECMP group sync failed: {e}")
+                logger.error(f"ECMP group sync failed: {e}")
+
+        return result
+
+    async def notify_ecmp_group_changed(self, group_tag: str, action: str = "updated") -> bool:
+        """Notify rust-router that an ECMP group was changed.
+
+        Args:
+            group_tag: The ECMP group tag
+            action: One of "added", "removed", "updated"
+
+        Returns:
+            True if notification was successful
+        """
+        if not await self.is_available():
+            logger.debug(f"Skipping ECMP group {action} notification: rust-router not available")
+            return False
+
+        try:
+            async with await self._get_client() as client:
+                if action == "removed":
+                    response = await client.remove_ecmp_group(group_tag)
+                    return response.success
+
+                # For added/updated, get group from database and sync
+                db = self._get_db()
+                group = db.get_outbound_group(group_tag)
+                if not group:
+                    logger.warning(f"ECMP group {group_tag} not found in database")
+                    return False
+
+                enabled = group.get("enabled", False)
+                if not enabled:
+                    # Remove disabled group from rust-router
+                    response = await client.remove_ecmp_group(group_tag)
+                    return response.success
+
+                # Prepare group configuration
+                algorithm = group.get("algorithm", "five_tuple_hash")
+                description = group.get("description", "")
+                routing_table = group.get("routing_table")
+                members_list = group.get("members", [])
+                weights_list = group.get("weights") or []
+
+                members = []
+                for i, member_tag in enumerate(members_list):
+                    weight = weights_list[i] if i < len(weights_list) else 1
+                    members.append({"tag": member_tag, "weight": weight})
+
+                # Check if group exists
+                current_groups = await client.list_ecmp_groups()
+                exists = any(g.tag == group_tag for g in current_groups)
+
+                if action == "added" or not exists:
+                    response = await client.create_ecmp_group(
+                        tag=group_tag,
+                        members=members,
+                        algorithm=algorithm,
+                        description=description,
+                        routing_table=routing_table,
+                        health_check=True,
+                    )
+                else:
+                    # Update members
+                    response = await client.update_ecmp_group_members(group_tag, members)
+
+                if not response.success:
+                    logger.warning(f"Failed to {action} ECMP group {group_tag}: {response.error}")
+                return response.success
+
+        except Exception as e:
+            logger.error(f"Failed to notify ECMP group {action}: {e}")
+            return False
+
+    # =========================================================================
+    # Chain Sync (Phase 6)
+    # =========================================================================
+
+    async def sync_chains(self) -> SyncResult:
+        """Sync multi-hop chains from database to rust-router.
+
+        This method:
+        1. Gets all chains from database (db.get_node_chains())
+        2. Gets current chains from rust-router
+        3. Creates chains in rust-router
+        4. Activates chains that should be active
+
+        Returns:
+            SyncResult with statistics and errors
+        """
+        result = SyncResult(success=True)
+
+        async with self._sync_lock:
+            try:
+                if not await self.is_available():
+                    result.success = False
+                    result.errors.append("rust-router is not available")
+                    return result
+
+                db = self._get_db()
+                chains = db.get_node_chains(enabled_only=False)
+
+                async with await self._get_client() as client:
+                    # Get current chains from rust-router
+                    current_chains = await client.list_chains()
+                    current_tags = {c.tag for c in current_chains}
+
+                    synced = 0
+
+                    for chain in chains:
+                        tag = chain.get("tag", "")
+                        if not tag:
+                            continue
+
+                        enabled = chain.get("enabled", False)
+                        chain_state = chain.get("chain_state", "inactive")
+                        hops = chain.get("hops", [])
+                        exit_egress = chain.get("exit_egress", "")
+                        description = chain.get("description", "")
+                        allow_transitive = chain.get("allow_transitive", False)
+
+                        if not enabled:
+                            # If chain is disabled and exists, delete it
+                            if tag in current_tags:
+                                # First deactivate if active
+                                for cc in current_chains:
+                                    if cc.tag == tag and cc.chain_state == "active":
+                                        await client.deactivate_chain(tag)
+                                        break
+                                await client.delete_chain(tag)
+                            continue
+
+                        if tag not in current_tags:
+                            # Create new chain
+                            create_response = await client.create_chain(
+                                tag=tag,
+                                hops=hops,
+                                exit_egress=exit_egress,
+                                description=description,
+                                allow_transitive=allow_transitive,
+                            )
+                            if not create_response.success:
+                                result.errors.append(f"Failed to create chain {tag}: {create_response.error}")
+                                continue
+                            synced += 1
+
+                        # Activate chain if it should be active
+                        if chain_state == "active":
+                            # Check current state in rust-router
+                            status_response = await client.get_chain_status(tag)
+                            if status_response.success and status_response.data:
+                                rr_state = status_response.data.get("chain_state", "inactive")
+                                if rr_state != "active":
+                                    activate_response = await client.activate_chain(tag)
+                                    if not activate_response.success:
+                                        result.errors.append(f"Failed to activate chain {tag}: {activate_response.error}")
+
+                    # Remove chains that exist in rust-router but not in database
+                    db_tags = {c.get("tag", "") for c in chains if c.get("enabled", False)}
+                    for current_tag in current_tags:
+                        if current_tag not in db_tags:
+                            # Deactivate before deleting
+                            for cc in current_chains:
+                                if cc.tag == current_tag and cc.chain_state == "active":
+                                    await client.deactivate_chain(current_tag)
+                                    break
+                            await client.delete_chain(current_tag)
+
+                    result.chains_synced = synced
+
+                if result.errors:
+                    result.success = False
+
+                logger.info(f"Chain sync complete: chains_synced={result.chains_synced}")
+
+            except Exception as e:
+                result.success = False
+                result.errors.append(f"Chain sync failed: {e}")
+                logger.error(f"Chain sync failed: {e}")
+
+        return result
+
+    async def notify_chain_changed(self, chain_tag: str, action: str = "updated") -> bool:
+        """Notify rust-router that a chain was changed.
+
+        Args:
+            chain_tag: The chain tag
+            action: One of "created", "deleted", "activated", "deactivated", "updated"
+
+        Returns:
+            True if notification was successful
+        """
+        if not await self.is_available():
+            logger.debug(f"Skipping chain {action} notification: rust-router not available")
+            return False
+
+        try:
+            async with await self._get_client() as client:
+                if action == "deleted":
+                    # Deactivate first if needed
+                    status_response = await client.get_chain_status(chain_tag)
+                    if status_response.success and status_response.data:
+                        if status_response.data.get("chain_state") == "active":
+                            await client.deactivate_chain(chain_tag)
+                    response = await client.delete_chain(chain_tag)
+                    return response.success
+
+                if action == "activated":
+                    response = await client.activate_chain(chain_tag)
+                    return response.success
+
+                if action == "deactivated":
+                    response = await client.deactivate_chain(chain_tag)
+                    return response.success
+
+                # For created/updated, get chain from database
+                db = self._get_db()
+                chain = db.get_node_chain(chain_tag)
+                if not chain:
+                    logger.warning(f"Chain {chain_tag} not found in database")
+                    return False
+
+                enabled = chain.get("enabled", False)
+                if not enabled:
+                    # Remove disabled chain from rust-router
+                    await client.deactivate_chain(chain_tag)
+                    response = await client.delete_chain(chain_tag)
+                    return response.success
+
+                hops = chain.get("hops", [])
+                exit_egress = chain.get("exit_egress", "")
+                description = chain.get("description", "")
+                allow_transitive = chain.get("allow_transitive", False)
+                chain_state = chain.get("chain_state", "inactive")
+
+                # Check if chain exists in rust-router
+                current_chains = await client.list_chains()
+                exists = any(c.tag == chain_tag for c in current_chains)
+
+                if action == "created" or not exists:
+                    response = await client.create_chain(
+                        tag=chain_tag,
+                        hops=hops,
+                        exit_egress=exit_egress,
+                        description=description,
+                        allow_transitive=allow_transitive,
+                    )
+                    if not response.success:
+                        logger.warning(f"Failed to create chain {chain_tag}: {response.error}")
+                        return False
+
+                    # Activate if should be active
+                    if chain_state == "active":
+                        activate_response = await client.activate_chain(chain_tag)
+                        return activate_response.success
+                    return True
+                else:
+                    # Update chain (must be inactive to update)
+                    for cc in current_chains:
+                        if cc.tag == chain_tag and cc.chain_state == "active":
+                            await client.deactivate_chain(chain_tag)
+                            break
+
+                    response = await client.update_chain(
+                        tag=chain_tag,
+                        hops=hops,
+                        exit_egress=exit_egress,
+                        description=description,
+                        allow_transitive=allow_transitive,
+                    )
+                    if not response.success:
+                        logger.warning(f"Failed to update chain {chain_tag}: {response.error}")
+                        return False
+
+                    # Reactivate if should be active
+                    if chain_state == "active":
+                        activate_response = await client.activate_chain(chain_tag)
+                        return activate_response.success
+                    return True
+
+        except Exception as e:
+            logger.error(f"Failed to notify chain {action}: {e}")
+            return False
+
+    # =========================================================================
     # Full Sync
     # =========================================================================
 
     async def full_sync(self) -> SyncResult:
-        """Full sync: outbounds + rules.
+        """Full sync: outbounds + rules + peers + ecmp groups + chains.
 
         This should be called on startup to ensure rust-router
         is in sync with the database.
 
         Returns:
-            Combined SyncResult from outbound and rule sync
+            Combined SyncResult from all sync operations
         """
         result = SyncResult(success=True)
 
@@ -427,13 +982,38 @@ class RustRouterManager:
         result.rules_synced = rules_result.rules_synced
         result.errors.extend(rules_result.errors)
 
+        # Sync peers (Phase 6)
+        peers_result = await self.sync_peers()
+        result.peers_synced = peers_result.peers_synced
+        result.errors.extend(peers_result.errors)
+
+        # Sync ECMP groups (Phase 6)
+        ecmp_result = await self.sync_ecmp_groups()
+        result.ecmp_groups_synced = ecmp_result.ecmp_groups_synced
+        result.errors.extend(ecmp_result.errors)
+
+        # Sync chains (Phase 6)
+        chains_result = await self.sync_chains()
+        result.chains_synced = chains_result.chains_synced
+        result.errors.extend(chains_result.errors)
+
         # Overall success
-        result.success = outbound_result.success and rules_result.success
+        result.success = (
+            outbound_result.success and
+            rules_result.success and
+            peers_result.success and
+            ecmp_result.success and
+            chains_result.success
+        )
 
         logger.info(
             f"Full sync complete: outbounds_added={result.outbounds_added}, "
             f"outbounds_removed={result.outbounds_removed}, "
-            f"rules_synced={result.rules_synced}, success={result.success}"
+            f"rules_synced={result.rules_synced}, "
+            f"peers_synced={result.peers_synced}, "
+            f"ecmp_groups_synced={result.ecmp_groups_synced}, "
+            f"chains_synced={result.chains_synced}, "
+            f"success={result.success}"
         )
 
         return result
@@ -756,6 +1336,50 @@ if __name__ == "__main__":
             """Test errors is always a list"""
             result = SyncResult(success=True)
             self.assertIsInstance(result.errors, list)
+
+    class TestSyncResultPhase6(unittest.TestCase):
+        """Test SyncResult Phase 6 fields"""
+
+        def test_phase6_default_values(self):
+            """Test Phase 6 default values"""
+            result = SyncResult(success=True)
+            self.assertEqual(result.peers_synced, 0)
+            self.assertEqual(result.ecmp_groups_synced, 0)
+            self.assertEqual(result.chains_synced, 0)
+
+        def test_phase6_with_values(self):
+            """Test Phase 6 with custom values"""
+            result = SyncResult(
+                success=True,
+                peers_synced=3,
+                ecmp_groups_synced=2,
+                chains_synced=1,
+            )
+            self.assertEqual(result.peers_synced, 3)
+            self.assertEqual(result.ecmp_groups_synced, 2)
+            self.assertEqual(result.chains_synced, 1)
+
+        def test_all_fields_together(self):
+            """Test all fields together"""
+            result = SyncResult(
+                success=True,
+                outbounds_added=5,
+                outbounds_removed=2,
+                outbounds_updated=1,
+                rules_synced=10,
+                peers_synced=3,
+                ecmp_groups_synced=2,
+                chains_synced=1,
+                errors=["warning1"],
+            )
+            self.assertEqual(result.outbounds_added, 5)
+            self.assertEqual(result.outbounds_removed, 2)
+            self.assertEqual(result.outbounds_updated, 1)
+            self.assertEqual(result.rules_synced, 10)
+            self.assertEqual(result.peers_synced, 3)
+            self.assertEqual(result.ecmp_groups_synced, 2)
+            self.assertEqual(result.chains_synced, 1)
+            self.assertEqual(len(result.errors), 1)
 
     class TestEgressTypeMap(unittest.TestCase):
         """Test EGRESS_TYPE_MAP constant"""
@@ -1202,6 +1826,328 @@ if __name__ == "__main__":
             config = self.manager._get_egress_config("test", "unknown_type")
             self.assertIsNone(config)
 
+    class TestPeerSync(unittest.IsolatedAsyncioTestCase):
+        """Test peer sync methods (Phase 6)"""
+
+        def setUp(self):
+            self.manager = RustRouterManager()
+            self.mock_db = MagicMock()
+            self.manager._db = self.mock_db
+
+        async def test_sync_peers_when_unavailable(self):
+            """Test sync_peers when rust-router unavailable"""
+            with patch.object(self.manager, 'is_available', return_value=False):
+                result = await self.manager.sync_peers()
+                self.assertFalse(result.success)
+                self.assertIn("not available", result.errors[0])
+
+        async def test_sync_peers_empty(self):
+            """Test sync_peers with no peers"""
+            self.mock_db.get_peer_nodes.return_value = []
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_peers = AsyncMock(return_value=[])
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_peers()
+                    self.assertTrue(result.success)
+                    self.assertEqual(result.peers_synced, 0)
+
+        async def test_sync_peers_with_existing(self):
+            """Test sync_peers with existing peers"""
+            self.mock_db.get_peer_nodes.return_value = [
+                {"tag": "node-a", "enabled": True, "auto_connect": True, "tunnel_status": "connected"}
+            ]
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_peers = AsyncMock(return_value=[
+                        MagicMock(tag="node-a")
+                    ])
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_peers()
+                    self.assertTrue(result.success)
+                    self.assertEqual(result.peers_synced, 1)
+
+        async def test_notify_peer_added_when_unavailable(self):
+            """Test notify_peer_added when unavailable"""
+            with patch.object(self.manager, 'is_available', return_value=False):
+                result = await self.manager.notify_peer_added("node-a")
+                self.assertFalse(result)
+
+        async def test_notify_peer_removed_success(self):
+            """Test notify_peer_removed success"""
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.remove_peer = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_peer_removed("node-a")
+                    self.assertTrue(result)
+                    mock_client.remove_peer.assert_called_once_with("node-a")
+
+        async def test_notify_peer_updated_connect(self):
+            """Test notify_peer_updated triggers connect"""
+            self.mock_db.get_peer_node.return_value = {
+                "tag": "node-a", "enabled": True, "auto_connect": True, "tunnel_status": "disconnected"
+            }
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.connect_peer = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_peer_updated("node-a")
+                    self.assertTrue(result)
+                    mock_client.connect_peer.assert_called_once_with("node-a")
+
+    class TestEcmpGroupSync(unittest.IsolatedAsyncioTestCase):
+        """Test ECMP group sync methods (Phase 6)"""
+
+        def setUp(self):
+            self.manager = RustRouterManager()
+            self.mock_db = MagicMock()
+            self.manager._db = self.mock_db
+
+        async def test_sync_ecmp_groups_when_unavailable(self):
+            """Test sync_ecmp_groups when rust-router unavailable"""
+            with patch.object(self.manager, 'is_available', return_value=False):
+                result = await self.manager.sync_ecmp_groups()
+                self.assertFalse(result.success)
+                self.assertIn("not available", result.errors[0])
+
+        async def test_sync_ecmp_groups_empty(self):
+            """Test sync_ecmp_groups with no groups"""
+            self.mock_db.get_outbound_groups.return_value = []
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_ecmp_groups = AsyncMock(return_value=[])
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_ecmp_groups()
+                    self.assertTrue(result.success)
+                    self.assertEqual(result.ecmp_groups_synced, 0)
+
+        async def test_sync_ecmp_groups_create_new(self):
+            """Test sync_ecmp_groups creates new group"""
+            self.mock_db.get_outbound_groups.return_value = [
+                {
+                    "tag": "group-1",
+                    "enabled": True,
+                    "algorithm": "round_robin",
+                    "description": "Test group",
+                    "members": ["us-east", "us-west"],
+                    "weights": [1, 2],
+                    "routing_table": 200,
+                }
+            ]
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_ecmp_groups = AsyncMock(return_value=[])
+                    mock_client.create_ecmp_group = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_ecmp_groups()
+                    self.assertTrue(result.success)
+                    self.assertEqual(result.ecmp_groups_synced, 1)
+                    mock_client.create_ecmp_group.assert_called_once()
+
+        async def test_notify_ecmp_group_removed(self):
+            """Test notify_ecmp_group_changed with remove action"""
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.remove_ecmp_group = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_ecmp_group_changed("group-1", "removed")
+                    self.assertTrue(result)
+                    mock_client.remove_ecmp_group.assert_called_once_with("group-1")
+
+        async def test_notify_ecmp_group_added(self):
+            """Test notify_ecmp_group_changed with add action"""
+            self.mock_db.get_outbound_group.return_value = {
+                "tag": "group-1",
+                "enabled": True,
+                "algorithm": "five_tuple_hash",
+                "description": "Test",
+                "members": ["us-east"],
+                "weights": [1],
+                "routing_table": 201,
+            }
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_ecmp_groups = AsyncMock(return_value=[])
+                    mock_client.create_ecmp_group = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_ecmp_group_changed("group-1", "added")
+                    self.assertTrue(result)
+                    mock_client.create_ecmp_group.assert_called_once()
+
+    class TestChainSync(unittest.IsolatedAsyncioTestCase):
+        """Test chain sync methods (Phase 6)"""
+
+        def setUp(self):
+            self.manager = RustRouterManager()
+            self.mock_db = MagicMock()
+            self.manager._db = self.mock_db
+
+        async def test_sync_chains_when_unavailable(self):
+            """Test sync_chains when rust-router unavailable"""
+            with patch.object(self.manager, 'is_available', return_value=False):
+                result = await self.manager.sync_chains()
+                self.assertFalse(result.success)
+                self.assertIn("not available", result.errors[0])
+
+        async def test_sync_chains_empty(self):
+            """Test sync_chains with no chains"""
+            self.mock_db.get_node_chains.return_value = []
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_chains = AsyncMock(return_value=[])
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_chains()
+                    self.assertTrue(result.success)
+                    self.assertEqual(result.chains_synced, 0)
+
+        async def test_sync_chains_create_new(self):
+            """Test sync_chains creates new chain"""
+            self.mock_db.get_node_chains.return_value = [
+                {
+                    "tag": "chain-1",
+                    "enabled": True,
+                    "chain_state": "inactive",
+                    "hops": ["node-a", "node-b"],
+                    "exit_egress": "us-east",
+                    "description": "Test chain",
+                    "allow_transitive": False,
+                }
+            ]
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_chains = AsyncMock(return_value=[])
+                    mock_client.create_chain = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_chains()
+                    self.assertTrue(result.success)
+                    self.assertEqual(result.chains_synced, 1)
+                    mock_client.create_chain.assert_called_once()
+
+        async def test_sync_chains_activate(self):
+            """Test sync_chains activates chain that should be active"""
+            self.mock_db.get_node_chains.return_value = [
+                {
+                    "tag": "chain-1",
+                    "enabled": True,
+                    "chain_state": "active",
+                    "hops": ["node-a"],
+                    "exit_egress": "us-east",
+                    "description": "",
+                    "allow_transitive": False,
+                }
+            ]
+
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.list_chains = AsyncMock(return_value=[])
+                    mock_client.create_chain = AsyncMock(return_value=MagicMock(success=True))
+                    mock_client.get_chain_status = AsyncMock(return_value=MagicMock(
+                        success=True, data={"chain_state": "inactive"}
+                    ))
+                    mock_client.activate_chain = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.sync_chains()
+                    self.assertTrue(result.success)
+                    mock_client.activate_chain.assert_called_once_with("chain-1")
+
+        async def test_notify_chain_deleted(self):
+            """Test notify_chain_changed with deleted action"""
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.get_chain_status = AsyncMock(return_value=MagicMock(
+                        success=True, data={"chain_state": "inactive"}
+                    ))
+                    mock_client.delete_chain = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_chain_changed("chain-1", "deleted")
+                    self.assertTrue(result)
+                    mock_client.delete_chain.assert_called_once_with("chain-1")
+
+        async def test_notify_chain_activated(self):
+            """Test notify_chain_changed with activated action"""
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.activate_chain = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_chain_changed("chain-1", "activated")
+                    self.assertTrue(result)
+                    mock_client.activate_chain.assert_called_once_with("chain-1")
+
+        async def test_notify_chain_deactivated(self):
+            """Test notify_chain_changed with deactivated action"""
+            with patch.object(self.manager, 'is_available', return_value=True):
+                with patch.object(self.manager, '_get_client') as mock_get_client:
+                    mock_client = AsyncMock()
+                    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+                    mock_client.__aexit__ = AsyncMock()
+                    mock_client.deactivate_chain = AsyncMock(return_value=MagicMock(success=True))
+                    mock_get_client.return_value = mock_client
+
+                    result = await self.manager.notify_chain_changed("chain-1", "deactivated")
+                    self.assertTrue(result)
+                    mock_client.deactivate_chain.assert_called_once_with("chain-1")
+
     class TestSetDefaultOutbound(unittest.IsolatedAsyncioTestCase):
         """Test set_default_outbound method"""
 
@@ -1230,13 +2176,16 @@ if __name__ == "__main__":
 
     # CLI entry point
     parser = argparse.ArgumentParser(
-        description="Rust Router Manager (Phase 3.4)",
+        description="Rust Router Manager (Phase 6)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s sync           # Full sync (outbounds + rules)
+  %(prog)s sync           # Full sync (outbounds + rules + peers + ecmp + chains)
   %(prog)s outbounds      # Sync outbounds only
   %(prog)s rules          # Sync routing rules only
+  %(prog)s peers          # Sync peer nodes only (Phase 6)
+  %(prog)s ecmp           # Sync ECMP groups only (Phase 6)
+  %(prog)s chains         # Sync chains only (Phase 6)
   %(prog)s health         # Get outbound health status
   %(prog)s status         # Get rust-router status
   %(prog)s test           # Run comprehensive unit tests
@@ -1244,7 +2193,7 @@ Examples:
     )
     parser.add_argument(
         "command",
-        choices=["sync", "outbounds", "rules", "health", "status", "test"],
+        choices=["sync", "outbounds", "rules", "peers", "ecmp", "chains", "health", "status", "test"],
         help="Command to execute"
     )
 
@@ -1261,6 +2210,7 @@ Examples:
 
         # Add all test classes
         suite.addTests(loader.loadTestsFromTestCase(TestSyncResult))
+        suite.addTests(loader.loadTestsFromTestCase(TestSyncResultPhase6))
         suite.addTests(loader.loadTestsFromTestCase(TestEgressTypeMap))
         suite.addTests(loader.loadTestsFromTestCase(TestRustRouterManagerInit))
         suite.addTests(loader.loadTestsFromTestCase(TestRustRouterManagerSingleton))
@@ -1269,6 +2219,10 @@ Examples:
         suite.addTests(loader.loadTestsFromTestCase(TestManagerNotifications))
         suite.addTests(loader.loadTestsFromTestCase(TestManagerHealth))
         suite.addTests(loader.loadTestsFromTestCase(TestGetEgressConfig))
+        # Phase 6 test classes
+        suite.addTests(loader.loadTestsFromTestCase(TestPeerSync))
+        suite.addTests(loader.loadTestsFromTestCase(TestEcmpGroupSync))
+        suite.addTests(loader.loadTestsFromTestCase(TestChainSync))
         suite.addTests(loader.loadTestsFromTestCase(TestSetDefaultOutbound))
 
         # Run tests
@@ -1296,6 +2250,9 @@ Examples:
             print(f"Outbounds added: {result.outbounds_added}")
             print(f"Outbounds removed: {result.outbounds_removed}")
             print(f"Rules synced: {result.rules_synced}")
+            print(f"Peers synced: {result.peers_synced}")
+            print(f"ECMP groups synced: {result.ecmp_groups_synced}")
+            print(f"Chains synced: {result.chains_synced}")
             if result.errors:
                 print(f"Errors: {result.errors}")
             return 0 if result.success else 1
@@ -1314,6 +2271,33 @@ Examples:
             result = await manager.sync_routing_rules()
             print(f"Success: {result.success}")
             print(f"Rules synced: {result.rules_synced}")
+            if result.errors:
+                print(f"Errors: {result.errors}")
+            return 0 if result.success else 1
+
+        elif args.command == "peers":
+            print("Syncing peer nodes...")
+            result = await manager.sync_peers()
+            print(f"Success: {result.success}")
+            print(f"Peers synced: {result.peers_synced}")
+            if result.errors:
+                print(f"Errors: {result.errors}")
+            return 0 if result.success else 1
+
+        elif args.command == "ecmp":
+            print("Syncing ECMP groups...")
+            result = await manager.sync_ecmp_groups()
+            print(f"Success: {result.success}")
+            print(f"ECMP groups synced: {result.ecmp_groups_synced}")
+            if result.errors:
+                print(f"Errors: {result.errors}")
+            return 0 if result.success else 1
+
+        elif args.command == "chains":
+            print("Syncing chains...")
+            result = await manager.sync_chains()
+            print(f"Success: {result.success}")
+            print(f"Chains synced: {result.chains_synced}")
             if result.errors:
                 print(f"Errors: {result.errors}")
             return 0 if result.success else 1

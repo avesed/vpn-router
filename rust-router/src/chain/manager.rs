@@ -610,6 +610,101 @@ impl ChainManager {
         Ok(())
     }
 
+    /// Update an existing chain configuration
+    ///
+    /// Updates a chain configuration. The chain must be in Inactive state
+    /// to be updated. DSCP value cannot be changed via update.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Chain tag to update
+    /// * `config` - New chain configuration (tag and dscp_value are preserved from original)
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` - Chain does not exist
+    /// - `AlreadyActive` - Chain is currently active
+    /// - `AlreadyActivating` - Chain is currently activating
+    /// - Validation errors if new configuration is invalid
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// manager.update_chain("my-chain", updated_config).await?;
+    /// ```
+    pub async fn update_chain(&self, tag: &str, config: ChainConfig) -> Result<(), ChainError> {
+        // Step 1: Validate the new configuration
+        self.validate_chain(&config)?;
+
+        // Step 2: Get current chain and check state
+        let (allocated_dscp, my_role) = {
+            let chains = self
+                .chains
+                .read()
+                .map_err(|e| ChainError::LockError(e.to_string()))?;
+
+            let chain = chains
+                .get(tag)
+                .ok_or_else(|| ChainError::NotFound(tag.to_string()))?;
+
+            // Can only update inactive chains
+            match chain.state {
+                ChainState::Inactive | ChainState::Error => {
+                    // OK to update
+                }
+                ChainState::Active => {
+                    return Err(ChainError::AlreadyActive(tag.to_string()));
+                }
+                ChainState::Activating => {
+                    return Err(ChainError::AlreadyActivating(tag.to_string()));
+                }
+            }
+
+            (chain.allocated_dscp, chain.my_role.clone())
+        };
+
+        // Step 3: Update the chain in-place
+        {
+            let mut chains = self
+                .chains
+                .write()
+                .map_err(|e| ChainError::LockError(e.to_string()))?;
+
+            let chain = chains
+                .get_mut(tag)
+                .ok_or_else(|| ChainError::NotFound(tag.to_string()))?;
+
+            // Re-check state (TOCTOU prevention)
+            match chain.state {
+                ChainState::Inactive | ChainState::Error => {
+                    // Still OK
+                }
+                ChainState::Active => {
+                    return Err(ChainError::AlreadyActive(tag.to_string()));
+                }
+                ChainState::Activating => {
+                    return Err(ChainError::AlreadyActivating(tag.to_string()));
+                }
+            }
+
+            // Update the chain, preserving DSCP value and state
+            chain.config = ChainConfig {
+                tag: tag.to_string(),
+                description: config.description,
+                dscp_value: allocated_dscp, // Preserve original DSCP
+                hops: config.hops,
+                rules: config.rules,
+                exit_egress: config.exit_egress,
+                allow_transitive: config.allow_transitive,
+            };
+            chain.my_role = my_role;
+            // Keep existing state and last_error
+        }
+
+        info!(tag = %tag, "Updated chain configuration");
+        Ok(())
+    }
+
     /// Validate a chain configuration
     ///
     /// Performs comprehensive validation of chain configuration including:

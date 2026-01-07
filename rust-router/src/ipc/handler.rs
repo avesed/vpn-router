@@ -10,17 +10,23 @@ use tracing::{debug, info, warn};
 
 use super::protocol::{
     BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainListResponse, ChainRoleResponse,
-    ChainState, ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
+    ChainState, EcmpGroupListResponse, EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IpcCommand,
+    IpcResponse, OutboundInfo, OutboundStatsResponse, PairingResponse, PeerListResponse,
     PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
     ServerCapabilities, ServerStatus, Socks5PoolStats, UdpProcessorInfo, UdpSessionInfo,
     UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
-    UdpWorkerPoolInfo, UdpWorkerStatsResponse,
+    UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
 };
 use crate::chain::ChainManager;
 use crate::config::{load_config_with_env, OutboundConfig};
 use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
+use crate::ecmp::group::EcmpGroupManager;
+use crate::egress::manager::WgEgressManager;
+use crate::ingress::manager::WgIngressManager;
 use crate::io::UdpBufferPool;
 use crate::outbound::OutboundManager;
+use crate::peer::manager::PeerManager;
+use crate::peer::pairing::PairRequestConfig;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
 use crate::tproxy::UdpWorkerPool;
 
@@ -72,6 +78,22 @@ pub struct IpcHandler {
 
     /// Local node tag for chain identification
     local_node_tag: String,
+
+    // ========================================================================
+    // Phase 6.9: Additional Manager Components
+    // ========================================================================
+
+    /// Peer manager for multi-node connections (Phase 6.5)
+    peer_manager: Option<Arc<PeerManager>>,
+
+    /// ECMP group manager for load balancing (Phase 6.7)
+    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
+
+    /// WireGuard ingress manager (Phase 6.3)
+    wg_ingress_manager: Option<Arc<WgIngressManager>>,
+
+    /// WireGuard egress manager (Phase 6.4)
+    wg_egress_manager: Option<Arc<WgEgressManager>>,
 }
 
 impl IpcHandler {
@@ -95,6 +117,10 @@ impl IpcHandler {
             udp_buffer_pool: None,
             chain_manager: None,
             local_node_tag: String::from("local"),
+            peer_manager: None,
+            ecmp_group_manager: None,
+            wg_ingress_manager: None,
+            wg_egress_manager: None,
         }
     }
 
@@ -124,6 +150,10 @@ impl IpcHandler {
             udp_buffer_pool: Some(udp_buffer_pool),
             chain_manager: None,
             local_node_tag: String::from("local"),
+            peer_manager: None,
+            ecmp_group_manager: None,
+            wg_ingress_manager: None,
+            wg_egress_manager: None,
         }
     }
 
@@ -152,6 +182,10 @@ impl IpcHandler {
             udp_buffer_pool: None,
             chain_manager: Some(chain_manager),
             local_node_tag,
+            peer_manager: None,
+            ecmp_group_manager: None,
+            wg_ingress_manager: None,
+            wg_egress_manager: None,
         }
     }
 
@@ -183,6 +217,10 @@ impl IpcHandler {
             udp_buffer_pool: Some(udp_buffer_pool),
             chain_manager: Some(chain_manager),
             local_node_tag,
+            peer_manager: None,
+            ecmp_group_manager: None,
+            wg_ingress_manager: None,
+            wg_egress_manager: None,
         }
     }
 
@@ -192,6 +230,38 @@ impl IpcHandler {
     pub fn with_chain_manager(mut self, chain_manager: Arc<ChainManager>, local_node_tag: String) -> Self {
         self.chain_manager = Some(chain_manager);
         self.local_node_tag = local_node_tag;
+        self
+    }
+
+    /// Set the peer manager after construction
+    ///
+    /// This allows adding peer management capability to an existing handler.
+    pub fn with_peer_manager(mut self, peer_manager: Arc<PeerManager>) -> Self {
+        self.peer_manager = Some(peer_manager);
+        self
+    }
+
+    /// Set the ECMP group manager after construction
+    ///
+    /// This allows adding ECMP group management capability to an existing handler.
+    pub fn with_ecmp_group_manager(mut self, ecmp_group_manager: Arc<EcmpGroupManager>) -> Self {
+        self.ecmp_group_manager = Some(ecmp_group_manager);
+        self
+    }
+
+    /// Set the WireGuard ingress manager after construction
+    ///
+    /// This allows adding WireGuard ingress capability to an existing handler.
+    pub fn with_wg_ingress_manager(mut self, wg_ingress_manager: Arc<WgIngressManager>) -> Self {
+        self.wg_ingress_manager = Some(wg_ingress_manager);
+        self
+    }
+
+    /// Set the WireGuard egress manager after construction
+    ///
+    /// This allows adding WireGuard egress capability to an existing handler.
+    pub fn with_wg_egress_manager(mut self, wg_egress_manager: Arc<WgEgressManager>) -> Self {
+        self.wg_egress_manager = Some(wg_egress_manager);
         self
     }
 
@@ -338,64 +408,93 @@ impl IpcHandler {
             IpcCommand::GetBufferPoolStats => self.handle_get_buffer_pool_stats(),
 
             // ================================================================
-            // Phase 6.0: IPC Protocol v3.2 Command Handlers (Stubs)
+            // Phase 6.9: IPC Protocol v3.2 Command Handlers
             // ================================================================
 
             // WireGuard Tunnel Management (Phase 6 - userspace WireGuard)
-            IpcCommand::CreateWgTunnel { tag, config: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("CreateWgTunnel not yet implemented: {}", tag))
+            IpcCommand::CreateWgTunnel { tag, config } => {
+                self.handle_create_wg_tunnel(tag, config).await
             }
-            IpcCommand::RemoveWgTunnel { tag, drain_timeout_secs: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("RemoveWgTunnel not yet implemented: {}", tag))
+            IpcCommand::RemoveWgTunnel { tag, drain_timeout_secs } => {
+                self.handle_remove_wg_tunnel(&tag, drain_timeout_secs).await
             }
             IpcCommand::GetWgTunnelStatus { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GetWgTunnelStatus not yet implemented: {}", tag))
+                self.handle_get_wg_tunnel_status(&tag)
             }
             IpcCommand::ListWgTunnels => {
-                IpcResponse::error(ErrorCode::OperationFailed, "ListWgTunnels not yet implemented")
+                self.handle_list_wg_tunnels()
             }
 
             // ECMP Group Management
-            IpcCommand::CreateEcmpGroup { tag, config: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("CreateEcmpGroup not yet implemented: {}", tag))
+            IpcCommand::CreateEcmpGroup { tag, config } => {
+                self.handle_create_ecmp_group(tag, config)
             }
             IpcCommand::RemoveEcmpGroup { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("RemoveEcmpGroup not yet implemented: {}", tag))
+                self.handle_remove_ecmp_group(&tag)
             }
             IpcCommand::GetEcmpGroupStatus { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GetEcmpGroupStatus not yet implemented: {}", tag))
+                self.handle_get_ecmp_group_status(&tag)
             }
             IpcCommand::ListEcmpGroups => {
-                IpcResponse::error(ErrorCode::OperationFailed, "ListEcmpGroups not yet implemented")
+                self.handle_list_ecmp_groups()
+            }
+            IpcCommand::UpdateEcmpGroupMembers { tag, members } => {
+                self.handle_update_ecmp_group_members(&tag, members)
             }
 
             // Peer Management
-            IpcCommand::GeneratePairRequest { local_tag, .. } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GeneratePairRequest not yet implemented: {}", local_tag))
+            IpcCommand::GeneratePairRequest {
+                local_tag,
+                local_description,
+                local_endpoint,
+                local_api_port,
+                bidirectional,
+                tunnel_type,
+            } => {
+                self.handle_generate_pair_request(
+                    local_tag,
+                    local_description,
+                    local_endpoint,
+                    local_api_port,
+                    bidirectional,
+                    tunnel_type,
+                )
             }
-            IpcCommand::ImportPairRequest { code: _, local_tag, .. } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("ImportPairRequest not yet implemented: {}", local_tag))
+            IpcCommand::ImportPairRequest {
+                code,
+                local_tag,
+                local_description,
+                local_endpoint,
+                local_api_port,
+            } => {
+                self.handle_import_pair_request(
+                    code,
+                    local_tag,
+                    local_description,
+                    local_endpoint,
+                    local_api_port,
+                ).await
             }
-            IpcCommand::CompleteHandshake { code: _ } => {
-                IpcResponse::error(ErrorCode::OperationFailed, "CompleteHandshake not yet implemented")
+            IpcCommand::CompleteHandshake { code } => {
+                self.handle_complete_handshake(code).await
             }
             IpcCommand::ConnectPeer { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("ConnectPeer not yet implemented: {}", tag))
+                self.handle_connect_peer(&tag).await
             }
             IpcCommand::DisconnectPeer { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("DisconnectPeer not yet implemented: {}", tag))
+                self.handle_disconnect_peer(&tag).await
             }
             IpcCommand::GetPeerStatus { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GetPeerStatus not yet implemented: {}", tag))
+                self.handle_get_peer_status(&tag)
             }
             IpcCommand::GetPeerTunnelHealth { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("GetPeerTunnelHealth not yet implemented: {}", tag))
+                self.handle_get_peer_tunnel_health(&tag)
             }
             IpcCommand::ListPeers => {
-                IpcResponse::error(ErrorCode::OperationFailed, "ListPeers not yet implemented")
+                self.handle_list_peers()
             }
             IpcCommand::RemovePeer { tag } => {
-                IpcResponse::error(ErrorCode::OperationFailed, format!("RemovePeer not yet implemented: {}", tag))
+                self.handle_remove_peer(&tag).await
             }
 
             // ================================================================
@@ -424,6 +523,9 @@ impl IpcHandler {
             }
             IpcCommand::UpdateChainState { tag, state, last_error } => {
                 self.handle_update_chain_state(&tag, state, last_error)
+            }
+            IpcCommand::UpdateChain { tag, hops, exit_egress, description, allow_transitive } => {
+                self.handle_update_chain(tag, hops, exit_egress, description, allow_transitive).await
             }
 
             // ================================================================
@@ -2062,6 +2164,80 @@ impl IpcHandler {
         }
     }
 
+    /// Handle UpdateChain command
+    ///
+    /// Updates an existing chain configuration. Chain must be inactive.
+    async fn handle_update_chain(
+        &self,
+        tag: String,
+        hops: Option<Vec<super::protocol::ChainHop>>,
+        exit_egress: Option<String>,
+        description: Option<String>,
+        allow_transitive: Option<bool>,
+    ) -> IpcResponse {
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Chain manager not available",
+            );
+        };
+
+        // Get current chain status to check state and merge with updates
+        let current_status = match chain_manager.get_chain_status(&tag) {
+            Some(status) => status,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Chain '{}' not found", tag),
+                );
+            }
+        };
+
+        // Chain must be inactive to update
+        if current_status.state != ChainState::Inactive {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                format!("Chain '{}' must be inactive to update (current state: {})", tag, current_status.state),
+            );
+        }
+
+        // Get current config to merge with updates
+        let current_config = match chain_manager.get_chain_config(&tag) {
+            Some(config) => config,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Chain '{}' configuration not found", tag),
+                );
+            }
+        };
+
+        // Build updated config
+        let updated_config = ChainConfig {
+            tag: tag.clone(),
+            description: description.unwrap_or(current_config.description),
+            dscp_value: current_config.dscp_value, // Cannot change DSCP value via update
+            hops: hops.unwrap_or(current_config.hops),
+            rules: current_config.rules, // Keep existing rules
+            exit_egress: exit_egress.unwrap_or(current_config.exit_egress),
+            allow_transitive: allow_transitive.unwrap_or(current_config.allow_transitive),
+        };
+
+        match chain_manager.update_chain(&tag, updated_config).await {
+            Ok(()) => {
+                info!("Updated chain '{}'", tag);
+                IpcResponse::success_with_message(format!("Chain '{}' updated", tag))
+            }
+            Err(e) => {
+                warn!("Failed to update chain '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::chain_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
     // ========================================================================
     // Phase 6.6.5: Two-Phase Commit Handler Implementations
     // ========================================================================
@@ -2183,6 +2359,733 @@ impl IpcHandler {
                     chain_tag
                 ))
             }
+        }
+    }
+
+    // ========================================================================
+    // Phase 6.9: WireGuard Tunnel Handler Implementations
+    // ========================================================================
+
+    /// Handle CreateWgTunnel command
+    ///
+    /// Creates a new userspace WireGuard tunnel via egress manager.
+    async fn handle_create_wg_tunnel(
+        &self,
+        tag: String,
+        config: super::protocol::WgTunnelConfig,
+    ) -> IpcResponse {
+        let Some(egress_manager) = &self.wg_egress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "WireGuard egress manager not available",
+            );
+        };
+
+        // Convert IPC config to egress config
+        let mut egress_config = crate::egress::config::WgEgressConfig::new(
+            &tag,
+            crate::egress::config::EgressTunnelType::Custom {
+                name: tag.clone(),
+            },
+            config.private_key.clone(),
+            config.peer_public_key.clone(),
+            &config.peer_endpoint,
+        );
+
+        // Apply optional fields
+        if let Some(local_ip) = config.local_ip {
+            egress_config = egress_config.with_local_ip(local_ip);
+        }
+        if let Some(keepalive) = config.persistent_keepalive {
+            egress_config = egress_config.with_persistent_keepalive(keepalive);
+        }
+        if let Some(mtu) = config.mtu {
+            egress_config = egress_config.with_mtu(mtu);
+        }
+
+        match egress_manager.create_tunnel(egress_config).await {
+            Ok(()) => {
+                info!("Created WireGuard tunnel '{}'", tag);
+                IpcResponse::success_with_message(format!("WireGuard tunnel '{}' created", tag))
+            }
+            Err(e) => {
+                warn!("Failed to create WireGuard tunnel '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::egress_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle RemoveWgTunnel command
+    ///
+    /// Removes a userspace WireGuard tunnel with optional drain timeout.
+    async fn handle_remove_wg_tunnel(
+        &self,
+        tag: &str,
+        drain_timeout_secs: Option<u32>,
+    ) -> IpcResponse {
+        let Some(egress_manager) = &self.wg_egress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "WireGuard egress manager not available",
+            );
+        };
+
+        let drain_timeout = drain_timeout_secs.map(|s| std::time::Duration::from_secs(s as u64));
+
+        match egress_manager.remove_tunnel(tag, drain_timeout).await {
+            Ok(()) => {
+                info!("Removed WireGuard tunnel '{}'", tag);
+                IpcResponse::success_with_message(format!("WireGuard tunnel '{}' removed", tag))
+            }
+            Err(e) => {
+                warn!("Failed to remove WireGuard tunnel '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::egress_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle GetWgTunnelStatus command
+    ///
+    /// Returns status information for a specific WireGuard tunnel.
+    fn handle_get_wg_tunnel_status(&self, tag: &str) -> IpcResponse {
+        let Some(egress_manager) = &self.wg_egress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "WireGuard egress manager not available",
+            );
+        };
+
+        match egress_manager.get_tunnel_status(tag) {
+            Some(status) => {
+                let ipc_status = WgTunnelStatus {
+                    tag: status.tag,
+                    active: status.connected,
+                    local_ip: status.local_ip,
+                    peer_endpoint: status.peer_endpoint,
+                    last_handshake: status.stats.last_handshake,
+                    tx_bytes: status.stats.tx_bytes,
+                    rx_bytes: status.stats.rx_bytes,
+                    active_connections: 0, // WireGuard tunnels track packets, not connections
+                    error: None,
+                };
+                IpcResponse::WgTunnelStatus(ipc_status)
+            }
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("WireGuard tunnel '{}' not found", tag),
+            ),
+        }
+    }
+
+    /// Handle ListWgTunnels command
+    ///
+    /// Returns a list of all userspace WireGuard tunnels.
+    fn handle_list_wg_tunnels(&self) -> IpcResponse {
+        let Some(egress_manager) = &self.wg_egress_manager else {
+            return IpcResponse::WgTunnelList(WgTunnelListResponse { tunnels: vec![] });
+        };
+
+        let tunnel_tags = egress_manager.list_tunnels();
+        let tunnels: Vec<WgTunnelStatus> = tunnel_tags
+            .iter()
+            .filter_map(|tag| {
+                egress_manager.get_tunnel_status(tag).map(|status| WgTunnelStatus {
+                    tag: status.tag,
+                    active: status.connected,
+                    local_ip: status.local_ip,
+                    peer_endpoint: status.peer_endpoint,
+                    last_handshake: status.stats.last_handshake,
+                    tx_bytes: status.stats.tx_bytes,
+                    rx_bytes: status.stats.rx_bytes,
+                    active_connections: 0,
+                    error: None,
+                })
+            })
+            .collect();
+
+        IpcResponse::WgTunnelList(WgTunnelListResponse { tunnels })
+    }
+
+    // ========================================================================
+    // Phase 6.9: ECMP Group Handler Implementations
+    // ========================================================================
+
+    /// Handle CreateEcmpGroup command
+    ///
+    /// Creates a new ECMP load balancing group.
+    fn handle_create_ecmp_group(
+        &self,
+        tag: String,
+        config: super::protocol::EcmpGroupConfig,
+    ) -> IpcResponse {
+        let Some(ecmp_manager) = &self.ecmp_group_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "ECMP group manager not available",
+            );
+        };
+
+        // Convert IPC config to internal config
+        let members: Vec<crate::ecmp::group::EcmpMember> = config
+            .members
+            .iter()
+            .map(|m| crate::ecmp::group::EcmpMember::with_weight(m.outbound.clone(), m.weight))
+            .collect();
+
+        let algorithm = match config.algorithm {
+            super::protocol::EcmpAlgorithm::RoundRobin => crate::ecmp::lb::LbAlgorithm::RoundRobin,
+            super::protocol::EcmpAlgorithm::Random => crate::ecmp::lb::LbAlgorithm::Random,
+            super::protocol::EcmpAlgorithm::SourceHash => crate::ecmp::lb::LbAlgorithm::FiveTupleHash,
+            super::protocol::EcmpAlgorithm::Weighted => crate::ecmp::lb::LbAlgorithm::Weighted,
+            super::protocol::EcmpAlgorithm::LeastConnections => crate::ecmp::lb::LbAlgorithm::LeastConnections,
+        };
+
+        let internal_config = crate::ecmp::group::EcmpGroupConfig {
+            tag: tag.clone(),
+            description: config.description,
+            members,
+            algorithm,
+            routing_mark: config.routing_mark,
+            routing_table: config.routing_table,
+            health_check: config.skip_unhealthy,
+        };
+
+        match ecmp_manager.add_group(internal_config) {
+            Ok(()) => {
+                info!("Created ECMP group '{}'", tag);
+                IpcResponse::success_with_message(format!("ECMP group '{}' created", tag))
+            }
+            Err(e) => {
+                warn!("Failed to create ECMP group '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::ecmp_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle RemoveEcmpGroup command
+    ///
+    /// Removes an ECMP load balancing group.
+    fn handle_remove_ecmp_group(&self, tag: &str) -> IpcResponse {
+        let Some(ecmp_manager) = &self.ecmp_group_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "ECMP group manager not available",
+            );
+        };
+
+        match ecmp_manager.remove_group(tag) {
+            Ok(()) => {
+                info!("Removed ECMP group '{}'", tag);
+                IpcResponse::success_with_message(format!("ECMP group '{}' removed", tag))
+            }
+            Err(e) => {
+                warn!("Failed to remove ECMP group '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::ecmp_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle GetEcmpGroupStatus command
+    ///
+    /// Returns status information for a specific ECMP group.
+    fn handle_get_ecmp_group_status(&self, tag: &str) -> IpcResponse {
+        let Some(ecmp_manager) = &self.ecmp_group_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "ECMP group manager not available",
+            );
+        };
+
+        match ecmp_manager.get_group(tag) {
+            Some(group) => {
+                let config = group.config();
+                let algorithm = match config.algorithm {
+                    crate::ecmp::lb::LbAlgorithm::RoundRobin => super::protocol::EcmpAlgorithm::RoundRobin,
+                    crate::ecmp::lb::LbAlgorithm::Random => super::protocol::EcmpAlgorithm::Random,
+                    crate::ecmp::lb::LbAlgorithm::FiveTupleHash => super::protocol::EcmpAlgorithm::SourceHash,
+                    crate::ecmp::lb::LbAlgorithm::Weighted => super::protocol::EcmpAlgorithm::Weighted,
+                    crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
+                };
+
+                let members: Vec<EcmpMemberStatus> = config
+                    .members
+                    .iter()
+                    .map(|m| EcmpMemberStatus {
+                        outbound: m.tag.clone(),
+                        weight: m.weight,
+                        enabled: true,
+                        health: "healthy".to_string(), // TODO: Get from health checker
+                        active_connections: 0,
+                        total_connections: 0,
+                    })
+                    .collect();
+
+                let status = EcmpGroupStatus {
+                    tag: tag.to_string(),
+                    algorithm,
+                    members,
+                    active_connections: 0,
+                    total_connections: 0,
+                };
+
+                IpcResponse::EcmpGroupStatus(status)
+            }
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("ECMP group '{}' not found", tag),
+            ),
+        }
+    }
+
+    /// Handle ListEcmpGroups command
+    ///
+    /// Returns a list of all ECMP groups.
+    fn handle_list_ecmp_groups(&self) -> IpcResponse {
+        let Some(ecmp_manager) = &self.ecmp_group_manager else {
+            return IpcResponse::EcmpGroupList(EcmpGroupListResponse { groups: vec![] });
+        };
+
+        let group_tags = ecmp_manager.list_groups();
+        let groups: Vec<EcmpGroupStatus> = group_tags
+            .iter()
+            .filter_map(|tag| {
+                ecmp_manager.get_group(tag).map(|group| {
+                    let config = group.config();
+                    let algorithm = match config.algorithm {
+                        crate::ecmp::lb::LbAlgorithm::RoundRobin => super::protocol::EcmpAlgorithm::RoundRobin,
+                        crate::ecmp::lb::LbAlgorithm::Random => super::protocol::EcmpAlgorithm::Random,
+                        crate::ecmp::lb::LbAlgorithm::FiveTupleHash => super::protocol::EcmpAlgorithm::SourceHash,
+                        crate::ecmp::lb::LbAlgorithm::Weighted => super::protocol::EcmpAlgorithm::Weighted,
+                        crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
+                    };
+
+                    let members: Vec<EcmpMemberStatus> = config
+                        .members
+                        .iter()
+                        .map(|m| EcmpMemberStatus {
+                            outbound: m.tag.clone(),
+                            weight: m.weight,
+                            enabled: true,
+                            health: "healthy".to_string(),
+                            active_connections: 0,
+                            total_connections: 0,
+                        })
+                        .collect();
+
+                    EcmpGroupStatus {
+                        tag: tag.clone(),
+                        algorithm,
+                        members,
+                        active_connections: 0,
+                        total_connections: 0,
+                    }
+                })
+            })
+            .collect();
+
+        IpcResponse::EcmpGroupList(EcmpGroupListResponse { groups })
+    }
+
+    /// Handle UpdateEcmpGroupMembers command
+    ///
+    /// Replaces the members of an existing ECMP group.
+    fn handle_update_ecmp_group_members(
+        &self,
+        tag: &str,
+        members: Vec<super::protocol::EcmpMemberConfig>,
+    ) -> IpcResponse {
+        let Some(ecmp_manager) = &self.ecmp_group_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "ECMP group manager not available",
+            );
+        };
+
+        // Get the group to update
+        let group = match ecmp_manager.get_group(tag) {
+            Some(g) => g,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("ECMP group '{}' not found", tag),
+                );
+            }
+        };
+
+        // Clear existing members and add new ones
+        // First, get current members to remove them
+        let current_members: Vec<String> = group
+            .config()
+            .members
+            .iter()
+            .map(|m| m.tag.clone())
+            .collect();
+
+        // Remove all current members
+        for member_tag in current_members {
+            if let Err(e) = group.remove_member(&member_tag) {
+                warn!("Failed to remove member '{}' from group '{}': {}", member_tag, tag, e);
+            }
+        }
+
+        // Add new members
+        for member in members {
+            let ecmp_member = crate::ecmp::group::EcmpMember::with_weight(
+                member.outbound.clone(),
+                member.weight,
+            );
+            if let Err(e) = group.add_member(ecmp_member) {
+                warn!("Failed to add member '{}' to group '{}': {}", member.outbound, tag, e);
+                return IpcResponse::error(
+                    Self::ecmp_error_to_code(&e),
+                    e.to_string(),
+                );
+            }
+        }
+
+        info!("Updated ECMP group '{}' members", tag);
+        IpcResponse::success_with_message(format!("ECMP group '{}' members updated", tag))
+    }
+
+    // ========================================================================
+    // Phase 6.9: Peer Management Handler Implementations
+    // ========================================================================
+
+    /// Handle GeneratePairRequest command
+    ///
+    /// Generates an offline pairing request code.
+    fn handle_generate_pair_request(
+        &self,
+        local_tag: String,
+        local_description: String,
+        local_endpoint: String,
+        local_api_port: u16,
+        bidirectional: bool,
+        tunnel_type: super::protocol::TunnelType,
+    ) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        let config = PairRequestConfig {
+            local_tag,
+            local_description,
+            local_endpoint,
+            local_api_port,
+            bidirectional,
+            tunnel_type,
+        };
+
+        match peer_manager.generate_pair_request(config) {
+            Ok(code) => {
+                info!("Generated pairing request code");
+                IpcResponse::Pairing(PairingResponse {
+                    success: true,
+                    code: Some(code),
+                    message: Some("Pairing request generated".to_string()),
+                    peer_tag: None,
+                })
+            }
+            Err(e) => {
+                warn!("Failed to generate pairing request: {}", e);
+                IpcResponse::Pairing(PairingResponse {
+                    success: false,
+                    code: None,
+                    message: Some(e.to_string()),
+                    peer_tag: None,
+                })
+            }
+        }
+    }
+
+    /// Handle ImportPairRequest command
+    ///
+    /// Imports a pairing request and generates a response code.
+    async fn handle_import_pair_request(
+        &self,
+        code: String,
+        local_tag: String,
+        local_description: String,
+        local_endpoint: String,
+        local_api_port: u16,
+    ) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        let local_config = PairRequestConfig {
+            local_tag,
+            local_description,
+            local_endpoint,
+            local_api_port,
+            bidirectional: false, // Not relevant for import
+            tunnel_type: super::protocol::TunnelType::WireGuard, // Will be determined from request
+        };
+
+        match peer_manager.import_pair_request(&code, local_config).await {
+            Ok(response_code) => {
+                info!("Imported pairing request, generated response code");
+                IpcResponse::Pairing(PairingResponse {
+                    success: true,
+                    code: Some(response_code),
+                    message: Some("Pairing request imported".to_string()),
+                    peer_tag: None,
+                })
+            }
+            Err(e) => {
+                warn!("Failed to import pairing request: {}", e);
+                IpcResponse::Pairing(PairingResponse {
+                    success: false,
+                    code: None,
+                    message: Some(e.to_string()),
+                    peer_tag: None,
+                })
+            }
+        }
+    }
+
+    /// Handle CompleteHandshake command
+    ///
+    /// Completes the pairing handshake with a response code.
+    async fn handle_complete_handshake(&self, code: String) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        match peer_manager.complete_handshake(&code).await {
+            Ok(()) => {
+                info!("Completed pairing handshake");
+                IpcResponse::Pairing(PairingResponse {
+                    success: true,
+                    code: None,
+                    message: Some("Handshake completed".to_string()),
+                    peer_tag: None,
+                })
+            }
+            Err(e) => {
+                warn!("Failed to complete handshake: {}", e);
+                IpcResponse::Pairing(PairingResponse {
+                    success: false,
+                    code: None,
+                    message: Some(e.to_string()),
+                    peer_tag: None,
+                })
+            }
+        }
+    }
+
+    /// Handle ConnectPeer command
+    ///
+    /// Connects to a configured peer node.
+    async fn handle_connect_peer(&self, tag: &str) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        match peer_manager.connect(tag).await {
+            Ok(()) => {
+                info!("Connected to peer '{}'", tag);
+                IpcResponse::success_with_message(format!("Connected to peer '{}'", tag))
+            }
+            Err(e) => {
+                warn!("Failed to connect to peer '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::peer_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle DisconnectPeer command
+    ///
+    /// Disconnects from a connected peer.
+    async fn handle_disconnect_peer(&self, tag: &str) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        match peer_manager.disconnect(tag).await {
+            Ok(()) => {
+                info!("Disconnected from peer '{}'", tag);
+                IpcResponse::success_with_message(format!("Disconnected from peer '{}'", tag))
+            }
+            Err(e) => {
+                warn!("Failed to disconnect from peer '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::peer_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    /// Handle GetPeerStatus command
+    ///
+    /// Returns status information for a specific peer.
+    fn handle_get_peer_status(&self, tag: &str) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        match peer_manager.get_peer_status(tag) {
+            Some(status) => IpcResponse::PeerStatus(status),
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Peer '{}' not found", tag),
+            ),
+        }
+    }
+
+    /// Handle GetPeerTunnelHealth command
+    ///
+    /// Returns health information for a peer's tunnel.
+    fn handle_get_peer_tunnel_health(&self, tag: &str) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        // For now, return the peer status which includes health-related fields
+        // A more detailed health response could be added in the future
+        match peer_manager.get_peer_status(tag) {
+            Some(status) => {
+                // Return peer status - includes last_handshake and other health indicators
+                IpcResponse::PeerStatus(status)
+            }
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Peer '{}' not found", tag),
+            ),
+        }
+    }
+
+    /// Handle ListPeers command
+    ///
+    /// Returns a list of all configured peers.
+    fn handle_list_peers(&self) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::PeerList(PeerListResponse { peers: vec![] });
+        };
+
+        let peers = peer_manager.list_peers();
+        IpcResponse::PeerList(PeerListResponse { peers })
+    }
+
+    /// Handle RemovePeer command
+    ///
+    /// Removes a peer configuration.
+    async fn handle_remove_peer(&self, tag: &str) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        match peer_manager.remove_peer(tag).await {
+            Ok(()) => {
+                info!("Removed peer '{}'", tag);
+                IpcResponse::success_with_message(format!("Peer '{}' removed", tag))
+            }
+            Err(e) => {
+                warn!("Failed to remove peer '{}': {}", tag, e);
+                IpcResponse::error(
+                    Self::peer_error_to_code(&e),
+                    e.to_string(),
+                )
+            }
+        }
+    }
+
+    // ========================================================================
+    // Error Code Conversion Helpers
+    // ========================================================================
+
+    /// Convert EgressError to IPC ErrorCode
+    fn egress_error_to_code(err: &crate::egress::error::EgressError) -> ErrorCode {
+        use crate::egress::error::EgressError;
+        match err {
+            EgressError::TunnelNotFound(_) => ErrorCode::NotFound,
+            EgressError::TunnelAlreadyExists(_) => ErrorCode::AlreadyExists,
+            EgressError::ShuttingDown => ErrorCode::ShuttingDown,
+            EgressError::InvalidConfig(_) => ErrorCode::InvalidParameters,
+            _ => ErrorCode::OperationFailed,
+        }
+    }
+
+    /// Convert EcmpGroupError to IPC ErrorCode
+    fn ecmp_error_to_code(err: &crate::ecmp::group::EcmpGroupError) -> ErrorCode {
+        use crate::ecmp::group::EcmpGroupError;
+        match err {
+            EcmpGroupError::GroupNotFound(_) | EcmpGroupError::MemberNotFound(_) => {
+                ErrorCode::NotFound
+            }
+            EcmpGroupError::GroupExists(_) | EcmpGroupError::MemberExists(_) => {
+                ErrorCode::AlreadyExists
+            }
+            EcmpGroupError::InvalidRoutingMark(_) | EcmpGroupError::InvalidWeight(_) => {
+                ErrorCode::InvalidParameters
+            }
+            EcmpGroupError::NoMembers | EcmpGroupError::NoHealthyMembers => {
+                ErrorCode::OperationFailed
+            }
+            _ => ErrorCode::InternalError,
+        }
+    }
+
+    /// Convert PeerError to IPC ErrorCode
+    fn peer_error_to_code(err: &crate::peer::manager::PeerError) -> ErrorCode {
+        use crate::peer::manager::PeerError;
+        match err {
+            PeerError::NotFound(_) | PeerError::PendingRequestNotFound(_) => ErrorCode::NotFound,
+            PeerError::AlreadyExists(_) | PeerError::AlreadyConnected(_) => ErrorCode::AlreadyExists,
+            PeerError::NotConnected(_) | PeerError::NotConfigured(_) => ErrorCode::OperationFailed,
+            PeerError::Validation(_) | PeerError::PairingMismatch { .. } => {
+                ErrorCode::InvalidParameters
+            }
+            PeerError::PortExhausted
+            | PeerError::IpExhausted
+            | PeerError::MissingBidirectionalKey
+            | PeerError::MissingWgKey => ErrorCode::OperationFailed,
+            PeerError::XrayRelayNotSupported(_) => ErrorCode::OperationFailed,
+            PeerError::TunnelCreationFailed(_)
+            | PeerError::TunnelError(_)
+            | PeerError::Pairing(_)
+            | PeerError::Ipc(_)
+            | PeerError::Internal(_) => ErrorCode::InternalError,
         }
     }
 
@@ -4047,5 +4950,566 @@ mod tests {
 
         assert!(handler.chain_manager().is_some());
         assert_eq!(handler.local_node_tag(), "test-node");
+    }
+
+    // ========================================================================
+    // Phase 6.9: New Handler Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_wg_tunnel_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::GetWgTunnelStatus {
+                tag: "test-tunnel".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_wg_tunnels_empty() {
+        let handler = create_test_handler();
+
+        let response = handler.handle(IpcCommand::ListWgTunnels).await;
+
+        if let IpcResponse::WgTunnelList(list_response) = response {
+            assert!(list_response.tunnels.is_empty());
+        } else {
+            panic!("Expected WgTunnelList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ecmp_group_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::GetEcmpGroupStatus {
+                tag: "test-group".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_ecmp_groups_empty() {
+        let handler = create_test_handler();
+
+        let response = handler.handle(IpcCommand::ListEcmpGroups).await;
+
+        if let IpcResponse::EcmpGroupList(list_response) = response {
+            assert!(list_response.groups.is_empty());
+        } else {
+            panic!("Expected EcmpGroupList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peer_manager_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::GetPeerStatus {
+                tag: "test-peer".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_peers_empty() {
+        let handler = create_test_handler();
+
+        let response = handler.handle(IpcCommand::ListPeers).await;
+
+        if let IpcResponse::PeerList(list_response) = response {
+            assert!(list_response.peers.is_empty());
+        } else {
+            panic!("Expected PeerList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_peer_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::ConnectPeer {
+                tag: "test-peer".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_peer_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::DisconnectPeer {
+                tag: "test-peer".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_handshake_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::CompleteHandshake {
+                code: "test-code".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_peer_not_available() {
+        let handler = create_test_handler();
+
+        let response = handler
+            .handle(IpcCommand::RemovePeer {
+                tag: "test-peer".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("not available"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_with_peer_manager() {
+        let handler = create_test_handler();
+
+        // Build a peer manager for testing
+        let peer_manager = Arc::new(crate::peer::manager::PeerManager::new(
+            "test-node".to_string(),
+        ));
+
+        let handler = handler.with_peer_manager(peer_manager);
+
+        // Now list peers should return empty list, not an error
+        let response = handler.handle(IpcCommand::ListPeers).await;
+
+        if let IpcResponse::PeerList(list_response) = response {
+            assert!(list_response.peers.is_empty());
+        } else {
+            panic!("Expected PeerList response, not error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_with_ecmp_group_manager() {
+        let handler = create_test_handler();
+
+        // Build an ECMP group manager for testing
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+
+        let handler = handler.with_ecmp_group_manager(ecmp_manager);
+
+        // Now list groups should return empty list, not an error
+        let response = handler.handle(IpcCommand::ListEcmpGroups).await;
+
+        if let IpcResponse::EcmpGroupList(list_response) = response {
+            assert!(list_response.groups.is_empty());
+        } else {
+            panic!("Expected EcmpGroupList response, not error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_ecmp_group_with_manager() {
+        use crate::ipc::protocol::{EcmpAlgorithm, EcmpGroupConfig, EcmpMemberConfig};
+
+        let handler = create_test_handler();
+
+        // Build an ECMP group manager for testing
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+
+        let handler = handler.with_ecmp_group_manager(ecmp_manager);
+
+        // Create a group
+        let config = EcmpGroupConfig {
+            description: "Test group".to_string(),
+            algorithm: EcmpAlgorithm::RoundRobin,
+            members: vec![EcmpMemberConfig {
+                outbound: "direct".to_string(),
+                weight: 1,
+                enabled: true,
+            }],
+            skip_unhealthy: true,
+            health_check_interval_secs: 30,
+            routing_mark: None,
+            routing_table: None,
+        };
+
+        let response = handler
+            .handle(IpcCommand::CreateEcmpGroup {
+                tag: "test-group".to_string(),
+                config,
+            })
+            .await;
+
+        // Should succeed
+        assert!(!response.is_error());
+
+        // List should now have one group
+        let response = handler.handle(IpcCommand::ListEcmpGroups).await;
+        if let IpcResponse::EcmpGroupList(list_response) = response {
+            assert_eq!(list_response.groups.len(), 1);
+            assert_eq!(list_response.groups[0].tag, "test-group");
+        } else {
+            panic!("Expected EcmpGroupList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_ecmp_group() {
+        use crate::ipc::protocol::{EcmpAlgorithm, EcmpGroupConfig, EcmpMemberConfig};
+
+        let handler = create_test_handler();
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+        let handler = handler.with_ecmp_group_manager(ecmp_manager);
+
+        // Create a group first
+        let config = EcmpGroupConfig {
+            description: "Test group".to_string(),
+            algorithm: EcmpAlgorithm::RoundRobin,
+            members: vec![EcmpMemberConfig {
+                outbound: "direct".to_string(),
+                weight: 1,
+                enabled: true,
+            }],
+            skip_unhealthy: true,
+            health_check_interval_secs: 30,
+            routing_mark: None,
+            routing_table: None,
+        };
+
+        handler
+            .handle(IpcCommand::CreateEcmpGroup {
+                tag: "test-group".to_string(),
+                config,
+            })
+            .await;
+
+        // Remove the group
+        let response = handler
+            .handle(IpcCommand::RemoveEcmpGroup {
+                tag: "test-group".to_string(),
+            })
+            .await;
+
+        assert!(!response.is_error());
+
+        // List should now be empty
+        let response = handler.handle(IpcCommand::ListEcmpGroups).await;
+        if let IpcResponse::EcmpGroupList(list_response) = response {
+            assert!(list_response.groups.is_empty());
+        } else {
+            panic!("Expected EcmpGroupList response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_ecmp_group_status() {
+        use crate::ipc::protocol::{EcmpAlgorithm, EcmpGroupConfig, EcmpMemberConfig};
+
+        let handler = create_test_handler();
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+        let handler = handler.with_ecmp_group_manager(ecmp_manager);
+
+        // Create a group first
+        let config = EcmpGroupConfig {
+            description: "Test group".to_string(),
+            algorithm: EcmpAlgorithm::Weighted,
+            members: vec![
+                EcmpMemberConfig {
+                    outbound: "outbound-1".to_string(),
+                    weight: 2,
+                    enabled: true,
+                },
+                EcmpMemberConfig {
+                    outbound: "outbound-2".to_string(),
+                    weight: 3,
+                    enabled: true,
+                },
+            ],
+            skip_unhealthy: true,
+            health_check_interval_secs: 30,
+            routing_mark: Some(200),
+            routing_table: Some(200),
+        };
+
+        handler
+            .handle(IpcCommand::CreateEcmpGroup {
+                tag: "weighted-group".to_string(),
+                config,
+            })
+            .await;
+
+        // Get status
+        let response = handler
+            .handle(IpcCommand::GetEcmpGroupStatus {
+                tag: "weighted-group".to_string(),
+            })
+            .await;
+
+        if let IpcResponse::EcmpGroupStatus(status) = response {
+            assert_eq!(status.tag, "weighted-group");
+            assert!(matches!(status.algorithm, EcmpAlgorithm::Weighted));
+            assert_eq!(status.members.len(), 2);
+            assert_eq!(status.members[0].outbound, "outbound-1");
+            assert_eq!(status.members[0].weight, 2);
+            assert_eq!(status.members[1].outbound, "outbound-2");
+            assert_eq!(status.members[1].weight, 3);
+        } else {
+            panic!("Expected EcmpGroupStatus response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_ecmp_group_status_not_found() {
+        let handler = create_test_handler();
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+        let handler = handler.with_ecmp_group_manager(ecmp_manager);
+
+        let response = handler
+            .handle(IpcCommand::GetEcmpGroupStatus {
+                tag: "nonexistent-group".to_string(),
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        }
+    }
+
+    // ========================================================================
+    // Phase 6.9: UpdateChain and UpdateEcmpGroupMembers Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_update_chain_success() {
+        use crate::chain::ChainManager;
+        use crate::ipc::protocol::{ChainConfig, ChainHop, ChainRole, TunnelType};
+
+        let handler = create_test_handler();
+
+        // Create chain manager
+        let chain_manager = Arc::new(ChainManager::new("test-node".to_string()));
+        let handler = handler.with_chain_manager(chain_manager.clone(), "test-node".to_string());
+
+        // Create a chain first
+        let config = ChainConfig {
+            tag: "test-chain".to_string(),
+            description: "Original description".to_string(),
+            dscp_value: 0,
+            hops: vec![ChainHop {
+                node_tag: "terminal-node".to_string(),
+                tunnel_type: TunnelType::WireGuard,
+                role: ChainRole::Terminal,
+            }],
+            rules: vec![],
+            exit_egress: "pia-us-east".to_string(),
+            allow_transitive: false,
+        };
+
+        handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain".to_string(),
+                config,
+            })
+            .await;
+
+        // Update the chain
+        let response = handler
+            .handle(IpcCommand::UpdateChain {
+                tag: "test-chain".to_string(),
+                hops: None,
+                exit_egress: Some("pia-uk-london".to_string()),
+                description: Some("Updated description".to_string()),
+                allow_transitive: Some(true),
+            })
+            .await;
+
+        assert!(!response.is_error());
+
+        // Verify the update
+        let updated_config = chain_manager.get_chain_config("test-chain");
+        assert!(updated_config.is_some());
+        let config = updated_config.unwrap();
+        assert_eq!(config.description, "Updated description");
+        assert_eq!(config.exit_egress, "pia-uk-london");
+        assert!(config.allow_transitive);
+    }
+
+    #[tokio::test]
+    async fn test_update_chain_not_inactive() {
+        use crate::chain::ChainManager;
+        use crate::ipc::protocol::{ChainConfig, ChainHop, ChainRole, ChainState, TunnelType};
+
+        let handler = create_test_handler();
+
+        let chain_manager = Arc::new(ChainManager::new("test-node".to_string()));
+        let handler = handler.with_chain_manager(chain_manager.clone(), "test-node".to_string());
+
+        // Create a chain
+        let config = ChainConfig {
+            tag: "test-chain".to_string(),
+            description: "Test".to_string(),
+            dscp_value: 0,
+            hops: vec![ChainHop {
+                node_tag: "terminal-node".to_string(),
+                tunnel_type: TunnelType::WireGuard,
+                role: ChainRole::Terminal,
+            }],
+            rules: vec![],
+            exit_egress: "pia-us-east".to_string(),
+            allow_transitive: false,
+        };
+
+        handler
+            .handle(IpcCommand::CreateChain {
+                tag: "test-chain".to_string(),
+                config,
+            })
+            .await;
+
+        // Manually set state to Active (simulating activation)
+        let _ = chain_manager.update_chain_state("test-chain", ChainState::Active, None);
+
+        // Try to update - should fail
+        let response = handler
+            .handle(IpcCommand::UpdateChain {
+                tag: "test-chain".to_string(),
+                hops: None,
+                exit_egress: Some("pia-uk-london".to_string()),
+                description: None,
+                allow_transitive: None,
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(err.message.contains("inactive"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_ecmp_group_members_success() {
+        use crate::ipc::protocol::{EcmpAlgorithm, EcmpGroupConfig, EcmpMemberConfig};
+
+        let handler = create_test_handler();
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+        let handler = handler.with_ecmp_group_manager(ecmp_manager.clone());
+
+        // Create a group first
+        let config = EcmpGroupConfig {
+            description: "Test group".to_string(),
+            algorithm: EcmpAlgorithm::RoundRobin,
+            members: vec![EcmpMemberConfig {
+                outbound: "direct".to_string(),
+                weight: 1,
+                enabled: true,
+            }],
+            skip_unhealthy: true,
+            health_check_interval_secs: 30,
+            routing_mark: None,
+            routing_table: None,
+        };
+
+        handler
+            .handle(IpcCommand::CreateEcmpGroup {
+                tag: "test-group".to_string(),
+                config,
+            })
+            .await;
+
+        // Update the members
+        let response = handler
+            .handle(IpcCommand::UpdateEcmpGroupMembers {
+                tag: "test-group".to_string(),
+                members: vec![
+                    EcmpMemberConfig {
+                        outbound: "proxy-1".to_string(),
+                        weight: 2,
+                        enabled: true,
+                    },
+                    EcmpMemberConfig {
+                        outbound: "proxy-2".to_string(),
+                        weight: 3,
+                        enabled: true,
+                    },
+                ],
+            })
+            .await;
+
+        assert!(!response.is_error());
+
+        // Verify the update - use member_count() and member_tags() instead of config().members
+        // because the config is the original config and members are stored separately
+        let group = ecmp_manager.get_group("test-group").unwrap();
+        assert_eq!(group.member_count(), 2);
+        let tags = group.member_tags();
+        assert!(tags.contains(&"proxy-1".to_string()));
+        assert!(tags.contains(&"proxy-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_ecmp_group_members_not_found() {
+        use crate::ipc::protocol::EcmpMemberConfig;
+
+        let handler = create_test_handler();
+        let ecmp_manager = Arc::new(crate::ecmp::group::EcmpGroupManager::new());
+        let handler = handler.with_ecmp_group_manager(ecmp_manager);
+
+        // Try to update non-existent group
+        let response = handler
+            .handle(IpcCommand::UpdateEcmpGroupMembers {
+                tag: "nonexistent-group".to_string(),
+                members: vec![EcmpMemberConfig {
+                    outbound: "proxy-1".to_string(),
+                    weight: 1,
+                    enabled: true,
+                }],
+            })
+            .await;
+
+        assert!(response.is_error());
+        if let IpcResponse::Error(err) = response {
+            assert!(matches!(err.code, ErrorCode::NotFound));
+        }
     }
 }

@@ -36,6 +36,12 @@ run_iptables() {
 cleanup() {
   echo "[entrypoint] cleanup: stopping all managed processes..."
 
+  # Stop rust-router if running (Phase 6)
+  if [ -n "${RUST_ROUTER_PID:-}" ] && kill -0 "${RUST_ROUTER_PID}" >/dev/null 2>&1; then
+    echo "[entrypoint] stopping rust-router (PID ${RUST_ROUTER_PID})"
+    kill "${RUST_ROUTER_PID}" >/dev/null 2>&1 || true
+  fi
+
   # Stop health checker first (depends on other services)
   if [ -n "${HEALTH_CHECKER_PID:-}" ] && kill -0 "${HEALTH_CHECKER_PID}" >/dev/null 2>&1; then
     echo "[entrypoint] stopping health checker (PID ${HEALTH_CHECKER_PID})"
@@ -80,6 +86,9 @@ cleanup() {
   echo "[entrypoint] cleaning up DSCP rules..."
   python3 /usr/local/bin/dscp_manager.py cleanup 2>/dev/null || true
 
+  # Cleanup rust-router socket (Phase 6)
+  rm -f "${RUST_ROUTER_SOCKET}" 2>/dev/null || true
+
   # Cleanup WireGuard interfaces created by this container
   cleanup_wireguard_interfaces
 
@@ -94,13 +103,16 @@ XRAY_EGRESS_MGR_PID=""
 WARP_MGR_PID=""
 HEALTH_CHECKER_PID=""
 PEER_TUNNEL_MGR_PID=""
+RUST_ROUTER_PID=""
 
 # Cleanup WireGuard interfaces created by this container
 # This is important for network_mode: host to prevent stale interfaces
+# Note: In Phase 6 userspace mode, kernel WireGuard interfaces are not created,
+# but this function is safe to call anyway (operations are idempotent with || true)
 cleanup_wireguard_interfaces() {
   echo "[entrypoint] cleaning up WireGuard interfaces..."
 
-  # Cleanup ingress interface
+  # Cleanup ingress interface (not present in userspace mode)
   if ip link show wg-ingress >/dev/null 2>&1; then
     echo "[entrypoint] removing wg-ingress interface"
     ip link delete wg-ingress 2>/dev/null || true
@@ -175,6 +187,19 @@ RUST_ROUTER_BIN="${RUST_ROUTER_BIN:-/usr/local/bin/rust-router}"
 RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG:-/etc/rust-router/config.json}"
 RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET:-/var/run/rust-router.sock}"
 RUST_ROUTER_LOG="${RUST_ROUTER_LOG:-/var/log/rust-router.log}"
+
+# Phase 6: Userspace WireGuard mode
+# When USERSPACE_WG=true, rust-router handles WireGuard in userspace (boringtun)
+# and kernel WireGuard interfaces are not created.
+# REQUIRES: USE_RUST_ROUTER=true (will log warning if misconfigured)
+USERSPACE_WG="${USERSPACE_WG:-false}"
+
+# Validate userspace WireGuard configuration
+if [ "${USERSPACE_WG}" = "true" ] && [ "${USE_RUST_ROUTER}" != "true" ]; then
+  echo "[entrypoint] WARNING: USERSPACE_WG=true requires USE_RUST_ROUTER=true"
+  echo "[entrypoint] disabling userspace WireGuard mode"
+  USERSPACE_WG="false"
+fi
 
 # Track which router is active (rust-router or sing-box)
 ACTIVE_ROUTER="rust-router"
@@ -343,6 +368,12 @@ TPROXY_MARK="1"
 TPROXY_TABLE="100"
 
 setup_kernel_wireguard() {
+  # Phase 6: Skip kernel WireGuard if userspace mode is enabled
+  if [ "${USERSPACE_WG}" = "true" ]; then
+    echo "[entrypoint] USERSPACE_WG=true, skipping kernel WireGuard setup (rust-router handles this)"
+    return 0
+  fi
+
   echo "[entrypoint] setting up kernel WireGuard interface"
 
   # Create WireGuard interface if not exists
@@ -535,6 +566,12 @@ setup_kernel_wireguard
 # Creates wg-pia-* and wg-eg-* interfaces for outbound traffic
 
 setup_kernel_wireguard_egress() {
+  # Phase 6: Skip kernel WireGuard egress if userspace mode is enabled
+  if [ "${USERSPACE_WG}" = "true" ]; then
+    echo "[entrypoint] USERSPACE_WG=true, skipping kernel WireGuard egress setup"
+    return 0
+  fi
+
   echo "[entrypoint] setting up kernel WireGuard egress interfaces"
 
   # Apply WireGuard egress config from database
@@ -590,6 +627,41 @@ sync_chain_routes
 
 # Restore entry node DSCP rules (Phase 11-Fix.P)
 restore_dscp_rules
+
+# Phase 6: Sync configuration to rust-router via IPC
+# This function syncs database configuration (rules, outbounds, peers) to rust-router
+# via its Unix socket IPC interface
+sync_rust_router() {
+  if [ "${USE_RUST_ROUTER}" != "true" ]; then
+    return 0
+  fi
+
+  # Wait for rust-router socket to be available
+  local max_wait=30
+  local waited=0
+  while [ ! -S "${RUST_ROUTER_SOCKET}" ] && [ $waited -lt $max_wait ]; do
+    sleep 1
+    waited=$((waited + 1))
+    # Log progress every 5 seconds for debugging
+    if [ $((waited % 5)) -eq 0 ]; then
+      echo "[entrypoint] waiting for rust-router socket... (${waited}/${max_wait}s)"
+    fi
+  done
+
+  if [ ! -S "${RUST_ROUTER_SOCKET}" ]; then
+    echo "[entrypoint] WARNING: rust-router socket not available after ${max_wait}s, skipping sync"
+    return 1
+  fi
+
+  echo "[entrypoint] syncing configuration to rust-router via IPC"
+  # Use head -50 to capture more output while still preventing runaway logs
+  if python3 /usr/local/bin/rust_router_manager.py sync 2>&1 | head -50; then
+    echo "[entrypoint] rust-router sync completed"
+  else
+    echo "[entrypoint] WARNING: rust-router sync failed"
+    return 1
+  fi
+}
 
 start_api_server() {
   if [ "${ENABLE_API:-1}" = "1" ]; then
@@ -905,7 +977,7 @@ start_peer_tunnel_manager
 # Router startup logic - supports both sing-box and rust-router
 # rust-router provides high-performance Rust implementation with fallback to sing-box
 SINGBOX_PID=""
-RUST_ROUTER_PID=""
+# Note: RUST_ROUTER_PID is initialized in the PID block at script start
 
 start_singbox() {
   local config="$1"
@@ -943,6 +1015,13 @@ start_rust_router() {
   export RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG}"
   export RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET}"
   export RUST_LOG="${RUST_LOG:-info}"
+
+  # Phase 6: Configure userspace WireGuard mode
+  if [ "${USERSPACE_WG}" = "true" ]; then
+    export RUST_ROUTER_USERSPACE_WG="true"
+    export RUST_ROUTER_WG_LISTEN_PORT="${WG_LISTEN_PORT}"
+    echo "[entrypoint] rust-router userspace WireGuard enabled (port ${WG_LISTEN_PORT})"
+  fi
 
   # Start rust-router
   "${RUST_ROUTER_BIN}" >> "${RUST_ROUTER_LOG}" 2>&1 &
@@ -1005,12 +1084,20 @@ trap handle_signals SIGTERM SIGINT
 # Start the appropriate router based on configuration
 if [ "${USE_RUST_ROUTER}" = "true" ]; then
   echo "[entrypoint] rust-router enabled via USE_RUST_ROUTER=true"
+  if [ "${USERSPACE_WG}" = "true" ]; then
+    echo "[entrypoint] userspace WireGuard mode enabled"
+  fi
   if start_rust_router; then
     echo "[entrypoint] rust-router started successfully"
+
+    # Phase 6: Sync configuration to rust-router
+    sync_rust_router || echo "[entrypoint] WARNING: initial sync failed, will retry later"
   else
     echo "[entrypoint] rust-router failed to start, falling back to sing-box" >&2
     # Reset TPROXY port for sing-box fallback
     TPROXY_PORT="7893"
+    # Also disable userspace mode since we're falling back to sing-box
+    USERSPACE_WG="false"
     start_singbox "${CONFIG_PATH}"
   fi
 else
@@ -1022,6 +1109,11 @@ fi
 # SKIP_TPROXY_SETUP=true to disable automatic TPROXY rules (for manual debugging)
 if [ "${SKIP_TPROXY_SETUP:-false}" = "true" ]; then
   echo "[entrypoint] SKIP_TPROXY_SETUP=true, skipping automatic TPROXY setup"
+elif [ "${USERSPACE_WG}" = "true" ] && [ "${USE_RUST_ROUTER}" = "true" ]; then
+  # Phase 6: Full userspace mode - rust-router handles all routing internally
+  # No iptables TPROXY rules needed as traffic goes directly to rust-router's WireGuard listener
+  echo "[entrypoint] Full userspace mode: rust-router handles all routing internally"
+  echo "[entrypoint] Skipping iptables TPROXY setup (not needed for userspace WireGuard)"
 else
   check_tproxy_prerequisites
 
@@ -1079,9 +1171,22 @@ rotate_logs() {
   done
 }
 
+# Phase 6: Counter for periodic rust-router sync check (every 5 minutes = 300 seconds)
+SYNC_CHECK_COUNT=0
+
 # 主循环：监控 nginx, API 和 sing-box 进程
 while true; do
   rotate_logs
+
+  # Phase 6: Periodic rust-router sync check (every 5 minutes)
+  SYNC_CHECK_COUNT=$((SYNC_CHECK_COUNT + 1))
+  if [ "${USE_RUST_ROUTER}" = "true" ] && [ $((SYNC_CHECK_COUNT % 300)) -eq 0 ]; then
+    if [ -S "${RUST_ROUTER_SOCKET}" ]; then
+      # Re-sync if rust-router is running
+      sync_rust_router >/dev/null 2>&1 || true
+    fi
+  fi
+
   # Check nginx
   if [ -n "${NGINX_PID}" ] && ! kill -0 "${NGINX_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: nginx died" >&2
@@ -1139,16 +1244,22 @@ while true; do
       # Try to restart rust-router
       if start_rust_router; then
         echo "[entrypoint] rust-router restarted successfully"
+        # Phase 6: Re-sync configuration after restart
+        sync_rust_router || echo "[entrypoint] WARNING: sync after restart failed"
       else
         echo "[entrypoint] rust-router restart failed, falling back to sing-box" >&2
         # Fall back to sing-box
         TPROXY_PORT="7893"
+        # H1 fix: Reset USERSPACE_WG since sing-box requires kernel WireGuard
+        USERSPACE_WG="false"
         start_singbox "${GENERATED_CONFIG_PATH:-${BASE_CONFIG_PATH}}"
-        # Reconfigure TPROXY for new port
+        # Reconfigure TPROXY for new port (now needed since we're back to kernel WG mode)
         if [ "${SKIP_TPROXY_SETUP:-false}" != "true" ]; then
           setup_tproxy_routing
           setup_xray_tproxy
         fi
+        # Note: Kernel WireGuard interfaces should already exist from initial setup
+        # If they don't, a container restart will be needed
       fi
     fi
   else

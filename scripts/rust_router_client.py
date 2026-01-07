@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Rust Router IPC Client (v3.1 - Phase 3.4 + Prometheus Metrics)
+Rust Router IPC Client (v4.0 - Phase 6 v3.2)
 
 Async client for communicating with rust-router via Unix socket.
 Used by api_server.py and RustRouterManager for configuration sync.
 
-Protocol v3.1 Features (Phase 3.4 + Prometheus Metrics):
+Protocol v4.0 Features (Phase 6 v3.2):
 - Length-prefixed JSON framing (4 bytes BE + JSON) - matches Rust IPC protocol
 - WireGuard outbound management (AddWireguardOutbound)
 - SOCKS5 outbound management (AddSocks5Outbound)
@@ -16,6 +16,13 @@ Protocol v3.1 Features (Phase 3.4 + Prometheus Metrics):
 - Prometheus metrics retrieval (GetPrometheusMetrics)
 - Connection retry with exponential backoff
 - Graceful degradation when rust-router unavailable
+
+Phase 6 v3.2 New Commands:
+- Userspace WireGuard tunnel management (CreateWgTunnel, RemoveWgTunnel, etc.)
+- ECMP group management (CreateEcmpGroup, RemoveEcmpGroup, etc.)
+- Peer node management (GeneratePairRequest, ImportPairRequest, ConnectPeer, etc.)
+- Chain management (CreateChain, ActivateChain, DeactivateChain, etc.)
+- Two-Phase Commit for distributed chain activation
 
 Wire Protocol:
   [4 bytes: message length (big-endian u32)]
@@ -40,7 +47,7 @@ LENGTH_PREFIX_SIZE = 4
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 
 # Protocol version
-PROTOCOL_VERSION = 3  # Phase 3.4: IPC v2.1 with drain, health, routing updates
+PROTOCOL_VERSION = 4  # Phase 6 v3.2: Userspace WireGuard, ECMP groups, peer management, chains
 
 # Default timeouts
 DEFAULT_CONNECT_TIMEOUT = 5.0  # seconds
@@ -124,6 +131,100 @@ class PrometheusMetricsResponse:
     """Prometheus metrics response from rust-router"""
     metrics_text: str
     timestamp_ms: int
+
+
+# =============================================================================
+# Phase 6 v3.2: New dataclasses
+# =============================================================================
+
+
+@dataclass
+class WgTunnelInfo:
+    """Information about a userspace WireGuard tunnel"""
+    tag: str
+    state: str
+    local_ip: str
+    peer_ip: Optional[str] = None
+    endpoint: Optional[str] = None
+    listen_port: Optional[int] = None
+    mtu: int = 1420
+    bytes_rx: int = 0
+    bytes_tx: int = 0
+    last_handshake: Optional[int] = None
+    persistent_keepalive: int = 25
+
+
+@dataclass
+class EcmpGroupInfo:
+    """Information about an ECMP load balancing group"""
+    tag: str
+    description: str
+    algorithm: str
+    member_count: int
+    healthy_count: int
+    routing_mark: Optional[int] = None
+    routing_table: Optional[int] = None
+    health_check: bool = True
+
+
+@dataclass
+class EcmpMemberInfo:
+    """Information about an ECMP group member"""
+    tag: str
+    weight: int = 1
+    health: str = "unknown"
+    active_connections: int = 0
+
+
+@dataclass
+class PeerInfo:
+    """Information about a peer node"""
+    tag: str
+    description: str
+    endpoint: str
+    tunnel_type: str
+    state: str
+    tunnel_status: str = "disconnected"
+    api_port: int = 36000
+    tunnel_port: Optional[int] = None
+    tunnel_ip: Optional[str] = None
+    last_handshake: Optional[int] = None
+    bytes_rx: int = 0
+    bytes_tx: int = 0
+
+
+@dataclass
+class PeerHealthInfo:
+    """Health status for a peer tunnel"""
+    tag: str
+    tunnel_status: str
+    latency_ms: Optional[float] = None
+    packet_loss: Optional[float] = None
+    last_check: Optional[int] = None
+    consecutive_failures: int = 0
+
+
+@dataclass
+class ChainInfo:
+    """Information about a multi-hop chain"""
+    tag: str
+    description: str
+    hops: List[str]
+    exit_egress: str
+    chain_state: str
+    dscp_value: Optional[int] = None
+    allow_transitive: bool = False
+    last_error: Optional[str] = None
+
+
+@dataclass
+class ChainRoleInfo:
+    """Chain role information for current node"""
+    chain_tag: str
+    role: str  # "entry", "relay", "terminal"
+    dscp_value: Optional[int] = None
+    previous_hop: Optional[str] = None
+    next_hop: Optional[str] = None
 
 
 @dataclass
@@ -805,6 +906,661 @@ class RustRouterClient:
         })
 
     # =========================================================================
+    # Phase 6: WireGuard Tunnel Management (Userspace)
+    # =========================================================================
+
+    async def create_wg_tunnel(
+        self,
+        tag: str,
+        private_key: str,
+        peer_public_key: str,
+        endpoint: str,
+        local_ip: str,
+        peer_ip: Optional[str] = None,
+        listen_port: Optional[int] = None,
+        mtu: int = 1420,
+        persistent_keepalive: int = 25,
+    ) -> IpcResponse:
+        """Create a userspace WireGuard tunnel.
+
+        Args:
+            tag: Unique tag for this tunnel
+            private_key: WireGuard private key (Base64)
+            peer_public_key: Peer's public key (Base64)
+            endpoint: Peer endpoint (IP:port)
+            local_ip: Local tunnel IP
+            peer_ip: Remote tunnel IP (optional)
+            listen_port: Local listen port (optional)
+            mtu: MTU size (default: 1420)
+            persistent_keepalive: Keepalive interval in seconds (default: 25)
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        config = {
+            "private_key": private_key,
+            "peer_public_key": peer_public_key,
+            "endpoint": endpoint,
+            "local_ip": local_ip,
+            "mtu": mtu,
+            "persistent_keepalive": persistent_keepalive,
+        }
+        if peer_ip is not None:
+            config["peer_ip"] = peer_ip
+        if listen_port is not None:
+            config["listen_port"] = listen_port
+
+        return await self._send_command({
+            "type": "create_wg_tunnel",
+            "tag": tag,
+            "config": config,
+        })
+
+    async def remove_wg_tunnel(
+        self,
+        tag: str,
+        drain_timeout_secs: Optional[int] = None,
+    ) -> IpcResponse:
+        """Remove a userspace WireGuard tunnel.
+
+        Args:
+            tag: Tunnel tag to remove
+            drain_timeout_secs: Optional drain timeout before removal
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        command = {"type": "remove_wg_tunnel", "tag": tag}
+        if drain_timeout_secs is not None:
+            command["drain_timeout_secs"] = drain_timeout_secs
+        return await self._send_command(command)
+
+    async def get_wg_tunnel_status(self, tag: str) -> IpcResponse:
+        """Get status of a userspace WireGuard tunnel.
+
+        Args:
+            tag: Tunnel tag
+
+        Returns:
+            IpcResponse with tunnel status data
+        """
+        return await self._send_command({"type": "get_wg_tunnel_status", "tag": tag})
+
+    async def list_wg_tunnels(self) -> List[WgTunnelInfo]:
+        """List all userspace WireGuard tunnels.
+
+        Returns:
+            List of WgTunnelInfo for each tunnel
+        """
+        response = await self._send_command({"type": "list_wg_tunnels"})
+        if not response.success:
+            return []
+
+        result = []
+        if response.data and "tunnels" in response.data:
+            for item in response.data["tunnels"]:
+                result.append(WgTunnelInfo(
+                    tag=item.get("tag", ""),
+                    state=item.get("state", "unknown"),
+                    local_ip=item.get("local_ip", ""),
+                    peer_ip=item.get("peer_ip"),
+                    endpoint=item.get("endpoint"),
+                    listen_port=item.get("listen_port"),
+                    mtu=item.get("mtu", 1420),
+                    bytes_rx=item.get("bytes_rx", 0),
+                    bytes_tx=item.get("bytes_tx", 0),
+                    last_handshake=item.get("last_handshake"),
+                    persistent_keepalive=item.get("persistent_keepalive", 25),
+                ))
+        return result
+
+    # =========================================================================
+    # Phase 6: ECMP Group Management
+    # =========================================================================
+
+    async def create_ecmp_group(
+        self,
+        tag: str,
+        members: List[Dict[str, Any]],
+        algorithm: str = "five_tuple_hash",
+        description: str = "",
+        routing_mark: Optional[int] = None,
+        routing_table: Optional[int] = None,
+        health_check: bool = True,
+    ) -> IpcResponse:
+        """Create an ECMP load balancing group.
+
+        Args:
+            tag: Unique tag for this group
+            members: List of member dicts with 'tag' and optional 'weight'
+            algorithm: Load balancing algorithm:
+                - five_tuple_hash: 5-tuple hash for connection affinity (default)
+                - round_robin: Sequential distribution
+                - weighted: Weight-based distribution
+                - least_connections: Route to member with fewest connections
+                - random: Random selection
+            description: Group description
+            routing_mark: Optional routing mark (200-299 range)
+            routing_table: Optional routing table
+            health_check: Enable health checking (default: True)
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        config = {
+            "tag": tag,
+            "members": members,
+            "algorithm": algorithm,
+            "description": description,
+            "health_check": health_check,
+        }
+        if routing_mark is not None:
+            config["routing_mark"] = routing_mark
+        if routing_table is not None:
+            config["routing_table"] = routing_table
+
+        return await self._send_command({
+            "type": "create_ecmp_group",
+            "tag": tag,
+            "config": config,
+        })
+
+    async def remove_ecmp_group(self, tag: str) -> IpcResponse:
+        """Remove an ECMP group.
+
+        Args:
+            tag: Group tag to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "remove_ecmp_group", "tag": tag})
+
+    async def get_ecmp_group_status(self, tag: str) -> IpcResponse:
+        """Get status of an ECMP group.
+
+        Args:
+            tag: Group tag
+
+        Returns:
+            IpcResponse with group status data including member health
+        """
+        return await self._send_command({"type": "get_ecmp_group_status", "tag": tag})
+
+    async def list_ecmp_groups(self) -> List[EcmpGroupInfo]:
+        """List all ECMP groups.
+
+        Returns:
+            List of EcmpGroupInfo for each group
+        """
+        response = await self._send_command({"type": "list_ecmp_groups"})
+        if not response.success:
+            return []
+
+        result = []
+        if response.data and "groups" in response.data:
+            for item in response.data["groups"]:
+                result.append(EcmpGroupInfo(
+                    tag=item.get("tag", ""),
+                    description=item.get("description", ""),
+                    algorithm=item.get("algorithm", "five_tuple_hash"),
+                    member_count=item.get("member_count", 0),
+                    healthy_count=item.get("healthy_count", 0),
+                    routing_mark=item.get("routing_mark"),
+                    routing_table=item.get("routing_table"),
+                    health_check=item.get("health_check", True),
+                ))
+        return result
+
+    async def update_ecmp_group_members(
+        self,
+        tag: str,
+        members: List[Dict[str, Any]],
+    ) -> IpcResponse:
+        """Update members of an ECMP group.
+
+        Args:
+            tag: Group tag
+            members: New list of member dicts with 'tag' and optional 'weight'
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "update_ecmp_group_members",
+            "tag": tag,
+            "members": members,
+        })
+
+    # =========================================================================
+    # Phase 6: Peer Node Management
+    # =========================================================================
+
+    async def generate_pair_request(
+        self,
+        local_tag: str,
+        local_description: str,
+        local_endpoint: str,
+        local_api_port: int = 36000,
+        bidirectional: bool = True,
+        tunnel_type: str = "wireguard",
+    ) -> IpcResponse:
+        """Generate an offline pairing request code.
+
+        This starts the offline pairing process. The returned code should be
+        shared with the remote node (via QR code, copy-paste, etc.).
+
+        Args:
+            local_tag: Local node tag (how remote will identify this node)
+            local_description: Human-readable description of this node
+            local_endpoint: Local WireGuard endpoint (IP:port)
+            local_api_port: Local Web API port (default: 36000)
+            bidirectional: Enable bidirectional auto-connect (default: True)
+            tunnel_type: Tunnel type ("wireguard" or "xray")
+
+        Returns:
+            IpcResponse with 'code' field containing the Base64 pairing request
+        """
+        return await self._send_command({
+            "type": "generate_pair_request",
+            "local_tag": local_tag,
+            "local_description": local_description,
+            "local_endpoint": local_endpoint,
+            "local_api_port": local_api_port,
+            "bidirectional": bidirectional,
+            "tunnel_type": tunnel_type,
+        })
+
+    async def import_pair_request(
+        self,
+        code: str,
+        local_tag: str,
+        local_description: str,
+        local_endpoint: str,
+        local_api_port: int = 36000,
+    ) -> IpcResponse:
+        """Import a pairing request from another node.
+
+        This processes a pairing request code from another node and generates
+        a response code to send back.
+
+        Args:
+            code: Base64 pairing request code from remote node
+            local_tag: Local node tag
+            local_description: Human-readable description of this node
+            local_endpoint: Local WireGuard endpoint (IP:port)
+            local_api_port: Local Web API port (default: 36000)
+
+        Returns:
+            IpcResponse with 'response_code' field containing the response code
+        """
+        return await self._send_command({
+            "type": "import_pair_request",
+            "code": code,
+            "local_tag": local_tag,
+            "local_description": local_description,
+            "local_endpoint": local_endpoint,
+            "local_api_port": local_api_port,
+        })
+
+    async def complete_handshake(self, code: str) -> IpcResponse:
+        """Complete the pairing handshake with a response code.
+
+        This finalizes the pairing process on the initiating node.
+
+        Args:
+            code: Base64 response code from remote node
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "complete_handshake", "code": code})
+
+    async def connect_peer(self, tag: str) -> IpcResponse:
+        """Connect to a configured peer node.
+
+        Establishes the WireGuard or Xray tunnel to the peer.
+
+        Args:
+            tag: Peer tag to connect
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "connect_peer", "tag": tag})
+
+    async def disconnect_peer(self, tag: str) -> IpcResponse:
+        """Disconnect from a peer node.
+
+        Tears down the tunnel but preserves the peer configuration.
+
+        Args:
+            tag: Peer tag to disconnect
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "disconnect_peer", "tag": tag})
+
+    async def get_peer_status(self, tag: str) -> IpcResponse:
+        """Get status of a peer node.
+
+        Args:
+            tag: Peer tag
+
+        Returns:
+            IpcResponse with peer status data
+        """
+        return await self._send_command({"type": "get_peer_status", "tag": tag})
+
+    async def get_peer_tunnel_health(self, tag: str) -> Optional[PeerHealthInfo]:
+        """Get tunnel health status for a peer.
+
+        Args:
+            tag: Peer tag
+
+        Returns:
+            PeerHealthInfo with health metrics, or None if failed
+        """
+        response = await self._send_command({"type": "get_peer_tunnel_health", "tag": tag})
+        if not response.success or not response.data:
+            return None
+
+        return PeerHealthInfo(
+            tag=tag,
+            tunnel_status=response.data.get("tunnel_status", "unknown"),
+            latency_ms=response.data.get("latency_ms"),
+            packet_loss=response.data.get("packet_loss"),
+            last_check=response.data.get("last_check"),
+            consecutive_failures=response.data.get("consecutive_failures", 0),
+        )
+
+    async def list_peers(self) -> List[PeerInfo]:
+        """List all configured peer nodes.
+
+        Returns:
+            List of PeerInfo for each peer
+        """
+        response = await self._send_command({"type": "list_peers"})
+        if not response.success:
+            return []
+
+        result = []
+        if response.data and "peers" in response.data:
+            for item in response.data["peers"]:
+                result.append(PeerInfo(
+                    tag=item.get("tag", ""),
+                    description=item.get("description", ""),
+                    endpoint=item.get("endpoint", ""),
+                    tunnel_type=item.get("tunnel_type", "wireguard"),
+                    state=item.get("state", "unknown"),
+                    tunnel_status=item.get("tunnel_status", "disconnected"),
+                    api_port=item.get("api_port", 36000),
+                    tunnel_port=item.get("tunnel_port"),
+                    tunnel_ip=item.get("tunnel_ip"),
+                    last_handshake=item.get("last_handshake"),
+                    bytes_rx=item.get("bytes_rx", 0),
+                    bytes_tx=item.get("bytes_tx", 0),
+                ))
+        return result
+
+    async def remove_peer(self, tag: str) -> IpcResponse:
+        """Remove a peer node configuration.
+
+        This disconnects (if connected) and removes all peer configuration.
+
+        Args:
+            tag: Peer tag to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "remove_peer", "tag": tag})
+
+    # =========================================================================
+    # Phase 6: Chain Management
+    # =========================================================================
+
+    async def create_chain(
+        self,
+        tag: str,
+        hops: List[str],
+        exit_egress: str,
+        description: str = "",
+        allow_transitive: bool = False,
+    ) -> IpcResponse:
+        """Create a multi-hop chain.
+
+        Args:
+            tag: Unique tag for this chain
+            hops: Ordered list of peer tags forming the chain path
+            exit_egress: Egress tag on the terminal node
+            description: Chain description
+            allow_transitive: Allow terminal node to select egress dynamically
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "create_chain",
+            "tag": tag,
+            "hops": hops,
+            "exit_egress": exit_egress,
+            "description": description,
+            "allow_transitive": allow_transitive,
+        })
+
+    async def update_chain(
+        self,
+        tag: str,
+        hops: Optional[List[str]] = None,
+        exit_egress: Optional[str] = None,
+        description: Optional[str] = None,
+        allow_transitive: Optional[bool] = None,
+    ) -> IpcResponse:
+        """Update an existing chain.
+
+        Only provided fields are updated. Chain must be inactive.
+
+        Args:
+            tag: Chain tag to update
+            hops: New hop list (optional)
+            exit_egress: New exit egress (optional)
+            description: New description (optional)
+            allow_transitive: New transitive setting (optional)
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        command: Dict[str, Any] = {"type": "update_chain", "tag": tag}
+        if hops is not None:
+            command["hops"] = hops
+        if exit_egress is not None:
+            command["exit_egress"] = exit_egress
+        if description is not None:
+            command["description"] = description
+        if allow_transitive is not None:
+            command["allow_transitive"] = allow_transitive
+        return await self._send_command(command)
+
+    async def remove_chain(self, tag: str) -> IpcResponse:
+        """Remove a chain.
+
+        Chain must be inactive before removal.
+
+        Args:
+            tag: Chain tag to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "remove_chain", "tag": tag})
+
+    # Backwards compatibility alias
+    delete_chain = remove_chain
+
+    async def activate_chain(self, tag: str) -> IpcResponse:
+        """Activate a chain using Two-Phase Commit.
+
+        This performs distributed activation across all hops:
+        1. PREPARE phase: Validate configuration on all nodes
+        2. COMMIT phase: Apply DSCP rules on all nodes
+
+        Args:
+            tag: Chain tag to activate
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "activate_chain", "tag": tag})
+
+    async def deactivate_chain(self, tag: str) -> IpcResponse:
+        """Deactivate an active chain.
+
+        Removes DSCP rules from all nodes in the chain.
+
+        Args:
+            tag: Chain tag to deactivate
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "deactivate_chain", "tag": tag})
+
+    async def get_chain_status(self, tag: str) -> IpcResponse:
+        """Get status of a chain.
+
+        Args:
+            tag: Chain tag
+
+        Returns:
+            IpcResponse with chain status including state and any errors
+        """
+        return await self._send_command({"type": "get_chain_status", "tag": tag})
+
+    async def list_chains(self) -> List[ChainInfo]:
+        """List all chains.
+
+        Returns:
+            List of ChainInfo for each chain
+        """
+        response = await self._send_command({"type": "list_chains"})
+        if not response.success:
+            return []
+
+        result = []
+        if response.data and "chains" in response.data:
+            for item in response.data["chains"]:
+                result.append(ChainInfo(
+                    tag=item.get("tag", ""),
+                    description=item.get("description", ""),
+                    hops=item.get("hops", []),
+                    exit_egress=item.get("exit_egress", ""),
+                    chain_state=item.get("chain_state", "inactive"),
+                    dscp_value=item.get("dscp_value"),
+                    allow_transitive=item.get("allow_transitive", False),
+                    last_error=item.get("last_error"),
+                ))
+        return result
+
+    async def get_chain_role(self, tag: str) -> Optional[ChainRoleInfo]:
+        """Get this node's role in a chain.
+
+        Args:
+            tag: Chain tag
+
+        Returns:
+            ChainRoleInfo describing this node's role, or None if not in chain
+        """
+        response = await self._send_command({"type": "get_chain_role", "tag": tag})
+        if not response.success or not response.data:
+            return None
+
+        return ChainRoleInfo(
+            chain_tag=tag,
+            role=response.data.get("role", "unknown"),
+            dscp_value=response.data.get("dscp_value"),
+            previous_hop=response.data.get("previous_hop"),
+            next_hop=response.data.get("next_hop"),
+        )
+
+    # =========================================================================
+    # Phase 6: Two-Phase Commit (2PC) Protocol
+    # =========================================================================
+
+    async def prepare_chain_route(
+        self,
+        chain_tag: str,
+        dscp_value: int,
+        source_node: str,
+    ) -> IpcResponse:
+        """PREPARE phase of 2PC for chain route registration.
+
+        Validates the chain route configuration without applying rules.
+
+        Args:
+            chain_tag: Chain tag
+            dscp_value: DSCP value for this chain (1-63)
+            source_node: Tag of the node initiating the request
+
+        Returns:
+            IpcResponse indicating if PREPARE succeeded
+        """
+        return await self._send_command({
+            "type": "prepare_chain_route",
+            "chain_tag": chain_tag,
+            "dscp_value": dscp_value,
+            "source_node": source_node,
+        })
+
+    async def commit_chain_route(
+        self,
+        chain_tag: str,
+        dscp_value: int,
+        source_node: str,
+    ) -> IpcResponse:
+        """COMMIT phase of 2PC for chain route registration.
+
+        Applies the validated chain route rules.
+
+        Args:
+            chain_tag: Chain tag
+            dscp_value: DSCP value for this chain
+            source_node: Tag of the node initiating the request
+
+        Returns:
+            IpcResponse indicating if COMMIT succeeded
+        """
+        return await self._send_command({
+            "type": "commit_chain_route",
+            "chain_tag": chain_tag,
+            "dscp_value": dscp_value,
+            "source_node": source_node,
+        })
+
+    async def abort_chain_route(
+        self,
+        chain_tag: str,
+        source_node: str,
+    ) -> IpcResponse:
+        """ABORT phase of 2PC for chain route registration.
+
+        Rolls back any prepared state for this chain route.
+
+        Args:
+            chain_tag: Chain tag
+            source_node: Tag of the node initiating the request
+
+        Returns:
+            IpcResponse indicating if ABORT succeeded
+        """
+        return await self._send_command({
+            "type": "abort_chain_route",
+            "chain_tag": chain_tag,
+            "source_node": source_node,
+        })
+
+    # =========================================================================
     # Lifecycle Commands
     # =========================================================================
 
@@ -1427,6 +2183,405 @@ if __name__ == "__main__":
             result = await self.client.get_prometheus_metrics()
             self.assertIsNone(result)
 
+    class TestPhase6Dataclasses(unittest.TestCase):
+        """Test Phase 6 v3.2 dataclasses"""
+
+        def test_wg_tunnel_info_defaults(self):
+            """Test WgTunnelInfo with defaults"""
+            info = WgTunnelInfo(tag="peer1", state="running", local_ip="10.200.200.1")
+            self.assertEqual(info.tag, "peer1")
+            self.assertEqual(info.state, "running")
+            self.assertEqual(info.mtu, 1420)
+            self.assertEqual(info.bytes_rx, 0)
+            self.assertIsNone(info.peer_ip)
+
+        def test_wg_tunnel_info_full(self):
+            """Test WgTunnelInfo with all fields"""
+            info = WgTunnelInfo(
+                tag="peer1",
+                state="running",
+                local_ip="10.200.200.1",
+                peer_ip="10.200.200.2",
+                endpoint="1.2.3.4:36200",
+                listen_port=36201,
+                mtu=1400,
+                bytes_rx=1000,
+                bytes_tx=2000,
+                last_handshake=1704067200,
+                persistent_keepalive=30,
+            )
+            self.assertEqual(info.listen_port, 36201)
+            self.assertEqual(info.last_handshake, 1704067200)
+
+        def test_ecmp_group_info_defaults(self):
+            """Test EcmpGroupInfo with defaults"""
+            info = EcmpGroupInfo(
+                tag="us-exits",
+                description="US exit group",
+                algorithm="five_tuple_hash",
+                member_count=3,
+                healthy_count=2,
+            )
+            self.assertEqual(info.algorithm, "five_tuple_hash")
+            self.assertIsNone(info.routing_mark)
+            self.assertTrue(info.health_check)
+
+        def test_ecmp_member_info(self):
+            """Test EcmpMemberInfo"""
+            info = EcmpMemberInfo(tag="us-east", weight=2, health="healthy")
+            self.assertEqual(info.weight, 2)
+            self.assertEqual(info.active_connections, 0)
+
+        def test_peer_info_defaults(self):
+            """Test PeerInfo with defaults"""
+            info = PeerInfo(
+                tag="node-b",
+                description="Remote node B",
+                endpoint="10.0.0.2:36200",
+                tunnel_type="wireguard",
+                state="connected",
+            )
+            self.assertEqual(info.tunnel_status, "disconnected")
+            self.assertEqual(info.api_port, 36000)
+            self.assertIsNone(info.tunnel_port)
+
+        def test_peer_health_info(self):
+            """Test PeerHealthInfo"""
+            info = PeerHealthInfo(
+                tag="node-b",
+                tunnel_status="healthy",
+                latency_ms=15.5,
+                packet_loss=0.01,
+                consecutive_failures=0,
+            )
+            self.assertEqual(info.latency_ms, 15.5)
+            self.assertEqual(info.packet_loss, 0.01)
+
+        def test_chain_info_defaults(self):
+            """Test ChainInfo with defaults"""
+            info = ChainInfo(
+                tag="chain-us",
+                description="US chain",
+                hops=["node-a", "node-b"],
+                exit_egress="us-east",
+                chain_state="inactive",
+            )
+            self.assertEqual(len(info.hops), 2)
+            self.assertIsNone(info.dscp_value)
+            self.assertFalse(info.allow_transitive)
+
+        def test_chain_role_info(self):
+            """Test ChainRoleInfo"""
+            info = ChainRoleInfo(
+                chain_tag="chain-us",
+                role="relay",
+                dscp_value=10,
+                previous_hop="node-a",
+                next_hop="node-b",
+            )
+            self.assertEqual(info.role, "relay")
+            self.assertEqual(info.dscp_value, 10)
+
+    class TestPhase6Commands(unittest.IsolatedAsyncioTestCase):
+        """Test Phase 6 v3.2 client command methods"""
+
+        async def asyncSetUp(self):
+            self.client = RustRouterClient()
+            self.client._connected = True
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(success=True, response_type="success")
+            )
+
+        async def test_create_wg_tunnel_command_format(self):
+            """Test create_wg_tunnel command format"""
+            await self.client.create_wg_tunnel(
+                tag="peer1",
+                private_key="cGVlcjEtcHJpdmF0ZS1rZXk=",
+                peer_public_key="cGVlcjEtcHVibGljLWtleQ==",
+                endpoint="10.0.0.2:36200",
+                local_ip="10.200.200.1",
+                peer_ip="10.200.200.2",
+                listen_port=36201,
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "create_wg_tunnel")
+            self.assertEqual(call_args["tag"], "peer1")
+            self.assertEqual(call_args["config"]["endpoint"], "10.0.0.2:36200")
+            self.assertEqual(call_args["config"]["listen_port"], 36201)
+            self.assertEqual(call_args["config"]["mtu"], 1420)
+
+        async def test_remove_wg_tunnel_command_format(self):
+            """Test remove_wg_tunnel command format"""
+            await self.client.remove_wg_tunnel("peer1", drain_timeout_secs=30)
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "remove_wg_tunnel")
+            self.assertEqual(call_args["tag"], "peer1")
+            self.assertEqual(call_args["drain_timeout_secs"], 30)
+
+        async def test_list_wg_tunnels_parsing(self):
+            """Test list_wg_tunnels response parsing"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="list_wg_tunnels",
+                    data={
+                        "tunnels": [
+                            {"tag": "peer1", "state": "running", "local_ip": "10.200.200.1"},
+                            {"tag": "peer2", "state": "stopped", "local_ip": "10.200.200.3"},
+                        ]
+                    }
+                )
+            )
+
+            tunnels = await self.client.list_wg_tunnels()
+            self.assertEqual(len(tunnels), 2)
+            self.assertEqual(tunnels[0].tag, "peer1")
+            self.assertEqual(tunnels[0].state, "running")
+
+        async def test_create_ecmp_group_command_format(self):
+            """Test create_ecmp_group command format"""
+            await self.client.create_ecmp_group(
+                tag="us-exits",
+                members=[{"tag": "us-east", "weight": 2}, {"tag": "us-west", "weight": 1}],
+                algorithm="weighted",
+                routing_mark=200,
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "create_ecmp_group")
+            self.assertEqual(call_args["config"]["algorithm"], "weighted")
+            self.assertEqual(len(call_args["config"]["members"]), 2)
+            self.assertEqual(call_args["config"]["routing_mark"], 200)
+
+        async def test_list_ecmp_groups_parsing(self):
+            """Test list_ecmp_groups response parsing"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="list_ecmp_groups",
+                    data={
+                        "groups": [
+                            {
+                                "tag": "us-exits",
+                                "description": "US exits",
+                                "algorithm": "five_tuple_hash",
+                                "member_count": 2,
+                                "healthy_count": 2,
+                            }
+                        ]
+                    }
+                )
+            )
+
+            groups = await self.client.list_ecmp_groups()
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0].tag, "us-exits")
+            self.assertEqual(groups[0].member_count, 2)
+
+        async def test_generate_pair_request_command_format(self):
+            """Test generate_pair_request command format"""
+            await self.client.generate_pair_request(
+                local_tag="node-a",
+                local_description="Node A",
+                local_endpoint="10.0.0.1:36200",
+                local_api_port=36001,
+                bidirectional=True,
+                tunnel_type="wireguard",
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "generate_pair_request")
+            self.assertEqual(call_args["local_tag"], "node-a")
+            self.assertEqual(call_args["local_api_port"], 36001)
+            self.assertTrue(call_args["bidirectional"])
+
+        async def test_import_pair_request_command_format(self):
+            """Test import_pair_request command format"""
+            await self.client.import_pair_request(
+                code="base64-pairing-code",
+                local_tag="node-b",
+                local_description="Node B",
+                local_endpoint="10.0.0.2:36200",
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "import_pair_request")
+            self.assertEqual(call_args["code"], "base64-pairing-code")
+
+        async def test_connect_peer_command_format(self):
+            """Test connect_peer command format"""
+            await self.client.connect_peer("node-b")
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "connect_peer")
+            self.assertEqual(call_args["tag"], "node-b")
+
+        async def test_list_peers_parsing(self):
+            """Test list_peers response parsing"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="list_peers",
+                    data={
+                        "peers": [
+                            {
+                                "tag": "node-b",
+                                "description": "Remote B",
+                                "endpoint": "10.0.0.2:36200",
+                                "tunnel_type": "wireguard",
+                                "state": "connected",
+                                "tunnel_status": "healthy",
+                                "api_port": 36000,
+                            }
+                        ]
+                    }
+                )
+            )
+
+            peers = await self.client.list_peers()
+            self.assertEqual(len(peers), 1)
+            self.assertEqual(peers[0].tag, "node-b")
+            self.assertEqual(peers[0].tunnel_status, "healthy")
+
+        async def test_get_peer_tunnel_health_parsing(self):
+            """Test get_peer_tunnel_health response parsing"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="peer_health",
+                    data={
+                        "tunnel_status": "healthy",
+                        "latency_ms": 12.5,
+                        "packet_loss": 0.0,
+                        "consecutive_failures": 0,
+                    }
+                )
+            )
+
+            health = await self.client.get_peer_tunnel_health("node-b")
+            self.assertIsNotNone(health)
+            self.assertEqual(health.tunnel_status, "healthy")
+            self.assertEqual(health.latency_ms, 12.5)
+
+        async def test_create_chain_command_format(self):
+            """Test create_chain command format"""
+            await self.client.create_chain(
+                tag="chain-us",
+                hops=["node-b", "node-c"],
+                exit_egress="us-east",
+                description="US chain via B and C",
+                allow_transitive=True,
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "create_chain")
+            self.assertEqual(call_args["hops"], ["node-b", "node-c"])
+            self.assertEqual(call_args["exit_egress"], "us-east")
+            self.assertTrue(call_args["allow_transitive"])
+
+        async def test_update_chain_partial(self):
+            """Test update_chain with partial fields"""
+            await self.client.update_chain(
+                tag="chain-us",
+                exit_egress="us-west",
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "update_chain")
+            self.assertEqual(call_args["exit_egress"], "us-west")
+            self.assertNotIn("hops", call_args)
+            self.assertNotIn("description", call_args)
+
+        async def test_activate_chain_command_format(self):
+            """Test activate_chain command format"""
+            await self.client.activate_chain("chain-us")
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "activate_chain")
+            self.assertEqual(call_args["tag"], "chain-us")
+
+        async def test_list_chains_parsing(self):
+            """Test list_chains response parsing"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="list_chains",
+                    data={
+                        "chains": [
+                            {
+                                "tag": "chain-us",
+                                "description": "US chain",
+                                "hops": ["node-b"],
+                                "exit_egress": "us-east",
+                                "chain_state": "active",
+                                "dscp_value": 10,
+                            }
+                        ]
+                    }
+                )
+            )
+
+            chains = await self.client.list_chains()
+            self.assertEqual(len(chains), 1)
+            self.assertEqual(chains[0].chain_state, "active")
+            self.assertEqual(chains[0].dscp_value, 10)
+
+        async def test_get_chain_role_parsing(self):
+            """Test get_chain_role response parsing"""
+            self.client._send_command = AsyncMock(
+                return_value=IpcResponse(
+                    success=True,
+                    response_type="chain_role",
+                    data={
+                        "role": "entry",
+                        "dscp_value": 10,
+                        "next_hop": "node-b",
+                    }
+                )
+            )
+
+            role = await self.client.get_chain_role("chain-us")
+            self.assertIsNotNone(role)
+            self.assertEqual(role.role, "entry")
+            self.assertEqual(role.next_hop, "node-b")
+
+        async def test_prepare_chain_route_command_format(self):
+            """Test prepare_chain_route (2PC PREPARE) command format"""
+            await self.client.prepare_chain_route(
+                chain_tag="chain-us",
+                dscp_value=10,
+                source_node="node-a",
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "prepare_chain_route")
+            self.assertEqual(call_args["dscp_value"], 10)
+            self.assertEqual(call_args["source_node"], "node-a")
+
+        async def test_commit_chain_route_command_format(self):
+            """Test commit_chain_route (2PC COMMIT) command format"""
+            await self.client.commit_chain_route(
+                chain_tag="chain-us",
+                dscp_value=10,
+                source_node="node-a",
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "commit_chain_route")
+
+        async def test_abort_chain_route_command_format(self):
+            """Test abort_chain_route (2PC ABORT) command format"""
+            await self.client.abort_chain_route(
+                chain_tag="chain-us",
+                source_node="node-a",
+            )
+
+            call_args = self.client._send_command.call_args[0][0]
+            self.assertEqual(call_args["type"], "abort_chain_route")
+            self.assertNotIn("dscp_value", call_args)
+
     class TestConvenienceFunctions(unittest.IsolatedAsyncioTestCase):
         """Test convenience functions"""
 
@@ -1457,7 +2612,7 @@ if __name__ == "__main__":
 
     # CLI entry point
     parser = argparse.ArgumentParser(
-        description="Rust Router IPC Client (v3.1 - Phase 3.4 + Prometheus Metrics)",
+        description="Rust Router IPC Client (v4.0 - Phase 6 v3.2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1471,6 +2626,12 @@ Examples:
   %(prog)s reload -c /path/to/cfg      # Reload configuration
   %(prog)s shutdown                    # Request graceful shutdown
   %(prog)s test                        # Run comprehensive unit tests
+
+Phase 6 v3.2 Features:
+  - Userspace WireGuard tunnel management (boringtun)
+  - ECMP load balancing groups (5 algorithms)
+  - Peer node management with offline pairing
+  - Multi-hop chain management with 2PC activation
         """
     )
     parser.add_argument(
@@ -1520,6 +2681,8 @@ Examples:
         suite.addTests(loader.loadTestsFromTestCase(TestClientProtocol))
         suite.addTests(loader.loadTestsFromTestCase(TestClientConnection))
         suite.addTests(loader.loadTestsFromTestCase(TestClientCommands))
+        suite.addTests(loader.loadTestsFromTestCase(TestPhase6Dataclasses))
+        suite.addTests(loader.loadTestsFromTestCase(TestPhase6Commands))
         suite.addTests(loader.loadTestsFromTestCase(TestConvenienceFunctions))
 
         # Run tests
