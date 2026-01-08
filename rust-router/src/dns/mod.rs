@@ -103,15 +103,24 @@
 //! - [`client::HealthChecker`]: Health state machine with configurable thresholds
 //! - [`client::UpstreamPool`]: Multi-upstream pool with failover and selection strategies
 //!
+//! # Phase 7.4 Deliverables
+//!
+//! This phase adds the DNS blocking/filtering module:
+//!
+//! - [`filter::BlockFilter`]: High-performance domain blocker with ArcSwap hot-reload
+//! - [`filter::CnameDetector`]: CNAME chain detection for bypass prevention
+//! - [`filter::BlockedResponseBuilder`]: Response generator for blocked queries
+//!
 //! Future phases will add:
-//! - Phase 7.4: Blocking engine
-//! - Phase 7.5: Query logging
-//! - Phase 7.6: Integration and testing
+//! - Phase 7.5: DNS splitting (per-domain routing)
+//! - Phase 7.6: Query logging
+//! - Phase 7.7: Integration and testing
 
 pub mod cache;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod filter;
 pub mod server;
 
 // Re-export commonly used types at module level
@@ -139,6 +148,9 @@ pub use client::DohClient;
 
 #[cfg(feature = "dns-dot")]
 pub use client::DotClient;
+
+// Re-export filter types
+pub use filter::{BlockFilter, BlockFilterStats, BlockReason, BlockedResponseBuilder, CnameBlockReason, CnameDetector};
 
 #[cfg(test)]
 mod tests {
@@ -319,5 +331,72 @@ mod tests {
         assert!(nodata.is_nodata());
         assert!(!nodata.is_nxdomain());
         assert_eq!(format!("{}", nodata), "NODATA");
+    }
+
+    // ========================================================================
+    // Phase 7.4: Filter Module Tests
+    // ========================================================================
+
+    #[test]
+    fn test_filter_module_exports() {
+        // Verify filter types are accessible
+        let config = BlockingConfig::default();
+        let filter = BlockFilter::new(config.clone());
+        let _detector = CnameDetector::new(config.cname_max_depth);
+        let _builder = BlockedResponseBuilder::new(BlockResponseType::ZeroIp);
+
+        // Verify filter stats
+        let _stats = filter.stats();
+    }
+
+    #[test]
+    fn test_block_filter_basic() {
+        let filter = BlockFilter::new(BlockingConfig::default());
+
+        // Load some domains
+        let domains = vec![
+            "ads.example.com".to_string(),
+            "tracker.net".to_string(),
+        ];
+        let count = filter.load_from_domains(&domains).unwrap();
+        assert_eq!(count, 2);
+
+        // Test blocking
+        assert!(filter.is_blocked("ads.example.com").is_some());
+        assert!(filter.is_blocked("www.ads.example.com").is_some()); // subdomain
+        assert!(filter.is_blocked("tracker.net").is_some());
+        assert!(filter.is_blocked("google.com").is_none());
+    }
+
+    #[test]
+    fn test_blocked_response_builder() {
+        use hickory_proto::op::{Message, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+
+        let builder = BlockedResponseBuilder::new(BlockResponseType::ZeroIp);
+
+        // Create a query
+        let mut query = Message::new();
+        query.set_id(0x1234);
+        let name = Name::from_str("blocked.example.com.").unwrap();
+        query.add_query(Query::query(name, RecordType::A));
+
+        // Build response
+        let response = builder.build_response(&query);
+
+        assert_eq!(response.id(), 0x1234);
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert!(!response.answers().is_empty());
+    }
+
+    #[test]
+    fn test_cname_detector_creation() {
+        let detector = CnameDetector::new(5);
+        assert_eq!(detector.max_depth(), 5);
+
+        // Depth is clamped to minimum of 1
+        let detector_zero = CnameDetector::new(0);
+        assert_eq!(detector_zero.max_depth(), 1);
     }
 }
