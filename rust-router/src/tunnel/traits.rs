@@ -424,6 +424,33 @@ pub trait WgTunnel: Send + Sync {
     // Tunnel Control
     // ========================================================================
 
+    /// Connect the tunnel
+    ///
+    /// Initializes the tunnel by:
+    /// 1. Creating the boringtun instance
+    /// 2. Binding the UDP socket
+    /// 3. Starting background tasks for packet processing
+    ///
+    /// After successful connection, the tunnel can send and receive packets.
+    ///
+    /// # Errors
+    ///
+    /// - `AlreadyConnected` - The tunnel is already connected
+    /// - `IoError` - Failed to bind UDP socket
+    /// - `Internal` - Failed to initialize tunnel
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `NotSupported` error. Implementations should override this
+    /// with actual connection logic.
+    fn connect(&self) -> BoxFuture<'_, Result<(), WgTunnelError>> {
+        Box::pin(async {
+            Err(WgTunnelError::NotSupported(
+                "Connect not supported by this implementation".into(),
+            ))
+        })
+    }
+
     /// Trigger a handshake with a specific peer
     ///
     /// This can be used to verify connectivity or refresh session keys.

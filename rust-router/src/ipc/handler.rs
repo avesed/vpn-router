@@ -12,10 +12,11 @@ use super::protocol::{
     BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainListResponse, ChainRoleResponse,
     ChainState, EcmpGroupListResponse, EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IpcCommand,
     IpcResponse, OutboundInfo, OutboundStatsResponse, PairingResponse, PeerListResponse,
-    PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
-    ServerCapabilities, ServerStatus, Socks5PoolStats, UdpProcessorInfo, UdpSessionInfo,
-    UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
-    UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
+    PeerState, PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
+    ServerCapabilities, ServerStatus, Socks5PoolStats, TunnelType, UdpProcessorInfo,
+    UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse,
+    UdpStatsResponse, UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse,
+    WgTunnelStatus,
 };
 use crate::chain::ChainManager;
 use crate::config::{load_config_with_env, OutboundConfig};
@@ -2487,27 +2488,47 @@ impl IpcHandler {
     ///
     /// Returns a list of all userspace WireGuard tunnels.
     fn handle_list_wg_tunnels(&self) -> IpcResponse {
-        let Some(egress_manager) = &self.wg_egress_manager else {
-            return IpcResponse::WgTunnelList(WgTunnelListResponse { tunnels: vec![] });
-        };
+        let mut tunnels = Vec::new();
 
-        let tunnel_tags = egress_manager.list_tunnels();
-        let tunnels: Vec<WgTunnelStatus> = tunnel_tags
-            .iter()
-            .filter_map(|tag| {
-                egress_manager.get_tunnel_status(tag).map(|status| WgTunnelStatus {
-                    tag: status.tag,
-                    active: status.connected,
-                    local_ip: status.local_ip,
-                    peer_endpoint: status.peer_endpoint,
-                    last_handshake: status.stats.last_handshake,
-                    tx_bytes: status.stats.tx_bytes,
-                    rx_bytes: status.stats.rx_bytes,
-                    active_connections: 0,
-                    error: None,
-                })
-            })
-            .collect();
+        // Query WgEgressManager tunnels
+        if let Some(egress_manager) = &self.wg_egress_manager {
+            let tunnel_tags = egress_manager.list_tunnels();
+            for tag in tunnel_tags {
+                if let Some(status) = egress_manager.get_tunnel_status(&tag) {
+                    tunnels.push(WgTunnelStatus {
+                        tag: status.tag,
+                        active: status.connected,
+                        local_ip: status.local_ip,
+                        peer_endpoint: status.peer_endpoint,
+                        last_handshake: status.stats.last_handshake,
+                        tx_bytes: status.stats.tx_bytes,
+                        rx_bytes: status.stats.rx_bytes,
+                        active_connections: 0,
+                        error: None,
+                    });
+                }
+            }
+        }
+
+        // Query PeerManager's WireGuard tunnels (peer connections)
+        if let Some(peer_manager) = &self.peer_manager {
+            let peers = peer_manager.list_peers();
+            for peer in peers {
+                if peer.tunnel_type == TunnelType::WireGuard {
+                    tunnels.push(WgTunnelStatus {
+                        tag: peer.tag,
+                        active: peer.state == PeerState::Connected,
+                        local_ip: peer.tunnel_local_ip,
+                        peer_endpoint: peer.tunnel_remote_ip.unwrap_or_else(|| "unknown".to_string()),
+                        last_handshake: peer.last_handshake,
+                        tx_bytes: peer.tx_bytes,
+                        rx_bytes: peer.rx_bytes,
+                        active_connections: 0,
+                        error: peer.last_error,
+                    });
+                }
+            }
+        }
 
         IpcResponse::WgTunnelList(WgTunnelListResponse { tunnels })
     }

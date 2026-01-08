@@ -376,6 +376,7 @@ impl PeerManager {
             bidirectional: config.bidirectional,
             wg_public_key: Some(local_public_key.clone()),
             tunnel_ip: local_tunnel_ip.map(|ip| ip.to_string()),
+            remote_tunnel_ip: remote_tunnel_ip.map(|ip| ip.to_string()),
             remote_wg_private_key: remote_private_key.clone(),
             remote_wg_public_key: remote_public_key.clone(),
             xray_uuid: None,
@@ -491,11 +492,21 @@ impl PeerManager {
             (priv_key, pub_key)
         };
 
-        // Allocate our tunnel IP
-        let local_tunnel_ip = self
-            .tunnel_ip_allocator
-            .allocate()
-            .map_err(|_| PeerError::IpExhausted)?;
+        // For bidirectional pairing, use the pre-allocated tunnel IP from the request
+        // For non-bidirectional, allocate our own IP
+        let local_tunnel_ip = if request.bidirectional {
+            // Use the remote_tunnel_ip that was pre-allocated for us
+            request
+                .remote_tunnel_ip
+                .as_ref()
+                .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+                .ok_or(PeerError::MissingBidirectionalKey)?
+        } else {
+            // Allocate our own IP for non-bidirectional pairing
+            self.tunnel_ip_allocator
+                .allocate()
+                .map_err(|_| PeerError::IpExhausted)?
+        };
 
         // Allocate tunnel port for our side
         let tunnel_port = self
@@ -558,7 +569,7 @@ impl PeerManager {
             xray_uuid: None,
         };
 
-        // Encode and return
+        // Encode response
         let response_code = encode_pair_response(&response)?;
 
         debug!(
@@ -567,6 +578,24 @@ impl PeerManager {
             code_len = response_code.len(),
             "Pairing response generated"
         );
+
+        // For bidirectional pairing, automatically connect to the peer
+        // This ensures both sides establish the tunnel after pairing completes
+        if request.bidirectional {
+            info!(
+                remote_tag = %request.node_tag,
+                "Bidirectional pairing: auto-connecting to peer"
+            );
+            if let Err(e) = self.connect(&request.node_tag).await {
+                warn!(
+                    remote_tag = %request.node_tag,
+                    error = %e,
+                    "Failed to auto-connect after bidirectional pairing import"
+                );
+                // Don't fail the pairing - the response code is still valid
+                // and the user can manually connect later
+            }
+        }
 
         Ok(response_code)
     }
@@ -643,6 +672,10 @@ impl PeerManager {
             xray_local_socks_port: None,
         };
 
+        // Store bidirectional flag before removing pending request
+        let is_bidirectional = pending.bidirectional;
+        let peer_tag = response.node_tag.clone();
+
         // Add peer to the manager
         self.add_peer_internal(peer_config)?;
 
@@ -653,9 +686,28 @@ impl PeerManager {
         }
 
         debug!(
-            node = %response.node_tag,
+            node = %peer_tag,
             "Pairing handshake completed"
         );
+
+        // For bidirectional pairing, automatically connect to the peer
+        // This ensures both sides establish the tunnel after pairing completes
+        // (Node B connected via import_pair_request, Node A connects here)
+        if is_bidirectional {
+            info!(
+                remote_tag = %peer_tag,
+                "Bidirectional pairing: auto-connecting to peer after handshake"
+            );
+            if let Err(e) = self.connect(&peer_tag).await {
+                warn!(
+                    remote_tag = %peer_tag,
+                    error = %e,
+                    "Failed to auto-connect after handshake completion"
+                );
+                // Don't fail the handshake if auto-connect fails
+                // The peer can still be connected manually later
+            }
+        }
 
         Ok(())
     }
@@ -740,34 +792,31 @@ impl PeerManager {
             )
             .with_persistent_keepalive(config.persistent_keepalive.unwrap_or(25));
 
-        if let Some(port) = config.tunnel_port {
-            let tunnel_config = tunnel_config.with_listen_port(port);
-            // Build tunnel
-            let tunnel = WgTunnelBuilder::new(tunnel_config)
-                .with_tag(tag)
-                .build_userspace()
-                .map_err(|e| PeerError::TunnelCreationFailed(e.to_string()))?;
-
-            // Store tunnel
-            {
-                let mut wg_tunnels = self.wg_tunnels.write();
-                wg_tunnels.insert(tag.to_string(), Arc::new(tunnel));
-            }
+        let tunnel_config = if let Some(port) = config.tunnel_port {
+            tunnel_config.with_listen_port(port)
         } else {
-            // Build tunnel without listen port
-            let tunnel = WgTunnelBuilder::new(tunnel_config)
-                .with_tag(tag)
-                .build_userspace()
-                .map_err(|e| PeerError::TunnelCreationFailed(e.to_string()))?;
+            tunnel_config
+        };
 
-            // Store tunnel
-            {
-                let mut wg_tunnels = self.wg_tunnels.write();
-                wg_tunnels.insert(tag.to_string(), Arc::new(tunnel));
-            }
+        // Build tunnel
+        let tunnel = WgTunnelBuilder::new(tunnel_config)
+            .with_tag(tag)
+            .build_userspace()
+            .map_err(|e| PeerError::TunnelCreationFailed(e.to_string()))?;
+
+        // Connect the tunnel (this starts the UDP socket and background tasks)
+        tunnel
+            .connect()
+            .await
+            .map_err(|e| PeerError::TunnelCreationFailed(format!("Failed to connect tunnel: {e}")))?;
+
+        // Store tunnel
+        {
+            let mut wg_tunnels = self.wg_tunnels.write();
+            wg_tunnels.insert(tag.to_string(), Arc::new(tunnel));
         }
 
-        debug!(tag = %tag, "WireGuard tunnel created");
+        debug!(tag = %tag, "WireGuard tunnel created and connected");
 
         Ok(())
     }

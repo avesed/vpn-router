@@ -1678,6 +1678,13 @@ impl WgTunnel for UserspaceWgTunnel {
     // Phase 6.2: Tunnel Control
     // ========================================================================
 
+    fn connect(&self) -> BoxFuture<'_, Result<(), WgTunnelError>> {
+        Box::pin(async move {
+            // Delegate to the inherent async connect method
+            UserspaceWgTunnel::connect(self).await
+        })
+    }
+
     fn trigger_handshake(
         &self,
         peer_public_key: Option<&str>,

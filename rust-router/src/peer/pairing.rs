@@ -104,7 +104,10 @@ pub struct PairRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tunnel_ip: Option<String>,
 
-    // Bidirectional pairing: Pre-generated keys for remote node
+    // Bidirectional pairing: Pre-generated keys and IP for remote node
+    /// Pre-allocated tunnel IP for remote node (bidirectional only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_tunnel_ip: Option<String>,
     /// Pre-generated private key for remote node (bidirectional only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_wg_private_key: Option<String>,
@@ -416,6 +419,7 @@ mod tests {
             bidirectional: false,
             wg_public_key: Some("test-key".to_string()),
             tunnel_ip: Some("10.200.200.1".to_string()),
+            remote_tunnel_ip: None,
             remote_wg_private_key: None,
             remote_wg_public_key: None,
             xray_uuid: None,
@@ -475,6 +479,7 @@ mod tests {
             bidirectional: false,
             wg_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             tunnel_ip: Some("10.200.200.1".to_string()),
+            remote_tunnel_ip: None,
             remote_wg_private_key: None,
             remote_wg_public_key: None,
             xray_uuid: None,
