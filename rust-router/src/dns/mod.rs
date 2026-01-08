@@ -111,9 +111,26 @@
 //! - [`filter::CnameDetector`]: CNAME chain detection for bypass prevention
 //! - [`filter::BlockedResponseBuilder`]: Response generator for blocked queries
 //!
+//! # Phase 7.5 Deliverables
+//!
+//! This phase adds the DNS splitting module:
+//!
+//! - [`split::DnsRouter`]: Per-domain upstream routing with ArcSwap hot-reload
+//! - [`split::DomainMatchType`]: Match types (Exact, Suffix, Keyword, Regex)
+//! - [`split::RouteInfo`]: Route configuration information
+//! - [`split::DnsRouterStats`]: Routing statistics with atomic counters
+//!
+//! # Phase 7.6 Deliverables
+//!
+//! This phase adds the DNS query logging module:
+//!
+//! - [`log::QueryLogger`]: Async non-blocking query logger with batch writes
+//! - [`log::QueryLogEntry`]: DNS query log entry with serialization support
+//! - [`log::LogRotator`]: Time-based log rotation with configurable retention
+//! - [`log::LogStats`]: Atomic logging statistics (entries, drops, bytes)
+//! - [`log::RotationStats`]: Rotation statistics (rotations, deletions)
+//!
 //! Future phases will add:
-//! - Phase 7.5: DNS splitting (per-domain routing)
-//! - Phase 7.6: Query logging
 //! - Phase 7.7: Integration and testing
 
 pub mod cache;
@@ -121,7 +138,9 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod filter;
+pub mod log;
 pub mod server;
+pub mod split;
 
 // Re-export commonly used types at module level
 pub use config::{
@@ -151,6 +170,12 @@ pub use client::DotClient;
 
 // Re-export filter types
 pub use filter::{BlockFilter, BlockFilterStats, BlockReason, BlockedResponseBuilder, CnameBlockReason, CnameDetector};
+
+// Re-export split types
+pub use split::{DnsRouter, DnsRouterStats, DnsRouterStatsSnapshot, DomainMatchType, RouteInfo};
+
+// Re-export log types
+pub use log::{LogRotator, LogStats, LogStatsSnapshot, QueryLogEntry, QueryLogger, RotationStats, RotationStatsSnapshot};
 
 #[cfg(test)]
 mod tests {
@@ -398,5 +423,200 @@ mod tests {
         // Depth is clamped to minimum of 1
         let detector_zero = CnameDetector::new(0);
         assert_eq!(detector_zero.max_depth(), 1);
+    }
+
+    // ========================================================================
+    // Phase 7.5: Split Module Tests
+    // ========================================================================
+
+    #[test]
+    fn test_split_module_exports() {
+        // Verify split types are accessible
+        let router = DnsRouter::new("default".to_string());
+        assert_eq!(router.default_upstream(), "default");
+        assert!(router.is_empty());
+    }
+
+    #[test]
+    fn test_split_router_basic_routing() {
+        let router = DnsRouter::new("direct".to_string());
+        router.add_route("cn", DomainMatchType::Suffix, "china").unwrap();
+        router.add_route("google.com", DomainMatchType::Suffix, "google").unwrap();
+
+        assert_eq!(router.route_to_tag("baidu.cn"), "china");
+        assert_eq!(router.route_to_tag("mail.google.com"), "google");
+        assert_eq!(router.route_to_tag("example.org"), "direct");
+    }
+
+    #[test]
+    fn test_split_route_info() {
+        let info = RouteInfo::new("example.com", DomainMatchType::Suffix, "upstream");
+        assert_eq!(info.pattern, "example.com");
+        assert_eq!(info.match_type, DomainMatchType::Suffix);
+        assert_eq!(info.upstream_tag, "upstream");
+    }
+
+    #[test]
+    fn test_split_domain_match_types() {
+        assert_eq!(format!("{}", DomainMatchType::Exact), "exact");
+        assert_eq!(format!("{}", DomainMatchType::Suffix), "suffix");
+        assert_eq!(format!("{}", DomainMatchType::Keyword), "keyword");
+        assert_eq!(format!("{}", DomainMatchType::Regex), "regex");
+    }
+
+    #[test]
+    fn test_split_router_stats() {
+        let router = DnsRouter::new("default".to_string());
+        router.add_route("test.com", DomainMatchType::Suffix, "test").unwrap();
+
+        // Generate some stats
+        let _ = router.route_to_tag("test.com"); // Match
+        let _ = router.route_to_tag("other.com"); // Fallback
+
+        let stats = router.stats();
+        assert_eq!(stats.routes_evaluated, 2);
+        assert_eq!(stats.default_fallbacks, 1);
+        assert_eq!(stats.rule_count, 1);
+    }
+
+    // ========================================================================
+    // Phase 7.6: Log Module Tests
+    // ========================================================================
+
+    #[test]
+    fn test_log_module_exports() {
+        // Verify log types are accessible
+        let entry = QueryLogEntry::new("example.com", 1);
+        assert_eq!(entry.domain, "example.com");
+
+        let logger = QueryLogger::disabled();
+        assert!(!logger.is_enabled());
+
+        let _stats = LogStats::new();
+        let _snapshot = LogStatsSnapshot::default();
+        let _rotation_snapshot = RotationStatsSnapshot::default();
+    }
+
+    #[test]
+    fn test_query_log_entry_builder() {
+        let entry = QueryLogEntry::new("test.example.com", 28)
+            .with_upstream("cloudflare")
+            .with_latency_us(2000)
+            .with_response_code(0)
+            .with_blocked(false)
+            .with_cached(true);
+
+        assert_eq!(entry.domain, "test.example.com");
+        assert_eq!(entry.qtype, 28);
+        assert_eq!(entry.upstream, "cloudflare");
+        assert_eq!(entry.latency_us, 2000);
+        assert_eq!(entry.response_code, 0);
+        assert!(!entry.blocked);
+        assert!(entry.cached);
+    }
+
+    #[test]
+    fn test_query_log_entry_qtype_str() {
+        let entry_a = QueryLogEntry::new("example.com", 1);
+        assert_eq!(entry_a.qtype_str(), "A");
+
+        let entry_aaaa = QueryLogEntry::new("example.com", 28);
+        assert_eq!(entry_aaaa.qtype_str(), "AAAA");
+
+        let entry_cname = QueryLogEntry::new("example.com", 5);
+        assert_eq!(entry_cname.qtype_str(), "CNAME");
+    }
+
+    #[test]
+    fn test_query_log_entry_rcode_str() {
+        let entry_ok = QueryLogEntry::new("example.com", 1).with_response_code(0);
+        assert_eq!(entry_ok.rcode_str(), "NOERROR");
+
+        let entry_nx = QueryLogEntry::new("example.com", 1).with_response_code(3);
+        assert_eq!(entry_nx.rcode_str(), "NXDOMAIN");
+
+        let entry_refused = QueryLogEntry::new("example.com", 1).with_response_code(5);
+        assert_eq!(entry_refused.rcode_str(), "REFUSED");
+    }
+
+    #[test]
+    fn test_query_log_entry_serialization() {
+        let entry = QueryLogEntry::new("example.com", 1)
+            .with_timestamp(1704067200000)
+            .with_upstream("google");
+
+        // JSON serialization
+        let json = entry.to_json();
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("\"qtype\":1"));
+
+        // TSV serialization
+        let tsv = entry.to_tsv();
+        assert!(tsv.contains("example.com"));
+        assert!(tsv.contains('\t'));
+
+        // Binary roundtrip
+        let binary = entry.to_binary().expect("serialize");
+        let decoded = QueryLogEntry::from_binary(&binary).expect("deserialize");
+        assert_eq!(entry.domain, decoded.domain);
+        assert_eq!(entry.qtype, decoded.qtype);
+    }
+
+    #[test]
+    fn test_log_stats_operations() {
+        let stats = LogStats::new();
+        assert_eq!(stats.entries_logged(), 0);
+        assert_eq!(stats.entries_dropped(), 0);
+
+        stats.record_logged();
+        stats.record_logged_batch(10);
+        assert_eq!(stats.entries_logged(), 11);
+
+        stats.record_dropped();
+        stats.record_dropped();
+        assert_eq!(stats.entries_dropped(), 2);
+
+        stats.record_bytes_written(1000);
+        assert_eq!(stats.bytes_written(), 1000);
+
+        stats.record_batch_written();
+        assert_eq!(stats.batches_written(), 1);
+    }
+
+    #[test]
+    fn test_log_stats_drop_rate() {
+        let stats = LogStats::new();
+        assert_eq!(stats.drop_rate(), 0.0);
+
+        stats.record_logged_batch(90);
+        for _ in 0..10 {
+            stats.record_dropped();
+        }
+
+        // 90 logged + 10 dropped = 10% drop rate
+        let rate = stats.drop_rate();
+        assert!((rate - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_log_rotator_creation() {
+        use std::path::PathBuf;
+        let rotator = LogRotator::new(PathBuf::from("./test.log"), 7, 7);
+        assert_eq!(rotator.rotation_days(), 7);
+        assert_eq!(rotator.max_files(), 7);
+    }
+
+    #[test]
+    fn test_rotation_stats() {
+        let stats = RotationStats::new();
+        assert_eq!(stats.rotations_performed(), 0);
+        assert_eq!(stats.files_deleted(), 0);
+
+        stats.record_rotation();
+        assert_eq!(stats.rotations_performed(), 1);
+
+        stats.record_deletion(3, 1024);
+        assert_eq!(stats.files_deleted(), 3);
+        assert_eq!(stats.bytes_freed(), 1024);
     }
 }

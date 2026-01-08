@@ -79,6 +79,12 @@ rand = "0.8"
 # Parking lot for efficient synchronization
 parking_lot = "0.12"
 
+# Binary serialization
+bincode = "1.3"
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
 # Hostname detection
 hostname = "0.3"
 
