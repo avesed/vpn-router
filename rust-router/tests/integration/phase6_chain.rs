@@ -2045,3 +2045,614 @@ async fn test_recover_chains_in_normal_states() {
     let status3 = manager.get_chain_status("error-chain").unwrap();
     assert_eq!(status3.state, ChainState::Error);
 }
+
+// ============================================================================
+// Phase 6.11 - Three-Node Chain E2E Tests
+// ============================================================================
+
+/// Test a complete 3-node chain flow (Entry -> Relay -> Terminal)
+///
+/// This test simulates the full chain activation flow across three nodes:
+/// 1. Entry node creates chain and sends PREPARE to relay and terminal
+/// 2. Relay and Terminal nodes handle PREPARE
+/// 3. Entry sends COMMIT to activate the chain
+#[tokio::test]
+async fn test_3_node_chain_e2e_lifecycle() {
+    let entry_manager = ChainManager::new("node-a".to_string());
+    let relay_manager = ChainManager::new("node-b".to_string());
+    let terminal_manager = ChainManager::new("node-c".to_string());
+
+    entry_manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+    relay_manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+    terminal_manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+
+    let config = create_three_hop_config("e2e-3node-chain", 35);
+
+    // Entry node creates chain
+    let dscp = entry_manager.create_chain(config.clone()).await.unwrap();
+    assert_eq!(dscp, 35);
+
+    // Entry node sends PREPARE to relay and terminal
+    relay_manager
+        .handle_prepare_request("e2e-3node-chain", config.clone(), "node-a")
+        .await
+        .expect("Relay should accept PREPARE");
+
+    terminal_manager
+        .handle_prepare_request("e2e-3node-chain", config, "node-a")
+        .await
+        .expect("Terminal should accept PREPARE");
+
+    // All nodes should have the chain
+    assert!(entry_manager.chain_exists("e2e-3node-chain"));
+    assert!(relay_manager.chain_exists("e2e-3node-chain"));
+    assert!(terminal_manager.chain_exists("e2e-3node-chain"));
+
+    // All should be in Inactive state (waiting for COMMIT)
+    assert_eq!(
+        entry_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        ChainState::Inactive
+    );
+    assert_eq!(
+        relay_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        ChainState::Inactive
+    );
+    assert_eq!(
+        terminal_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        ChainState::Inactive
+    );
+
+    // Entry sends COMMIT
+    relay_manager
+        .handle_commit_request("e2e-3node-chain", "node-a")
+        .await
+        .expect("Relay should accept COMMIT");
+
+    terminal_manager
+        .handle_commit_request("e2e-3node-chain", "node-a")
+        .await
+        .expect("Terminal should accept COMMIT");
+
+    entry_manager
+        .activate_chain("e2e-3node-chain")
+        .await
+        .expect("Entry should activate");
+
+    // All should now be Active
+    assert_eq!(
+        entry_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        ChainState::Active
+    );
+    assert_eq!(
+        relay_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        ChainState::Active
+    );
+    assert_eq!(
+        terminal_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        ChainState::Active
+    );
+
+    // Verify roles
+    assert_eq!(
+        entry_manager.get_chain_role("e2e-3node-chain"),
+        Some(ChainRole::Entry)
+    );
+    assert_eq!(
+        relay_manager.get_chain_role("e2e-3node-chain"),
+        Some(ChainRole::Relay)
+    );
+    assert_eq!(
+        terminal_manager.get_chain_role("e2e-3node-chain"),
+        Some(ChainRole::Terminal)
+    );
+}
+
+/// Test 3-node chain abort flow
+#[tokio::test]
+async fn test_3_node_chain_abort_flow() {
+    let entry_manager = ChainManager::new("node-a".to_string());
+    let relay_manager = ChainManager::new("node-b".to_string());
+    let terminal_manager = ChainManager::new("node-c".to_string());
+
+    let config = create_three_hop_config("abort-3node-chain", 40);
+
+    // Entry node creates chain and sends PREPARE
+    entry_manager.create_chain(config.clone()).await.unwrap();
+    relay_manager
+        .handle_prepare_request("abort-3node-chain", config.clone(), "node-a")
+        .await
+        .unwrap();
+    terminal_manager
+        .handle_prepare_request("abort-3node-chain", config, "node-a")
+        .await
+        .unwrap();
+
+    // Entry decides to abort (e.g., one node failed)
+    relay_manager
+        .handle_abort_request("abort-3node-chain", "node-a")
+        .await
+        .expect("Relay should accept ABORT");
+
+    terminal_manager
+        .handle_abort_request("abort-3node-chain", "node-a")
+        .await
+        .expect("Terminal should accept ABORT");
+
+    // Entry removes its own chain
+    entry_manager.remove_chain("abort-3node-chain").await.unwrap();
+
+    // All chains should be removed
+    assert!(!entry_manager.chain_exists("abort-3node-chain"));
+    assert!(!relay_manager.chain_exists("abort-3node-chain"));
+    assert!(!terminal_manager.chain_exists("abort-3node-chain"));
+}
+
+/// Test DSCP packet flow simulation in a 3-node chain
+#[test]
+fn test_3_node_chain_dscp_packet_flow() {
+    // Simulate packet processing at each hop
+
+    // Entry node sets DSCP
+    let mut packet = create_ipv4_packet(0);
+    let chain_dscp = 45;
+
+    // Entry marks packet with chain DSCP
+    set_dscp(&mut packet, chain_dscp).unwrap();
+    assert_eq!(get_dscp(&packet).unwrap(), chain_dscp);
+    assert!(verify_ipv4_checksum(&packet));
+
+    // Relay node reads DSCP, forwards unchanged
+    let relay_dscp = get_dscp(&packet).unwrap();
+    assert_eq!(relay_dscp, chain_dscp);
+
+    // Terminal node reads DSCP, applies exit egress
+    let terminal_dscp = get_dscp(&packet).unwrap();
+    assert_eq!(terminal_dscp, chain_dscp);
+
+    // After terminal processing, DSCP can be cleared
+    set_dscp(&mut packet, 0).unwrap();
+    assert_eq!(get_dscp(&packet).unwrap(), 0);
+}
+
+// ============================================================================
+// Phase 6.11 - Xray Relay Rejection Tests
+// ============================================================================
+
+/// Test that Xray tunnel in relay position is rejected
+///
+/// Xray tunnels use SOCKS5 proxy protocol which strips DSCP headers,
+/// breaking relay routing. Only WireGuard tunnels preserve IP headers.
+#[tokio::test]
+async fn test_xray_relay_rejected_explicit() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    let config = ChainConfig {
+        tag: "xray-relay-rejected".to_string(),
+        description: "Chain with Xray relay should be rejected".to_string(),
+        dscp_value: 0,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Relay,
+                tunnel_type: TunnelType::Xray, // MUST be rejected
+            },
+            ChainHop {
+                node_tag: "node-c".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ],
+        rules: vec![],
+        exit_egress: "pia-us-east".to_string(),
+        allow_transitive: false,
+    };
+
+    let result = manager.create_chain(config).await;
+    assert!(
+        matches!(result, Err(ChainError::XrayRelayNotAllowed)),
+        "Xray relay should be rejected: {:?}",
+        result
+    );
+}
+
+/// Test that Xray in entry position is allowed
+#[tokio::test]
+async fn test_xray_entry_allowed_in_chain() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    let config = ChainConfig {
+        tag: "xray-entry-allowed".to_string(),
+        description: "Chain with Xray entry should be allowed".to_string(),
+        dscp_value: 0,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::Xray, // OK for entry
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Relay,
+                tunnel_type: TunnelType::WireGuard, // Must be WireGuard
+            },
+            ChainHop {
+                node_tag: "node-c".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ],
+        rules: vec![],
+        exit_egress: "pia-us-east".to_string(),
+        allow_transitive: false,
+    };
+
+    let result = manager.create_chain(config).await;
+    assert!(result.is_ok(), "Xray entry should be allowed: {:?}", result);
+}
+
+/// Test that Xray in terminal position is allowed
+#[tokio::test]
+async fn test_xray_terminal_allowed_in_chain() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    let config = ChainConfig {
+        tag: "xray-terminal-allowed".to_string(),
+        description: "Chain with Xray terminal should be allowed".to_string(),
+        dscp_value: 0,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Relay,
+                tunnel_type: TunnelType::WireGuard, // Must be WireGuard
+            },
+            ChainHop {
+                node_tag: "node-c".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::Xray, // OK for terminal
+            },
+        ],
+        rules: vec![],
+        exit_egress: "pia-us-east".to_string(),
+        allow_transitive: false,
+    };
+
+    let result = manager.create_chain(config).await;
+    assert!(result.is_ok(), "Xray terminal should be allowed: {:?}", result);
+}
+
+/// Test that multiple Xray relays are all rejected
+#[tokio::test]
+async fn test_multiple_xray_relays_rejected() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    let config = ChainConfig {
+        tag: "multi-xray-relay".to_string(),
+        description: "Chain with multiple Xray relays".to_string(),
+        dscp_value: 0,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Relay,
+                tunnel_type: TunnelType::Xray, // First Xray relay - rejected
+            },
+            ChainHop {
+                node_tag: "node-c".to_string(),
+                role: ChainRole::Relay,
+                tunnel_type: TunnelType::Xray, // Second Xray relay
+            },
+            ChainHop {
+                node_tag: "node-d".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ],
+        rules: vec![],
+        exit_egress: "pia-us-east".to_string(),
+        allow_transitive: false,
+    };
+
+    let result = manager.create_chain(config).await;
+    assert!(matches!(result, Err(ChainError::XrayRelayNotAllowed)));
+}
+
+// ============================================================================
+// Phase 6.11 - SOCKS Egress Rejection Tests
+// ============================================================================
+
+/// Test that "direct" egress is rejected in chain (covered in existing tests)
+/// This is a validation test for completeness
+#[tokio::test]
+async fn test_direct_egress_explicitly_rejected() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    let mut config = create_two_hop_config("direct-reject-test", 0);
+    config.exit_egress = "direct".to_string();
+
+    let result = manager.create_chain(config).await;
+    assert!(
+        matches!(result, Err(ChainError::DirectNotAllowed)),
+        "Direct egress should be rejected"
+    );
+}
+
+/// Test that SOCKS-based egress tags work when properly configured
+/// (The actual V2Ray/WARP rejection is done at API level, not ChainManager)
+#[tokio::test]
+async fn test_valid_egress_tags_accepted() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    // Test various valid egress tags
+    let valid_egress_tags = vec![
+        "pia-us-east",
+        "custom-wg-exit",
+        "wg-peer-node",
+        "openvpn-server",
+    ];
+
+    for (i, egress) in valid_egress_tags.iter().enumerate() {
+        let mut config = create_two_hop_config(&format!("valid-egress-{}", i), 0);
+        config.exit_egress = egress.to_string();
+
+        let result = manager.create_chain(config).await;
+        assert!(result.is_ok(), "Valid egress '{}' should be accepted", egress);
+    }
+}
+
+// ============================================================================
+// Phase 6.11 - Remote Egress Validation Tests
+// ============================================================================
+
+/// Test transitive mode skips egress validation
+///
+/// When `allow_transitive=true`, the entry node does not validate
+/// whether the exit_egress exists on the terminal node.
+#[tokio::test]
+async fn test_transitive_mode_skips_validation() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    let config = ChainConfig {
+        tag: "transitive-skip".to_string(),
+        description: "Transitive chain skips validation".to_string(),
+        dscp_value: 0,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ],
+        rules: vec![],
+        exit_egress: "unknown-remote-egress".to_string(), // Would fail validation normally
+        allow_transitive: true, // Skip validation
+    };
+
+    let result = manager.create_chain(config).await;
+    assert!(result.is_ok(), "Transitive mode should skip egress validation");
+
+    let retrieved = manager.get_chain_config("transitive-skip").unwrap();
+    assert!(retrieved.allow_transitive);
+    assert_eq!(retrieved.exit_egress, "unknown-remote-egress");
+}
+
+/// Test non-transitive mode with valid local egress
+///
+/// In non-transitive mode, only the first hop is validated locally.
+#[tokio::test]
+async fn test_non_transitive_local_validation() {
+    let manager = ChainManager::new("node-a".to_string());
+
+    // Create a chain where entry node validates its own egress
+    let config = ChainConfig {
+        tag: "non-transitive-local".to_string(),
+        description: "Non-transitive chain validates locally".to_string(),
+        dscp_value: 0,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ],
+        rules: vec![],
+        exit_egress: "pia-us-east".to_string(),
+        allow_transitive: false,
+    };
+
+    let result = manager.create_chain(config).await;
+    assert!(result.is_ok());
+
+    let retrieved = manager.get_chain_config("non-transitive-local").unwrap();
+    assert!(!retrieved.allow_transitive);
+}
+
+/// Test that chain config preserves allow_transitive field through serialization
+#[test]
+fn test_allow_transitive_serialization() {
+    let config = ChainConfig {
+        tag: "transitive-serde".to_string(),
+        description: "Test serialization".to_string(),
+        dscp_value: 10,
+        hops: vec![ChainHop {
+            node_tag: "node-a".to_string(),
+            role: ChainRole::Terminal,
+            tunnel_type: TunnelType::WireGuard,
+        }],
+        rules: vec![],
+        exit_egress: "some-egress".to_string(),
+        allow_transitive: true,
+    };
+
+    let json = serde_json::to_string(&config).unwrap();
+    let decoded: ChainConfig = serde_json::from_str(&json).unwrap();
+
+    assert!(decoded.allow_transitive);
+}
+
+/// Test chain status includes correct my_role for all node positions
+#[tokio::test]
+async fn test_chain_status_my_role_all_positions() {
+    // Entry node
+    let entry_manager = ChainManager::new("node-a".to_string());
+    let config = create_three_hop_config("role-status-test", 50);
+    entry_manager.create_chain(config.clone()).await.unwrap();
+
+    let entry_status = entry_manager.get_chain_status("role-status-test").unwrap();
+    assert_eq!(entry_status.my_role, Some(ChainRole::Entry));
+
+    // Relay node
+    let relay_manager = ChainManager::new("node-b".to_string());
+    relay_manager.create_chain(config.clone()).await.unwrap();
+
+    let relay_status = relay_manager.get_chain_status("role-status-test").unwrap();
+    assert_eq!(relay_status.my_role, Some(ChainRole::Relay));
+
+    // Terminal node
+    let terminal_manager = ChainManager::new("node-c".to_string());
+    terminal_manager.create_chain(config).await.unwrap();
+
+    let terminal_status = terminal_manager.get_chain_status("role-status-test").unwrap();
+    assert_eq!(terminal_status.my_role, Some(ChainRole::Terminal));
+}
+
+// ============================================================================
+// Phase 6.11 - Chain State and Peer Connectivity Tests
+// ============================================================================
+
+/// Test chain activation fails when required peer is not connected
+///
+/// The ChainManager checks peer connectivity via PeerConnectivityCallback
+/// before allowing activation.
+#[tokio::test]
+async fn test_chain_activation_requires_peer_connectivity() {
+    let manager = ChainManager::new("node-a".to_string());
+    let peer_callback = Arc::new(MockPeerConnectivity::new());
+
+    // node-b is NOT connected
+    manager.set_peer_callback(peer_callback.clone());
+    manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+
+    // Create a chain
+    let config = create_two_hop_config("peer-check-chain", 55);
+    manager.create_chain(config).await.unwrap();
+
+    // Activation should fail because node-b is not connected
+    let result = manager.activate_chain("peer-check-chain").await;
+    assert!(
+        matches!(result, Err(ChainError::PeerNotConnected(_))),
+        "Activation should fail when peer not connected: {:?}",
+        result
+    );
+}
+
+/// Test chain activation succeeds when required peer is connected
+#[tokio::test]
+async fn test_chain_activation_succeeds_with_connected_peer() {
+    let manager = ChainManager::new("node-a".to_string());
+    let peer_callback = Arc::new(MockPeerConnectivity::new());
+
+    // Set node-b as connected
+    peer_callback.set_connected("node-b");
+
+    manager.set_peer_callback(peer_callback);
+    manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+
+    let config = create_two_hop_config("connected-peer-chain", 0);
+    manager.create_chain(config).await.unwrap();
+
+    let result = manager.activate_chain("connected-peer-chain").await;
+    assert!(result.is_ok(), "Activation should succeed when peer connected");
+
+    let status = manager.get_chain_status("connected-peer-chain").unwrap();
+    assert_eq!(status.state, ChainState::Active);
+}
+
+/// Test multi-hop chain requires all peers to be connected
+#[tokio::test]
+async fn test_multi_hop_chain_requires_all_peers_connected() {
+    let manager = ChainManager::new("node-a".to_string());
+    let peer_callback = Arc::new(MockPeerConnectivity::new());
+
+    // Only node-b connected, node-c not connected
+    peer_callback.set_connected("node-b");
+
+    manager.set_peer_callback(peer_callback.clone());
+    manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+
+    let config = create_three_hop_config("multi-hop-peer-check", 0);
+    manager.create_chain(config).await.unwrap();
+
+    // Should fail because node-c is not connected
+    let result = manager.activate_chain("multi-hop-peer-check").await;
+    assert!(
+        matches!(result, Err(ChainError::PeerNotConnected(_))),
+        "Should fail when any peer is not connected: {:?}",
+        result
+    );
+
+    // Now connect node-c
+    peer_callback.set_connected("node-c");
+
+    // Should succeed now
+    let result = manager.activate_chain("multi-hop-peer-check").await;
+    assert!(result.is_ok(), "Should succeed when all peers connected");
+}
+
+/// Test chain can be deactivated and reactivated
+#[tokio::test]
+async fn test_chain_deactivate_and_reactivate() {
+    let manager = ChainManager::new("node-a".to_string());
+    let peer_callback = Arc::new(MockPeerConnectivity::new());
+
+    peer_callback.set_connected("node-b");
+    manager.set_peer_callback(peer_callback);
+    manager.set_routing_callback(Arc::new(NoOpRoutingCallback));
+
+    let config = create_two_hop_config("reactivate-chain", 0);
+    manager.create_chain(config).await.unwrap();
+
+    // Activate
+    manager.activate_chain("reactivate-chain").await.unwrap();
+    assert_eq!(
+        manager.get_chain_status("reactivate-chain").unwrap().state,
+        ChainState::Active
+    );
+
+    // Deactivate
+    manager.deactivate_chain("reactivate-chain").await.unwrap();
+    assert_eq!(
+        manager.get_chain_status("reactivate-chain").unwrap().state,
+        ChainState::Inactive
+    );
+
+    // Reactivate
+    manager.activate_chain("reactivate-chain").await.unwrap();
+    assert_eq!(
+        manager.get_chain_status("reactivate-chain").unwrap().state,
+        ChainState::Active
+    );
+}

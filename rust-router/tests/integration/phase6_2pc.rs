@@ -70,6 +70,29 @@ fn create_test_chain_config() -> ChainConfig {
     }
 }
 
+fn create_test_chain_config_with_tag(tag: &str) -> ChainConfig {
+    ChainConfig {
+        tag: tag.to_string(),
+        description: format!("Test chain {}", tag),
+        dscp_value: 10,
+        hops: vec![
+            ChainHop {
+                node_tag: "node-a".to_string(),
+                role: ChainRole::Entry,
+                tunnel_type: TunnelType::WireGuard,
+            },
+            ChainHop {
+                node_tag: "node-b".to_string(),
+                role: ChainRole::Terminal,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        ],
+        rules: vec![],
+        exit_egress: "pia-us-east".to_string(),
+        allow_transitive: false,
+    }
+}
+
 fn create_three_hop_config() -> ChainConfig {
     ChainConfig {
         tag: "three-hop-chain".to_string(),
@@ -1329,4 +1352,457 @@ async fn test_noop_network_client() {
     assert!(client.send_prepare("any-node", &config).await.is_ok());
     assert!(client.send_commit("any-node", "any-chain").await.is_ok());
     assert!(client.send_abort("any-node", "any-chain").await.is_ok());
+}
+
+// ============================================================================
+// Phase 6.11 - Network Partition Tests
+// ============================================================================
+
+/// Test 2PC behavior when a node becomes unreachable during PREPARE (network partition)
+///
+/// When a node is unreachable during PREPARE, the coordinator should:
+/// 1. Timeout on the unreachable node
+/// 2. Mark that node as failed
+/// 3. Abort all prepared nodes
+#[tokio::test]
+async fn test_2pc_network_partition_during_prepare() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+
+    // Simulate node-b being unreachable (fails immediately)
+    mock_client.fail_prepare("node-b", "Network unreachable");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(), // This one will fail
+        "node-c".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "partition-chain".to_string(),
+        create_test_chain_config_with_tag("partition-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare should fail due to network issue
+    let prepare_errors = coordinator.prepare_all().await;
+
+    // At least one node should have failed
+    assert!(!prepare_errors.is_empty(), "Should have prepare failures due to network issue");
+
+    // Node-b should be failed
+    let node_b = coordinator.get_participant("node-b").unwrap();
+    assert!(matches!(node_b.state, TwoPhaseState::Failed(_)));
+}
+
+/// Test that prepare failure on one node should be handled in the coordinator
+#[tokio::test]
+async fn test_2pc_prepare_failure_triggers_partial_failure() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.fail_prepare("node-b", "Validation failed");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "abort-test-chain".to_string(),
+        create_test_chain_config_with_tag("abort-test-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare will have failures
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(!prepare_errors.is_empty());
+
+    // Should not be able to commit
+    assert!(!coordinator.all_prepared());
+
+    // Abort all nodes (those that prepared successfully)
+    let abort_errors = coordinator.abort_all().await;
+
+    // Check that abort happened (may or may not have errors)
+    // After abort, verify state - each participant should be in a terminal state
+    for participant in coordinator.participants() {
+        // Either Aborted (if it was prepared) or Failed (if prepare failed)
+        assert!(
+            matches!(participant.state, TwoPhaseState::Aborted | TwoPhaseState::Failed(_)),
+            "Participant {} should be aborted or failed, was {:?}",
+            participant.node_tag,
+            participant.state
+        );
+    }
+}
+
+/// Test 2PC with multiple prepare failures
+#[tokio::test]
+async fn test_2pc_multiple_prepare_failures() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.fail_prepare("node-a", "Invalid DSCP");
+    mock_client.fail_prepare("node-c", "Peer not connected");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+        "node-d".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "multi-fail-chain".to_string(),
+        create_test_chain_config_with_tag("multi-fail-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare should fail on multiple nodes
+    let prepare_errors = coordinator.prepare_all().await;
+
+    // Should have 2 failures
+    assert_eq!(prepare_errors.len(), 2);
+
+    // Verify failed nodes
+    let failed = coordinator.failed_nodes();
+    assert!(failed.contains(&"node-a".to_string()));
+    assert!(failed.contains(&"node-c".to_string()));
+
+    // Verify prepared nodes
+    let prepared = coordinator.prepared_nodes();
+    assert!(prepared.contains(&"node-b".to_string()));
+    assert!(prepared.contains(&"node-d".to_string()));
+}
+
+/// Test commit partial failure (some nodes fail during commit)
+#[tokio::test]
+async fn test_2pc_commit_partial_failure() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    // Prepare all succeed, but some commits fail
+    mock_client.fail_commit("node-b", "Failed to apply rules");
+    mock_client.fail_commit("node-d", "Out of memory");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+        "node-d".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "partial-commit-chain".to_string(),
+        create_test_chain_config_with_tag("partial-commit-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare all should succeed
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(prepare_errors.is_empty());
+    assert!(coordinator.all_prepared());
+
+    // Commit should have partial failures
+    let commit_errors = coordinator.commit_all().await;
+    assert_eq!(commit_errors.len(), 2);
+
+    // Check states
+    let node_a = coordinator.get_participant("node-a").unwrap();
+    assert_eq!(node_a.state, TwoPhaseState::Committed);
+
+    let node_b = coordinator.get_participant("node-b").unwrap();
+    assert!(matches!(node_b.state, TwoPhaseState::Failed(_)));
+
+    let node_c = coordinator.get_participant("node-c").unwrap();
+    assert_eq!(node_c.state, TwoPhaseState::Committed);
+
+    let node_d = coordinator.get_participant("node-d").unwrap();
+    assert!(matches!(node_d.state, TwoPhaseState::Failed(_)));
+
+    // Should not be all_committed
+    assert!(!coordinator.all_committed());
+}
+
+// ============================================================================
+// Phase 6.11 - Abort Recovery Tests
+// ============================================================================
+
+/// Test that abort properly cleans up state after prepare
+#[tokio::test]
+async fn test_2pc_abort_cleans_state_after_prepare() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "abort-cleanup-chain".to_string(),
+        create_test_chain_config_with_tag("abort-cleanup-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare all successfully
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(prepare_errors.is_empty());
+    assert!(coordinator.all_prepared());
+
+    // Now abort instead of commit
+    coordinator.abort_all().await;
+
+    // All nodes should be in Aborted state
+    for participant in coordinator.participants() {
+        assert_eq!(
+            participant.state,
+            TwoPhaseState::Aborted,
+            "Participant {} should be aborted",
+            participant.node_tag
+        );
+    }
+
+    // Transaction should be aborted
+    assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Aborted);
+}
+
+/// Test that coordinator tracks abort errors
+#[tokio::test]
+async fn test_2pc_abort_error_tracking() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.fail_abort("node-b", "Cannot rollback");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "abort-error-chain".to_string(),
+        create_test_chain_config_with_tag("abort-error-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare all
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(prepare_errors.is_empty());
+
+    // Abort all - network errors are logged but all nodes marked aborted
+    coordinator.abort_all().await;
+
+    // node-a and node-c should be aborted successfully
+    let node_a = coordinator.get_participant("node-a").unwrap();
+    assert_eq!(node_a.state, TwoPhaseState::Aborted);
+
+    let node_c = coordinator.get_participant("node-c").unwrap();
+    assert_eq!(node_c.state, TwoPhaseState::Aborted);
+
+    // node-b should still be aborted (best effort abort marks as aborted anyway)
+    let node_b = coordinator.get_participant("node-b").unwrap();
+    assert_eq!(node_b.state, TwoPhaseState::Aborted);
+}
+
+/// Test that already finalized transaction rejects new operations
+#[tokio::test]
+async fn test_2pc_reject_operations_after_finalize() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+
+    let participants = vec!["node-a".to_string()];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "finalized-chain".to_string(),
+        create_test_chain_config_with_tag("finalized-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare and commit
+    let _ = coordinator.prepare_all().await;
+    let _ = coordinator.commit_all().await;
+    assert!(coordinator.all_committed());
+
+    // Try to prepare again - should fail
+    let result = coordinator.prepare("node-a").await;
+    assert!(matches!(result, Err(TwoPhaseError::AlreadyFinalized { .. })));
+}
+
+/// Test recovery state after various failures
+#[tokio::test]
+async fn test_2pc_state_recovery_verification() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.fail_prepare("node-c", "Validation failed");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "recovery-chain".to_string(),
+        create_test_chain_config_with_tag("recovery-chain"),
+        participants.clone(),
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Partial prepare (node-c fails)
+    let _ = coordinator.prepare_all().await;
+
+    // Abort the transaction
+    let _ = coordinator.abort_all().await;
+
+    // Verify all participants are in terminal state
+    assert_eq!(
+        coordinator.participant_count(),
+        3,
+        "Should have 3 participants"
+    );
+
+    // All should be either aborted or failed
+    for participant in coordinator.participants() {
+        let is_terminal = matches!(
+            participant.state,
+            TwoPhaseState::Aborted | TwoPhaseState::Failed(_)
+        );
+        assert!(
+            is_terminal,
+            "Participant {} in non-terminal state: {:?}",
+            participant.node_tag,
+            participant.state
+        );
+    }
+}
+
+/// Test that 2PC helper functions work correctly
+#[tokio::test]
+async fn test_2pc_helper_functions_comprehensive() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.fail_prepare("node-b", "Failure");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "helper-chain".to_string(),
+        create_test_chain_config_with_tag("helper-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Test initial state
+    assert_eq!(coordinator.participant_count(), 3);
+    assert!(!coordinator.all_prepared());
+    assert!(!coordinator.all_committed());
+    assert!(!coordinator.any_failed());
+    assert_eq!(coordinator.prepared_nodes().len(), 0);
+    assert_eq!(coordinator.failed_nodes().len(), 0);
+
+    // After prepare
+    let _ = coordinator.prepare_all().await;
+
+    assert!(!coordinator.all_prepared()); // node-b failed
+    assert!(coordinator.any_failed());
+    assert_eq!(coordinator.prepared_nodes().len(), 2); // node-a and node-c
+    assert_eq!(coordinator.failed_nodes().len(), 1); // node-b
+}
+
+/// Test network delay without timeout
+#[tokio::test]
+async fn test_2pc_network_delay_no_timeout() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.set_delay(100); // 100ms delay
+
+    let participants = vec!["node-a".to_string(), "node-b".to_string()];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "delay-chain".to_string(),
+        create_test_chain_config_with_tag("delay-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5); // 5 seconds, longer than delay
+
+    // Should succeed despite delay
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(prepare_errors.is_empty());
+    assert!(coordinator.all_prepared());
+}
+
+/// Test abort on coordinator decision (not failure)
+#[tokio::test]
+async fn test_2pc_coordinator_decision_abort() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+
+    let participants = vec!["node-a".to_string(), "node-b".to_string()];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "decision-abort-chain".to_string(),
+        create_test_chain_config_with_tag("decision-abort-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare all successfully
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(prepare_errors.is_empty());
+    assert!(coordinator.all_prepared());
+
+    // Coordinator decides to abort (e.g., external condition changed)
+    coordinator.abort_all().await;
+
+    // All should be aborted
+    assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Aborted);
+    for participant in coordinator.participants() {
+        assert_eq!(participant.state, TwoPhaseState::Aborted);
+    }
+}
+
+/// Test that late-arriving prepare failures don't affect already-failed transaction
+#[tokio::test]
+async fn test_2pc_transaction_state_after_early_failure() {
+    let mock_client = Arc::new(MockNetworkClient::new());
+    mock_client.fail_prepare("node-a", "Early failure");
+
+    let participants = vec![
+        "node-a".to_string(),
+        "node-b".to_string(),
+        "node-c".to_string(),
+    ];
+
+    let mut coordinator = TwoPhaseCommit::new(
+        "early-fail-chain".to_string(),
+        create_test_chain_config_with_tag("early-fail-chain"),
+        participants,
+    )
+    .with_network_client(mock_client.clone())
+    .with_timeout(5);
+
+    // Prepare - node-a fails early
+    let prepare_errors = coordinator.prepare_all().await;
+    assert!(!prepare_errors.is_empty());
+
+    // Transaction should be in failed state
+    assert!(matches!(
+        coordinator.transaction_state(),
+        TwoPhaseState::Failed(_)
+    ));
+
+    // Even though node-b and node-c might have prepared, we can still abort
+    let _ = coordinator.abort_all().await;
+    assert_eq!(*coordinator.transaction_state(), TwoPhaseState::Aborted);
 }

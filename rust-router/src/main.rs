@@ -13,25 +13,36 @@
 //!
 //! # Run with environment overrides
 //! RUST_ROUTER_LOG_LEVEL=debug sudo ./rust-router
+//!
+//! # Run with userspace WireGuard (Phase 6)
+//! RUST_ROUTER_USERSPACE_WG=true sudo ./rust-router
 //! ```
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use tokio::signal;
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
+use rust_router::chain::ChainManager;
 use rust_router::config::{load_config_with_env, Config};
 use rust_router::connection::{
     run_accept_loop, ConnectionManager, UdpPacketProcessor, UdpProcessorConfig,
     UdpSessionConfig, UdpSessionManager,
 };
+use rust_router::ecmp::group::EcmpGroupManager;
+use rust_router::egress::manager::WgEgressManager;
+use rust_router::egress::reply::WgReplyHandler;
+use rust_router::ingress::manager::WgIngressManager;
+use rust_router::ingress::WgIngressConfig;
 use rust_router::ipc::{IpcHandler, IpcServer};
 use rust_router::outbound::{OutboundManager, OutboundManagerBuilder};
+use rust_router::peer::manager::PeerManager;
 use rust_router::rules::{RuleEngine, RoutingSnapshotBuilder};
 use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig};
 
@@ -111,6 +122,13 @@ ENVIRONMENT:
     RUST_ROUTER_MAX_CONNECTIONS  Override maximum connections
     RUST_ROUTER_IPC_SOCKET       Override IPC socket path
 
+    Phase 6 (Userspace WireGuard):
+    RUST_ROUTER_USERSPACE_WG     Enable userspace WireGuard mode (true/false)
+    RUST_ROUTER_WG_LISTEN_PORT   WireGuard listen port (default: 36100)
+    RUST_ROUTER_WG_PRIVATE_KEY   WireGuard private key (Base64)
+    RUST_ROUTER_WG_SUBNET        WireGuard ingress subnet (default: 10.25.0.0/24)
+    RUST_ROUTER_NODE_TAG         Local node tag for multi-node peering
+
 REQUIREMENTS:
     - Linux kernel with TPROXY support
     - CAP_NET_ADMIN capability (or root)
@@ -124,6 +142,11 @@ EXAMPLE:
     ip route add local 0.0.0.0/0 dev lo table 100
 
     # Run the router
+    sudo rust-router -c /etc/rust-router/config.json
+
+    # Run with userspace WireGuard (Phase 6)
+    RUST_ROUTER_USERSPACE_WG=true \
+    RUST_ROUTER_WG_PRIVATE_KEY=<base64_key> \
     sudo rust-router -c /etc/rust-router/config.json
 "#,
         rust_router::VERSION
@@ -183,6 +206,67 @@ fn build_outbound_manager(config: &Config) -> Arc<OutboundManager> {
     );
 
     Arc::new(manager)
+}
+
+/// Phase 6 configuration from environment variables
+#[derive(Debug)]
+struct Phase6Config {
+    /// Enable userspace WireGuard mode
+    userspace_wg: bool,
+    /// WireGuard listen port
+    wg_listen_port: u16,
+    /// WireGuard private key (Base64)
+    wg_private_key: Option<String>,
+    /// WireGuard ingress subnet
+    wg_subnet: String,
+    /// Local node tag for multi-node peering
+    node_tag: String,
+    /// WireGuard ingress local IP
+    wg_local_ip: IpAddr,
+}
+
+impl Phase6Config {
+    /// Load Phase 6 configuration from environment variables
+    fn from_env() -> Self {
+        let userspace_wg = std::env::var("RUST_ROUTER_USERSPACE_WG")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let wg_listen_port = std::env::var("RUST_ROUTER_WG_LISTEN_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(36100);
+
+        let wg_private_key = std::env::var("RUST_ROUTER_WG_PRIVATE_KEY").ok();
+
+        let wg_subnet = std::env::var("RUST_ROUTER_WG_SUBNET")
+            .unwrap_or_else(|_| "10.25.0.0/24".to_string());
+
+        let node_tag = std::env::var("RUST_ROUTER_NODE_TAG")
+            .unwrap_or_else(|_| hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "local-node".to_string()));
+
+        // Default local IP is .1 in the subnet
+        let wg_local_ip = std::env::var("RUST_ROUTER_WG_LOCAL_IP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(10, 25, 0, 1)));
+
+        Self {
+            userspace_wg,
+            wg_listen_port,
+            wg_private_key,
+            wg_subnet,
+            node_tag,
+            wg_local_ip,
+        }
+    }
+
+    /// Check if userspace WireGuard can be enabled
+    fn can_enable_userspace_wg(&self) -> bool {
+        self.userspace_wg && self.wg_private_key.is_some()
+    }
 }
 
 /// Main application entry point
@@ -298,25 +382,129 @@ async fn main() -> Result<()> {
         config.listen.udp_workers.unwrap_or(0)
     );
 
-    // Create IPC handler with or without UDP components
+    // ========================================================================
+    // Phase 6: Load Phase 6 configuration and create managers
+    // ========================================================================
+    let phase6_config = Phase6Config::from_env();
+
+    info!(
+        "Phase 6 config: userspace_wg={}, node_tag={}, wg_port={}",
+        phase6_config.userspace_wg,
+        phase6_config.node_tag,
+        phase6_config.wg_listen_port
+    );
+
+    // Create PeerManager (always created for IPC support)
+    let peer_manager = Arc::new(PeerManager::new(phase6_config.node_tag.clone()));
+    debug!("Created PeerManager with node tag: {}", phase6_config.node_tag);
+
+    // Create ChainManager (always created for IPC support)
+    let chain_manager = Arc::new(ChainManager::new(phase6_config.node_tag.clone()));
+    debug!("Created ChainManager with node tag: {}", phase6_config.node_tag);
+
+    // Create EcmpGroupManager (always created for IPC support)
+    let ecmp_group_manager = Arc::new(EcmpGroupManager::new());
+    debug!("Created EcmpGroupManager");
+
+    // Create WireGuard egress manager (always created for IPC support)
+    // The reply handler forwards decrypted packets back to the connection manager
+    let wg_reply_handler = Arc::new(WgReplyHandler::new({
+        let _conn_mgr = Arc::clone(&connection_manager);
+        move |packet, tunnel_tag| {
+            debug!(
+                "WireGuard reply from '{}': {} bytes (forwarding not yet implemented)",
+                tunnel_tag,
+                packet.len()
+            );
+            // TODO: Forward decrypted packets to appropriate handler
+            // This will be implemented when we integrate with the connection flow
+        }
+    }));
+    let wg_egress_manager = Arc::new(WgEgressManager::new(wg_reply_handler));
+    debug!("Created WgEgressManager");
+
+    // Create WireGuard ingress manager (only if userspace mode is enabled and configured)
+    let wg_ingress_manager: Option<Arc<WgIngressManager>> = if phase6_config.can_enable_userspace_wg() {
+        let private_key = phase6_config.wg_private_key.as_ref().unwrap();
+        let listen_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            phase6_config.wg_listen_port,
+        );
+        let allowed_subnet: ipnet::IpNet = phase6_config.wg_subnet.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid WG subnet '{}': {}", phase6_config.wg_subnet, e))?;
+
+        let wg_ingress_config = WgIngressConfig::builder()
+            .private_key(private_key)
+            .listen_addr(listen_addr)
+            .local_ip(phase6_config.wg_local_ip)
+            .allowed_subnet(allowed_subnet)
+            .build();
+
+        match WgIngressManager::new(wg_ingress_config, Arc::clone(&rule_engine)) {
+            Ok(manager) => {
+                info!(
+                    "Created WgIngressManager (userspace WireGuard on port {})",
+                    phase6_config.wg_listen_port
+                );
+                Some(Arc::new(manager))
+            }
+            Err(e) => {
+                error!("Failed to create WgIngressManager: {}", e);
+                warn!("Userspace WireGuard will be disabled");
+                None
+            }
+        }
+    } else {
+        if phase6_config.userspace_wg {
+            warn!(
+                "Userspace WireGuard requested but RUST_ROUTER_WG_PRIVATE_KEY not set"
+            );
+        }
+        None
+    };
+
+    // Create base IPC handler
     let ipc_handler = if let (Some(session_mgr), Some(worker_pool), Some(buffer_pool)) =
         (&udp_session_manager, &udp_worker_pool, &udp_buffer_pool)
     {
-        Arc::new(IpcHandler::new_with_udp(
+        IpcHandler::new_with_udp(
             Arc::clone(&connection_manager),
             Arc::clone(&outbound_manager),
             Arc::clone(&rule_engine),
             Arc::clone(session_mgr),
             Arc::clone(worker_pool),
             Arc::clone(buffer_pool),
-        ))
+        )
     } else {
-        Arc::new(IpcHandler::new(
+        IpcHandler::new(
             Arc::clone(&connection_manager),
             Arc::clone(&outbound_manager),
             Arc::clone(&rule_engine),
-        ))
+        )
     };
+
+    // Wire up Phase 6 managers to IPC handler
+    let ipc_handler = ipc_handler
+        .with_peer_manager(Arc::clone(&peer_manager))
+        .with_chain_manager(Arc::clone(&chain_manager), phase6_config.node_tag.clone())
+        .with_ecmp_group_manager(Arc::clone(&ecmp_group_manager))
+        .with_wg_egress_manager(Arc::clone(&wg_egress_manager));
+
+    // Add WireGuard ingress manager if available
+    let ipc_handler = if let Some(ref ingress_mgr) = wg_ingress_manager {
+        ipc_handler.with_wg_ingress_manager(Arc::clone(ingress_mgr))
+    } else {
+        ipc_handler
+    };
+
+    let ipc_handler = Arc::new(ipc_handler);
+
+    info!(
+        "IPC handler configured with Phase 6 managers (peer={}, chain={}, ecmp={}, wg_ingress={}, wg_egress={})",
+        true, true, true,
+        wg_ingress_manager.is_some(),
+        true
+    );
 
     let ipc_server = IpcServer::new(config.ipc.clone(), Arc::clone(&ipc_handler));
     let ipc_shutdown = ipc_server.shutdown_sender();
@@ -327,6 +515,26 @@ async fn main() -> Result<()> {
             error!("IPC server error: {}", e);
         }
     });
+
+    // ========================================================================
+    // Phase 6: Start userspace WireGuard ingress if enabled
+    // ========================================================================
+    if let Some(ref ingress_mgr) = wg_ingress_manager {
+        info!("Starting userspace WireGuard ingress...");
+
+        // Start the manager - this spawns its own internal packet processing task
+        if let Err(e) = ingress_mgr.start().await {
+            error!("Failed to start WireGuard ingress manager: {}", e);
+            // Continue without WireGuard ingress, but log the error
+        } else {
+            info!(
+                "WireGuard ingress started on {} (userspace mode)",
+                ingress_mgr.listen_addr()
+            );
+        }
+    } else {
+        debug!("Userspace WireGuard ingress not enabled");
+    }
 
     info!(
         "Startup complete in {:.2}ms",
@@ -360,6 +568,24 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(5),
         ipc_handle,
     ).await;
+
+    // ========================================================================
+    // Phase 6: Shutdown WireGuard ingress if running
+    // ========================================================================
+    if let Some(ref ingress_mgr) = wg_ingress_manager {
+        if ingress_mgr.is_running() {
+            info!("Shutting down WireGuard ingress manager...");
+            if let Err(e) = ingress_mgr.stop().await {
+                warn!("Error stopping WireGuard ingress: {}", e);
+            }
+            info!("WireGuard ingress manager shutdown complete");
+        }
+    }
+
+    // Shutdown WireGuard egress manager
+    info!("Shutting down WireGuard egress manager...");
+    wg_egress_manager.shutdown().await;
+    info!("WireGuard egress manager shutdown complete");
 
     // Shutdown UDP worker pool if enabled
     // We need to drop the IPC handler's reference first by dropping ipc_handler
