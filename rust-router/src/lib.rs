@@ -66,6 +66,7 @@
 pub mod chain;
 pub mod config;
 pub mod connection;
+pub mod dns;
 pub mod ecmp;
 pub mod egress;
 pub mod error;
@@ -128,6 +129,13 @@ pub use egress::{
 pub use chain::{
     ChainError, ChainManager, DscpAllocator, DscpRoutingCallback, NoOpRoutingCallback,
     PeerConnectivityCallback,
+};
+pub use dns::{
+    analyze_negative_response, dns_classes, extract_soa_minimum, get_negative_cache_ttl,
+    is_negative_response, record_types, BlockResponseType, BlockingConfig, CacheConfig, CacheEntry,
+    CacheKey, CacheStats, CacheStatsSnapshot, DnsCache, DnsConfig, DnsError, DnsResult, LogFormat,
+    LoggingConfig, NegativeAnalysis, NegativeCacheConfig, NegativeResponseType, RateLimitConfig,
+    TcpServerConfig, UpstreamConfig, UpstreamProtocol,
 };
 
 /// Crate version
