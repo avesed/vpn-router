@@ -379,6 +379,14 @@ pub struct UpstreamConfig {
     /// These IPs are used to resolve the upstream hostname.
     #[serde(default)]
     pub bootstrap: Option<Vec<String>>,
+
+    /// Server Name Indication (SNI) for TLS connections
+    ///
+    /// Required when using IP address with DoT and server requires
+    /// hostname verification. If not set, the hostname from the address
+    /// will be used.
+    #[serde(default)]
+    pub sni: Option<String>,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -405,6 +413,7 @@ impl UpstreamConfig {
             protocol,
             timeout_secs: default_timeout_secs(),
             bootstrap: None,
+            sni: None,
         }
     }
 
@@ -439,6 +448,23 @@ impl UpstreamConfig {
     #[must_use]
     pub fn with_bootstrap(mut self, bootstrap: Vec<String>) -> Self {
         self.bootstrap = Some(bootstrap);
+        self
+    }
+
+    /// Set the SNI (Server Name Indication) for TLS connections
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::dns::{UpstreamConfig, UpstreamProtocol};
+    ///
+    /// let upstream = UpstreamConfig::new("dot", "1.1.1.1:853", UpstreamProtocol::Dot)
+    ///     .with_sni("cloudflare-dns.com");
+    /// assert_eq!(upstream.sni, Some("cloudflare-dns.com".to_string()));
+    /// ```
+    #[must_use]
+    pub fn with_sni(mut self, sni: impl Into<String>) -> Self {
+        self.sni = Some(sni.into());
         self
     }
 

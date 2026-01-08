@@ -91,13 +91,25 @@
 //! - [`cache::CacheStats`]: Atomic cache statistics (hits, misses, etc.)
 //! - Negative caching support for NXDOMAIN/NODATA per RFC 2308
 //!
+//! # Phase 7.3 Deliverables
+//!
+//! This phase adds the DNS client module:
+//!
+//! - [`client::DnsUpstream`]: Core trait for all upstream clients
+//! - [`client::UdpClient`]: UDP DNS client with retry logic
+//! - [`client::TcpClient`]: TCP DNS client with deadpool connection pooling
+//! - [`client::DohClient`]: DNS-over-HTTPS client (RFC 8484) - requires `dns-doh`
+//! - [`client::DotClient`]: DNS-over-TLS client (RFC 7858) - requires `dns-dot`
+//! - [`client::HealthChecker`]: Health state machine with configurable thresholds
+//! - [`client::UpstreamPool`]: Multi-upstream pool with failover and selection strategies
+//!
 //! Future phases will add:
-//! - Phase 7.3: Upstream client implementations
 //! - Phase 7.4: Blocking engine
 //! - Phase 7.5: Query logging
 //! - Phase 7.6: Integration and testing
 
 pub mod cache;
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod server;
@@ -115,6 +127,18 @@ pub use cache::{
     is_negative_response, record_types, CacheEntry, CacheKey, CacheStats, CacheStatsSnapshot,
     DnsCache, NegativeAnalysis, NegativeResponseType,
 };
+
+// Re-export client types
+pub use client::{
+    DnsUpstream, HealthCheckConfig, HealthChecker, HealthStats, PoolStats, SelectionStrategy,
+    TcpClient, UdpClient, UpstreamInfo, UpstreamPool, UpstreamPoolBuilder,
+};
+
+#[cfg(feature = "dns-doh")]
+pub use client::DohClient;
+
+#[cfg(feature = "dns-dot")]
+pub use client::DotClient;
 
 #[cfg(test)]
 mod tests {

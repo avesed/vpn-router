@@ -88,6 +88,26 @@ hickory-proto = "0.24"
 # Rate limiting
 governor = "0.6"
 
+# HTTP for DoH (hyper replaces reqwest - reduces binary size)
+hyper = { version = "1.4", features = ["client", "http2"], optional = true }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http2"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-rustls = { version = "0.27", features = ["http2"], optional = true }
+
+# TLS for DoT
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# HTTP types
+http = { version = "1", optional = true }
+
+[features]
+default = ["dns-doh", "dns-dot"]
+dns-doh = ["hyper", "hyper-util", "http-body-util", "hyper-rustls", "http", "rustls", "rustls-pki-types", "webpki-roots"]
+dns-dot = ["tokio-rustls", "rustls", "rustls-pki-types", "webpki-roots"]
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
