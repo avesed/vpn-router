@@ -564,6 +564,135 @@ pub enum IpcCommand {
         /// Node that initiated this request
         source_node: String,
     },
+
+    // ========================================================================
+    // Phase 7.7: IPC Protocol v3.3 - DNS Commands
+    // ========================================================================
+
+    /// Get overall DNS statistics
+    ///
+    /// Returns comprehensive DNS statistics including cache, blocking, and upstream metrics.
+    GetDnsStats,
+
+    /// Get detailed DNS cache statistics
+    ///
+    /// Returns cache-specific statistics including hit rate, entry count, and evictions.
+    GetDnsCacheStats,
+
+    /// Flush DNS cache entries
+    ///
+    /// Flushes cache entries matching the optional pattern.
+    /// If no pattern is provided, flushes the entire cache.
+    FlushDnsCache {
+        /// Optional pattern for selective flush (exact or suffix match)
+        #[serde(default)]
+        pattern: Option<String>,
+    },
+
+    /// Get DNS blocking/filter statistics
+    ///
+    /// Returns statistics about DNS blocking including blocked queries and rule counts.
+    GetDnsBlockStats,
+
+    /// Reload DNS blocklist rules
+    ///
+    /// Reloads blocking rules from the database, performing a hot-reload.
+    ReloadDnsBlocklist,
+
+    /// Add a DNS upstream server
+    ///
+    /// Adds a new upstream DNS server with the specified configuration.
+    ///
+    /// # Status: NOT YET IMPLEMENTED
+    ///
+    /// This command is reserved for future use. Currently returns an error.
+    /// Dynamic upstream management will be implemented in a future phase.
+    AddDnsUpstream {
+        /// Unique tag for this upstream
+        tag: String,
+        /// Upstream configuration
+        config: DnsUpstreamConfig,
+    },
+
+    /// Remove a DNS upstream server
+    ///
+    /// Removes an upstream DNS server by tag.
+    ///
+    /// # Status: NOT YET IMPLEMENTED
+    ///
+    /// This command is reserved for future use. Currently returns an error.
+    /// Dynamic upstream management will be implemented in a future phase.
+    RemoveDnsUpstream {
+        /// Upstream tag to remove
+        tag: String,
+    },
+
+    /// Get DNS upstream status
+    ///
+    /// Returns status information for upstream servers.
+    /// If tag is None, returns status for all upstreams.
+    GetDnsUpstreamStatus {
+        /// Optional tag to query specific upstream (all if None)
+        #[serde(default)]
+        tag: Option<String>,
+    },
+
+    /// Add a DNS routing rule
+    ///
+    /// Adds a rule to route queries for matching domains to a specific upstream.
+    AddDnsRoute {
+        /// Domain pattern to match
+        pattern: String,
+        /// Match type (exact, suffix, keyword, regex)
+        match_type: String,
+        /// Upstream tag to route to
+        upstream_tag: String,
+    },
+
+    /// Remove a DNS routing rule
+    ///
+    /// Removes a DNS routing rule by pattern.
+    RemoveDnsRoute {
+        /// Domain pattern to remove
+        pattern: String,
+    },
+
+    /// Get DNS query log entries
+    ///
+    /// Returns recent DNS query log entries with optional pagination.
+    ///
+    /// # Status: PARTIAL IMPLEMENTATION
+    ///
+    /// Currently returns an empty list with metadata. The QueryLogger (Phase 7.6)
+    /// is write-only by design. A log reader implementation is planned for a
+    /// future phase to enable reading logs from disk.
+    GetDnsQueryLog {
+        /// Maximum number of entries to return (default: 100)
+        #[serde(default = "default_dns_query_limit")]
+        limit: usize,
+        /// Offset for pagination (default: 0)
+        #[serde(default)]
+        offset: usize,
+    },
+
+    /// Perform a test DNS query
+    ///
+    /// Executes a DNS query for debugging and testing purposes.
+    DnsQuery {
+        /// Domain name to query
+        domain: String,
+        /// Query type (e.g., 1 for A, 28 for AAAA; default: A)
+        #[serde(default)]
+        qtype: Option<u16>,
+        /// Optional specific upstream to use (uses default routing if None)
+        #[serde(default)]
+        upstream: Option<String>,
+    },
+
+    /// Get current DNS configuration
+    ///
+    /// Returns the current DNS engine configuration.
+    GetDnsConfig,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -588,6 +717,11 @@ fn default_drain_timeout() -> u32 {
 
 /// Default limit for UDP session listing
 fn default_udp_session_limit() -> usize {
+    100
+}
+
+/// Default limit for DNS query log listing
+fn default_dns_query_limit() -> usize {
     100
 }
 
@@ -732,6 +866,31 @@ pub enum IpcResponse {
 
     /// Two-Phase Commit prepare response
     PrepareResult(PrepareResponse),
+
+    // ========================================================================
+    // Phase 7.7: IPC Protocol v3.3 - DNS Response Types
+    // ========================================================================
+
+    /// DNS overall statistics response
+    DnsStats(DnsStatsResponse),
+
+    /// DNS cache statistics response
+    DnsCacheStats(DnsCacheStatsResponse),
+
+    /// DNS blocking statistics response
+    DnsBlockStats(DnsBlockStatsResponse),
+
+    /// DNS upstream status response
+    DnsUpstreamStatus(DnsUpstreamStatusResponse),
+
+    /// DNS query log response
+    DnsQueryLog(DnsQueryLogResponse),
+
+    /// DNS query result response
+    DnsQueryResult(DnsQueryResponse),
+
+    /// DNS configuration response
+    DnsConfig(DnsConfigResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -1784,6 +1943,230 @@ pub struct PrepareResponse {
     pub message: Option<String>,
     /// Node that responded
     pub node: String,
+}
+
+// ============================================================================
+// Phase 7.7: IPC Protocol v3.3 - DNS Types
+// ============================================================================
+
+/// DNS upstream configuration for IPC
+///
+/// Configuration for a DNS upstream server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsUpstreamConfig {
+    /// Upstream address (e.g., "8.8.8.8:53", "https://dns.google/dns-query")
+    pub address: String,
+    /// Protocol type: "udp", "tcp", "doh", "dot"
+    pub protocol: String,
+    /// Bootstrap DNS servers for resolving DoH/DoT hostnames
+    #[serde(default)]
+    pub bootstrap: Vec<String>,
+    /// Query timeout in seconds
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// DNS overall statistics response
+///
+/// Comprehensive DNS statistics including cache, blocking, and upstream metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsStatsResponse {
+    /// Whether DNS engine is enabled
+    pub enabled: bool,
+    /// Uptime in seconds since DNS engine started
+    pub uptime_secs: u64,
+    /// Total DNS queries processed
+    pub total_queries: u64,
+    /// Queries served from cache
+    pub cache_hits: u64,
+    /// Queries that required upstream resolution
+    pub cache_misses: u64,
+    /// Queries blocked by filter rules
+    pub blocked_queries: u64,
+    /// Queries sent to upstream servers
+    pub upstream_queries: u64,
+    /// Average query latency in microseconds
+    pub avg_latency_us: u64,
+}
+
+/// DNS cache statistics response
+///
+/// Detailed statistics about the DNS cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsCacheStatsResponse {
+    /// Whether caching is enabled
+    pub enabled: bool,
+    /// Maximum cache entries
+    pub max_entries: usize,
+    /// Current number of cached entries
+    pub current_entries: usize,
+    /// Cache hit count
+    pub hits: u64,
+    /// Cache miss count
+    pub misses: u64,
+    /// Cache hit rate (0.0 to 1.0)
+    pub hit_rate: f64,
+    /// Negative cache hits (NXDOMAIN/NODATA)
+    pub negative_hits: u64,
+    /// Total cache inserts
+    pub inserts: u64,
+    /// Total cache evictions
+    pub evictions: u64,
+}
+
+/// DNS blocking statistics response
+///
+/// Statistics about DNS blocking/filtering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsBlockStatsResponse {
+    /// Whether blocking is enabled
+    pub enabled: bool,
+    /// Number of blocking rules loaded
+    pub rule_count: usize,
+    /// Total blocked queries
+    pub blocked_queries: u64,
+    /// Total queries evaluated for blocking
+    pub total_queries: u64,
+    /// Block rate (0.0 to 1.0)
+    pub block_rate: f64,
+    /// ISO 8601 timestamp of last rule reload
+    pub last_reload: Option<String>,
+}
+
+/// DNS upstream status response
+///
+/// Status information for DNS upstream servers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsUpstreamStatusResponse {
+    /// Status of each upstream server
+    pub upstreams: Vec<DnsUpstreamInfo>,
+}
+
+/// DNS upstream information
+///
+/// Status and statistics for a single upstream DNS server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsUpstreamInfo {
+    /// Upstream tag
+    pub tag: String,
+    /// Upstream address
+    pub address: String,
+    /// Protocol type (udp, tcp, doh, dot)
+    pub protocol: String,
+    /// Whether the upstream is healthy
+    pub healthy: bool,
+    /// Total queries sent to this upstream
+    pub total_queries: u64,
+    /// Failed queries to this upstream
+    pub failed_queries: u64,
+    /// Average latency in microseconds
+    pub avg_latency_us: u64,
+    /// ISO 8601 timestamp of last successful query
+    pub last_success: Option<String>,
+    /// ISO 8601 timestamp of last failed query
+    pub last_failure: Option<String>,
+}
+
+/// DNS query log response
+///
+/// Response containing DNS query log entries with pagination info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryLogResponse {
+    /// Query log entries
+    pub entries: Vec<DnsQueryLogEntry>,
+    /// Total entries available (may differ from entries.len() due to pagination)
+    pub total_available: usize,
+    /// Pagination offset used
+    pub offset: usize,
+    /// Pagination limit used
+    pub limit: usize,
+}
+
+/// DNS query log entry
+///
+/// A single DNS query log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryLogEntry {
+    /// Unix timestamp in milliseconds
+    pub timestamp: u64,
+    /// Queried domain name
+    pub domain: String,
+    /// Query type (e.g., 1 for A, 28 for AAAA)
+    pub qtype: u16,
+    /// Query type as string (e.g., "A", "AAAA")
+    pub qtype_str: String,
+    /// Upstream server used
+    pub upstream: String,
+    /// DNS response code (e.g., 0 for NOERROR, 3 for NXDOMAIN)
+    pub response_code: u8,
+    /// Response code as string (e.g., "NOERROR", "NXDOMAIN")
+    pub rcode_str: String,
+    /// Query latency in microseconds
+    pub latency_us: u32,
+    /// Whether the query was blocked
+    pub blocked: bool,
+    /// Whether the response was served from cache
+    pub cached: bool,
+}
+
+/// DNS query result response
+///
+/// Result of a test DNS query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsQueryResponse {
+    /// Whether the query succeeded
+    pub success: bool,
+    /// Queried domain name
+    pub domain: String,
+    /// Query type used
+    pub qtype: u16,
+    /// DNS response code
+    pub response_code: u8,
+    /// Answer records (IP addresses or CNAME targets as strings)
+    pub answers: Vec<String>,
+    /// Query latency in microseconds
+    pub latency_us: u64,
+    /// Whether the response was cached
+    pub cached: bool,
+    /// Whether the query was blocked
+    pub blocked: bool,
+    /// Upstream server used (None if cached or blocked)
+    pub upstream_used: Option<String>,
+}
+
+/// DNS configuration response
+///
+/// Current DNS engine configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsConfigResponse {
+    /// Whether DNS engine is enabled
+    pub enabled: bool,
+    /// UDP listen address
+    pub listen_udp: String,
+    /// TCP listen address
+    pub listen_tcp: String,
+    /// Configured upstream servers
+    pub upstreams: Vec<DnsUpstreamInfo>,
+    /// Whether caching is enabled
+    pub cache_enabled: bool,
+    /// Maximum cache entries
+    pub cache_max_entries: usize,
+    /// Whether blocking is enabled
+    pub blocking_enabled: bool,
+    /// Blocking response type (e.g., "zero_ip", "nxdomain", "refused")
+    pub blocking_response_type: String,
+    /// Whether query logging is enabled
+    pub logging_enabled: bool,
+    /// Logging format (e.g., "json", "tsv", "binary")
+    pub logging_format: String,
+    /// Available features and their implementation status
+    ///
+    /// Keys are feature names, values indicate implementation status:
+    /// - "available": Feature is fully implemented
+    /// - "partial": Feature is partially implemented
+    /// - "not_implemented": Feature is reserved for future use
+    #[serde(default)]
+    pub available_features: std::collections::HashMap<String, String>,
 }
 
 /// IPC error
@@ -3164,5 +3547,537 @@ rust_router_connections_total 12345
         } else {
             panic!("Expected PrepareResult response");
         }
+    }
+
+    // =========================================================================
+    // Phase 7.7: DNS IPC Protocol Tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_dns_stats_command_serialization() {
+        let cmd = IpcCommand::GetDnsStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsStats));
+    }
+
+    #[test]
+    fn test_get_dns_cache_stats_command_serialization() {
+        let cmd = IpcCommand::GetDnsCacheStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_cache_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsCacheStats));
+    }
+
+    #[test]
+    fn test_flush_dns_cache_command_serialization() {
+        // Without pattern
+        let cmd = IpcCommand::FlushDnsCache { pattern: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"flush_dns_cache\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::FlushDnsCache { pattern } = parsed {
+            assert!(pattern.is_none());
+        } else {
+            panic!("Expected FlushDnsCache command");
+        }
+
+        // With pattern
+        let cmd = IpcCommand::FlushDnsCache { pattern: Some("*.google.com".into()) };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"pattern\":\"*.google.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::FlushDnsCache { pattern } = parsed {
+            assert_eq!(pattern, Some("*.google.com".into()));
+        } else {
+            panic!("Expected FlushDnsCache command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_block_stats_command_serialization() {
+        let cmd = IpcCommand::GetDnsBlockStats;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_block_stats\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsBlockStats));
+    }
+
+    #[test]
+    fn test_reload_dns_blocklist_command_serialization() {
+        let cmd = IpcCommand::ReloadDnsBlocklist;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"reload_dns_blocklist\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::ReloadDnsBlocklist));
+    }
+
+    #[test]
+    fn test_add_dns_upstream_command_serialization() {
+        let config = DnsUpstreamConfig {
+            address: "8.8.8.8:53".into(),
+            protocol: "udp".into(),
+            bootstrap: vec![],
+            timeout_secs: Some(5),
+        };
+        let cmd = IpcCommand::AddDnsUpstream {
+            tag: "google".into(),
+            config,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_dns_upstream\""));
+        assert!(json.contains("\"tag\":\"google\""));
+        assert!(json.contains("\"address\":\"8.8.8.8:53\""));
+        assert!(json.contains("\"protocol\":\"udp\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::AddDnsUpstream { tag, config } = parsed {
+            assert_eq!(tag, "google");
+            assert_eq!(config.address, "8.8.8.8:53");
+            assert_eq!(config.protocol, "udp");
+            assert_eq!(config.timeout_secs, Some(5));
+        } else {
+            panic!("Expected AddDnsUpstream command");
+        }
+    }
+
+    #[test]
+    fn test_remove_dns_upstream_command_serialization() {
+        let cmd = IpcCommand::RemoveDnsUpstream { tag: "google".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_dns_upstream\""));
+        assert!(json.contains("\"tag\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::RemoveDnsUpstream { tag } = parsed {
+            assert_eq!(tag, "google");
+        } else {
+            panic!("Expected RemoveDnsUpstream command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_upstream_status_command_serialization() {
+        // All upstreams
+        let cmd = IpcCommand::GetDnsUpstreamStatus { tag: None };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_upstream_status\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetDnsUpstreamStatus { tag } = parsed {
+            assert!(tag.is_none());
+        } else {
+            panic!("Expected GetDnsUpstreamStatus command");
+        }
+
+        // Specific upstream
+        let cmd = IpcCommand::GetDnsUpstreamStatus { tag: Some("google".into()) };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"tag\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetDnsUpstreamStatus { tag } = parsed {
+            assert_eq!(tag, Some("google".into()));
+        } else {
+            panic!("Expected GetDnsUpstreamStatus command");
+        }
+    }
+
+    #[test]
+    fn test_add_dns_route_command_serialization() {
+        let cmd = IpcCommand::AddDnsRoute {
+            pattern: "google.com".into(),
+            match_type: "suffix".into(),
+            upstream_tag: "google".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_dns_route\""));
+        assert!(json.contains("\"pattern\":\"google.com\""));
+        assert!(json.contains("\"match_type\":\"suffix\""));
+        assert!(json.contains("\"upstream_tag\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::AddDnsRoute { pattern, match_type, upstream_tag } = parsed {
+            assert_eq!(pattern, "google.com");
+            assert_eq!(match_type, "suffix");
+            assert_eq!(upstream_tag, "google");
+        } else {
+            panic!("Expected AddDnsRoute command");
+        }
+    }
+
+    #[test]
+    fn test_remove_dns_route_command_serialization() {
+        let cmd = IpcCommand::RemoveDnsRoute { pattern: "google.com".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_dns_route\""));
+        assert!(json.contains("\"pattern\":\"google.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::RemoveDnsRoute { pattern } = parsed {
+            assert_eq!(pattern, "google.com");
+        } else {
+            panic!("Expected RemoveDnsRoute command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_query_log_command_serialization() {
+        let cmd = IpcCommand::GetDnsQueryLog { limit: 50, offset: 10 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_query_log\""));
+        assert!(json.contains("\"limit\":50"));
+        assert!(json.contains("\"offset\":10"));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::GetDnsQueryLog { limit, offset } = parsed {
+            assert_eq!(limit, 50);
+            assert_eq!(offset, 10);
+        } else {
+            panic!("Expected GetDnsQueryLog command");
+        }
+
+        // Test defaults
+        let json_default = r#"{"type":"get_dns_query_log"}"#;
+        let parsed: IpcCommand = serde_json::from_str(json_default).unwrap();
+        if let IpcCommand::GetDnsQueryLog { limit, offset } = parsed {
+            assert_eq!(limit, 100); // default
+            assert_eq!(offset, 0);  // default
+        } else {
+            panic!("Expected GetDnsQueryLog command");
+        }
+    }
+
+    #[test]
+    fn test_dns_query_command_serialization() {
+        let cmd = IpcCommand::DnsQuery {
+            domain: "example.com".into(),
+            qtype: Some(1),
+            upstream: Some("google".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"dns_query\""));
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("\"qtype\":1"));
+        assert!(json.contains("\"upstream\":\"google\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::DnsQuery { domain, qtype, upstream } = parsed {
+            assert_eq!(domain, "example.com");
+            assert_eq!(qtype, Some(1));
+            assert_eq!(upstream, Some("google".into()));
+        } else {
+            panic!("Expected DnsQuery command");
+        }
+
+        // With defaults
+        let cmd = IpcCommand::DnsQuery {
+            domain: "example.com".into(),
+            qtype: None,
+            upstream: None,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::DnsQuery { domain, qtype, upstream } = parsed {
+            assert_eq!(domain, "example.com");
+            assert!(qtype.is_none());
+            assert!(upstream.is_none());
+        } else {
+            panic!("Expected DnsQuery command");
+        }
+    }
+
+    #[test]
+    fn test_get_dns_config_command_serialization() {
+        let cmd = IpcCommand::GetDnsConfig;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_dns_config\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::GetDnsConfig));
+    }
+
+    #[test]
+    fn test_dns_stats_response_serialization() {
+        let stats = DnsStatsResponse {
+            enabled: true,
+            uptime_secs: 3600,
+            total_queries: 10000,
+            cache_hits: 7000,
+            cache_misses: 3000,
+            blocked_queries: 500,
+            upstream_queries: 2500,
+            avg_latency_us: 1500,
+        };
+        let ipc_resp = IpcResponse::DnsStats(stats);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_stats\""));
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"uptime_secs\":3600"));
+        assert!(json.contains("\"total_queries\":10000"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsStats(s) = parsed {
+            assert!(s.enabled);
+            assert_eq!(s.uptime_secs, 3600);
+            assert_eq!(s.cache_hits, 7000);
+        } else {
+            panic!("Expected DnsStats response");
+        }
+    }
+
+    #[test]
+    fn test_dns_cache_stats_response_serialization() {
+        let stats = DnsCacheStatsResponse {
+            enabled: true,
+            max_entries: 10000,
+            current_entries: 5000,
+            hits: 7000,
+            misses: 3000,
+            hit_rate: 0.7,
+            negative_hits: 100,
+            inserts: 8000,
+            evictions: 500,
+        };
+        let ipc_resp = IpcResponse::DnsCacheStats(stats);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_cache_stats\""));
+        assert!(json.contains("\"hit_rate\":0.7"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsCacheStats(s) = parsed {
+            assert_eq!(s.current_entries, 5000);
+            assert!((s.hit_rate - 0.7).abs() < 0.001);
+        } else {
+            panic!("Expected DnsCacheStats response");
+        }
+    }
+
+    #[test]
+    fn test_dns_block_stats_response_serialization() {
+        let stats = DnsBlockStatsResponse {
+            enabled: true,
+            rule_count: 50000,
+            blocked_queries: 500,
+            total_queries: 10000,
+            block_rate: 0.05,
+            last_reload: Some("2026-01-08T12:00:00Z".into()),
+        };
+        let ipc_resp = IpcResponse::DnsBlockStats(stats);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_block_stats\""));
+        assert!(json.contains("\"rule_count\":50000"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsBlockStats(s) = parsed {
+            assert_eq!(s.rule_count, 50000);
+            assert_eq!(s.blocked_queries, 500);
+        } else {
+            panic!("Expected DnsBlockStats response");
+        }
+    }
+
+    #[test]
+    fn test_dns_upstream_status_response_serialization() {
+        let status = DnsUpstreamStatusResponse {
+            upstreams: vec![
+                DnsUpstreamInfo {
+                    tag: "google".into(),
+                    address: "8.8.8.8:53".into(),
+                    protocol: "udp".into(),
+                    healthy: true,
+                    total_queries: 5000,
+                    failed_queries: 10,
+                    avg_latency_us: 1200,
+                    last_success: Some("2026-01-08T12:00:00Z".into()),
+                    last_failure: None,
+                },
+                DnsUpstreamInfo {
+                    tag: "cloudflare".into(),
+                    address: "1.1.1.1:53".into(),
+                    protocol: "doh".into(),
+                    healthy: false,
+                    total_queries: 100,
+                    failed_queries: 50,
+                    avg_latency_us: 5000,
+                    last_success: Some("2026-01-08T11:00:00Z".into()),
+                    last_failure: Some("2026-01-08T12:00:00Z".into()),
+                },
+            ],
+        };
+        let ipc_resp = IpcResponse::DnsUpstreamStatus(status);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_upstream_status\""));
+        assert!(json.contains("\"tag\":\"google\""));
+        assert!(json.contains("\"tag\":\"cloudflare\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsUpstreamStatus(s) = parsed {
+            assert_eq!(s.upstreams.len(), 2);
+            assert!(s.upstreams[0].healthy);
+            assert!(!s.upstreams[1].healthy);
+        } else {
+            panic!("Expected DnsUpstreamStatus response");
+        }
+    }
+
+    #[test]
+    fn test_dns_query_log_response_serialization() {
+        let log = DnsQueryLogResponse {
+            entries: vec![
+                DnsQueryLogEntry {
+                    timestamp: 1704700000000,
+                    domain: "example.com".into(),
+                    qtype: 1,
+                    qtype_str: "A".into(),
+                    upstream: "google".into(),
+                    response_code: 0,
+                    rcode_str: "NOERROR".into(),
+                    latency_us: 1500,
+                    blocked: false,
+                    cached: false,
+                },
+                DnsQueryLogEntry {
+                    timestamp: 1704700001000,
+                    domain: "blocked.ad.com".into(),
+                    qtype: 1,
+                    qtype_str: "A".into(),
+                    upstream: "".into(),
+                    response_code: 0,
+                    rcode_str: "NOERROR".into(),
+                    latency_us: 50,
+                    blocked: true,
+                    cached: false,
+                },
+            ],
+            total_available: 1000,
+            offset: 0,
+            limit: 100,
+        };
+        let ipc_resp = IpcResponse::DnsQueryLog(log);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_query_log\""));
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("\"blocked\":true"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsQueryLog(l) = parsed {
+            assert_eq!(l.entries.len(), 2);
+            assert_eq!(l.total_available, 1000);
+            assert!(!l.entries[0].blocked);
+            assert!(l.entries[1].blocked);
+        } else {
+            panic!("Expected DnsQueryLog response");
+        }
+    }
+
+    #[test]
+    fn test_dns_query_response_serialization() {
+        let result = DnsQueryResponse {
+            success: true,
+            domain: "example.com".into(),
+            qtype: 1,
+            response_code: 0,
+            answers: vec!["93.184.216.34".into()],
+            latency_us: 1500,
+            cached: false,
+            blocked: false,
+            upstream_used: Some("google".into()),
+        };
+        let ipc_resp = IpcResponse::DnsQueryResult(result);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_query_result\""));
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("93.184.216.34"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsQueryResult(r) = parsed {
+            assert!(r.success);
+            assert_eq!(r.domain, "example.com");
+            assert_eq!(r.answers.len(), 1);
+            assert_eq!(r.upstream_used, Some("google".into()));
+        } else {
+            panic!("Expected DnsQueryResult response");
+        }
+    }
+
+    #[test]
+    fn test_dns_config_response_serialization() {
+        let config = DnsConfigResponse {
+            enabled: true,
+            listen_udp: "127.0.0.1:7853".into(),
+            listen_tcp: "127.0.0.1:7853".into(),
+            upstreams: vec![DnsUpstreamInfo {
+                tag: "default".into(),
+                address: "8.8.8.8:53".into(),
+                protocol: "udp".into(),
+                healthy: true,
+                total_queries: 0,
+                failed_queries: 0,
+                avg_latency_us: 0,
+                last_success: None,
+                last_failure: None,
+            }],
+            cache_enabled: true,
+            cache_max_entries: 10000,
+            blocking_enabled: true,
+            blocking_response_type: "zero_ip".into(),
+            logging_enabled: true,
+            logging_format: "json".into(),
+            available_features: std::collections::HashMap::new(),
+        };
+        let ipc_resp = IpcResponse::DnsConfig(config);
+        let json = serde_json::to_string(&ipc_resp).unwrap();
+        assert!(json.contains("\"type\":\"dns_config\""));
+        assert!(json.contains("\"listen_udp\":\"127.0.0.1:7853\""));
+        assert!(json.contains("\"blocking_response_type\":\"zero_ip\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::DnsConfig(c) = parsed {
+            assert!(c.enabled);
+            assert!(c.cache_enabled);
+            assert!(c.blocking_enabled);
+            assert_eq!(c.blocking_response_type, "zero_ip");
+        } else {
+            panic!("Expected DnsConfig response");
+        }
+    }
+
+    #[test]
+    fn test_dns_upstream_config_serialization() {
+        // Full config
+        let config = DnsUpstreamConfig {
+            address: "https://dns.google/dns-query".into(),
+            protocol: "doh".into(),
+            bootstrap: vec!["8.8.8.8:53".into(), "8.8.4.4:53".into()],
+            timeout_secs: Some(10),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"address\":\"https://dns.google/dns-query\""));
+        assert!(json.contains("\"protocol\":\"doh\""));
+        assert!(json.contains("8.8.8.8:53"));
+        assert!(json.contains("\"timeout_secs\":10"));
+
+        let parsed: DnsUpstreamConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.address, "https://dns.google/dns-query");
+        assert_eq!(parsed.protocol, "doh");
+        assert_eq!(parsed.bootstrap.len(), 2);
+        assert_eq!(parsed.timeout_secs, Some(10));
+
+        // Minimal config (defaults)
+        let json_minimal = r#"{"address":"1.1.1.1:53","protocol":"udp"}"#;
+        let parsed: DnsUpstreamConfig = serde_json::from_str(json_minimal).unwrap();
+        assert_eq!(parsed.address, "1.1.1.1:53");
+        assert_eq!(parsed.protocol, "udp");
+        assert!(parsed.bootstrap.is_empty());
+        assert!(parsed.timeout_secs.is_none());
     }
 }

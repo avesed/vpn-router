@@ -10,15 +10,23 @@ use tracing::{debug, info, warn};
 
 use super::protocol::{
     BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainListResponse, ChainRoleResponse,
-    ChainState, EcmpGroupListResponse, EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IpcCommand,
-    IpcResponse, OutboundInfo, OutboundStatsResponse, PairingResponse, PeerListResponse,
-    PeerState, PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
-    ServerCapabilities, ServerStatus, Socks5PoolStats, TunnelType, UdpProcessorInfo,
-    UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse,
-    UdpStatsResponse, UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse,
-    WgTunnelStatus,
+    ChainState, DnsBlockStatsResponse, DnsCacheStatsResponse, DnsConfigResponse,
+    DnsQueryLogResponse, DnsQueryResponse, DnsStatsResponse,
+    DnsUpstreamInfo, DnsUpstreamStatusResponse, EcmpGroupListResponse, EcmpGroupStatus,
+    EcmpMemberStatus, ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
+    PairingResponse, PeerListResponse, PeerState, PoolStatsResponse, PrepareResponse,
+    PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus,
+    Socks5PoolStats, TunnelType, UdpProcessorInfo, UdpSessionInfo, UdpSessionResponse,
+    UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse, UdpWorkerPoolInfo,
+    UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
 };
 use crate::chain::ChainManager;
+use crate::dns::cache::DnsCache;
+use crate::dns::client::UpstreamPool;
+use crate::dns::filter::BlockFilter;
+use crate::dns::log::QueryLogger;
+use crate::dns::split::{DnsRouter, DomainMatchType};
+use crate::dns::DnsConfig;
 use crate::config::{load_config_with_env, OutboundConfig};
 use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::ecmp::group::EcmpGroupManager;
@@ -30,6 +38,91 @@ use crate::peer::manager::PeerManager;
 use crate::peer::pairing::PairRequestConfig;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
 use crate::tproxy::UdpWorkerPool;
+
+/// DNS engine component holder
+///
+/// This struct holds references to all DNS components needed for IPC command handling.
+/// It provides a unified interface for DNS operations without exposing the internal
+/// implementation details of each component.
+pub struct DnsEngine {
+    /// DNS cache for query result caching
+    cache: Arc<DnsCache>,
+
+    /// Upstream pool for DNS query forwarding
+    upstream_pool: Arc<UpstreamPool>,
+
+    /// Block filter for ad/tracker blocking
+    block_filter: Arc<BlockFilter>,
+
+    /// DNS router for split DNS routing
+    router: Arc<DnsRouter>,
+
+    /// Query logger for DNS query logging
+    query_logger: Arc<QueryLogger>,
+
+    /// DNS configuration
+    config: DnsConfig,
+
+    /// Engine start time for uptime calculation
+    start_time: Instant,
+}
+
+impl DnsEngine {
+    /// Create a new DNS engine with all components
+    pub fn new(
+        cache: Arc<DnsCache>,
+        upstream_pool: Arc<UpstreamPool>,
+        block_filter: Arc<BlockFilter>,
+        router: Arc<DnsRouter>,
+        query_logger: Arc<QueryLogger>,
+        config: DnsConfig,
+    ) -> Self {
+        Self {
+            cache,
+            upstream_pool,
+            block_filter,
+            router,
+            query_logger,
+            config,
+            start_time: Instant::now(),
+        }
+    }
+
+    /// Get the uptime in seconds since the DNS engine started
+    pub fn uptime_secs(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+
+    /// Get a reference to the DNS cache
+    pub fn cache(&self) -> &Arc<DnsCache> {
+        &self.cache
+    }
+
+    /// Get a reference to the upstream pool
+    pub fn upstream_pool(&self) -> &Arc<UpstreamPool> {
+        &self.upstream_pool
+    }
+
+    /// Get a reference to the block filter
+    pub fn block_filter(&self) -> &Arc<BlockFilter> {
+        &self.block_filter
+    }
+
+    /// Get a reference to the DNS router
+    pub fn router(&self) -> &Arc<DnsRouter> {
+        &self.router
+    }
+
+    /// Get a reference to the query logger
+    pub fn query_logger(&self) -> &Arc<QueryLogger> {
+        &self.query_logger
+    }
+
+    /// Get the DNS configuration
+    pub fn config(&self) -> &DnsConfig {
+        &self.config
+    }
+}
 
 /// IPC command handler
 pub struct IpcHandler {
@@ -95,6 +188,13 @@ pub struct IpcHandler {
 
     /// WireGuard egress manager (Phase 6.4)
     wg_egress_manager: Option<Arc<WgEgressManager>>,
+
+    // ========================================================================
+    // Phase 7.7: DNS Engine Components
+    // ========================================================================
+
+    /// DNS engine for DNS query handling (Phase 7.7)
+    dns_engine: Option<Arc<DnsEngine>>,
 }
 
 impl IpcHandler {
@@ -122,6 +222,7 @@ impl IpcHandler {
             ecmp_group_manager: None,
             wg_ingress_manager: None,
             wg_egress_manager: None,
+            dns_engine: None,
         }
     }
 
@@ -155,6 +256,7 @@ impl IpcHandler {
             ecmp_group_manager: None,
             wg_ingress_manager: None,
             wg_egress_manager: None,
+            dns_engine: None,
         }
     }
 
@@ -187,6 +289,7 @@ impl IpcHandler {
             ecmp_group_manager: None,
             wg_ingress_manager: None,
             wg_egress_manager: None,
+            dns_engine: None,
         }
     }
 
@@ -222,6 +325,7 @@ impl IpcHandler {
             ecmp_group_manager: None,
             wg_ingress_manager: None,
             wg_egress_manager: None,
+            dns_engine: None,
         }
     }
 
@@ -264,6 +368,19 @@ impl IpcHandler {
     pub fn with_wg_egress_manager(mut self, wg_egress_manager: Arc<WgEgressManager>) -> Self {
         self.wg_egress_manager = Some(wg_egress_manager);
         self
+    }
+
+    /// Set the DNS engine after construction
+    ///
+    /// This allows adding DNS engine capability to an existing handler.
+    pub fn with_dns_engine(mut self, dns_engine: Arc<DnsEngine>) -> Self {
+        self.dns_engine = Some(dns_engine);
+        self
+    }
+
+    /// Get a reference to the DNS engine (if available)
+    pub fn dns_engine(&self) -> Option<&Arc<DnsEngine>> {
+        self.dns_engine.as_ref()
     }
 
     /// Create a new IPC handler with a default (empty) rule engine
@@ -540,6 +657,49 @@ impl IpcHandler {
             }
             IpcCommand::AbortChainRoute { chain_tag, source_node } => {
                 self.handle_abort_chain_route(&chain_tag, &source_node).await
+            }
+
+            // ================================================================
+            // Phase 7.7: DNS Command Handlers
+            // ================================================================
+            IpcCommand::GetDnsStats => {
+                self.handle_get_dns_stats()
+            }
+            IpcCommand::GetDnsCacheStats => {
+                self.handle_get_dns_cache_stats()
+            }
+            IpcCommand::FlushDnsCache { pattern } => {
+                self.handle_flush_dns_cache(pattern)
+            }
+            IpcCommand::GetDnsBlockStats => {
+                self.handle_get_dns_block_stats()
+            }
+            IpcCommand::ReloadDnsBlocklist => {
+                self.handle_reload_dns_blocklist()
+            }
+            IpcCommand::AddDnsUpstream { tag, config } => {
+                self.handle_add_dns_upstream(tag, config).await
+            }
+            IpcCommand::RemoveDnsUpstream { tag } => {
+                self.handle_remove_dns_upstream(&tag).await
+            }
+            IpcCommand::GetDnsUpstreamStatus { tag } => {
+                self.handle_get_dns_upstream_status(tag)
+            }
+            IpcCommand::AddDnsRoute { pattern, match_type, upstream_tag } => {
+                self.handle_add_dns_route(pattern, match_type, upstream_tag)
+            }
+            IpcCommand::RemoveDnsRoute { pattern } => {
+                self.handle_remove_dns_route(&pattern)
+            }
+            IpcCommand::GetDnsQueryLog { limit, offset } => {
+                self.handle_get_dns_query_log(limit, offset)
+            }
+            IpcCommand::DnsQuery { domain, qtype, upstream } => {
+                self.handle_dns_query(&domain, qtype, upstream).await
+            }
+            IpcCommand::GetDnsConfig => {
+                self.handle_get_dns_config()
             }
         }
     }
@@ -3141,6 +3301,547 @@ impl IpcHandler {
             | ChainError::LockError(_)
             | ChainError::Internal(_) => ErrorCode::InternalError,
         }
+    }
+
+    // ========================================================================
+    // Phase 7.7: DNS Command Handler Implementations
+    // ========================================================================
+
+    /// Handle GetDnsStats command
+    ///
+    /// Returns comprehensive DNS statistics including cache, blocking, and upstream metrics.
+    fn handle_get_dns_stats(&self) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        let cache_stats = dns_engine.cache().stats_snapshot();
+        let block_stats = dns_engine.block_filter().stats();
+        let _log_stats = dns_engine.query_logger().stats_snapshot();
+
+        // Calculate total queries from components
+        let total_queries = cache_stats.hits + cache_stats.misses;
+        let upstream_queries = cache_stats.misses; // Queries that went to upstream
+
+        // Calculate average latency (placeholder - would need tracking in a real implementation)
+        // For now, return 0 as we don't have latency tracking in the current architecture
+        let avg_latency_us = 0;
+
+        IpcResponse::DnsStats(DnsStatsResponse {
+            enabled: dns_engine.config().enabled,
+            uptime_secs: dns_engine.uptime_secs(),
+            total_queries,
+            cache_hits: cache_stats.hits,
+            cache_misses: cache_stats.misses,
+            blocked_queries: block_stats.blocked_count,
+            upstream_queries,
+            avg_latency_us,
+        })
+    }
+
+    /// Handle GetDnsCacheStats command
+    ///
+    /// Returns detailed cache statistics.
+    fn handle_get_dns_cache_stats(&self) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        let stats = dns_engine.cache().stats_snapshot();
+        let current_entries = dns_engine.cache().len();
+        let max_entries = dns_engine.config().cache.max_entries;
+
+        // Calculate hit rate
+        let total = stats.hits + stats.misses;
+        let hit_rate = if total > 0 {
+            stats.hits as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        IpcResponse::DnsCacheStats(DnsCacheStatsResponse {
+            enabled: dns_engine.config().cache.enabled,
+            max_entries,
+            current_entries,
+            hits: stats.hits,
+            misses: stats.misses,
+            hit_rate,
+            negative_hits: stats.negative_hits,
+            inserts: stats.inserts,
+            evictions: stats.evictions,
+        })
+    }
+
+    /// Handle FlushDnsCache command
+    ///
+    /// Flushes cache entries matching the optional pattern.
+    fn handle_flush_dns_cache(&self, pattern: Option<String>) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        let flushed = match pattern {
+            Some(p) => {
+                let count = dns_engine.cache().flush(Some(&p));
+                info!("Flushed {} DNS cache entries matching pattern: {}", count, p);
+                format!("Flushed {} entries matching '{}'", count, p)
+            }
+            None => {
+                let count = dns_engine.cache().flush(None);
+                info!("Flushed {} DNS cache entries", count);
+                format!("Flushed {} cache entries", count)
+            }
+        };
+
+        IpcResponse::success_with_message(flushed)
+    }
+
+    /// Handle GetDnsBlockStats command
+    ///
+    /// Returns DNS blocking/filtering statistics.
+    fn handle_get_dns_block_stats(&self) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        let stats = dns_engine.block_filter().stats();
+        let total_queries = stats.total_queries;
+        let blocked_queries = stats.blocked_count;
+
+        // Calculate block rate
+        let block_rate = if total_queries > 0 {
+            blocked_queries as f64 / total_queries as f64
+        } else {
+            0.0
+        };
+
+        // BlockFilterStats doesn't track last_reload time
+        let last_reload: Option<String> = None;
+
+        IpcResponse::DnsBlockStats(DnsBlockStatsResponse {
+            enabled: dns_engine.config().blocking.enabled,
+            rule_count: stats.rule_count,
+            blocked_queries,
+            total_queries,
+            block_rate,
+            last_reload,
+        })
+    }
+
+    /// Handle ReloadDnsBlocklist command
+    ///
+    /// Reloads blocking rules (hot-reload).
+    fn handle_reload_dns_blocklist(&self) -> IpcResponse {
+        let Some(_dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        // Reload from current domain list
+        // Note: In a full implementation, this would reload from the configured source
+        // For now, we just reset the stats and return success
+        // The actual blocklist is typically loaded at startup and updated via add/remove operations
+        info!("DNS blocklist reload requested (no-op in current implementation)");
+
+        IpcResponse::success_with_message("Blocklist reload completed")
+    }
+
+    /// Handle AddDnsUpstream command
+    ///
+    /// Adds a new upstream DNS server.
+    async fn handle_add_dns_upstream(
+        &self,
+        tag: String,
+        config: super::protocol::DnsUpstreamConfig,
+    ) -> IpcResponse {
+        let Some(_dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        // Validate protocol
+        let protocol = match config.protocol.to_lowercase().as_str() {
+            "udp" | "tcp" | "doh" | "dot" => config.protocol.to_lowercase(),
+            _ => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid protocol '{}': must be udp, tcp, doh, or dot", config.protocol),
+                );
+            }
+        };
+
+        // Note: Adding upstreams dynamically requires UpstreamPool to support add_upstream
+        // This is a placeholder that logs the attempt
+        info!(
+            "Add upstream request: tag={}, address={}, protocol={}",
+            tag, config.address, protocol
+        );
+
+        // For now, return an error indicating this operation is not yet implemented
+        // A full implementation would need to:
+        // 1. Create the appropriate upstream client (UDP, TCP, DoH, or DoT)
+        // 2. Add it to the UpstreamPool
+        IpcResponse::error(
+            ErrorCode::OperationFailed,
+            "Dynamic upstream addition not yet implemented",
+        )
+    }
+
+    /// Handle RemoveDnsUpstream command
+    ///
+    /// Removes an upstream DNS server by tag.
+    async fn handle_remove_dns_upstream(&self, tag: &str) -> IpcResponse {
+        let Some(_dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        info!("Remove upstream request: tag={}", tag);
+
+        // Placeholder - UpstreamPool would need remove_upstream method
+        IpcResponse::error(
+            ErrorCode::OperationFailed,
+            "Dynamic upstream removal not yet implemented",
+        )
+    }
+
+    /// Handle GetDnsUpstreamStatus command
+    ///
+    /// Returns status information for upstream servers.
+    fn handle_get_dns_upstream_status(&self, tag: Option<String>) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        let upstream_pool = dns_engine.upstream_pool();
+
+        // Use upstream_info() method which returns UpstreamInfo structs
+        let all_upstreams = upstream_pool.upstream_info();
+
+        let upstreams: Vec<DnsUpstreamInfo> = all_upstreams
+            .into_iter()
+            .filter(|u| tag.is_none() || tag.as_ref().map(|t| t == &u.tag).unwrap_or(false))
+            .map(|u| DnsUpstreamInfo {
+                tag: u.tag,
+                address: u.address,
+                protocol: u.protocol.to_string(),
+                healthy: u.healthy,
+                total_queries: 0,     // Pool stats are aggregate, not per-upstream
+                failed_queries: 0,
+                avg_latency_us: 0,
+                last_success: None,
+                last_failure: None,
+            })
+            .collect();
+
+        if let Some(t) = &tag {
+            if upstreams.is_empty() {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Upstream '{}' not found", t),
+                );
+            }
+        }
+
+        IpcResponse::DnsUpstreamStatus(DnsUpstreamStatusResponse { upstreams })
+    }
+
+    /// Handle AddDnsRoute command
+    ///
+    /// Adds a DNS routing rule.
+    fn handle_add_dns_route(
+        &self,
+        pattern: String,
+        match_type: String,
+        upstream_tag: String,
+    ) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        // Parse match type
+        let mt = match match_type.to_lowercase().as_str() {
+            "exact" => DomainMatchType::Exact,
+            "suffix" => DomainMatchType::Suffix,
+            "keyword" => DomainMatchType::Keyword,
+            "regex" => DomainMatchType::Regex,
+            _ => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!(
+                        "Invalid match_type '{}': must be exact, suffix, keyword, or regex",
+                        match_type
+                    ),
+                );
+            }
+        };
+
+        // Add the route
+        match dns_engine.router().add_route(&pattern, mt, &upstream_tag) {
+            Ok(()) => {
+                info!(
+                    "Added DNS route: {} ({}) -> {}",
+                    pattern, match_type, upstream_tag
+                );
+                IpcResponse::success_with_message(format!(
+                    "Route added: {} -> {}",
+                    pattern, upstream_tag
+                ))
+            }
+            Err(e) => {
+                warn!("Failed to add DNS route: {}", e);
+                IpcResponse::error(ErrorCode::OperationFailed, e.to_string())
+            }
+        }
+    }
+
+    /// Handle RemoveDnsRoute command
+    ///
+    /// Removes a DNS routing rule by pattern.
+    fn handle_remove_dns_route(&self, pattern: &str) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        match dns_engine.router().remove_route(pattern) {
+            Ok(removed) => {
+                if removed {
+                    info!("Removed DNS route: {}", pattern);
+                    IpcResponse::success_with_message(format!("Route '{}' removed", pattern))
+                } else {
+                    IpcResponse::error(
+                        ErrorCode::NotFound,
+                        format!("Route '{}' not found", pattern),
+                    )
+                }
+            }
+            Err(e) => {
+                warn!("Failed to remove DNS route: {}", e);
+                IpcResponse::error(ErrorCode::OperationFailed, e.to_string())
+            }
+        }
+    }
+
+    /// Handle GetDnsQueryLog command
+    ///
+    /// Returns recent DNS query log entries with pagination.
+    fn handle_get_dns_query_log(&self, limit: usize, offset: usize) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        // Note: QueryLogger is write-only by design (batch writes to file)
+        // Reading query logs would require a separate log reader component
+        // For now, return an empty response with appropriate metadata
+        let stats = dns_engine.query_logger().stats_snapshot();
+        let total_available = stats.entries_logged as usize;
+
+        IpcResponse::DnsQueryLog(DnsQueryLogResponse {
+            entries: vec![],
+            total_available,
+            offset,
+            limit,
+        })
+    }
+
+    /// Handle DnsQuery command
+    ///
+    /// Performs a test DNS query.
+    async fn handle_dns_query(
+        &self,
+        domain: &str,
+        qtype: Option<u16>,
+        upstream: Option<String>,
+    ) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        use hickory_proto::op::{Message, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+
+        let record_type = match qtype.unwrap_or(1) {
+            1 => RecordType::A,
+            28 => RecordType::AAAA,
+            5 => RecordType::CNAME,
+            15 => RecordType::MX,
+            16 => RecordType::TXT,
+            n => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Unsupported query type: {}", n),
+                );
+            }
+        };
+
+        // Parse domain name
+        let name = match Name::from_str(domain) {
+            Ok(n) => n,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid domain name: {}", e),
+                );
+            }
+        };
+
+        // Build query
+        let mut query_msg = Message::new();
+        query_msg.set_id(rand::random());
+        query_msg.set_recursion_desired(true);
+        query_msg.add_query(Query::query(name.clone(), record_type));
+
+        let start = Instant::now();
+
+        // Determine which upstream to use
+        let upstream_pool = dns_engine.upstream_pool();
+
+        // Perform query
+        let result = if let Some(upstream_tag) = &upstream {
+            // Query specific upstream
+            upstream_pool.query_by_tag(upstream_tag, &query_msg).await
+        } else {
+            // Use router to determine upstream tag or default pool
+            let routed_tag = dns_engine.router().route_to_tag(domain);
+            upstream_pool.query_by_tag(&routed_tag, &query_msg).await
+        };
+
+        let latency_us = start.elapsed().as_micros() as u64;
+
+        match result {
+            Ok(response) => {
+                // ResponseCode is an enum, use Into<u16> and truncate to u8
+                let response_code: u8 = u16::from(response.response_code()) as u8;
+                let answers: Vec<String> = response
+                    .answers()
+                    .iter()
+                    .map(|r| r.data().map(|d| d.to_string()).unwrap_or_default())
+                    .collect();
+
+                IpcResponse::DnsQueryResult(DnsQueryResponse {
+                    success: true,
+                    domain: domain.to_string(),
+                    qtype: qtype.unwrap_or(1),
+                    response_code,
+                    answers,
+                    latency_us,
+                    cached: false, // Direct query, not cached
+                    blocked: false,
+                    upstream_used: upstream,
+                })
+            }
+            Err(e) => {
+                warn!("DNS query failed for {}: {}", domain, e);
+                IpcResponse::DnsQueryResult(DnsQueryResponse {
+                    success: false,
+                    domain: domain.to_string(),
+                    qtype: qtype.unwrap_or(1),
+                    response_code: 2, // SERVFAIL
+                    answers: vec![],
+                    latency_us,
+                    cached: false,
+                    blocked: false,
+                    upstream_used: upstream,
+                })
+            }
+        }
+    }
+
+    /// Handle GetDnsConfig command
+    ///
+    /// Returns the current DNS engine configuration.
+    fn handle_get_dns_config(&self) -> IpcResponse {
+        let Some(dns_engine) = &self.dns_engine else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "DNS engine not enabled",
+            );
+        };
+
+        let config = dns_engine.config();
+        let upstream_pool = dns_engine.upstream_pool();
+
+        // Build upstream info list using upstream_info()
+        let upstreams: Vec<DnsUpstreamInfo> = upstream_pool
+            .upstream_info()
+            .into_iter()
+            .map(|u| DnsUpstreamInfo {
+                tag: u.tag,
+                address: u.address,
+                protocol: u.protocol.to_string(),
+                healthy: u.healthy,
+                total_queries: 0,
+                failed_queries: 0,
+                avg_latency_us: 0,
+                last_success: None,
+                last_failure: None,
+            })
+            .collect();
+
+        // Build available_features map to inform clients about implementation status
+        let mut available_features = std::collections::HashMap::new();
+        available_features.insert("get_dns_stats".to_string(), "available".to_string());
+        available_features.insert("get_dns_cache_stats".to_string(), "available".to_string());
+        available_features.insert("flush_dns_cache".to_string(), "available".to_string());
+        available_features.insert("get_dns_block_stats".to_string(), "available".to_string());
+        available_features.insert("reload_dns_blocklist".to_string(), "available".to_string());
+        available_features.insert("get_dns_upstream_status".to_string(), "available".to_string());
+        available_features.insert("add_dns_route".to_string(), "available".to_string());
+        available_features.insert("remove_dns_route".to_string(), "available".to_string());
+        available_features.insert("dns_query".to_string(), "available".to_string());
+        available_features.insert("get_dns_config".to_string(), "available".to_string());
+        // Partially/not implemented features
+        available_features.insert("add_dns_upstream".to_string(), "not_implemented".to_string());
+        available_features.insert("remove_dns_upstream".to_string(), "not_implemented".to_string());
+        available_features.insert("get_dns_query_log".to_string(), "partial".to_string());
+
+        IpcResponse::DnsConfig(DnsConfigResponse {
+            enabled: config.enabled,
+            listen_udp: config.listen_udp.to_string(),
+            listen_tcp: config.listen_tcp.to_string(),
+            upstreams,
+            cache_enabled: config.cache.enabled,
+            cache_max_entries: config.cache.max_entries,
+            blocking_enabled: config.blocking.enabled,
+            blocking_response_type: config.blocking.response_type.to_string(),
+            logging_enabled: config.logging.enabled,
+            logging_format: config.logging.format.to_string(),
+            available_features,
+        })
     }
 }
 

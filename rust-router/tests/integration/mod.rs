@@ -6,6 +6,7 @@
 //! # Test Organization
 //!
 //! - `ab_comparison`: A/B comparison framework for rust-router vs sing-box
+//! - `dns_ipc`: DNS IPC command serialization and handler tests (Phase 7.7)
 //! - `socks5_integration`: SOCKS5 outbound integration tests with mock server
 //! - `wireguard_integration`: WireGuard interface utilities and parity tests
 //! - `failover_integration`: Health check, IPC, and graceful shutdown tests
@@ -38,6 +39,7 @@
 
 pub mod ab_comparison;
 pub mod chaos;
+pub mod dns_ipc;
 pub mod dscp_chain;
 pub mod e2e;
 pub mod failover_integration;

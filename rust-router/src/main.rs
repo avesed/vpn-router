@@ -35,12 +35,21 @@ use rust_router::connection::{
     run_accept_loop, ConnectionManager, UdpPacketProcessor, UdpProcessorConfig,
     UdpSessionConfig, UdpSessionManager,
 };
+use rust_router::dns::cache::DnsCache;
+use rust_router::dns::client::UpstreamPool;
+use rust_router::dns::filter::BlockFilter;
+use rust_router::dns::log::QueryLogger;
+use rust_router::dns::server::{DnsHandler, DnsRateLimiter, TcpDnsServer, UdpDnsServer};
+use rust_router::dns::split::DnsRouter;
+use rust_router::dns::{
+    BlockingConfig, CacheConfig, DnsConfig, RateLimitConfig, UpstreamConfig, UpstreamProtocol,
+};
 use rust_router::ecmp::group::EcmpGroupManager;
 use rust_router::egress::manager::WgEgressManager;
 use rust_router::egress::reply::WgReplyHandler;
 use rust_router::ingress::manager::WgIngressManager;
 use rust_router::ingress::WgIngressConfig;
-use rust_router::ipc::{IpcHandler, IpcServer};
+use rust_router::ipc::{DnsEngine, IpcHandler, IpcServer};
 use rust_router::outbound::{OutboundManager, OutboundManagerBuilder};
 use rust_router::peer::manager::PeerManager;
 use rust_router::rules::{RuleEngine, RoutingSnapshotBuilder};
@@ -497,10 +506,69 @@ async fn main() -> Result<()> {
         ipc_handler
     };
 
+    // ========================================================================
+    // Phase 7: DNS Engine Initialization
+    // ========================================================================
+
+    // Create DNS configuration with default upstream servers
+    let dns_config = DnsConfig::new()
+        .with_upstream(UpstreamConfig::new("cloudflare", "1.1.1.1:53", UpstreamProtocol::Udp))
+        .with_upstream(UpstreamConfig::new("cloudflare-backup", "1.0.0.1:53", UpstreamProtocol::Udp))
+        .with_upstream(UpstreamConfig::new("google", "8.8.8.8:53", UpstreamProtocol::Udp))
+        .with_cache(CacheConfig::default())
+        .with_blocking(BlockingConfig::default())
+        .with_rate_limit(RateLimitConfig::default());
+
+    info!(
+        "DNS engine configuration: {} upstreams, cache enabled={}, blocking enabled={}",
+        dns_config.upstreams.len(),
+        dns_config.cache.enabled,
+        dns_config.blocking.enabled
+    );
+
+    // Create DNS components
+    let dns_cache = Arc::new(DnsCache::new(dns_config.cache.clone()));
+
+    // Create upstream clients from configuration
+    let mut upstreams: Vec<Box<dyn rust_router::dns::client::DnsUpstream>> = Vec::new();
+    for upstream_config in &dns_config.upstreams {
+        match rust_router::dns::client::UdpClient::new(upstream_config.clone()) {
+            Ok(client) => {
+                info!("Created DNS upstream: {} ({})", upstream_config.tag, upstream_config.address);
+                upstreams.push(Box::new(client));
+            }
+            Err(e) => {
+                warn!("Failed to create DNS upstream {}: {}", upstream_config.tag, e);
+            }
+        }
+    }
+
+    if upstreams.is_empty() {
+        warn!("No DNS upstreams configured - DNS engine will not be able to resolve queries");
+    }
+
+    let dns_upstream_pool = Arc::new(UpstreamPool::new(upstreams));
+    let dns_block_filter = Arc::new(BlockFilter::new(dns_config.blocking.clone()));
+    let dns_router = Arc::new(DnsRouter::new("cloudflare".to_string()));
+    let dns_query_logger = Arc::new(QueryLogger::disabled());
+
+    // Create DNS engine for IPC integration
+    let dns_engine = Arc::new(DnsEngine::new(
+        Arc::clone(&dns_cache),
+        Arc::clone(&dns_upstream_pool),
+        Arc::clone(&dns_block_filter),
+        Arc::clone(&dns_router),
+        Arc::clone(&dns_query_logger),
+        dns_config.clone(),
+    ));
+
+    // Wire up DNS engine to IPC handler
+    let ipc_handler = ipc_handler.with_dns_engine(Arc::clone(&dns_engine));
+
     let ipc_handler = Arc::new(ipc_handler);
 
     info!(
-        "IPC handler configured with Phase 6 managers (peer={}, chain={}, ecmp={}, wg_ingress={}, wg_egress={})",
+        "IPC handler configured with Phase 6 managers (peer={}, chain={}, ecmp={}, wg_ingress={}, wg_egress={}) and DNS engine",
         true, true, true,
         wg_ingress_manager.is_some(),
         true
@@ -515,6 +583,64 @@ async fn main() -> Result<()> {
             error!("IPC server error: {}", e);
         }
     });
+
+    // ========================================================================
+    // Phase 7: Start DNS Servers (UDP + TCP on 127.0.0.1:7853)
+    // ========================================================================
+
+    // Create rate limiter and handler for DNS servers
+    let dns_rate_limiter = Arc::new(DnsRateLimiter::new(&dns_config.rate_limit));
+    let dns_handler = Arc::new(DnsHandler::new(Arc::clone(&dns_rate_limiter)));
+
+    // Create shutdown channels for DNS servers
+    let (dns_udp_shutdown_tx, dns_udp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (dns_tcp_shutdown_tx, dns_tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Start UDP DNS server
+    let dns_udp_addr = dns_config.listen_udp;
+    let dns_udp_handle = {
+        let handler = Arc::clone(&dns_handler);
+        tokio::spawn(async move {
+            match UdpDnsServer::bind(dns_udp_addr, handler).await {
+                Ok(server) => {
+                    info!("DNS UDP server listening on {}", dns_udp_addr);
+                    if let Err(e) = server.run_until_shutdown(dns_udp_shutdown_rx).await {
+                        error!("DNS UDP server error: {}", e);
+                    }
+                    info!("DNS UDP server shutdown complete");
+                }
+                Err(e) => {
+                    error!("Failed to start DNS UDP server on {}: {}", dns_udp_addr, e);
+                }
+            }
+        })
+    };
+
+    // Start TCP DNS server
+    let dns_tcp_addr = dns_config.listen_tcp;
+    let dns_tcp_config = dns_config.tcp.clone();
+    let dns_tcp_handle = {
+        let handler = Arc::clone(&dns_handler);
+        tokio::spawn(async move {
+            match TcpDnsServer::bind(dns_tcp_addr, handler, dns_tcp_config).await {
+                Ok(server) => {
+                    info!("DNS TCP server listening on {}", dns_tcp_addr);
+                    if let Err(e) = server.run_until_shutdown(dns_tcp_shutdown_rx).await {
+                        error!("DNS TCP server error: {}", e);
+                    }
+                    info!("DNS TCP server shutdown complete");
+                }
+                Err(e) => {
+                    error!("Failed to start DNS TCP server on {}: {}", dns_tcp_addr, e);
+                }
+            }
+        })
+    };
+
+    info!(
+        "DNS servers started on {} (UDP) and {} (TCP)",
+        dns_config.listen_udp, dns_config.listen_tcp
+    );
 
     // ========================================================================
     // Phase 6: Start userspace WireGuard ingress if enabled
@@ -568,6 +694,26 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(5),
         ipc_handle,
     ).await;
+
+    // ========================================================================
+    // Phase 7: Shutdown DNS servers
+    // ========================================================================
+    info!("Shutting down DNS servers...");
+
+    // Send shutdown signals to DNS servers
+    let _ = dns_udp_shutdown_tx.send(());
+    let _ = dns_tcp_shutdown_tx.send(());
+
+    // Wait for DNS servers to shut down
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            let _ = dns_udp_handle.await;
+            let _ = dns_tcp_handle.await;
+        },
+    ).await;
+
+    info!("DNS servers shutdown complete");
 
     // ========================================================================
     // Phase 6: Shutdown WireGuard ingress if running

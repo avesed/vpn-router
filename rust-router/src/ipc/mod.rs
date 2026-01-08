@@ -35,7 +35,7 @@ mod handler;
 mod protocol;
 mod server;
 
-pub use handler::IpcHandler;
+pub use handler::{DnsEngine, IpcHandler};
 pub use protocol::{
     decode_message, encode_message, ErrorCode, IpcCommand, IpcError, IpcResponse, OutboundInfo,
     OutboundStatsResponse, ServerCapabilities, ServerStatus, LENGTH_PREFIX_SIZE, MAX_MESSAGE_SIZE,
@@ -46,5 +46,9 @@ pub use protocol::{
     ChainRole, ChainState, ChainHop, ChainConfig, HopStatus, ChainStatus, ChainListResponse,
     PrepareStatus, ChainRoleResponse, PrepareResponse, PairingResponse,
     PairRequest, PairResponse,
+    // Phase 7.7: DNS IPC types
+    DnsUpstreamConfig, DnsStatsResponse, DnsCacheStatsResponse, DnsBlockStatsResponse,
+    DnsUpstreamStatusResponse, DnsUpstreamInfo, DnsQueryLogResponse, DnsQueryLogEntry,
+    DnsQueryResponse, DnsConfigResponse,
 };
 pub use server::{IpcClient, IpcServer};

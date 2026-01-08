@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Rust Router IPC Client (v4.0 - Phase 6 v3.2)
+Rust Router IPC Client (v4.1 - Phase 7.7)
 
 Async client for communicating with rust-router via Unix socket.
 Used by api_server.py and RustRouterManager for configuration sync.
 
-Protocol v4.0 Features (Phase 6 v3.2):
+Protocol v4.1 Features (Phase 7.7):
 - Length-prefixed JSON framing (4 bytes BE + JSON) - matches Rust IPC protocol
 - WireGuard outbound management (AddWireguardOutbound)
 - SOCKS5 outbound management (AddSocks5Outbound)
@@ -17,12 +17,21 @@ Protocol v4.0 Features (Phase 6 v3.2):
 - Connection retry with exponential backoff
 - Graceful degradation when rust-router unavailable
 
-Phase 6 v3.2 New Commands:
+Phase 6 v3.2 Commands:
 - Userspace WireGuard tunnel management (CreateWgTunnel, RemoveWgTunnel, etc.)
 - ECMP group management (CreateEcmpGroup, RemoveEcmpGroup, etc.)
 - Peer node management (GeneratePairRequest, ImportPairRequest, ConnectPeer, etc.)
 - Chain management (CreateChain, ActivateChain, DeactivateChain, etc.)
 - Two-Phase Commit for distributed chain activation
+
+Phase 7.7 DNS Commands:
+- DNS statistics (GetDnsStats, GetDnsCacheStats, GetDnsBlockStats)
+- Cache management (FlushDnsCache)
+- Upstream management (AddDnsUpstream, RemoveDnsUpstream, GetDnsUpstreamStatus)
+- DNS routing (AddDnsRoute, RemoveDnsRoute)
+- Query logging (GetDnsQueryLog)
+- Test queries (DnsQuery)
+- Configuration (GetDnsConfig, ReloadDnsBlocklist)
 
 Wire Protocol:
   [4 bytes: message length (big-endian u32)]
@@ -47,7 +56,7 @@ LENGTH_PREFIX_SIZE = 4
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 
 # Protocol version
-PROTOCOL_VERSION = 4  # Phase 6 v3.2: Userspace WireGuard, ECMP groups, peer management, chains
+PROTOCOL_VERSION = 5  # Phase 7.7: DNS engine commands
 
 # Default timeouts
 DEFAULT_CONNECT_TIMEOUT = 5.0  # seconds
@@ -244,6 +253,114 @@ class RuleConfig:
             "priority": self.priority,
             "enabled": self.enabled,
         }
+
+
+# =============================================================================
+# Phase 7.7: DNS dataclasses
+# =============================================================================
+
+
+@dataclass
+class DnsStats:
+    """DNS engine statistics"""
+    enabled: bool = False
+    uptime_secs: int = 0
+    total_queries: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    blocked_queries: int = 0
+    upstream_queries: int = 0
+    avg_latency_us: int = 0
+
+
+@dataclass
+class DnsCacheStats:
+    """DNS cache statistics"""
+    enabled: bool = False
+    max_entries: int = 0
+    current_entries: int = 0
+    hits: int = 0
+    misses: int = 0
+    hit_rate: float = 0.0
+    negative_hits: int = 0
+    inserts: int = 0
+    evictions: int = 0
+
+
+@dataclass
+class DnsBlockStats:
+    """DNS blocking statistics"""
+    enabled: bool = False
+    rule_count: int = 0
+    blocked_queries: int = 0
+    total_queries: int = 0
+    block_rate: float = 0.0
+    last_reload: Optional[str] = None
+
+
+@dataclass
+class DnsUpstreamInfo:
+    """DNS upstream server information"""
+    tag: str
+    address: str
+    protocol: str
+    healthy: bool = True
+    total_queries: int = 0
+    failed_queries: int = 0
+    avg_latency_us: int = 0
+    last_success: Optional[str] = None
+    last_failure: Optional[str] = None
+
+
+@dataclass
+class DnsQueryLogEntry:
+    """DNS query log entry"""
+    timestamp: int
+    domain: str
+    qtype: int
+    qtype_str: str
+    upstream: str
+    response_code: int
+    rcode_str: str
+    latency_us: int
+    blocked: bool = False
+    cached: bool = False
+
+
+@dataclass
+class DnsQueryResult:
+    """DNS query result"""
+    success: bool
+    domain: str
+    qtype: int
+    response_code: int
+    answers: List[str] = field(default_factory=list)
+    latency_us: int = 0
+    cached: bool = False
+    blocked: bool = False
+    upstream_used: Optional[str] = None
+
+
+@dataclass
+class DnsConfig:
+    """DNS engine configuration
+
+    The `available_features` field indicates implementation status of each feature:
+    - "available": Feature is fully implemented
+    - "partial": Feature is partially implemented (e.g., get_dns_query_log returns empty)
+    - "not_implemented": Feature is reserved for future use
+    """
+    enabled: bool = False
+    listen_udp: str = ""
+    listen_tcp: str = ""
+    upstreams: List[DnsUpstreamInfo] = field(default_factory=list)
+    cache_enabled: bool = True
+    cache_max_entries: int = 10000
+    blocking_enabled: bool = True
+    blocking_response_type: str = "zero_ip"
+    logging_enabled: bool = False
+    logging_format: str = "json"
+    available_features: Dict[str, str] = field(default_factory=dict)
 
 
 class IpcError(Exception):
@@ -1559,6 +1676,303 @@ class RustRouterClient:
             "chain_tag": chain_tag,
             "source_node": source_node,
         })
+
+    # =========================================================================
+    # Phase 7.7: DNS Commands
+    # =========================================================================
+
+    async def get_dns_stats(self) -> Optional[DnsStats]:
+        """Get overall DNS statistics"""
+        response = await self._send_command({"type": "get_dns_stats"})
+        if not response.success or not response.data:
+            return None
+        return DnsStats(
+            enabled=response.data.get("enabled", False),
+            uptime_secs=response.data.get("uptime_secs", 0),
+            total_queries=response.data.get("total_queries", 0),
+            cache_hits=response.data.get("cache_hits", 0),
+            cache_misses=response.data.get("cache_misses", 0),
+            blocked_queries=response.data.get("blocked_queries", 0),
+            upstream_queries=response.data.get("upstream_queries", 0),
+            avg_latency_us=response.data.get("avg_latency_us", 0),
+        )
+
+    async def get_dns_cache_stats(self) -> Optional[DnsCacheStats]:
+        """Get DNS cache statistics"""
+        response = await self._send_command({"type": "get_dns_cache_stats"})
+        if not response.success or not response.data:
+            return None
+        return DnsCacheStats(
+            enabled=response.data.get("enabled", False),
+            max_entries=response.data.get("max_entries", 0),
+            current_entries=response.data.get("current_entries", 0),
+            hits=response.data.get("hits", 0),
+            misses=response.data.get("misses", 0),
+            hit_rate=response.data.get("hit_rate", 0.0),
+            negative_hits=response.data.get("negative_hits", 0),
+            inserts=response.data.get("inserts", 0),
+            evictions=response.data.get("evictions", 0),
+        )
+
+    async def flush_dns_cache(self, pattern: Optional[str] = None) -> IpcResponse:
+        """Flush DNS cache (optional pattern for selective flush)
+
+        Args:
+            pattern: Optional domain pattern for selective flush.
+                     If None, flushes entire cache.
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        cmd: Dict[str, Any] = {"type": "flush_dns_cache"}
+        if pattern:
+            cmd["pattern"] = pattern
+        return await self._send_command(cmd)
+
+    async def get_dns_block_stats(self) -> Optional[DnsBlockStats]:
+        """Get DNS blocking statistics"""
+        response = await self._send_command({"type": "get_dns_block_stats"})
+        if not response.success or not response.data:
+            return None
+        return DnsBlockStats(
+            enabled=response.data.get("enabled", False),
+            rule_count=response.data.get("rule_count", 0),
+            blocked_queries=response.data.get("blocked_queries", 0),
+            total_queries=response.data.get("total_queries", 0),
+            block_rate=response.data.get("block_rate", 0.0),
+            last_reload=response.data.get("last_reload"),
+        )
+
+    async def reload_dns_blocklist(self) -> IpcResponse:
+        """Reload DNS blocklist from database"""
+        return await self._send_command({"type": "reload_dns_blocklist"})
+
+    async def add_dns_upstream(
+        self,
+        tag: str,
+        address: str,
+        protocol: str,
+        bootstrap: Optional[List[str]] = None,
+        timeout_secs: Optional[int] = None,
+    ) -> IpcResponse:
+        """Add a DNS upstream server
+
+        Args:
+            tag: Unique tag for this upstream
+            address: Server address (IP:port for UDP/TCP, URL for DoH/DoT)
+            protocol: Protocol type ("udp", "tcp", "doh", "dot")
+            bootstrap: Optional bootstrap DNS servers for DoH/DoT
+            timeout_secs: Optional query timeout in seconds
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        config: Dict[str, Any] = {
+            "address": address,
+            "protocol": protocol,
+        }
+        if bootstrap:
+            config["bootstrap"] = bootstrap
+        if timeout_secs:
+            config["timeout_secs"] = timeout_secs
+        return await self._send_command({
+            "type": "add_dns_upstream",
+            "tag": tag,
+            "config": config,
+        })
+
+    async def remove_dns_upstream(self, tag: str) -> IpcResponse:
+        """Remove a DNS upstream server
+
+        Args:
+            tag: Upstream tag to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "remove_dns_upstream",
+            "tag": tag,
+        })
+
+    async def get_dns_upstream_status(
+        self, tag: Optional[str] = None
+    ) -> List[DnsUpstreamInfo]:
+        """Get DNS upstream status
+
+        Args:
+            tag: Optional specific upstream tag. If None, returns all upstreams.
+
+        Returns:
+            List of DnsUpstreamInfo for each upstream
+        """
+        cmd: Dict[str, Any] = {"type": "get_dns_upstream_status"}
+        if tag:
+            cmd["tag"] = tag
+        response = await self._send_command(cmd)
+        if not response.success or not response.data:
+            return []
+
+        result = []
+        for item in response.data.get("upstreams", []):
+            result.append(DnsUpstreamInfo(
+                tag=item.get("tag", ""),
+                address=item.get("address", ""),
+                protocol=item.get("protocol", ""),
+                healthy=item.get("healthy", True),
+                total_queries=item.get("total_queries", 0),
+                failed_queries=item.get("failed_queries", 0),
+                avg_latency_us=item.get("avg_latency_us", 0),
+                last_success=item.get("last_success"),
+                last_failure=item.get("last_failure"),
+            ))
+        return result
+
+    async def add_dns_route(
+        self, pattern: str, match_type: str, upstream_tag: str
+    ) -> IpcResponse:
+        """Add a DNS routing rule
+
+        Args:
+            pattern: Domain pattern to match
+            match_type: One of "exact", "suffix", "keyword", "regex"
+            upstream_tag: Upstream server tag to route to
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "add_dns_route",
+            "pattern": pattern,
+            "match_type": match_type,
+            "upstream_tag": upstream_tag,
+        })
+
+    async def remove_dns_route(self, pattern: str) -> IpcResponse:
+        """Remove a DNS routing rule by pattern
+
+        Args:
+            pattern: Domain pattern to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "remove_dns_route",
+            "pattern": pattern,
+        })
+
+    async def get_dns_query_log(
+        self, limit: int = 100, offset: int = 0
+    ) -> List[DnsQueryLogEntry]:
+        """Get DNS query log entries
+
+        Args:
+            limit: Maximum number of entries to return (default: 100)
+            offset: Number of entries to skip (default: 0)
+
+        Returns:
+            List of DnsQueryLogEntry
+        """
+        response = await self._send_command({
+            "type": "get_dns_query_log",
+            "limit": limit,
+            "offset": offset,
+        })
+        if not response.success or not response.data:
+            return []
+
+        result = []
+        for item in response.data.get("entries", []):
+            result.append(DnsQueryLogEntry(
+                timestamp=item.get("timestamp", 0),
+                domain=item.get("domain", ""),
+                qtype=item.get("qtype", 0),
+                qtype_str=item.get("qtype_str", ""),
+                upstream=item.get("upstream", ""),
+                response_code=item.get("response_code", 0),
+                rcode_str=item.get("rcode_str", ""),
+                latency_us=item.get("latency_us", 0),
+                blocked=item.get("blocked", False),
+                cached=item.get("cached", False),
+            ))
+        return result
+
+    async def dns_query(
+        self,
+        domain: str,
+        qtype: int = 1,  # Default: A record
+        upstream: Optional[str] = None,
+    ) -> Optional[DnsQueryResult]:
+        """Perform a test DNS query
+
+        Args:
+            domain: Domain name to query
+            qtype: Query type (1=A, 28=AAAA, 5=CNAME, etc.)
+            upstream: Optional specific upstream to use
+
+        Returns:
+            DnsQueryResult with query results, or None if failed
+        """
+        cmd: Dict[str, Any] = {
+            "type": "dns_query",
+            "domain": domain,
+            "qtype": qtype,
+        }
+        if upstream:
+            cmd["upstream"] = upstream
+        response = await self._send_command(cmd)
+        if not response.success or not response.data:
+            return None
+        return DnsQueryResult(
+            success=response.data.get("success", False),
+            domain=response.data.get("domain", domain),
+            qtype=response.data.get("qtype", qtype),
+            response_code=response.data.get("response_code", 0),
+            answers=response.data.get("answers", []),
+            latency_us=response.data.get("latency_us", 0),
+            cached=response.data.get("cached", False),
+            blocked=response.data.get("blocked", False),
+            upstream_used=response.data.get("upstream_used"),
+        )
+
+    async def get_dns_config(self) -> Optional[DnsConfig]:
+        """Get current DNS configuration
+
+        Returns:
+            DnsConfig with current settings, or None if failed
+        """
+        response = await self._send_command({"type": "get_dns_config"})
+        if not response.success or not response.data:
+            return None
+
+        upstreams = []
+        for item in response.data.get("upstreams", []):
+            upstreams.append(DnsUpstreamInfo(
+                tag=item.get("tag", ""),
+                address=item.get("address", ""),
+                protocol=item.get("protocol", ""),
+                healthy=item.get("healthy", True),
+                total_queries=item.get("total_queries", 0),
+                failed_queries=item.get("failed_queries", 0),
+                avg_latency_us=item.get("avg_latency_us", 0),
+                last_success=item.get("last_success"),
+                last_failure=item.get("last_failure"),
+            ))
+
+        return DnsConfig(
+            enabled=response.data.get("enabled", False),
+            listen_udp=response.data.get("listen_udp", ""),
+            listen_tcp=response.data.get("listen_tcp", ""),
+            upstreams=upstreams,
+            cache_enabled=response.data.get("cache_enabled", True),
+            cache_max_entries=response.data.get("cache_max_entries", 10000),
+            blocking_enabled=response.data.get("blocking_enabled", True),
+            blocking_response_type=response.data.get("blocking_response_type", "zero_ip"),
+            logging_enabled=response.data.get("logging_enabled", False),
+            logging_format=response.data.get("logging_format", "json"),
+            available_features=response.data.get("available_features", {}),
+        )
 
     # =========================================================================
     # Lifecycle Commands

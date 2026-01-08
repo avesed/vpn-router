@@ -148,6 +148,12 @@ cleanup_wireguard_interfaces() {
   # Note: Do NOT reset route_localnet sysctl - it's a host setting with network_mode: host
   # Resetting could break other services on the host
 
+  # Phase 7.7: Clean up DNS redirect rules
+  ${IPTABLES} -t nat -D PREROUTING -i wg-ingress -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT:-7853}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i wg-ingress -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT:-7853}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i xray-tun0 -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT:-7853}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i xray-tun0 -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT:-7853}" 2>/dev/null || true
+
   # Cleanup ip rules
   ip rule del fwmark 1 lookup 100 2>/dev/null || true
 }
@@ -179,27 +185,25 @@ export WEB_PORT="${WEB_PORT:-36000}"
 export WG_LISTEN_PORT="${WG_LISTEN_PORT:-36100}"
 
 # Rust Router configuration
-# [Phase 5] rust-router is now the default data plane (9.01/10 final score)
-# Set USE_RUST_ROUTER=false to fall back to sing-box
-# If rust-router fails to start, it will automatically fall back to sing-box
-USE_RUST_ROUTER="${USE_RUST_ROUTER:-true}"
+# rust-router is the primary data plane (9.01/10 final score)
+# Fallback to sing-box only if rust-router binary is missing
 RUST_ROUTER_BIN="${RUST_ROUTER_BIN:-/usr/local/bin/rust-router}"
 RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG:-/etc/rust-router/config.json}"
 RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET:-/var/run/rust-router.sock}"
 RUST_ROUTER_LOG="${RUST_ROUTER_LOG:-/var/log/rust-router.log}"
 
-# Phase 6: Userspace WireGuard mode
-# When USERSPACE_WG=true, rust-router handles WireGuard in userspace (boringtun)
-# and kernel WireGuard interfaces are not created.
-# REQUIRES: USE_RUST_ROUTER=true (will log warning if misconfigured)
-USERSPACE_WG="${USERSPACE_WG:-false}"
+# Phase 6: Userspace WireGuard mode (default)
+# rust-router handles WireGuard in userspace via boringtun
+# Set USERSPACE_WG=false to use kernel WireGuard (requires wireguard kernel module)
+USERSPACE_WG="${USERSPACE_WG:-true}"
 
-# Validate userspace WireGuard configuration
-if [ "${USERSPACE_WG}" = "true" ] && [ "${USE_RUST_ROUTER}" != "true" ]; then
-  echo "[entrypoint] WARNING: USERSPACE_WG=true requires USE_RUST_ROUTER=true"
-  echo "[entrypoint] disabling userspace WireGuard mode"
-  USERSPACE_WG="false"
-fi
+# Phase 7: DNS engine port (always enabled, no separate flag needed)
+# The DNS engine listens on 127.0.0.1:7853 by default and provides:
+# - Ad blocking (DomainMatcher integration)
+# - DNS caching (moka LRU, per-entry TTL)
+# - DNS splitting (per-domain upstream routing)
+# - Query logging (async writer, 7-day rotation)
+RUST_ROUTER_DNS_PORT="${RUST_ROUTER_DNS_PORT:-7853}"
 
 # Track which router is active (rust-router or sing-box)
 ACTIVE_ROUTER="rust-router"
@@ -357,13 +361,9 @@ fi
 WG_INTERFACE="${WG_INTERFACE:-wg-ingress}"
 WG_SUBNET="${WG_SUBNET:-10.25.0.0/24}"
 
-# Set TPROXY port based on which router will be used
-# rust-router uses 7894, sing-box uses 7893
-if [ "${USE_RUST_ROUTER}" = "true" ]; then
-  TPROXY_PORT="${TPROXY_PORT:-7894}"
-else
-  TPROXY_PORT="${TPROXY_PORT:-7893}"
-fi
+# Set TPROXY port for rust-router (7894)
+# sing-box uses 7893 as fallback
+TPROXY_PORT="${TPROXY_PORT:-7894}"
 TPROXY_MARK="1"
 TPROXY_TABLE="100"
 
@@ -559,6 +559,40 @@ setup_tproxy_routing() {
   echo "[entrypoint] TPROXY routing verified: table ${TPROXY_TABLE} OK, ip rule OK"
 }
 
+# ============================================================================
+# Phase 7.7: DNS Engine Rules
+# ============================================================================
+# Redirects DNS traffic (port 53) from ingress interfaces to rust-router DNS engine
+# This enables ad blocking, caching, and DNS splitting without modifying client DNS settings
+# DNS engine is always enabled in rust-router (Phase 7)
+setup_dns_redirect_rules() {
+  echo "[entrypoint] setting up DNS redirect rules (port 53 -> ${RUST_ROUTER_DNS_PORT})"
+
+  # Remove existing DNS redirect rules (idempotent)
+  ${IPTABLES} -t nat -D PREROUTING -i "${WG_INTERFACE}" -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i "${WG_INTERFACE}" -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+
+  # Add DNS redirect rules for WireGuard interface
+  # UDP DNS (most common)
+  ${IPTABLES} -t nat -A PREROUTING -i "${WG_INTERFACE}" -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}"
+  # TCP DNS (for large responses, zone transfers)
+  ${IPTABLES} -t nat -A PREROUTING -i "${WG_INTERFACE}" -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}"
+
+  echo "[entrypoint] DNS redirect added for ${WG_INTERFACE}"
+
+  # Also add for Xray interface if it exists
+  if ip link show "${XRAY_INTERFACE}" >/dev/null 2>&1; then
+    ${IPTABLES} -t nat -D PREROUTING -i "${XRAY_INTERFACE}" -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+    ${IPTABLES} -t nat -D PREROUTING -i "${XRAY_INTERFACE}" -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+    ${IPTABLES} -t nat -A PREROUTING -i "${XRAY_INTERFACE}" -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}"
+    ${IPTABLES} -t nat -A PREROUTING -i "${XRAY_INTERFACE}" -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}"
+    echo "[entrypoint] DNS redirect added for ${XRAY_INTERFACE}"
+  fi
+
+  echo "[entrypoint] DNS redirect rules applied successfully"
+  return 0
+}
+
 # Setup kernel WireGuard ingress before other services
 setup_kernel_wireguard
 
@@ -632,10 +666,6 @@ restore_dscp_rules
 # This function syncs database configuration (rules, outbounds, peers) to rust-router
 # via its Unix socket IPC interface
 sync_rust_router() {
-  if [ "${USE_RUST_ROUTER}" != "true" ]; then
-    return 0
-  fi
-
   # Wait for rust-router socket to be available
   local max_wait=30
   local waited=0
@@ -948,21 +978,19 @@ if ! python3 /usr/local/bin/render_singbox.py; then
 fi
 CONFIG_PATH="${GENERATED_CONFIG_PATH}"
 
-# [Phase 5] Generate rust-router config from database
-# This ensures rust-router has consistent configuration with sing-box
-if [ "${USE_RUST_ROUTER}" = "true" ]; then
-  echo "[entrypoint] rendering rust-router config"
-  mkdir -p "$(dirname "${RUST_ROUTER_CONFIG}")"
-  # Export RUST_ROUTER_PORT so render_routing_config.py uses the correct port
-  export RUST_ROUTER_PORT="${TPROXY_PORT}"
-  if python3 /usr/local/bin/render_routing_config.py \
-      --format=rust-router \
-      --output="${RUST_ROUTER_CONFIG}"; then
-    echo "[entrypoint] rust-router config generated: ${RUST_ROUTER_CONFIG}"
-  else
-    echo "[entrypoint] rust-router config generation failed, will use sing-box" >&2
-    USE_RUST_ROUTER="false"
-  fi
+# Generate rust-router config from database
+# Fallback to sing-box if config generation fails
+echo "[entrypoint] rendering rust-router config"
+mkdir -p "$(dirname "${RUST_ROUTER_CONFIG}")"
+# Export RUST_ROUTER_PORT so render_routing_config.py uses the correct port
+export RUST_ROUTER_PORT="${TPROXY_PORT}"
+if python3 /usr/local/bin/render_routing_config.py \
+    --format=rust-router \
+    --output="${RUST_ROUTER_CONFIG}"; then
+  echo "[entrypoint] rust-router config generated: ${RUST_ROUTER_CONFIG}"
+else
+  echo "[entrypoint] rust-router config generation failed, will use sing-box" >&2
+  ACTIVE_ROUTER="sing-box"
 fi
 
 start_api_server
@@ -1047,6 +1075,13 @@ fallback_to_singbox() {
   TPROXY_PORT="${TPROXY_PORT:-7893}"
   export TPROXY_PORT
 
+  # Remove DNS redirect rules (sing-box doesn't have rust-router's DNS engine)
+  echo "[entrypoint] removing DNS redirect rules (sing-box fallback)"
+  ${IPTABLES} -t nat -D PREROUTING -i "${WG_INTERFACE}" -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i "${WG_INTERFACE}" -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i "${XRAY_INTERFACE}" -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+  ${IPTABLES} -t nat -D PREROUTING -i "${XRAY_INTERFACE}" -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT}" 2>/dev/null || true
+
   # Start sing-box
   start_singbox "${CONFIG_PATH}"
 
@@ -1081,27 +1116,23 @@ handle_signals() {
 
 trap handle_signals SIGTERM SIGINT
 
-# Start the appropriate router based on configuration
-if [ "${USE_RUST_ROUTER}" = "true" ]; then
-  echo "[entrypoint] rust-router enabled via USE_RUST_ROUTER=true"
-  if [ "${USERSPACE_WG}" = "true" ]; then
-    echo "[entrypoint] userspace WireGuard mode enabled"
-  fi
-  if start_rust_router; then
-    echo "[entrypoint] rust-router started successfully"
+# Start rust-router (default router)
+echo "[entrypoint] starting rust-router (default router)"
+if [ "${USERSPACE_WG}" = "true" ]; then
+  echo "[entrypoint] userspace WireGuard mode enabled"
+fi
+if start_rust_router; then
+  echo "[entrypoint] rust-router started successfully"
 
-    # Phase 6: Sync configuration to rust-router
-    sync_rust_router || echo "[entrypoint] WARNING: initial sync failed, will retry later"
-  else
-    echo "[entrypoint] rust-router failed to start, falling back to sing-box" >&2
-    # Reset TPROXY port for sing-box fallback
-    TPROXY_PORT="7893"
-    # Also disable userspace mode since we're falling back to sing-box
-    USERSPACE_WG="false"
-    start_singbox "${CONFIG_PATH}"
-  fi
+  # Phase 6: Sync configuration to rust-router
+  sync_rust_router || echo "[entrypoint] WARNING: initial sync failed, will retry later"
 else
-  echo "[entrypoint] starting sing-box (default router)"
+  echo "[entrypoint] rust-router failed to start, falling back to sing-box" >&2
+  ACTIVE_ROUTER="sing-box"
+  # Reset TPROXY port for sing-box fallback
+  TPROXY_PORT="7893"
+  # Also disable userspace mode since we're falling back to sing-box
+  USERSPACE_WG="false"
   start_singbox "${CONFIG_PATH}"
 fi
 
@@ -1109,11 +1140,13 @@ fi
 # SKIP_TPROXY_SETUP=true to disable automatic TPROXY rules (for manual debugging)
 if [ "${SKIP_TPROXY_SETUP:-false}" = "true" ]; then
   echo "[entrypoint] SKIP_TPROXY_SETUP=true, skipping automatic TPROXY setup"
-elif [ "${USERSPACE_WG}" = "true" ] && [ "${USE_RUST_ROUTER}" = "true" ]; then
+elif [ "${USERSPACE_WG}" = "true" ]; then
   # Phase 6: Full userspace mode - rust-router handles all routing internally
   # No iptables TPROXY rules needed as traffic goes directly to rust-router's WireGuard listener
   echo "[entrypoint] Full userspace mode: rust-router handles all routing internally"
   echo "[entrypoint] Skipping iptables TPROXY setup (not needed for userspace WireGuard)"
+  # DNS is handled internally by rust-router in userspace mode
+  echo "[entrypoint] DNS engine handled internally by rust-router"
 else
   check_tproxy_prerequisites
 
@@ -1122,7 +1155,13 @@ else
 
   # Setup TPROXY routing for Xray V2Ray ingress traffic
   setup_xray_tproxy
+
+  # Phase 7.7: Setup DNS redirect rules (port 53 -> rust-router DNS engine)
+  setup_dns_redirect_rules
 fi
+
+# Phase 7.7: Log DNS engine status (always enabled with rust-router)
+echo "[entrypoint] DNS engine: enabled (port ${RUST_ROUTER_DNS_PORT})"
 
 # Log rotation configuration
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-10485760}"  # 10 MB default
@@ -1180,7 +1219,7 @@ while true; do
 
   # Phase 6: Periodic rust-router sync check (every 5 minutes)
   SYNC_CHECK_COUNT=$((SYNC_CHECK_COUNT + 1))
-  if [ "${USE_RUST_ROUTER}" = "true" ] && [ $((SYNC_CHECK_COUNT % 300)) -eq 0 ]; then
+  if [ "${ACTIVE_ROUTER}" = "rust-router" ] && [ $((SYNC_CHECK_COUNT % 300)) -eq 0 ]; then
     if [ -S "${RUST_ROUTER_SOCKET}" ]; then
       # Re-sync if rust-router is running
       sync_rust_router >/dev/null 2>&1 || true

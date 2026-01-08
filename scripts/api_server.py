@@ -127,6 +127,14 @@ except ImportError:
     ENTRY_ROUTING_MARK_BASE = 100  # 回退值
     print("WARNING: DSCP manager not available")
 
+# Phase 7.7: Rust Router Client for DNS API
+try:
+    from rust_router_client import RustRouterClient
+    HAS_RUST_ROUTER_CLIENT = True
+except ImportError:
+    HAS_RUST_ROUTER_CLIENT = False
+    print("WARNING: Rust router client not available, DNS API disabled")
+
 CONFIG_PATH = Path(os.environ.get("SING_BOX_CONFIG", "/etc/sing-box/sing-box.json"))
 GENERATED_CONFIG_PATH = Path(os.environ.get("SING_BOX_GENERATED_CONFIG", "/etc/sing-box/sing-box.generated.json"))
 GEODATA_DB_PATH = Path(os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db"))
@@ -18194,6 +18202,407 @@ def api_stats_chain_detail(tag: str):
         "status": "healthy" if all_connected else "unhealthy",
         "upload": traffic.get("upload", 0),
         "download": traffic.get("download", 0),
+    }
+
+
+# ============================================================================
+# DNS API Endpoints (Phase 7.7)
+# ============================================================================
+
+# Global rust-router client instance (reused across requests)
+_rust_router_client: Optional["RustRouterClient"] = None
+
+
+async def _get_rust_router_client() -> Optional["RustRouterClient"]:
+    """Get rust-router client if available.
+
+    Uses a singleton pattern with connection validation.
+    Returns None if rust-router is not available.
+    """
+    global _rust_router_client
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        return None
+
+    try:
+        if _rust_router_client is None:
+            _rust_router_client = RustRouterClient()
+
+        # Test connection with a ping
+        ping_response = await _rust_router_client.ping()
+        if ping_response.success:
+            return _rust_router_client
+        else:
+            # Connection failed, reset client for next attempt
+            _rust_router_client = None
+            return None
+    except Exception as e:
+        logging.warning(f"Failed to connect to rust-router: {e}")
+        _rust_router_client = None
+        return None
+
+
+class FlushCacheRequest(BaseModel):
+    """Request to flush DNS cache
+
+    Patterns are matched as domain suffixes (e.g., "example.com" matches "sub.example.com").
+    Maximum pattern length is 253 characters (RFC 1035 DNS label limit).
+    """
+    pattern: Optional[str] = None
+
+    @validator('pattern')
+    def validate_pattern(cls, v):
+        if v is None:
+            return v
+        # Max DNS domain length (RFC 1035)
+        if len(v) > 253:
+            raise ValueError('Pattern exceeds maximum DNS domain length (253 characters)')
+        # Basic sanitization - only allow valid DNS label characters
+        import re
+        if not re.match(r'^[a-zA-Z0-9._-]+$', v):
+            raise ValueError('Pattern contains invalid characters. Only alphanumeric, dots, hyphens, and underscores allowed')
+        return v
+
+
+class AddUpstreamRequest(BaseModel):
+    """Request to add a DNS upstream server"""
+    tag: str
+    address: str
+    protocol: str  # "udp", "tcp", "doh", "dot"
+    bootstrap: Optional[List[str]] = None
+    timeout_secs: Optional[int] = None
+
+
+class AddRouteRequest(BaseModel):
+    """Request to add a DNS routing rule"""
+    pattern: str
+    match_type: str  # "exact", "suffix", "keyword", "regex"
+    upstream_tag: str
+
+
+class DnsQueryRequest(BaseModel):
+    """Request to perform a DNS query"""
+    domain: str
+    qtype: int = 1  # Default: A record
+    upstream: Optional[str] = None
+
+
+@app.get("/api/dns/stats")
+async def api_get_dns_stats():
+    """Get overall DNS statistics"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    stats = await client.get_dns_stats()
+    if not stats:
+        raise HTTPException(status_code=500, detail="Failed to get DNS stats")
+
+    return {
+        "enabled": stats.enabled,
+        "uptime_secs": stats.uptime_secs,
+        "total_queries": stats.total_queries,
+        "cache_hits": stats.cache_hits,
+        "cache_misses": stats.cache_misses,
+        "blocked_queries": stats.blocked_queries,
+        "upstream_queries": stats.upstream_queries,
+        "avg_latency_us": stats.avg_latency_us,
+    }
+
+
+@app.get("/api/dns/config")
+async def api_get_dns_config():
+    """Get current DNS configuration"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    config = await client.get_dns_config()
+    if not config:
+        raise HTTPException(status_code=500, detail="Failed to get DNS config")
+
+    return {
+        "enabled": config.enabled,
+        "listen_udp": config.listen_udp,
+        "listen_tcp": config.listen_tcp,
+        "upstreams": [
+            {
+                "tag": u.tag,
+                "address": u.address,
+                "protocol": u.protocol,
+                "healthy": u.healthy,
+            }
+            for u in config.upstreams
+        ],
+        "cache_enabled": config.cache_enabled,
+        "cache_max_entries": config.cache_max_entries,
+        "blocking_enabled": config.blocking_enabled,
+        "blocking_response_type": config.blocking_response_type,
+        "logging_enabled": config.logging_enabled,
+        "logging_format": config.logging_format,
+        # Feature availability status for clients to determine what's implemented
+        "available_features": config.available_features,
+    }
+
+
+@app.get("/api/dns/cache/stats")
+async def api_get_dns_cache_stats():
+    """Get DNS cache statistics"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    stats = await client.get_dns_cache_stats()
+    if not stats:
+        raise HTTPException(status_code=500, detail="Failed to get cache stats")
+
+    return {
+        "enabled": stats.enabled,
+        "max_entries": stats.max_entries,
+        "current_entries": stats.current_entries,
+        "hits": stats.hits,
+        "misses": stats.misses,
+        "hit_rate": stats.hit_rate,
+        "negative_hits": stats.negative_hits,
+        "inserts": stats.inserts,
+        "evictions": stats.evictions,
+    }
+
+
+@app.post("/api/dns/cache/flush")
+async def api_flush_dns_cache(request: FlushCacheRequest = None):
+    """Flush DNS cache (optional pattern for selective flush)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    pattern = request.pattern if request else None
+    response = await client.flush_dns_cache(pattern)
+
+    if not response.success:
+        raise HTTPException(status_code=500, detail=response.error or "Failed to flush cache")
+
+    return {"success": True, "message": f"Cache flushed{' for pattern: ' + pattern if pattern else ''}"}
+
+
+@app.get("/api/dns/block/stats")
+async def api_get_dns_block_stats():
+    """Get DNS blocking statistics"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    stats = await client.get_dns_block_stats()
+    if not stats:
+        raise HTTPException(status_code=500, detail="Failed to get block stats")
+
+    return {
+        "enabled": stats.enabled,
+        "rule_count": stats.rule_count,
+        "blocked_queries": stats.blocked_queries,
+        "total_queries": stats.total_queries,
+        "block_rate": stats.block_rate,
+        "last_reload": stats.last_reload,
+    }
+
+
+@app.post("/api/dns/blocklist/reload")
+async def api_reload_dns_blocklist():
+    """Reload DNS blocklist from database"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.reload_dns_blocklist()
+
+    if not response.success:
+        raise HTTPException(status_code=500, detail=response.error or "Failed to reload blocklist")
+
+    return {"success": True, "message": "Blocklist reloaded"}
+
+
+@app.get("/api/dns/upstreams")
+async def api_get_dns_upstreams(tag: Optional[str] = None):
+    """Get DNS upstream server status"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    upstreams = await client.get_dns_upstream_status(tag)
+
+    return {
+        "upstreams": [
+            {
+                "tag": u.tag,
+                "address": u.address,
+                "protocol": u.protocol,
+                "healthy": u.healthy,
+                "total_queries": u.total_queries,
+                "failed_queries": u.failed_queries,
+                "avg_latency_us": u.avg_latency_us,
+                "last_success": u.last_success,
+                "last_failure": u.last_failure,
+            }
+            for u in upstreams
+        ]
+    }
+
+
+@app.post("/api/dns/upstreams")
+async def api_add_dns_upstream(request: AddUpstreamRequest):
+    """Add a DNS upstream server"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.add_dns_upstream(
+        tag=request.tag,
+        address=request.address,
+        protocol=request.protocol,
+        bootstrap=request.bootstrap,
+        timeout_secs=request.timeout_secs,
+    )
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to add upstream")
+
+    return {"success": True, "message": f"Upstream '{request.tag}' added"}
+
+
+@app.delete("/api/dns/upstreams/{tag}")
+async def api_remove_dns_upstream(tag: str):
+    """Remove a DNS upstream server"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.remove_dns_upstream(tag)
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to remove upstream")
+
+    return {"success": True, "message": f"Upstream '{tag}' removed"}
+
+
+@app.post("/api/dns/routes")
+async def api_add_dns_route(request: AddRouteRequest):
+    """Add a DNS routing rule"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.add_dns_route(
+        pattern=request.pattern,
+        match_type=request.match_type,
+        upstream_tag=request.upstream_tag,
+    )
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to add route")
+
+    return {"success": True, "message": f"Route for '{request.pattern}' added"}
+
+
+@app.delete("/api/dns/routes/{pattern:path}")
+async def api_remove_dns_route(pattern: str):
+    """Remove a DNS routing rule"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    response = await client.remove_dns_route(pattern)
+
+    if not response.success:
+        raise HTTPException(status_code=400, detail=response.error or "Failed to remove route")
+
+    return {"success": True, "message": f"Route for '{pattern}' removed"}
+
+
+@app.get("/api/dns/query-log")
+async def api_get_dns_query_log(limit: int = 100, offset: int = 0):
+    """Get DNS query log entries"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    entries = await client.get_dns_query_log(limit=limit, offset=offset)
+
+    return {
+        "entries": [
+            {
+                "timestamp": e.timestamp,
+                "domain": e.domain,
+                "qtype": e.qtype,
+                "qtype_str": e.qtype_str,
+                "upstream": e.upstream,
+                "response_code": e.response_code,
+                "rcode_str": e.rcode_str,
+                "latency_us": e.latency_us,
+                "blocked": e.blocked,
+                "cached": e.cached,
+            }
+            for e in entries
+        ],
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/dns/query")
+async def api_dns_query_get(
+    domain: str,
+    qtype: int = 1,
+    upstream: Optional[str] = None,
+):
+    """Perform a test DNS query (GET method)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    result = await client.dns_query(domain=domain, qtype=qtype, upstream=upstream)
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to perform DNS query")
+
+    return {
+        "success": result.success,
+        "domain": result.domain,
+        "qtype": result.qtype,
+        "response_code": result.response_code,
+        "answers": result.answers,
+        "latency_us": result.latency_us,
+        "cached": result.cached,
+        "blocked": result.blocked,
+        "upstream_used": result.upstream_used,
+    }
+
+
+@app.post("/api/dns/query")
+async def api_dns_query_post(request: DnsQueryRequest):
+    """Perform a test DNS query (POST method)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
+    result = await client.dns_query(
+        domain=request.domain,
+        qtype=request.qtype,
+        upstream=request.upstream,
+    )
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to perform DNS query")
+
+    return {
+        "success": result.success,
+        "domain": result.domain,
+        "qtype": result.qtype,
+        "response_code": result.response_code,
+        "answers": result.answers,
+        "latency_us": result.latency_us,
+        "cached": result.cached,
+        "blocked": result.blocked,
+        "upstream_used": result.upstream_used,
     }
 
 
