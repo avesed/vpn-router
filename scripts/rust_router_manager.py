@@ -25,12 +25,14 @@ Usage:
 """
 
 import asyncio
+import ipaddress
 import logging
 import os
+import socket
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Add script directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -79,6 +81,8 @@ class SyncResult:
     peers_synced: int = 0
     ecmp_groups_synced: int = 0
     chains_synced: int = 0
+    wg_tunnels_synced: int = 0  # Phase 11-Fix.AB
+    wg_tunnels_removed: int = 0  # Phase 11-Fix.AB
     errors: List[str] = field(default_factory=list)
 
 
@@ -92,6 +96,84 @@ def _get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str 
     """Get WireGuard interface name for an egress"""
     from setup_kernel_wg_egress import get_egress_interface_name
     return get_egress_interface_name(tag, is_pia=is_pia, egress_type=egress_type)
+
+
+def _is_ip_address(host: str) -> bool:
+    """Check if host is already an IP address (IPv4 or IPv6)."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+async def _resolve_hostname_async(
+    hostname: str,
+    port: int = 0,
+    dns_cache: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Resolve hostname to IP address asynchronously.
+
+    Phase 11-Fix.AC: Async DNS resolution for WireGuard egress endpoints.
+    Hostnames in Custom WG or WARP egress are resolved to IP addresses
+    since rust-router's WgEgressConfig requires IP:port format.
+
+    Args:
+        hostname: The hostname or IP address to resolve
+        port: Port number for getaddrinfo (default 0)
+        dns_cache: Optional cache dict to store/retrieve resolved IPs
+
+    Returns:
+        IP address string if resolution successful, None if failed.
+        Returns hostname unchanged if it's already an IP address.
+    """
+    # Return unchanged if already an IP address
+    if _is_ip_address(hostname):
+        return hostname
+
+    # Check cache first
+    if dns_cache is not None and hostname in dns_cache:
+        logger.debug(f"DNS cache hit for {hostname}: {dns_cache[hostname]}")
+        return dns_cache[hostname]
+
+    # Resolve hostname using getaddrinfo in executor (non-blocking)
+    # Phase 11-Fix.AC: Use get_running_loop() for Python 3.10+ compatibility
+    loop = asyncio.get_running_loop()
+    try:
+        # Use run_in_executor to avoid blocking the event loop
+        # socket.getaddrinfo is a blocking call
+        result = await loop.run_in_executor(
+            None,  # Use default ThreadPoolExecutor
+            lambda: socket.getaddrinfo(
+                hostname,
+                port,
+                socket.AF_INET,  # Prefer IPv4
+                socket.SOCK_DGRAM,  # UDP (WireGuard uses UDP)
+                socket.IPPROTO_UDP,
+            )
+        )
+
+        if result:
+            # result format: [(family, type, proto, canonname, sockaddr), ...]
+            # sockaddr for AF_INET: (host, port)
+            ip_address = result[0][4][0]
+            logger.info(f"Resolved hostname {hostname} to {ip_address}")
+
+            # Cache the result
+            if dns_cache is not None:
+                dns_cache[hostname] = ip_address
+
+            return ip_address
+        else:
+            logger.warning(f"DNS resolution returned empty result for {hostname}")
+            return None
+
+    except socket.gaierror as e:
+        logger.warning(f"DNS resolution failed for {hostname}: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Unexpected error resolving {hostname}: {e}")
+        return None
 
 
 class RustRouterManager:
@@ -129,6 +211,8 @@ class RustRouterManager:
         self._request_timeout = request_timeout
         self._sync_lock = asyncio.Lock()
         self._db = None  # Lazy loaded
+        # Phase 11-Fix.AB: Detect userspace WireGuard mode
+        self._userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
 
     def _get_db(self):
         """Get database instance (lazy load)"""
@@ -336,6 +420,192 @@ class RustRouterManager:
                 response_type="error",
                 error=f"Unknown outbound type: {outbound_type}",
             )
+
+    # =========================================================================
+    # Userspace WireGuard Egress Sync (Phase 11-Fix.AB)
+    # =========================================================================
+
+    async def sync_wg_egress_tunnels(self) -> SyncResult:
+        """Sync WireGuard egress tunnels for userspace WG mode.
+
+        Phase 11-Fix.AB: In userspace WG mode, WireGuard egress types
+        (PIA, Custom, WARP WG) use rust-router's CreateWgTunnel command
+        instead of kernel WireGuard interfaces.
+
+        Returns:
+            SyncResult with tunnel sync statistics
+        """
+        result = SyncResult(success=True)
+
+        # Skip if not in userspace WG mode
+        if not self._userspace_wg:
+            logger.debug("sync_wg_egress_tunnels: Skipped (not in userspace WG mode)")
+            return result
+
+        async with self._sync_lock:
+            try:
+                db = self._get_db()
+
+                # Phase 11-Fix.AC: DNS resolution cache for this sync cycle
+                dns_cache: Dict[str, str] = {}
+
+                # Collect WG-based egress from database
+                wg_egress: Dict[str, Dict[str, Any]] = {}
+
+                # PIA profiles
+                for profile in db.get_pia_profiles(enabled_only=True):
+                    tag = profile.get("name", "")
+                    private_key = profile.get("private_key")
+                    peer_public_key = profile.get("public_key")
+                    peer_ip = profile.get("peer_ip")
+                    local_ip = profile.get("local_ip")
+
+                    if tag and private_key and peer_public_key and peer_ip:
+                        wg_egress[tag] = {
+                            "private_key": private_key,
+                            "peer_public_key": peer_public_key,
+                            "endpoint": f"{peer_ip}:51820",
+                            "local_ip": local_ip or "10.0.0.2/32",
+                            "type": "pia",
+                        }
+
+                # Custom WG egress
+                for egress in db.get_custom_egress_list(enabled_only=True):
+                    tag = egress.get("tag", "")
+                    private_key = egress.get("private_key")
+                    peer_public_key = egress.get("public_key")
+                    server = egress.get("server")
+                    port = egress.get("port", 51820)
+                    address = egress.get("address")
+
+                    if tag and private_key and peer_public_key and server:
+                        # Phase 11-Fix.AC: Resolve hostname to IP if needed
+                        resolved_server = await _resolve_hostname_async(server, port, dns_cache)
+                        if resolved_server is None:
+                            logger.warning(
+                                f"Skipping Custom WG egress {tag}: failed to resolve server hostname '{server}'"
+                            )
+                            continue
+
+                        wg_egress[tag] = {
+                            "private_key": private_key,
+                            "peer_public_key": peer_public_key,
+                            "endpoint": f"{resolved_server}:{port}",
+                            "local_ip": address or "10.0.0.2/32",
+                            "type": "custom",
+                        }
+
+                # WARP WireGuard egress (not MASQUE)
+                for egress in db.get_warp_egress_list(enabled_only=True):
+                    protocol = egress.get("protocol", "wireguard")
+                    if protocol != "wireguard":
+                        continue  # Skip WARP MASQUE (uses SOCKS5)
+
+                    tag = egress.get("tag", "")
+                    private_key = egress.get("private_key")
+                    peer_public_key = egress.get("public_key")
+                    endpoint = egress.get("endpoint")
+                    local_ip = egress.get("local_ip")
+
+                    if tag and private_key and peer_public_key and endpoint:
+                        # Phase 11-Fix.AC: Parse endpoint and resolve hostname if needed
+                        # WARP endpoint format is usually "host:port"
+                        resolved_endpoint = endpoint
+                        if ":" in endpoint:
+                            # Split into host and port
+                            last_colon = endpoint.rfind(":")
+                            host_part = endpoint[:last_colon]
+                            port_part = endpoint[last_colon + 1:]
+
+                            # Handle IPv6 addresses in brackets [::1]:port
+                            if host_part.startswith("[") and host_part.endswith("]"):
+                                host_part = host_part[1:-1]  # Remove brackets
+
+                            try:
+                                port_num = int(port_part)
+                            except ValueError:
+                                logger.warning(
+                                    f"Skipping WARP egress {tag}: invalid port in endpoint '{endpoint}'"
+                                )
+                                continue
+
+                            resolved_host = await _resolve_hostname_async(host_part, port_num, dns_cache)
+                            if resolved_host is None:
+                                logger.warning(
+                                    f"Skipping WARP egress {tag}: failed to resolve endpoint hostname '{host_part}'"
+                                )
+                                continue
+
+                            # Phase 11-Fix.AC: Add brackets for IPv6 addresses
+                            if ":" in resolved_host:  # IPv6 address
+                                resolved_endpoint = f"[{resolved_host}]:{port_num}"
+                            else:
+                                resolved_endpoint = f"{resolved_host}:{port_num}"
+                        else:
+                            # No port in endpoint - unusual, but try to resolve anyway
+                            resolved_host = await _resolve_hostname_async(endpoint, 0, dns_cache)
+                            if resolved_host is None:
+                                logger.warning(
+                                    f"Skipping WARP egress {tag}: failed to resolve endpoint '{endpoint}'"
+                                )
+                                continue
+                            resolved_endpoint = resolved_host
+
+                        wg_egress[tag] = {
+                            "private_key": private_key,
+                            "peer_public_key": peer_public_key,
+                            "endpoint": resolved_endpoint,
+                            "local_ip": local_ip or "10.0.0.2/32",
+                            "type": "warp",
+                        }
+
+                # Get current tunnels from rust-router
+                # Note: list_wg_tunnels() returns List[WgTunnelInfo], not IpcResponse
+                async with await self._get_client() as client:
+                    current_tunnels = await client.list_wg_tunnels()
+                    current_tags = {t.tag for t in current_tunnels if t.tag}
+
+                    # Create missing tunnels
+                    for tag, config in wg_egress.items():
+                        if tag in current_tags:
+                            logger.debug(f"Tunnel {tag} already exists, skipping")
+                            continue
+
+                        logger.info(f"Creating userspace WG tunnel: {tag} ({config['type']})")
+                        resp = await client.create_wg_tunnel(
+                            tag=tag,
+                            private_key=config["private_key"],
+                            peer_public_key=config["peer_public_key"],
+                            endpoint=config["endpoint"],
+                            local_ip=config["local_ip"],
+                        )
+
+                        if resp.success:
+                            result.wg_tunnels_synced += 1
+                            logger.info(f"Created userspace WG tunnel: {tag}")
+                        else:
+                            error_msg = f"Failed to create tunnel {tag}: {resp.error}"
+                            result.errors.append(error_msg)
+                            logger.error(error_msg)
+
+                    # Remove stale tunnels (in DB but disabled, or not in DB)
+                    db_enabled_tags = set(wg_egress.keys())
+                    for tag in current_tags:
+                        if tag not in db_enabled_tags:
+                            logger.info(f"Removing stale WG tunnel: {tag}")
+                            resp = await client.remove_wg_tunnel(tag)
+                            if resp.success:
+                                result.wg_tunnels_removed += 1
+                            else:
+                                logger.warning(f"Failed to remove stale tunnel {tag}: {resp.error}")
+
+            except Exception as e:
+                result.success = False
+                error_msg = f"WG tunnel sync failed: {e}"
+                result.errors.append(error_msg)
+                logger.error(error_msg)
+
+        return result
 
     # =========================================================================
     # Routing Rules Sync
@@ -977,6 +1247,15 @@ class RustRouterManager:
         result.outbounds_removed = outbound_result.outbounds_removed
         result.errors.extend(outbound_result.errors)
 
+        # Phase 11-Fix.AB: Sync userspace WG tunnels (after outbounds sync)
+        # Initialize with success=True for non-userspace mode
+        wg_tunnel_result = SyncResult(success=True)
+        if self._userspace_wg:
+            wg_tunnel_result = await self.sync_wg_egress_tunnels()
+            result.wg_tunnels_synced = wg_tunnel_result.wg_tunnels_synced
+            result.wg_tunnels_removed = wg_tunnel_result.wg_tunnels_removed
+            result.errors.extend(wg_tunnel_result.errors)
+
         # Then sync routing rules
         rules_result = await self.sync_routing_rules()
         result.rules_synced = rules_result.rules_synced
@@ -997,9 +1276,10 @@ class RustRouterManager:
         result.chains_synced = chains_result.chains_synced
         result.errors.extend(chains_result.errors)
 
-        # Overall success
+        # Overall success (includes wg_tunnel_result for userspace WG mode)
         result.success = (
             outbound_result.success and
+            wg_tunnel_result.success and
             rules_result.success and
             peers_result.success and
             ecmp_result.success and
@@ -1009,6 +1289,8 @@ class RustRouterManager:
         logger.info(
             f"Full sync complete: outbounds_added={result.outbounds_added}, "
             f"outbounds_removed={result.outbounds_removed}, "
+            f"wg_tunnels_synced={result.wg_tunnels_synced}, "
+            f"wg_tunnels_removed={result.wg_tunnels_removed}, "
             f"rules_synced={result.rules_synced}, "
             f"peers_synced={result.peers_synced}, "
             f"ecmp_groups_synced={result.ecmp_groups_synced}, "

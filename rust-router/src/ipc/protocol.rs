@@ -298,6 +298,37 @@ pub enum IpcCommand {
     ListWgTunnels,
 
     // ========================================================================
+    // Phase 11-Fix.AA: Ingress Peer Management
+    // ========================================================================
+
+    /// Add a peer to WireGuard ingress
+    ///
+    /// Adds a new client peer to the userspace WireGuard ingress.
+    AddIngressPeer {
+        /// Peer public key (Base64-encoded)
+        public_key: String,
+        /// Allowed IPs for this peer (e.g., "10.25.0.2/32")
+        allowed_ips: String,
+        /// Optional peer name/description
+        name: Option<String>,
+        /// Optional preshared key (Base64-encoded)
+        preshared_key: Option<String>,
+    },
+
+    /// Remove a peer from WireGuard ingress
+    ///
+    /// Removes a client peer from the userspace WireGuard ingress.
+    RemoveIngressPeer {
+        /// Peer public key (Base64-encoded)
+        public_key: String,
+    },
+
+    /// List all WireGuard ingress peers
+    ///
+    /// Returns a list of all peers registered with the ingress.
+    ListIngressPeers,
+
+    // ========================================================================
     // Phase 6.0: IPC Protocol v3.0 - ECMP Group Management
     // ========================================================================
 
@@ -840,6 +871,9 @@ pub enum IpcResponse {
     /// WireGuard tunnel list response
     WgTunnelList(WgTunnelListResponse),
 
+    /// Phase 11-Fix.AA: Ingress peer list response
+    IngressPeerList(IngressPeerListResponse),
+
     /// ECMP group status response
     EcmpGroupStatus(EcmpGroupStatus),
 
@@ -1324,12 +1358,15 @@ pub struct BufferPoolStatsResponse {
 /// Tunnel type for peer connections
 ///
 /// Defines the type of tunnel used for peer-to-peer connections.
+/// Phase 11-Fix.AC: Use explicit renames for API compatibility with Python REST API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TunnelType {
     /// WireGuard tunnel (userspace via boringtun)
+    /// Serializes as "wireguard" (not "wire_guard") for REST API compatibility
+    #[serde(rename = "wireguard")]
     WireGuard,
     /// Xray tunnel (via SOCKS5 bridge)
+    #[serde(rename = "xray")]
     Xray,
 }
 
@@ -1883,6 +1920,36 @@ pub struct PairResponse {
 pub struct WgTunnelListResponse {
     /// List of tunnel statuses
     pub tunnels: Vec<WgTunnelStatus>,
+}
+
+// ============================================================================
+// Phase 11-Fix.AA: Ingress Peer Types
+// ============================================================================
+
+/// Information about an ingress peer
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressPeerInfo {
+    /// Peer public key (Base64)
+    pub public_key: String,
+    /// Allowed IPs
+    pub allowed_ips: String,
+    /// Optional peer name
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Bytes received from this peer
+    pub rx_bytes: u64,
+    /// Bytes sent to this peer
+    pub tx_bytes: u64,
+    /// Last handshake timestamp (Unix epoch seconds)
+    #[serde(default)]
+    pub last_handshake: Option<u64>,
+}
+
+/// Response containing ingress peer list
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressPeerListResponse {
+    /// List of ingress peers
+    pub peers: Vec<IngressPeerInfo>,
 }
 
 /// Response containing an ECMP group list
@@ -2917,16 +2984,17 @@ rust_router_connections_total 12345
 
     #[test]
     fn test_tunnel_type_serialization() {
+        // Phase 11-Fix.AC: TunnelType uses "wireguard" (not "wire_guard") for REST API compatibility
         let wg = TunnelType::WireGuard;
         let json = serde_json::to_string(&wg).unwrap();
-        assert_eq!(json, "\"wire_guard\"");
+        assert_eq!(json, "\"wireguard\"");
 
         let xray = TunnelType::Xray;
         let json = serde_json::to_string(&xray).unwrap();
         assert_eq!(json, "\"xray\"");
 
         // Deserialize back
-        let parsed: TunnelType = serde_json::from_str("\"wire_guard\"").unwrap();
+        let parsed: TunnelType = serde_json::from_str("\"wireguard\"").unwrap();
         assert_eq!(parsed, TunnelType::WireGuard);
 
         let parsed: TunnelType = serde_json::from_str("\"xray\"").unwrap();

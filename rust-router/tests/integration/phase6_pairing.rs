@@ -241,7 +241,8 @@ fn test_tunnel_type_serialization() {
     let json_wg = serde_json::to_string(&wireguard).expect("Serialize WireGuard");
     let json_xray = serde_json::to_string(&xray).expect("Serialize Xray");
 
-    assert_eq!(json_wg, "\"wire_guard\"");
+    // Phase 11-Fix.AC: TunnelType uses "wireguard" for REST API compatibility
+    assert_eq!(json_wg, "\"wireguard\"");
     assert_eq!(json_xray, "\"xray\"");
 }
 
@@ -346,7 +347,8 @@ fn test_xray_tunnel_type_serde() {
     let wg_json = serde_json::to_string(&wireguard).expect("Serialize WireGuard");
 
     assert_eq!(xray_json, "\"xray\"");
-    assert_eq!(wg_json, "\"wire_guard\"");
+    // Phase 11-Fix.AC: TunnelType uses "wireguard" for REST API compatibility
+    assert_eq!(wg_json, "\"wireguard\"");
 
     // Deserialize
     let decoded_xray: TunnelType = serde_json::from_str(&xray_json).expect("Deserialize Xray");

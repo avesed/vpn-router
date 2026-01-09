@@ -149,6 +149,23 @@ impl std::fmt::Display for IngressState {
     }
 }
 
+/// Phase 11-Fix.AA: Information about an ingress peer for listing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressPeerListItem {
+    /// Peer public key (Base64)
+    pub public_key: String,
+    /// Allowed IPs (comma-separated)
+    pub allowed_ips: String,
+    /// Optional peer name (from database)
+    pub name: Option<String>,
+    /// Bytes received from this peer
+    pub rx_bytes: u64,
+    /// Bytes sent to this peer
+    pub tx_bytes: u64,
+    /// Last handshake timestamp (Unix epoch seconds)
+    pub last_handshake: Option<u64>,
+}
+
 /// Statistics for the WireGuard ingress manager
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WgIngressStats {
@@ -838,6 +855,28 @@ impl WgIngressManager {
     #[must_use]
     pub fn has_peer(&self, public_key: &str) -> bool {
         self.peers.read().contains_key(public_key)
+    }
+
+    /// Phase 11-Fix.AA: List all registered peers
+    ///
+    /// Returns information about all peers registered with the ingress.
+    #[must_use]
+    pub fn list_peers(&self) -> Vec<IngressPeerListItem> {
+        let peers = self.peers.read();
+        peers
+            .iter()
+            .map(|(public_key, p)| IngressPeerListItem {
+                public_key: public_key.clone(),
+                allowed_ips: p.config.allowed_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(","),
+                name: None, // Name is stored in database, not in WireGuard config
+                rx_bytes: p.rx_bytes.load(Ordering::Relaxed),
+                tx_bytes: p.tx_bytes.load(Ordering::Relaxed),
+                last_handshake: {
+                    let ts = p.last_handshake.load(Ordering::Relaxed);
+                    if ts > 0 { Some(ts) } else { None }
+                },
+            })
+            .collect()
     }
 
     /// Get list of registered peer public keys

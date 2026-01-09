@@ -79,6 +79,7 @@ class IpcResponse:
     data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     error_code: Optional[str] = None
+    message: Optional[str] = None
 
 
 @dataclass
@@ -510,6 +511,14 @@ class RustRouterClient:
                 self._connected = False
                 logger.debug("Disconnected from rust-router")
 
+    async def close(self) -> None:
+        """Close the connection (alias for disconnect()).
+
+        Provided for compatibility with common Python patterns where
+        resources are closed using a close() method.
+        """
+        await self.disconnect()
+
     @property
     def is_connected(self) -> bool:
         """Check if client is connected"""
@@ -626,6 +635,7 @@ class RustRouterClient:
             success=True,
             response_type=response_type,
             data=response,
+            message=response.get("message"),
         )
 
     # =========================================================================
@@ -1131,6 +1141,66 @@ class RustRouterClient:
                     persistent_keepalive=item.get("persistent_keepalive", 25),
                 ))
         return result
+
+    # =========================================================================
+    # Phase 11-Fix.AA: Ingress Peer Management
+    # =========================================================================
+
+    async def add_ingress_peer(
+        self,
+        public_key: str,
+        allowed_ips: str,
+        name: Optional[str] = None,
+        preshared_key: Optional[str] = None,
+    ) -> IpcResponse:
+        """Add a peer to WireGuard ingress.
+
+        Args:
+            public_key: Base64-encoded peer public key
+            allowed_ips: Comma-separated list of allowed IPs (e.g., "10.25.0.2/32")
+            name: Optional friendly name for the peer
+            preshared_key: Optional pre-shared key for additional security
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        cmd: Dict[str, Any] = {
+            "type": "add_ingress_peer",
+            "public_key": public_key,
+            "allowed_ips": allowed_ips,
+        }
+        if name is not None:
+            cmd["name"] = name
+        if preshared_key is not None:
+            cmd["preshared_key"] = preshared_key
+        return await self._send_command(cmd)
+
+    async def remove_ingress_peer(self, public_key: str) -> IpcResponse:
+        """Remove a peer from WireGuard ingress.
+
+        Args:
+            public_key: Base64-encoded peer public key to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "remove_ingress_peer",
+            "public_key": public_key,
+        })
+
+    async def list_ingress_peers(self) -> List[Dict[str, Any]]:
+        """List all WireGuard ingress peers.
+
+        Returns:
+            List of peer info dicts with public_key, allowed_ips, name, rx_bytes, tx_bytes, last_handshake
+        """
+        response = await self._send_command({"type": "list_ingress_peers"})
+        if not response.success:
+            return []
+        if response.data and "peers" in response.data:
+            return response.data["peers"]
+        return []
 
     # =========================================================================
     # Phase 6: ECMP Group Management
@@ -2343,6 +2413,22 @@ if __name__ == "__main__":
             client = RustRouterClient()
             # Should not raise
             await client.disconnect()
+            self.assertFalse(client.is_connected)
+
+        async def test_close_alias_when_not_connected(self):
+            """Test close() alias when not connected"""
+            client = RustRouterClient()
+            # Should not raise - close() is an alias for disconnect()
+            await client.close()
+            self.assertFalse(client.is_connected)
+
+        async def test_close_idempotent(self):
+            """Test multiple close() calls are safe"""
+            client = RustRouterClient()
+            # Multiple calls should not raise
+            await client.close()
+            await client.close()
+            await client.close()
             self.assertFalse(client.is_connected)
 
         async def test_context_manager_without_server(self):

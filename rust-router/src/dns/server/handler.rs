@@ -56,10 +56,15 @@ use std::sync::Arc;
 use hickory_proto::op::{Header, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::rate_limit::DnsRateLimiter;
+use crate::dns::cache::DnsCache;
+use crate::dns::client::UpstreamPool;
 use crate::dns::error::{DnsError, DnsResult};
+use crate::dns::filter::BlockFilter;
+use crate::dns::log::QueryLogger;
+use crate::dns::split::DnsRouter;
 
 /// Minimum DNS header size
 const DNS_HEADER_SIZE: usize = 12;
@@ -195,16 +200,36 @@ impl HandlerStatsSnapshot {
 
 /// DNS query handler
 ///
-/// Processes incoming DNS queries, applying rate limiting and validation.
+/// Phase 11-Fix.AA: Now connected to all DNS components for real query processing.
+///
+/// Processes incoming DNS queries through the full pipeline:
+/// 1. Rate limiting
+/// 2. Query validation
+/// 3. Block filter check
+/// 4. Cache lookup
+/// 5. DNS routing (upstream selection)
+/// 6. Upstream query
+/// 7. Cache update
+/// 8. Query logging
 pub struct DnsHandler {
     /// Rate limiter
     rate_limiter: Arc<DnsRateLimiter>,
     /// Statistics
     stats: HandlerStats,
+    /// DNS cache for query result caching (optional for backward compatibility)
+    cache: Option<Arc<DnsCache>>,
+    /// Block filter for ad/tracker blocking (optional)
+    block_filter: Option<Arc<BlockFilter>>,
+    /// Upstream pool for DNS query forwarding (optional)
+    upstream_pool: Option<Arc<UpstreamPool>>,
+    /// DNS router for split DNS routing (optional)
+    router: Option<Arc<DnsRouter>>,
+    /// Query logger (optional)
+    query_logger: Option<Arc<QueryLogger>>,
 }
 
 impl DnsHandler {
-    /// Create a new DNS handler
+    /// Create a new DNS handler with minimal configuration (backward compatible)
     ///
     /// # Arguments
     ///
@@ -225,6 +250,11 @@ impl DnsHandler {
         Self {
             rate_limiter,
             stats: HandlerStats::new(),
+            cache: None,
+            block_filter: None,
+            upstream_pool: None,
+            router: None,
+            query_logger: None,
         }
     }
 
@@ -234,7 +264,51 @@ impl DnsHandler {
         Self::new(Arc::new(DnsRateLimiter::disabled()))
     }
 
+    /// Phase 11-Fix.AA: Create a fully configured DNS handler
+    ///
+    /// This constructor connects the handler to all DNS components for
+    /// real query processing.
+    ///
+    /// # Arguments
+    ///
+    /// * `rate_limiter` - Rate limiter instance
+    /// * `cache` - DNS cache for query result caching
+    /// * `block_filter` - Block filter for ad/tracker blocking
+    /// * `upstream_pool` - Upstream pool for DNS query forwarding
+    /// * `router` - DNS router for split DNS routing
+    /// * `query_logger` - Query logger for DNS query logging
+    #[must_use]
+    pub fn with_components(
+        rate_limiter: Arc<DnsRateLimiter>,
+        cache: Arc<DnsCache>,
+        block_filter: Arc<BlockFilter>,
+        upstream_pool: Arc<UpstreamPool>,
+        router: Arc<DnsRouter>,
+        query_logger: Arc<QueryLogger>,
+    ) -> Self {
+        info!("Creating DnsHandler with all components connected");
+        Self {
+            rate_limiter,
+            stats: HandlerStats::new(),
+            cache: Some(cache),
+            block_filter: Some(block_filter),
+            upstream_pool: Some(upstream_pool),
+            router: Some(router),
+            query_logger: Some(query_logger),
+        }
+    }
+
     /// Handle an incoming DNS query
+    ///
+    /// Phase 11-Fix.AA: Now implements full query processing pipeline:
+    /// 1. Rate limiting
+    /// 2. Query validation
+    /// 3. Block filter check
+    /// 4. Cache lookup
+    /// 5. DNS routing (upstream selection)
+    /// 6. Upstream query
+    /// 7. Cache update
+    /// 8. Query logging
     ///
     /// # Arguments
     ///
@@ -269,15 +343,81 @@ impl DnsHandler {
         );
 
         // Validate the query
-        let _context = self.validate_query(client, &query)?;
+        let context = self.validate_query(client, &query)?;
 
-        // For now, generate a SERVFAIL response since we don't have upstream yet
-        // Future: Check cache, apply filters, forward to upstream
-        let response = self.generate_servfail_response(&query, "no upstream configured");
+        // Phase 11-Fix.AA: Real query processing with components
+        let response = self.process_query(&query, &context).await?;
 
         self.stats.queries_processed.fetch_add(1, Ordering::Relaxed);
 
         self.serialize_response(&response)
+    }
+
+    /// Phase 11-Fix.AA: Process a validated DNS query through the full pipeline
+    async fn process_query(&self, query: &Message, context: &QueryContext) -> DnsResult<Message> {
+        let qname = &context.qname;
+
+        // Step 1: Check block filter
+        if let Some(block_filter) = &self.block_filter {
+            if block_filter.is_blocked(qname).is_some() {
+                debug!(qname = %qname, "Query blocked by filter");
+                // Return blocked response (NXDOMAIN or zero IP based on config)
+                return Ok(self.generate_blocked_response(query));
+            }
+        }
+
+        // Step 2: Check cache (DnsCache.get takes Message directly)
+        if let Some(cache) = &self.cache {
+            if let Some(cached_response) = cache.get(query) {
+                debug!(qname = %qname, "Cache hit");
+                // Return cached response (already has correct query ID)
+                return Ok(cached_response);
+            }
+        }
+
+        // Step 3: Forward to upstream
+        // First try the router, then fall back to the default upstream pool
+        let upstream: Option<Arc<UpstreamPool>> = if let Some(router) = &self.router {
+            // Use DNS router to select upstream based on domain
+            match router.route(qname) {
+                Some(pool) => Some(pool),
+                None => self.upstream_pool.clone(),
+            }
+        } else {
+            self.upstream_pool.clone()
+        };
+
+        if let Some(upstream_pool) = upstream {
+            // Query upstream
+            match upstream_pool.query(query).await {
+                Ok(response) => {
+                    // Step 4: Cache the response
+                    if let Some(cache) = &self.cache {
+                        cache.insert(query, &response, "default");
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    warn!(qname = %qname, error = %e, "Upstream query failed");
+                    return Ok(self.generate_servfail_response(query, &format!("upstream error: {}", e)));
+                }
+            }
+        }
+
+        // No upstream configured
+        Ok(self.generate_servfail_response(query, "no upstream configured"))
+    }
+
+    /// Generate a blocked response (NXDOMAIN)
+    fn generate_blocked_response(&self, query: &Message) -> Message {
+        let mut response = query.clone();
+        let mut header = Header::response_from_request(query.header());
+        header.set_response_code(ResponseCode::NXDomain);
+        header.set_recursion_available(true);
+        header.set_authoritative(false);
+        response.set_header(header);
+        // Clear answers, we're just returning NXDOMAIN
+        response
     }
 
     /// Parse raw bytes into a DNS message

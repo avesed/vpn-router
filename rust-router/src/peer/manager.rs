@@ -421,6 +421,27 @@ impl PeerManager {
 
         {
             let mut pending_requests = self.pending_requests.write();
+
+            // Phase 11-Fix.AA: Release resources from any existing pending request with same tag
+            // This prevents resource leaks when generate_pair_request is called multiple times
+            if let Some(old_pending) = pending_requests.remove(&config.local_tag) {
+                warn!(
+                    tag = %config.local_tag,
+                    "Replacing existing pending request, releasing old resources"
+                );
+                // Release old IP allocations
+                if let Some(ip) = old_pending.local_tunnel_ip {
+                    self.tunnel_ip_allocator.release(ip);
+                }
+                if let Some(ip) = old_pending.remote_tunnel_ip {
+                    self.tunnel_ip_allocator.release(ip);
+                }
+                // Release old port allocation
+                if let Some(port) = old_pending.tunnel_port {
+                    self.tunnel_port_allocator.release(port);
+                }
+            }
+
             pending_requests.insert(config.local_tag.clone(), pending);
         }
 
@@ -552,13 +573,28 @@ impl PeerManager {
         // Add peer to the manager
         self.add_peer_internal(peer_config)?;
 
+        // Phase 11-Fix.AA: Construct response endpoint with allocated tunnel_port
+        // The user-provided endpoint may have a wrong/reserved port (e.g., 36100)
+        // We need to replace it with the dynamically allocated tunnel_port
+        let response_endpoint = {
+            let user_endpoint = &local_config.local_endpoint;
+            // Find the last colon to handle both IPv4 (host:port) and IPv6 ([host]:port)
+            if let Some(colon_pos) = user_endpoint.rfind(':') {
+                let host_part = &user_endpoint[..colon_pos];
+                format!("{}:{}", host_part, tunnel_port)
+            } else {
+                // No port in the user endpoint, append the tunnel_port
+                format!("{}:{}", user_endpoint, tunnel_port)
+            }
+        };
+
         // Create pairing response
         let response = PairResponse {
             version: PAIRING_PROTOCOL_VERSION,
             request_node_tag: request.node_tag.clone(),
             node_tag: local_config.local_tag.clone(),
             node_description: local_config.local_description.clone(),
-            endpoint: local_config.local_endpoint.clone(),
+            endpoint: response_endpoint,
             api_port: local_config.local_api_port,
             tunnel_type: local_config.tunnel_type,
             timestamp,

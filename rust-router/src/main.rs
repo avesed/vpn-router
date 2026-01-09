@@ -590,7 +590,14 @@ async fn main() -> Result<()> {
 
     // Create rate limiter and handler for DNS servers
     let dns_rate_limiter = Arc::new(DnsRateLimiter::new(&dns_config.rate_limit));
-    let dns_handler = Arc::new(DnsHandler::new(Arc::clone(&dns_rate_limiter)));
+    let dns_handler = Arc::new(DnsHandler::with_components(
+        Arc::clone(&dns_rate_limiter),
+        Arc::clone(&dns_cache),
+        Arc::clone(&dns_block_filter),
+        Arc::clone(&dns_upstream_pool),
+        Arc::clone(&dns_router),
+        Arc::clone(&dns_query_logger),
+    ));
 
     // Create shutdown channels for DNS servers
     let (dns_udp_shutdown_tx, dns_udp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();

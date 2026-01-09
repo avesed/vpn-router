@@ -16,7 +16,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import base64
 import io
@@ -3811,6 +3811,12 @@ def api_get_default_outbound():
     }
 
 
+@app.post("/api/rules")
+def api_add_rule(payload: CustomRuleRequest):
+    """添加路由规则（Phase 11-Fix.AB: 别名，等同于 POST /api/rules/custom）"""
+    return api_add_custom_rule(payload)
+
+
 @app.post("/api/rules/custom")
 def api_add_custom_rule(payload: CustomRuleRequest):
     """添加自定义路由规则（数据库版本，使用批量操作优化性能）"""
@@ -4603,9 +4609,106 @@ def get_peer_transfer_info() -> dict:
 def apply_ingress_config(config: dict) -> dict:
     """应用入口 WireGuard 配置到系统
 
-    使用内核 WireGuard 模式：通过 wg set 命令直接管理 peer，
-    无需重载 sing-box（流量通过 TUN 入口，与 peer 管理解耦）。
+    Phase 11-Fix.AA: 支持用户态和内核 WireGuard 两种模式：
+    - USERSPACE_WG=true: 通过 IPC 调用 rust-router 管理 peer
+    - USERSPACE_WG=false: 通过 wg set 命令直接管理 peer
     """
+    # Phase 11-Fix.AA: Check if userspace WireGuard mode is enabled
+    userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+
+    if userspace_wg:
+        return _apply_ingress_config_userspace(config)
+    else:
+        return _apply_ingress_config_kernel(config)
+
+
+def _apply_ingress_config_userspace(config: dict) -> dict:
+    """Phase 11-Fix.AA: 应用入口配置到用户态 WireGuard (via IPC)"""
+    import asyncio
+    from rust_router_client import RustRouterClient
+
+    async def _sync_peers_via_ipc():
+        try:
+            client = RustRouterClient()
+            peers = config.get("peers", [])
+
+            # Get current peers from rust-router
+            current_peers_list = await client.list_ingress_peers()
+            current_peers = {p.get("public_key") for p in current_peers_list if p.get("public_key")}
+
+            # Calculate desired peers
+            desired_peers = {p.get("public_key") for p in peers if p.get("public_key")}
+
+            removed_count = 0
+            added_count = 0
+            updated_count = 0
+
+            # Remove peers not in desired list
+            for pubkey in current_peers - desired_peers:
+                if pubkey:
+                    result = await client.remove_ingress_peer(pubkey)
+                    if result.success:
+                        removed_count += 1
+                        print(f"[api] Removed peer via IPC: {pubkey[:20]}...")
+                    else:
+                        print(f"[api] Failed to remove peer via IPC: {result.error or result.message}")
+
+            # Add or update peers
+            for peer in peers:
+                pubkey = peer.get("public_key")
+                if not pubkey:
+                    continue
+
+                allowed_ips = peer.get("allowed_ips", get_default_peer_ip())
+                if isinstance(allowed_ips, list):
+                    allowed_ips = ",".join(allowed_ips)
+
+                name = peer.get("name")
+                preshared_key = peer.get("preshared_key")
+
+                result = await client.add_ingress_peer(
+                    public_key=pubkey,
+                    allowed_ips=allowed_ips,
+                    name=name,
+                    preshared_key=preshared_key,
+                )
+
+                if result.success:
+                    if pubkey in current_peers:
+                        updated_count += 1
+                        print(f"[api] Updated peer via IPC: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
+                    else:
+                        added_count += 1
+                        print(f"[api] Added peer via IPC: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
+                else:
+                    print(f"[api] Failed to add/update peer via IPC: {result.error or result.message}")
+
+            await client.close()
+            return {
+                "success": True,
+                "message": f"Peers synced via IPC (added={added_count}, updated={updated_count}, removed={removed_count})"
+            }
+        except Exception as exc:
+            return {"success": False, "message": f"IPC sync failed: {exc}"}
+
+    # Run async code in sync context
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If already in an async context, create a new loop in a thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _sync_peers_via_ipc())
+                return future.result(timeout=30)
+        else:
+            return loop.run_until_complete(_sync_peers_via_ipc())
+    except RuntimeError:
+        # No event loop exists, create one
+        return asyncio.run(_sync_peers_via_ipc())
+
+
+def _apply_ingress_config_kernel(config: dict) -> dict:
+    """应用入口配置到内核 WireGuard (via wg set)"""
     try:
         interface = os.environ.get("WG_INTERFACE", "wg-ingress")
         peers = config.get("peers", [])
@@ -4667,6 +4770,150 @@ def apply_ingress_config(config: dict) -> dict:
         return {"success": False, "message": f"wg set failed: {exc}"}
     except Exception as exc:
         return {"success": False, "message": str(exc)}
+
+
+# ============ Phase 11-Fix.AC: Userspace WG Pairing Helpers ============
+
+async def _generate_pair_request_via_ipc(
+    node_tag: str,
+    node_description: str,
+    endpoint: str,
+    api_port: int,
+    bidirectional: bool,
+    tunnel_type: str,
+) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+    """Generate pairing request via rust-router IPC (userspace WG mode).
+
+    Returns:
+        Tuple of (success, code_or_error, peer_tag, pending_request_dict)
+    """
+    from rust_router_client import RustRouterClient
+
+    client = RustRouterClient()
+    try:
+        # Ping to check availability
+        ping_result = await client.ping()
+        if not ping_result.success:
+            return False, "rust-router unavailable", None, {}
+
+        # Map tunnel_type from API format to IPC format
+        # IPC uses "wireguard" (same as API), but double-check
+        ipc_tunnel_type = tunnel_type
+
+        result = await client.generate_pair_request(
+            local_tag=node_tag,
+            local_description=node_description,
+            local_endpoint=endpoint,
+            local_api_port=api_port or 36000,
+            bidirectional=bidirectional,
+            tunnel_type=ipc_tunnel_type,
+        )
+
+        if result.success:
+            code = result.data.get("code", "") if result.data else ""
+            peer_tag = result.data.get("peer_tag") if result.data else None
+            return True, code, peer_tag, result.data or {}
+        else:
+            return False, result.error or "IPC request failed", None, {}
+    finally:
+        await client.close()
+
+
+async def _import_pair_request_via_ipc(
+    code: str,
+    local_tag: str,
+    local_description: str,
+    local_endpoint: str,
+    local_api_port: int,
+) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+    """Import pairing request via rust-router IPC (userspace WG mode).
+
+    Returns:
+        Tuple of (success, response_code_or_error, remote_node_tag, response_data)
+    """
+    from rust_router_client import RustRouterClient
+
+    client = RustRouterClient()
+    try:
+        ping_result = await client.ping()
+        if not ping_result.success:
+            return False, "rust-router unavailable", None, {}
+
+        result = await client.import_pair_request(
+            code=code,
+            local_tag=local_tag,
+            local_description=local_description,
+            local_endpoint=local_endpoint,
+            local_api_port=local_api_port,
+        )
+
+        if result.success:
+            response_code = result.data.get("response_code", "") if result.data else ""
+            remote_tag = result.data.get("remote_node_tag") if result.data else None
+            return True, response_code, remote_tag, result.data or {}
+        else:
+            return False, result.error or "IPC request failed", None, {}
+    finally:
+        await client.close()
+
+
+async def _complete_handshake_via_ipc(code: str) -> Tuple[bool, str, Optional[str]]:
+    """Complete pairing handshake via rust-router IPC (userspace WG mode).
+
+    Returns:
+        Tuple of (success, message_or_error, peer_tag)
+    """
+    from rust_router_client import RustRouterClient
+
+    client = RustRouterClient()
+    try:
+        ping_result = await client.ping()
+        if not ping_result.success:
+            return False, "rust-router unavailable", None
+
+        result = await client.complete_handshake(code)
+
+        if result.success:
+            peer_tag = result.data.get("peer_tag") if result.data else None
+            return True, result.message or "Handshake completed", peer_tag
+        else:
+            return False, result.error or "IPC request failed", None
+    finally:
+        await client.close()
+
+
+def _run_async_ipc(coro):
+    """Run async IPC coroutine in sync context.
+
+    Handles event loop management for FastAPI sync endpoints.
+    Returns the coroutine result, or raises HTTPException on timeout/error.
+
+    Phase 11-Fix.AC: Uses asyncio.get_running_loop() for Python 3.10+ compatibility,
+    handles TimeoutError and general exceptions properly.
+    """
+    import asyncio
+    import concurrent.futures
+
+    IPC_TIMEOUT_SECONDS = 30
+
+    try:
+        # Python 3.10+: Use get_running_loop() to check if we're in async context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in a running loop - use thread pool to run in separate loop
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, coro)
+                return future.result(timeout=IPC_TIMEOUT_SECONDS)
+        except RuntimeError:
+            # No running loop - safe to create one with asyncio.run()
+            return asyncio.run(coro)
+
+    except concurrent.futures.TimeoutError:
+        logging.error(f"[pairing] IPC operation timed out after {IPC_TIMEOUT_SECONDS}s")
+        raise HTTPException(status_code=504, detail=f"IPC operation timed out after {IPC_TIMEOUT_SECONDS} seconds")
+    except Exception as e:
+        logging.error(f"[pairing] IPC communication error: {e}")
+        raise HTTPException(status_code=503, detail=f"IPC communication error: {e}")
 
 
 @app.get("/api/ingress")
@@ -14048,6 +14295,41 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
     pairing_id = None  # Phase 6 Issue 30: 用于错误时清理 pending_pairing
 
     try:
+        # Phase 11-Fix.AC: Check userspace WG mode - route to IPC
+        userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+
+        if userspace_wg and payload.tunnel_type == "wireguard":
+            # Use rust-router IPC for pairing in userspace WG mode
+            success, code_or_error, peer_tag, pending_data = _run_async_ipc(
+                _generate_pair_request_via_ipc(
+                    node_tag=payload.node_tag,
+                    node_description=payload.node_description,
+                    endpoint=endpoint,
+                    api_port=payload.api_port,
+                    bidirectional=payload.bidirectional,
+                    tunnel_type=payload.tunnel_type,
+                )
+            )
+
+            if not success:
+                raise HTTPException(status_code=503, detail=code_or_error)
+
+            # Build pending_request for response
+            pending_request = {
+                "node_tag": payload.node_tag,
+                "tunnel_type": payload.tunnel_type,
+                "bidirectional": payload.bidirectional,
+            }
+            pending_request.update(pending_data)
+
+            logging.info(f"[pairing] 生成配对请求码 (IPC): node_tag={payload.node_tag}")
+            return GeneratePairRequestResponse(
+                code=code_or_error,
+                psk="",
+                pending_request=pending_request
+            )
+
+        # Existing kernel WireGuard code path continues below...
         # Step 1: 分配隧道 IP 和端口（需要在生成配对码之前，以便包含在配对码中）
         # Phase 11-Fix.C: 使用确定性分配以避免多节点场景下的冲突
         local_ip = None
@@ -14238,7 +14520,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
     db = _get_db()
     generator = PairingCodeGenerator(db)
 
-    # Step 1: 验证配对请求码
+    # Step 1: 验证配对请求码 (moved BEFORE IPC check to get tunnel_type)
     is_valid, error, request_obj = generator.validate_pair_request(payload.code)
     if not is_valid:
         return ImportPairRequestResponse(
@@ -14247,6 +14529,47 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             response_code=None,
             created_node_tag=None
         )
+
+    # Phase 11-Fix.AC: Check userspace WG mode - route to IPC for WireGuard only
+    # Xray tunnels always use kernel code path
+    userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+
+    if userspace_wg and request_obj.tunnel_type == "wireguard":
+        # Use rust-router IPC for importing in userspace WG mode
+        success, response_code_or_error, remote_tag, response_data = _run_async_ipc(
+            _import_pair_request_via_ipc(
+                code=payload.code,
+                local_tag=payload.local_node_tag,
+                local_description=payload.local_node_description,
+                local_endpoint=endpoint,
+                local_api_port=payload.api_port or 36000,
+            )
+        )
+
+        if not success:
+            return ImportPairRequestResponse(
+                success=False,
+                message=response_code_or_error,
+                response_code=None,
+                created_node_tag=None
+            )
+
+        # Check if tunnel was established directly (no response code needed)
+        tunnel_status = response_data.get("tunnel_status")
+        bidirectional = response_data.get("bidirectional", False)
+
+        logging.info(f"[pairing] 导入配对请求 (IPC): remote_tag={remote_tag}, tunnel_status={tunnel_status}")
+        return ImportPairRequestResponse(
+            success=True,
+            message=response_data.get("message", "Pairing request imported via IPC"),
+            response_code=response_code_or_error if response_code_or_error else None,
+            created_node_tag=remote_tag,
+            tunnel_status=tunnel_status,
+            bidirectional=bidirectional
+        )
+
+    # Existing kernel WireGuard / Xray code path continues below...
+    # (validation already done above at the start of the function)
 
     # 检查是否已存在同名节点
     remote_node_tag = request_obj.node_tag
@@ -14458,6 +14781,35 @@ def api_complete_pairing(payload: CompletePairingRequest):
         raise HTTPException(status_code=503, detail="Pairing module not available")
 
     db = _get_db()
+
+    # Phase 11-Fix.AC: Check userspace WG mode - route to IPC
+    userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+
+    # Check tunnel_type from pending_request to decide routing
+    tunnel_type = payload.pending_request.get("tunnel_type", "wireguard")
+
+    if userspace_wg and tunnel_type == "wireguard":
+        # Use rust-router IPC for completing pairing in userspace WG mode
+        success, message_or_error, peer_tag = _run_async_ipc(
+            _complete_handshake_via_ipc(payload.code)
+        )
+
+        if not success:
+            logging.warning(f"[pairing] 完成配对失败 (IPC): {message_or_error}")
+            return CompletePairingResponse(
+                success=False,
+                message=message_or_error,
+                created_node_tag=None
+            )
+
+        logging.info(f"[pairing] 配对完成 (IPC): node_tag={peer_tag}")
+        return CompletePairingResponse(
+            success=True,
+            message=message_or_error,
+            created_node_tag=peer_tag
+        )
+
+    # Existing kernel WireGuard code path continues below...
     manager = PairingManager(db)
 
     # 验证 pending_request 包含必要字段（psk 已废弃，不再必需）

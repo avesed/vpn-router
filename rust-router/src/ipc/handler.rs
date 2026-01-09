@@ -543,6 +543,17 @@ impl IpcHandler {
                 self.handle_list_wg_tunnels()
             }
 
+            // Phase 11-Fix.AA: Ingress Peer Management
+            IpcCommand::AddIngressPeer { public_key, allowed_ips, name, preshared_key } => {
+                self.handle_add_ingress_peer(public_key, allowed_ips, name, preshared_key).await
+            }
+            IpcCommand::RemoveIngressPeer { public_key } => {
+                self.handle_remove_ingress_peer(public_key).await
+            }
+            IpcCommand::ListIngressPeers => {
+                self.handle_list_ingress_peers()
+            }
+
             // ECMP Group Management
             IpcCommand::CreateEcmpGroup { tag, config } => {
                 self.handle_create_ecmp_group(tag, config)
@@ -878,8 +889,11 @@ impl IpcHandler {
     }
 
     /// Handle list outbounds command
+    ///
+    /// Phase 11-Fix.AA: Now includes WgEgressManager tunnels in addition to
+    /// OutboundManager outbounds.
     fn handle_list_outbounds(&self) -> IpcResponse {
-        let outbounds: Vec<OutboundInfo> = self
+        let mut outbounds: Vec<OutboundInfo> = self
             .outbound_manager
             .all()
             .iter()
@@ -897,6 +911,25 @@ impl IpcHandler {
                 }
             })
             .collect();
+
+        // Phase 11-Fix.AA: Include userspace WireGuard egress tunnels
+        if let Some(egress_manager) = &self.wg_egress_manager {
+            let tunnel_tags = egress_manager.list_tunnels();
+            for tag in tunnel_tags {
+                if let Some(status) = egress_manager.get_tunnel_status(&tag) {
+                    outbounds.push(OutboundInfo {
+                        tag: status.tag.clone(),
+                        outbound_type: "wireguard".to_string(),
+                        enabled: status.connected,
+                        health: if status.connected { "healthy".to_string() } else { "unhealthy".to_string() },
+                        active_connections: 0,
+                        total_connections: status.stats.tx_packets,
+                        bind_interface: None,
+                        routing_mark: None,
+                    });
+                }
+            }
+        }
 
         IpcResponse::OutboundList { outbounds }
     }
@@ -2729,6 +2762,114 @@ impl IpcHandler {
         }
 
         IpcResponse::WgTunnelList(WgTunnelListResponse { tunnels })
+    }
+
+    // ========================================================================
+    // Phase 11-Fix.AA: Ingress Peer Handler Implementations
+    // ========================================================================
+
+    /// Handle AddIngressPeer command
+    ///
+    /// Adds a new peer to the userspace WireGuard ingress.
+    async fn handle_add_ingress_peer(
+        &self,
+        public_key: String,
+        allowed_ips: String,
+        name: Option<String>,
+        preshared_key: Option<String>,
+    ) -> IpcResponse {
+        let Some(ingress_manager) = &self.wg_ingress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Userspace WireGuard ingress not enabled",
+            );
+        };
+
+        use crate::ingress::config::WgIngressPeerConfig;
+
+        // Build peer config
+        let mut peer_config = WgIngressPeerConfig::new(&public_key, &allowed_ips);
+        if let Some(psk) = preshared_key {
+            peer_config = peer_config.with_preshared_key(&psk);
+        }
+        // Note: name is stored in db_helper, not in WireGuard config
+
+        // Add peer to ingress manager
+        match ingress_manager.add_peer(peer_config).await {
+            Ok(()) => {
+                info!(
+                    public_key = %public_key,
+                    allowed_ips = %allowed_ips,
+                    name = ?name,
+                    "Ingress peer added"
+                );
+                IpcResponse::success_with_message("Ingress peer added")
+            }
+            Err(e) => {
+                warn!(
+                    public_key = %public_key,
+                    error = %e,
+                    "Failed to add ingress peer"
+                );
+                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to add peer: {}", e))
+            }
+        }
+    }
+
+    /// Handle RemoveIngressPeer command
+    ///
+    /// Removes a peer from the userspace WireGuard ingress.
+    async fn handle_remove_ingress_peer(&self, public_key: String) -> IpcResponse {
+        let Some(ingress_manager) = &self.wg_ingress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Userspace WireGuard ingress not enabled",
+            );
+        };
+
+        match ingress_manager.remove_peer(&public_key).await {
+            Ok(()) => {
+                info!(public_key = %public_key, "Ingress peer removed");
+                IpcResponse::success_with_message("Ingress peer removed")
+            }
+            Err(e) => {
+                warn!(
+                    public_key = %public_key,
+                    error = %e,
+                    "Failed to remove ingress peer"
+                );
+                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to remove peer: {}", e))
+            }
+        }
+    }
+
+    /// Handle ListIngressPeers command
+    ///
+    /// Returns a list of all peers registered with the ingress.
+    fn handle_list_ingress_peers(&self) -> IpcResponse {
+        use super::protocol::{IngressPeerInfo, IngressPeerListResponse};
+
+        let Some(ingress_manager) = &self.wg_ingress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Userspace WireGuard ingress not enabled",
+            );
+        };
+
+        let peers = ingress_manager
+            .list_peers()
+            .into_iter()
+            .map(|p| IngressPeerInfo {
+                public_key: p.public_key,
+                allowed_ips: p.allowed_ips,
+                name: p.name,
+                rx_bytes: p.rx_bytes,
+                tx_bytes: p.tx_bytes,
+                last_handshake: p.last_handshake,
+            })
+            .collect();
+
+        IpcResponse::IngressPeerList(IngressPeerListResponse { peers })
     }
 
     // ========================================================================
