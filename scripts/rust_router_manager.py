@@ -360,8 +360,8 @@ class RustRouterManager:
                 rules = db.get_routing_rules(enabled_only=True)
 
                 # Get default outbound from settings or use "direct"
-                settings = db.get_settings()
-                default_outbound = settings.get("default_outbound", "direct") if settings else "direct"
+                # Phase 11-Fix.Z: 使用正确的方法名 get_setting() (不是 get_settings())
+                default_outbound = db.get_setting("default_outbound", "direct") or "direct"
 
                 # Convert to RuleConfig list
                 rule_configs: List[RuleConfig] = []

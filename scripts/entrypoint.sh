@@ -1048,7 +1048,31 @@ start_rust_router() {
   if [ "${USERSPACE_WG}" = "true" ]; then
     export RUST_ROUTER_USERSPACE_WG="true"
     export RUST_ROUTER_WG_LISTEN_PORT="${WG_LISTEN_PORT}"
-    echo "[entrypoint] rust-router userspace WireGuard enabled (port ${WG_LISTEN_PORT})"
+
+    # Phase 11-Fix.Z: Retrieve WireGuard private key from database for userspace WG
+    RUST_ROUTER_WG_PRIVATE_KEY=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+import os
+db = get_db(
+    os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
+    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+)
+server = db.get_wireguard_server()
+if server and server.get('private_key'):
+    print(server['private_key'])
+else:
+    print('')
+" 2>/dev/null || echo "")
+
+    if [ -n "${RUST_ROUTER_WG_PRIVATE_KEY}" ]; then
+      export RUST_ROUTER_WG_PRIVATE_KEY
+      echo "[entrypoint] rust-router userspace WireGuard enabled (port ${WG_LISTEN_PORT}, private key loaded)"
+    else
+      echo "[entrypoint] WARNING: USERSPACE_WG=true but no private key found in database" >&2
+      echo "[entrypoint] rust-router will fail to start userspace WireGuard ingress" >&2
+    fi
   fi
 
   # Start rust-router

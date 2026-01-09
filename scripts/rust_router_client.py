@@ -1057,7 +1057,8 @@ class RustRouterClient:
         config = {
             "private_key": private_key,
             "peer_public_key": peer_public_key,
-            "endpoint": endpoint,
+            # Phase 11-Fix.Z: 修复字段名不匹配 - Rust IPC 协议使用 peer_endpoint
+            "peer_endpoint": endpoint,
             "local_ip": local_ip,
             "mtu": mtu,
             "persistent_keepalive": persistent_keepalive,

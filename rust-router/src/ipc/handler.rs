@@ -1315,13 +1315,18 @@ impl IpcHandler {
     /// Handle update routing command
     ///
     /// Atomically updates routing rules via ArcSwap.
+    ///
+    /// Phase 11-Fix.Z: Properly rebuild domain_matcher and geoip_matcher
+    /// using RoutingSnapshotBuilder instead of just cloning existing matchers.
+    /// This ensures domain/geoip rules are actually matched by the high-performance
+    /// Aho-Corasick and CIDR matchers.
     fn handle_update_routing(
         &self,
         rules: Vec<super::protocol::RuleConfig>,
         default_outbound: String,
     ) -> IpcResponse {
         use super::protocol::UpdateRoutingResponse;
-        use crate::rules::{CompiledRuleSet, Rule, RuleType};
+        use crate::rules::RuleType;
 
         // Validate default outbound exists
         if self.outbound_manager.get(&default_outbound).is_none() {
@@ -1331,9 +1336,22 @@ impl IpcHandler {
             );
         }
 
-        // Convert RuleConfig to internal Rule format
-        let mut internal_rules = Vec::with_capacity(rules.len());
-        let mut rule_id = 1u64;
+        // Atomically increment version BEFORE creating snapshot to prevent race condition
+        let new_version = self.config_version.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Load current snapshot to preserve fwmark router (chain configurations)
+        let current = self.rule_engine.load();
+
+        // Use RoutingSnapshotBuilder to properly build domain_matcher and geoip_matcher
+        // Phase 11-Fix.Z: This is the key fix - we must use the builder to add rules
+        // to their respective matchers, not just compile them into CompiledRuleSet
+        let mut builder = RoutingSnapshotBuilder::new()
+            .default_outbound(&default_outbound)
+            .version(new_version);
+
+        // Track rule count for response
+        let mut rule_count = 0usize;
+
         for rule_cfg in &rules {
             if !rule_cfg.enabled {
                 continue;
@@ -1365,52 +1383,72 @@ impl IpcHandler {
                 }
             };
 
-            let rule = Rule::new(
-                rule_id,
-                rule_type,
-                rule_cfg.target.clone(),
-                rule_cfg.outbound.clone(),
-            )
-            .with_priority(rule_cfg.priority);
+            // Phase 11-Fix.Z: Route rules to appropriate builders based on type
+            // This ensures domain rules go to domain_matcher (Aho-Corasick),
+            // geoip rules go to geoip_matcher (CIDR), etc.
+            let result = match rule_type {
+                // Domain rules → domain_matcher (Aho-Corasick)
+                RuleType::Domain | RuleType::DomainSuffix |
+                RuleType::DomainKeyword | RuleType::DomainRegex => {
+                    builder.add_domain_rule(rule_type, &rule_cfg.target, &rule_cfg.outbound)
+                }
+                // GeoIP/IpCidr rules → geoip_matcher (CIDR)
+                RuleType::GeoIP | RuleType::IpCidr => {
+                    builder.add_geoip_rule(rule_type, &rule_cfg.target, &rule_cfg.outbound)
+                }
+                // Port rules → CompiledRuleSet
+                RuleType::Port => {
+                    builder.add_port_rule(&rule_cfg.target, &rule_cfg.outbound)
+                }
+                // Protocol rules → CompiledRuleSet
+                RuleType::Protocol => {
+                    builder.add_protocol_rule(&rule_cfg.target, &rule_cfg.outbound)
+                }
+                // GeoSite requires domain catalog loading, add as raw rule for now
+                // TODO: Implement GeoSite expansion from domain-catalog.json
+                RuleType::GeoSite => {
+                    warn!(
+                        "GeoSite rule '{}' not yet supported in rust-router, skipping",
+                        rule_cfg.target
+                    );
+                    continue;
+                }
+            };
 
-            rule_id += 1;
-            internal_rules.push(rule);
+            if let Err(e) = result {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Failed to add rule '{}': {}", rule_cfg.target, e),
+                );
+            }
+
+            rule_count += 1;
         }
 
-        // Compile rules into an optimized rule set
-        let rule_count = internal_rules.len();
-        let compiled = match CompiledRuleSet::new(internal_rules, default_outbound.clone()) {
-            Ok(c) => c,
+        // Preserve fwmark_router from current snapshot (chain configurations)
+        // We need to rebuild with the same chains
+        // Note: This is a limitation - ideally we'd have a method to copy chains
+        // For now, we'll use the built fwmark_router and accept that chains
+        // need to be re-registered separately
+
+        // Build the new snapshot
+        let new_snapshot = match builder.build() {
+            Ok(mut snapshot) => {
+                // Preserve fwmark_router from current configuration
+                // (chain DSCP mappings should persist across rule updates)
+                snapshot.fwmark_router = current.fwmark_router.clone();
+                snapshot
+            }
             Err(e) => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Failed to compile rules: {}", e),
+                    format!("Failed to build routing snapshot: {}", e),
                 );
             }
         };
 
-        // Atomically increment version BEFORE creating snapshot to prevent race condition
-        // fetch_add returns the previous value, so we add 1 to get the new version
-        let new_version = self.config_version.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Load current snapshot to preserve domain/geoip/fwmark matchers
-        let current = self.rule_engine.load();
-
-        // Build new routing snapshot with updated rules
-        let new_snapshot = crate::rules::RoutingSnapshot {
-            domain_matcher: current.domain_matcher.clone(),
-            geoip_matcher: current.geoip_matcher.clone(),
-            fwmark_router: current.fwmark_router.clone(),
-            rules: compiled,
-            default_outbound: default_outbound.clone(),
-            version: new_version,
-        };
-
         // Atomic swap via rule engine
         self.rule_engine.reload(new_snapshot);
-
-        // Version is already incremented, use new_version directly
-        let version = new_version;
 
         // Update last reload timestamp
         let now = std::time::SystemTime::now()
@@ -1420,13 +1458,13 @@ impl IpcHandler {
         self.last_reload_timestamp.store(now, Ordering::Relaxed);
 
         info!(
-            "Updated routing: {} rules, default='{}', version={}",
-            rule_count, default_outbound, version
+            "Updated routing: {} rules, default='{}', version={} (domain/geoip matchers rebuilt)",
+            rule_count, default_outbound, new_version
         );
 
         IpcResponse::UpdateRoutingResult(UpdateRoutingResponse {
             success: true,
-            version,
+            version: new_version,
             rule_count,
             default_outbound,
         })

@@ -12277,7 +12277,8 @@ def api_peer_chain_register(request: Request, payload: ChainRegisterRequest):
         downstream_node_tag=payload.downstream_node
     )
 
-    return {"status": "registered", "chain_id": payload.chain_id}
+    # Phase 11-Fix.Z: 添加 success 字段，与 _register_chain_with_peers 的 resp.get("success") 匹配
+    return {"success": True, "status": "registered", "chain_id": payload.chain_id}
 
 
 class ChainUnregisterRequest(BaseModel):
