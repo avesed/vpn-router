@@ -5193,8 +5193,29 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
     if not server_public_key:
         raise HTTPException(status_code=500, detail="服务端公钥不可用")
 
-    # 客户端 IP
-    client_ip = peer.get("allowed_ips", [get_default_peer_ip()])[0]
+    # 客户端 IP - Phase 11-Fix.AB: 从 allowed_ips 提取客户端 IP 地址
+    # allowed_ips 应该是一个列表，如 ["10.23.0.2/32"]
+    allowed_ips_list = peer.get("allowed_ips")
+    if not allowed_ips_list:
+        # 如果没有 allowed_ips，使用默认值
+        client_ip = get_default_peer_ip()
+    elif isinstance(allowed_ips_list, str):
+        # 如果是字符串（不应该发生，但防御性处理）
+        client_ip = allowed_ips_list.split(",")[0].strip() if allowed_ips_list else get_default_peer_ip()
+    elif isinstance(allowed_ips_list, list) and len(allowed_ips_list) > 0:
+        # 正常情况：是一个非空列表
+        client_ip = allowed_ips_list[0]
+        if not client_ip or client_ip == "None":
+            # 防御性检查：如果第一个元素是None或字符串"None"
+            client_ip = get_default_peer_ip()
+    else:
+        # 其他异常情况
+        client_ip = get_default_peer_ip()
+
+    # WireGuard Address 字段需要 CIDR 格式（如 10.23.0.2/32）
+    # 确保 client_ip 包含 CIDR 后缀
+    if "/" not in client_ip:
+        client_ip = f"{client_ip}/32"
 
     # 服务端地址（优先使用设置文件，其次使用环境变量）
     settings = load_settings()
