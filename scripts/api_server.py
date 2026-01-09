@@ -4610,11 +4610,11 @@ def apply_ingress_config(config: dict) -> dict:
     """应用入口 WireGuard 配置到系统
 
     Phase 11-Fix.AA: 支持用户态和内核 WireGuard 两种模式：
-    - USERSPACE_WG=true: 通过 IPC 调用 rust-router 管理 peer
-    - USERSPACE_WG=false: 通过 wg set 命令直接管理 peer
+    - USERSPACE_WG=true (默认): 通过 IPC 调用 rust-router 管理 peer
+    - USERSPACE_WG=false: 通过 wg set 命令直接管理 peer (内核模式)
     """
-    # Phase 11-Fix.AA: Check if userspace WireGuard mode is enabled
-    userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+    # Phase 11-Fix.AA/AC: Userspace WireGuard mode is default (matches entrypoint.sh)
+    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
     if userspace_wg:
         return _apply_ingress_config_userspace(config)
@@ -9315,14 +9315,16 @@ def _sync_kernel_wg_egress() -> str:
             print("[api] Kernel WireGuard egress interfaces synced")
             return ", WireGuard interfaces synced"
         else:
-            print(f"[api] WireGuard sync failed: {result.stderr.strip()}")
-            return ", WireGuard sync failed"
+            # Phase 5: Include actual error details in return message (Issue #9)
+            error_detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            print(f"[api] WireGuard sync failed: {error_detail}")
+            return f", WireGuard sync failed: {error_detail}"
     except subprocess.TimeoutExpired:
         print("[api] WireGuard sync timeout")
-        return ", WireGuard sync timeout"
+        return ", WireGuard sync timeout (30s)"
     except Exception as e:
         print(f"[api] WireGuard sync error: {e}")
-        return ""
+        return f", WireGuard sync error: {e}"
 
 
 def _sync_kernel_wg_ingress() -> str:
@@ -9346,14 +9348,16 @@ def _sync_kernel_wg_ingress() -> str:
             print("[api] Kernel WireGuard ingress interface synced")
             return ", WireGuard ingress synced"
         else:
-            print(f"[api] WireGuard ingress sync failed: {result.stderr.strip()}")
-            return ", WireGuard ingress sync failed"
+            # Phase 5: Include actual error details in return message (Issue #9)
+            error_detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            print(f"[api] WireGuard ingress sync failed: {error_detail}")
+            return f", WireGuard ingress sync failed: {error_detail}"
     except subprocess.TimeoutExpired:
         print("[api] WireGuard ingress sync timeout")
-        return ", WireGuard ingress sync timeout"
+        return ", WireGuard ingress sync timeout (30s)"
     except Exception as e:
         print(f"[api] WireGuard ingress sync error: {e}")
-        return ""
+        return f", WireGuard ingress sync error: {e}"
 
 
 # ============ Domain List Catalog APIs ============
@@ -14296,7 +14300,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
 
     try:
         # Phase 11-Fix.AC: Check userspace WG mode - route to IPC
-        userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+        userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
         if userspace_wg and payload.tunnel_type == "wireguard":
             # Use rust-router IPC for pairing in userspace WG mode
@@ -14532,7 +14536,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
 
     # Phase 11-Fix.AC: Check userspace WG mode - route to IPC for WireGuard only
     # Xray tunnels always use kernel code path
-    userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
     if userspace_wg and request_obj.tunnel_type == "wireguard":
         # Use rust-router IPC for importing in userspace WG mode
@@ -14783,7 +14787,7 @@ def api_complete_pairing(payload: CompletePairingRequest):
     db = _get_db()
 
     # Phase 11-Fix.AC: Check userspace WG mode - route to IPC
-    userspace_wg = os.environ.get("USERSPACE_WG", "false").lower() == "true"
+    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
     # Check tunnel_type from pending_request to decide routing
     tunnel_type = payload.pending_request.get("tunnel_type", "wireguard")

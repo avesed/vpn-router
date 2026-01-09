@@ -135,6 +135,9 @@ impl Default for DnsConfig {
 }
 
 impl DnsConfig {
+    /// Default DNS port
+    pub const DEFAULT_PORT: u16 = 7853;
+
     /// Create a new DNS configuration with default values
     ///
     /// # Example
@@ -148,6 +151,88 @@ impl DnsConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create DnsConfig from environment variables
+    ///
+    /// Reads the following environment variables:
+    /// - `RUST_ROUTER_DNS_PORT`: DNS listen port (default: 7853)
+    /// - `RUST_ROUTER_DNS_ENABLED`: Whether DNS is enabled (default: true)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::dns::DnsConfig;
+    ///
+    /// // With default values (when env vars not set)
+    /// let config = DnsConfig::from_env();
+    /// assert!(config.enabled);
+    /// assert_eq!(config.listen_udp.port(), 7853);
+    /// ```
+    #[must_use]
+    pub fn from_env() -> Self {
+        let port = match std::env::var("RUST_ROUTER_DNS_PORT") {
+            Ok(val) => match val.parse::<u16>() {
+                Ok(p) => {
+                    if p == 0 {
+                        tracing::warn!(
+                            value = %val,
+                            "RUST_ROUTER_DNS_PORT=0 is invalid, using default {}",
+                            Self::DEFAULT_PORT
+                        );
+                        Self::DEFAULT_PORT
+                    } else if p < 1024 {
+                        tracing::warn!(
+                            port = p,
+                            "RUST_ROUTER_DNS_PORT {} is a privileged port, may require root",
+                            p
+                        );
+                        p
+                    } else {
+                        p
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        value = %val,
+                        "Invalid RUST_ROUTER_DNS_PORT value, using default {}",
+                        Self::DEFAULT_PORT
+                    );
+                    Self::DEFAULT_PORT
+                }
+            },
+            Err(_) => Self::DEFAULT_PORT,
+        };
+
+        let enabled = std::env::var("RUST_ROUTER_DNS_ENABLED")
+            .ok()
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(true);
+
+        let udp_addr = format!("127.0.0.1:{}", port)
+            .parse()
+            .expect("valid listen address");
+        let tcp_addr = format!("127.0.0.1:{}", port)
+            .parse()
+            .expect("valid listen address");
+
+        tracing::info!(
+            port = port,
+            enabled = enabled,
+            "DNS configuration loaded from environment"
+        );
+
+        Self {
+            enabled,
+            listen_udp: udp_addr,
+            listen_tcp: tcp_addr,
+            upstreams: Vec::new(),
+            cache: CacheConfig::default(),
+            blocking: BlockingConfig::default(),
+            logging: LoggingConfig::default(),
+            tcp: TcpServerConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+        }
     }
 
     /// Create a disabled DNS configuration
@@ -1290,6 +1375,7 @@ impl RateLimitConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // ========================================================================
     // DnsConfig Tests
@@ -1349,6 +1435,142 @@ mod tests {
 
         assert_eq!(parsed.enabled, config.enabled);
         assert_eq!(parsed.upstreams.len(), 1);
+    }
+
+    #[test]
+    fn test_dns_config_default_port_constant() {
+        assert_eq!(DnsConfig::DEFAULT_PORT, 7853);
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_defaults() {
+        // Clear env vars to ensure defaults are used
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+
+        let config = DnsConfig::from_env();
+        assert!(config.enabled);
+        assert_eq!(config.listen_udp.port(), 7853);
+        assert_eq!(config.listen_tcp.port(), 7853);
+        assert_eq!(config.listen_udp.ip().to_string(), "127.0.0.1");
+        assert_eq!(config.listen_tcp.ip().to_string(), "127.0.0.1");
+        assert!(config.upstreams.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_custom_port() {
+        // Set custom port
+        std::env::set_var("RUST_ROUTER_DNS_PORT", "5353");
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+
+        let config = DnsConfig::from_env();
+        assert!(config.enabled);
+        assert_eq!(config.listen_udp.port(), 5353);
+        assert_eq!(config.listen_tcp.port(), 5353);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_disabled_false() {
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
+        std::env::set_var("RUST_ROUTER_DNS_ENABLED", "false");
+
+        let config = DnsConfig::from_env();
+        assert!(!config.enabled);
+        assert_eq!(config.listen_udp.port(), 7853);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_disabled_zero() {
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
+        std::env::set_var("RUST_ROUTER_DNS_ENABLED", "0");
+
+        let config = DnsConfig::from_env();
+        assert!(!config.enabled);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_enabled_true() {
+        std::env::set_var("RUST_ROUTER_DNS_ENABLED", "true");
+
+        let config = DnsConfig::from_env();
+        assert!(config.enabled);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_enabled_one() {
+        std::env::set_var("RUST_ROUTER_DNS_ENABLED", "1");
+
+        let config = DnsConfig::from_env();
+        assert!(config.enabled);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_invalid_port_uses_default() {
+        // Invalid port should fall back to default
+        std::env::set_var("RUST_ROUTER_DNS_PORT", "invalid");
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+
+        let config = DnsConfig::from_env();
+        assert_eq!(config.listen_udp.port(), 7853);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_port_too_large_uses_default() {
+        // Port number too large for u16 should fall back to default
+        std::env::set_var("RUST_ROUTER_DNS_PORT", "99999");
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+
+        let config = DnsConfig::from_env();
+        assert_eq!(config.listen_udp.port(), 7853);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dns_config_from_env_builder_chain() {
+        // Verify builder pattern works with from_env()
+        std::env::set_var("RUST_ROUTER_DNS_PORT", "8853");
+        std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
+
+        let config = DnsConfig::from_env()
+            .with_upstream(UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp))
+            .with_cache(CacheConfig::default())
+            .with_blocking(BlockingConfig::default());
+
+        assert_eq!(config.listen_udp.port(), 8853);
+        assert_eq!(config.listen_tcp.port(), 8853);
+        assert_eq!(config.upstreams.len(), 1);
+
+        // Clean up
+        std::env::remove_var("RUST_ROUTER_DNS_PORT");
     }
 
     // ========================================================================

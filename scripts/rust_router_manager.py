@@ -87,9 +87,58 @@ class SyncResult:
 
 
 def _get_db():
-    """Lazy import and get database instance"""
+    """Lazy import and get database instance.
+
+    Phase 11-Fix.AB: Ensures SQLCIPHER_KEY is available from multiple sources:
+    1. Environment variable (preferred)
+    2. Key file (/etc/sing-box/encryption.key or .db-key)
+    3. KeyManager fallback
+
+    This fixes Issue #10 where SQLCIPHER_KEY was not available to RustRouterManager.
+    """
     from db_helper import get_db
-    return get_db()
+
+    # Check if SQLCIPHER_KEY is already set
+    encryption_key = os.environ.get("SQLCIPHER_KEY")
+
+    if not encryption_key:
+        # Try to read from key files
+        key_files = [
+            "/etc/sing-box/encryption.key",
+            "/etc/sing-box/.db-key",
+        ]
+        for key_file in key_files:
+            try:
+                if os.path.exists(key_file):
+                    with open(key_file, "r") as f:
+                        encryption_key = f.read().strip()
+                    if encryption_key:
+                        logger.debug(f"Read SQLCIPHER_KEY from {key_file}")
+                        break
+            except Exception as e:
+                logger.warning(f"Failed to read key from {key_file}: {e}")
+
+        # Try KeyManager as last resort
+        if not encryption_key:
+            try:
+                from key_manager import KeyManager
+                encryption_key = KeyManager.get_or_create_key()
+                if encryption_key:
+                    logger.debug("Got SQLCIPHER_KEY from KeyManager")
+            except Exception as e:
+                logger.warning(f"KeyManager fallback failed: {e}")
+
+        # Set environment variable for future calls
+        if encryption_key:
+            os.environ["SQLCIPHER_KEY"] = encryption_key
+        else:
+            logger.error(
+                "SQLCIPHER_KEY not found in environment, key files, or KeyManager. "
+                "Database operations may fail. Set SQLCIPHER_KEY environment variable "
+                "or ensure /etc/sing-box/encryption.key exists."
+            )
+
+    return get_db(encryption_key=encryption_key)
 
 
 def _get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str = None) -> str:

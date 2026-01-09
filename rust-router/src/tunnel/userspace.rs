@@ -90,6 +90,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::io::UdpBufferPool;
 use crate::tunnel::config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConfig};
+#[cfg(feature = "handshake_retry")]
+use crate::tunnel::handshake::{HandshakeConfig, HandshakeTracker};
 use crate::tunnel::traits::{BoxFuture, DecryptResult, WgTunnel, WgTunnelError, WgTunnelStats};
 
 /// WireGuard transport data packet overhead
@@ -268,6 +270,11 @@ struct TunnelShared {
     /// Single peer state tracking (Phase 6.2)
     /// This is initialized on tunnel creation and updated during operation.
     peer_state: RwLock<Option<Arc<PeerStateInner>>>,
+
+    /// Handshake tracker for retry with backoff (Issue #13 fix)
+    /// Prevents busy loop when connecting to unreachable peers.
+    #[cfg(feature = "handshake_retry")]
+    handshake_tracker: HandshakeTracker,
 }
 
 /// Internal statistics tracking
@@ -503,6 +510,8 @@ impl UserspaceWgTunnel {
             allowed_ips: RwLock::new(allowed_ips_parsed),
             handshake_tx,
             peer_state: RwLock::new(Some(Arc::new(peer_state))),
+            #[cfg(feature = "handshake_retry")]
+            handshake_tracker: HandshakeTracker::new(HandshakeConfig::from_env()),
         });
 
         // Create or use provided buffer pool (H1 fix)
@@ -551,6 +560,10 @@ impl UserspaceWgTunnel {
         if self.shared.connected.load(Ordering::Acquire) {
             return Err(WgTunnelError::AlreadyConnected);
         }
+
+        // Issue #13 fix: Reset handshake tracker for new connection
+        #[cfg(feature = "handshake_retry")]
+        self.shared.handshake_tracker.reset();
 
         info!(
             "Connecting userspace WireGuard tunnel to {}",
@@ -739,6 +752,10 @@ impl UserspaceWgTunnel {
 
         // Mark as disconnected first to stop accepting new operations
         self.shared.connected.store(false, Ordering::Release);
+
+        // Issue #13 fix: Set handshake tracker to disconnecting state
+        #[cfg(feature = "handshake_retry")]
+        self.shared.handshake_tracker.set_disconnecting();
 
         // Send shutdown signal
         if let Some(tx) = self.shutdown_tx.lock().take() {
@@ -1133,10 +1150,57 @@ async fn run_background_task(
 
                 if let Some(result) = result {
                     if let TunnResult::WriteToNetwork(data) = result {
-                        if let Err(e) = socket.send(data).await {
-                            warn!("Failed to send timer packet: {}", e);
-                        } else {
-                            trace!("Sent timer packet ({} bytes)", data.len());
+                        // Issue #13 fix: Use handshake tracker to prevent busy loop
+                        #[cfg(feature = "handshake_retry")]
+                        {
+                            // Check if this is a handshake initiation (148 bytes)
+                            let is_handshake_init = data.len() == WG_HANDSHAKE_INIT_SIZE;
+
+                            if is_handshake_init {
+                                // Check if handshake retry is allowed (respects backoff)
+                                if shared.handshake_tracker.can_initiate() {
+                                    match shared.handshake_tracker.on_initiate() {
+                                        Ok(attempt) => {
+                                            if let Err(e) = socket.send(data).await {
+                                                warn!("Failed to send handshake attempt {}: {}", attempt, e);
+                                                shared.handshake_tracker.on_network_error();
+                                            } else {
+                                                debug!("Sent handshake initiation attempt {} ({} bytes)", attempt, data.len());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            trace!("Handshake initiation blocked: {}", e);
+                                        }
+                                    }
+                                } else if shared.handshake_tracker.is_failed() {
+                                    // Handshake retries exhausted, stop the tunnel
+                                    warn!("Handshake retries exhausted, stopping tunnel");
+                                    shared.connected.store(false, Ordering::Release);
+                                    break;
+                                } else {
+                                    // Still in backoff period
+                                    if let Some(remaining) = shared.handshake_tracker.time_until_next_retry() {
+                                        trace!("Handshake backoff: {:?} remaining", remaining);
+                                    }
+                                }
+                            } else {
+                                // Not a handshake init (keepalive, data, etc.) - send immediately
+                                if let Err(e) = socket.send(data).await {
+                                    warn!("Failed to send timer packet: {}", e);
+                                } else {
+                                    trace!("Sent timer packet ({} bytes)", data.len());
+                                }
+                            }
+                        }
+
+                        // Without handshake_retry feature, send all packets immediately
+                        #[cfg(not(feature = "handshake_retry"))]
+                        {
+                            if let Err(e) = socket.send(data).await {
+                                warn!("Failed to send timer packet: {}", e);
+                            } else {
+                                trace!("Sent timer packet ({} bytes)", data.len());
+                            }
                         }
                     }
                 }
@@ -1324,6 +1388,10 @@ async fn handle_decapsulate_result(
                 // H3 fix: Signal handshake completion
                 // Sending response typically indicates handshake response was sent
                 let _ = shared.handshake_tx.send(true);
+
+                // Issue #13 fix: Signal handshake tracker completion
+                #[cfg(feature = "handshake_retry")]
+                shared.handshake_tracker.on_complete();
             }
 
             // Process any additional data after sending response

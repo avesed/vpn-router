@@ -1813,12 +1813,26 @@ pub struct ChainStatus {
 // Phase 6.0: Pairing Types
 // ============================================================================
 
+/// Default value for pair_request message type
+fn default_pair_request_type() -> String {
+    "pair_request".to_string()
+}
+
+/// Default value for pair_response message type
+fn default_pair_response_type() -> String {
+    "pair_response".to_string()
+}
+
 /// Offline pairing request
 ///
 /// Contains all information needed for offline node pairing.
 /// Encoded as Base64 JSON for exchange via QR code or text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairRequest {
+    /// Message type discriminator for protocol compatibility with Python
+    /// Uses serde rename to "type" (Rust keyword) and default for backward compatibility
+    #[serde(rename = "type", default = "default_pair_request_type")]
+    pub message_type: String,
     /// Protocol version (2 for v3.2)
     pub version: u8,
     /// Node tag
@@ -1872,6 +1886,10 @@ pub struct PairRequest {
 /// Response to a pairing request, completing the handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairResponse {
+    /// Message type discriminator for protocol compatibility with Python
+    /// Uses serde rename to "type" (Rust keyword) and default for backward compatibility
+    #[serde(rename = "type", default = "default_pair_response_type")]
+    pub message_type: String,
     /// Protocol version
     pub version: u8,
     /// Original request node tag
@@ -3161,6 +3179,7 @@ rust_router_connections_total 12345
     #[test]
     fn test_pair_request_serialization() {
         let request = PairRequest {
+            message_type: "pair_request".to_string(),
             version: 2,
             node_tag: "node-a".into(),
             node_description: "Test node A".into(),
@@ -3183,11 +3202,14 @@ rust_router_connections_total 12345
         assert!(json.contains("\"node_tag\":\"node-a\""));
         assert!(json.contains("\"bidirectional\":true"));
         assert!(json.contains("\"api_port\":36000"));
+        // Verify type field is serialized as "type" (not "message_type")
+        assert!(json.contains("\"type\":\"pair_request\""));
 
         let parsed: PairRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.api_port, 36000);
         assert!(parsed.bidirectional);
+        assert_eq!(parsed.message_type, "pair_request");
     }
 
     #[test]

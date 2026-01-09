@@ -510,8 +510,8 @@ async fn main() -> Result<()> {
     // Phase 7: DNS Engine Initialization
     // ========================================================================
 
-    // Create DNS configuration with default upstream servers
-    let dns_config = DnsConfig::new()
+    // Create DNS configuration from environment variables with default upstream servers
+    let dns_config = DnsConfig::from_env()
         .with_upstream(UpstreamConfig::new("cloudflare", "1.1.1.1:53", UpstreamProtocol::Udp))
         .with_upstream(UpstreamConfig::new("cloudflare-backup", "1.0.0.1:53", UpstreamProtocol::Udp))
         .with_upstream(UpstreamConfig::new("google", "8.8.8.8:53", UpstreamProtocol::Udp))

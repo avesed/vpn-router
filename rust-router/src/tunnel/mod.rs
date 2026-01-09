@@ -98,6 +98,7 @@
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Sections 6.1-6.4
 
 pub mod config;
+pub mod handshake;
 pub mod traits;
 pub mod userspace;
 
@@ -106,6 +107,7 @@ pub use config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConfig, WG_REKE
 pub use traits::{
     BoxFuture, DecryptResult, WgTunnel, WgTunnelBuilder, WgTunnelError, WgTunnelStats,
 };
+pub use handshake::{HandshakeConfig, HandshakeError, HandshakeState, HandshakeTracker};
 pub use userspace::{
     derive_public_key, generate_private_key, validate_key, UserspaceWgTunnel, DEFAULT_MTU,
     MIN_BUFFER_SIZE, WG_HANDSHAKE_INIT_SIZE, WG_HANDSHAKE_RESPONSE_SIZE, WG_TRANSPORT_OVERHEAD,

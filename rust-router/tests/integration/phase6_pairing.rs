@@ -253,6 +253,7 @@ fn test_tunnel_type_serialization() {
 #[test]
 fn test_pair_request_serialization() {
     let request = PairRequest {
+        message_type: "pair_request".to_string(),
         version: 2,
         node_tag: "test-node".to_string(),
         node_description: "Test Node".to_string(),
@@ -273,15 +274,20 @@ fn test_pair_request_serialization() {
     };
 
     let json = serde_json::to_string(&request).expect("Should serialize");
+    // Verify type field is serialized as "type" (not "message_type")
+    assert!(json.contains("\"type\":\"pair_request\""));
+
     let decoded: PairRequest = serde_json::from_str(&json).expect("Should deserialize");
 
     assert_eq!(decoded.node_tag, "test-node");
     assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.message_type, "pair_request");
 }
 
 #[test]
 fn test_pair_response_serialization() {
     let response = PairResponse {
+        message_type: "pair_response".to_string(),
         version: 2,
         request_node_tag: "request-node".to_string(),
         node_tag: "response-node".to_string(),
@@ -298,10 +304,14 @@ fn test_pair_response_serialization() {
     };
 
     let json = serde_json::to_string(&response).expect("Should serialize");
+    // Verify type field is serialized as "type" (not "message_type")
+    assert!(json.contains("\"type\":\"pair_response\""));
+
     let decoded: PairResponse = serde_json::from_str(&json).expect("Should deserialize");
 
     assert_eq!(decoded.node_tag, "response-node");
     assert_eq!(decoded.request_node_tag, "request-node");
+    assert_eq!(decoded.message_type, "pair_response");
 }
 
 // ============================================================================
@@ -362,6 +372,7 @@ fn test_xray_tunnel_type_serde() {
 #[test]
 fn test_xray_pair_request_fields() {
     let request = PairRequest {
+        message_type: "pair_request".to_string(),
         version: 2,
         node_tag: "xray-peer".to_string(),
         node_description: "Xray Peer Node".to_string(),

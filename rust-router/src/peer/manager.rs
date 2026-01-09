@@ -366,6 +366,7 @@ impl PeerManager {
 
         // Create pairing request
         let request = PairRequest {
+            message_type: "pair_request".to_string(),
             version: PAIRING_PROTOCOL_VERSION,
             node_tag: config.local_tag.clone(),
             node_description: config.local_description.clone(),
@@ -590,6 +591,7 @@ impl PeerManager {
 
         // Create pairing response
         let response = PairResponse {
+            message_type: "pair_response".to_string(),
             version: PAIRING_PROTOCOL_VERSION,
             request_node_tag: request.node_tag.clone(),
             node_tag: local_config.local_tag.clone(),

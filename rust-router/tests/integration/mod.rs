@@ -43,6 +43,8 @@ pub mod dns_ipc;
 pub mod dscp_chain;
 pub mod e2e;
 pub mod failover_integration;
+#[cfg(feature = "handshake_retry")]
+pub mod handshake_integration;
 pub mod memory_stability;
 pub mod phase6_2pc;
 pub mod phase6_chain;

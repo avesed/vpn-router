@@ -74,11 +74,25 @@ pub struct PairRequestConfig {
     pub tunnel_type: TunnelType,
 }
 
+/// Default value for pair_request message type
+fn default_pair_request_type() -> String {
+    "pair_request".to_string()
+}
+
+/// Default value for pair_response message type
+fn default_pair_response_type() -> String {
+    "pair_response".to_string()
+}
+
 /// Pairing request structure (encoded in Base64)
 ///
 /// This is the structure that gets serialized into a pairing code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairRequest {
+    /// Message type discriminator for protocol compatibility with Python
+    /// Uses serde rename to "type" (Rust keyword) and default for backward compatibility
+    #[serde(rename = "type", default = "default_pair_request_type")]
+    pub message_type: String,
     /// Protocol version (currently 2 for v3.2)
     pub version: u8,
     /// Node tag identifier
@@ -135,6 +149,10 @@ pub struct PairRequest {
 /// This is returned by the importing node to complete the pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairResponse {
+    /// Message type discriminator for protocol compatibility with Python
+    /// Uses serde rename to "type" (Rust keyword) and default for backward compatibility
+    #[serde(rename = "type", default = "default_pair_response_type")]
+    pub message_type: String,
     /// Protocol version
     pub version: u8,
     /// Tag of the requesting node (for correlation)
@@ -409,6 +427,7 @@ mod tests {
     #[test]
     fn test_pair_request_serialization() {
         let request = PairRequest {
+            message_type: "pair_request".to_string(),
             version: PAIRING_PROTOCOL_VERSION,
             node_tag: "test-node".to_string(),
             node_description: "Test Node".to_string(),
@@ -431,16 +450,20 @@ mod tests {
         // Test serialization doesn't panic
         let json = serde_json::to_string(&request).expect("Serialization should succeed");
         assert!(json.contains("test-node"));
+        // Verify type field is serialized correctly
+        assert!(json.contains("\"type\":\"pair_request\""));
 
         // Test deserialization
         let decoded: PairRequest = serde_json::from_str(&json).expect("Deserialization should succeed");
         assert_eq!(decoded.node_tag, "test-node");
         assert_eq!(decoded.version, PAIRING_PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, "pair_request");
     }
 
     #[test]
     fn test_pair_response_serialization() {
         let response = PairResponse {
+            message_type: "pair_response".to_string(),
             version: PAIRING_PROTOCOL_VERSION,
             request_node_tag: "request-node".to_string(),
             node_tag: "response-node".to_string(),
@@ -457,9 +480,13 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response).expect("Serialization should succeed");
+        // Verify type field is serialized correctly
+        assert!(json.contains("\"type\":\"pair_response\""));
+
         let decoded: PairResponse = serde_json::from_str(&json).expect("Deserialization should succeed");
         assert_eq!(decoded.node_tag, "response-node");
         assert_eq!(decoded.request_node_tag, "request-node");
+        assert_eq!(decoded.message_type, "pair_response");
     }
 
     fn create_test_request() -> PairRequest {
@@ -469,6 +496,7 @@ mod tests {
             .as_secs();
 
         PairRequest {
+            message_type: "pair_request".to_string(),
             version: PAIRING_PROTOCOL_VERSION,
             node_tag: "test-node".to_string(),
             node_description: "Test Node".to_string(),
@@ -496,6 +524,7 @@ mod tests {
             .as_secs();
 
         PairResponse {
+            message_type: "pair_response".to_string(),
             version: PAIRING_PROTOCOL_VERSION,
             request_node_tag: "request-node".to_string(),
             node_tag: "response-node".to_string(),
@@ -609,5 +638,124 @@ mod tests {
         request.node_description = "a".repeat(20000); // Exceed 16KB limit
         let result = encode_pair_request(&request);
         assert!(matches!(result, Err(PairingError::CodeTooLarge(_))));
+    }
+
+    // =========================================================================
+    // Protocol Compatibility Tests (Issue #14 Fix)
+    // =========================================================================
+
+    /// Test that Rust-generated pairing code includes "type": "pair_request"
+    #[test]
+    fn test_rust_generated_code_includes_type_field() {
+        let request = create_test_request();
+        let code = encode_pair_request(&request).expect("Should encode");
+
+        // Decode the Base64 to JSON
+        let json_bytes = BASE64_STANDARD.decode(&code).expect("Should decode Base64");
+        let json_str = String::from_utf8(json_bytes).expect("Should be valid UTF-8");
+
+        // Verify the type field exists and is correct
+        assert!(json_str.contains("\"type\":\"pair_request\""));
+    }
+
+    /// Test that Rust can deserialize Python-generated code WITH type field
+    #[test]
+    fn test_deserialize_python_code_with_type_field() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Simulate Python-generated JSON with "type" field
+        let python_json = format!(
+            r#"{{
+                "type": "pair_request",
+                "version": 2,
+                "node_tag": "python-node",
+                "node_description": "Python Node",
+                "endpoint": "192.168.1.1:36200",
+                "api_port": 36000,
+                "tunnel_type": "wireguard",
+                "timestamp": {},
+                "bidirectional": true,
+                "wg_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }}"#,
+            now
+        );
+
+        let encoded = BASE64_STANDARD.encode(python_json.as_bytes());
+        let request = decode_pair_request(&encoded).expect("Should decode Python code");
+
+        assert_eq!(request.message_type, "pair_request");
+        assert_eq!(request.node_tag, "python-node");
+        assert_eq!(request.version, PAIRING_PROTOCOL_VERSION);
+    }
+
+    /// Test that Rust can deserialize old codes WITHOUT type field (backward compatibility)
+    #[test]
+    fn test_deserialize_legacy_code_without_type_field() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Simulate old pairing code WITHOUT "type" field
+        let legacy_json = format!(
+            r#"{{
+                "version": 2,
+                "node_tag": "legacy-node",
+                "node_description": "Legacy Node",
+                "endpoint": "192.168.1.1:36200",
+                "api_port": 36000,
+                "tunnel_type": "wireguard",
+                "timestamp": {},
+                "bidirectional": false
+            }}"#,
+            now
+        );
+
+        let encoded = BASE64_STANDARD.encode(legacy_json.as_bytes());
+        let request = decode_pair_request(&encoded).expect("Should decode legacy code");
+
+        // Default value should be applied
+        assert_eq!(request.message_type, "pair_request");
+        assert_eq!(request.node_tag, "legacy-node");
+    }
+
+    /// Test round-trip serialization preserves all fields including type
+    #[test]
+    fn test_roundtrip_serialization_preserves_type() {
+        let request = create_test_request();
+
+        // Encode to Base64
+        let code = encode_pair_request(&request).expect("Should encode");
+
+        // Decode back
+        let decoded = decode_pair_request(&code).expect("Should decode");
+
+        // Verify type field preserved
+        assert_eq!(decoded.message_type, "pair_request");
+        assert_eq!(decoded.node_tag, request.node_tag);
+        assert_eq!(decoded.version, request.version);
+    }
+
+    /// Test PairResponse type field serialization
+    #[test]
+    fn test_pair_response_type_field_serialization() {
+        let response = create_test_response();
+
+        // Encode to Base64
+        let code = encode_pair_response(&response).expect("Should encode");
+
+        // Decode the Base64 to JSON
+        let json_bytes = BASE64_STANDARD.decode(&code).expect("Should decode Base64");
+        let json_str = String::from_utf8(json_bytes).expect("Should be valid UTF-8");
+
+        // Verify the type field exists and is correct
+        assert!(json_str.contains("\"type\":\"pair_response\""));
+
+        // Decode back and verify
+        let decoded = decode_pair_response(&code).expect("Should decode");
+        assert_eq!(decoded.message_type, "pair_response");
     }
 }

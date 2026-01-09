@@ -110,14 +110,17 @@ webpki-roots = { version = "0.26", optional = true }
 http = { version = "1", optional = true }
 
 [features]
-default = ["dns-doh", "dns-dot"]
+default = ["dns-doh", "dns-dot", "handshake_retry"]
 dns-doh = ["hyper", "hyper-util", "http-body-util", "hyper-rustls", "http", "rustls", "rustls-pki-types", "webpki-roots"]
 dns-dot = ["tokio-rustls", "rustls", "rustls-pki-types", "webpki-roots"]
+# Handshake retry with exponential backoff to prevent busy loop on invalid egress
+handshake_retry = []
 
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+serial_test = "3"
 
 [[bin]]
 name = "rust-router"
