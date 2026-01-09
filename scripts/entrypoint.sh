@@ -984,6 +984,8 @@ echo "[entrypoint] rendering rust-router config"
 mkdir -p "$(dirname "${RUST_ROUTER_CONFIG}")"
 # Export RUST_ROUTER_PORT so render_routing_config.py uses the correct port
 export RUST_ROUTER_PORT="${TPROXY_PORT}"
+# Phase 11-Fix.AB: Export USERSPACE_WG so render_routing_config.py can skip WireGuard outbounds
+export USERSPACE_WG="${USERSPACE_WG}"
 if python3 /usr/local/bin/render_routing_config.py \
     --format=rust-router \
     --output="${RUST_ROUTER_CONFIG}"; then

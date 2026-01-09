@@ -665,7 +665,14 @@ class RustRouterConfigGenerator:
         Note: rust-router currently only supports Direct and Block outbound types
         in config. WireGuard-based outbounds use Direct with bind_interface.
         SOCKS5 outbounds (V2Ray, WARP MASQUE) are not yet supported and will be skipped.
+
+        Phase 11-Fix.AB: In userspace WireGuard mode (USERSPACE_WG=true), WireGuard
+        outbounds should NOT be included in static config - they will be managed via
+        IPC by rust_router_manager.py.
         """
+        # Phase 11-Fix.AB: Check if userspace WireGuard mode is enabled
+        userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
+
         if ob.egress_type == EgressType.DIRECT:
             result: Dict[str, Any] = {
                 "type": "direct",  # lowercase to match serde deserialization
@@ -686,7 +693,13 @@ class RustRouterConfigGenerator:
             }
 
         elif ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER):
-            # WireGuard-based: use direct with bind_interface
+            # Phase 11-Fix.AB: In userspace WireGuard mode, skip these outbounds in static config
+            # They will be added via IPC as userspace WireGuard tunnels by rust_router_manager.py
+            if userspace_wg:
+                logger.info(f"Skipping WireGuard outbound '{ob.tag}' in static config (USERSPACE_WG=true)")
+                return None
+
+            # WireGuard-based (kernel mode): use direct with bind_interface
             # rust-router treats these as direct outbounds bound to WireGuard interfaces
             result = {
                 "type": "direct",  # lowercase to match serde deserialization
