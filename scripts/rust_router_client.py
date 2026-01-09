@@ -1206,6 +1206,33 @@ class RustRouterClient:
     # Phase 6: ECMP Group Management
     # =========================================================================
 
+    @staticmethod
+    def _map_algorithm_name(algorithm: str) -> str:
+        """Map Python/sing-box algorithm names to rust-router IPC protocol names.
+
+        Mapping:
+            five_tuple_hash, loadbalance -> source_hash
+            round_robin -> round_robin
+            random -> random
+            weighted -> weighted
+            least_connections -> least_connections
+
+        Args:
+            algorithm: Algorithm name from Python code or database
+
+        Returns:
+            Algorithm name compatible with rust-router IPC protocol v3.2
+        """
+        algorithm_map = {
+            "five_tuple_hash": "source_hash",
+            "loadbalance": "source_hash",  # sing-box format
+            "round_robin": "round_robin",
+            "random": "random",
+            "weighted": "weighted",
+            "least_connections": "least_connections",
+        }
+        return algorithm_map.get(algorithm.lower(), "source_hash")
+
     async def create_ecmp_group(
         self,
         tag: str,
@@ -1215,12 +1242,13 @@ class RustRouterClient:
         routing_mark: Optional[int] = None,
         routing_table: Optional[int] = None,
         health_check: bool = True,
+        health_check_interval_secs: int = 30,
     ) -> IpcResponse:
         """Create an ECMP load balancing group.
 
         Args:
             tag: Unique tag for this group
-            members: List of member dicts with 'tag' and optional 'weight'
+            members: List of member dicts with 'tag' and optional 'weight', 'enabled'
             algorithm: Load balancing algorithm:
                 - five_tuple_hash: 5-tuple hash for connection affinity (default)
                 - round_robin: Sequential distribution
@@ -1231,16 +1259,32 @@ class RustRouterClient:
             routing_mark: Optional routing mark (200-299 range)
             routing_table: Optional routing table
             health_check: Enable health checking (default: True)
+            health_check_interval_secs: Health check interval in seconds (default: 30)
 
         Returns:
             IpcResponse indicating success or failure
         """
+        # Convert members from Python format to Rust IPC format
+        # Python: {"tag": "...", "weight": 1}
+        # Rust:   {"outbound": "...", "weight": 1, "enabled": true}
+        ipc_members = []
+        for member in members:
+            ipc_member = {
+                "outbound": member.get("tag", member.get("outbound", "")),
+                "weight": member.get("weight", 1),
+                "enabled": member.get("enabled", True),
+            }
+            ipc_members.append(ipc_member)
+
+        # Build config according to rust-router IPC protocol v3.2
+        # EcmpGroupConfig fields: description, algorithm, members, skip_unhealthy,
+        # health_check_interval_secs, routing_mark, routing_table
         config = {
-            "tag": tag,
-            "members": members,
-            "algorithm": algorithm,
             "description": description,
-            "health_check": health_check,
+            "algorithm": self._map_algorithm_name(algorithm),
+            "members": ipc_members,
+            "skip_unhealthy": health_check,
+            "health_check_interval_secs": health_check_interval_secs,
         }
         if routing_mark is not None:
             config["routing_mark"] = routing_mark
