@@ -590,6 +590,13 @@ class RustRouterConfigGenerator:
                 outbounds.append(outbound_dict)
                 valid_outbound_tags.add(outbound_dict["tag"])
 
+        # Phase 11-Fix.AB: Check if default outbound was skipped (e.g., WireGuard in userspace mode)
+        # If so, remap to "direct" which always exists
+        default_outbound = config.default_outbound
+        if default_outbound not in valid_outbound_tags:
+            logger.warning(f"Default outbound '{default_outbound}' was skipped, remapping to 'direct'")
+            default_outbound = "direct"
+
         # Filter rules to only include those with valid outbounds
         # For rules referencing skipped outbounds (e.g., SOCKS5), use default outbound
         rules = []
@@ -599,8 +606,8 @@ class RustRouterConfigGenerator:
             if outbound not in valid_outbound_tags:
                 # Rule references a skipped outbound, reroute to default
                 skipped_count += 1
-                outbound = config.default_outbound
-                # Skip if default outbound is also invalid (shouldn't happen)
+                outbound = default_outbound
+                # Skip if default outbound is also invalid (shouldn't happen since we validated above)
                 if outbound not in valid_outbound_tags:
                     continue
 
@@ -633,7 +640,8 @@ class RustRouterConfigGenerator:
             # Outbounds - required
             "outbounds": outbounds,
             # Default outbound - required (top-level, not in routing)
-            "default_outbound": config.default_outbound,
+            # Phase 11-Fix.AB: Use validated default_outbound (may have been remapped)
+            "default_outbound": default_outbound,
             # IpcConfig - required
             "ipc": {
                 "socket_path": socket_path,
