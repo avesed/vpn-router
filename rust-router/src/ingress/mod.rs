@@ -80,11 +80,19 @@
 
 pub mod config;
 pub mod error;
+pub mod forwarder;
 pub mod manager;
 pub mod processor;
 
 // Re-export commonly used types
 pub use config::WgIngressConfig;
 pub use error::IngressError;
+pub use forwarder::{
+    parse_ip_packet, parse_tcp_details, run_forwarding_loop, run_reply_router_loop,
+    spawn_forwarding_task, spawn_reply_router, tcp_flags, FiveTuple, ForwardingStats,
+    ForwardingStatsSnapshot, IngressReplyStats, IngressReplyStatsSnapshot, IngressSessionTracker,
+    ParsedPacket, PeerSession, ReplyPacket, TcpConnection, TcpConnectionManager,
+    TcpConnectionState, TcpDetails,
+};
 pub use manager::{WgIngressManager, WgIngressStats};
 pub use processor::{IngressProcessor, RoutingDecision};

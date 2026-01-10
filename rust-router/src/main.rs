@@ -20,6 +20,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -416,17 +417,53 @@ async fn main() -> Result<()> {
     debug!("Created EcmpGroupManager");
 
     // Create WireGuard egress manager (always created for IPC support)
-    // The reply handler forwards decrypted packets back to the connection manager
+    // The reply handler forwards decrypted packets back to the ingress reply router
+    let reply_router_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
+        Arc::new(parking_lot::RwLock::new(None));
+    let reply_stats = Arc::new(rust_router::ingress::IngressReplyStats::default());
+
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
-        let _conn_mgr = Arc::clone(&connection_manager);
+        let reply_router_tx = Arc::clone(&reply_router_tx);
+        let reply_stats = Arc::clone(&reply_stats);
         move |packet, tunnel_tag| {
-            debug!(
-                "WireGuard reply from '{}': {} bytes (forwarding not yet implemented)",
-                tunnel_tag,
-                packet.len()
-            );
-            // TODO: Forward decrypted packets to appropriate handler
-            // This will be implemented when we integrate with the connection flow
+            reply_stats
+                .packets_received
+                .fetch_add(1, Ordering::Relaxed);
+
+            let maybe_tx = reply_router_tx.read().clone();
+            if let Some(tx) = maybe_tx {
+                match tx.try_send(rust_router::ingress::ReplyPacket { packet, tunnel_tag }) {
+                    Ok(()) => {
+                        reply_stats
+                            .packets_enqueued
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(reply)) => {
+                        reply_stats.queue_full.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Reply router queue full; dropping reply from '{}'",
+                            reply.tunnel_tag
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(reply)) => {
+                        reply_stats
+                            .router_unavailable
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "Reply router unavailable; dropping reply from '{}'",
+                            reply.tunnel_tag
+                        );
+                    }
+                }
+            } else {
+                reply_stats
+                    .router_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Reply router not ready; dropping reply from '{}'",
+                    tunnel_tag
+                );
+            }
         }
     }));
     let wg_egress_manager = Arc::new(WgEgressManager::new(wg_reply_handler));
@@ -652,6 +689,12 @@ async fn main() -> Result<()> {
     // ========================================================================
     // Phase 6: Start userspace WireGuard ingress if enabled
     // ========================================================================
+    // Track forwarding task handle for graceful shutdown
+    let mut forwarding_task_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let forwarding_stats: Option<Arc<rust_router::ingress::ForwardingStats>> = None;
+    let _forwarding_stats = forwarding_stats; // Silence unused warning until IPC integration
+
     if let Some(ref ingress_mgr) = wg_ingress_manager {
         info!("Starting userspace WireGuard ingress...");
 
@@ -664,6 +707,49 @@ async fn main() -> Result<()> {
                 "WireGuard ingress started on {} (userspace mode)",
                 ingress_mgr.listen_addr()
             );
+
+            // Take the packet receiver and spawn forwarding task
+            if let Some(packet_rx) = ingress_mgr.take_packet_receiver().await {
+                let tcp_manager = Arc::new(
+                    rust_router::ingress::TcpConnectionManager::new(
+                        std::time::Duration::from_secs(300), // 5 minute connection timeout
+                    ),
+                );
+                let session_tracker = Arc::new(
+                    rust_router::ingress::IngressSessionTracker::new(
+                        std::time::Duration::from_secs(300), // 5 minute session TTL
+                    ),
+                );
+                let fwd_stats = Arc::new(rust_router::ingress::ForwardingStats::default());
+
+                let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1024);
+                *reply_router_tx.write() = Some(reply_tx);
+
+                let reply_handle = rust_router::ingress::spawn_reply_router(
+                    reply_rx,
+                    Arc::clone(ingress_mgr),
+                    Arc::clone(&session_tracker),
+                    Arc::clone(&reply_stats),
+                );
+
+                let forward_handle = rust_router::ingress::spawn_forwarding_task(
+                    packet_rx,
+                    Arc::clone(&outbound_manager),
+                    Arc::clone(&wg_egress_manager),
+                    tcp_manager,
+                    session_tracker,
+                    Arc::clone(&fwd_stats),
+                );
+
+                info!("Ingress reply router task started");
+                reply_task_handle = Some(reply_handle);
+                info!("Ingress packet forwarding task started");
+                forwarding_task_handle = Some(forward_handle);
+                // Store stats for future IPC integration
+                // forwarding_stats = Some(fwd_stats);
+            } else {
+                warn!("Failed to take packet receiver from WireGuard ingress - forwarding disabled");
+            }
         }
     } else {
         debug!("Userspace WireGuard ingress not enabled");
@@ -733,6 +819,29 @@ async fn main() -> Result<()> {
             }
             info!("WireGuard ingress manager shutdown complete");
         }
+    }
+
+    // Shutdown reply router task (drop sender to close channel)
+    *reply_router_tx.write() = None;
+    if let Some(handle) = reply_task_handle {
+        info!("Waiting for reply router task to complete...");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle,
+        )
+        .await;
+        info!("Reply router task shutdown complete");
+    }
+
+    // Shutdown forwarding task (after ingress stops, the channel will close)
+    if let Some(handle) = forwarding_task_handle {
+        info!("Waiting for forwarding task to complete...");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle,
+        )
+        .await;
+        info!("Forwarding task shutdown complete");
     }
 
     // Shutdown WireGuard egress manager

@@ -1,0 +1,3164 @@
+//! Ingress packet forwarding - consumes ProcessedPacket and forwards to outbounds
+//!
+//! This module bridges the gap between WireGuard ingress (which decrypts packets)
+//! and the outbound system (which sends packets to the internet or other tunnels).
+//!
+//! # Architecture
+//!
+//! ```text
+//! WgIngressManager
+//!       |
+//!       v (mpsc channel)
+//! ProcessedPacket
+//!       |
+//!       v
+//! IngressForwarder
+//!       |
+//!       +---> UDP packets ---> WgEgressManager.send() / OutboundManager
+//!       |
+//!       +---> TCP packets ---> (Phase 3: TCP state machine)
+//! ```
+//!
+//! # Session Tracking
+//!
+//! The forwarder maintains a session tracker to route reply packets back to
+//! the correct WireGuard peer. When a packet is forwarded, a session entry
+//! is created with the 5-tuple key and the peer's information.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use rust_router::ingress::forwarder::{spawn_forwarding_task, IngressSessionTracker, ForwardingStats};
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+//! let stats = Arc::new(ForwardingStats::default());
+//!
+//! let handle = spawn_forwarding_task(
+//!     packet_rx,
+//!     outbound_manager,
+//!     wg_egress_manager,
+//!     session_tracker,
+//!     stats,
+//! );
+//! ```
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, info, trace, warn};
+
+use super::manager::{ProcessedPacket, WgIngressManager};
+use crate::egress::manager::WgEgressManager;
+use crate::outbound::OutboundManager;
+
+/// IP protocol numbers
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const IPPROTO_ICMPV6: u8 = 58;
+
+// ============================================================================
+// TCP Connection Tracking (Phase 3)
+// ============================================================================
+
+/// TCP flag bits
+pub mod tcp_flags {
+    /// FIN flag - connection close request
+    pub const FIN: u8 = 0x01;
+    /// SYN flag - connection open request
+    pub const SYN: u8 = 0x02;
+    /// RST flag - connection reset
+    pub const RST: u8 = 0x04;
+    /// PSH flag - push data immediately
+    pub const PSH: u8 = 0x08;
+    /// ACK flag - acknowledgment
+    pub const ACK: u8 = 0x10;
+    /// URG flag - urgent pointer valid
+    pub const URG: u8 = 0x20;
+}
+
+/// TCP connection state
+///
+/// Simplified state machine for ingress TCP tracking:
+/// ```text
+///     SynReceived --> Established --> Closing --> Closed
+///           |              |             ^
+///           +-- RST -------+-------------+
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpConnectionState {
+    /// SYN received from client, waiting for outbound connection
+    SynReceived,
+    /// Connection established (outbound connected)
+    Established,
+    /// FIN received, connection closing
+    Closing,
+    /// Connection closed
+    Closed,
+}
+
+impl std::fmt::Display for TcpConnectionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SynReceived => write!(f, "SYN_RECEIVED"),
+            Self::Established => write!(f, "ESTABLISHED"),
+            Self::Closing => write!(f, "CLOSING"),
+            Self::Closed => write!(f, "CLOSED"),
+        }
+    }
+}
+
+/// Tracked TCP connection
+///
+/// Stores state and metadata for a TCP connection flowing through ingress.
+pub struct TcpConnection {
+    /// Connection state
+    pub state: TcpConnectionState,
+    /// Outbound tag used for routing
+    pub outbound_tag: String,
+    /// Peer's WireGuard public key (for reply routing)
+    pub peer_public_key: String,
+    /// Peer's external endpoint
+    pub peer_endpoint: SocketAddr,
+    /// Outbound TCP stream (if established)
+    pub outbound_stream: Option<TcpStream>,
+    /// Bytes sent to destination
+    pub bytes_sent: AtomicU64,
+    /// Bytes received from destination (replies)
+    pub bytes_received: AtomicU64,
+    /// Last activity timestamp
+    pub last_activity: Instant,
+    /// Client's initial sequence number
+    pub client_seq: u32,
+    /// Server's initial sequence number (from SYN-ACK)
+    pub server_seq: u32,
+}
+
+impl TcpConnection {
+    /// Create a new TCP connection entry
+    pub fn new(
+        outbound_tag: String,
+        peer_public_key: String,
+        peer_endpoint: SocketAddr,
+    ) -> Self {
+        Self {
+            state: TcpConnectionState::SynReceived,
+            outbound_tag,
+            peer_public_key,
+            peer_endpoint,
+            outbound_stream: None,
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            last_activity: Instant::now(),
+            client_seq: 0,
+            server_seq: 0,
+        }
+    }
+
+    /// Update the last activity timestamp
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Add bytes sent
+    pub fn add_bytes_sent(&self, bytes: u64) {
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Add bytes received
+    pub fn add_bytes_received(&self, bytes: u64) {
+        self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Get bytes sent
+    pub fn get_bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Get bytes received
+    pub fn get_bytes_received(&self) -> u64 {
+        self.bytes_received.load(Ordering::Relaxed)
+    }
+}
+
+/// Manages TCP connections for ingress forwarding
+///
+/// Thread-safe connection tracker using `DashMap` for concurrent access.
+/// Each connection is wrapped in `RwLock` for fine-grained locking.
+pub struct TcpConnectionManager {
+    /// Active connections keyed by 5-tuple
+    connections: DashMap<FiveTuple, Arc<RwLock<TcpConnection>>>,
+    /// Connection timeout for cleanup
+    connection_timeout: Duration,
+}
+
+impl TcpConnectionManager {
+    /// Create a new TCP connection manager
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_timeout` - How long to keep idle connections before cleanup
+    pub fn new(connection_timeout: Duration) -> Self {
+        Self {
+            connections: DashMap::new(),
+            connection_timeout,
+        }
+    }
+
+    /// Get or create a connection entry
+    ///
+    /// If a connection already exists, returns the existing entry.
+    /// Otherwise, creates a new entry with `SynReceived` state.
+    pub fn get_or_create(
+        &self,
+        five_tuple: FiveTuple,
+        peer_public_key: String,
+        peer_endpoint: SocketAddr,
+        outbound_tag: String,
+    ) -> Arc<RwLock<TcpConnection>> {
+        self.connections
+            .entry(five_tuple)
+            .or_insert_with(|| {
+                Arc::new(RwLock::new(TcpConnection::new(
+                    outbound_tag,
+                    peer_public_key,
+                    peer_endpoint,
+                )))
+            })
+            .clone()
+    }
+
+    /// Get an existing connection
+    pub fn get(&self, five_tuple: &FiveTuple) -> Option<Arc<RwLock<TcpConnection>>> {
+        self.connections.get(five_tuple).map(|r| r.clone())
+    }
+
+    /// Remove a connection
+    pub fn remove(&self, five_tuple: &FiveTuple) -> Option<Arc<RwLock<TcpConnection>>> {
+        self.connections.remove(five_tuple).map(|(_, v)| v)
+    }
+
+    /// Cleanup stale connections
+    ///
+    /// Removes connections that have been idle longer than `connection_timeout`.
+    ///
+    /// # Returns
+    ///
+    /// Number of connections removed.
+    pub fn cleanup(&self) -> usize {
+        let timeout = self.connection_timeout;
+        let before = self.connections.len();
+        self.connections.retain(|_, conn| {
+            if let Some(guard) = conn.try_read() {
+                guard.last_activity.elapsed() < timeout
+            } else {
+                // Keep connections that are currently locked (in use)
+                true
+            }
+        });
+        before.saturating_sub(self.connections.len())
+    }
+
+    /// Get the number of active connections
+    pub fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Check if there are no connections
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
+    }
+
+    /// Get the connection timeout
+    pub fn connection_timeout(&self) -> Duration {
+        self.connection_timeout
+    }
+}
+
+impl Default for TcpConnectionManager {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300)) // 5 minute default timeout
+    }
+}
+
+/// Parsed TCP header details
+#[derive(Debug, Clone)]
+pub struct TcpDetails {
+    /// Source port
+    pub src_port: u16,
+    /// Destination port
+    pub dst_port: u16,
+    /// Sequence number
+    pub seq_num: u32,
+    /// Acknowledgment number
+    pub ack_num: u32,
+    /// Data offset (header length) in bytes
+    pub data_offset: usize,
+    /// TCP flags
+    pub flags: u8,
+    /// Offset to TCP payload within the packet
+    pub payload_offset: usize,
+}
+
+impl TcpDetails {
+    /// Check if this is a SYN packet (connection initiation)
+    #[must_use]
+    pub fn is_syn(&self) -> bool {
+        (self.flags & tcp_flags::SYN) != 0 && (self.flags & tcp_flags::ACK) == 0
+    }
+
+    /// Check if this is a SYN-ACK packet (connection response)
+    #[must_use]
+    pub fn is_syn_ack(&self) -> bool {
+        (self.flags & tcp_flags::SYN) != 0 && (self.flags & tcp_flags::ACK) != 0
+    }
+
+    /// Check if ACK flag is set
+    #[must_use]
+    pub fn is_ack(&self) -> bool {
+        (self.flags & tcp_flags::ACK) != 0
+    }
+
+    /// Check if FIN flag is set (connection close)
+    #[must_use]
+    pub fn is_fin(&self) -> bool {
+        (self.flags & tcp_flags::FIN) != 0
+    }
+
+    /// Check if RST flag is set (connection reset)
+    #[must_use]
+    pub fn is_rst(&self) -> bool {
+        (self.flags & tcp_flags::RST) != 0
+    }
+
+    /// Check if packet has TCP payload
+    #[must_use]
+    pub fn has_payload(&self, packet_len: usize) -> bool {
+        self.payload_offset < packet_len
+    }
+
+    /// Get payload length if any
+    #[must_use]
+    pub fn payload_len(&self, packet_len: usize) -> usize {
+        if self.payload_offset < packet_len {
+            packet_len - self.payload_offset
+        } else {
+            0
+        }
+    }
+
+    /// Get a human-readable description of the flags
+    #[must_use]
+    pub fn flags_string(&self) -> String {
+        let mut flags = Vec::new();
+        if self.flags & tcp_flags::SYN != 0 {
+            flags.push("SYN");
+        }
+        if self.flags & tcp_flags::ACK != 0 {
+            flags.push("ACK");
+        }
+        if self.flags & tcp_flags::FIN != 0 {
+            flags.push("FIN");
+        }
+        if self.flags & tcp_flags::RST != 0 {
+            flags.push("RST");
+        }
+        if self.flags & tcp_flags::PSH != 0 {
+            flags.push("PSH");
+        }
+        if self.flags & tcp_flags::URG != 0 {
+            flags.push("URG");
+        }
+        if flags.is_empty() {
+            "none".to_string()
+        } else {
+            flags.join(",")
+        }
+    }
+}
+
+/// Parse TCP header to extract details
+///
+/// # Arguments
+///
+/// * `packet` - Raw IP packet data
+/// * `ip_header_len` - Length of the IP header in bytes
+///
+/// # Returns
+///
+/// Parsed TCP details, or None if the packet is too short or invalid.
+#[must_use]
+pub fn parse_tcp_details(packet: &[u8], ip_header_len: usize) -> Option<TcpDetails> {
+    let tcp_start = ip_header_len;
+
+    // Minimum TCP header is 20 bytes
+    if packet.len() < tcp_start + 20 {
+        return None;
+    }
+
+    let src_port = u16::from_be_bytes([packet[tcp_start], packet[tcp_start + 1]]);
+    let dst_port = u16::from_be_bytes([packet[tcp_start + 2], packet[tcp_start + 3]]);
+    let seq_num = u32::from_be_bytes([
+        packet[tcp_start + 4],
+        packet[tcp_start + 5],
+        packet[tcp_start + 6],
+        packet[tcp_start + 7],
+    ]);
+    let ack_num = u32::from_be_bytes([
+        packet[tcp_start + 8],
+        packet[tcp_start + 9],
+        packet[tcp_start + 10],
+        packet[tcp_start + 11],
+    ]);
+
+    // Data offset is in the high 4 bits of byte 12, in 32-bit words
+    let data_offset_words = (packet[tcp_start + 12] >> 4) as usize;
+    let data_offset = data_offset_words * 4;
+
+    // Validate data offset (must be at least 5 words = 20 bytes)
+    if data_offset < 20 || tcp_start + data_offset > packet.len() {
+        return None;
+    }
+
+    let flags = packet[tcp_start + 13];
+
+    Some(TcpDetails {
+        src_port,
+        dst_port,
+        seq_num,
+        ack_num,
+        data_offset,
+        flags,
+        payload_offset: tcp_start + data_offset,
+    })
+}
+
+/// 5-tuple key for session tracking
+///
+/// A 5-tuple uniquely identifies a connection/flow and consists of:
+/// - Source IP address
+/// - Source port
+/// - Destination IP address
+/// - Destination port
+/// - Protocol (TCP=6, UDP=17)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FiveTuple {
+    /// Source IP address
+    pub src_ip: IpAddr,
+    /// Source port
+    pub src_port: u16,
+    /// Destination IP address
+    pub dst_ip: IpAddr,
+    /// Destination port
+    pub dst_port: u16,
+    /// IP protocol number (6=TCP, 17=UDP)
+    pub protocol: u8,
+}
+
+impl FiveTuple {
+    /// Create a new 5-tuple
+    ///
+    /// # Arguments
+    ///
+    /// * `src_ip` - Source IP address
+    /// * `src_port` - Source port
+    /// * `dst_ip` - Destination IP address
+    /// * `dst_port` - Destination port
+    /// * `protocol` - IP protocol number (6=TCP, 17=UDP)
+    #[must_use]
+    pub fn new(src_ip: IpAddr, src_port: u16, dst_ip: IpAddr, dst_port: u16, protocol: u8) -> Self {
+        Self {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            protocol,
+        }
+    }
+
+    /// Create a reversed tuple for reply matching
+    ///
+    /// Swaps source and destination addresses/ports while keeping the protocol.
+    /// This is useful for matching reply packets to their original session.
+    #[must_use]
+    pub fn reverse(&self) -> Self {
+        Self {
+            src_ip: self.dst_ip,
+            src_port: self.dst_port,
+            dst_ip: self.src_ip,
+            dst_port: self.src_port,
+            protocol: self.protocol,
+        }
+    }
+
+    /// Check if this is a TCP flow
+    #[must_use]
+    pub fn is_tcp(&self) -> bool {
+        self.protocol == IPPROTO_TCP
+    }
+
+    /// Check if this is a UDP flow
+    #[must_use]
+    pub fn is_udp(&self) -> bool {
+        self.protocol == IPPROTO_UDP
+    }
+
+    /// Get the protocol name for logging
+    #[must_use]
+    pub fn protocol_name(&self) -> &'static str {
+        match self.protocol {
+            IPPROTO_TCP => "TCP",
+            IPPROTO_UDP => "UDP",
+            IPPROTO_ICMP => "ICMP",
+            IPPROTO_ICMPV6 => "ICMPv6",
+            _ => "Unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for FiveTuple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}->{}:{}/{}",
+            self.src_ip,
+            self.src_port,
+            self.dst_ip,
+            self.dst_port,
+            self.protocol_name()
+        )
+    }
+}
+
+/// Session information for reply routing
+///
+/// Stores the information needed to route reply packets back to the
+/// correct WireGuard peer.
+#[derive(Debug, Clone)]
+pub struct PeerSession {
+    /// Peer's WireGuard public key (Base64)
+    pub peer_public_key: String,
+    /// Peer's external endpoint (IP:port)
+    pub peer_endpoint: SocketAddr,
+    /// Outbound tag used for this session
+    pub outbound_tag: String,
+    /// Timestamp of last activity
+    pub last_seen: Instant,
+    /// Bytes sent in this session
+    pub bytes_sent: u64,
+    /// Bytes received in this session (replies)
+    pub bytes_received: u64,
+}
+
+impl PeerSession {
+    /// Create a new peer session
+    #[must_use]
+    pub fn new(peer_public_key: String, peer_endpoint: SocketAddr, outbound_tag: String) -> Self {
+        Self {
+            peer_public_key,
+            peer_endpoint,
+            outbound_tag,
+            last_seen: Instant::now(),
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    }
+
+    /// Update the last seen timestamp
+    pub fn touch(&mut self) {
+        self.last_seen = Instant::now();
+    }
+
+    /// Add bytes sent
+    pub fn add_bytes_sent(&mut self, bytes: u64) {
+        self.bytes_sent = self.bytes_sent.saturating_add(bytes);
+    }
+
+    /// Add bytes received
+    pub fn add_bytes_received(&mut self, bytes: u64) {
+        self.bytes_received = self.bytes_received.saturating_add(bytes);
+    }
+
+    /// Check if the session has expired
+    #[must_use]
+    pub fn is_expired(&self, ttl: Duration) -> bool {
+        self.last_seen.elapsed() >= ttl
+    }
+}
+
+/// Tracks active sessions for reply routing
+///
+/// Uses a concurrent hash map (DashMap) for thread-safe access
+/// from multiple async tasks.
+pub struct IngressSessionTracker {
+    /// Active sessions indexed by 5-tuple
+    sessions: DashMap<FiveTuple, PeerSession>,
+    /// Session time-to-live
+    session_ttl: Duration,
+}
+
+impl IngressSessionTracker {
+    /// Create a new session tracker
+    ///
+    /// # Arguments
+    ///
+    /// * `session_ttl` - How long to keep sessions alive without activity
+    #[must_use]
+    pub fn new(session_ttl: Duration) -> Self {
+        Self {
+            sessions: DashMap::new(),
+            session_ttl,
+        }
+    }
+
+    /// Register or update a session
+    ///
+    /// If a session already exists, updates the last_seen timestamp and bytes.
+    /// Otherwise, creates a new session entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 5-tuple key for the session
+    /// * `peer_public_key` - Peer's WireGuard public key
+    /// * `peer_endpoint` - Peer's external endpoint
+    /// * `outbound_tag` - Outbound tag used for routing
+    /// * `bytes` - Bytes being sent in this packet
+    pub fn register(
+        &self,
+        key: FiveTuple,
+        peer_public_key: String,
+        peer_endpoint: SocketAddr,
+        outbound_tag: String,
+        bytes: u64,
+    ) {
+        self.sessions
+            .entry(key)
+            .and_modify(|session| {
+                session.touch();
+                session.add_bytes_sent(bytes);
+            })
+            .or_insert_with(|| {
+                let mut session = PeerSession::new(peer_public_key, peer_endpoint, outbound_tag);
+                session.add_bytes_sent(bytes);
+                session
+            });
+    }
+
+    /// Look up a session for reply routing
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 5-tuple key (should be the reversed tuple for replies)
+    ///
+    /// # Returns
+    ///
+    /// The session if found, or None if not found or expired.
+    #[must_use]
+    pub fn get(&self, key: &FiveTuple) -> Option<PeerSession> {
+        self.sessions.get(key).and_then(|entry| {
+            let session = entry.value();
+            if session.is_expired(self.session_ttl) {
+                None
+            } else {
+                Some(session.clone())
+            }
+        })
+    }
+
+    /// Update bytes received for a session (for reply tracking)
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 5-tuple key (reversed for replies)
+    /// * `bytes` - Bytes received
+    pub fn update_received(&self, key: &FiveTuple, bytes: u64) {
+        if let Some(mut entry) = self.sessions.get_mut(key) {
+            entry.touch();
+            entry.add_bytes_received(bytes);
+        }
+    }
+
+    /// Clean up expired sessions
+    ///
+    /// Should be called periodically to remove stale sessions.
+    ///
+    /// # Returns
+    ///
+    /// Number of sessions removed.
+    pub fn cleanup(&self) -> usize {
+        let before = self.sessions.len();
+        self.sessions.retain(|_, session| !session.is_expired(self.session_ttl));
+        before.saturating_sub(self.sessions.len())
+    }
+
+    /// Get the number of active sessions
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Check if there are no sessions
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// Get session TTL
+    #[must_use]
+    pub fn session_ttl(&self) -> Duration {
+        self.session_ttl
+    }
+}
+
+impl Default for IngressSessionTracker {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300)) // 5 minute default TTL
+    }
+}
+
+/// Reply packet received from egress
+#[derive(Debug, Clone)]
+pub struct ReplyPacket {
+    /// Decrypted IP packet from egress
+    pub packet: Vec<u8>,
+    /// Tunnel tag that delivered the reply
+    pub tunnel_tag: String,
+}
+
+/// Reply path statistics
+#[derive(Debug, Default)]
+pub struct IngressReplyStats {
+    /// Packets received from egress reply handler
+    pub packets_received: AtomicU64,
+    /// Packets enqueued for reply routing
+    pub packets_enqueued: AtomicU64,
+    /// Packets dropped because the queue was full
+    pub queue_full: AtomicU64,
+    /// Packets dropped because reply router was not ready
+    pub router_unavailable: AtomicU64,
+    /// Packets parsed successfully and forwarded
+    pub packets_forwarded: AtomicU64,
+    /// Packets with parse errors
+    pub parse_errors: AtomicU64,
+    /// Packets with missing session mapping
+    pub session_misses: AtomicU64,
+    /// Packets rejected due to tunnel tag mismatch
+    pub tunnel_mismatch: AtomicU64,
+    /// Packets rejected by peer IP validation
+    pub peer_ip_rejected: AtomicU64,
+    /// Errors while sending replies
+    pub send_errors: AtomicU64,
+}
+
+impl IngressReplyStats {
+    /// Snapshot current reply statistics
+    #[must_use]
+    pub fn snapshot(&self) -> IngressReplyStatsSnapshot {
+        IngressReplyStatsSnapshot {
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            packets_enqueued: self.packets_enqueued.load(Ordering::Relaxed),
+            queue_full: self.queue_full.load(Ordering::Relaxed),
+            router_unavailable: self.router_unavailable.load(Ordering::Relaxed),
+            packets_forwarded: self.packets_forwarded.load(Ordering::Relaxed),
+            parse_errors: self.parse_errors.load(Ordering::Relaxed),
+            session_misses: self.session_misses.load(Ordering::Relaxed),
+            tunnel_mismatch: self.tunnel_mismatch.load(Ordering::Relaxed),
+            peer_ip_rejected: self.peer_ip_rejected.load(Ordering::Relaxed),
+            send_errors: self.send_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Snapshot of reply statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressReplyStatsSnapshot {
+    pub packets_received: u64,
+    pub packets_enqueued: u64,
+    pub queue_full: u64,
+    pub router_unavailable: u64,
+    pub packets_forwarded: u64,
+    pub parse_errors: u64,
+    pub session_misses: u64,
+    pub tunnel_mismatch: u64,
+    pub peer_ip_rejected: u64,
+    pub send_errors: u64,
+}
+
+/// Forwarding statistics
+///
+/// Thread-safe statistics for the forwarding loop.
+#[derive(Debug, Default)]
+pub struct ForwardingStats {
+    /// Total packets forwarded successfully
+    pub packets_forwarded: AtomicU64,
+    /// Total bytes forwarded
+    pub bytes_forwarded: AtomicU64,
+    /// UDP packets processed
+    pub udp_packets: AtomicU64,
+    /// TCP packets processed
+    pub tcp_packets: AtomicU64,
+    /// ICMP packets processed
+    pub icmp_packets: AtomicU64,
+    /// Packets dropped due to forward errors
+    pub forward_errors: AtomicU64,
+    /// Packets with unknown/unsupported protocol
+    pub unknown_protocol: AtomicU64,
+    /// Packets dropped due to block rule
+    pub blocked_packets: AtomicU64,
+    /// Parse errors (invalid IP headers, etc.)
+    pub parse_errors: AtomicU64,
+}
+
+impl ForwardingStats {
+    /// Create a snapshot of current statistics
+    #[must_use]
+    pub fn snapshot(&self) -> ForwardingStatsSnapshot {
+        ForwardingStatsSnapshot {
+            packets_forwarded: self.packets_forwarded.load(Ordering::Relaxed),
+            bytes_forwarded: self.bytes_forwarded.load(Ordering::Relaxed),
+            udp_packets: self.udp_packets.load(Ordering::Relaxed),
+            tcp_packets: self.tcp_packets.load(Ordering::Relaxed),
+            icmp_packets: self.icmp_packets.load(Ordering::Relaxed),
+            forward_errors: self.forward_errors.load(Ordering::Relaxed),
+            unknown_protocol: self.unknown_protocol.load(Ordering::Relaxed),
+            blocked_packets: self.blocked_packets.load(Ordering::Relaxed),
+            parse_errors: self.parse_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all statistics to zero
+    pub fn reset(&self) {
+        self.packets_forwarded.store(0, Ordering::Relaxed);
+        self.bytes_forwarded.store(0, Ordering::Relaxed);
+        self.udp_packets.store(0, Ordering::Relaxed);
+        self.tcp_packets.store(0, Ordering::Relaxed);
+        self.icmp_packets.store(0, Ordering::Relaxed);
+        self.forward_errors.store(0, Ordering::Relaxed);
+        self.unknown_protocol.store(0, Ordering::Relaxed);
+        self.blocked_packets.store(0, Ordering::Relaxed);
+        self.parse_errors.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Immutable snapshot of forwarding statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardingStatsSnapshot {
+    /// Total packets forwarded successfully
+    pub packets_forwarded: u64,
+    /// Total bytes forwarded
+    pub bytes_forwarded: u64,
+    /// UDP packets processed
+    pub udp_packets: u64,
+    /// TCP packets processed
+    pub tcp_packets: u64,
+    /// ICMP packets processed
+    pub icmp_packets: u64,
+    /// Packets dropped due to forward errors
+    pub forward_errors: u64,
+    /// Packets with unknown/unsupported protocol
+    pub unknown_protocol: u64,
+    /// Packets dropped due to block rule
+    pub blocked_packets: u64,
+    /// Parse errors
+    pub parse_errors: u64,
+}
+
+impl ForwardingStatsSnapshot {
+    /// Get total packets processed (including errors)
+    #[must_use]
+    pub fn total_packets(&self) -> u64 {
+        self.packets_forwarded
+            .saturating_add(self.forward_errors)
+            .saturating_add(self.unknown_protocol)
+            .saturating_add(self.blocked_packets)
+            .saturating_add(self.parse_errors)
+    }
+
+    /// Get success rate as a percentage
+    #[must_use]
+    pub fn success_rate(&self) -> f64 {
+        let total = self.total_packets();
+        if total == 0 {
+            100.0
+        } else {
+            (self.packets_forwarded as f64 / total as f64) * 100.0
+        }
+    }
+}
+
+/// Parsed IP packet information
+#[derive(Debug, Clone)]
+pub struct ParsedPacket {
+    /// Source IP address
+    pub src_ip: IpAddr,
+    /// Destination IP address
+    pub dst_ip: IpAddr,
+    /// IP protocol number
+    pub protocol: u8,
+    /// IP header length in bytes
+    pub ip_header_len: usize,
+    /// Source port (for TCP/UDP)
+    pub src_port: Option<u16>,
+    /// Destination port (for TCP/UDP)
+    pub dst_port: Option<u16>,
+    /// Total packet length
+    pub total_len: usize,
+}
+
+impl ParsedPacket {
+    /// Get the 5-tuple for this packet (if TCP or UDP)
+    #[must_use]
+    pub fn five_tuple(&self) -> Option<FiveTuple> {
+        match (self.src_port, self.dst_port) {
+            (Some(src_port), Some(dst_port)) => Some(FiveTuple::new(
+                self.src_ip,
+                src_port,
+                self.dst_ip,
+                dst_port,
+                self.protocol,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Get the destination socket address (for TCP/UDP)
+    #[must_use]
+    pub fn dst_addr(&self) -> Option<SocketAddr> {
+        self.dst_port.map(|port| SocketAddr::new(self.dst_ip, port))
+    }
+
+    /// Get the payload offset (start of transport layer payload)
+    #[must_use]
+    pub fn payload_offset(&self) -> usize {
+        let transport_header_len = match self.protocol {
+            IPPROTO_UDP => 8,
+            IPPROTO_TCP => 20, // Minimum TCP header; actual may be larger
+            _ => 0,
+        };
+        self.ip_header_len + transport_header_len
+    }
+}
+
+/// Parse an IP packet header
+///
+/// Extracts IP header information including source/destination addresses,
+/// protocol, and header length. Also parses transport layer ports for TCP/UDP.
+///
+/// # Arguments
+///
+/// * `packet` - Raw IP packet data
+///
+/// # Returns
+///
+/// Parsed packet information, or None if the packet is invalid.
+#[must_use]
+pub fn parse_ip_packet(packet: &[u8]) -> Option<ParsedPacket> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    match version {
+        4 => parse_ipv4_packet(packet),
+        6 => parse_ipv6_packet(packet),
+        _ => None,
+    }
+}
+
+/// Parse an IPv4 packet
+fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
+    // Minimum IPv4 header is 20 bytes
+    if packet.len() < 20 {
+        return None;
+    }
+
+    // IHL (Internet Header Length) is in 32-bit words
+    let ihl = (packet[0] & 0x0F) as usize * 4;
+    if packet.len() < ihl {
+        return None;
+    }
+
+    let protocol = packet[9];
+
+    // Extract source IP (bytes 12-15)
+    let src_ip = IpAddr::V4(Ipv4Addr::new(
+        packet[12],
+        packet[13],
+        packet[14],
+        packet[15],
+    ));
+
+    // Extract destination IP (bytes 16-19)
+    let dst_ip = IpAddr::V4(Ipv4Addr::new(
+        packet[16],
+        packet[17],
+        packet[18],
+        packet[19],
+    ));
+
+    // Parse transport layer ports
+    let (src_port, dst_port) = parse_transport_ports(packet, ihl, protocol);
+
+    Some(ParsedPacket {
+        src_ip,
+        dst_ip,
+        protocol,
+        ip_header_len: ihl,
+        src_port,
+        dst_port,
+        total_len: packet.len(),
+    })
+}
+
+/// Parse an IPv6 packet
+fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
+    // IPv6 header is 40 bytes
+    if packet.len() < 40 {
+        return None;
+    }
+
+    // Next Header (protocol) is at byte 6
+    let protocol = packet[6];
+
+    // Extract source IP (bytes 8-23)
+    let src_ip = IpAddr::V6(Ipv6Addr::from([
+        packet[8],
+        packet[9],
+        packet[10],
+        packet[11],
+        packet[12],
+        packet[13],
+        packet[14],
+        packet[15],
+        packet[16],
+        packet[17],
+        packet[18],
+        packet[19],
+        packet[20],
+        packet[21],
+        packet[22],
+        packet[23],
+    ]));
+
+    // Extract destination IP (bytes 24-39)
+    let dst_ip = IpAddr::V6(Ipv6Addr::from([
+        packet[24],
+        packet[25],
+        packet[26],
+        packet[27],
+        packet[28],
+        packet[29],
+        packet[30],
+        packet[31],
+        packet[32],
+        packet[33],
+        packet[34],
+        packet[35],
+        packet[36],
+        packet[37],
+        packet[38],
+        packet[39],
+    ]));
+
+    // Parse transport layer ports
+    let (src_port, dst_port) = parse_transport_ports(packet, 40, protocol);
+
+    Some(ParsedPacket {
+        src_ip,
+        dst_ip,
+        protocol,
+        ip_header_len: 40,
+        src_port,
+        dst_port,
+        total_len: packet.len(),
+    })
+}
+
+/// Parse transport layer (TCP/UDP) ports
+fn parse_transport_ports(packet: &[u8], ip_header_len: usize, protocol: u8) -> (Option<u16>, Option<u16>) {
+    match protocol {
+        IPPROTO_TCP | IPPROTO_UDP => {
+            // Both TCP and UDP have source port at offset 0-1 and dest port at 2-3
+            let start = ip_header_len;
+            if packet.len() >= start + 4 {
+                let src_port = u16::from_be_bytes([packet[start], packet[start + 1]]);
+                let dst_port = u16::from_be_bytes([packet[start + 2], packet[start + 3]]);
+                (Some(src_port), Some(dst_port))
+            } else {
+                (None, None)
+            }
+        }
+        _ => (None, None),
+    }
+}
+
+/// Main packet forwarding loop
+///
+/// Consumes `ProcessedPacket` from the channel and forwards to the appropriate outbound.
+///
+/// # Arguments
+///
+/// * `packet_rx` - Receiver for processed packets from ingress
+/// * `outbound_manager` - Manager for direct/SOCKS5 outbounds
+/// * `wg_egress_manager` - Manager for WireGuard egress tunnels
+/// * `tcp_manager` - TCP connection manager for stateful connection tracking
+/// * `session_tracker` - Session tracker for reply routing
+/// * `stats` - Statistics collector
+pub async fn run_forwarding_loop(
+    mut packet_rx: mpsc::Receiver<ProcessedPacket>,
+    outbound_manager: Arc<OutboundManager>,
+    wg_egress_manager: Arc<WgEgressManager>,
+    tcp_manager: Arc<TcpConnectionManager>,
+    session_tracker: Arc<IngressSessionTracker>,
+    stats: Arc<ForwardingStats>,
+) {
+    info!("Ingress forwarding loop started");
+
+    // Periodic cleanup interval
+    let cleanup_interval = Duration::from_secs(60);
+    let mut last_cleanup = Instant::now();
+
+    while let Some(processed) = packet_rx.recv().await {
+        let packet_len = processed.data.len();
+
+        // Parse IP header
+        let Some(parsed) = parse_ip_packet(&processed.data) else {
+            warn!("Failed to parse IP header from ProcessedPacket");
+            stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+
+        trace!(
+            "Forwarding packet: {} -> {}, protocol={}, outbound={}, dscp={:?}",
+            parsed.src_ip,
+            parsed.dst_ip,
+            parsed.protocol,
+            processed.routing.outbound,
+            processed.routing.dscp_mark
+        );
+
+        // Handle block outbound first
+        let outbound_tag = &processed.routing.outbound;
+        if outbound_tag == "block" || outbound_tag == "adblock" {
+            debug!(
+                "Blocking packet: {} -> {} (rule: {})",
+                parsed.src_ip, parsed.dst_ip, outbound_tag
+            );
+            stats.blocked_packets.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        // Process by protocol
+        match parsed.protocol {
+            IPPROTO_UDP => {
+                stats.udp_packets.fetch_add(1, Ordering::Relaxed);
+                forward_udp_packet(
+                    &processed,
+                    &parsed,
+                    &wg_egress_manager,
+                    &outbound_manager,
+                    &session_tracker,
+                    &stats,
+                )
+                .await;
+            }
+            IPPROTO_TCP => {
+                stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
+                // Parse TCP header for connection tracking
+                if let Some(tcp_details) = parse_tcp_details(&processed.data, parsed.ip_header_len) {
+                    forward_tcp_packet(
+                        &processed,
+                        &parsed,
+                        &tcp_details,
+                        &outbound_manager,
+                        &wg_egress_manager,
+                        &tcp_manager,
+                        &session_tracker,
+                        &stats,
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        "Failed to parse TCP header: {}:{} -> {}:{}",
+                        parsed.src_ip,
+                        parsed.src_port.unwrap_or(0),
+                        parsed.dst_ip,
+                        parsed.dst_port.unwrap_or(0)
+                    );
+                    stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            IPPROTO_ICMP | IPPROTO_ICMPV6 => {
+                stats.icmp_packets.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "ICMP packet: {} -> {}, outbound='{}' (forwarding not yet implemented)",
+                    parsed.src_ip, parsed.dst_ip, outbound_tag
+                );
+                // TODO: ICMP forwarding may be added later
+            }
+            _ => {
+                stats.unknown_protocol.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Unknown IP protocol {}: {} -> {}, dropped",
+                    parsed.protocol, parsed.src_ip, parsed.dst_ip
+                );
+                continue;
+            }
+        }
+
+        // Update forwarding stats for successfully processed packets
+        stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+        stats
+            .bytes_forwarded
+            .fetch_add(packet_len as u64, Ordering::Relaxed);
+
+        // Periodic session and TCP connection cleanup
+        if last_cleanup.elapsed() >= cleanup_interval {
+            let sessions_removed = session_tracker.cleanup();
+            let tcp_removed = tcp_manager.cleanup();
+            if sessions_removed > 0 || tcp_removed > 0 {
+                debug!(
+                    "Cleaned up {} expired sessions, {} TCP connections",
+                    sessions_removed, tcp_removed
+                );
+            }
+            last_cleanup = Instant::now();
+        }
+    }
+
+    info!("Ingress forwarding loop stopped (channel closed)");
+}
+
+/// Reply routing loop
+///
+/// Consumes decrypted reply packets and sends them back to the appropriate ingress peer.
+pub async fn run_reply_router_loop(
+    mut reply_rx: mpsc::Receiver<ReplyPacket>,
+    ingress_manager: Arc<WgIngressManager>,
+    session_tracker: Arc<IngressSessionTracker>,
+    stats: Arc<IngressReplyStats>,
+) {
+    info!("Ingress reply router started");
+
+    while let Some(reply) = reply_rx.recv().await {
+        let Some(parsed) = parse_ip_packet(&reply.packet) else {
+            stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+            warn!("Failed to parse reply IP header");
+            continue;
+        };
+
+        let (Some(src_port), Some(dst_port)) = (parsed.src_port, parsed.dst_port) else {
+            stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Reply packet missing ports: {} -> {} (protocol={})",
+                parsed.src_ip, parsed.dst_ip, parsed.protocol
+            );
+            continue;
+        };
+
+        let reply_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, parsed.protocol);
+        let lookup_key = reply_tuple.reverse();
+
+        let Some(session) = session_tracker.get(&lookup_key) else {
+            stats.session_misses.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "No session mapping for reply {} (tunnel={})",
+                reply_tuple, reply.tunnel_tag
+            );
+            continue;
+        };
+
+        if reply.tunnel_tag != session.outbound_tag {
+            stats.tunnel_mismatch.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Reply tunnel mismatch for {}: session={}, reply={}",
+                reply_tuple, session.outbound_tag, reply.tunnel_tag
+            );
+            continue;
+        }
+
+        if !ingress_manager.is_peer_ip_allowed(&session.peer_public_key, parsed.dst_ip) {
+            stats.peer_ip_rejected.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Reply dest IP not allowed for peer {}: {}",
+                session.peer_public_key, parsed.dst_ip
+            );
+            continue;
+        }
+
+        match ingress_manager
+            .send_to_peer(&session.peer_public_key, session.peer_endpoint, &reply.packet)
+            .await
+        {
+            Ok(()) => {
+                stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                session_tracker.update_received(&lookup_key, reply.packet.len() as u64);
+                trace!(
+                    "Forwarded reply {} via peer {}",
+                    reply_tuple,
+                    session.peer_public_key
+                );
+            }
+            Err(e) => {
+                stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "Failed to forward reply {} via peer {}: {}",
+                    reply_tuple,
+                    session.peer_public_key,
+                    e
+                );
+            }
+        }
+    }
+
+    info!("Ingress reply router stopped (channel closed)");
+}
+
+/// Forward a TCP packet through the appropriate outbound
+///
+/// Handles TCP connection state tracking and data forwarding:
+/// - SYN packets: Establish outbound connection
+/// - Data packets: Forward through established connection
+/// - FIN/RST packets: Mark connection as closing
+///
+/// # WireGuard Egress
+///
+/// For WireGuard egress tunnels (wg-, pia-, peer-), the full IP packet
+/// is forwarded through the tunnel. The tunnel handles encapsulation.
+///
+/// # Direct/SOCKS5
+///
+/// For direct or SOCKS5 outbounds, we establish a TCP connection on the
+/// first SYN packet and forward payload data on subsequent packets.
+/// The reply path (SYN-ACK, data from server) will be handled in Phase 4.
+async fn forward_tcp_packet(
+    processed: &ProcessedPacket,
+    parsed: &ParsedPacket,
+    tcp_details: &TcpDetails,
+    outbound_manager: &Arc<OutboundManager>,
+    wg_egress_manager: &Arc<WgEgressManager>,
+    tcp_manager: &Arc<TcpConnectionManager>,
+    session_tracker: &Arc<IngressSessionTracker>,
+    stats: &Arc<ForwardingStats>,
+) {
+    let outbound_tag = &processed.routing.outbound;
+
+    // Create 5-tuple for connection tracking
+    let five_tuple = FiveTuple::new(
+        parsed.src_ip,
+        tcp_details.src_port,
+        parsed.dst_ip,
+        tcp_details.dst_port,
+        IPPROTO_TCP,
+    );
+
+    // Check if this goes to a WireGuard egress (full IP packet forwarding)
+    let is_wg_egress = outbound_tag.starts_with("wg-")
+        || outbound_tag.starts_with("pia-")
+        || outbound_tag.starts_with("peer-")
+        || wg_egress_manager.has_tunnel(outbound_tag);
+
+    if is_wg_egress {
+        session_tracker.register(
+            five_tuple,
+            processed.peer_public_key.clone(),
+            processed.src_addr,
+            outbound_tag.clone(),
+            parsed.total_len as u64,
+        );
+
+        // Forward full IP packet to WireGuard egress
+        match wg_egress_manager
+            .send(outbound_tag, processed.data.clone())
+            .await
+        {
+            Ok(()) => {
+                debug!(
+                    "Forwarded TCP to WG egress '{}': {}:{} -> {}:{} (flags={}, {} bytes)",
+                    outbound_tag,
+                    parsed.src_ip,
+                    tcp_details.src_port,
+                    parsed.dst_ip,
+                    tcp_details.dst_port,
+                    tcp_details.flags_string(),
+                    parsed.total_len
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to forward TCP to WG egress '{}': {}",
+                    outbound_tag, e
+                );
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+
+    // Handle block outbound
+    if outbound_tag == "block" || outbound_tag == "adblock" {
+        debug!(
+            "Blocking TCP connection: {}:{} -> {}:{}",
+            parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+        );
+        stats.blocked_packets.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // For direct/SOCKS5, we need to establish and manage connections
+    // Register in session tracker for potential reply routing
+    session_tracker.register(
+        five_tuple,
+        processed.peer_public_key.clone(),
+        processed.src_addr,
+        outbound_tag.clone(),
+        parsed.total_len as u64,
+    );
+
+    if tcp_details.is_syn() {
+        // New connection - establish outbound
+        let dst_addr = SocketAddr::new(parsed.dst_ip, tcp_details.dst_port);
+
+        if let Some(outbound) = outbound_manager.get(outbound_tag) {
+            // Try to establish TCP connection
+            match outbound.connect(dst_addr, Duration::from_secs(10)).await {
+                Ok(conn) => {
+                    info!(
+                        "Established TCP connection via '{}': {}:{} -> {}:{}",
+                        outbound_tag,
+                        parsed.src_ip,
+                        tcp_details.src_port,
+                        parsed.dst_ip,
+                        tcp_details.dst_port
+                    );
+
+                    // Store connection for future packets
+                    let tracked = tcp_manager.get_or_create(
+                        five_tuple,
+                        processed.peer_public_key.clone(),
+                        processed.src_addr,
+                        outbound_tag.clone(),
+                    );
+
+                    {
+                        let mut conn_guard = tracked.write().await;
+                        conn_guard.state = TcpConnectionState::Established;
+                        conn_guard.outbound_stream = Some(conn.into_stream());
+                        conn_guard.client_seq = tcp_details.seq_num;
+                    }
+
+                    // Note: We've established the outbound connection
+                    // The reply path (SYN-ACK back to client) will be handled in Phase 4
+                    debug!(
+                        "TCP SYN processed, outbound connection established. Reply path pending Phase 4."
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to establish TCP connection via '{}' to {}: {}",
+                        outbound_tag, dst_addr, e
+                    );
+                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else {
+            warn!("Unknown outbound '{}' for TCP connection", outbound_tag);
+            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if tcp_details.is_fin() || tcp_details.is_rst() {
+        // Connection closing
+        if let Some(conn) = tcp_manager.get(&five_tuple) {
+            {
+                let mut conn_guard = conn.write().await;
+                conn_guard.state = TcpConnectionState::Closing;
+                conn_guard.touch();
+            }
+            debug!(
+                "TCP connection closing: {}:{} -> {}:{} (flags={})",
+                parsed.src_ip,
+                tcp_details.src_port,
+                parsed.dst_ip,
+                tcp_details.dst_port,
+                tcp_details.flags_string()
+            );
+
+            // Also forward FIN/RST to WireGuard egress if applicable
+            // (handled above for WG egress, here we just track state)
+        } else {
+            // FIN/RST for unknown connection - likely already cleaned up
+            debug!(
+                "TCP FIN/RST for untracked connection: {}:{} -> {}:{}",
+                parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+            );
+        }
+    } else if tcp_details.has_payload(processed.data.len()) {
+        // Data packet - forward through established connection
+        if let Some(conn) = tcp_manager.get(&five_tuple) {
+            let payload_len = tcp_details.payload_len(processed.data.len());
+            let payload = &processed.data[tcp_details.payload_offset..];
+
+            let mut conn_guard = conn.write().await;
+
+            if conn_guard.state != TcpConnectionState::Established {
+                debug!(
+                    "TCP data for connection in {} state: {}:{} -> {}:{}",
+                    conn_guard.state,
+                    parsed.src_ip,
+                    tcp_details.src_port,
+                    parsed.dst_ip,
+                    tcp_details.dst_port
+                );
+                // Don't forward data if connection not established
+                return;
+            }
+
+            if let Some(ref mut stream) = conn_guard.outbound_stream {
+                match stream.write_all(payload).await {
+                    Ok(()) => {
+                        conn_guard.add_bytes_sent(payload_len as u64);
+                        conn_guard.touch();
+                        debug!(
+                            "Forwarded {} bytes TCP payload via '{}': {}:{} -> {}:{}",
+                            payload_len,
+                            conn_guard.outbound_tag,
+                            parsed.src_ip,
+                            tcp_details.src_port,
+                            parsed.dst_ip,
+                            tcp_details.dst_port
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to write TCP payload: {} (connection may be closed)",
+                            e
+                        );
+                        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        // Mark connection as closing on write error
+                        conn_guard.state = TcpConnectionState::Closing;
+                    }
+                }
+            } else {
+                debug!(
+                    "TCP data for connection without stream - may be establishing: {}:{} -> {}:{}",
+                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                );
+            }
+        } else {
+            // Data for unknown connection (maybe missed the SYN)
+            debug!(
+                "TCP data for untracked connection: {}:{} -> {}:{} ({} bytes payload)",
+                parsed.src_ip,
+                tcp_details.src_port,
+                parsed.dst_ip,
+                tcp_details.dst_port,
+                tcp_details.payload_len(processed.data.len())
+            );
+        }
+    } else {
+        // ACK without data - update connection state
+        if let Some(conn) = tcp_manager.get(&five_tuple) {
+            let mut conn_guard = conn.write().await;
+            conn_guard.touch();
+            trace!(
+                "TCP ACK (no data): {}:{} -> {}:{}, state={}",
+                parsed.src_ip,
+                tcp_details.src_port,
+                parsed.dst_ip,
+                tcp_details.dst_port,
+                conn_guard.state
+            );
+        }
+    }
+}
+
+/// Forward a UDP packet to the appropriate outbound
+async fn forward_udp_packet(
+    processed: &ProcessedPacket,
+    parsed: &ParsedPacket,
+    wg_egress_manager: &Arc<WgEgressManager>,
+    outbound_manager: &Arc<OutboundManager>,
+    session_tracker: &Arc<IngressSessionTracker>,
+    stats: &Arc<ForwardingStats>,
+) {
+    let outbound_tag = &processed.routing.outbound;
+
+    // Get ports
+    let Some(src_port) = parsed.src_port else {
+        warn!("UDP packet missing source port");
+        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let Some(dst_port) = parsed.dst_port else {
+        warn!("UDP packet missing destination port");
+        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    // Register session for reply routing
+    let five_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP);
+    session_tracker.register(
+        five_tuple,
+        processed.peer_public_key.clone(),
+        processed.src_addr,
+        outbound_tag.clone(),
+        parsed.total_len as u64,
+    );
+
+    // Determine if this is a WireGuard egress tunnel
+    // WireGuard tunnels are tagged with prefixes like "wg-", "pia-", etc.
+    let is_wg_egress = outbound_tag.starts_with("wg-")
+        || outbound_tag.starts_with("pia-")
+        || outbound_tag.starts_with("peer-")
+        || wg_egress_manager.has_tunnel(outbound_tag);
+
+    if is_wg_egress {
+        // Forward through WireGuard egress tunnel
+        // For WireGuard tunnels, we send the entire IP packet (it gets encapsulated)
+        match wg_egress_manager.send(outbound_tag, processed.data.clone()).await {
+            Ok(()) => {
+                debug!(
+                    "Forwarded UDP to WG egress '{}': {} -> {}:{} ({} bytes)",
+                    outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to forward UDP to WG egress '{}': {} -> {}:{}, error: {}",
+                    outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, e
+                );
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else if outbound_tag == "direct" || outbound_tag.starts_with("direct-") {
+        // Direct outbound - send UDP directly to destination
+        let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
+
+        // Extract UDP payload (skip IP header + UDP header)
+        let payload_offset = parsed.ip_header_len + 8; // IP header + 8 bytes UDP header
+        if processed.data.len() <= payload_offset {
+            warn!("UDP packet too short for payload: {} bytes, need > {}", processed.data.len(), payload_offset);
+            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let udp_payload = &processed.data[payload_offset..];
+
+        if let Some(outbound) = outbound_manager.get(outbound_tag) {
+            // Check if outbound supports UDP
+            if !outbound.supports_udp() {
+                warn!("Outbound '{}' does not support UDP", outbound_tag);
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            // Connect and send
+            match outbound.connect_udp(dst_addr, Duration::from_secs(5)).await {
+                Ok(handle) => {
+                    match handle.send(udp_payload).await {
+                        Ok(bytes_sent) => {
+                            debug!(
+                                "Forwarded UDP via direct '{}': {} -> {}:{} ({} bytes)",
+                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, bytes_sent
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to send UDP via direct '{}': {}", outbound_tag, e);
+                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect UDP via direct '{}' to {}: {}", outbound_tag, dst_addr, e);
+                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else {
+            // Fallback to default direct if tag not found in manager
+            // Create a raw UDP socket and send directly
+            match create_direct_udp_socket(dst_addr).await {
+                Ok(socket) => {
+                    match socket.send(udp_payload).await {
+                        Ok(bytes_sent) => {
+                            debug!(
+                                "Forwarded UDP direct (fallback): {} -> {}:{} ({} bytes)",
+                                parsed.src_ip, parsed.dst_ip, dst_port, bytes_sent
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to send UDP direct (fallback): {}", e);
+                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to create UDP socket for direct forwarding: {}", e);
+                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    } else if outbound_tag == "block" || outbound_tag == "adblock" {
+        // Block outbound - silently drop
+        // (Note: This case is also handled in the main loop, but included here for completeness)
+        debug!("Dropping UDP packet (blocked): {} -> {}", parsed.src_ip, parsed.dst_ip);
+        stats.blocked_packets.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Try to get SOCKS5 or other outbound from manager
+        if let Some(outbound) = outbound_manager.get(outbound_tag) {
+            let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
+
+            // Check if outbound supports UDP
+            if !outbound.supports_udp() {
+                warn!("Outbound '{}' does not support UDP, dropping packet", outbound_tag);
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            // Extract UDP payload
+            let payload_offset = parsed.ip_header_len + 8;
+            if processed.data.len() <= payload_offset {
+                warn!("UDP packet too short for payload");
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let udp_payload = &processed.data[payload_offset..];
+
+            // Connect via the outbound (SOCKS5, etc.) and send
+            match outbound.connect_udp(dst_addr, Duration::from_secs(10)).await {
+                Ok(handle) => {
+                    match handle.send(udp_payload).await {
+                        Ok(bytes_sent) => {
+                            debug!(
+                                "Forwarded UDP via '{}': {} -> {}:{} ({} bytes)",
+                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, bytes_sent
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to send UDP via '{}': {}", outbound_tag, e);
+                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect UDP via '{}' to {}: {}", outbound_tag, dst_addr, e);
+                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else {
+            warn!("Unknown outbound '{}', dropping UDP packet: {} -> {}:{}",
+                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port);
+            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Create a direct UDP socket connected to the destination
+///
+/// Used as a fallback when `OutboundManager` doesn't have the specified tag.
+/// The socket is bound to an ephemeral port and connected to the destination.
+///
+/// # Arguments
+///
+/// * `dst_addr` - Destination address to connect to
+///
+/// # Returns
+///
+/// A connected `UdpSocket` on success, or an I/O error on failure.
+async fn create_direct_udp_socket(dst_addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let bind_addr = if dst_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(dst_addr).await?;
+    Ok(socket)
+}
+
+/// Spawn the forwarding loop as a tokio task
+///
+/// Returns a `JoinHandle` that can be used to wait for the task to complete
+/// or abort it.
+///
+/// # Arguments
+///
+/// * `packet_rx` - Receiver for processed packets from ingress
+/// * `outbound_manager` - Manager for direct/SOCKS5 outbounds
+/// * `wg_egress_manager` - Manager for WireGuard egress tunnels
+/// * `tcp_manager` - TCP connection manager for stateful connection tracking
+/// * `session_tracker` - Session tracker for reply routing
+/// * `stats` - Statistics collector
+///
+/// # Returns
+///
+/// A `JoinHandle` for the spawned task.
+pub fn spawn_forwarding_task(
+    packet_rx: mpsc::Receiver<ProcessedPacket>,
+    outbound_manager: Arc<OutboundManager>,
+    wg_egress_manager: Arc<WgEgressManager>,
+    tcp_manager: Arc<TcpConnectionManager>,
+    session_tracker: Arc<IngressSessionTracker>,
+    stats: Arc<ForwardingStats>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_forwarding_loop(
+        packet_rx,
+        outbound_manager,
+        wg_egress_manager,
+        tcp_manager,
+        session_tracker,
+        stats,
+    ))
+}
+
+/// Spawn the reply router loop as a tokio task
+pub fn spawn_reply_router(
+    reply_rx: mpsc::Receiver<ReplyPacket>,
+    ingress_manager: Arc<WgIngressManager>,
+    session_tracker: Arc<IngressSessionTracker>,
+    stats: Arc<IngressReplyStats>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_reply_router_loop(
+        reply_rx,
+        ingress_manager,
+        session_tracker,
+        stats,
+    ))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // FiveTuple Tests
+    // ========================================================================
+
+    #[test]
+    fn test_five_tuple_new() {
+        let tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        assert_eq!(tuple.src_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(tuple.src_port, 1234);
+        assert_eq!(tuple.dst_ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(tuple.dst_port, 53);
+        assert_eq!(tuple.protocol, IPPROTO_UDP);
+    }
+
+    #[test]
+    fn test_five_tuple_reverse() {
+        let tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        let reversed = tuple.reverse();
+
+        assert_eq!(reversed.src_ip, tuple.dst_ip);
+        assert_eq!(reversed.src_port, tuple.dst_port);
+        assert_eq!(reversed.dst_ip, tuple.src_ip);
+        assert_eq!(reversed.dst_port, tuple.src_port);
+        assert_eq!(reversed.protocol, tuple.protocol);
+    }
+
+    #[test]
+    fn test_five_tuple_reverse_is_self_inverse() {
+        let tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+            45678,
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            443,
+            IPPROTO_TCP,
+        );
+
+        assert_eq!(tuple.reverse().reverse(), tuple);
+    }
+
+    #[test]
+    fn test_five_tuple_is_tcp() {
+        let tcp = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1234,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            80,
+            IPPROTO_TCP,
+        );
+        let udp = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1234,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            53,
+            IPPROTO_UDP,
+        );
+
+        assert!(tcp.is_tcp());
+        assert!(!tcp.is_udp());
+        assert!(udp.is_udp());
+        assert!(!udp.is_tcp());
+    }
+
+    #[test]
+    fn test_five_tuple_protocol_name() {
+        assert_eq!(
+            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IPPROTO_TCP)
+                .protocol_name(),
+            "TCP"
+        );
+        assert_eq!(
+            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IPPROTO_UDP)
+                .protocol_name(),
+            "UDP"
+        );
+        assert_eq!(
+            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IPPROTO_ICMP)
+                .protocol_name(),
+            "ICMP"
+        );
+        assert_eq!(
+            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 99)
+                .protocol_name(),
+            "Unknown"
+        );
+    }
+
+    #[test]
+    fn test_five_tuple_display() {
+        let tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        assert_eq!(tuple.to_string(), "10.0.0.1:1234->8.8.8.8:53/UDP");
+    }
+
+    #[test]
+    fn test_five_tuple_hash_eq() {
+        let t1 = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+        let t2 = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+        let t3 = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        assert_eq!(t1, t2);
+        assert_ne!(t1, t3);
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        t1.hash(&mut h1);
+        t2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    // ========================================================================
+    // PeerSession Tests
+    // ========================================================================
+
+    #[test]
+    fn test_peer_session_new() {
+        let session = PeerSession::new(
+            "test_key".to_string(),
+            "192.168.1.100:51820".parse().unwrap(),
+            "pia-us-west".to_string(),
+        );
+
+        assert_eq!(session.peer_public_key, "test_key");
+        assert_eq!(session.outbound_tag, "pia-us-west");
+        assert_eq!(session.bytes_sent, 0);
+        assert_eq!(session.bytes_received, 0);
+    }
+
+    #[test]
+    fn test_peer_session_bytes_tracking() {
+        let mut session = PeerSession::new(
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "direct".to_string(),
+        );
+
+        session.add_bytes_sent(100);
+        session.add_bytes_sent(50);
+        session.add_bytes_received(200);
+
+        assert_eq!(session.bytes_sent, 150);
+        assert_eq!(session.bytes_received, 200);
+    }
+
+    #[test]
+    fn test_peer_session_expiry() {
+        let session = PeerSession::new(
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "direct".to_string(),
+        );
+
+        // Should not be expired immediately
+        assert!(!session.is_expired(Duration::from_secs(1)));
+
+        // Should be expired with 0 TTL
+        assert!(session.is_expired(Duration::ZERO));
+    }
+
+    // ========================================================================
+    // IngressSessionTracker Tests
+    // ========================================================================
+
+    #[test]
+    fn test_session_tracker_new() {
+        let tracker = IngressSessionTracker::new(Duration::from_secs(300));
+
+        assert_eq!(tracker.len(), 0);
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.session_ttl(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_session_tracker_default() {
+        let tracker = IngressSessionTracker::default();
+        assert_eq!(tracker.session_ttl(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_session_tracker_register_get() {
+        let tracker = IngressSessionTracker::new(Duration::from_secs(300));
+
+        let key = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        tracker.register(
+            key,
+            "test_peer_key".to_string(),
+            "192.168.1.100:51820".parse().unwrap(),
+            "pia-us-west".to_string(),
+            100,
+        );
+
+        assert_eq!(tracker.len(), 1);
+
+        let session = tracker.get(&key);
+        assert!(session.is_some());
+        let session = session.unwrap();
+        assert_eq!(session.peer_public_key, "test_peer_key");
+        assert_eq!(session.outbound_tag, "pia-us-west");
+        assert_eq!(session.bytes_sent, 100);
+    }
+
+    #[test]
+    fn test_session_tracker_update_existing() {
+        let tracker = IngressSessionTracker::new(Duration::from_secs(300));
+
+        let key = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        tracker.register(
+            key,
+            "key1".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "out1".to_string(),
+            100,
+        );
+
+        // Register again with same key - should update bytes
+        tracker.register(
+            key,
+            "key2".to_string(), // This won't change existing entry
+            "127.0.0.1:5678".parse().unwrap(),
+            "out2".to_string(),
+            50,
+        );
+
+        assert_eq!(tracker.len(), 1);
+        let session = tracker.get(&key).unwrap();
+        assert_eq!(session.bytes_sent, 150); // Accumulated
+        assert_eq!(session.peer_public_key, "key1"); // Original value preserved
+    }
+
+    #[test]
+    fn test_session_tracker_update_received() {
+        let tracker = IngressSessionTracker::new(Duration::from_secs(300));
+
+        let key = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        tracker.register(
+            key,
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "out".to_string(),
+            100,
+        );
+
+        tracker.update_received(&key, 200);
+
+        let session = tracker.get(&key).unwrap();
+        assert_eq!(session.bytes_received, 200);
+    }
+
+    #[test]
+    fn test_session_tracker_get_nonexistent() {
+        let tracker = IngressSessionTracker::new(Duration::from_secs(300));
+
+        let key = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        assert!(tracker.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_session_tracker_cleanup() {
+        let tracker = IngressSessionTracker::new(Duration::ZERO); // Immediate expiry
+
+        let key = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+            IPPROTO_UDP,
+        );
+
+        tracker.register(
+            key,
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "out".to_string(),
+            100,
+        );
+
+        // Session should be expired immediately
+        let removed = tracker.cleanup();
+        assert_eq!(removed, 1);
+        assert!(tracker.is_empty());
+    }
+
+    // ========================================================================
+    // ForwardingStats Tests
+    // ========================================================================
+
+    #[test]
+    fn test_forwarding_stats_default() {
+        let stats = ForwardingStats::default();
+        let snapshot = stats.snapshot();
+
+        assert_eq!(snapshot.packets_forwarded, 0);
+        assert_eq!(snapshot.bytes_forwarded, 0);
+        assert_eq!(snapshot.forward_errors, 0);
+    }
+
+    #[test]
+    fn test_forwarding_stats_atomic_updates() {
+        let stats = ForwardingStats::default();
+
+        stats.packets_forwarded.fetch_add(10, Ordering::Relaxed);
+        stats.bytes_forwarded.fetch_add(1000, Ordering::Relaxed);
+        stats.udp_packets.fetch_add(5, Ordering::Relaxed);
+        stats.tcp_packets.fetch_add(3, Ordering::Relaxed);
+        stats.forward_errors.fetch_add(2, Ordering::Relaxed);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.packets_forwarded, 10);
+        assert_eq!(snapshot.bytes_forwarded, 1000);
+        assert_eq!(snapshot.udp_packets, 5);
+        assert_eq!(snapshot.tcp_packets, 3);
+        assert_eq!(snapshot.forward_errors, 2);
+    }
+
+    #[test]
+    fn test_forwarding_stats_reset() {
+        let stats = ForwardingStats::default();
+
+        stats.packets_forwarded.fetch_add(100, Ordering::Relaxed);
+        stats.bytes_forwarded.fetch_add(10000, Ordering::Relaxed);
+
+        stats.reset();
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.packets_forwarded, 0);
+        assert_eq!(snapshot.bytes_forwarded, 0);
+    }
+
+    #[test]
+    fn test_forwarding_stats_snapshot_total() {
+        let stats = ForwardingStats::default();
+
+        stats.packets_forwarded.store(100, Ordering::Relaxed);
+        stats.forward_errors.store(5, Ordering::Relaxed);
+        stats.unknown_protocol.store(2, Ordering::Relaxed);
+        stats.blocked_packets.store(10, Ordering::Relaxed);
+        stats.parse_errors.store(3, Ordering::Relaxed);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.total_packets(), 120);
+    }
+
+    #[test]
+    fn test_forwarding_stats_snapshot_success_rate() {
+        let stats = ForwardingStats::default();
+
+        stats.packets_forwarded.store(90, Ordering::Relaxed);
+        stats.forward_errors.store(10, Ordering::Relaxed);
+
+        let snapshot = stats.snapshot();
+        assert!((snapshot.success_rate() - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_forwarding_stats_snapshot_success_rate_zero() {
+        let stats = ForwardingStats::default();
+        let snapshot = stats.snapshot();
+        assert!((snapshot.success_rate() - 100.0).abs() < 0.001);
+    }
+
+    // ========================================================================
+    // IP Packet Parsing Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_ipv4_packet() {
+        // Minimal IPv4 packet (20 bytes header) + UDP header (8 bytes)
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45; // IPv4, IHL=5 (20 bytes)
+        packet[9] = IPPROTO_UDP; // Protocol
+        packet[12..16].copy_from_slice(&[10, 0, 0, 1]); // Source: 10.0.0.1
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]); // Dest: 8.8.8.8
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes()); // Src port
+        packet[22..24].copy_from_slice(&53u16.to_be_bytes()); // Dst port
+
+        let parsed = parse_ip_packet(&packet);
+        assert!(parsed.is_some());
+
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.src_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(parsed.dst_ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(parsed.protocol, IPPROTO_UDP);
+        assert_eq!(parsed.ip_header_len, 20);
+        assert_eq!(parsed.src_port, Some(1234));
+        assert_eq!(parsed.dst_port, Some(53));
+    }
+
+    #[test]
+    fn test_parse_ipv4_with_options() {
+        // IPv4 with options (IHL=6 = 24 bytes)
+        let mut packet = vec![0u8; 32];
+        packet[0] = 0x46; // IPv4, IHL=6 (24 bytes)
+        packet[9] = IPPROTO_TCP;
+        packet[12..16].copy_from_slice(&[192, 168, 1, 1]);
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        // Options at 20-23
+        // TCP header at 24
+        packet[24..26].copy_from_slice(&80u16.to_be_bytes()); // Src port
+        packet[26..28].copy_from_slice(&443u16.to_be_bytes()); // Dst port
+
+        let parsed = parse_ip_packet(&packet).unwrap();
+        assert_eq!(parsed.ip_header_len, 24);
+        assert_eq!(parsed.src_port, Some(80));
+        assert_eq!(parsed.dst_port, Some(443));
+    }
+
+    #[test]
+    fn test_parse_ipv6_packet() {
+        // IPv6 packet (40 bytes header) + UDP header
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60; // IPv6
+        packet[6] = IPPROTO_UDP; // Next Header
+        // Source IPv6 at bytes 8-23
+        packet[8..24].copy_from_slice(&[
+            0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
+        ]);
+        // Dest IPv6 at bytes 24-39
+        packet[24..40].copy_from_slice(&[
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x88, 0x88,
+        ]);
+        // UDP header at 40
+        packet[40..42].copy_from_slice(&5678u16.to_be_bytes());
+        packet[42..44].copy_from_slice(&53u16.to_be_bytes());
+
+        let parsed = parse_ip_packet(&packet).unwrap();
+        assert_eq!(parsed.src_ip, "fd00::2".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            parsed.dst_ip,
+            "2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(parsed.protocol, IPPROTO_UDP);
+        assert_eq!(parsed.ip_header_len, 40);
+        assert_eq!(parsed.src_port, Some(5678));
+        assert_eq!(parsed.dst_port, Some(53));
+    }
+
+    #[test]
+    fn test_parse_empty_packet() {
+        assert!(parse_ip_packet(&[]).is_none());
+    }
+
+    #[test]
+    fn test_parse_packet_too_short() {
+        // IPv4 header needs at least 20 bytes
+        let packet = vec![0x45, 0x00, 0x00, 0x14]; // Only 4 bytes
+        assert!(parse_ip_packet(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_invalid_version() {
+        // Version 7 (invalid)
+        let mut packet = vec![0x70, 0x00];
+        packet.extend_from_slice(&[0x00; 18]); // Pad to 20 bytes
+        assert!(parse_ip_packet(&packet).is_none());
+    }
+
+    #[test]
+    fn test_parse_icmp_packet() {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[9] = IPPROTO_ICMP;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+
+        let parsed = parse_ip_packet(&packet).unwrap();
+        assert_eq!(parsed.protocol, IPPROTO_ICMP);
+        assert!(parsed.src_port.is_none()); // ICMP has no ports
+        assert!(parsed.dst_port.is_none());
+    }
+
+    // ========================================================================
+    // ParsedPacket Tests
+    // ========================================================================
+
+    #[test]
+    fn test_parsed_packet_five_tuple() {
+        let parsed = ParsedPacket {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            protocol: IPPROTO_UDP,
+            ip_header_len: 20,
+            src_port: Some(1234),
+            dst_port: Some(53),
+            total_len: 100,
+        };
+
+        let tuple = parsed.five_tuple().unwrap();
+        assert_eq!(tuple.src_port, 1234);
+        assert_eq!(tuple.dst_port, 53);
+    }
+
+    #[test]
+    fn test_parsed_packet_five_tuple_no_ports() {
+        let parsed = ParsedPacket {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            protocol: IPPROTO_ICMP,
+            ip_header_len: 20,
+            src_port: None,
+            dst_port: None,
+            total_len: 64,
+        };
+
+        assert!(parsed.five_tuple().is_none());
+    }
+
+    #[test]
+    fn test_parsed_packet_dst_addr() {
+        let parsed = ParsedPacket {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            protocol: IPPROTO_UDP,
+            ip_header_len: 20,
+            src_port: Some(1234),
+            dst_port: Some(53),
+            total_len: 100,
+        };
+
+        let addr = parsed.dst_addr().unwrap();
+        assert_eq!(addr, "8.8.8.8:53".parse().unwrap());
+    }
+
+    #[test]
+    fn test_parsed_packet_payload_offset() {
+        let udp_parsed = ParsedPacket {
+            src_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            dst_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            protocol: IPPROTO_UDP,
+            ip_header_len: 20,
+            src_port: Some(1234),
+            dst_port: Some(53),
+            total_len: 100,
+        };
+
+        let tcp_parsed = ParsedPacket {
+            src_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            dst_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            protocol: IPPROTO_TCP,
+            ip_header_len: 20,
+            src_port: Some(1234),
+            dst_port: Some(80),
+            total_len: 100,
+        };
+
+        assert_eq!(udp_parsed.payload_offset(), 28); // 20 + 8
+        assert_eq!(tcp_parsed.payload_offset(), 40); // 20 + 20 (minimum TCP header)
+    }
+
+    // ========================================================================
+    // UDP Forwarding Tests (Phase 2)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_direct_udp_socket_ipv4() {
+        // Create a UDP server to verify we can connect
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Create a direct socket to the server
+        let result = create_direct_udp_socket(server_addr).await;
+        assert!(result.is_ok(), "Expected socket creation to succeed");
+
+        let socket = result.unwrap();
+        // Verify we can send data
+        let sent = socket.send(b"test").await.unwrap();
+        assert_eq!(sent, 4);
+
+        // Receive on server
+        let mut buf = [0u8; 64];
+        let (n, _addr) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"test");
+    }
+
+    #[tokio::test]
+    async fn test_create_direct_udp_socket_ipv6() {
+        // Create an IPv6 UDP server - skip test if IPv6 not available
+        let server = match tokio::net::UdpSocket::bind("[::1]:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Skipping IPv6 test - IPv6 bind failed: {}", e);
+                return;
+            }
+        };
+        let server_addr = server.local_addr().unwrap();
+
+        // Create a direct socket to the server - skip if IPv6 connectivity fails
+        let result = create_direct_udp_socket(server_addr).await;
+        let socket = match result {
+            Ok(s) => s,
+            Err(e) => {
+                // IPv6 connectivity may not be available even if bind works
+                eprintln!("Skipping IPv6 test - IPv6 connect failed: {}", e);
+                return;
+            }
+        };
+
+        let sent = socket.send(b"ipv6").await.unwrap();
+        assert_eq!(sent, 4);
+
+        // Receive on server
+        let mut buf = [0u8; 64];
+        let (n, _addr) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ipv6");
+    }
+
+    /// Helper to build a fake UDP packet with IP + UDP headers
+    fn build_udp_packet(
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = 8 + payload.len();
+        let total_len = 20 + udp_len;
+
+        let mut packet = vec![0u8; total_len];
+
+        // IPv4 header (20 bytes minimum)
+        packet[0] = 0x45; // Version 4, IHL 5
+        packet[1] = 0x00; // DSCP/ECN
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes()); // Total length
+        packet[4..6].copy_from_slice(&[0x00, 0x00]); // Identification
+        packet[6..8].copy_from_slice(&[0x00, 0x00]); // Flags + Fragment offset
+        packet[8] = 64; // TTL
+        packet[9] = IPPROTO_UDP; // Protocol
+        // Checksum left as 0
+        packet[12..16].copy_from_slice(&src_ip.octets()); // Source IP
+        packet[16..20].copy_from_slice(&dst_ip.octets()); // Dest IP
+
+        // UDP header (8 bytes)
+        packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        // UDP checksum left as 0
+
+        // Payload
+        packet[28..].copy_from_slice(payload);
+
+        packet
+    }
+
+    #[tokio::test]
+    async fn test_udp_payload_extraction() {
+        // Build a UDP packet with known payload
+        let payload = b"Hello, World!";
+        let packet = build_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+            payload,
+        );
+
+        // Parse it
+        let parsed = parse_ip_packet(&packet).unwrap();
+        assert_eq!(parsed.ip_header_len, 20);
+        assert_eq!(parsed.src_port, Some(12345));
+        assert_eq!(parsed.dst_port, Some(53));
+
+        // Verify payload offset calculation
+        let payload_offset = parsed.ip_header_len + 8; // IP header + UDP header
+        assert_eq!(payload_offset, 28);
+        assert_eq!(&packet[payload_offset..], payload);
+    }
+
+    #[tokio::test]
+    async fn test_direct_udp_forwarding_with_outbound_manager() {
+        use crate::outbound::{DirectOutbound, OutboundManager};
+
+        // Create a UDP echo server
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Create outbound manager with a direct outbound
+        let manager = OutboundManager::new();
+        manager.add(Box::new(DirectOutbound::simple("direct")));
+
+        // Get the direct outbound
+        let outbound = manager.get("direct").unwrap();
+        assert!(outbound.supports_udp());
+
+        // Connect UDP
+        let handle = outbound.connect_udp(server_addr, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(handle.dest_addr(), server_addr);
+
+        // Send via handle
+        let test_data = b"direct test";
+        let sent = handle.send(test_data).await.unwrap();
+        assert_eq!(sent, test_data.len());
+
+        // Verify server received
+        let mut buf = [0u8; 64];
+        let (n, client_addr) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], test_data);
+
+        // Send reply and verify reception
+        server.send_to(b"reply", client_addr).await.unwrap();
+        let n = handle.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"reply");
+    }
+
+    #[tokio::test]
+    async fn test_direct_udp_forwarding_fallback() {
+        use crate::outbound::OutboundManager;
+
+        // Create a UDP server
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Create an empty outbound manager (no "direct" outbound registered)
+        let manager = OutboundManager::new();
+
+        // The "direct" tag is not in the manager
+        assert!(manager.get("direct").is_none());
+
+        // Fallback should still work using create_direct_udp_socket
+        let socket = create_direct_udp_socket(server_addr).await.unwrap();
+        let sent = socket.send(b"fallback test").await.unwrap();
+        assert_eq!(sent, 13);
+
+        // Verify server received
+        let mut buf = [0u8; 64];
+        let (n, _addr) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"fallback test");
+    }
+
+    #[tokio::test]
+    async fn test_block_outbound_blocks_udp() {
+        use crate::error::UdpError;
+        use crate::outbound::{BlockOutbound, OutboundManager};
+
+        let manager = OutboundManager::new();
+        manager.add(Box::new(BlockOutbound::new("block")));
+
+        let outbound = manager.get("block").unwrap();
+
+        // Block outbound "supports" UDP - it handles UDP by blocking it
+        // This allows routing to direct UDP packets to block outbounds
+        assert!(outbound.supports_udp());
+
+        // Attempting to connect UDP should return a Blocked error
+        let addr: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let result = outbound.connect_udp(addr, Duration::from_secs(1)).await;
+        assert!(result.is_err());
+
+        // Verify it's specifically a Blocked error
+        match result {
+            Err(UdpError::Blocked { tag, addr: blocked_addr }) => {
+                assert_eq!(tag, "block");
+                assert_eq!(blocked_addr, addr);
+            }
+            other => panic!("Expected UdpError::Blocked, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_outbound_drops_packet() {
+        use crate::outbound::OutboundManager;
+
+        // Create an empty manager
+        let manager = OutboundManager::new();
+
+        // Unknown tag should return None
+        assert!(manager.get("unknown-tag").is_none());
+    }
+
+    #[test]
+    fn test_forwarding_stats_forward_errors() {
+        let stats = ForwardingStats::default();
+
+        stats.forward_errors.fetch_add(5, Ordering::Relaxed);
+        stats.blocked_packets.fetch_add(3, Ordering::Relaxed);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.forward_errors, 5);
+        assert_eq!(snapshot.blocked_packets, 3);
+    }
+
+    // ========================================================================
+    // TCP Connection State Tests (Phase 3)
+    // ========================================================================
+
+    #[test]
+    fn test_tcp_connection_state_display() {
+        assert_eq!(TcpConnectionState::SynReceived.to_string(), "SYN_RECEIVED");
+        assert_eq!(TcpConnectionState::Established.to_string(), "ESTABLISHED");
+        assert_eq!(TcpConnectionState::Closing.to_string(), "CLOSING");
+        assert_eq!(TcpConnectionState::Closed.to_string(), "CLOSED");
+    }
+
+    #[test]
+    fn test_tcp_connection_new() {
+        let conn = TcpConnection::new(
+            "direct".to_string(),
+            "test_peer_key".to_string(),
+            "192.168.1.100:51820".parse().unwrap(),
+        );
+
+        assert_eq!(conn.state, TcpConnectionState::SynReceived);
+        assert_eq!(conn.outbound_tag, "direct");
+        assert_eq!(conn.peer_public_key, "test_peer_key");
+        assert!(conn.outbound_stream.is_none());
+        assert_eq!(conn.get_bytes_sent(), 0);
+        assert_eq!(conn.get_bytes_received(), 0);
+        assert_eq!(conn.client_seq, 0);
+        assert_eq!(conn.server_seq, 0);
+    }
+
+    #[test]
+    fn test_tcp_connection_bytes_tracking() {
+        let conn = TcpConnection::new(
+            "direct".to_string(),
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+        );
+
+        conn.add_bytes_sent(100);
+        conn.add_bytes_sent(50);
+        conn.add_bytes_received(200);
+        conn.add_bytes_received(100);
+
+        assert_eq!(conn.get_bytes_sent(), 150);
+        assert_eq!(conn.get_bytes_received(), 300);
+    }
+
+    // ========================================================================
+    // TCP Connection Manager Tests
+    // ========================================================================
+
+    #[test]
+    fn test_tcp_connection_manager_new() {
+        let manager = TcpConnectionManager::new(Duration::from_secs(300));
+
+        assert_eq!(manager.len(), 0);
+        assert!(manager.is_empty());
+        assert_eq!(manager.connection_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_tcp_connection_manager_default() {
+        let manager = TcpConnectionManager::default();
+        assert_eq!(manager.connection_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_tcp_connection_manager_get_or_create() {
+        let manager = TcpConnectionManager::new(Duration::from_secs(300));
+
+        let five_tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            80,
+            IPPROTO_TCP,
+        );
+
+        let conn = manager.get_or_create(
+            five_tuple,
+            "peer_key".to_string(),
+            "192.168.1.100:51820".parse().unwrap(),
+            "direct".to_string(),
+        );
+
+        assert_eq!(manager.len(), 1);
+
+        let guard = conn.read();
+        assert_eq!(guard.state, TcpConnectionState::SynReceived);
+        assert_eq!(guard.outbound_tag, "direct");
+        assert_eq!(guard.peer_public_key, "peer_key");
+    }
+
+    #[test]
+    fn test_tcp_connection_manager_get_existing() {
+        let manager = TcpConnectionManager::new(Duration::from_secs(300));
+
+        let five_tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            80,
+            IPPROTO_TCP,
+        );
+
+        // Create first connection
+        let conn1 = manager.get_or_create(
+            five_tuple,
+            "key1".to_string(),
+            "192.168.1.100:51820".parse().unwrap(),
+            "out1".to_string(),
+        );
+
+        // Try to create again with same 5-tuple - should return existing
+        let conn2 = manager.get_or_create(
+            five_tuple,
+            "key2".to_string(), // Different key - but should use existing
+            "192.168.1.200:51820".parse().unwrap(),
+            "out2".to_string(),
+        );
+
+        assert_eq!(manager.len(), 1);
+
+        // Both should point to the same connection
+        let guard1 = conn1.read();
+        let guard2 = conn2.read();
+        assert_eq!(guard1.peer_public_key, guard2.peer_public_key);
+        assert_eq!(guard1.peer_public_key, "key1"); // Original value
+    }
+
+    #[test]
+    fn test_tcp_connection_manager_get() {
+        let manager = TcpConnectionManager::new(Duration::from_secs(300));
+
+        let five_tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            80,
+            IPPROTO_TCP,
+        );
+
+        // Get on empty manager
+        assert!(manager.get(&five_tuple).is_none());
+
+        // Create connection
+        manager.get_or_create(
+            five_tuple,
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "direct".to_string(),
+        );
+
+        // Now get should succeed
+        assert!(manager.get(&five_tuple).is_some());
+    }
+
+    #[test]
+    fn test_tcp_connection_manager_remove() {
+        let manager = TcpConnectionManager::new(Duration::from_secs(300));
+
+        let five_tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            80,
+            IPPROTO_TCP,
+        );
+
+        manager.get_or_create(
+            five_tuple,
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "direct".to_string(),
+        );
+
+        assert_eq!(manager.len(), 1);
+
+        let removed = manager.remove(&five_tuple);
+        assert!(removed.is_some());
+        assert_eq!(manager.len(), 0);
+
+        // Second remove should return None
+        assert!(manager.remove(&five_tuple).is_none());
+    }
+
+    #[test]
+    fn test_tcp_connection_manager_cleanup() {
+        let manager = TcpConnectionManager::new(Duration::ZERO); // Immediate timeout
+
+        let five_tuple = FiveTuple::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            80,
+            IPPROTO_TCP,
+        );
+
+        manager.get_or_create(
+            five_tuple,
+            "key".to_string(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "direct".to_string(),
+        );
+
+        // Should expire immediately
+        let removed = manager.cleanup();
+        assert_eq!(removed, 1);
+        assert!(manager.is_empty());
+    }
+
+    // ========================================================================
+    // TCP Details Parsing Tests
+    // ========================================================================
+
+    /// Build a TCP packet with specified flags
+    fn build_tcp_packet(
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let tcp_header_len = 20; // No options
+        let tcp_len = tcp_header_len + payload.len();
+        let total_len = 20 + tcp_len; // IP header + TCP
+
+        let mut packet = vec![0u8; total_len];
+
+        // IPv4 header
+        packet[0] = 0x45; // Version 4, IHL 5
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64; // TTL
+        packet[9] = IPPROTO_TCP;
+        packet[12..16].copy_from_slice(&src_ip.octets());
+        packet[16..20].copy_from_slice(&dst_ip.octets());
+
+        // TCP header
+        let tcp_start = 20;
+        packet[tcp_start..tcp_start + 2].copy_from_slice(&src_port.to_be_bytes());
+        packet[tcp_start + 2..tcp_start + 4].copy_from_slice(&dst_port.to_be_bytes());
+        packet[tcp_start + 4..tcp_start + 8].copy_from_slice(&seq.to_be_bytes());
+        packet[tcp_start + 8..tcp_start + 12].copy_from_slice(&ack.to_be_bytes());
+        // Data offset = 5 (20 bytes), shifted to high nibble
+        packet[tcp_start + 12] = (5 << 4);
+        packet[tcp_start + 13] = flags;
+
+        // Payload
+        if !payload.is_empty() {
+            packet[tcp_start + 20..].copy_from_slice(payload);
+        }
+
+        packet
+    }
+
+    #[test]
+    fn test_parse_tcp_details_syn() {
+        let packet = build_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            1000, // seq
+            0,    // ack
+            tcp_flags::SYN,
+            &[],
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+
+        assert_eq!(details.src_port, 12345);
+        assert_eq!(details.dst_port, 80);
+        assert_eq!(details.seq_num, 1000);
+        assert_eq!(details.ack_num, 0);
+        assert_eq!(details.data_offset, 20);
+        assert!(details.is_syn());
+        assert!(!details.is_ack());
+        assert!(!details.is_fin());
+        assert!(!details.is_rst());
+        assert!(!details.has_payload(packet.len()));
+    }
+
+    #[test]
+    fn test_parse_tcp_details_syn_ack() {
+        let packet = build_tcp_packet(
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            5000, // seq
+            1001, // ack
+            tcp_flags::SYN | tcp_flags::ACK,
+            &[],
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+
+        assert!(details.is_syn_ack());
+        assert!(!details.is_syn()); // is_syn() returns false for SYN+ACK
+        assert!(details.is_ack());
+        assert_eq!(details.seq_num, 5000);
+        assert_eq!(details.ack_num, 1001);
+    }
+
+    #[test]
+    fn test_parse_tcp_details_ack_with_data() {
+        let payload = b"GET / HTTP/1.1\r\n";
+        let packet = build_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            1001, // seq
+            5001, // ack
+            tcp_flags::ACK | tcp_flags::PSH,
+            payload,
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+
+        assert!(details.is_ack());
+        assert!(details.has_payload(packet.len()));
+        assert_eq!(details.payload_len(packet.len()), payload.len());
+        assert_eq!(details.payload_offset, 40); // 20 IP + 20 TCP
+    }
+
+    #[test]
+    fn test_parse_tcp_details_fin() {
+        let packet = build_tcp_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            2000,
+            6000,
+            tcp_flags::FIN | tcp_flags::ACK,
+            &[],
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+
+        assert!(details.is_fin());
+        assert!(details.is_ack());
+    }
+
+    #[test]
+    fn test_parse_tcp_details_rst() {
+        let packet = build_tcp_packet(
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            0,
+            0,
+            tcp_flags::RST,
+            &[],
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+
+        assert!(details.is_rst());
+        assert!(!details.is_fin());
+        assert!(!details.is_syn());
+    }
+
+    #[test]
+    fn test_parse_tcp_details_flags_string() {
+        // SYN only
+        let details = TcpDetails {
+            src_port: 1234,
+            dst_port: 80,
+            seq_num: 0,
+            ack_num: 0,
+            data_offset: 20,
+            flags: tcp_flags::SYN,
+            payload_offset: 40,
+        };
+        assert_eq!(details.flags_string(), "SYN");
+
+        // SYN+ACK
+        let details = TcpDetails {
+            flags: tcp_flags::SYN | tcp_flags::ACK,
+            ..details
+        };
+        assert_eq!(details.flags_string(), "SYN,ACK");
+
+        // ACK+PSH
+        let details = TcpDetails {
+            flags: tcp_flags::ACK | tcp_flags::PSH,
+            ..details
+        };
+        assert_eq!(details.flags_string(), "ACK,PSH");
+
+        // FIN+ACK
+        let details = TcpDetails {
+            flags: tcp_flags::FIN | tcp_flags::ACK,
+            ..details
+        };
+        assert_eq!(details.flags_string(), "ACK,FIN");
+
+        // All flags
+        let details = TcpDetails {
+            flags: tcp_flags::SYN | tcp_flags::ACK | tcp_flags::FIN | tcp_flags::RST | tcp_flags::PSH | tcp_flags::URG,
+            ..details
+        };
+        assert_eq!(details.flags_string(), "SYN,ACK,FIN,RST,PSH,URG");
+
+        // No flags
+        let details = TcpDetails {
+            flags: 0,
+            ..details
+        };
+        assert_eq!(details.flags_string(), "none");
+    }
+
+    #[test]
+    fn test_parse_tcp_details_too_short() {
+        // Packet too short for TCP header
+        let packet = vec![0u8; 30]; // Only 10 bytes after IP header
+        assert!(parse_tcp_details(&packet, 20).is_none());
+    }
+
+    #[test]
+    fn test_parse_tcp_details_invalid_data_offset() {
+        // Build packet with invalid data offset (< 5)
+        let mut packet = vec![0u8; 60];
+        packet[0] = 0x45; // IPv4
+        packet[9] = IPPROTO_TCP;
+        // Data offset = 2 (invalid, should be >= 5)
+        packet[32] = 2 << 4;
+
+        assert!(parse_tcp_details(&packet, 20).is_none());
+    }
+
+    #[test]
+    fn test_tcp_flags_constants() {
+        // Verify flag constants match standard TCP flags
+        assert_eq!(tcp_flags::FIN, 0x01);
+        assert_eq!(tcp_flags::SYN, 0x02);
+        assert_eq!(tcp_flags::RST, 0x04);
+        assert_eq!(tcp_flags::PSH, 0x08);
+        assert_eq!(tcp_flags::ACK, 0x10);
+        assert_eq!(tcp_flags::URG, 0x20);
+    }
+
+    #[test]
+    fn test_tcp_details_payload_len_no_payload() {
+        let details = TcpDetails {
+            src_port: 1234,
+            dst_port: 80,
+            seq_num: 0,
+            ack_num: 0,
+            data_offset: 20,
+            flags: tcp_flags::SYN,
+            payload_offset: 40, // 20 IP + 20 TCP
+        };
+
+        // Packet exactly at payload offset = no payload
+        assert_eq!(details.payload_len(40), 0);
+        assert!(!details.has_payload(40));
+
+        // Packet shorter than payload offset = no payload
+        assert_eq!(details.payload_len(30), 0);
+        assert!(!details.has_payload(30));
+
+        // Packet with payload
+        assert_eq!(details.payload_len(100), 60);
+        assert!(details.has_payload(100));
+    }
+}

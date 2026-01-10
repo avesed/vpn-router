@@ -892,6 +892,76 @@ impl WgIngressManager {
         self.packet_rx.lock().await.take()
     }
 
+    /// Check whether an IP is allowed for a specific peer
+    #[must_use]
+    pub fn is_peer_ip_allowed(&self, peer_public_key: &str, ip: IpAddr) -> bool {
+        let peers = self.peers.read();
+        peers
+            .get(peer_public_key)
+            .map(|peer| peer.is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip))
+            .unwrap_or(false)
+    }
+
+    /// Send a decrypted IP packet back to a WireGuard peer
+    pub async fn send_to_peer(
+        &self,
+        peer_public_key: &str,
+        peer_endpoint: SocketAddr,
+        packet: &[u8],
+    ) -> IngressResult<()> {
+        let peer = {
+            let peers = self.peers.read();
+            peers.get(peer_public_key).cloned()
+        }
+        .ok_or_else(|| IngressError::peer_not_found(peer_public_key))?;
+
+        let socket = self
+            .socket
+            .read()
+            .clone()
+            .ok_or(IngressError::NotStarted)?;
+
+        let mut encrypted = vec![0u8; packet.len() + WG_TRANSPORT_OVERHEAD];
+        let encapsulated = {
+            let mut tunn_guard = peer.tunn.lock();
+            let tunn = tunn_guard
+                .as_mut()
+                .ok_or_else(|| IngressError::internal("Peer tunnel not initialized"))?;
+            tunn.encapsulate(packet, &mut encrypted)
+        };
+
+        match encapsulated {
+            TunnResult::WriteToNetwork(data) => {
+                socket.send_to(data, peer_endpoint).await?;
+                self.stats
+                    .tx_bytes
+                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                self.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
+                peer.tx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                peer.update_activity();
+                Ok(())
+            }
+            TunnResult::Done => {
+                debug!(
+                    "Packet queued for peer {} (handshake in progress)",
+                    peer_public_key
+                );
+                Ok(())
+            }
+            TunnResult::Err(err) => Err(IngressError::internal(format!(
+                "Failed to encapsulate packet for peer {}: {:?}",
+                peer_public_key, err
+            ))),
+            _ => {
+                warn!(
+                    "Unexpected encapsulation result for peer {}",
+                    peer_public_key
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Background packet processing loop
     ///
     /// This loop:
