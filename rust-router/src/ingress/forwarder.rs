@@ -258,7 +258,7 @@ impl TcpConnectionManager {
         let timeout = self.connection_timeout;
         let before = self.connections.len();
         self.connections.retain(|_, conn| {
-            if let Some(guard) = conn.try_read() {
+            if let Ok(guard) = conn.try_read() {
                 guard.last_activity.elapsed() < timeout
             } else {
                 // Keep connections that are currently locked (in use)
