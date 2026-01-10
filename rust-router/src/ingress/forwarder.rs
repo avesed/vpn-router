@@ -753,6 +753,10 @@ pub struct IngressReplyStats {
     pub session_misses: AtomicU64,
     /// Packets rejected due to tunnel tag mismatch
     pub tunnel_mismatch: AtomicU64,
+    /// Packets rejected due to unsupported protocols
+    pub unsupported_protocol: AtomicU64,
+    /// IPv6 packets with extension headers
+    pub ipv6_extension_headers: AtomicU64,
     /// Packets rejected by peer IP validation
     pub peer_ip_rejected: AtomicU64,
     /// Errors while sending replies
@@ -772,6 +776,8 @@ impl IngressReplyStats {
             parse_errors: self.parse_errors.load(Ordering::Relaxed),
             session_misses: self.session_misses.load(Ordering::Relaxed),
             tunnel_mismatch: self.tunnel_mismatch.load(Ordering::Relaxed),
+            unsupported_protocol: self.unsupported_protocol.load(Ordering::Relaxed),
+            ipv6_extension_headers: self.ipv6_extension_headers.load(Ordering::Relaxed),
             peer_ip_rejected: self.peer_ip_rejected.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
         }
@@ -789,6 +795,8 @@ pub struct IngressReplyStatsSnapshot {
     pub parse_errors: u64,
     pub session_misses: u64,
     pub tunnel_mismatch: u64,
+    pub unsupported_protocol: u64,
+    pub ipv6_extension_headers: u64,
     pub peer_ip_rejected: u64,
     pub send_errors: u64,
 }
@@ -2755,8 +2763,8 @@ mod tests {
         assert_eq!(manager.connection_timeout(), Duration::from_secs(300));
     }
 
-    #[test]
-    fn test_tcp_connection_manager_get_or_create() {
+    #[tokio::test]
+    async fn test_tcp_connection_manager_get_or_create() {
         let manager = TcpConnectionManager::new(Duration::from_secs(300));
 
         let five_tuple = FiveTuple::new(
@@ -2776,14 +2784,14 @@ mod tests {
 
         assert_eq!(manager.len(), 1);
 
-        let guard = conn.read();
+        let guard = conn.read().await;
         assert_eq!(guard.state, TcpConnectionState::SynReceived);
         assert_eq!(guard.outbound_tag, "direct");
         assert_eq!(guard.peer_public_key, "peer_key");
     }
 
-    #[test]
-    fn test_tcp_connection_manager_get_existing() {
+    #[tokio::test]
+    async fn test_tcp_connection_manager_get_existing() {
         let manager = TcpConnectionManager::new(Duration::from_secs(300));
 
         let five_tuple = FiveTuple::new(
@@ -2813,8 +2821,8 @@ mod tests {
         assert_eq!(manager.len(), 1);
 
         // Both should point to the same connection
-        let guard1 = conn1.read();
-        let guard2 = conn2.read();
+        let guard1 = conn1.read().await;
+        let guard2 = conn2.read().await;
         assert_eq!(guard1.peer_public_key, guard2.peer_public_key);
         assert_eq!(guard1.peer_public_key, "key1"); // Original value
     }
