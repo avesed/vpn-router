@@ -399,6 +399,7 @@ mod e2e_ipc {
             }),
             IpcResponse::IngressStats(IngressStatsResponse {
                 ingress_enabled: false,
+                ingress_state: None,
                 manager_stats: None,
                 forwarding_stats: None,
                 reply_stats: None,

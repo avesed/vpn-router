@@ -532,19 +532,20 @@ async fn main() -> Result<()> {
     };
 
     // Wire up Phase 6 managers to IPC handler
-    let ipc_handler = ipc_handler
+    let mut ipc_handler = ipc_handler
         .with_peer_manager(Arc::clone(&peer_manager))
         .with_chain_manager(Arc::clone(&chain_manager), phase6_config.node_tag.clone())
         .with_ecmp_group_manager(Arc::clone(&ecmp_group_manager))
-        .with_wg_egress_manager(Arc::clone(&wg_egress_manager))
-        .with_ingress_stats(Arc::clone(&forwarding_stats), Arc::clone(&reply_stats));
+        .with_wg_egress_manager(Arc::clone(&wg_egress_manager));
 
     // Add WireGuard ingress manager if available
-    let ipc_handler = if let Some(ref ingress_mgr) = wg_ingress_manager {
-        ipc_handler.with_wg_ingress_manager(Arc::clone(ingress_mgr))
-    } else {
-        ipc_handler
-    };
+    if let Some(ref ingress_mgr) = wg_ingress_manager {
+        ipc_handler = ipc_handler.with_wg_ingress_manager(Arc::clone(ingress_mgr));
+        ipc_handler = ipc_handler.with_ingress_stats(
+            Arc::clone(&forwarding_stats),
+            Arc::clone(&reply_stats),
+        );
+    }
 
     // ========================================================================
     // Phase 7: DNS Engine Initialization

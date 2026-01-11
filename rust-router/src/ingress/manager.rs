@@ -76,7 +76,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -184,7 +184,7 @@ pub struct WgIngressStats {
     pub handshake_count: u64,
     /// Number of currently registered peers
     pub peer_count: usize,
-    /// Number of active (connected) peers
+    /// Number of peers that have completed a handshake (best-effort)
     pub active_peer_count: usize,
     /// Packets dropped due to errors
     pub dropped_packets: u64,
@@ -200,10 +200,12 @@ struct StatsInner {
     invalid_packets: AtomicU64,
     handshake_count: AtomicU64,
     dropped_packets: AtomicU64,
+    peer_count: AtomicUsize,
+    active_peer_count: AtomicUsize,
 }
 
 impl StatsInner {
-    fn snapshot(&self, peer_count: usize, active_peer_count: usize) -> WgIngressStats {
+    fn snapshot(&self) -> WgIngressStats {
         WgIngressStats {
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
             tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
@@ -211,8 +213,8 @@ impl StatsInner {
             tx_packets: self.tx_packets.load(Ordering::Relaxed),
             invalid_packets: self.invalid_packets.load(Ordering::Relaxed),
             handshake_count: self.handshake_count.load(Ordering::Relaxed),
-            peer_count,
-            active_peer_count,
+            peer_count: self.peer_count.load(Ordering::Relaxed),
+            active_peer_count: self.active_peer_count.load(Ordering::Relaxed),
             dropped_packets: self.dropped_packets.load(Ordering::Relaxed),
         }
     }
@@ -235,6 +237,8 @@ struct RegisteredPeer {
     tunn: Mutex<Option<Box<Tunn>>>,
     /// Whether the peer is currently connected
     is_connected: AtomicBool,
+    /// Whether the peer has been removed from the manager
+    is_removed: AtomicBool,
     /// Bytes received from this peer
     rx_bytes: AtomicU64,
     /// Bytes transmitted to this peer (reserved for future use)
@@ -282,6 +286,7 @@ impl RegisteredPeer {
             config,
             tunn: Mutex::new(Some(Box::new(tunn))),
             is_connected: AtomicBool::new(false),
+            is_removed: AtomicBool::new(false),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             last_activity: AtomicU64::new(0),
@@ -751,25 +756,20 @@ impl WgIngressManager {
 
         let public_key = peer.public_key.clone();
 
-        // Check for duplicate
-        {
-            let peers = self.peers.read();
+        // Add peer
+        let tunnel_index = {
+            let mut peers = self.peers.write();
             if peers.contains_key(&public_key) {
                 return Err(IngressError::peer_already_exists(&public_key));
             }
-        }
 
-        // Get next tunnel index
-        let tunnel_index = self.next_tunnel_index.fetch_add(1, Ordering::Relaxed) as u32;
+            let tunnel_index = self.next_tunnel_index.fetch_add(1, Ordering::Relaxed) as u32;
+            let registered_peer = RegisteredPeer::new(peer, &self.private_key, tunnel_index)?;
 
-        // Create registered peer with boringtun tunnel
-        let registered_peer = RegisteredPeer::new(peer, &self.private_key, tunnel_index)?;
-
-        // Add peer
-        {
-            let mut peers = self.peers.write();
             peers.insert(public_key.clone(), Arc::new(registered_peer));
-        }
+            self.stats.peer_count.fetch_add(1, Ordering::Relaxed);
+            tunnel_index
+        };
 
         info!(public_key = %public_key, tunnel_index = tunnel_index, "Added peer to ingress");
         Ok(())
@@ -792,8 +792,28 @@ impl WgIngressManager {
     /// ```
     pub async fn remove_peer(&self, public_key: &str) -> IngressResult<()> {
         let mut peers = self.peers.write();
-        if peers.remove(public_key).is_none() {
+        let removed = peers.remove(public_key);
+        if removed.is_none() {
             return Err(IngressError::peer_not_found(public_key));
+        }
+
+        if let Some(peer) = &removed {
+            peer.is_removed.store(true, Ordering::Relaxed);
+        }
+
+        let _ = self.stats.peer_count.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value: usize| value.checked_sub(1),
+        );
+        if let Some(peer) = removed {
+            if peer.is_connected.load(Ordering::Relaxed) {
+                let _ = self.stats.active_peer_count.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |value: usize| value.checked_sub(1),
+                );
+            }
         }
 
         info!(public_key = %public_key, "Removed peer from ingress");
@@ -807,13 +827,7 @@ impl WgIngressManager {
     /// A snapshot of the current ingress statistics.
     #[must_use]
     pub fn stats(&self) -> WgIngressStats {
-        let peers = self.peers.read();
-        let peer_count = peers.len();
-        let active_peer_count = peers
-            .values()
-            .filter(|p| p.is_connected.load(Ordering::Relaxed))
-            .count();
-        self.stats.snapshot(peer_count, active_peer_count)
+        self.stats.snapshot()
     }
 
     /// Get current state
@@ -831,7 +845,7 @@ impl WgIngressManager {
     /// Get the number of registered peers
     #[must_use]
     pub fn peer_count(&self) -> usize {
-        self.peers.read().len()
+        self.stats.peer_count.load(Ordering::Relaxed)
     }
 
     /// Get the configuration
@@ -1188,7 +1202,22 @@ impl WgIngressManager {
                 trace!(src_addr = %src_addr, "Sent handshake response");
                 stats.handshake_count.fetch_add(1, Ordering::Relaxed);
                 peer_ref.update_handshake();
-                peer_ref.is_connected.store(true, Ordering::Relaxed);
+                let was_connected = peer_ref.is_connected.swap(true, Ordering::Relaxed);
+                if !was_connected {
+                    if peer_ref.is_removed.load(Ordering::Relaxed) {
+                        peer_ref.is_connected.store(false, Ordering::Relaxed);
+                    } else {
+                        stats.active_peer_count.fetch_add(1, Ordering::Relaxed);
+                        if peer_ref.is_removed.load(Ordering::Relaxed) {
+                            let _ = stats.active_peer_count.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |value: usize| value.checked_sub(1),
+                            );
+                            peer_ref.is_connected.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
 
@@ -1859,7 +1888,10 @@ mod tests {
         stats.rx_bytes.store(100, Ordering::Relaxed);
         stats.rx_packets.store(5, Ordering::Relaxed);
 
-        let snapshot = stats.snapshot(3, 2);
+        stats.peer_count.store(3, Ordering::Relaxed);
+        stats.active_peer_count.store(2, Ordering::Relaxed);
+
+        let snapshot = stats.snapshot();
         assert_eq!(snapshot.rx_bytes, 100);
         assert_eq!(snapshot.rx_packets, 5);
         assert_eq!(snapshot.peer_count, 3);

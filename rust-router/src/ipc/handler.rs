@@ -2906,6 +2906,10 @@ impl IpcHandler {
     /// Returns ingress manager, forwarding, and reply statistics.
     fn handle_get_ingress_stats(&self) -> IpcResponse {
         let ingress_enabled = self.wg_ingress_manager.is_some();
+        let ingress_state = self
+            .wg_ingress_manager
+            .as_ref()
+            .map(|manager| manager.state().to_string());
         let manager_stats = self.wg_ingress_manager.as_ref().map(|manager| manager.stats());
         let forwarding_stats = if ingress_enabled {
             self.ingress_forwarding_stats
@@ -2924,6 +2928,7 @@ impl IpcHandler {
 
         IpcResponse::IngressStats(IngressStatsResponse {
             ingress_enabled,
+            ingress_state,
             manager_stats,
             forwarding_stats,
             reply_stats,
@@ -4194,7 +4199,8 @@ mod tests {
         IpcHandler::new(connection_manager, outbound_manager, rule_engine)
     }
 
-    fn create_test_handler_with_ingress_stats() -> IpcHandler {
+    fn create_test_handler_with_ingress_stats(
+    ) -> (IpcHandler, Arc<ForwardingStats>, Arc<IngressReplyStats>) {
         let outbound_manager = Arc::new(OutboundManager::new());
         outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple("direct")));
 
@@ -4231,9 +4237,11 @@ mod tests {
         let forwarding_stats = Arc::new(ForwardingStats::default());
         let reply_stats = Arc::new(IngressReplyStats::default());
 
-        IpcHandler::new(connection_manager, outbound_manager, rule_engine)
+        let handler = IpcHandler::new(connection_manager, outbound_manager, rule_engine)
             .with_wg_ingress_manager(Arc::clone(&ingress_manager))
-            .with_ingress_stats(forwarding_stats, reply_stats)
+            .with_ingress_stats(Arc::clone(&forwarding_stats), Arc::clone(&reply_stats));
+
+        (handler, forwarding_stats, reply_stats)
     }
 
     #[tokio::test]
@@ -5379,6 +5387,7 @@ mod tests {
 
         if let IpcResponse::IngressStats(stats) = response {
             assert!(!stats.ingress_enabled);
+            assert!(stats.ingress_state.is_none());
             assert!(stats.manager_stats.is_none());
             assert!(stats.forwarding_stats.is_none());
             assert!(stats.reply_stats.is_none());
@@ -5389,15 +5398,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_ingress_stats_enabled() {
-        let handler = create_test_handler_with_ingress_stats();
+        let (handler, _forwarding_stats, _reply_stats) = create_test_handler_with_ingress_stats();
         let response = handler.handle(IpcCommand::GetIngressStats).await;
 
         if let IpcResponse::IngressStats(stats) = response {
             assert!(stats.ingress_enabled);
+            assert_eq!(stats.ingress_state.as_deref(), Some("created"));
             let manager_stats = stats.manager_stats.expect("manager stats");
             assert_eq!(manager_stats.peer_count, 0);
             assert!(stats.forwarding_stats.is_some());
             assert!(stats.reply_stats.is_some());
+        } else {
+            panic!("Expected IngressStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_ingress_stats_populated() {
+        let (handler, forwarding_stats, reply_stats) = create_test_handler_with_ingress_stats();
+        forwarding_stats.packets_forwarded.fetch_add(3, Ordering::Relaxed);
+        forwarding_stats.bytes_forwarded.fetch_add(512, Ordering::Relaxed);
+        reply_stats.packets_received.fetch_add(2, Ordering::Relaxed);
+        reply_stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+
+        let response = handler.handle(IpcCommand::GetIngressStats).await;
+
+        if let IpcResponse::IngressStats(stats) = response {
+            let forwarding_stats = stats.forwarding_stats.expect("forwarding stats");
+            assert_eq!(forwarding_stats.packets_forwarded, 3);
+            assert_eq!(forwarding_stats.bytes_forwarded, 512);
+
+            let reply_stats = stats.reply_stats.expect("reply stats");
+            assert_eq!(reply_stats.packets_received, 2);
+            assert_eq!(reply_stats.packets_forwarded, 1);
         } else {
             panic!("Expected IngressStats response");
         }

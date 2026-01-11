@@ -1022,7 +1022,7 @@ impl Default for ServerCapabilities {
             tls_sniffing: true,
             udp_support: false, // Phase 1: TCP only
             max_connections: 65536,
-            protocol_version: 3, // Phase 3.3: IPC v2.1 with drain, health, routing updates
+            protocol_version: 4, // Phase 5: IPC ingress stats
         }
     }
 }
@@ -1984,6 +1984,8 @@ pub struct IngressPeerListResponse {
 pub struct IngressStatsResponse {
     /// Whether userspace WireGuard ingress is enabled
     pub ingress_enabled: bool,
+    /// Current ingress manager state (if enabled)
+    pub ingress_state: Option<String>,
     /// Ingress manager statistics (if enabled)
     pub manager_stats: Option<WgIngressStats>,
     /// Forwarding loop statistics (if available)

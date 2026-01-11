@@ -2406,6 +2406,30 @@ mod tests {
         assert_eq!(snapshot.packets_forwarded, 0);
     }
 
+    #[tokio::test]
+    async fn test_reply_router_parse_error() {
+        let ingress_manager = create_test_ingress_manager();
+        let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+        let stats = Arc::new(IngressReplyStats::default());
+
+        let reply_packet = ReplyPacket {
+            packet: vec![0u8; 4],
+            tunnel_tag: "wg-test".to_string(),
+        };
+
+        run_reply_router_once(
+            reply_packet,
+            ingress_manager,
+            session_tracker,
+            Arc::clone(&stats),
+        )
+        .await;
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.parse_errors, 1);
+        assert_eq!(snapshot.packets_forwarded, 0);
+    }
+
     // ========================================================================
     // PeerSession Tests
     // ========================================================================

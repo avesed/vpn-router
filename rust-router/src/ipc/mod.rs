@@ -49,6 +49,6 @@ pub use protocol::{
     // Phase 7.7: DNS IPC types
     DnsUpstreamConfig, DnsStatsResponse, DnsCacheStatsResponse, DnsBlockStatsResponse,
     DnsUpstreamStatusResponse, DnsUpstreamInfo, DnsQueryLogResponse, DnsQueryLogEntry,
-    DnsQueryResponse, DnsConfigResponse,
+    DnsQueryResponse, DnsConfigResponse, IngressStatsResponse,
 };
 pub use server::{IpcClient, IpcServer};
