@@ -93,7 +93,8 @@ pub struct RoutingDecision {
     /// Optional DSCP value to set on the packet
     ///
     /// If Some, the packet's DSCP field should be modified before sending.
-    /// This is used for marking packets entering a chain.
+    /// This is used for marking packets entering a chain or clearing DSCP
+    /// when the packet should leave chain routing (value 0).
     pub dscp_mark: Option<u8>,
 
     /// Optional routing mark for kernel policy routing
@@ -127,9 +128,14 @@ impl RoutingDecision {
     /// Create a routing decision from a rule engine match result
     #[must_use]
     pub fn from_match_result(result: MatchResult) -> Self {
+        let dscp_mark = result
+            .routing_mark
+            .and_then(ChainMark::from_routing_mark)
+            .map(|mark| mark.dscp_value);
+
         Self {
             outbound: result.outbound,
-            dscp_mark: None,
+            dscp_mark,
             routing_mark: result.routing_mark,
             is_chain_packet: false,
             match_info: result.matched_rule.map(|r| r.to_string()),
@@ -214,8 +220,8 @@ impl IngressProcessor {
     ///
     /// 1. Extract IP version from packet
     /// 2. Extract DSCP value
-    /// 3. If DSCP > 0, use chain routing
-    /// 4. Otherwise, extract connection info and use rule engine
+    /// 3. If DSCP > 0 and chain exists, use chain routing
+    /// 4. Otherwise, extract connection info and use rule engine (clear DSCP)
     ///
     /// # Errors
     ///
@@ -246,33 +252,30 @@ impl IngressProcessor {
 
         // Check for chain routing (DSCP > 0)
         if dscp > 0 {
-            if let Some(mark) = ChainMark::from_dscp(dscp) {
-                // This is a chain packet - check if we have a chain registered
-                let snapshot = self.rule_engine.load();
+            let snapshot = self.rule_engine.load();
 
-                // Look for a chain with this DSCP value
-                let chain_found = snapshot.fwmark_router.chains().any(|(_, chain_mark)| {
-                    chain_mark.dscp_value == dscp
-                });
-
-                if chain_found {
-                    trace!(
-                        peer = src_peer,
-                        dscp = dscp,
-                        routing_mark = mark.routing_mark,
-                        "Chain packet detected"
-                    );
-                    // For chain packets, we use a special outbound that handles DSCP
-                    // The actual outbound is determined by the chain configuration
-                    return Ok(RoutingDecision::chain_packet("chain", mark));
-                }
-                // DSCP set but no chain registered - log and process normally
-                debug!(
+            if let Some((chain_tag, chain_mark)) = snapshot
+                .fwmark_router
+                .chains()
+                .find(|(_, chain_mark)| chain_mark.dscp_value == dscp)
+            {
+                trace!(
                     peer = src_peer,
                     dscp = dscp,
-                    "DSCP set but no chain registered, using rule matching"
+                    routing_mark = chain_mark.routing_mark,
+                    chain_tag = chain_tag,
+                    "Chain packet detected"
                 );
+                // For chain packets, route using the matching chain tag
+                return Ok(RoutingDecision::chain_packet(chain_tag, *chain_mark));
             }
+
+            // DSCP set but no chain registered - log and process normally
+            debug!(
+                peer = src_peer,
+                dscp = dscp,
+                "DSCP set but no chain registered, using rule matching"
+            );
         }
 
         // Extract connection info for rule matching
@@ -296,7 +299,12 @@ impl IngressProcessor {
             "Routing decision"
         );
 
-        Ok(RoutingDecision::from_match_result(result))
+        let mut decision = RoutingDecision::from_match_result(result);
+        if dscp > 0 && decision.dscp_mark.is_none() {
+            decision.dscp_mark = Some(0);
+        }
+
+        Ok(decision)
     }
 
     /// Extract connection information from a packet
@@ -404,8 +412,9 @@ impl IngressProcessor {
             )));
         }
 
-        // Extract next header (protocol)
-        let protocol = packet[6];
+        let (protocol, header_len, total_len) =
+            super::forwarder::parse_ipv6_transport_header(packet)
+                .ok_or_else(|| IngressError::invalid_packet("IPv6 extension header parsing failed"))?;
 
         // Extract source IP (bytes 8-23)
         let src_ip = Ipv6Addr::from([
@@ -448,19 +457,19 @@ impl IngressProcessor {
         ]);
 
         // Extract ports for TCP/UDP (after IPv6 header)
-        let (dest_port, protocol_str) = if packet.len() >= IPV6_MIN_HEADER_LEN + 4 {
+        let (dest_port, protocol_str) = if total_len >= header_len + 4 {
             match protocol {
                 IPPROTO_TCP => {
                     let port = u16::from_be_bytes([
-                        packet[IPV6_MIN_HEADER_LEN + 2],
-                        packet[IPV6_MIN_HEADER_LEN + 3],
+                        packet[header_len + 2],
+                        packet[header_len + 3],
                     ]);
                     (port, "tcp")
                 }
                 IPPROTO_UDP => {
                     let port = u16::from_be_bytes([
-                        packet[IPV6_MIN_HEADER_LEN + 2],
-                        packet[IPV6_MIN_HEADER_LEN + 3],
+                        packet[header_len + 2],
+                        packet[header_len + 3],
                     ]);
                     (port, "udp")
                 }
@@ -468,6 +477,14 @@ impl IngressProcessor {
                 _ => (0, "unknown"),
             }
         } else {
+            if matches!(protocol, IPPROTO_TCP | IPPROTO_UDP) {
+                return Err(IngressError::invalid_packet(format!(
+                    "IPv6 transport header truncated: {} < {}",
+                    total_len,
+                    header_len + 4
+                )));
+            }
+
             match protocol {
                 IPPROTO_TCP => (0, "tcp"),
                 IPPROTO_UDP => (0, "udp"),
@@ -790,6 +807,7 @@ mod tests {
         let decision = processor.process(&packet, "test-peer").unwrap();
         assert_eq!(decision.outbound, "direct");
         assert!(!decision.is_chain());
+        assert_eq!(decision.dscp_mark, Some(0));
     }
 
     #[test]
@@ -805,7 +823,7 @@ mod tests {
         set_dscp(&mut packet, 10).unwrap();
 
         let decision = processor.process(&packet, "test-peer").unwrap();
-        assert_eq!(decision.outbound, "chain");
+        assert_eq!(decision.outbound, "test-chain");
         assert!(decision.is_chain());
         assert_eq!(decision.dscp_mark, Some(10));
     }

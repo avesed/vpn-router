@@ -57,8 +57,11 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, trace, warn};
 
 use super::manager::{ProcessedPacket, WgIngressManager};
+use super::processor::RoutingDecision;
+use crate::chain::dscp::set_dscp;
 use crate::egress::manager::WgEgressManager;
 use crate::outbound::OutboundManager;
+use crate::rules::fwmark::ChainMark;
 
 /// IP protocol numbers
 const IPPROTO_TCP: u8 = 6;
@@ -1014,7 +1017,7 @@ fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
     ));
 
     // Parse transport layer ports
-    let (src_port, dst_port) = parse_transport_ports(packet, ihl, protocol);
+    let (src_port, dst_port) = parse_transport_ports(packet, ihl, protocol, packet.len());
 
     Some(ParsedPacket {
         src_ip,
@@ -1034,8 +1037,7 @@ fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
         return None;
     }
 
-    // Next Header (protocol) is at byte 6
-    let protocol = packet[6];
+    let (protocol, header_len, total_len) = parse_ipv6_transport_header(packet)?;
 
     // Extract source IP (bytes 8-23)
     let src_ip = IpAddr::V6(Ipv6Addr::from([
@@ -1077,27 +1079,102 @@ fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
         packet[39],
     ]));
 
+    if matches!(protocol, IPPROTO_TCP | IPPROTO_UDP) && total_len < header_len + 4 {
+        return None;
+    }
+
     // Parse transport layer ports
-    let (src_port, dst_port) = parse_transport_ports(packet, 40, protocol);
+    let (src_port, dst_port) = parse_transport_ports(packet, header_len, protocol, total_len);
 
     Some(ParsedPacket {
         src_ip,
         dst_ip,
         protocol,
-        ip_header_len: 40,
+        ip_header_len: header_len,
         src_port,
         dst_port,
-        total_len: packet.len(),
+        total_len,
     })
 }
 
+const IPV6_MAX_EXT_HEADERS: usize = 16;
+
+pub(crate) fn parse_ipv6_transport_header(packet: &[u8]) -> Option<(u8, usize, usize)> {
+    if packet.len() < 40 {
+        return None;
+    }
+
+    let mut next_header = packet[6];
+    let mut offset = 40usize;
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let total_len = if payload_len == 0 {
+        packet.len()
+    } else {
+        40 + payload_len
+    };
+
+    if total_len > packet.len() {
+        return None;
+    }
+
+    for _ in 0..IPV6_MAX_EXT_HEADERS {
+        match next_header {
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
+                if total_len < offset + 2 {
+                    return None;
+                }
+                let hdr_len = packet[offset + 1] as usize;
+                let ext_len = (hdr_len + 1) * 8;
+                if total_len < offset + ext_len {
+                    return None;
+                }
+                next_header = packet[offset];
+                offset += ext_len;
+            }
+            44 => {
+                if total_len < offset + 8 {
+                    return None;
+                }
+                let frag = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                let frag_offset = frag >> 3;
+                if frag_offset != 0 {
+                    return Some((44, offset + 8, total_len));
+                }
+                next_header = packet[offset];
+                offset += 8;
+            }
+            51 => {
+                if total_len < offset + 2 {
+                    return None;
+                }
+                let payload_len = packet[offset + 1] as usize;
+                let ext_len = (payload_len + 2) * 4;
+                if total_len < offset + ext_len {
+                    return None;
+                }
+                next_header = packet[offset];
+                offset += ext_len;
+            }
+            50 | 59 => return Some((next_header, offset, total_len)),
+            _ => return Some((next_header, offset, total_len)),
+        }
+    }
+
+    None
+}
+
 /// Parse transport layer (TCP/UDP) ports
-fn parse_transport_ports(packet: &[u8], ip_header_len: usize, protocol: u8) -> (Option<u16>, Option<u16>) {
+fn parse_transport_ports(
+    packet: &[u8],
+    ip_header_len: usize,
+    protocol: u8,
+    total_len: usize,
+) -> (Option<u16>, Option<u16>) {
     match protocol {
         IPPROTO_TCP | IPPROTO_UDP => {
             // Both TCP and UDP have source port at offset 0-1 and dest port at 2-3
             let start = ip_header_len;
-            if packet.len() >= start + 4 {
+            if total_len >= start + 4 && packet.len() >= start + 4 {
                 let src_port = u16::from_be_bytes([packet[start], packet[start + 1]]);
                 let dst_port = u16::from_be_bytes([packet[start + 2], packet[start + 3]]);
                 (Some(src_port), Some(dst_port))
@@ -1106,6 +1183,26 @@ fn parse_transport_ports(packet: &[u8], ip_header_len: usize, protocol: u8) -> (
             }
         }
         _ => (None, None),
+    }
+}
+
+fn is_ipv6_extension_header(protocol: u8) -> bool {
+    matches!(
+        protocol,
+        0 | 43 | 44 | 50 | 51 | 59 | 60 | 135 | 139 | 140 | 253 | 254
+    )
+}
+
+fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
+    let has_chain_mark = routing
+        .routing_mark
+        .and_then(ChainMark::from_routing_mark)
+        .is_some();
+
+    if routing.is_chain_packet && !has_chain_mark {
+        Some(0)
+    } else {
+        routing.dscp_mark
     }
 }
 
@@ -1135,8 +1232,18 @@ pub async fn run_forwarding_loop(
     let cleanup_interval = Duration::from_secs(60);
     let mut last_cleanup = Instant::now();
 
-    while let Some(processed) = packet_rx.recv().await {
+    while let Some(mut processed) = packet_rx.recv().await {
         let packet_len = processed.data.len();
+
+        if let Some(dscp_mark) = dscp_update_value(&processed.routing) {
+            if let Err(e) = set_dscp(&mut processed.data, dscp_mark) {
+                if dscp_mark == 0 {
+                    warn!("Failed to clear DSCP: {}", e);
+                } else {
+                    warn!("Failed to set DSCP {}: {}", dscp_mark, e);
+                }
+            }
+        }
 
         // Parse IP header
         let Some(parsed) = parse_ip_packet(&processed.data) else {
@@ -1263,6 +1370,23 @@ pub async fn run_reply_router_loop(
             warn!("Failed to parse reply IP header");
             continue;
         };
+
+        if parsed.protocol != IPPROTO_TCP && parsed.protocol != IPPROTO_UDP {
+            if parsed.src_ip.is_ipv6() && is_ipv6_extension_header(parsed.protocol) {
+                stats.ipv6_extension_headers.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "IPv6 reply with extension header {} dropped",
+                    parsed.protocol
+                );
+            } else {
+                stats.unsupported_protocol.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Unsupported reply protocol {} dropped",
+                    parsed.protocol
+                );
+            }
+            continue;
+        }
 
         let (Some(src_port), Some(dst_port)) = (parsed.src_port, parsed.dst_port) else {
             stats.parse_errors.fetch_add(1, Ordering::Relaxed);
@@ -1847,6 +1971,7 @@ pub fn spawn_reply_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingress::processor::RoutingDecision;
 
     // ========================================================================
     // FiveTuple Tests
@@ -1996,6 +2121,77 @@ mod tests {
         t1.hash(&mut h1);
         t2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    // ========================================================================
+    // DSCP Update Tests
+    // ========================================================================
+
+    #[test]
+    fn test_dscp_update_value_sets_mark_for_entry() {
+        let mark = ChainMark::from_dscp(10).unwrap();
+        let routing = RoutingDecision {
+            outbound: "chain-out".to_string(),
+            dscp_mark: Some(mark.dscp_value),
+            routing_mark: Some(mark.routing_mark),
+            is_chain_packet: false,
+            match_info: None,
+        };
+
+        assert_eq!(dscp_update_value(&routing), Some(10));
+    }
+
+    #[test]
+    fn test_dscp_update_value_preserves_chain_mark() {
+        let mark = ChainMark::from_dscp(5).unwrap();
+        let routing = RoutingDecision {
+            outbound: "chain-out".to_string(),
+            dscp_mark: Some(mark.dscp_value),
+            routing_mark: Some(mark.routing_mark),
+            is_chain_packet: true,
+            match_info: None,
+        };
+
+        assert_eq!(dscp_update_value(&routing), Some(5));
+    }
+
+    #[test]
+    fn test_dscp_update_value_clears_chain_without_mark() {
+        let routing = RoutingDecision {
+            outbound: "direct".to_string(),
+            dscp_mark: Some(7),
+            routing_mark: None,
+            is_chain_packet: true,
+            match_info: None,
+        };
+
+        assert_eq!(dscp_update_value(&routing), Some(0));
+    }
+
+    #[test]
+    fn test_dscp_update_value_clears_non_chain_mark() {
+        let routing = RoutingDecision {
+            outbound: "direct".to_string(),
+            dscp_mark: Some(0),
+            routing_mark: None,
+            is_chain_packet: false,
+            match_info: None,
+        };
+
+        assert_eq!(dscp_update_value(&routing), Some(0));
+    }
+
+    #[test]
+    fn test_dscp_update_value_skips_unmarked_packets() {
+        let routing = RoutingDecision {
+            outbound: "direct".to_string(),
+            dscp_mark: None,
+            routing_mark: None,
+            is_chain_packet: false,
+            match_info: None,
+        };
+
+        assert_eq!(dscp_update_value(&routing), None);
     }
 
     // ========================================================================
@@ -2327,6 +2523,7 @@ mod tests {
         // IPv6 packet (40 bytes header) + UDP header
         let mut packet = vec![0u8; 48];
         packet[0] = 0x60; // IPv6
+        packet[4..6].copy_from_slice(&(8u16.to_be_bytes())); // Payload length (UDP header)
         packet[6] = IPPROTO_UDP; // Next Header
         // Source IPv6 at bytes 8-23
         packet[8..24].copy_from_slice(&[

@@ -70,8 +70,8 @@
 //!
 //! 1. Decrypt incoming WireGuard packet
 //! 2. Extract DSCP from IP header using `chain/dscp::get_dscp()`
-//! 3. If DSCP > 0, map to routing mark using `rules/fwmark::ChainMark`
-//! 4. Otherwise, use rule engine for routing decision
+//! 3. If DSCP > 0 and matches a configured chain, route to that chain tag
+//! 4. Otherwise, clear DSCP and use rule engine for routing decision
 //!
 //! # References
 //!
