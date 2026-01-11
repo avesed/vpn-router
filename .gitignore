@@ -117,6 +117,8 @@ htmlcov/
 *.py,cover
 /config-node*
 /test-config-rust/
+test_dir/
+
 
 # Temporary test scripts in root directory
 /test_*.sh
