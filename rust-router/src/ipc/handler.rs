@@ -13,7 +13,7 @@ use super::protocol::{
     ChainState, DnsBlockStatsResponse, DnsCacheStatsResponse, DnsConfigResponse,
     DnsQueryLogResponse, DnsQueryResponse, DnsStatsResponse,
     DnsUpstreamInfo, DnsUpstreamStatusResponse, EcmpGroupListResponse, EcmpGroupStatus,
-    EcmpMemberStatus, ErrorCode, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
+    EcmpMemberStatus, ErrorCode, IngressStatsResponse, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
     PairingResponse, PeerListResponse, PeerState, PoolStatsResponse, PrepareResponse,
     PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus,
     Socks5PoolStats, TunnelType, UdpProcessorInfo, UdpSessionInfo, UdpSessionResponse,
@@ -32,6 +32,7 @@ use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::ecmp::group::EcmpGroupManager;
 use crate::egress::manager::WgEgressManager;
 use crate::ingress::manager::WgIngressManager;
+use crate::ingress::{ForwardingStats, IngressReplyStats};
 use crate::io::UdpBufferPool;
 use crate::outbound::OutboundManager;
 use crate::peer::manager::PeerManager;
@@ -186,6 +187,12 @@ pub struct IpcHandler {
     /// WireGuard ingress manager (Phase 6.3)
     wg_ingress_manager: Option<Arc<WgIngressManager>>,
 
+    /// WireGuard ingress forwarding stats (Phase 6.3)
+    ingress_forwarding_stats: Option<Arc<ForwardingStats>>,
+
+    /// WireGuard ingress reply stats (Phase 6.3)
+    ingress_reply_stats: Option<Arc<IngressReplyStats>>,
+
     /// WireGuard egress manager (Phase 6.4)
     wg_egress_manager: Option<Arc<WgEgressManager>>,
 
@@ -221,6 +228,8 @@ impl IpcHandler {
             peer_manager: None,
             ecmp_group_manager: None,
             wg_ingress_manager: None,
+            ingress_forwarding_stats: None,
+            ingress_reply_stats: None,
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -255,6 +264,8 @@ impl IpcHandler {
             peer_manager: None,
             ecmp_group_manager: None,
             wg_ingress_manager: None,
+            ingress_forwarding_stats: None,
+            ingress_reply_stats: None,
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -288,6 +299,8 @@ impl IpcHandler {
             peer_manager: None,
             ecmp_group_manager: None,
             wg_ingress_manager: None,
+            ingress_forwarding_stats: None,
+            ingress_reply_stats: None,
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -324,6 +337,8 @@ impl IpcHandler {
             peer_manager: None,
             ecmp_group_manager: None,
             wg_ingress_manager: None,
+            ingress_forwarding_stats: None,
+            ingress_reply_stats: None,
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -359,6 +374,17 @@ impl IpcHandler {
     /// This allows adding WireGuard ingress capability to an existing handler.
     pub fn with_wg_ingress_manager(mut self, wg_ingress_manager: Arc<WgIngressManager>) -> Self {
         self.wg_ingress_manager = Some(wg_ingress_manager);
+        self
+    }
+
+    /// Set ingress forwarding and reply statistics after construction
+    pub fn with_ingress_stats(
+        mut self,
+        forwarding_stats: Arc<ForwardingStats>,
+        reply_stats: Arc<IngressReplyStats>,
+    ) -> Self {
+        self.ingress_forwarding_stats = Some(forwarding_stats);
+        self.ingress_reply_stats = Some(reply_stats);
         self
     }
 
@@ -552,6 +578,9 @@ impl IpcHandler {
             }
             IpcCommand::ListIngressPeers => {
                 self.handle_list_ingress_peers()
+            }
+            IpcCommand::GetIngressStats => {
+                self.handle_get_ingress_stats()
             }
 
             // ECMP Group Management
@@ -2872,6 +2901,35 @@ impl IpcHandler {
         IpcResponse::IngressPeerList(IngressPeerListResponse { peers })
     }
 
+    /// Handle GetIngressStats command
+    ///
+    /// Returns ingress manager, forwarding, and reply statistics.
+    fn handle_get_ingress_stats(&self) -> IpcResponse {
+        let ingress_enabled = self.wg_ingress_manager.is_some();
+        let manager_stats = self.wg_ingress_manager.as_ref().map(|manager| manager.stats());
+        let forwarding_stats = if ingress_enabled {
+            self.ingress_forwarding_stats
+                .as_ref()
+                .map(|stats| stats.snapshot())
+        } else {
+            None
+        };
+        let reply_stats = if ingress_enabled {
+            self.ingress_reply_stats
+                .as_ref()
+                .map(|stats| stats.snapshot())
+        } else {
+            None
+        };
+
+        IpcResponse::IngressStats(IngressStatsResponse {
+            ingress_enabled,
+            manager_stats,
+            forwarding_stats,
+            reply_stats,
+        })
+    }
+
     // ========================================================================
     // Phase 6.9: ECMP Group Handler Implementations
     // ========================================================================
@@ -4079,9 +4137,16 @@ fn chrono_lite_format(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::config::ConnectionConfig;
+    use crate::ingress::config::WgIngressConfig;
+    use crate::ingress::manager::WgIngressManager;
+    use crate::ingress::{ForwardingStats, IngressReplyStats};
     use crate::ipc::protocol::{EgressAction, ErrorCode, RuleConfig};
-    use crate::rules::RuleType;
+    use crate::rules::{RuleEngine, RuleType};
+    use ipnet::IpNet;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
+
+    const TEST_VALID_KEY: &str = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=";
 
     fn create_test_handler() -> IpcHandler {
         let outbound_manager = Arc::new(OutboundManager::new());
@@ -4127,6 +4192,48 @@ mod tests {
         let rule_engine = Arc::new(RuleEngine::new(snapshot));
 
         IpcHandler::new(connection_manager, outbound_manager, rule_engine)
+    }
+
+    fn create_test_handler_with_ingress_stats() -> IpcHandler {
+        let outbound_manager = Arc::new(OutboundManager::new());
+        outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple("direct")));
+
+        let conn_config = ConnectionConfig::default();
+        let connection_manager = Arc::new(ConnectionManager::new(
+            &conn_config,
+            Arc::clone(&outbound_manager),
+            "direct".into(),
+            Duration::from_millis(300),
+        ));
+
+        let snapshot = RoutingSnapshotBuilder::new()
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
+        let rule_engine = Arc::new(RuleEngine::new(snapshot));
+
+        let allowed_subnet: IpNet = "10.25.0.0/24".parse().unwrap();
+        let ingress_config = WgIngressConfig::builder()
+            .private_key(TEST_VALID_KEY)
+            .listen_addr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                36100,
+            ))
+            .local_ip("10.25.0.1".parse().unwrap())
+            .allowed_subnet(allowed_subnet)
+            .build();
+
+        let ingress_manager = Arc::new(
+            WgIngressManager::new(ingress_config, Arc::clone(&rule_engine)).unwrap(),
+        );
+
+        let forwarding_stats = Arc::new(ForwardingStats::default());
+        let reply_stats = Arc::new(IngressReplyStats::default());
+
+        IpcHandler::new(connection_manager, outbound_manager, rule_engine)
+            .with_wg_ingress_manager(Arc::clone(&ingress_manager))
+            .with_ingress_stats(forwarding_stats, reply_stats)
     }
 
     #[tokio::test]
@@ -5265,6 +5372,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_get_ingress_stats_disabled() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetIngressStats).await;
+
+        if let IpcResponse::IngressStats(stats) = response {
+            assert!(!stats.ingress_enabled);
+            assert!(stats.manager_stats.is_none());
+            assert!(stats.forwarding_stats.is_none());
+            assert!(stats.reply_stats.is_none());
+        } else {
+            panic!("Expected IngressStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_ingress_stats_enabled() {
+        let handler = create_test_handler_with_ingress_stats();
+        let response = handler.handle(IpcCommand::GetIngressStats).await;
+
+        if let IpcResponse::IngressStats(stats) = response {
+            assert!(stats.ingress_enabled);
+            let manager_stats = stats.manager_stats.expect("manager stats");
+            assert_eq!(manager_stats.peer_count, 0);
+            assert!(stats.forwarding_stats.is_some());
+            assert!(stats.reply_stats.is_some());
+        } else {
+            panic!("Expected IngressStats response");
+        }
+    }
+
     // ========================================================================
     // Phase 6.6.5: Chain Management Tests
     // ========================================================================
@@ -5615,7 +5753,8 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_chain_route_success() {
         let handler = create_test_handler_with_chain_manager();
-        let config = create_test_chain_config("test-chain-10");
+        let mut config = create_test_chain_config("test-chain-10");
+        config.dscp_value = 10;
 
         let response = handler
             .handle(IpcCommand::PrepareChainRoute {
@@ -5637,6 +5776,7 @@ mod tests {
     async fn test_prepare_chain_route_invalid_config() {
         let handler = create_test_handler_with_chain_manager();
         let mut config = create_test_chain_config("test-chain-11");
+        config.dscp_value = 11;
         config.exit_egress = "direct".to_string(); // Invalid
 
         let response = handler
@@ -5658,7 +5798,8 @@ mod tests {
     #[tokio::test]
     async fn test_commit_chain_route_after_prepare() {
         let handler = create_test_handler_with_chain_manager();
-        let config = create_test_chain_config("test-chain-12");
+        let mut config = create_test_chain_config("test-chain-12");
+        config.dscp_value = 12;
 
         // Prepare first
         let response = handler
@@ -5686,7 +5827,8 @@ mod tests {
     #[tokio::test]
     async fn test_abort_chain_route() {
         let handler = create_test_handler_with_chain_manager();
-        let config = create_test_chain_config("test-chain-13");
+        let mut config = create_test_chain_config("test-chain-13");
+        config.dscp_value = 13;
 
         // Prepare first
         let response = handler

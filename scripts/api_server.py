@@ -13326,6 +13326,9 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
                 )
             return {"success": False, "message": f"iptables error: {str(e)}"}
 
+    except ValueError as e:
+        logging.warning(f"[tunnel-api] 链路路由参数错误: {e}")
+        return {"success": False, "message": str(e)}
     except sqlite3.IntegrityError as e:
         logging.error(f"[tunnel-api] 链路路由数据库约束错误: {e}")
         return {"success": False, "message": "Database constraint error"}
@@ -16214,6 +16217,27 @@ def api_relay_routing_prepare(request: Request, payload: RelayRouteRegisterReque
     if payload.mark_type != "dscp":
         return {"prepared": False, "error": f"Invalid mark_type: {payload.mark_type}. Only 'dscp' is supported."}
 
+    # 验证中继节点 DSCP 是否已被占用
+    try:
+        from relay_config_manager import get_relay_manager
+
+        relay_mgr = get_relay_manager(db)
+        for rule in relay_mgr.get_active_rules():
+            if (
+                rule.get("mark_type") == payload.mark_type
+                and rule.get("dscp_value") == payload.dscp_value
+                and rule.get("chain_tag") != payload.chain_tag
+            ):
+                return {
+                    "prepared": False,
+                    "error": (
+                        f"DSCP value {payload.dscp_value} already used by chain "
+                        f"'{rule.get('chain_tag')}'"
+                    ),
+                }
+    except ImportError:
+        return {"prepared": False, "error": "Relay config manager unavailable"}
+
     # 验证源节点和目标节点存在且已连接
     source_peer = _resolve_peer_node(db, payload.source_node, client_ip)
     target_peer = _resolve_peer_node(db, payload.target_node)
@@ -17375,17 +17399,15 @@ def api_activate_chain(tag: str):
                             f"({config['source']} -> {config['target']})"
                         )
 
-        # Phase 5 Issue 28: 检查中继结果，如果全部失败则中止激活
+        # Phase 5 Issue 28: 检查中继结果，任意失败则中止激活
         if relay_results:
-            successful_relays = sum(1 for r in relay_results if r.get("success"))
-            failed_relays = len(relay_results) - successful_relays
+            failed_relays = [r for r in relay_results if not r.get("success")]
 
-            if successful_relays == 0:
-                # 所有中继节点配置失败 - 中止激活
-                failed_nodes = [r["node"] for r in relay_results]
-                logging.error(f"[chains] 所有中继节点配置失败: {failed_nodes}")
+            if failed_relays:
+                failed_nodes = [r["node"] for r in failed_relays]
+                logging.error(f"[chains] 中继节点配置失败，中止激活: {failed_nodes}")
 
-                # 回滚: 注销已成功注册的终端路由
+                # 回滚: 注销终端和已成功的中继路由
                 try:
                     if client:
                         client.unregister_chain_route(
@@ -17395,18 +17417,21 @@ def api_activate_chain(tag: str):
                             target_node=terminal_tag if via_relay else None,
                             source_node=local_node_id,  # Phase 11-Fix.V.3
                         )
+                    for relay_result in relay_results:
+                        if relay_result.get("success"):
+                            relay_tag = relay_result["node"]
+                            relay_client = client_mgr.get_client(relay_tag)
+                            if relay_client:
+                                relay_client.unregister_relay_route(
+                                    chain_tag=tag,
+                                    source_node=local_node_id,  # Phase 11-Fix.V.3
+                                )
                 except Exception as rollback_err:
-                    logging.warning(f"[chains] 回滚终端路由时出错: {rollback_err}")
+                    logging.warning(f"[chains] 回滚中继路由时出错: {rollback_err}")
 
                 raise HTTPException(
                     status_code=503,
-                    detail=f"所有中继节点配置失败: {', '.join(failed_nodes)}"
-                )
-            elif failed_relays > 0:
-                # 部分成功 - 继续但警告
-                logging.warning(
-                    f"[chains] 链路 '{tag}' 部分中继节点配置失败: "
-                    f"{failed_relays}/{len(relay_results)} 失败"
+                    detail=f"中继节点配置失败: {', '.join(failed_nodes)}"
                 )
 
         # Phase 4 Issue 3 修复: 设置入口节点 DSCP 规则

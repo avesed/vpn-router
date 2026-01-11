@@ -421,6 +421,7 @@ async fn main() -> Result<()> {
     let reply_router_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
         Arc::new(parking_lot::RwLock::new(None));
     let reply_stats = Arc::new(rust_router::ingress::IngressReplyStats::default());
+    let forwarding_stats = Arc::new(rust_router::ingress::ForwardingStats::default());
 
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
         let reply_router_tx = Arc::clone(&reply_router_tx);
@@ -492,6 +493,7 @@ async fn main() -> Result<()> {
                     "Created WgIngressManager (userspace WireGuard on port {})",
                     phase6_config.wg_listen_port
                 );
+                manager.set_chain_manager(Arc::clone(&chain_manager));
                 Some(Arc::new(manager))
             }
             Err(e) => {
@@ -534,7 +536,8 @@ async fn main() -> Result<()> {
         .with_peer_manager(Arc::clone(&peer_manager))
         .with_chain_manager(Arc::clone(&chain_manager), phase6_config.node_tag.clone())
         .with_ecmp_group_manager(Arc::clone(&ecmp_group_manager))
-        .with_wg_egress_manager(Arc::clone(&wg_egress_manager));
+        .with_wg_egress_manager(Arc::clone(&wg_egress_manager))
+        .with_ingress_stats(Arc::clone(&forwarding_stats), Arc::clone(&reply_stats));
 
     // Add WireGuard ingress manager if available
     let ipc_handler = if let Some(ref ingress_mgr) = wg_ingress_manager {
@@ -692,8 +695,6 @@ async fn main() -> Result<()> {
     // Track forwarding task handle for graceful shutdown
     let mut forwarding_task_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let forwarding_stats: Option<Arc<rust_router::ingress::ForwardingStats>> = None;
-    let _forwarding_stats = forwarding_stats; // Silence unused warning until IPC integration
 
     if let Some(ref ingress_mgr) = wg_ingress_manager {
         info!("Starting userspace WireGuard ingress...");
@@ -720,7 +721,7 @@ async fn main() -> Result<()> {
                         std::time::Duration::from_secs(300), // 5 minute session TTL
                     ),
                 );
-                let fwd_stats = Arc::new(rust_router::ingress::ForwardingStats::default());
+                let fwd_stats = Arc::clone(&forwarding_stats);
 
                 let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1024);
                 *reply_router_tx.write() = Some(reply_tx);
@@ -745,8 +746,6 @@ async fn main() -> Result<()> {
                 reply_task_handle = Some(reply_handle);
                 info!("Ingress packet forwarding task started");
                 forwarding_task_handle = Some(forward_handle);
-                // Store stats for future IPC integration
-                // forwarding_stats = Some(fwd_stats);
             } else {
                 warn!("Failed to take packet receiver from WireGuard ingress - forwarding disabled");
             }

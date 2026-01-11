@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::OutboundConfig;
 use crate::connection::StatsSnapshot;
+use crate::ingress::{ForwardingStatsSnapshot, IngressReplyStatsSnapshot, WgIngressStats};
 
 /// IPC command types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +328,11 @@ pub enum IpcCommand {
     ///
     /// Returns a list of all peers registered with the ingress.
     ListIngressPeers,
+
+    /// Get userspace WireGuard ingress statistics
+    ///
+    /// Returns ingress manager, forwarding, and reply statistics when available.
+    GetIngressStats,
 
     // ========================================================================
     // Phase 6.0: IPC Protocol v3.0 - ECMP Group Management
@@ -873,6 +879,9 @@ pub enum IpcResponse {
 
     /// Phase 11-Fix.AA: Ingress peer list response
     IngressPeerList(IngressPeerListResponse),
+
+    /// Userspace WireGuard ingress statistics response
+    IngressStats(IngressStatsResponse),
 
     /// ECMP group status response
     EcmpGroupStatus(EcmpGroupStatus),
@@ -1968,6 +1977,19 @@ pub struct IngressPeerInfo {
 pub struct IngressPeerListResponse {
     /// List of ingress peers
     pub peers: Vec<IngressPeerInfo>,
+}
+
+/// Response containing ingress statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressStatsResponse {
+    /// Whether userspace WireGuard ingress is enabled
+    pub ingress_enabled: bool,
+    /// Ingress manager statistics (if enabled)
+    pub manager_stats: Option<WgIngressStats>,
+    /// Forwarding loop statistics (if available)
+    pub forwarding_stats: Option<ForwardingStatsSnapshot>,
+    /// Reply router statistics (if available)
+    pub reply_stats: Option<IngressReplyStatsSnapshot>,
 }
 
 /// Response containing an ECMP group list

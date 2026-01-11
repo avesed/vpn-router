@@ -1306,25 +1306,59 @@ impl ChainManager {
         // Step 2: Validate the chain configuration
         self.validate_chain(&config)?;
 
-        // Step 3: Check if chain already exists
-        {
+        // Step 3: Validate tag and DSCP value
+        if config.tag != chain_tag {
+            return Err(ChainError::InvalidTag(chain_tag.to_string()));
+        }
+
+        if config.dscp_value == 0 {
+            return Err(ChainError::InvalidDscp(config.dscp_value));
+        }
+
+        // Step 4: Pre-check existing state and DSCP usage
+        let (existing_state, existing_dscp, dscp_conflict) = {
             let chains = self
                 .chains
                 .read()
                 .map_err(|e| ChainError::LockError(e.to_string()))?;
 
-            if let Some(existing) = chains.get(chain_tag) {
-                // Chain exists - must be in Inactive state to re-prepare
-                if existing.state != ChainState::Inactive {
-                    return Err(ChainError::AlreadyActive(chain_tag.to_string()));
-                }
+            let existing = chains.get(chain_tag);
+            let existing_state = existing.map(|chain| chain.state.clone());
+            let existing_dscp = existing.map(|chain| chain.allocated_dscp);
+            let dscp_conflict = chains.iter().any(|(tag, chain)| {
+                tag.as_str() != chain_tag && chain.allocated_dscp == config.dscp_value
+            });
+
+            (existing_state, existing_dscp, dscp_conflict)
+        };
+
+        if dscp_conflict {
+            return Err(ChainError::DscpConflict(config.dscp_value));
+        }
+
+        if let Some(state) = existing_state {
+            if state != ChainState::Inactive {
+                return Err(ChainError::AlreadyActive(chain_tag.to_string()));
             }
         }
 
-        // Step 4: Determine our role
+        if let Some(existing_dscp) = existing_dscp {
+            if existing_dscp != config.dscp_value {
+                return Err(ChainError::DscpConflict(config.dscp_value));
+            }
+        }
+
+        // Step 5: Reserve DSCP if needed (align lock order with create_chain)
+        let mut reserved = false;
+        if !self.dscp_allocator.is_allocated(config.dscp_value) {
+            self.dscp_allocator.reserve(config.dscp_value)?;
+            reserved = true;
+        }
+
+        // Step 6: Determine our role
         let my_role = our_hop.map(|hop| hop.role.clone());
 
-        // Step 5: Store the chain config (still Inactive until COMMIT)
+        // Step 7: Store the chain config (still Inactive until COMMIT)
         let internal_state = ChainStateInternal {
             config: config.clone(),
             state: ChainState::Inactive,
@@ -1337,13 +1371,40 @@ impl ChainManager {
                 .unwrap_or(0),
         };
 
-        {
+        let insert_result: Result<(), ChainError> = (|| {
             let mut chains = self
                 .chains
                 .write()
                 .map_err(|e| ChainError::LockError(e.to_string()))?;
 
+            if let Some(existing) = chains.get(chain_tag) {
+                if existing.state != ChainState::Inactive {
+                    return Err(ChainError::AlreadyActive(chain_tag.to_string()));
+                }
+                if existing.allocated_dscp != config.dscp_value {
+                    return Err(ChainError::DscpConflict(config.dscp_value));
+                }
+            }
+
+            if chains.iter().any(|(tag, chain)| {
+                tag.as_str() != chain_tag && chain.allocated_dscp == config.dscp_value
+            }) {
+                return Err(ChainError::DscpConflict(config.dscp_value));
+            }
+
+            if chains.get(chain_tag).is_none() && !reserved {
+                return Err(ChainError::DscpConflict(config.dscp_value));
+            }
+
             chains.insert(chain_tag.to_string(), internal_state);
+            Ok(())
+        })();
+
+        if let Err(err) = insert_result {
+            if reserved {
+                self.dscp_allocator.release(config.dscp_value);
+            }
+            return Err(err);
         }
 
         debug!("PREPARE succeeded for chain {}", chain_tag);
@@ -1423,7 +1484,7 @@ impl ChainManager {
         let _ = self.teardown_local_routing(chain_tag);
 
         // Step 2: Check if we need to clean up the chain
-        {
+        let removed_dscp = {
             let mut chains = self
                 .chains
                 .write()
@@ -1433,10 +1494,20 @@ impl ChainManager {
                 // Only remove if it was just prepared (still Inactive)
                 // If it's somehow Active, don't remove it
                 if chain.state == ChainState::Inactive {
+                    let dscp = chain.allocated_dscp;
                     chains.remove(chain_tag);
                     debug!("Removed prepared chain {} on ABORT", chain_tag);
+                    Some(dscp)
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+
+        if let Some(dscp) = removed_dscp {
+            self.dscp_allocator.release(dscp);
         }
 
         debug!("ABORT handled for chain {}", chain_tag);
@@ -1459,6 +1530,9 @@ impl ChainManager {
 mod tests {
     use super::*;
     use crate::ipc::ChainHop;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     /// Helper to create a valid chain config for testing
     fn create_test_config(tag: &str, dscp: u8) -> ChainConfig {
@@ -1955,6 +2029,77 @@ mod tests {
         let result = manager.create_chain(config2).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);
+    }
+
+    // =========================================================================
+    // 2PC prepare/abort tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_prepare_reserves_and_abort_releases_dscp() {
+        let manager = ChainManager::new("node-a".to_string());
+        let config = create_test_config("test-chain", 42);
+
+        manager
+            .handle_prepare_request("test-chain", config, "coordinator-node")
+            .await
+            .unwrap();
+        assert!(manager.dscp_allocator().is_allocated(42));
+
+        manager
+            .handle_abort_request("test-chain", "coordinator-node")
+            .await
+            .unwrap();
+        assert!(!manager.dscp_allocator().is_allocated(42));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_rejects_duplicate_dscp() {
+        let manager = ChainManager::new("node-a".to_string());
+        let config = create_test_config("chain-a", 42);
+
+        manager
+            .handle_prepare_request("chain-a", config, "coordinator-node")
+            .await
+            .unwrap();
+
+        let config = create_test_config("chain-b", 42);
+        let result = manager
+            .handle_prepare_request("chain-b", config, "coordinator-node")
+            .await;
+
+        assert!(matches!(result, Err(ChainError::DscpConflict(42))));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_create_no_deadlock() {
+        let manager = Arc::new(ChainManager::new("node-a".to_string()));
+        let prepare_manager = Arc::clone(&manager);
+        let create_manager = Arc::clone(&manager);
+
+        let prepare = tokio::spawn(async move {
+            let config = create_test_config("chain-prepare", 41);
+            prepare_manager
+                .handle_prepare_request("chain-prepare", config, "coordinator-node")
+                .await
+        });
+
+        let create = tokio::spawn(async move {
+            let config = create_test_config("chain-create", 42);
+            create_manager.create_chain(config).await
+        });
+
+        let result = timeout(Duration::from_secs(2), async {
+            let prepare_result = prepare.await.unwrap();
+            let create_result = create.await.unwrap();
+            (prepare_result, create_result)
+        })
+        .await;
+
+        assert!(result.is_ok());
+        let (prepare_result, create_result) = result.unwrap();
+        assert!(prepare_result.is_ok());
+        assert!(create_result.is_ok());
     }
 
     // =========================================================================

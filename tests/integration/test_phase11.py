@@ -519,6 +519,35 @@ class TestCascadeDelete:
 
 # ============ 单元测试：模块导入 ============
 
+class TestRelayConfigManager:
+    """验证中继配置管理器的 DSCP 冲突处理"""
+
+    def test_relay_rejects_duplicate_dscp(self):
+        from relay_config_manager import RelayConfigManager, RelayRule
+
+        manager = RelayConfigManager()
+        manager._rules["chain-a"] = RelayRule(
+            chain_tag="chain-a",
+            source_interface="wg-peer-a",
+            target_interface="wg-peer-b",
+            dscp_value=10,
+            mark_type="dscp",
+            fwmark=400,
+            table_id=400,
+            active=True,
+        )
+
+        success = manager.setup_relay_route(
+            chain_tag="chain-b",
+            source_interface="wg-peer-a",
+            target_interface="wg-peer-c",
+            dscp_value=10,
+            mark_type="dscp",
+        )
+
+        assert success is False
+
+
 class TestModuleImports:
     """验证关键模块可以正常导入"""
 

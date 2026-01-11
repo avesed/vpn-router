@@ -98,6 +98,7 @@ use crate::io::{BatchConfig, BatchReceiver};
 use super::config::{WgIngressConfig, WgIngressPeerConfig};
 use super::error::{IngressError, IngressResult};
 use super::processor::{IngressProcessor, RoutingDecision};
+use crate::chain::ChainManager;
 use crate::rules::RuleEngine;
 
 /// Default buffer size for UDP receive
@@ -843,6 +844,11 @@ impl WgIngressManager {
     #[must_use]
     pub fn processor(&self) -> &Arc<IngressProcessor> {
         &self.processor
+    }
+
+    /// Attach a chain manager for terminal DSCP handling
+    pub fn set_chain_manager(&self, chain_manager: Arc<ChainManager>) {
+        self.processor.set_chain_manager(chain_manager);
     }
 
     /// Get the listen address

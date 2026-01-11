@@ -269,6 +269,30 @@ async fn test_ipc_high_frequency_stats() {
 }
 
 #[tokio::test]
+async fn test_ipc_high_frequency_ingress_stats() {
+    let handler = create_stress_test_handler();
+
+    let start = Instant::now();
+    let count = 2_000;
+
+    for _ in 0..count {
+        let response = handler.handle(IpcCommand::GetIngressStats).await;
+        assert!(matches!(response, IpcResponse::IngressStats(_)));
+    }
+
+    let elapsed = start.elapsed();
+    let per_op = elapsed.as_nanos() / count as u128;
+
+    println!(
+        "IPC GetIngressStats: {} ops in {:?}, {} ns/op",
+        count, elapsed, per_op
+    );
+
+    // Should be < 10μs per GetIngressStats
+    assert!(per_op < 10_000, "IPC GetIngressStats too slow: {} ns", per_op);
+}
+
+#[tokio::test]
 async fn test_ipc_concurrent_commands() {
     let handler = Arc::new(create_stress_test_handler());
     let success_count = Arc::new(AtomicU64::new(0));

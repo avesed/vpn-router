@@ -94,6 +94,20 @@ class RelayConfigManager:
                 logger.warning(f"[relay] 链路 '{chain_tag}' 的中继规则已存在")
                 return True
 
+            if any(
+                rule.dscp_value == dscp_value and rule.mark_type == mark_type
+                for rule in self._rules.values()
+            ):
+                conflict = next(
+                    rule
+                    for rule in self._rules.values()
+                    if rule.dscp_value == dscp_value and rule.mark_type == mark_type
+                )
+                logger.error(
+                    f"[relay] DSCP={dscp_value} 已被链路 '{conflict.chain_tag}' 使用，拒绝重复注册"
+                )
+                return False
+
             # 分配 fwmark 和路由表
             fwmark = self._allocate_fwmark()
             if fwmark < 0:

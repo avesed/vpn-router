@@ -1723,7 +1723,7 @@ class RustRouterClient:
     async def prepare_chain_route(
         self,
         chain_tag: str,
-        dscp_value: int,
+        config: Dict[str, Any],
         source_node: str,
     ) -> IpcResponse:
         """PREPARE phase of 2PC for chain route registration.
@@ -1732,23 +1732,24 @@ class RustRouterClient:
 
         Args:
             chain_tag: Chain tag
-            dscp_value: DSCP value for this chain (1-63)
+            config: Full chain configuration payload
             source_node: Tag of the node initiating the request
 
         Returns:
             IpcResponse indicating if PREPARE succeeded
         """
+        payload = dict(config)
+        payload["tag"] = chain_tag
         return await self._send_command({
             "type": "prepare_chain_route",
             "chain_tag": chain_tag,
-            "dscp_value": dscp_value,
+            "config": payload,
             "source_node": source_node,
         })
 
     async def commit_chain_route(
         self,
         chain_tag: str,
-        dscp_value: int,
         source_node: str,
     ) -> IpcResponse:
         """COMMIT phase of 2PC for chain route registration.
@@ -1757,7 +1758,6 @@ class RustRouterClient:
 
         Args:
             chain_tag: Chain tag
-            dscp_value: DSCP value for this chain
             source_node: Tag of the node initiating the request
 
         Returns:
@@ -1766,7 +1766,6 @@ class RustRouterClient:
         return await self._send_command({
             "type": "commit_chain_route",
             "chain_tag": chain_tag,
-            "dscp_value": dscp_value,
             "source_node": source_node,
         })
 
@@ -3094,27 +3093,37 @@ if __name__ == "__main__":
 
         async def test_prepare_chain_route_command_format(self):
             """Test prepare_chain_route (2PC PREPARE) command format"""
+            config = {
+                "tag": "chain-us",
+                "description": "Test chain",
+                "dscp_value": 10,
+                "hops": [],
+                "rules": [],
+                "exit_egress": "pia-us-east",
+                "allow_transitive": False,
+            }
             await self.client.prepare_chain_route(
                 chain_tag="chain-us",
-                dscp_value=10,
+                config=config,
                 source_node="node-a",
             )
 
             call_args = self.client._send_command.call_args[0][0]
             self.assertEqual(call_args["type"], "prepare_chain_route")
-            self.assertEqual(call_args["dscp_value"], 10)
+            self.assertEqual(call_args["config"]["tag"], "chain-us")
+            self.assertEqual(call_args["config"]["dscp_value"], 10)
             self.assertEqual(call_args["source_node"], "node-a")
 
         async def test_commit_chain_route_command_format(self):
             """Test commit_chain_route (2PC COMMIT) command format"""
             await self.client.commit_chain_route(
                 chain_tag="chain-us",
-                dscp_value=10,
                 source_node="node-a",
             )
 
             call_args = self.client._send_command.call_args[0][0]
             self.assertEqual(call_args["type"], "commit_chain_route")
+            self.assertNotIn("dscp_value", call_args)
 
         async def test_abort_chain_route_command_format(self):
             """Test abort_chain_route (2PC ABORT) command format"""

@@ -44,8 +44,9 @@
 //! the packet is part of a multi-hop chain. The processor:
 //!
 //! 1. Extracts the DSCP value from the IP header
-//! 2. Looks up the corresponding routing mark via `FwmarkRouter`
-//! 3. Returns a routing decision with the mark set
+//! 2. Looks up the corresponding chain tag via `FwmarkRouter`
+//! 3. If the local node is terminal, routes to the exit egress and clears DSCP
+//! 4. Otherwise returns a routing decision with the chain mark set
 //!
 //! # Example
 //!
@@ -66,10 +67,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use tracing::{debug, trace};
 
 use super::error::IngressError;
 use crate::chain::dscp::{get_dscp, DscpError, IPV4_MIN_HEADER_LEN, IPV6_MIN_HEADER_LEN};
+use crate::chain::ChainManager;
+use crate::ipc::ChainRole;
 use crate::rules::engine::{ConnectionInfo, MatchResult, RuleEngine};
 use crate::rules::fwmark::ChainMark;
 
@@ -185,6 +189,8 @@ impl Default for RoutingDecision {
 pub struct IngressProcessor {
     /// Rule engine for routing decisions
     rule_engine: Arc<RuleEngine>,
+    /// Optional chain manager for terminal routing decisions
+    chain_manager: Arc<RwLock<Option<Arc<ChainManager>>>>,
 }
 
 impl IngressProcessor {
@@ -202,7 +208,10 @@ impl IngressProcessor {
     /// ```
     #[must_use]
     pub fn new(rule_engine: Arc<RuleEngine>) -> Self {
-        Self { rule_engine }
+        Self {
+            rule_engine,
+            chain_manager: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// Process a decrypted packet and return a routing decision
@@ -259,6 +268,34 @@ impl IngressProcessor {
                 .chains()
                 .find(|(_, chain_mark)| chain_mark.dscp_value == dscp)
             {
+                if let Some(chain_manager) = self.chain_manager.read().clone() {
+                    if chain_manager.get_chain_role(chain_tag) == Some(ChainRole::Terminal) {
+                        if let Some(config) = chain_manager.get_chain_config(chain_tag) {
+                            let exit_egress = config.exit_egress;
+                            trace!(
+                                peer = src_peer,
+                                dscp = dscp,
+                                chain_tag = chain_tag,
+                                exit_egress = %exit_egress,
+                                "Terminal chain packet detected"
+                            );
+                            return Ok(RoutingDecision {
+                                outbound: exit_egress,
+                                dscp_mark: Some(0),
+                                routing_mark: None,
+                                is_chain_packet: true,
+                                match_info: Some(format!("dscp:{} terminal", chain_mark.dscp_value)),
+                            });
+                        }
+
+                        debug!(
+                            peer = src_peer,
+                            chain_tag = chain_tag,
+                            "Terminal chain config missing; routing via chain tag"
+                        );
+                    }
+                }
+
                 trace!(
                     peer = src_peer,
                     dscp = dscp,
@@ -509,6 +546,11 @@ impl IngressProcessor {
         &self.rule_engine
     }
 
+    /// Attach a chain manager for terminal routing decisions
+    pub fn set_chain_manager(&self, chain_manager: Arc<ChainManager>) {
+        *self.chain_manager.write() = Some(chain_manager);
+    }
+
     /// Update the rule engine (for hot-reload)
     pub fn set_rule_engine(&mut self, rule_engine: Arc<RuleEngine>) {
         self.rule_engine = rule_engine;
@@ -519,6 +561,7 @@ impl std::fmt::Debug for IngressProcessor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngressProcessor")
             .field("rule_engine_version", &self.rule_engine.version())
+            .field("chain_manager_set", &self.chain_manager.read().is_some())
             .finish()
     }
 }
@@ -527,8 +570,11 @@ impl std::fmt::Debug for IngressProcessor {
 mod tests {
     use super::*;
     use crate::chain::dscp::set_dscp;
+    use crate::chain::ChainManager;
+    use crate::ipc::{ChainConfig, ChainHop, ChainRole, TunnelType};
     use crate::rules::engine::RoutingSnapshotBuilder;
     use crate::rules::RuleType;
+    use tokio::runtime::Runtime;
 
     // Helper to create a simple rule engine
     fn create_test_engine() -> Arc<RuleEngine> {
@@ -826,6 +872,53 @@ mod tests {
         assert_eq!(decision.outbound, "test-chain");
         assert!(decision.is_chain());
         assert_eq!(decision.dscp_mark, Some(10));
+    }
+
+    #[test]
+    fn test_process_dscp_packet_terminal_clears_dscp() {
+        let mut builder = RoutingSnapshotBuilder::new();
+        builder.add_chain_with_dscp("test-chain", 10).unwrap();
+        let snapshot = builder.default_outbound("direct").build().unwrap();
+        let engine = Arc::new(RuleEngine::new(snapshot));
+
+        let chain_manager = Arc::new(ChainManager::new("terminal-node".to_string()));
+        let config = ChainConfig {
+            tag: "test-chain".to_string(),
+            description: "Terminal chain".to_string(),
+            dscp_value: 10,
+            hops: vec![
+                ChainHop {
+                    node_tag: "entry-node".to_string(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "terminal-node".to_string(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            ],
+            rules: vec![],
+            exit_egress: "pia-us-east".to_string(),
+            allow_transitive: false,
+        };
+
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            chain_manager.create_chain(config).await.unwrap();
+        });
+
+        let processor = IngressProcessor::new(engine);
+        processor.set_chain_manager(Arc::clone(&chain_manager));
+
+        let mut packet = create_ipv4_tcp_packet("10.25.0.2", "8.8.8.8", 443);
+        set_dscp(&mut packet, 10).unwrap();
+
+        let decision = processor.process(&packet, "test-peer").unwrap();
+        assert_eq!(decision.outbound, "pia-us-east");
+        assert!(decision.is_chain());
+        assert_eq!(decision.dscp_mark, Some(0));
+        assert!(decision.routing_mark.is_none());
     }
 
     #[test]

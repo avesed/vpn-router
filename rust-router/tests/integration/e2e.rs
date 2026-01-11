@@ -27,7 +27,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rust_router::ipc::{decode_message, encode_message, ErrorCode, IpcCommand, IpcError, IpcResponse};
+use rust_router::ipc::{
+    decode_message, encode_message, ErrorCode, IngressStatsResponse, IpcCommand, IpcError,
+    IpcResponse,
+};
 use rust_router::rules::{
     ConnectionInfo, RuleEngine, RuleType, RoutingSnapshotBuilder,
 };
@@ -361,6 +364,7 @@ mod e2e_ipc {
             IpcCommand::Ping,
             IpcCommand::Status,
             IpcCommand::GetStats,
+            IpcCommand::GetIngressStats,
             IpcCommand::ListOutbounds,
             IpcCommand::Shutdown { drain_timeout_secs: Some(30) },
             IpcCommand::Shutdown { drain_timeout_secs: None },
@@ -392,6 +396,12 @@ mod e2e_ipc {
             IpcResponse::Error(IpcError {
                 code: ErrorCode::Unknown,
                 message: "Test error".to_string(),
+            }),
+            IpcResponse::IngressStats(IngressStatsResponse {
+                ingress_enabled: false,
+                manager_stats: None,
+                forwarding_stats: None,
+                reply_stats: None,
             }),
         ];
 

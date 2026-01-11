@@ -4013,6 +4013,15 @@ class UserDatabase:
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            existing = cursor.execute(
+                "SELECT chain_tag FROM chain_routing WHERE mark_value = ? AND mark_type = ?",
+                (mark_value, mark_type),
+            ).fetchone()
+            if existing and existing[0] != chain_tag:
+                raise ValueError(
+                    f"Mark value {mark_value} ({mark_type}) already registered to chain '{existing[0]}'"
+                )
+
             cursor.execute("""
                 INSERT INTO chain_routing (chain_tag, mark_value, mark_type, egress_tag, source_node)
                 VALUES (?, ?, ?, ?, ?)
@@ -4030,7 +4039,7 @@ class UserDatabase:
     ) -> int:
         """添加或更新链路路由 (原子操作)
 
-        使用 INSERT OR REPLACE 确保原子性，避免竞态条件。
+        使用显式 UPDATE/INSERT 更新同一链路记录，避免覆盖其他链路。
         如果路由已存在（相同 chain_tag + mark_value + mark_type），则更新。
 
         Args:
@@ -4059,13 +4068,40 @@ class UserDatabase:
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            # 使用 INSERT OR REPLACE 实现原子 upsert
-            # chain_routing 表的 UNIQUE 约束在 (chain_tag, mark_value, mark_type) 上
-            cursor.execute("""
-                INSERT OR REPLACE INTO chain_routing
+            existing = cursor.execute(
+                "SELECT chain_tag FROM chain_routing WHERE mark_value = ? AND mark_type = ?",
+                (mark_value, mark_type),
+            ).fetchone()
+            if existing and existing[0] != chain_tag:
+                raise ValueError(
+                    f"Mark value {mark_value} ({mark_type}) already registered to chain '{existing[0]}'"
+                )
+
+            existing_row = cursor.execute(
+                "SELECT id FROM chain_routing WHERE chain_tag = ? AND mark_value = ? AND mark_type = ?",
+                (chain_tag, mark_value, mark_type),
+            ).fetchone()
+
+            if existing_row:
+                cursor.execute(
+                    """
+                    UPDATE chain_routing
+                    SET egress_tag = ?, source_node = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (egress_tag, source_node, existing_row[0]),
+                )
+                conn.commit()
+                return existing_row[0]
+
+            cursor.execute(
+                """
+                INSERT INTO chain_routing
                     (chain_tag, mark_value, mark_type, egress_tag, source_node, updated_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            """, (chain_tag, mark_value, mark_type, egress_tag, source_node))
+                """,
+                (chain_tag, mark_value, mark_type, egress_tag, source_node),
+            )
             conn.commit()
             return cursor.lastrowid
 

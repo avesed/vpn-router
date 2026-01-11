@@ -633,6 +633,7 @@ CREATE TABLE IF NOT EXISTS chain_routing (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(chain_tag, mark_value, mark_type)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_routing_unique_mark ON chain_routing(mark_value, mark_type);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_mark ON chain_routing(mark_value, mark_type);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_tag);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag);
@@ -1477,30 +1478,45 @@ def migrate_chain_routing_table(conn: sqlite3.Connection):
 
     # 检查 chain_routing 表是否存在
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chain_routing'")
-    if cursor.fetchone():
-        print("⊘ chain_routing 表已存在，跳过迁移")
-        return
+    table_exists = cursor.fetchone() is not None
+    if table_exists:
+        print("⊘ chain_routing 表已存在，跳过创建")
 
     # 创建表
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chain_routing (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chain_tag TEXT NOT NULL,
-            mark_value INTEGER NOT NULL,
-            mark_type TEXT NOT NULL DEFAULT 'dscp' CHECK(mark_type IN ('dscp', 'xray_email')),
-            egress_tag TEXT NOT NULL,
-            source_node TEXT,
-            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(chain_tag, mark_value, mark_type)
+    if not table_exists:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chain_routing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chain_tag TEXT NOT NULL,
+                mark_value INTEGER NOT NULL,
+                mark_type TEXT NOT NULL DEFAULT 'dscp' CHECK(mark_type IN ('dscp', 'xray_email')),
+                egress_tag TEXT NOT NULL,
+                source_node TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chain_tag, mark_value, mark_type)
+            )
+        """)
+
+    try:
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_routing_unique_mark ON chain_routing(mark_value, mark_type)"
         )
-    """)
+        print("✓ 创建 chain_routing 唯一索引 (mark_value, mark_type)")
+    except sqlite3.IntegrityError as e:
+        raise RuntimeError(
+            "Duplicate chain_routing marks detected; clean up duplicates before migration"
+        ) from e
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_mark ON chain_routing(mark_value, mark_type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_tag)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_chain_routing_source_node ON chain_routing(source_node)")
     conn.commit()
-    print("✓ 创建 chain_routing 表")
+    if table_exists:
+        print("✓ 更新 chain_routing 索引")
+    else:
+        print("✓ 创建 chain_routing 表")
 
 
 def migrate_peer_nodes_bidirectional_fields(conn: sqlite3.Connection):

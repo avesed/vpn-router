@@ -1971,7 +1971,54 @@ pub fn spawn_reply_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingress::config::WgIngressConfig;
+    use crate::ingress::config::WgIngressPeerConfig;
     use crate::ingress::processor::RoutingDecision;
+    use crate::rules::engine::RoutingSnapshotBuilder;
+    use crate::rules::RuleEngine;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    const TEST_VALID_KEY: &str = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=";
+
+    fn create_test_engine() -> Arc<RuleEngine> {
+        let snapshot = RoutingSnapshotBuilder::new()
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
+        Arc::new(RuleEngine::new(snapshot))
+    }
+
+    fn create_test_ingress_manager() -> Arc<WgIngressManager> {
+        let config = WgIngressConfig::builder()
+            .private_key(TEST_VALID_KEY)
+            .listen_addr("127.0.0.1:0".parse().unwrap())
+            .local_ip("10.25.0.1".parse().unwrap())
+            .allowed_subnet("10.25.0.0/24".parse().unwrap())
+            .build();
+
+        Arc::new(WgIngressManager::new(config, create_test_engine()).unwrap())
+    }
+
+    async fn run_reply_router_once(
+        reply: ReplyPacket,
+        ingress_manager: Arc<WgIngressManager>,
+        session_tracker: Arc<IngressSessionTracker>,
+        stats: Arc<IngressReplyStats>,
+    ) {
+        let (tx, rx) = mpsc::channel(1);
+        let handle = tokio::spawn(run_reply_router_loop(
+            rx,
+            ingress_manager,
+            session_tracker,
+            stats,
+        ));
+
+        tx.send(reply).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+    }
 
     // ========================================================================
     // FiveTuple Tests
@@ -2192,6 +2239,171 @@ mod tests {
         };
 
         assert_eq!(dscp_update_value(&routing), None);
+    }
+
+    // ========================================================================
+    // Reply Router Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_reply_router_session_miss() {
+        let ingress_manager = create_test_ingress_manager();
+        let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+        let stats = Arc::new(IngressReplyStats::default());
+
+        let reply_packet = ReplyPacket {
+            packet: build_udp_packet(
+                Ipv4Addr::new(8, 8, 8, 8),
+                53,
+                Ipv4Addr::new(10, 25, 0, 2),
+                12345,
+                b"reply",
+            ),
+            tunnel_tag: "wg-test".to_string(),
+        };
+
+        run_reply_router_once(
+            reply_packet,
+            ingress_manager,
+            session_tracker,
+            Arc::clone(&stats),
+        )
+        .await;
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.session_misses, 1);
+        assert_eq!(snapshot.packets_forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reply_router_tunnel_mismatch() {
+        let ingress_manager = create_test_ingress_manager();
+        let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+        let stats = Arc::new(IngressReplyStats::default());
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let request_tuple = FiveTuple::new(client_ip, 12345, server_ip, 53, IPPROTO_UDP);
+
+        session_tracker.register(
+            request_tuple,
+            "test-peer".to_string(),
+            "127.0.0.1:12345".parse().unwrap(),
+            "wg-good".to_string(),
+            100,
+        );
+
+        let reply_packet = ReplyPacket {
+            packet: build_udp_packet(
+                Ipv4Addr::new(8, 8, 8, 8),
+                53,
+                Ipv4Addr::new(10, 25, 0, 2),
+                12345,
+                b"reply",
+            ),
+            tunnel_tag: "wg-bad".to_string(),
+        };
+
+        run_reply_router_once(
+            reply_packet,
+            ingress_manager,
+            session_tracker,
+            Arc::clone(&stats),
+        )
+        .await;
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.tunnel_mismatch, 1);
+        assert_eq!(snapshot.packets_forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reply_router_peer_ip_rejected() {
+        let ingress_manager = create_test_ingress_manager();
+        let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+        let stats = Arc::new(IngressReplyStats::default());
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let request_tuple = FiveTuple::new(client_ip, 12345, server_ip, 53, IPPROTO_UDP);
+
+        session_tracker.register(
+            request_tuple,
+            "test-peer".to_string(),
+            "127.0.0.1:12345".parse().unwrap(),
+            "wg-good".to_string(),
+            100,
+        );
+
+        let reply_packet = ReplyPacket {
+            packet: build_udp_packet(
+                Ipv4Addr::new(8, 8, 8, 8),
+                53,
+                Ipv4Addr::new(10, 25, 0, 2),
+                12345,
+                b"reply",
+            ),
+            tunnel_tag: "wg-good".to_string(),
+        };
+
+        run_reply_router_once(
+            reply_packet,
+            ingress_manager,
+            session_tracker,
+            Arc::clone(&stats),
+        )
+        .await;
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.peer_ip_rejected, 1);
+        assert_eq!(snapshot.packets_forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reply_router_send_error() {
+        let ingress_manager = create_test_ingress_manager();
+        ingress_manager
+            .add_peer(WgIngressPeerConfig::new(TEST_VALID_KEY, "10.25.0.2"))
+            .await
+            .unwrap();
+
+        let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+        let stats = Arc::new(IngressReplyStats::default());
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let request_tuple = FiveTuple::new(client_ip, 12345, server_ip, 53, IPPROTO_UDP);
+
+        session_tracker.register(
+            request_tuple,
+            TEST_VALID_KEY.to_string(),
+            "127.0.0.1:12345".parse().unwrap(),
+            "wg-good".to_string(),
+            100,
+        );
+
+        let reply_packet = ReplyPacket {
+            packet: build_udp_packet(
+                Ipv4Addr::new(8, 8, 8, 8),
+                53,
+                Ipv4Addr::new(10, 25, 0, 2),
+                12345,
+                b"reply",
+            ),
+            tunnel_tag: "wg-good".to_string(),
+        };
+
+        run_reply_router_once(
+            reply_packet,
+            ingress_manager,
+            session_tracker,
+            Arc::clone(&stats),
+        )
+        .await;
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.send_errors, 1);
+        assert_eq!(snapshot.packets_forwarded, 0);
     }
 
     // ========================================================================
