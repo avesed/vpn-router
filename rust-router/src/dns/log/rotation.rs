@@ -81,8 +81,7 @@ fn days_in_year(year: i32) -> u32 {
     // Use chrono's NaiveDate to determine days in year
     // Dec 31 of the year will have ordinal equal to days in year
     NaiveDate::from_ymd_opt(year, 12, 31)
-        .map(|d| d.ordinal())
-        .unwrap_or(365) // Fallback to 365 if year is invalid (extremely unlikely)
+        .map_or(365, |d| d.ordinal()) // Fallback to 365 if year is invalid (extremely unlikely)
 }
 
 // ============================================================================
@@ -325,32 +324,29 @@ impl LogRotator {
         let now: DateTime<Utc> = Utc::now();
         let day_of_year = now.ordinal();
 
-        match self.last_rotation_day {
-            Some(last_day) => {
-                // Handle year wrap-around with proper leap year calculation
-                let days_since = if day_of_year >= last_day {
-                    day_of_year - last_day
-                } else {
-                    // Year wrapped around - calculate days in the previous year
-                    // The previous year is (current_year - 1)
-                    let prev_year = now.year() - 1;
-                    let days_in_prev_year = days_in_year(prev_year);
-                    (days_in_prev_year - last_day) + day_of_year
-                };
+        if let Some(last_day) = self.last_rotation_day {
+            // Handle year wrap-around with proper leap year calculation
+            let days_since = if day_of_year >= last_day {
+                day_of_year - last_day
+            } else {
+                // Year wrapped around - calculate days in the previous year
+                // The previous year is (current_year - 1)
+                let prev_year = now.year() - 1;
+                let days_in_prev_year = days_in_year(prev_year);
+                (days_in_prev_year - last_day) + day_of_year
+            };
 
-                days_since >= self.rotation_days
-            }
-            None => {
-                // Never rotated - check if file exists and is from a previous day
-                if let Ok(metadata) = fs::metadata(&self.path) {
-                    if let Ok(modified) = metadata.modified() {
-                        let modified_time: DateTime<Utc> = modified.into();
-                        let age = now.signed_duration_since(modified_time);
-                        return age >= ChronoDuration::days(i64::from(self.rotation_days));
-                    }
+            days_since >= self.rotation_days
+        } else {
+            // Never rotated - check if file exists and is from a previous day
+            if let Ok(metadata) = fs::metadata(&self.path) {
+                if let Ok(modified) = metadata.modified() {
+                    let modified_time: DateTime<Utc> = modified.into();
+                    let age = now.signed_duration_since(modified_time);
+                    return age >= ChronoDuration::days(i64::from(self.rotation_days));
                 }
-                false
             }
+            false
         }
     }
 
@@ -403,8 +399,7 @@ impl LogRotator {
                 } else {
                     self.stats.record_error();
                     return Err(DnsError::internal(format!(
-                        "Failed to rotate log file: {}",
-                        e
+                        "Failed to rotate log file: {e}"
                     )));
                 }
             }
@@ -438,7 +433,7 @@ impl LogRotator {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("dns-queries.log");
-        path.set_file_name(format!("{}.{}", file_name, number));
+        path.set_file_name(format!("{file_name}.{number}"));
         path
     }
 
@@ -465,9 +460,9 @@ impl LogRotator {
         Ok(())
     }
 
-    /// Delete files older than max_files
+    /// Delete files older than `max_files`
     ///
-    /// Returns (files_deleted, bytes_freed)
+    /// Returns (`files_deleted`, `bytes_freed`)
     fn cleanup_old_files(&self) -> DnsResult<(u64, u64)> {
         let mut files_deleted = 0u64;
         let mut bytes_freed = 0u64;

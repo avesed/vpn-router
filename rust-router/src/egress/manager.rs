@@ -1,7 +1,7 @@
-//! WireGuard Egress Manager for Phase 6.4
+//! `WireGuard` Egress Manager for Phase 6.4
 //!
 //! This module provides the main `WgEgressManager` struct that manages
-//! multiple WireGuard egress tunnels, including creation, removal, and
+//! multiple `WireGuard` egress tunnels, including creation, removal, and
 //! packet sending.
 //!
 //! # Architecture
@@ -28,8 +28,8 @@
 //! # Lock Ordering
 //!
 //! When acquiring locks in `WgEgressManager`, follow this order:
-//! 1. `shutdown` (AtomicBool) - Check first, no lock needed
-//! 2. `tunnels` (RwLock) - Registry lock
+//! 1. `shutdown` (`AtomicBool`) - Check first, no lock needed
+//! 2. `tunnels` (`RwLock`) - Registry lock
 //! 3. Per-tunnel locks (see `UserspaceWgTunnel` lock ordering)
 //!
 //! # Example
@@ -135,7 +135,7 @@ pub struct WgEgressStats {
 
 /// Internal tunnel wrapper with metadata
 struct ManagedTunnel {
-    /// The underlying WireGuard tunnel
+    /// The underlying `WireGuard` tunnel
     tunnel: Arc<UserspaceWgTunnel>,
     /// Tunnel configuration
     config: WgEgressConfig,
@@ -178,7 +178,7 @@ impl ManagedTunnel {
     }
 }
 
-/// Manager for WireGuard egress tunnels
+/// Manager for `WireGuard` egress tunnels
 ///
 /// Provides centralized management of multiple egress tunnels with
 /// concurrent send operations and automatic reply handling.
@@ -213,7 +213,7 @@ struct EgressManagerStats {
     tunnels_removed: AtomicU64,
 }
 
-/// Helper struct for sending stats to spawned tasks in send_nowait
+/// Helper struct for sending stats to spawned tasks in `send_nowait`
 struct EgressSendStats {
     packets_sent: Arc<AtomicU64>,
     bytes_sent: Arc<AtomicU64>,
@@ -250,7 +250,7 @@ impl WgEgressManager {
 
     /// Create a new egress tunnel
     ///
-    /// Creates and connects a WireGuard tunnel with the given configuration.
+    /// Creates and connects a `WireGuard` tunnel with the given configuration.
     /// Spawns a background task to receive and handle reply packets.
     ///
     /// # Arguments
@@ -380,7 +380,7 @@ impl WgEgressManager {
 
     /// Spawn a background task to receive reply packets from the tunnel
     ///
-    /// This task continuously receives decrypted packets from the WireGuard tunnel
+    /// This task continuously receives decrypted packets from the `WireGuard` tunnel
     /// and forwards them to the reply handler for processing.
     ///
     /// # Arguments
@@ -391,7 +391,7 @@ impl WgEgressManager {
     ///
     /// # Returns
     ///
-    /// A tuple of (shutdown_sender, task_handle) for controlling the task.
+    /// A tuple of (`shutdown_sender`, `task_handle`) for controlling the task.
     fn spawn_reply_receiver(
         tag: String,
         tunnel: Arc<UserspaceWgTunnel>,
@@ -628,7 +628,7 @@ impl WgEgressManager {
 
     /// Send a packet through an egress tunnel
     ///
-    /// The packet will be encrypted using WireGuard and sent to the peer.
+    /// The packet will be encrypted using `WireGuard` and sent to the peer.
     ///
     /// # Arguments
     ///
@@ -663,8 +663,7 @@ impl WgEgressManager {
                 Some(managed) => {
                     if managed.is_draining() {
                         return Err(EgressError::send_failed(format!(
-                            "Tunnel '{}' is draining, no new traffic allowed",
-                            tag
+                            "Tunnel '{tag}' is draining, no new traffic allowed"
                         )));
                     }
                     managed.tunnel.clone()
@@ -686,8 +685,7 @@ impl WgEgressManager {
             Err(e) => {
                 self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
                 Err(EgressError::send_failed(format!(
-                    "Failed to send packet through tunnel '{}': {}",
-                    tag, e
+                    "Failed to send packet through tunnel '{tag}': {e}"
                 )))
             }
         }
@@ -965,8 +963,7 @@ impl WgEgressManager {
                 Some(managed) => {
                     if managed.is_draining() {
                         return Err(EgressError::send_failed(format!(
-                            "Tunnel '{}' is draining, no new traffic allowed",
-                            tag
+                            "Tunnel '{tag}' is draining, no new traffic allowed"
                         )));
                     }
                     (
@@ -1030,7 +1027,7 @@ impl WgEgressManager {
 
     /// Batch send using sendmmsg (Linux only)
     ///
-    /// Encrypts packets via the WireGuard tunnel and sends them in batches
+    /// Encrypts packets via the `WireGuard` tunnel and sends them in batches
     /// using the sendmmsg syscall for improved throughput.
     #[cfg(target_os = "linux")]
     async fn send_batch_linux(

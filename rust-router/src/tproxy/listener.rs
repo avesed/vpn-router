@@ -42,7 +42,7 @@ impl TproxyListener {
     /// Returns `TproxyError` if:
     /// - Socket creation fails
     /// - Binding fails
-    /// - CAP_NET_ADMIN capability is missing
+    /// - `CAP_NET_ADMIN` capability is missing
     pub fn bind(config: &ListenConfig) -> Result<Self, TproxyError> {
         info!("Creating TPROXY TCP listener on {}", config.address);
 
@@ -138,7 +138,7 @@ impl TproxyListener {
         }
     }
 
-    /// Get a reference to the underlying tokio TcpListener.
+    /// Get a reference to the underlying tokio `TcpListener`.
     ///
     /// This can be used for advanced operations like `poll_accept`.
     #[must_use]
@@ -173,7 +173,7 @@ impl TproxyListenerBuilder {
         self
     }
 
-    /// Set whether to use SO_REUSEPORT.
+    /// Set whether to use `SO_REUSEPORT`.
     #[must_use]
     pub const fn reuse_port(mut self, reuse: bool) -> Self {
         self.reuse_port = reuse;

@@ -13,14 +13,14 @@
 //!
 //! # Submodules
 //!
-//! - [`manager`]: ChainManager for lifecycle management (Phase 6.6)
+//! - [`manager`]: `ChainManager` for lifecycle management (Phase 6.6)
 //! - [`dscp`]: DSCP packet modification and allocation (Phase 6.6)
 //! - [`two_phase`]: Two-Phase Commit protocol (Phase 6.6)
 //! - [`allocator`]: DSCP value allocator (Phase 6.6)
 //!
 //! # Phase 6 Implementation Status
 //!
-//! - [x] 6.6.1 ChainManager structure
+//! - [x] 6.6.1 `ChainManager` structure
 //! - [x] 6.6.2 Chain activation/deactivation with 2PC
 //! - [x] 6.6.3 Two-Phase Commit protocol
 //! - [x] 6.6.4 DSCP allocation

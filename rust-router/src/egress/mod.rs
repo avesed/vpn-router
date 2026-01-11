@@ -1,14 +1,14 @@
-//! WireGuard Egress module for Phase 6.4
+//! `WireGuard` Egress module for Phase 6.4
 //!
-//! This module provides WireGuard egress functionality, allowing rust-router
-//! to create and manage outbound WireGuard tunnels (PIA, custom WG, peer tunnels).
+//! This module provides `WireGuard` egress functionality, allowing rust-router
+//! to create and manage outbound `WireGuard` tunnels (PIA, custom WG, peer tunnels).
 //!
 //! # Phase 6.4 Implementation Status
 //!
-//! - [x] WgEgressConfig configuration type
-//! - [x] EgressError error types
-//! - [x] WgReplyHandler for reply traffic
-//! - [x] WgEgressManager for tunnel management
+//! - [x] `WgEgressConfig` configuration type
+//! - [x] `EgressError` error types
+//! - [x] `WgReplyHandler` for reply traffic
+//! - [x] `WgEgressManager` for tunnel management
 //! - [x] Multi-tunnel support with concurrent operations
 //!
 //! # Architecture
@@ -74,13 +74,13 @@
 //! # Tunnel Types
 //!
 //! - **PIA**: Private Internet Access VPN tunnels
-//! - **Custom**: User-configured WireGuard endpoints
+//! - **Custom**: User-configured `WireGuard` endpoints
 //! - **Peer**: Inter-node peer tunnels for multi-hop routing
 //!
 //! # References
 //!
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.4
-//! - WireGuard Protocol: <https://www.wireguard.com/protocol/>
+//! - `WireGuard` Protocol: <https://www.wireguard.com/protocol/>
 
 pub mod config;
 pub mod error;

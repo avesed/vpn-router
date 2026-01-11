@@ -86,8 +86,8 @@ impl TunnelIpAllocator {
     pub fn new(subnet: &str) -> Self {
         let (network, prefix_len) = Self::parse_subnet(subnet).unwrap_or_else(|_| {
             // Fallback to default
-            let default = Self::parse_subnet(DEFAULT_TUNNEL_SUBNET).unwrap();
-            default
+            
+            Self::parse_subnet(DEFAULT_TUNNEL_SUBNET).unwrap()
         });
 
         Self {
@@ -235,7 +235,7 @@ impl TunnelIpAllocator {
     ///
     /// # Returns
     ///
-    /// A tuple of (local_ip, remote_ip) or an error if not enough IPs available.
+    /// A tuple of (`local_ip`, `remote_ip`) or an error if not enough IPs available.
     ///
     /// # Example
     ///
@@ -303,7 +303,7 @@ impl TunnelIpAllocator {
         let host_bits = !mask;
 
         // Total hosts minus network and broadcast
-        let total = if host_bits > 1 { host_bits - 1 } else { 0 } as usize;
+        let total = host_bits.saturating_sub(1) as usize;
         total.saturating_sub(self.allocated_count())
     }
 

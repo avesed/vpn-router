@@ -35,7 +35,7 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
 
     // Parse JSON
     let config: Config = serde_json::from_str(&contents).map_err(|e| {
-        ConfigError::ParseError(format!("Failed to parse JSON: {} at {:?}", e, path))
+        ConfigError::ParseError(format!("Failed to parse JSON: {e} at {path:?}"))
     })?;
 
     // Validate configuration
@@ -83,7 +83,7 @@ pub fn load_config_with_env(path: impl AsRef<Path>) -> Result<Config, ConfigErro
         config.listen.address = addr.parse().map_err(|_| {
             ConfigError::EnvError {
                 name: "RUST_ROUTER_LISTEN_ADDR".into(),
-                reason: format!("Invalid socket address: {}", addr),
+                reason: format!("Invalid socket address: {addr}"),
             }
         })?;
         debug!("Listen address overridden to {}", config.listen.address);
@@ -99,7 +99,7 @@ pub fn load_config_with_env(path: impl AsRef<Path>) -> Result<Config, ConfigErro
     if let Ok(max) = std::env::var("RUST_ROUTER_MAX_CONNECTIONS") {
         config.connection.max_connections = max.parse().map_err(|_| ConfigError::EnvError {
             name: "RUST_ROUTER_MAX_CONNECTIONS".into(),
-            reason: format!("Invalid number: {}", max),
+            reason: format!("Invalid number: {max}"),
         })?;
         debug!(
             "Max connections overridden to {}",
@@ -127,7 +127,7 @@ pub fn load_config_with_env(path: impl AsRef<Path>) -> Result<Config, ConfigErro
 pub fn create_default_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     let config = Config::default_config();
     let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| ConfigError::ParseError(format!("Failed to serialize config: {}", e)))?;
+        .map_err(|e| ConfigError::ParseError(format!("Failed to serialize config: {e}")))?;
 
     std::fs::write(path, json)?;
     Ok(())

@@ -1,4 +1,4 @@
-//! WireGuard handshake tracking with exponential backoff
+//! `WireGuard` handshake tracking with exponential backoff
 //!
 //! This module provides handshake state tracking and retry logic to prevent
 //! busy loops when connecting to unreachable peers.
@@ -57,8 +57,8 @@
 //!
 //! # References
 //!
-//! - WireGuard Protocol: <https://www.wireguard.com/protocol/>
-//! - Issue #13: WireGuard busy loop on invalid egress
+//! - `WireGuard` Protocol: <https://www.wireguard.com/protocol/>
+//! - Issue #13: `WireGuard` busy loop on invalid egress
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -85,7 +85,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Handshake configuration with retry and backoff settings
 ///
 /// Controls how the handshake tracker handles retries and backoff
-/// when attempting to establish a WireGuard connection.
+/// when attempting to establish a `WireGuard` connection.
 #[derive(Debug, Clone)]
 pub struct HandshakeConfig {
     /// Maximum number of retry attempts before giving up
@@ -268,7 +268,7 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::CryptoError => write!(f, "Cryptographic error during handshake"),
             HandshakeError::NetworkError => write!(f, "Network error during handshake"),
             HandshakeError::RetriesExhausted => write!(f, "Maximum handshake retries exhausted"),
-            HandshakeError::InvalidConfig(msg) => write!(f, "Invalid configuration: {}", msg),
+            HandshakeError::InvalidConfig(msg) => write!(f, "Invalid configuration: {msg}"),
             HandshakeError::AlreadyInProgress => write!(f, "Handshake already in progress"),
             HandshakeError::Disconnecting => write!(f, "Tunnel is disconnecting"),
         }
@@ -281,8 +281,10 @@ impl std::error::Error for HandshakeError {}
 ///
 /// Tracks the current state of the handshake process.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum HandshakeState {
     /// No handshake in progress
+    #[default]
     Idle,
 
     /// Handshake initiated, waiting for response
@@ -311,11 +313,6 @@ pub enum HandshakeState {
     Disconnecting,
 }
 
-impl Default for HandshakeState {
-    fn default() -> Self {
-        HandshakeState::Idle
-    }
-}
 
 impl HandshakeState {
     /// Check if handshake is complete

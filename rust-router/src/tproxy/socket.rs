@@ -23,18 +23,18 @@ use tracing::debug;
 
 use crate::error::{TproxyError, UdpError};
 
-/// Linux kernel constant: IP_TRANSPARENT socket option (SOL_IP level)
+/// Linux kernel constant: `IP_TRANSPARENT` socket option (`SOL_IP` level)
 /// Allows the socket to:
 /// 1. Bind to non-local addresses
 /// 2. Accept TPROXY-redirected connections
 pub const IP_TRANSPARENT: libc::c_int = 19;
 
-/// Linux kernel constant: SO_ORIGINAL_DST (SOL_IP level)
+/// Linux kernel constant: `SO_ORIGINAL_DST` (`SOL_IP` level)
 /// Used with getsockopt to retrieve the original destination address
 /// from a TPROXY-redirected TCP connection.
 pub const SO_ORIGINAL_DST: libc::c_int = 80;
 
-/// Linux kernel constant: IP_RECVORIGDSTADDR (SOL_IP level)
+/// Linux kernel constant: `IP_RECVORIGDSTADDR` (`SOL_IP` level)
 /// When enabled, UDP packets include the original destination in ancillary data (cmsg).
 pub const IP_RECVORIGDSTADDR: libc::c_int = 20;
 
@@ -244,7 +244,7 @@ impl SocketProvider for MockSocketProvider {
 // Socket Creation Functions
 // =============================================================================
 
-/// Create a TCP socket with IP_TRANSPARENT enabled for TPROXY.
+/// Create a TCP socket with `IP_TRANSPARENT` enabled for TPROXY.
 ///
 /// This socket can:
 /// - Bind to any address (including non-local)
@@ -254,7 +254,7 @@ impl SocketProvider for MockSocketProvider {
 /// # Errors
 ///
 /// Returns `TproxyError::SocketCreation` if socket creation fails.
-/// Returns `TproxyError::SocketOption` if setting IP_TRANSPARENT fails.
+/// Returns `TproxyError::SocketOption` if setting `IP_TRANSPARENT` fails.
 pub fn create_tproxy_tcp_socket() -> Result<Socket, TproxyError> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
         .map_err(|e| TproxyError::SocketCreation(e.to_string()))?;
@@ -281,7 +281,7 @@ pub fn create_tproxy_tcp_socket() -> Result<Socket, TproxyError> {
     Ok(socket)
 }
 
-/// Create a UDP socket with IP_TRANSPARENT and IP_RECVORIGDSTADDR enabled.
+/// Create a UDP socket with `IP_TRANSPARENT` and `IP_RECVORIGDSTADDR` enabled.
 ///
 /// # Errors
 ///
@@ -315,12 +315,12 @@ pub fn create_tproxy_udp_socket() -> Result<Socket, TproxyError> {
     Ok(socket)
 }
 
-/// Set IP_TRANSPARENT socket option.
+/// Set `IP_TRANSPARENT` socket option.
 ///
 /// # Errors
 ///
 /// Returns `TproxyError::SocketOption` if setsockopt fails.
-/// Returns `TproxyError::PermissionDenied` if CAP_NET_ADMIN is required.
+/// Returns `TproxyError::PermissionDenied` if `CAP_NET_ADMIN` is required.
 fn set_ip_transparent(socket: &Socket) -> Result<(), TproxyError> {
     let fd = socket.as_raw_fd();
     let one: libc::c_int = 1;
@@ -346,7 +346,7 @@ fn set_ip_transparent(socket: &Socket) -> Result<(), TproxyError> {
     Ok(())
 }
 
-/// Set IP_RECVORIGDSTADDR socket option for UDP.
+/// Set `IP_RECVORIGDSTADDR` socket option for UDP.
 fn set_ip_recvorigdstaddr(socket: &Socket) -> Result<(), TproxyError> {
     let fd = socket.as_raw_fd();
     let one: libc::c_int = 1;
@@ -396,7 +396,7 @@ pub fn get_original_dst(fd: RawFd) -> Result<SocketAddr, TproxyError> {
             libc::SOL_IP,
             SO_ORIGINAL_DST,
             std::ptr::addr_of_mut!(addr).cast::<libc::c_void>(),
-            &mut len,
+            &raw mut len,
         )
     };
 
@@ -408,8 +408,7 @@ pub fn get_original_dst(fd: RawFd) -> Result<SocketAddr, TproxyError> {
             ));
         }
         return Err(TproxyError::OriginalDstError(format!(
-            "getsockopt SO_ORIGINAL_DST failed: {}",
-            err
+            "getsockopt SO_ORIGINAL_DST failed: {err}"
         )));
     }
 
@@ -423,7 +422,7 @@ pub fn get_original_dst(fd: RawFd) -> Result<SocketAddr, TproxyError> {
 /// Get the original destination from a TPROXY IPv6 TCP connection.
 ///
 /// Similar to `get_original_dst` but for IPv6 connections.
-/// Uses `IP6T_SO_ORIGINAL_DST` (80 at SOL_IPV6 level).
+/// Uses `IP6T_SO_ORIGINAL_DST` (80 at `SOL_IPV6` level).
 ///
 /// # Errors
 ///
@@ -442,15 +441,14 @@ pub fn get_original_dst_v6(fd: RawFd) -> Result<SocketAddr, TproxyError> {
             libc::SOL_IPV6,
             IP6T_SO_ORIGINAL_DST,
             std::ptr::addr_of_mut!(addr).cast::<libc::c_void>(),
-            &mut len,
+            &raw mut len,
         )
     };
 
     if ret != 0 {
         let err = io::Error::last_os_error();
         return Err(TproxyError::OriginalDstError(format!(
-            "getsockopt IP6T_SO_ORIGINAL_DST failed: {}",
-            err
+            "getsockopt IP6T_SO_ORIGINAL_DST failed: {err}"
         )));
     }
 
@@ -465,10 +463,10 @@ pub fn get_original_dst_v6(fd: RawFd) -> Result<SocketAddr, TproxyError> {
     )))
 }
 
-/// Check if the current process has CAP_NET_ADMIN capability.
+/// Check if the current process has `CAP_NET_ADMIN` capability.
 ///
-/// TPROXY requires CAP_NET_ADMIN for:
-/// - Setting IP_TRANSPARENT socket option
+/// TPROXY requires `CAP_NET_ADMIN` for:
+/// - Setting `IP_TRANSPARENT` socket option
 /// - Binding to non-local addresses
 #[must_use]
 pub fn has_net_admin_capability() -> bool {

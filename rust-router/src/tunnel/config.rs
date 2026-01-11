@@ -1,6 +1,6 @@
 //! Tunnel configuration types for Phase 6
 //!
-//! This module defines configuration types for WireGuard tunnels,
+//! This module defines configuration types for `WireGuard` tunnels,
 //! including both userspace and kernel-based implementations.
 //!
 //! # Phase 6 Implementation Status
@@ -19,19 +19,19 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// WireGuard rekey interval in seconds (3 minutes)
+/// `WireGuard` rekey interval in seconds (3 minutes)
 ///
-/// WireGuard initiates a new handshake when the current session key
+/// `WireGuard` initiates a new handshake when the current session key
 /// has been in use for this duration. A peer is considered "connected"
 /// if a successful handshake occurred within this interval.
 ///
 /// Reference: <https://www.wireguard.com/protocol/>
 pub const WG_REKEY_INTERVAL_SECS: u64 = 180;
 
-/// Configuration for a WireGuard tunnel
+/// Configuration for a `WireGuard` tunnel
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgTunnelConfig {
-    /// WireGuard private key (Base64 encoded)
+    /// `WireGuard` private key (Base64 encoded)
     pub private_key: String,
     /// Peer public key (Base64 encoded)
     pub peer_public_key: String,
@@ -74,7 +74,7 @@ impl WgTunnelConfig {
     ///
     /// # Arguments
     ///
-    /// * `private_key` - Local WireGuard private key
+    /// * `private_key` - Local `WireGuard` private key
     /// * `peer_public_key` - Remote peer's public key
     /// * `peer_endpoint` - Remote peer's endpoint (IP:port)
     pub fn new(private_key: String, peer_public_key: String, peer_endpoint: String) -> Self {
@@ -124,7 +124,7 @@ impl WgTunnelConfig {
     ///
     /// # Validation Steps
     ///
-    /// 1. Required fields: private_key, peer_public_key, peer_endpoint
+    /// 1. Required fields: `private_key`, `peer_public_key`, `peer_endpoint`
     /// 2. Private key: Must be valid Base64 decoding to exactly 32 bytes
     /// 3. Peer public key: Must be valid Base64 decoding to exactly 32 bytes
     /// 4. Peer endpoint: Must be in IP:port format
@@ -143,7 +143,7 @@ impl WgTunnelConfig {
         // Validate private key format (Base64, 32 bytes decoded)
         let private_bytes = BASE64
             .decode(&self.private_key)
-            .map_err(|e| format!("Invalid private key Base64: {}", e))?;
+            .map_err(|e| format!("Invalid private key Base64: {e}"))?;
         if private_bytes.len() != 32 {
             return Err(format!(
                 "Private key must be 32 bytes, got {}",
@@ -154,7 +154,7 @@ impl WgTunnelConfig {
         // Validate peer public key format (Base64, 32 bytes decoded)
         let public_bytes = BASE64
             .decode(&self.peer_public_key)
-            .map_err(|e| format!("Invalid peer public key Base64: {}", e))?;
+            .map_err(|e| format!("Invalid peer public key Base64: {e}"))?;
         if public_bytes.len() != 32 {
             return Err(format!(
                 "Peer public key must be 32 bytes, got {}",
@@ -178,7 +178,7 @@ impl WgTunnelConfig {
     }
 }
 
-/// Configuration for a WireGuard peer
+/// Configuration for a `WireGuard` peer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgPeerConfig {
     /// Peer public key (Base64 encoded)
@@ -247,7 +247,7 @@ impl WgPeerConfig {
     }
 }
 
-/// Information about a WireGuard peer
+/// Information about a `WireGuard` peer
 ///
 /// This struct contains runtime information about a connected peer,
 /// including statistics and connection state.
@@ -361,7 +361,7 @@ impl WgPeerInfo {
     /// Update connection status based on handshake timestamp
     ///
     /// Sets `is_connected` to true if the last handshake was within
-    /// [`WG_REKEY_INTERVAL_SECS`] (3 minutes), which is the WireGuard rekey interval.
+    /// [`WG_REKEY_INTERVAL_SECS`] (3 minutes), which is the `WireGuard` rekey interval.
     pub fn update_connection_status(&mut self) {
         self.is_connected = self.had_recent_handshake(WG_REKEY_INTERVAL_SECS);
     }
@@ -373,7 +373,7 @@ impl Default for WgPeerInfo {
     }
 }
 
-/// Update parameters for a WireGuard peer
+/// Update parameters for a `WireGuard` peer
 ///
 /// This struct contains optional fields for updating a peer's configuration.
 /// Only the fields that are `Some` will be updated.

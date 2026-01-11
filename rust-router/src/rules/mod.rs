@@ -49,7 +49,7 @@
 //! assert_eq!(matcher.match_domain("ads.example.org"), Some("block"));
 //! ```
 //!
-//! # GeoIP Matching (Phase 2.3)
+//! # `GeoIP` Matching (Phase 2.3)
 //!
 //! IP-based routing with CIDR and country code matching:
 //!

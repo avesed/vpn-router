@@ -9,7 +9,7 @@
 //! - [x] 6.7 Member management
 //! - [x] 6.7 Health integration
 //! - [x] 6.7 Routing mark allocation
-//! - [x] 6.7 EcmpGroupManager
+//! - [x] 6.7 `EcmpGroupManager`
 //! - [x] 6.7 Connection-based selection
 //!
 //! # Example
@@ -248,7 +248,7 @@ impl EcmpGroup {
 
         // Validate routing mark if specified
         if let Some(mark) = config.routing_mark {
-            if mark < ECMP_ROUTING_MARK_MIN || mark > ECMP_ROUTING_MARK_MAX {
+            if !(ECMP_ROUTING_MARK_MIN..=ECMP_ROUTING_MARK_MAX).contains(&mark) {
                 return Err(EcmpGroupError::InvalidRoutingMark(mark));
             }
         }
@@ -780,7 +780,7 @@ impl EcmpGroupManager {
             config.routing_table = self.allocate_routing_table();
         } else if let Some(table) = config.routing_table {
             // Track explicitly specified routing table
-            if table >= ECMP_ROUTING_TABLE_MIN && table <= ECMP_ROUTING_TABLE_MAX {
+            if (ECMP_ROUTING_TABLE_MIN..=ECMP_ROUTING_TABLE_MAX).contains(&table) {
                 self.routing_table_allocator.write().insert(table);
             }
         }
@@ -877,7 +877,7 @@ impl EcmpGroupManager {
     ///
     /// * `table` - Table number to release
     pub fn release_routing_table(&self, table: u32) {
-        if table >= ECMP_ROUTING_TABLE_MIN && table <= ECMP_ROUTING_TABLE_MAX {
+        if (ECMP_ROUTING_TABLE_MIN..=ECMP_ROUTING_TABLE_MAX).contains(&table) {
             self.routing_table_allocator.write().remove(&table);
         }
     }

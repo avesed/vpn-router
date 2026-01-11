@@ -20,11 +20,11 @@
 //! # Phase 6 Implementation Status
 //!
 //! - [x] 6.7 ECMP group structure
-//! - [x] 6.7 Load balancer algorithms (FiveTupleHash, RoundRobin, Weighted, LeastConnections, Random)
+//! - [x] 6.7 Load balancer algorithms (`FiveTupleHash`, `RoundRobin`, Weighted, `LeastConnections`, Random)
 //! - [x] 6.7 Health integration
 //! - [x] 6.7 Routing mark management
 //! - [x] 6.7 Connection affinity (five-tuple hash)
-//! - [x] 6.7 EcmpGroupManager
+//! - [x] 6.7 `EcmpGroupManager`
 //!
 //! # Architecture
 //!

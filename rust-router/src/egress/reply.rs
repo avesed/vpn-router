@@ -1,4 +1,4 @@
-//! Reply handler for WireGuard egress traffic
+//! Reply handler for `WireGuard` egress traffic
 //!
 //! This module provides the `WgReplyHandler` that handles decrypted reply
 //! packets from egress tunnels and routes them back to the appropriate
@@ -191,7 +191,7 @@ impl WgReplyHandler {
     ///
     /// # Arguments
     ///
-    /// * `packets` - Iterator of (packet, tunnel_tag) pairs
+    /// * `packets` - Iterator of (packet, `tunnel_tag`) pairs
     ///
     /// # Returns
     ///

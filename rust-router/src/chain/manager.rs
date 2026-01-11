@@ -1,23 +1,23 @@
-//! ChainManager - Multi-hop chain routing management for Phase 6
+//! `ChainManager` - Multi-hop chain routing management for Phase 6
 //!
 //! This module implements chain lifecycle management with Two-Phase
 //! Commit (2PC) protocol for distributed activation across nodes.
 //!
 //! # Phase 6 Implementation Status
 //!
-//! - [x] 6.6.1 ChainManager structure
+//! - [x] 6.6.1 `ChainManager` structure
 //! - [x] 6.6.1 Chain validation
 //! - [ ] 6.6.1 Remote egress validation
 //! - [ ] 6.6.1 2PC integration
 //!
 //! # Architecture
 //!
-//! The ChainManager coordinates:
+//! The `ChainManager` coordinates:
 //! - Local chain state management
 //! - Validation of chain configurations
 //! - 2PC protocol execution for distributed activation
-//! - Integration with PeerManager for tunnel access
-//! - Integration with RuleEngine for dynamic rule updates
+//! - Integration with `PeerManager` for tunnel access
+//! - Integration with `RuleEngine` for dynamic rule updates
 //!
 //! # Chain Validation Rules
 //!
@@ -26,7 +26,7 @@
 //! 3. **Hops count**: Must have 1-10 hops
 //! 4. **Exit egress**: Cannot be "direct" (traffic would exit locally)
 //! 5. **Xray relay**: Xray tunnels cannot be in relay position (DSCP lost in SOCKS5)
-//! 6. **SOCKS-based egress**: V2Ray and WARP MASQUE cannot be terminal egress
+//! 6. **SOCKS-based egress**: `V2Ray` and WARP MASQUE cannot be terminal egress
 //!
 //! # Example
 //!
@@ -127,7 +127,7 @@ pub enum ChainError {
     #[error("Cannot use 'direct' as exit egress in a chain (traffic would exit locally, not through the chain)")]
     DirectNotAllowed,
 
-    /// SOCKS-based egress not allowed (V2Ray, WARP MASQUE)
+    /// SOCKS-based egress not allowed (`V2Ray`, WARP MASQUE)
     #[error("SOCKS-based egress cannot be used as terminal egress: {0}")]
     SocksEgressNotAllowed(String),
 
@@ -201,7 +201,7 @@ impl From<TwoPhaseError> for ChainError {
             TwoPhaseError::PrepareFailed { node, reason } => ChainError::PrepareFailed(node, reason),
             TwoPhaseError::CommitFailed { node, reason } => ChainError::CommitFailed(node, reason),
             TwoPhaseError::Timeout { node, phase } => {
-                ChainError::PrepareFailed(node, format!("Timeout during {}", phase))
+                ChainError::PrepareFailed(node, format!("Timeout during {phase}"))
             }
             TwoPhaseError::NotAllPrepared => {
                 ChainError::Internal("Cannot commit: not all participants prepared".to_string())
@@ -290,7 +290,7 @@ struct ChainStateInternal {
     created_at: u64,
 }
 
-/// ChainManager handles multi-hop chain routing
+/// `ChainManager` handles multi-hop chain routing
 ///
 /// Manages the lifecycle of multi-hop routing chains, including:
 /// - Chain creation with validation
@@ -300,7 +300,7 @@ struct ChainStateInternal {
 ///
 /// # Thread Safety
 ///
-/// ChainManager uses `RwLock` for thread-safe access to chain state.
+/// `ChainManager` uses `RwLock` for thread-safe access to chain state.
 /// The DSCP allocator is shared via `Arc` for concurrent allocation.
 ///
 /// # Lock Order (IMPORTANT: Follow this order to prevent deadlocks)
@@ -311,7 +311,7 @@ struct ChainStateInternal {
 /// 4. `self.network_client` - 2PC network client
 ///
 /// CRITICAL: Callback implementations (`DscpRoutingCallback`, `PeerConnectivityCallback`)
-/// MUST NOT acquire any ChainManager locks. Deadlock WILL occur if they do.
+/// MUST NOT acquire any `ChainManager` locks. Deadlock WILL occur if they do.
 ///
 /// When acquiring multiple locks:
 /// - Always acquire locks in the order listed above
@@ -333,7 +333,7 @@ pub struct ChainManager {
 }
 
 impl ChainManager {
-    /// Create a new ChainManager
+    /// Create a new `ChainManager`
     ///
     /// # Arguments
     ///
@@ -358,7 +358,7 @@ impl ChainManager {
         }
     }
 
-    /// Create a ChainManager with a custom DSCP allocator
+    /// Create a `ChainManager` with a custom DSCP allocator
     ///
     /// This is primarily useful for testing or sharing allocators
     /// across multiple managers.
@@ -561,7 +561,7 @@ impl ChainManager {
                 .get(tag)
                 .ok_or_else(|| ChainError::NotFound(tag.to_string()))?;
 
-            (chain.allocated_dscp, chain.state.clone())
+            (chain.allocated_dscp, chain.state)
         };
 
         // Step 2: Verify chain is not active or activating
@@ -618,7 +618,7 @@ impl ChainManager {
     /// # Arguments
     ///
     /// * `tag` - Chain tag to update
-    /// * `config` - New chain configuration (tag and dscp_value are preserved from original)
+    /// * `config` - New chain configuration (tag and `dscp_value` are preserved from original)
     ///
     /// # Errors
     ///
@@ -660,7 +660,7 @@ impl ChainManager {
                 }
             }
 
-            (chain.allocated_dscp, chain.my_role.clone())
+            (chain.allocated_dscp, chain.my_role)
         };
 
         // Step 3: Update the chain in-place
@@ -886,7 +886,7 @@ impl ChainManager {
                 chain.config.clone(),
                 chain.allocated_dscp,
                 participant_tags,
-                chain.my_role.clone(),
+                chain.my_role,
             )
         };
 
@@ -1046,7 +1046,7 @@ impl ChainManager {
                 .get(tag)
                 .ok_or_else(|| ChainError::NotFound(tag.to_string()))?;
 
-            chain.state.clone()
+            chain.state
         };
 
         // Step 2: Validate state transition
@@ -1093,9 +1093,9 @@ impl ChainManager {
 
         Some(ChainStatus {
             tag: tag.to_string(),
-            state: chain.state.clone(),
+            state: chain.state,
             dscp_value: chain.allocated_dscp,
-            my_role: chain.my_role.clone(),
+            my_role: chain.my_role,
             hop_status: Vec::new(), // TODO(Phase 6.6.2): Populate from peer status
             active_connections: 0,
             last_error: chain.last_error.clone(),
@@ -1156,9 +1156,9 @@ impl ChainManager {
             .iter()
             .map(|(tag, chain)| ChainStatus {
                 tag: tag.clone(),
-                state: chain.state.clone(),
+                state: chain.state,
                 dscp_value: chain.allocated_dscp,
-                my_role: chain.my_role.clone(),
+                my_role: chain.my_role,
                 hop_status: Vec::new(),
                 active_connections: 0,
                 last_error: chain.last_error.clone(),
@@ -1263,7 +1263,7 @@ impl ChainManager {
     pub fn get_chain_role(&self, tag: &str) -> Option<ChainRole> {
         let chains = self.chains.read().ok()?;
         let chain = chains.get(tag)?;
-        chain.my_role.clone()
+        chain.my_role
     }
 
     /// Handle incoming PREPARE request from another node
@@ -1323,7 +1323,7 @@ impl ChainManager {
                 .map_err(|e| ChainError::LockError(e.to_string()))?;
 
             let existing = chains.get(chain_tag);
-            let existing_state = existing.map(|chain| chain.state.clone());
+            let existing_state = existing.map(|chain| chain.state);
             let existing_dscp = existing.map(|chain| chain.allocated_dscp);
             let dscp_conflict = chains.iter().any(|(tag, chain)| {
                 tag.as_str() != chain_tag && chain.allocated_dscp == config.dscp_value
@@ -1356,7 +1356,7 @@ impl ChainManager {
         }
 
         // Step 6: Determine our role
-        let my_role = our_hop.map(|hop| hop.role.clone());
+        let my_role = our_hop.map(|hop| hop.role);
 
         // Step 7: Store the chain config (still Inactive until COMMIT)
         let internal_state = ChainStateInternal {
@@ -1447,7 +1447,7 @@ impl ChainManager {
                 return Err(ChainError::AlreadyActive(chain_tag.to_string()));
             }
 
-            (chain.config.clone(), chain.my_role.clone())
+            (chain.config.clone(), chain.my_role)
         };
 
         // Step 2: Set up local DSCP routing
@@ -1519,7 +1519,7 @@ impl ChainManager {
     fn determine_role(&self, config: &ChainConfig) -> Option<ChainRole> {
         for hop in &config.hops {
             if hop.node_tag == self.local_node_tag {
-                return Some(hop.role.clone());
+                return Some(hop.role);
             }
         }
         None

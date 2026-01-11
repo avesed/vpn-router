@@ -8,6 +8,14 @@ FROM golang:1.25-bookworm AS xray-builder
 
 ARG TARGETARCH
 
+RUN set -eux; \
+    for file in /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$file" ]; then \
+            sed -i 's|http://|https://|g' "$file"; \
+        fi; \
+    done
+
 # Download UPX for binary compression (~70% size reduction)
 # UPX not available in Debian bookworm repos, downloading from GitHub
 # SHA256 checksums verified from official UPX releases (supply chain security)
@@ -63,6 +71,14 @@ FROM debian:12-slim AS usque-downloader
 ARG USQUE_VERSION=1.4.2
 ARG TARGETARCH
 
+RUN set -eux; \
+    for file in /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$file" ]; then \
+            sed -i 's|http://|https://|g' "$file"; \
+        fi; \
+    done
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     unzip \
@@ -92,6 +108,14 @@ RUN USQUE_ARCH="" && \
 FROM golang:1.23-bookworm AS singbox-builder
 
 ARG SINGBOX_VERSION=1.12.13
+
+RUN set -eux; \
+    for file in /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$file" ]; then \
+            sed -i 's|http://|https://|g' "$file"; \
+        fi; \
+    done
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 
@@ -158,6 +182,14 @@ RUN npm run build
 # Stage 6: Production Runtime
 # ==========================================
 FROM debian:12-slim
+
+RUN set -eux; \
+    for file in /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$file" ]; then \
+            sed -i 's|http://|https://|g' "$file"; \
+        fi; \
+    done
 
 ENV SING_BOX_CONFIG=/etc/sing-box/sing-box.json \
     RULESET_DIR=/etc/sing-box \

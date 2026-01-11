@@ -108,7 +108,7 @@ pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 60;
 /// This provides a balance between memory efficiency and CPU usage.
 const CLEANUP_CHECK_INTERVAL_DECREMENTS: u64 = 1000;
 
-/// P1 FIX: Helper function to safely decrement an AtomicU32 without underflow.
+/// P1 FIX: Helper function to safely decrement an `AtomicU32` without underflow.
 ///
 /// Uses a CAS (Compare-And-Swap) loop to ensure the counter never goes below 0.
 /// This is extracted to avoid code duplication between the eviction listener
@@ -316,7 +316,7 @@ pub struct UdpPacketProcessor {
     stats: Arc<UdpProcessorStats>,
     /// SEC-1 FIX: Per-IP session counter to prevent session table exhaustion
     ///
-    /// Maps source IP to current session count. Uses AtomicU32 for lock-free
+    /// Maps source IP to current session count. Uses `AtomicU32` for lock-free
     /// increment/decrement. When a session is created, the counter is incremented;
     /// when evicted from cache, it's decremented.
     ///
@@ -390,7 +390,7 @@ impl UdpPacketProcessor {
     /// # SEC-2 Enhancement
     ///
     /// This method now enforces `max_tracked_ips` as a hard limit. When the
-    /// DashMap has reached capacity, NEW IPs are rejected without creating
+    /// `DashMap` has reached capacity, NEW IPs are rejected without creating
     /// an entry. Existing IPs can still create sessions up to their limit.
     fn check_ip_session_limit(&self, source_ip: IpAddr) -> Result<u32, (u32, u32)> {
         // 0 means unlimited
@@ -469,8 +469,7 @@ impl UdpPacketProcessor {
     pub fn get_ip_session_count(&self, source_ip: IpAddr) -> u32 {
         self.ip_session_counts
             .get(&source_ip)
-            .map(|e| e.value().load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .map_or(0, |e| e.value().load(Ordering::Relaxed))
     }
 
     /// Get number of tracked source IPs (for monitoring)
@@ -544,7 +543,7 @@ impl UdpPacketProcessor {
         } else {
             // Condition 2: Check interval-based cleanup
             let decrement_count = self.decrement_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if decrement_count % CLEANUP_CHECK_INTERVAL_DECREMENTS == 0 {
+            if decrement_count.is_multiple_of(CLEANUP_CHECK_INTERVAL_DECREMENTS) {
                 // Enough decrements have occurred, check time
                 // Use try_lock to avoid blocking - if another thread is cleaning, skip
                 if let Ok(mut last) = self.last_cleanup.try_lock() {
@@ -582,7 +581,7 @@ impl UdpPacketProcessor {
                 // P1 FIX: Use unwrap_or_else to recover from poisoned mutex.
                 // A poisoned mutex means a thread panicked while holding it,
                 // but the inner data (Instant) is still valid and usable.
-                let mut last = self.last_cleanup.lock().unwrap_or_else(|e| e.into_inner());
+                let mut last = self.last_cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 *last = Instant::now();
             }
         }
@@ -601,7 +600,7 @@ impl UdpPacketProcessor {
 
         // Update last_cleanup time
         // P1 FIX: Use unwrap_or_else to recover from poisoned mutex
-        let mut last = self.last_cleanup.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last = self.last_cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *last = Instant::now();
 
         // Reset decrement counter
@@ -707,26 +706,20 @@ impl UdpPacketProcessor {
         );
 
         // Get outbound from manager
-        let outbound = match outbound_manager.get(&match_result.outbound) {
-            Some(o) => o,
-            None => {
-                warn!(
-                    "Outbound '{}' not found, using default",
-                    match_result.outbound
-                );
-                // Try to get default
-                match outbound_manager.get(&rule_engine.default_outbound()) {
-                    Some(o) => o,
-                    None => {
-                        // Counter drift fix: decrement counter since session won't be created
-                        self.decrement_ip_session_count(source_ip);
-                        return ProcessResult::Failed {
-                            error: UdpError::OutboundNotFound {
-                                tag: match_result.outbound,
-                            },
-                        };
-                    }
-                }
+        let outbound = if let Some(o) = outbound_manager.get(&match_result.outbound) { o } else {
+            warn!(
+                "Outbound '{}' not found, using default",
+                match_result.outbound
+            );
+            // Try to get default
+            if let Some(o) = outbound_manager.get(&rule_engine.default_outbound()) { o } else {
+                // Counter drift fix: decrement counter since session won't be created
+                self.decrement_ip_session_count(source_ip);
+                return ProcessResult::Failed {
+                    error: UdpError::OutboundNotFound {
+                        tag: match_result.outbound,
+                    },
+                };
             }
         };
 
@@ -850,10 +843,10 @@ impl UdpPacketProcessor {
     }
 
     /// Build `ConnectionInfo` for rule matching.
-    fn build_connection_info<'a>(
+    fn build_connection_info(
         &self,
         packet: &UdpPacketInfo,
-        domain: Option<&'a str>,
+        domain: Option<&str>,
     ) -> ConnectionInfo {
         let mut conn_info = ConnectionInfo::new("udp", packet.original_dst.port());
 

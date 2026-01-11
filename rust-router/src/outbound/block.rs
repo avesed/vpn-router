@@ -71,7 +71,7 @@ impl Outbound for BlockOutbound {
         // Return an error indicating the connection was blocked
         Err(OutboundError::unavailable(
             &self.tag,
-            format!("connection to {} blocked", addr),
+            format!("connection to {addr} blocked"),
         ))
     }
 
@@ -100,7 +100,7 @@ impl Outbound for BlockOutbound {
         0 // Block outbound doesn't maintain connections
     }
 
-    fn outbound_type(&self) -> &str {
+    fn outbound_type(&self) -> &'static str {
         "block"
     }
 

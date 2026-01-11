@@ -148,14 +148,14 @@ pub enum IpcCommand {
     // Phase 3.3: IPC Protocol v2.1 Commands
     // ========================================================================
 
-    /// Add a WireGuard outbound using DirectOutbound with bind_interface
+    /// Add a `WireGuard` outbound using `DirectOutbound` with `bind_interface`
     ///
-    /// Creates a direct outbound bound to a WireGuard interface (e.g., wg-pia-us-east).
-    /// The interface must already exist (created by Python setup_kernel_wg_egress.py).
+    /// Creates a direct outbound bound to a `WireGuard` interface (e.g., wg-pia-us-east).
+    /// The interface must already exist (created by Python `setup_kernel_wg_egress.py`).
     AddWireguardOutbound {
         /// Unique tag for this outbound
         tag: String,
-        /// WireGuard interface name (e.g., "wg-pia-us-east")
+        /// `WireGuard` interface name (e.g., "wg-pia-us-east")
         interface: String,
         /// Optional routing mark for policy routing
         #[serde(default)]
@@ -180,7 +180,7 @@ pub enum IpcCommand {
     /// Update routing rules atomically
     ///
     /// Replaces the current routing configuration with new rules.
-    /// Uses ArcSwap for lock-free hot-reload.
+    /// Uses `ArcSwap` for lock-free hot-reload.
     UpdateRouting {
         /// New routing rules
         rules: Vec<RuleConfig>,
@@ -264,19 +264,19 @@ pub enum IpcCommand {
     // Phase 6.0: IPC Protocol v3.0 - WireGuard Tunnel Management
     // ========================================================================
 
-    /// Create a userspace WireGuard tunnel
+    /// Create a userspace `WireGuard` tunnel
     ///
-    /// Creates a new WireGuard tunnel using boringtun (Phase 6).
+    /// Creates a new `WireGuard` tunnel using boringtun (Phase 6).
     CreateWgTunnel {
         /// Unique tag for this tunnel
         tag: String,
-        /// WireGuard tunnel configuration
+        /// `WireGuard` tunnel configuration
         config: WgTunnelConfig,
     },
 
-    /// Remove a WireGuard tunnel
+    /// Remove a `WireGuard` tunnel
     ///
-    /// Removes a userspace WireGuard tunnel with optional drain timeout.
+    /// Removes a userspace `WireGuard` tunnel with optional drain timeout.
     RemoveWgTunnel {
         /// Tunnel tag to remove
         tag: String,
@@ -285,26 +285,26 @@ pub enum IpcCommand {
         drain_timeout_secs: Option<u32>,
     },
 
-    /// Get WireGuard tunnel status
+    /// Get `WireGuard` tunnel status
     ///
-    /// Returns status information for a specific WireGuard tunnel.
+    /// Returns status information for a specific `WireGuard` tunnel.
     GetWgTunnelStatus {
         /// Tunnel tag
         tag: String,
     },
 
-    /// List all WireGuard tunnels
+    /// List all `WireGuard` tunnels
     ///
-    /// Returns a list of all userspace WireGuard tunnels.
+    /// Returns a list of all userspace `WireGuard` tunnels.
     ListWgTunnels,
 
     // ========================================================================
     // Phase 11-Fix.AA: Ingress Peer Management
     // ========================================================================
 
-    /// Add a peer to WireGuard ingress
+    /// Add a peer to `WireGuard` ingress
     ///
-    /// Adds a new client peer to the userspace WireGuard ingress.
+    /// Adds a new client peer to the userspace `WireGuard` ingress.
     AddIngressPeer {
         /// Peer public key (Base64-encoded)
         public_key: String,
@@ -316,20 +316,20 @@ pub enum IpcCommand {
         preshared_key: Option<String>,
     },
 
-    /// Remove a peer from WireGuard ingress
+    /// Remove a peer from `WireGuard` ingress
     ///
-    /// Removes a client peer from the userspace WireGuard ingress.
+    /// Removes a client peer from the userspace `WireGuard` ingress.
     RemoveIngressPeer {
         /// Peer public key (Base64-encoded)
         public_key: String,
     },
 
-    /// List all WireGuard ingress peers
+    /// List all `WireGuard` ingress peers
     ///
     /// Returns a list of all peers registered with the ingress.
     ListIngressPeers,
 
-    /// Get userspace WireGuard ingress statistics
+    /// Get userspace `WireGuard` ingress statistics
     ///
     /// Returns ingress manager, forwarding, and reply statistics when available.
     GetIngressStats,
@@ -398,7 +398,7 @@ pub enum IpcCommand {
         local_api_port: u16,
         /// Whether to enable bidirectional auto-connect
         bidirectional: bool,
-        /// Tunnel type (WireGuard or Xray)
+        /// Tunnel type (`WireGuard` or Xray)
         tunnel_type: TunnelType,
     },
 
@@ -453,7 +453,7 @@ pub enum IpcCommand {
 
     /// Get peer tunnel health status
     ///
-    /// Returns health information based on WireGuard handshake for a peer.
+    /// Returns health information based on `WireGuard` handshake for a peer.
     GetPeerTunnelHealth {
         /// Peer node tag
         tag: String,
@@ -560,7 +560,7 @@ pub enum IpcCommand {
         /// New description (if provided)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
-        /// New allow_transitive flag (if provided)
+        /// New `allow_transitive` flag (if provided)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         allow_transitive: Option<bool>,
     },
@@ -700,7 +700,7 @@ pub enum IpcCommand {
     ///
     /// # Status: PARTIAL IMPLEMENTATION
     ///
-    /// Currently returns an empty list with metadata. The QueryLogger (Phase 7.6)
+    /// Currently returns an empty list with metadata. The `QueryLogger` (Phase 7.6)
     /// is write-only by design. A log reader implementation is planned for a
     /// future phase to enable reading logs from disk.
     GetDnsQueryLog {
@@ -762,7 +762,7 @@ fn default_dns_query_limit() -> usize {
     100
 }
 
-/// Egress action type for NotifyEgressChange
+/// Egress action type for `NotifyEgressChange`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressAction {
@@ -774,10 +774,10 @@ pub enum EgressAction {
     Updated,
 }
 
-/// Rule configuration for UpdateRouting
+/// Rule configuration for `UpdateRouting`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleConfig {
-    /// Rule type (domain, domain_suffix, domain_keyword, geoip, port, protocol)
+    /// Rule type (domain, `domain_suffix`, `domain_keyword`, geoip, port, protocol)
     pub rule_type: String,
     /// Target value (e.g., "google.com", "CN", "443", "tcp")
     pub target: String,
@@ -871,16 +871,16 @@ pub enum IpcResponse {
     // Phase 6.0: IPC Protocol v3.2 Response Types
     // ========================================================================
 
-    /// WireGuard tunnel status response
+    /// `WireGuard` tunnel status response
     WgTunnelStatus(WgTunnelStatus),
 
-    /// WireGuard tunnel list response
+    /// `WireGuard` tunnel list response
     WgTunnelList(WgTunnelListResponse),
 
     /// Phase 11-Fix.AA: Ingress peer list response
     IngressPeerList(IngressPeerListResponse),
 
-    /// Userspace WireGuard ingress statistics response
+    /// Userspace `WireGuard` ingress statistics response
     IngressStats(IngressStatsResponse),
 
     /// ECMP group status response
@@ -1148,7 +1148,7 @@ pub struct OutboundHealthInfo {
     pub error: Option<String>,
 }
 
-/// Response for GetOutboundHealth command
+/// Response for `GetOutboundHealth` command
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundHealthResponse {
     /// Health status for each outbound
@@ -1157,7 +1157,7 @@ pub struct OutboundHealthResponse {
     pub overall_health: String,
 }
 
-/// Response for UpdateRouting command
+/// Response for `UpdateRouting` command
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateRoutingResponse {
     /// Whether the update was successful
@@ -1170,7 +1170,7 @@ pub struct UpdateRoutingResponse {
     pub default_outbound: String,
 }
 
-/// Response for DrainOutbound command
+/// Response for `DrainOutbound` command
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrainResponse {
     /// Whether drain completed successfully
@@ -1183,7 +1183,7 @@ pub struct DrainResponse {
     pub drain_time_ms: u64,
 }
 
-/// Response for GetPrometheusMetrics command
+/// Response for `GetPrometheusMetrics` command
 ///
 /// Contains metrics in Prometheus text exposition format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1369,21 +1369,18 @@ pub struct BufferPoolStatsResponse {
 /// Defines the type of tunnel used for peer-to-peer connections.
 /// Phase 11-Fix.AC: Use explicit renames for API compatibility with Python REST API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum TunnelType {
-    /// WireGuard tunnel (userspace via boringtun)
-    /// Serializes as "wireguard" (not "wire_guard") for REST API compatibility
+    /// `WireGuard` tunnel (userspace via boringtun)
+    /// Serializes as "wireguard" (not "`wire_guard`") for REST API compatibility
     #[serde(rename = "wireguard")]
+    #[default]
     WireGuard,
     /// Xray tunnel (via SOCKS5 bridge)
     #[serde(rename = "xray")]
     Xray,
 }
 
-impl Default for TunnelType {
-    fn default() -> Self {
-        Self::WireGuard
-    }
-}
 
 impl std::fmt::Display for TunnelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1394,12 +1391,12 @@ impl std::fmt::Display for TunnelType {
     }
 }
 
-/// WireGuard tunnel configuration
+/// `WireGuard` tunnel configuration
 ///
-/// Configuration for creating a userspace WireGuard tunnel.
+/// Configuration for creating a userspace `WireGuard` tunnel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgTunnelConfig {
-    /// WireGuard private key (Base64 encoded)
+    /// `WireGuard` private key (Base64 encoded)
     pub private_key: String,
     /// Peer public key (Base64 encoded)
     pub peer_public_key: String,
@@ -1422,7 +1419,7 @@ pub struct WgTunnelConfig {
     pub mtu: Option<u16>,
 }
 
-/// WireGuard tunnel status
+/// `WireGuard` tunnel status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgTunnelStatus {
     /// Tunnel tag
@@ -1448,8 +1445,10 @@ pub struct WgTunnelStatus {
 /// ECMP (Equal-Cost Multi-Path) load balancing algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EcmpAlgorithm {
     /// Round-robin distribution
+    #[default]
     RoundRobin,
     /// Random selection
     Random,
@@ -1461,11 +1460,6 @@ pub enum EcmpAlgorithm {
     LeastConnections,
 }
 
-impl Default for EcmpAlgorithm {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
-}
 
 /// ECMP group member configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1560,17 +1554,17 @@ pub struct PeerConfig {
     pub description: String,
     /// Peer endpoint (IP:port or hostname:port)
     pub endpoint: String,
-    /// Tunnel type (WireGuard or Xray)
+    /// Tunnel type (`WireGuard` or Xray)
     pub tunnel_type: TunnelType,
     /// Web API port on the peer (default: 36000)
     #[serde(default = "default_api_port")]
     pub api_port: u16,
 
     // WireGuard-specific fields
-    /// Peer's WireGuard public key
+    /// Peer's `WireGuard` public key
     #[serde(default)]
     pub wg_public_key: Option<String>,
-    /// Local WireGuard private key for this peer
+    /// Local `WireGuard` private key for this peer
     #[serde(default)]
     pub wg_local_private_key: Option<String>,
     /// Local tunnel IP
@@ -1611,8 +1605,10 @@ fn default_api_port() -> u16 {
 /// Peer connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PeerState {
     /// Not connected
+    #[default]
     Disconnected,
     /// Connection in progress
     Connecting,
@@ -1622,11 +1618,6 @@ pub enum PeerState {
     Failed,
 }
 
-impl Default for PeerState {
-    fn default() -> Self {
-        Self::Disconnected
-    }
-}
 
 impl std::fmt::Display for PeerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1654,7 +1645,7 @@ pub struct PeerStatus {
     pub tunnel_remote_ip: Option<String>,
     /// Web API port
     pub api_port: u16,
-    /// Last WireGuard handshake (Unix epoch seconds)
+    /// Last `WireGuard` handshake (Unix epoch seconds)
     pub last_handshake: Option<u64>,
     /// Bytes transmitted
     pub tx_bytes: u64,
@@ -1699,8 +1690,10 @@ impl std::fmt::Display for ChainRole {
 /// Chain activation state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ChainState {
     /// Chain is not active
+    #[default]
     Inactive,
     /// Chain activation is in progress (2PC)
     Activating,
@@ -1710,11 +1703,6 @@ pub enum ChainState {
     Error,
 }
 
-impl Default for ChainState {
-    fn default() -> Self {
-        Self::Inactive
-    }
-}
 
 impl std::fmt::Display for ChainState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1766,8 +1754,10 @@ pub struct ChainConfig {
 /// Two-Phase Commit prepare status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PrepareStatus {
     /// Not yet prepared
+    #[default]
     Pending,
     /// Successfully prepared (validated)
     Prepared,
@@ -1777,11 +1767,6 @@ pub enum PrepareStatus {
     Aborted,
 }
 
-impl Default for PrepareStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// Hop status in a chain
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1822,12 +1807,12 @@ pub struct ChainStatus {
 // Phase 6.0: Pairing Types
 // ============================================================================
 
-/// Default value for pair_request message type
+/// Default value for `pair_request` message type
 fn default_pair_request_type() -> String {
     "pair_request".to_string()
 }
 
-/// Default value for pair_response message type
+/// Default value for `pair_response` message type
 fn default_pair_response_type() -> String {
     "pair_response".to_string()
 }
@@ -1860,7 +1845,7 @@ pub struct PairRequest {
     pub bidirectional: bool,
 
     // WireGuard fields
-    /// Local WireGuard public key
+    /// Local `WireGuard` public key
     #[serde(default)]
     pub wg_public_key: Option<String>,
     /// Tunnel IP assigned to this node
@@ -1868,10 +1853,10 @@ pub struct PairRequest {
     pub tunnel_ip: Option<String>,
 
     // Bidirectional: Pre-generated keys for remote node
-    /// Pre-generated remote WireGuard private key (for bidirectional)
+    /// Pre-generated remote `WireGuard` private key (for bidirectional)
     #[serde(default)]
     pub remote_wg_private_key: Option<String>,
-    /// Pre-generated remote WireGuard public key (for bidirectional)
+    /// Pre-generated remote `WireGuard` public key (for bidirectional)
     #[serde(default)]
     pub remote_wg_public_key: Option<String>,
 
@@ -1917,7 +1902,7 @@ pub struct PairResponse {
     pub timestamp: u64,
 
     // WireGuard fields
-    /// Responding node's WireGuard public key
+    /// Responding node's `WireGuard` public key
     #[serde(default)]
     pub wg_public_key: Option<String>,
     /// Local tunnel IP (assigned to responding node)
@@ -1942,7 +1927,7 @@ pub struct PairResponse {
 // Phase 6.0: IPC Response Types
 // ============================================================================
 
-/// Response containing a WireGuard tunnel list
+/// Response containing a `WireGuard` tunnel list
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgTunnelListResponse {
     /// List of tunnel statuses
@@ -1982,7 +1967,7 @@ pub struct IngressPeerListResponse {
 /// Response containing ingress statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngressStatsResponse {
-    /// Whether userspace WireGuard ingress is enabled
+    /// Whether userspace `WireGuard` ingress is enabled
     pub ingress_enabled: bool,
     /// Current ingress manager state (if enabled)
     pub ingress_state: Option<String>,
@@ -2063,7 +2048,7 @@ pub struct PrepareResponse {
 /// Configuration for a DNS upstream server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsUpstreamConfig {
-    /// Upstream address (e.g., "8.8.8.8:53", "https://dns.google/dns-query")
+    /// Upstream address (e.g., "8.8.8.8:53", "<https://dns.google/dns-query>")
     pub address: String,
     /// Protocol type: "udp", "tcp", "doh", "dot"
     pub protocol: String,
@@ -2183,7 +2168,7 @@ pub struct DnsUpstreamInfo {
 pub struct DnsQueryLogResponse {
     /// Query log entries
     pub entries: Vec<DnsQueryLogEntry>,
-    /// Total entries available (may differ from entries.len() due to pagination)
+    /// Total entries available (may differ from `entries.len()` due to pagination)
     pub total_available: usize,
     /// Pagination offset used
     pub offset: usize,
@@ -2262,7 +2247,7 @@ pub struct DnsConfigResponse {
     pub cache_max_entries: usize,
     /// Whether blocking is enabled
     pub blocking_enabled: bool,
-    /// Blocking response type (e.g., "zero_ip", "nxdomain", "refused")
+    /// Blocking response type (e.g., "`zero_ip`", "nxdomain", "refused")
     pub blocking_response_type: String,
     /// Whether query logging is enabled
     pub logging_enabled: bool,
@@ -2273,7 +2258,7 @@ pub struct DnsConfigResponse {
     /// Keys are feature names, values indicate implementation status:
     /// - "available": Feature is fully implemented
     /// - "partial": Feature is partially implemented
-    /// - "not_implemented": Feature is reserved for future use
+    /// - "`not_implemented"`: Feature is reserved for future use
     #[serde(default)]
     pub available_features: std::collections::HashMap<String, String>,
 }

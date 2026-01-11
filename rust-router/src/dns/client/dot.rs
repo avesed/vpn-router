@@ -1,6 +1,6 @@
-//! DNS-over-TLS (DoT) Client
+//! DNS-over-TLS (`DoT`) Client
 //!
-//! This module provides a DoT client implementing RFC 7858 for querying
+//! This module provides a `DoT` client implementing RFC 7858 for querying
 //! upstream DNS servers over TLS.
 //!
 //! # Features
@@ -57,7 +57,7 @@ mod inner {
     use crate::dns::config::{UpstreamConfig, UpstreamProtocol};
     use crate::dns::error::{DnsError, DnsResult};
 
-    /// Default DoT port (RFC 7858)
+    /// Default `DoT` port (RFC 7858)
     const DEFAULT_DOT_PORT: u16 = 853;
 
     /// Default connection pool size
@@ -69,7 +69,7 @@ mod inner {
     /// TLS connection wrapper for the pool
     type TlsConnection = TlsStream<TcpStream>;
 
-    /// DoT connection manager for deadpool
+    /// `DoT` connection manager for deadpool
     struct DotConnectionManager {
         server_addr: SocketAddr,
         server_name: ServerName<'static>,
@@ -131,8 +131,7 @@ mod inner {
                 })?
                 .map_err(|e| {
                     DnsError::network(format!(
-                        "TLS handshake failed: {}",
-                        e
+                        "TLS handshake failed: {e}"
                     ))
                 })?;
 
@@ -163,8 +162,7 @@ mod inner {
                 )),
                 // Read error
                 Ok(Err(e)) => Err(RecycleError::Message(format!(
-                    "DoT connection check failed: {}",
-                    e
+                    "DoT connection check failed: {e}"
                 ))),
             }
         }
@@ -172,7 +170,7 @@ mod inner {
 
     /// DNS-over-TLS client
     ///
-    /// A DoT client using tokio-rustls for TLS transport. Implements RFC 7858
+    /// A `DoT` client using tokio-rustls for TLS transport. Implements RFC 7858
     /// with connection pooling for efficient resource usage.
     ///
     /// # Thread Safety
@@ -232,11 +230,11 @@ mod inner {
     }
 
     impl DotClient {
-        /// Create a new DoT client
+        /// Create a new `DoT` client
         ///
         /// # Arguments
         ///
-        /// * `config` - Upstream configuration with DoT address
+        /// * `config` - Upstream configuration with `DoT` address
         ///
         /// The address can be in one of these formats:
         /// - `hostname:port` (e.g., `cloudflare-dns.com:853`)
@@ -265,11 +263,11 @@ mod inner {
             Self::with_pool_size(config, DEFAULT_POOL_SIZE)
         }
 
-        /// Create a new DoT client with custom pool size
+        /// Create a new `DoT` client with custom pool size
         ///
         /// # Arguments
         ///
-        /// * `config` - Upstream configuration with DoT address
+        /// * `config` - Upstream configuration with `DoT` address
         /// * `pool_size` - Maximum number of pooled connections
         ///
         /// # Errors
@@ -284,11 +282,11 @@ mod inner {
             )
         }
 
-        /// Create a new DoT client with full configuration
+        /// Create a new `DoT` client with full configuration
         ///
         /// # Arguments
         ///
-        /// * `config` - Upstream configuration with DoT address
+        /// * `config` - Upstream configuration with `DoT` address
         /// * `pool_size` - Maximum number of pooled connections
         /// * `connect_timeout` - Timeout for establishing connections
         /// * `health_config` - Health check configuration
@@ -315,7 +313,7 @@ mod inner {
                 .try_into()
                 .map_err(|_| {
                     DnsError::config_field(
-                        format!("invalid server name for SNI: {}", server_name),
+                        format!("invalid server name for SNI: {server_name}"),
                         "upstream.address",
                     )
                 })?;
@@ -328,7 +326,7 @@ mod inner {
                 connect_timeout,
             );
             let pool = Pool::builder(manager).max_size(pool_size).build().map_err(|e| {
-                DnsError::config(format!("failed to create DoT connection pool: {}", e))
+                DnsError::config(format!("failed to create DoT connection pool: {e}"))
             })?;
 
             let query_timeout = Duration::from_secs(config.timeout_secs.max(1));
@@ -344,7 +342,7 @@ mod inner {
             })
         }
 
-        /// Parse the DoT address to extract socket address and hostname
+        /// Parse the `DoT` address to extract socket address and hostname
         fn parse_address(config: &UpstreamConfig) -> DnsResult<(SocketAddr, String)> {
             let address = &config.address;
 
@@ -372,7 +370,7 @@ mod inner {
                 if port_part.chars().all(|c| c.is_ascii_digit()) {
                     let port: u16 = port_part.parse().map_err(|_| {
                         DnsError::config_field(
-                            format!("invalid DoT port: {}", port_part),
+                            format!("invalid DoT port: {port_part}"),
                             "upstream.address",
                         )
                     })?;
@@ -389,7 +387,7 @@ mod inner {
             // Resolve hostname to socket address
             // For production, we'd want async DNS resolution, but for config parsing
             // we use blocking resolution (happens once at startup)
-            let addr_str = format!("{}:{}", hostname, port);
+            let addr_str = format!("{hostname}:{port}");
             let socket_addr: SocketAddr = addr_str.parse().or_else(|_| {
                 // If direct parse fails, try DNS resolution
                 use std::net::ToSocketAddrs;
@@ -397,14 +395,14 @@ mod inner {
                     .to_socket_addrs()
                     .map_err(|e| {
                         DnsError::config_field(
-                            format!("failed to resolve DoT hostname '{}': {}", hostname, e),
+                            format!("failed to resolve DoT hostname '{hostname}': {e}"),
                             "upstream.address",
                         )
                     })?
                     .next()
                     .ok_or_else(|| {
                         DnsError::config_field(
-                            format!("no addresses found for DoT hostname '{}'", hostname),
+                            format!("no addresses found for DoT hostname '{hostname}'"),
                             "upstream.address",
                         )
                     })
@@ -449,7 +447,7 @@ mod inner {
             &self.health
         }
 
-        /// Perform a DoT DNS query
+        /// Perform a `DoT` DNS query
         ///
         /// Uses the same 2-byte length prefix format as plain TCP DNS (RFC 1035),
         /// but over TLS (RFC 7858).
@@ -460,7 +458,7 @@ mod inner {
         ) -> DnsResult<Message> {
             // Serialize the query
             let query_bytes = query.to_vec().map_err(|e| {
-                DnsError::serialize(format!("failed to serialize DNS query: {}", e))
+                DnsError::serialize(format!("failed to serialize DNS query: {e}"))
             })?;
 
             // Check message size
@@ -535,8 +533,7 @@ mod inner {
             }
             if response_len > MAX_TCP_MESSAGE_SIZE {
                 return Err(DnsError::parse(format!(
-                    "DoT response too large: {} bytes (max {})",
-                    response_len, MAX_TCP_MESSAGE_SIZE
+                    "DoT response too large: {response_len} bytes (max {MAX_TCP_MESSAGE_SIZE})"
                 )));
             }
 
@@ -559,7 +556,7 @@ mod inner {
 
             // Parse the response
             let response = Message::from_vec(&response_buf).map_err(|e| {
-                DnsError::parse(format!("failed to parse DoT DNS response: {}", e))
+                DnsError::parse(format!("failed to parse DoT DNS response: {e}"))
             })?;
 
             // Validate response matches query
@@ -581,7 +578,7 @@ mod inner {
             let mut conn = self.pool.get().await.map_err(|e| {
                 DnsError::upstream(
                     &self.config.address,
-                    format!("failed to get DoT connection from pool: {}", e),
+                    format!("failed to get DoT connection from pool: {e}"),
                 )
             })?;
 
@@ -606,7 +603,7 @@ mod inner {
                         let mut new_conn = self.pool.get().await.map_err(|e| {
                             DnsError::upstream(
                                 &self.config.address,
-                                format!("failed to get fresh DoT connection: {}", e),
+                                format!("failed to get fresh DoT connection: {e}"),
                             )
                         })?;
 

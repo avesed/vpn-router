@@ -622,7 +622,7 @@ impl DnsCache {
                         } else {
                             // Pattern is "example.com" - match as suffix with dot separator
                             // "sub.example.com" ends with ".example.com"
-                            let suffix = format!(".{}", normalized_pattern);
+                            let suffix = format!(".{normalized_pattern}");
                             if normalized_qname.ends_with(&suffix) {
                                 return Some((*key).clone());
                             }
@@ -676,7 +676,7 @@ impl DnsCache {
     /// Get cache statistics
     #[must_use]
     pub fn stats(&self) -> &CacheStats {
-        &*self.stats
+        &self.stats
     }
 
     /// Get a snapshot of cache statistics

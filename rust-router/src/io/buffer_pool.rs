@@ -598,7 +598,7 @@ impl LocalBufferCacheStats {
         self.global_fallbacks.load(Ordering::Relaxed)
     }
 
-    /// Get local hit rate (local_hits / total_gets)
+    /// Get local hit rate (`local_hits` / `total_gets`)
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn local_hit_rate(&self) -> f64 {
@@ -650,7 +650,7 @@ impl LocalBufferCache {
     /// Get a buffer from the local cache or global pool.
     ///
     /// Fast path: Pop from local cache (single mutex lock)
-    /// Slow path: Get from global pool (atomic ArrayQueue operation)
+    /// Slow path: Get from global pool (atomic `ArrayQueue` operation)
     ///
     /// # Returns
     ///
@@ -658,7 +658,7 @@ impl LocalBufferCache {
     #[must_use]
     pub fn get(&self) -> LocalPooledBuffer<'_> {
         // NEW-5 FIX: Use poison recovery instead of unwrap to avoid cascade panics
-        let mut local = self.local_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut local = self.local_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let buffer = if let Some(mut buf) = local.pop() {
             // Fast path: local cache hit
@@ -708,7 +708,7 @@ impl LocalBufferCache {
     fn return_buffer(&self, mut buffer: Vec<u8>) {
         buffer.clear();
 
-        let mut local = self.local_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut local = self.local_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if local.len() < self.max_size {
             // Return to local cache
             self.stats.local_returns.fetch_add(1, Ordering::Relaxed);
@@ -729,7 +729,7 @@ impl LocalBufferCache {
     ///
     /// * `count` - Number of buffers to fetch from global pool
     pub fn refill(&self, count: usize) {
-        let mut local = self.local_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut local = self.local_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let space = self.max_size.saturating_sub(local.len());
         let to_fetch = count.min(space);
 
@@ -748,7 +748,7 @@ impl LocalBufferCache {
     /// Call this during shutdown or when the worker is idle for extended periods.
     pub fn flush(&self) {
         // NEW-5 FIX: Use poison recovery instead of unwrap to avoid cascade panics
-        let mut local = self.local_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut local = self.local_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for buffer in local.drain(..) {
             self.global_pool.return_buffer(buffer);
         }
@@ -764,7 +764,7 @@ impl LocalBufferCache {
     #[must_use]
     pub fn local_size(&self) -> usize {
         // NEW-5 FIX: Use poison recovery instead of unwrap to avoid cascade panics
-        self.local_buffers.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.local_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     /// Get the global pool reference.
@@ -778,7 +778,7 @@ impl std::fmt::Debug for LocalBufferCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // NEW-5 FIX: Use poison recovery instead of unwrap to avoid cascade panics
         f.debug_struct("LocalBufferCache")
-            .field("local_size", &self.local_buffers.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .field("local_size", &self.local_buffers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len())
             .field("max_size", &self.max_size)
             .field("global_pool_buffer_size", &self.global_pool.buffer_size())
             .field("stats", &self.stats)
@@ -797,7 +797,7 @@ pub struct LocalPooledBuffer<'a> {
     cache: &'a LocalBufferCache,
 }
 
-impl<'a> LocalPooledBuffer<'a> {
+impl LocalPooledBuffer<'_> {
     /// Consume this buffer without returning it to any pool.
     #[must_use]
     pub fn into_vec(mut self) -> Vec<u8> {

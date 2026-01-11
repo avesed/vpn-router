@@ -302,7 +302,7 @@ impl QueryLogEntry {
     pub fn to_json(&self) -> String {
         // Use serde_json for proper escaping
         match serde_json::to_string(self) {
-            Ok(json) => format!("{}\n", json),
+            Ok(json) => format!("{json}\n"),
             Err(e) => {
                 // Fallback for serialization errors (should be rare)
                 error!("Failed to serialize log entry to JSON: {}", e);
@@ -1018,11 +1018,11 @@ impl QueryLogger {
                     }
                 }
                 Ok(Some(LogCommand::FlushSync(response_tx))) => {
-                    let success = if !batch.is_empty() {
+                    let success = if batch.is_empty() {
+                        true // No entries to flush, consider it successful
+                    } else {
                         Self::write_batch_with_result(&mut file, &batch, &config.format, &stats, &mut rotator)
                             .await
-                    } else {
-                        true // No entries to flush, consider it successful
                     };
                     batch.clear();
 
@@ -1091,16 +1091,14 @@ impl QueryLogger {
         // Reject paths containing `..` (parent directory traversal)
         if path_str.contains("..") {
             return Err(DnsError::config(format!(
-                "Log path contains path traversal attempt: {:?}",
-                path
+                "Log path contains path traversal attempt: {path:?}"
             )));
         }
 
         // Ensure path has a valid file name (not empty, not a directory)
         let file_name = path.file_name().ok_or_else(|| {
             DnsError::config(format!(
-                "Log path has no file name (cannot be a directory or special path): {:?}",
-                path
+                "Log path has no file name (cannot be a directory or special path): {path:?}"
             ))
         })?;
 
@@ -1108,8 +1106,7 @@ impl QueryLogger {
         let file_name_str = file_name.to_string_lossy();
         if file_name_str.contains("..") || file_name_str.contains('/') || file_name_str.contains('\\') {
             return Err(DnsError::config(format!(
-                "Log file name contains invalid characters: {:?}",
-                file_name
+                "Log file name contains invalid characters: {file_name:?}"
             )));
         }
 
@@ -1124,8 +1121,7 @@ impl QueryLogger {
                 match component {
                     std::path::Component::ParentDir => {
                         return Err(DnsError::config(format!(
-                            "Log path contains parent directory traversal: {:?}",
-                            path
+                            "Log path contains parent directory traversal: {path:?}"
                         )));
                     }
                     std::path::Component::Normal(s) => {
@@ -1133,8 +1129,7 @@ impl QueryLogger {
                         let s_str = s.to_string_lossy();
                         if s_str.contains("..") {
                             return Err(DnsError::config(format!(
-                                "Log path component contains invalid sequence: {:?}",
-                                path
+                                "Log path component contains invalid sequence: {path:?}"
                             )));
                         }
                     }
@@ -1149,8 +1144,7 @@ impl QueryLogger {
         // Parent exists, so canonicalize it and verify the path stays within
         let canonical_parent = parent.canonicalize().map_err(|e| {
             DnsError::internal(format!(
-                "Failed to canonicalize log parent directory {:?}: {}",
-                parent, e
+                "Failed to canonicalize log parent directory {parent:?}: {e}"
             ))
         })?;
 
@@ -1162,16 +1156,14 @@ impl QueryLogger {
         if validated_path.exists() {
             let canonical_path = validated_path.canonicalize().map_err(|e| {
                 DnsError::internal(format!(
-                    "Failed to canonicalize log path {:?}: {}",
-                    validated_path, e
+                    "Failed to canonicalize log path {validated_path:?}: {e}"
                 ))
             })?;
 
             // Verify the canonical path starts with the canonical parent
             if !canonical_path.starts_with(&canonical_parent) {
                 return Err(DnsError::config(format!(
-                    "Log path escapes intended directory: {:?} not within {:?}",
-                    canonical_path, canonical_parent
+                    "Log path escapes intended directory: {canonical_path:?} not within {canonical_parent:?}"
                 )));
             }
 
@@ -1197,7 +1189,7 @@ impl QueryLogger {
             if !parent.exists() {
                 tokio::fs::create_dir_all(parent)
                     .await
-                    .map_err(|e| DnsError::internal(format!("Failed to create log directory: {}", e)))?;
+                    .map_err(|e| DnsError::internal(format!("Failed to create log directory: {e}")))?;
             }
         }
 
@@ -1206,7 +1198,7 @@ impl QueryLogger {
             .append(true)
             .open(&validated_path)
             .await
-            .map_err(|e| DnsError::internal(format!("Failed to open log file: {}", e)))
+            .map_err(|e| DnsError::internal(format!("Failed to open log file: {e}")))
     }
 
     /// Write a batch of entries to the log file

@@ -22,7 +22,7 @@
 //!
 //! - **Batch I/O**: Uses recvmmsg/sendmmsg when available (Linux)
 //! - **Buffer Pooling**: Reuses buffers to minimize allocations
-//! - **Rate Limiting**: Integrated with DnsRateLimiter
+//! - **Rate Limiting**: Integrated with `DnsRateLimiter`
 //! - **Graceful Shutdown**: Responds to shutdown signals
 //!
 //! # Example
@@ -281,7 +281,7 @@ impl UdpDnsServer {
     /// ```
     pub async fn bind(addr: SocketAddr, handler: Arc<DnsHandler>) -> DnsResult<Self> {
         let socket = UdpSocket::bind(addr).await.map_err(|e| {
-            DnsError::network_io(format!("failed to bind UDP socket to {}", addr), e)
+            DnsError::network_io(format!("failed to bind UDP socket to {addr}"), e)
         })?;
 
         let local_addr = socket.local_addr().map_err(|e| {
@@ -445,7 +445,7 @@ impl UdpDnsServer {
             Err(e) => {
                 let error_count = self.stats.record_recv_error();
                 let dns_error = DnsError::network_io("UDP recv_from failed".to_string(), e);
-                if Self::is_degraded_error(&dns_error) && error_count % 10 == 0 {
+                if Self::is_degraded_error(&dns_error) && error_count.is_multiple_of(10) {
                     warn!(
                         consecutive_errors = error_count,
                         "Consecutive degraded recv errors detected"
@@ -498,8 +498,7 @@ impl UdpDnsServer {
         let parsed_query = Message::from_bytes(query).ok();
         let client_buffer_size = parsed_query
             .as_ref()
-            .map(|q| self.handler.get_client_buffer_size(q))
-            .unwrap_or(MAX_UDP_RESPONSE_SIZE_NO_EDNS);
+            .map_or(MAX_UDP_RESPONSE_SIZE_NO_EDNS, |q| self.handler.get_client_buffer_size(q));
 
         match self.handler.handle_query(src, query).await {
             Ok(response) => {
@@ -587,7 +586,7 @@ impl UdpDnsServer {
     /// Check if an error indicates a degraded socket state
     ///
     /// Some errors are not immediately fatal but indicate the socket
-    /// may be in a bad state if they persist (e.g., repeated WouldBlock
+    /// may be in a bad state if they persist (e.g., repeated `WouldBlock`
     /// when the socket should be readable).
     fn is_degraded_error(err: &DnsError) -> bool {
         match err {

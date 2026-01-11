@@ -2,7 +2,7 @@
 //!
 //! This module defines the core traits for DNS upstream clients, providing
 //! a unified interface for querying upstream DNS servers across different
-//! protocols (UDP, TCP, DoH, DoT).
+//! protocols (UDP, TCP, `DoH`, `DoT`).
 //!
 //! # Example
 //!
@@ -105,15 +105,15 @@ pub trait DnsUpstream: Send + Sync + Debug {
     ///
     /// # Returns
     ///
-    /// The protocol type (UDP, TCP, DoH, DoT, DoQ)
+    /// The protocol type (UDP, TCP, `DoH`, `DoT`, `DoQ`)
     fn protocol(&self) -> UpstreamProtocol;
 
     /// Get the upstream server address
     ///
     /// The format depends on the protocol:
     /// - UDP/TCP: `ip:port` (e.g., `8.8.8.8:53`)
-    /// - DoH: Full URL (e.g., `https://dns.google/dns-query`)
-    /// - DoT: `hostname:port` (e.g., `dns.google:853`)
+    /// - `DoH`: Full URL (e.g., `https://dns.google/dns-query`)
+    /// - `DoT`: `hostname:port` (e.g., `dns.google:853`)
     ///
     /// # Returns
     ///
@@ -138,7 +138,7 @@ pub trait DnsUpstream: Send + Sync + Debug {
     ///
     /// # Returns
     ///
-    /// `true` for DoH, DoT, DoQ; `false` for plain UDP/TCP
+    /// `true` for `DoH`, `DoT`, `DoQ`; `false` for plain UDP/TCP
     fn is_encrypted(&self) -> bool {
         matches!(
             self.protocol(),

@@ -57,7 +57,7 @@ impl IpcServer {
         if socket_path.exists() {
             std::fs::remove_file(socket_path).map_err(|e| IpcError::SocketCreation {
                 path: socket_path.display().to_string(),
-                reason: format!("Failed to remove existing socket: {}", e),
+                reason: format!("Failed to remove existing socket: {e}"),
             })?;
         }
 
@@ -66,7 +66,7 @@ impl IpcServer {
             if !parent.exists() {
                 std::fs::create_dir_all(parent).map_err(|e| IpcError::SocketCreation {
                     path: socket_path.display().to_string(),
-                    reason: format!("Failed to create parent directory: {}", e),
+                    reason: format!("Failed to create parent directory: {e}"),
                 })?;
             }
         }
@@ -85,7 +85,7 @@ impl IpcServer {
             std::fs::set_permissions(socket_path, permissions).map_err(|e| {
                 IpcError::SocketCreation {
                     path: socket_path.display().to_string(),
-                    reason: format!("Failed to set permissions: {}", e),
+                    reason: format!("Failed to set permissions: {e}"),
                 }
             })?;
         }
@@ -169,7 +169,7 @@ async fn handle_connection(
             );
             let response = IpcResponse::error(
                 ErrorCode::InvalidParameters,
-                format!("Message too large: {} bytes", msg_len),
+                format!("Message too large: {msg_len} bytes"),
             );
             send_response(&mut stream, &response).await?;
             continue;
@@ -186,7 +186,7 @@ async fn handle_connection(
                 warn!("Invalid IPC command: {}", e);
                 let response = IpcResponse::error(
                     ErrorCode::InvalidCommand,
-                    format!("Invalid command format: {}", e),
+                    format!("Invalid command format: {e}"),
                 );
                 send_response(&mut stream, &response).await?;
                 continue;
@@ -256,8 +256,7 @@ impl IpcClient {
 
         if msg_len > MAX_MESSAGE_SIZE {
             return Err(IpcError::protocol(format!(
-                "Response too large: {} bytes",
-                msg_len
+                "Response too large: {msg_len} bytes"
             )));
         }
 

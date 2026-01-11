@@ -116,8 +116,7 @@ impl Manager for TcpConnectionManager {
             )),
             // Other errors
             Err(e) => Err(RecycleError::Message(format!(
-                "TCP connection check failed: {}",
-                e
+                "TCP connection check failed: {e}"
             ))),
         }
     }
@@ -249,7 +248,7 @@ impl TcpClient {
         let pool = Pool::builder(manager)
             .max_size(pool_size)
             .build()
-            .map_err(|e| DnsError::config(format!("failed to create TCP connection pool: {}", e)))?;
+            .map_err(|e| DnsError::config(format!("failed to create TCP connection pool: {e}")))?;
 
         let query_timeout = Duration::from_secs(config.timeout_secs.max(1));
         let health = Arc::new(HealthChecker::new(&health_config));
@@ -289,7 +288,7 @@ impl TcpClient {
     ) -> DnsResult<Message> {
         // Serialize the query
         let query_bytes = query.to_vec().map_err(|e| {
-            DnsError::serialize(format!("failed to serialize DNS query: {}", e))
+            DnsError::serialize(format!("failed to serialize DNS query: {e}"))
         })?;
 
         // Check message size
@@ -348,8 +347,7 @@ impl TcpClient {
         }
         if response_len > MAX_TCP_MESSAGE_SIZE {
             return Err(DnsError::parse(format!(
-                "TCP response too large: {} bytes (max {})",
-                response_len, MAX_TCP_MESSAGE_SIZE
+                "TCP response too large: {response_len} bytes (max {MAX_TCP_MESSAGE_SIZE})"
             )));
         }
 
@@ -372,7 +370,7 @@ impl TcpClient {
 
         // Parse the response
         let response = Message::from_vec(&response_buf).map_err(|e| {
-            DnsError::parse(format!("failed to parse TCP DNS response: {}", e))
+            DnsError::parse(format!("failed to parse TCP DNS response: {e}"))
         })?;
 
         // Validate response matches query
@@ -394,7 +392,7 @@ impl DnsUpstream for TcpClient {
         let mut conn = self.pool.get().await.map_err(|e| {
             DnsError::upstream(
                 &self.config.address,
-                format!("failed to get TCP connection from pool: {}", e),
+                format!("failed to get TCP connection from pool: {e}"),
             )
         })?;
 
@@ -419,7 +417,7 @@ impl DnsUpstream for TcpClient {
                     let mut new_conn = self.pool.get().await.map_err(|e| {
                         DnsError::upstream(
                             &self.config.address,
-                            format!("failed to get fresh TCP connection: {}", e),
+                            format!("failed to get fresh TCP connection: {e}"),
                         )
                     })?;
 

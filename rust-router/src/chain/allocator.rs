@@ -8,17 +8,17 @@
 //! - [ ] 6.6.4 DSCP allocation
 //! - [ ] 6.6.4 DSCP reservation
 //! - [ ] 6.6.4 Conflict detection
-//! - [ ] 6.6.4 Reserved QoS value protection
+//! - [ ] 6.6.4 Reserved `QoS` value protection
 //!
 //! # DSCP Value Range
 //!
 //! - Valid range: 1-63 (6-bit field)
 //! - Value 0: Reserved (no DSCP marking)
-//! - Standard QoS values: Protected from auto-allocation
+//! - Standard `QoS` values: Protected from auto-allocation
 //!
-//! # Reserved DSCP Values (Standard QoS)
+//! # Reserved DSCP Values (Standard `QoS`)
 //!
-//! The following DSCP values are reserved for standard QoS and cannot
+//! The following DSCP values are reserved for standard `QoS` and cannot
 //! be auto-allocated (but can be manually reserved):
 //!
 //! | DSCP | Name | Description |
@@ -49,10 +49,10 @@ pub const MIN_DSCP: u8 = 1;
 /// Maximum DSCP value (6-bit field)
 pub const MAX_DSCP: u8 = 63;
 
-/// Reserved DSCP values (standard QoS classes)
+/// Reserved DSCP values (standard `QoS` classes)
 ///
 /// These values are protected from auto-allocation to avoid
-/// interference with standard QoS mechanisms.
+/// interference with standard `QoS` mechanisms.
 pub const RESERVED_DSCP: &[u8] = &[
     0,  // BE (Best Effort)
     8,  // CS1 (Class Selector 1)
@@ -100,11 +100,11 @@ pub enum DscpAllocatorError {
 /// DSCP value allocator with conflict detection
 ///
 /// Manages allocation of unique DSCP values for chain routing
-/// while protecting standard QoS values.
+/// while protecting standard `QoS` values.
 pub struct DscpAllocator {
     /// Currently allocated DSCP values
     allocated: RwLock<HashSet<u8>>,
-    /// Reserved DSCP values (standard QoS)
+    /// Reserved DSCP values (standard `QoS`)
     reserved: HashSet<u8>,
 }
 
@@ -128,7 +128,7 @@ impl DscpAllocator {
     /// Allocate the next available DSCP value
     ///
     /// Automatically selects a DSCP value that is neither reserved
-    /// for QoS nor already allocated to another chain.
+    /// for `QoS` nor already allocated to another chain.
     ///
     /// # Returns
     ///
@@ -163,7 +163,7 @@ impl DscpAllocator {
     /// Reserve a specific DSCP value
     ///
     /// Allows manual reservation of a specific DSCP value for a chain.
-    /// Reserved QoS values can be manually allocated if the user
+    /// Reserved `QoS` values can be manually allocated if the user
     /// explicitly requests them.
     ///
     /// # Arguments
@@ -184,7 +184,7 @@ impl DscpAllocator {
     /// ```
     #[must_use = "The reservation result should be checked for success or failure"]
     pub fn reserve(&self, dscp: u8) -> Result<(), DscpAllocatorError> {
-        if dscp < MIN_DSCP || dscp > MAX_DSCP {
+        if !(MIN_DSCP..=MAX_DSCP).contains(&dscp) {
             return Err(DscpAllocatorError::OutOfRange(dscp));
         }
 
@@ -238,7 +238,7 @@ impl DscpAllocator {
             .unwrap_or(false)
     }
 
-    /// Check if a DSCP value is reserved for QoS
+    /// Check if a DSCP value is reserved for `QoS`
     ///
     /// # Arguments
     ///
@@ -246,7 +246,7 @@ impl DscpAllocator {
     ///
     /// # Returns
     ///
-    /// `true` if the value is reserved for QoS, `false` otherwise.
+    /// `true` if the value is reserved for `QoS`, `false` otherwise.
     pub fn is_reserved(&self, dscp: u8) -> bool {
         self.reserved.contains(&dscp)
     }
@@ -262,7 +262,7 @@ impl DscpAllocator {
     /// Get the number of available DSCP values
     ///
     /// Returns the count of DSCP values that are neither allocated
-    /// nor reserved for QoS.
+    /// nor reserved for `QoS`.
     pub fn available_count(&self) -> usize {
         let total = (MAX_DSCP - MIN_DSCP + 1) as usize;
         let reserved = self.reserved.len();

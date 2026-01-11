@@ -175,7 +175,7 @@ pub fn analyze_negative_response(
 /// 2. SOA record TTL
 /// 3. Default negative TTL
 ///
-/// The result is clamped to the configured max_ttl.
+/// The result is clamped to the configured `max_ttl`.
 fn determine_negative_ttl(message: &Message, config: &NegativeCacheConfig) -> (u32, bool) {
     if !config.enabled {
         return (config.default_ttl_secs, false);
@@ -268,7 +268,7 @@ pub fn extract_soa_minimum(message: &Message) -> Option<u32> {
 /// This applies all the configuration rules:
 /// - SOA MINIMUM if `respect_soa_minimum` is enabled
 /// - Default TTL as fallback
-/// - TTL clamping to max_ttl
+/// - TTL clamping to `max_ttl`
 ///
 /// # Arguments
 ///

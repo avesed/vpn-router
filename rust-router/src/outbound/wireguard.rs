@@ -1,12 +1,12 @@
-//! WireGuard interface utilities
+//! `WireGuard` interface utilities
 //!
-//! This module provides utilities for working with WireGuard interfaces,
+//! This module provides utilities for working with `WireGuard` interfaces,
 //! including interface name generation that matches the Python implementation
 //! in `scripts/setup_kernel_wg_egress.py`.
 //!
 //! # Interface Naming Convention
 //!
-//! WireGuard interfaces follow Linux's interface name limit of 15 characters
+//! `WireGuard` interfaces follow Linux's interface name limit of 15 characters
 //! (IFNAMSIZ - 1 for null terminator). The naming convention is:
 //!
 //! - PIA profiles: `wg-pia-{tag}` (prefix 7 chars, leaves 8 for tag)
@@ -34,9 +34,9 @@
 //!
 //! # Note
 //!
-//! This module provides UTILITIES only. The actual WireGuard connections are
+//! This module provides UTILITIES only. The actual `WireGuard` connections are
 //! handled by `DirectOutbound` with `bind_interface` and `routing_mark` options.
-//! The kernel WireGuard interfaces are created by the Python script
+//! The kernel `WireGuard` interfaces are created by the Python script
 //! `setup_kernel_wg_egress.py`.
 
 use std::fs;
@@ -50,28 +50,28 @@ use crate::error::OutboundError;
 /// Maximum length for Linux interface names (IFNAMSIZ - 1)
 pub const INTERFACE_MAX_LEN: usize = 15;
 
-/// Prefix for PIA WireGuard interfaces (7 chars)
+/// Prefix for PIA `WireGuard` interfaces (7 chars)
 pub const PIA_PREFIX: &str = "wg-pia-";
 
-/// Prefix for custom WireGuard interfaces (6 chars)
+/// Prefix for custom `WireGuard` interfaces (6 chars)
 pub const CUSTOM_PREFIX: &str = "wg-eg-";
 
-/// Prefix for WARP WireGuard interfaces (8 chars)
+/// Prefix for WARP `WireGuard` interfaces (8 chars)
 pub const WARP_PREFIX: &str = "wg-warp-";
 
-/// Prefix for peer node WireGuard interfaces (8 chars)
+/// Prefix for peer node `WireGuard` interfaces (8 chars)
 pub const PEER_PREFIX: &str = "wg-peer-";
 
-/// Type of WireGuard egress, determining the interface name prefix
+/// Type of `WireGuard` egress, determining the interface name prefix
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EgressType {
     /// PIA (Private Internet Access) VPN exit
     /// Interface prefix: `wg-pia-`
     Pia,
-    /// Custom WireGuard egress
+    /// Custom `WireGuard` egress
     /// Interface prefix: `wg-eg-`
     Custom,
-    /// Cloudflare WARP WireGuard egress
+    /// Cloudflare WARP `WireGuard` egress
     /// Interface prefix: `wg-warp-`
     Warp,
     /// Peer node tunnel
@@ -125,14 +125,14 @@ impl std::str::FromStr for EgressType {
     }
 }
 
-/// Generate a kernel WireGuard interface name for the given egress tag and type
+/// Generate a kernel `WireGuard` interface name for the given egress tag and type
 ///
 /// This function produces output **identical** to the Python function
 /// `get_egress_interface_name()` in `scripts/setup_kernel_wg_egress.py`.
 ///
 /// # Arguments
 ///
-/// * `tag` - The egress tag (e.g., "new_york", "cn2-la")
+/// * `tag` - The egress tag (e.g., "`new_york`", "cn2-la")
 /// * `egress_type` - The type of egress (PIA, Custom, WARP, Peer)
 ///
 /// # Returns
@@ -140,7 +140,7 @@ impl std::str::FromStr for EgressType {
 /// An interface name of at most 15 characters, formatted as `{prefix}{suffix}`
 /// where:
 /// - If `tag.len() <= max_tag_len`, suffix = tag
-/// - Otherwise, suffix = MD5(tag).hexdigest()[:max_tag_len]
+/// - Otherwise, suffix = `MD5(tag).hexdigest()`[:`max_tag_len`]
 ///
 /// # Examples
 ///
@@ -192,14 +192,14 @@ pub struct InterfaceInfo {
     pub if_type: u16,
 }
 
-/// ARPHRD_NONE from Linux kernel (include/uapi/linux/if_arp.h)
-/// WireGuard interfaces use this type because they don't have a hardware address
+/// `ARPHRD_NONE` from Linux kernel (`include/uapi/linux/if_arp.h`)
+/// `WireGuard` interfaces use this type because they don't have a hardware address
 const ARPHRD_NONE: u16 = 65534;
 
 impl InterfaceInfo {
-    /// Check if this is a WireGuard interface
+    /// Check if this is a `WireGuard` interface
     ///
-    /// WireGuard interfaces have type ARPHRD_NONE (65534) because they are
+    /// `WireGuard` interfaces have type `ARPHRD_NONE` (65534) because they are
     /// virtual tunnel interfaces without hardware addresses. This is defined
     /// in the Linux kernel's `include/uapi/linux/if_arp.h`.
     #[must_use]
@@ -356,7 +356,7 @@ fn io_error_message(e: &io::Error, interface: &str) -> String {
     }
 }
 
-/// List all WireGuard egress interfaces on the system
+/// List all `WireGuard` egress interfaces on the system
 ///
 /// This returns interfaces matching the naming patterns:
 /// - `wg-pia-*`
@@ -436,7 +436,7 @@ pub fn parse_interface_name(interface: &str) -> Option<(EgressType, &str)> {
     }
 }
 
-/// Check if an interface name is a valid WireGuard egress interface
+/// Check if an interface name is a valid `WireGuard` egress interface
 ///
 /// # Arguments
 ///
@@ -522,8 +522,8 @@ pub fn is_valid_routing_mark(mark: u32) -> bool {
 /// ```
 #[must_use]
 pub fn get_peer_routing_table(port: u16) -> Option<u32> {
-    if port >= PEER_PORT_MIN && port <= PEER_PORT_MAX {
-        Some(PEER_TABLE_BASE + (port - PEER_PORT_MIN) as u32)
+    if (PEER_PORT_MIN..=PEER_PORT_MAX).contains(&port) {
+        Some(PEER_TABLE_BASE + u32::from(port - PEER_PORT_MIN))
     } else {
         None
     }

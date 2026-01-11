@@ -16,10 +16,10 @@
 //!
 //! | Algorithm | Description |
 //! |-----------|-------------|
-//! | FiveTupleHash | Hash 5-tuple for connection affinity (DEFAULT) |
-//! | RoundRobin | Cycle through members sequentially |
+//! | `FiveTupleHash` | Hash 5-tuple for connection affinity (DEFAULT) |
+//! | `RoundRobin` | Cycle through members sequentially |
 //! | Weighted | Distribute based on member weights |
-//! | LeastConnections | Select member with fewest active connections |
+//! | `LeastConnections` | Select member with fewest active connections |
 //! | Random | Random selection (no state) |
 //!
 //! # Example
@@ -55,8 +55,10 @@ use serde::{Deserialize, Serialize};
 /// Used in `FiveTuple` to distinguish between TCP and UDP connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Protocol {
     /// Transmission Control Protocol
+    #[default]
     Tcp,
     /// User Datagram Protocol
     Udp,
@@ -91,11 +93,6 @@ impl Protocol {
     }
 }
 
-impl Default for Protocol {
-    fn default() -> Self {
-        Self::Tcp
-    }
-}
 
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -140,7 +137,7 @@ pub struct FiveTuple {
 }
 
 impl FiveTuple {
-    /// Create a new FiveTuple.
+    /// Create a new `FiveTuple`.
     ///
     /// # Arguments
     ///
@@ -180,10 +177,10 @@ impl FiveTuple {
         }
     }
 
-    /// Create a FiveTuple from a ConnectionInfo and source port.
+    /// Create a `FiveTuple` from a `ConnectionInfo` and source port.
     ///
-    /// This is a convenience method for creating a FiveTuple from
-    /// the rule engine's ConnectionInfo type.
+    /// This is a convenience method for creating a `FiveTuple` from
+    /// the rule engine's `ConnectionInfo` type.
     ///
     /// # Arguments
     ///
@@ -245,9 +242,11 @@ impl std::fmt::Display for FiveTuple {
 /// Load balancing algorithm
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum LbAlgorithm {
     /// Five-tuple hash: Connection affinity based on 5-tuple hash (DEFAULT)
     #[serde(rename = "five_tuple_hash")]
+    #[default]
     FiveTupleHash,
     /// Round-robin: Cycle through members sequentially
     RoundRobin,
@@ -259,11 +258,6 @@ pub enum LbAlgorithm {
     Random,
 }
 
-impl Default for LbAlgorithm {
-    fn default() -> Self {
-        Self::FiveTupleHash
-    }
-}
 
 impl std::fmt::Display for LbAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

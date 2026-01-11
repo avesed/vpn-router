@@ -66,7 +66,7 @@
 //! # Performance
 //!
 //! - Entry creation: < 100ns
-//! - Channel send: < 50ns (try_send)
+//! - Channel send: < 50ns (`try_send`)
 //! - No impact on DNS query latency
 //! - Memory: ~5MB for 10K entry buffer (configurable)
 //!

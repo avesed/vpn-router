@@ -6,7 +6,7 @@
 //! # Features
 //!
 //! - **TPROXY Support**: Full support for Linux TPROXY transparent proxying
-//! - **TLS SNI Sniffing**: Extract Server Name Indication from TLS ClientHello
+//! - **TLS SNI Sniffing**: Extract Server Name Indication from TLS `ClientHello`
 //! - **Multiple Outbounds**: Support for direct and block outbound types
 //! - **IPC Control**: Unix socket-based runtime control
 //! - **Connection Management**: Backpressure, statistics, and graceful shutdown
@@ -56,8 +56,8 @@
 //! - [`outbound`]: Outbound implementations
 //! - [`sniff`]: Protocol sniffing (TLS SNI, QUIC SNI)
 //! - [`tproxy`]: TPROXY socket and listener
-//! - [`ingress`]: WireGuard ingress management (Phase 6.3)
-//! - [`egress`]: WireGuard egress management (Phase 6.4)
+//! - [`ingress`]: `WireGuard` ingress management (Phase 6.3)
+//! - [`egress`]: `WireGuard` egress management (Phase 6.4)
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]

@@ -3,7 +3,7 @@
 //! This module generates appropriate DNS responses for blocked domains,
 //! supporting different response types:
 //!
-//! - **ZeroIp**: Return 0.0.0.0 for A queries and :: for AAAA queries
+//! - **`ZeroIp`**: Return 0.0.0.0 for A queries and :: for AAAA queries
 //! - **Nxdomain**: Return NXDOMAIN (domain does not exist)
 //! - **Refused**: Return REFUSED (server refuses to answer)
 //!
@@ -50,7 +50,7 @@ const BLOCKED_RESPONSE_TTL: u32 = 60;
 ///
 /// | Type | A Query Response | AAAA Query Response | Other Query Response |
 /// |------|-----------------|--------------------|--------------------|
-/// | ZeroIp | 0.0.0.0 | :: | NoError (empty) |
+/// | `ZeroIp` | 0.0.0.0 | :: | `NoError` (empty) |
 /// | Nxdomain | NXDOMAIN | NXDOMAIN | NXDOMAIN |
 /// | Refused | REFUSED | REFUSED | REFUSED |
 ///
@@ -70,7 +70,7 @@ pub struct BlockedResponseBuilder {
     /// The type of response to generate
     response_type: BlockResponseType,
 
-    /// TTL for answer records (only used for ZeroIp type)
+    /// TTL for answer records (only used for `ZeroIp` type)
     ttl: u32,
 }
 
@@ -206,7 +206,7 @@ impl BlockedResponseBuilder {
     /// Add zero-IP answer records to the response
     ///
     /// Adds 0.0.0.0 for A queries and :: for AAAA queries.
-    /// Other query types get no answer records (NoError with empty answer).
+    /// Other query types get no answer records (`NoError` with empty answer).
     fn add_zero_ip_answers(&self, response: &mut Message, query: &Message) {
         for q in query.queries() {
             let name = q.name().clone();
@@ -220,7 +220,7 @@ impl BlockedResponseBuilder {
                     record.set_dns_class(DNSClass::IN);
                     record.set_ttl(self.ttl);
                     record.set_data(Some(RData::A(hickory_proto::rr::rdata::A(
-                        Ipv4Addr::new(0, 0, 0, 0),
+                        Ipv4Addr::UNSPECIFIED,
                     ))));
                     response.add_answer(record);
                 }
@@ -231,7 +231,7 @@ impl BlockedResponseBuilder {
                     record.set_dns_class(DNSClass::IN);
                     record.set_ttl(self.ttl);
                     record.set_data(Some(RData::AAAA(hickory_proto::rr::rdata::AAAA(
-                        Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0),
+                        Ipv6Addr::UNSPECIFIED,
                     ))));
                     response.add_answer(record);
                 }

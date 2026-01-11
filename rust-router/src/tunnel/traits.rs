@@ -1,12 +1,12 @@
-//! WireGuard tunnel abstraction trait for Phase 6
+//! `WireGuard` tunnel abstraction trait for Phase 6
 //!
-//! This module defines the trait interface for WireGuard tunnels,
+//! This module defines the trait interface for `WireGuard` tunnels,
 //! allowing different implementations (userspace, kernel) to be
 //! used interchangeably.
 //!
 //! # Phase 6 Implementation Status
 //!
-//! - [x] 6.2 WgTunnel trait definition
+//! - [x] 6.2 `WgTunnel` trait definition
 //! - [x] 6.2 Async read/write operations
 //! - [x] 6.2 Statistics collection
 //! - [x] 6.2 Peer management (Ingress mode)
@@ -40,7 +40,7 @@ use tokio::net::UdpSocket;
 
 use crate::tunnel::config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConfig};
 
-/// Error types for WireGuard tunnel operations
+/// Error types for `WireGuard` tunnel operations
 #[derive(Debug, thiserror::Error)]
 pub enum WgTunnelError {
     /// Tunnel is not connected
@@ -106,7 +106,7 @@ impl From<std::io::Error> for WgTunnelError {
     }
 }
 
-/// Statistics for a WireGuard tunnel
+/// Statistics for a `WireGuard` tunnel
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WgTunnelStats {
     /// Bytes transmitted
@@ -133,14 +133,14 @@ pub type DecryptResult = (Vec<u8>, String);
 /// Boxed future type for async trait methods (object-safe)
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Trait for WireGuard tunnel implementations
+/// Trait for `WireGuard` tunnel implementations
 ///
-/// This trait abstracts over different WireGuard implementations
+/// This trait abstracts over different `WireGuard` implementations
 /// (userspace via boringtun, kernel via wg-quick, etc.).
 ///
 /// # Modes of Operation
 ///
-/// WireGuard tunnels can operate in two modes:
+/// `WireGuard` tunnels can operate in two modes:
 ///
 /// 1. **Egress mode** (single peer): Traditional VPN client mode where the tunnel
 ///    connects to a single remote endpoint. Most methods work as expected.
@@ -158,11 +158,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # Lock Ordering
 ///
 /// Implementations using interior mutability must follow this lock order:
-/// 1. `tunn` (Mutex) - WireGuard crypto state
-/// 2. `socket` (RwLock) - UDP socket
-/// 3. `recv_tx` (RwLock) - Receive channel
-/// 4. `local_ip` (RwLock) - Local IP address
-/// 5. `allowed_ips` (RwLock) - Allowed IPs for validation
+/// 1. `tunn` (Mutex) - `WireGuard` crypto state
+/// 2. `socket` (`RwLock`) - UDP socket
+/// 3. `recv_tx` (`RwLock`) - Receive channel
+/// 4. `local_ip` (`RwLock`) - Local IP address
+/// 5. `allowed_ips` (`RwLock`) - Allowed IPs for validation
 /// 6. `handshake_complete` (watch) - Handshake completion signal
 ///
 /// Always acquire locks in this order to prevent deadlocks.
@@ -210,7 +210,7 @@ pub trait WgTunnel: Send + Sync {
     /// Get the local tunnel IP address
     ///
     /// Returns a cloned String because the underlying storage uses
-    /// interior mutability (RwLock) which prevents returning references.
+    /// interior mutability (`RwLock`) which prevents returning references.
     fn local_ip(&self) -> Option<String>;
 
     /// Get the peer endpoint address
@@ -222,13 +222,13 @@ pub trait WgTunnel: Send + Sync {
 
     /// Get the UDP socket for batch I/O operations (Phase 6.8)
     ///
-    /// Returns an Arc-wrapped UdpSocket if the tunnel is connected.
+    /// Returns an Arc-wrapped `UdpSocket` if the tunnel is connected.
     /// This allows batch send/receive operations using `sendmmsg`/`recvmmsg`.
     ///
     /// # Safety
     ///
     /// The returned socket should not be used for direct send/receive operations
-    /// without proper WireGuard encryption/decryption handling.
+    /// without proper `WireGuard` encryption/decryption handling.
     ///
     /// # Default Implementation
     ///
@@ -360,9 +360,9 @@ pub trait WgTunnel: Send + Sync {
     // Encryption/Decryption Operations
     // ========================================================================
 
-    /// Decrypt an incoming WireGuard packet
+    /// Decrypt an incoming `WireGuard` packet
     ///
-    /// Takes a raw encrypted WireGuard packet and returns the decrypted
+    /// Takes a raw encrypted `WireGuard` packet and returns the decrypted
     /// inner IP packet along with the source peer's public key.
     ///
     /// This is useful for Ingress mode where you need to identify which
@@ -370,11 +370,11 @@ pub trait WgTunnel: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `encrypted` - The encrypted WireGuard packet
+    /// * `encrypted` - The encrypted `WireGuard` packet
     ///
     /// # Returns
     ///
-    /// A tuple of (decrypted_packet, source_peer_public_key)
+    /// A tuple of (`decrypted_packet`, `source_peer_public_key`)
     ///
     /// # Errors
     ///
@@ -402,7 +402,7 @@ pub trait WgTunnel: Send + Sync {
     ///
     /// # Returns
     ///
-    /// The encrypted WireGuard packet ready to be sent over the network.
+    /// The encrypted `WireGuard` packet ready to be sent over the network.
     ///
     /// # Errors
     ///
@@ -513,9 +513,9 @@ pub trait WgTunnel: Send + Sync {
     }
 }
 
-/// Builder for creating WireGuard tunnels
+/// Builder for creating `WireGuard` tunnels
 ///
-/// Provides a fluent API for constructing WireGuard tunnel instances
+/// Provides a fluent API for constructing `WireGuard` tunnel instances
 /// with various configurations and implementations.
 ///
 /// # Example
@@ -538,7 +538,7 @@ impl WgTunnelBuilder {
     ///
     /// # Arguments
     ///
-    /// * `config` - The WireGuard tunnel configuration
+    /// * `config` - The `WireGuard` tunnel configuration
     pub fn new(config: WgTunnelConfig) -> Self {
         Self { config, tag: None }
     }
@@ -563,7 +563,7 @@ impl WgTunnelBuilder {
     /// Build a userspace tunnel using boringtun
     ///
     /// Creates a new [`UserspaceWgTunnel`] instance using the provided
-    /// configuration. The tunnel uses boringtun for WireGuard crypto
+    /// configuration. The tunnel uses boringtun for `WireGuard` crypto
     /// operations in pure Rust.
     ///
     /// # Returns

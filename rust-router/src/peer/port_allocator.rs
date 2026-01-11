@@ -12,7 +12,7 @@
 //! # Port Range
 //!
 //! Peer tunnel ports are allocated from the range 36200-36299.
-//! Reserved ports (36000 for Web UI, 36100 for WireGuard ingress)
+//! Reserved ports (36000 for Web UI, 36100 for `WireGuard` ingress)
 //! are excluded from allocation.
 //!
 //! # Thread Safety

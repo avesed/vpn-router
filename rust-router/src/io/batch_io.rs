@@ -199,7 +199,7 @@ pub struct BatchStats {
     pub partial_batches: u64,
     /// Number of `EAGAIN`/`EWOULDBLOCK` returns
     pub would_block_count: u64,
-    /// Number of truncated packets (MSG_TRUNC flag set)
+    /// Number of truncated packets (`MSG_TRUNC` flag set)
     pub truncated_packets: u64,
     /// Number of EINTR retries
     pub eintr_retries: u64,

@@ -106,7 +106,7 @@ pub enum TproxyError {
     #[error("Failed to create TPROXY socket: {0}")]
     SocketCreation(String),
 
-    /// Failed to set socket option (IP_TRANSPARENT, etc.)
+    /// Failed to set socket option (`IP_TRANSPARENT`, etc.)
     #[error("Failed to set socket option {option}: {reason}")]
     SocketOption { option: String, reason: String },
 
@@ -126,7 +126,7 @@ pub enum TproxyError {
     #[error("Listener not ready")]
     NotReady,
 
-    /// Permission denied (CAP_NET_ADMIN required)
+    /// Permission denied (`CAP_NET_ADMIN` required)
     #[error("Permission denied: TPROXY requires CAP_NET_ADMIN capability")]
     PermissionDenied,
 
@@ -190,7 +190,7 @@ pub enum OutboundError {
     #[error("Outbound {tag} is unavailable: {reason}")]
     Unavailable { tag: String, reason: String },
 
-    /// Failed to set socket option (SO_BINDTODEVICE, SO_MARK)
+    /// Failed to set socket option (`SO_BINDTODEVICE`, `SO_MARK`)
     #[error("Failed to set outbound socket option {option}: {reason}")]
     SocketOption { option: String, reason: String },
 
@@ -422,7 +422,7 @@ pub enum UdpError {
     #[error("UDP socket operation failed: {option}: {reason}")]
     SocketOption { option: String, reason: String },
 
-    /// Permission denied (CAP_NET_ADMIN required)
+    /// Permission denied (`CAP_NET_ADMIN` required)
     #[error("Permission denied: UDP TPROXY requires CAP_NET_ADMIN capability")]
     PermissionDenied,
 
@@ -647,7 +647,7 @@ impl RuleError {
     }
 }
 
-/// Type alias for Result with RustRouterError
+/// Type alias for Result with `RustRouterError`
 pub type Result<T> = std::result::Result<T, RustRouterError>;
 
 #[cfg(test)]

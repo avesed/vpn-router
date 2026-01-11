@@ -32,7 +32,7 @@ const HEALTH_DEGRADED: u8 = 1;
 const HEALTH_UNHEALTHY: u8 = 2;
 const HEALTH_UNKNOWN: u8 = 3;
 
-/// Convert HealthStatus to u8 for atomic storage
+/// Convert `HealthStatus` to u8 for atomic storage
 #[inline]
 const fn health_to_u8(status: HealthStatus) -> u8 {
     match status {
@@ -43,7 +43,7 @@ const fn health_to_u8(status: HealthStatus) -> u8 {
     }
 }
 
-/// Convert u8 to HealthStatus
+/// Convert u8 to `HealthStatus`
 #[inline]
 const fn u8_to_health(value: u8) -> HealthStatus {
     match value {
@@ -57,9 +57,9 @@ const fn u8_to_health(value: u8) -> HealthStatus {
 /// Direct outbound - connects directly to the destination
 ///
 /// Supports:
-/// - `bind_interface`: Bind to a specific network interface (SO_BINDTODEVICE)
+/// - `bind_interface`: Bind to a specific network interface (`SO_BINDTODEVICE`)
 /// - `bind_address`: Bind to a specific local address
-/// - `routing_mark`: Set routing mark for policy routing (SO_MARK)
+/// - `routing_mark`: Set routing mark for policy routing (`SO_MARK`)
 pub struct DirectOutbound {
     /// Configuration
     config: OutboundConfig,
@@ -68,7 +68,7 @@ pub struct DirectOutbound {
     /// Whether the outbound is enabled
     enabled: AtomicBool,
     /// PERF-3 FIX: Current health status as atomic u8
-    /// This eliminates RwLock write contention on every connect
+    /// This eliminates `RwLock` write contention on every connect
     health: AtomicU8,
 }
 
@@ -109,7 +109,7 @@ impl DirectOutbound {
             socket.bind(&(*addr).into()).map_err(|e| {
                 OutboundError::SocketOption {
                     option: "bind".into(),
-                    reason: format!("Failed to bind to {}: {}", addr, e),
+                    reason: format!("Failed to bind to {addr}: {e}"),
                 }
             })?;
         }
@@ -139,13 +139,13 @@ impl DirectOutbound {
         Ok(socket)
     }
 
-    /// Set SO_BINDTODEVICE to bind to a specific interface
+    /// Set `SO_BINDTODEVICE` to bind to a specific interface
     fn set_bind_device(&self, socket: &Socket, interface: &str) -> Result<(), OutboundError> {
         // Interface name must be null-terminated and fit in IFNAMSIZ (16 bytes)
         if interface.len() > 15 {
             return Err(OutboundError::SocketOption {
                 option: "SO_BINDTODEVICE".into(),
-                reason: format!("Interface name too long: {} (max 15 chars)", interface),
+                reason: format!("Interface name too long: {interface} (max 15 chars)"),
             });
         }
 
@@ -169,7 +169,7 @@ impl DirectOutbound {
             let err = io::Error::last_os_error();
             return Err(OutboundError::SocketOption {
                 option: "SO_BINDTODEVICE".into(),
-                reason: format!("Failed to bind to interface {}: {}", interface, err),
+                reason: format!("Failed to bind to interface {interface}: {err}"),
             });
         }
 
@@ -177,7 +177,7 @@ impl DirectOutbound {
         Ok(())
     }
 
-    /// Set SO_MARK for policy routing
+    /// Set `SO_MARK` for policy routing
     fn set_routing_mark(&self, socket: &Socket, mark: u32) -> Result<(), OutboundError> {
         let fd = socket.as_raw_fd();
 
@@ -195,7 +195,7 @@ impl DirectOutbound {
             let err = io::Error::last_os_error();
             return Err(OutboundError::SocketOption {
                 option: "SO_MARK".into(),
-                reason: format!("Failed to set routing mark {}: {}", mark, err),
+                reason: format!("Failed to set routing mark {mark}: {err}"),
             });
         }
 
@@ -205,7 +205,7 @@ impl DirectOutbound {
 
     /// Update health status based on connection result
     ///
-    /// PERF-3 FIX: Uses lock-free atomic compare-and-swap instead of RwLock.
+    /// PERF-3 FIX: Uses lock-free atomic compare-and-swap instead of `RwLock`.
     /// This eliminates write lock contention on every connect (~1M ops/s improvement).
     fn update_health(&self, success: bool) {
         if success {
@@ -248,7 +248,7 @@ impl DirectOutbound {
     /// if configured, similar to TCP socket creation.
     fn create_udp_socket(&self) -> Result<Socket, UdpError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
-            UdpError::socket_option("create", format!("Failed to create UDP socket: {}", e))
+            UdpError::socket_option("create", format!("Failed to create UDP socket: {e}"))
         })?;
 
         // Set SO_BINDTODEVICE if interface is specified
@@ -264,7 +264,7 @@ impl DirectOutbound {
         // Bind to specific address if specified
         if let Some(ref addr) = self.config.bind_address {
             socket.bind(&(*addr).into()).map_err(|e| {
-                UdpError::socket_option("bind", format!("Failed to bind to {}: {}", addr, e))
+                UdpError::socket_option("bind", format!("Failed to bind to {addr}: {e}"))
             })?;
         }
 
@@ -276,12 +276,12 @@ impl DirectOutbound {
         Ok(socket)
     }
 
-    /// Set SO_BINDTODEVICE for UDP socket
+    /// Set `SO_BINDTODEVICE` for UDP socket
     fn set_bind_device_udp(&self, socket: &Socket, interface: &str) -> Result<(), UdpError> {
         if interface.len() > 15 {
             return Err(UdpError::socket_option(
                 "SO_BINDTODEVICE",
-                format!("Interface name too long: {} (max 15 chars)", interface),
+                format!("Interface name too long: {interface} (max 15 chars)"),
             ));
         }
 
@@ -303,7 +303,7 @@ impl DirectOutbound {
             let err = io::Error::last_os_error();
             return Err(UdpError::socket_option(
                 "SO_BINDTODEVICE",
-                format!("Failed to bind to interface {}: {}", interface, err),
+                format!("Failed to bind to interface {interface}: {err}"),
             ));
         }
 
@@ -311,7 +311,7 @@ impl DirectOutbound {
         Ok(())
     }
 
-    /// Set SO_MARK for UDP socket (policy routing)
+    /// Set `SO_MARK` for UDP socket (policy routing)
     fn set_routing_mark_udp(&self, socket: &Socket, mark: u32) -> Result<(), UdpError> {
         let fd = socket.as_raw_fd();
 
@@ -329,7 +329,7 @@ impl DirectOutbound {
             let err = io::Error::last_os_error();
             return Err(UdpError::socket_option(
                 "SO_MARK",
-                format!("Failed to set routing mark {}: {}", mark, err),
+                format!("Failed to set routing mark {mark}: {err}"),
             ));
         }
 
@@ -440,7 +440,7 @@ impl Outbound for DirectOutbound {
         self.stats.active()
     }
 
-    fn outbound_type(&self) -> &str {
+    fn outbound_type(&self) -> &'static str {
         "direct"
     }
 
@@ -465,7 +465,7 @@ impl Outbound for DirectOutbound {
 
         // Convert to tokio UdpSocket
         let socket = UdpSocket::from_std(std_socket).map_err(|e| {
-            UdpError::socket_option("from_std", format!("Failed to convert socket: {}", e))
+            UdpError::socket_option("from_std", format!("Failed to convert socket: {e}"))
         })?;
 
         // Connect the socket to the destination (with timeout)
@@ -489,7 +489,7 @@ impl Outbound for DirectOutbound {
                 self.stats.record_error();
                 Err(UdpError::socket_option(
                     "connect",
-                    format!("Failed to connect UDP to {}: {}", addr, e),
+                    format!("Failed to connect UDP to {addr}: {e}"),
                 ))
             }
             Err(_) => {
@@ -497,7 +497,7 @@ impl Outbound for DirectOutbound {
                 self.stats.record_error();
                 Err(UdpError::socket_option(
                     "connect",
-                    format!("UDP connection to {} timed out after {:?}", addr, connect_timeout),
+                    format!("UDP connection to {addr} timed out after {connect_timeout:?}"),
                 ))
             }
         }

@@ -104,13 +104,10 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
     let outbound_tag = &ctx.default_outbound;
 
     // Get the outbound
-    let outbound = match ctx.outbound_manager.get(outbound_tag) {
-        Some(o) => o,
-        None => {
-            error!("Outbound '{}' not found", outbound_tag);
-            result.error = Some(format!("Outbound '{}' not found", outbound_tag));
-            return result;
-        }
+    let outbound = if let Some(o) = ctx.outbound_manager.get(outbound_tag) { o } else {
+        error!("Outbound '{}' not found", outbound_tag);
+        result.error = Some(format!("Outbound '{outbound_tag}' not found"));
+        return result;
     };
 
     result.outbound_tag = outbound_tag.clone();
@@ -123,7 +120,7 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
                 "Failed to connect to {} via {}: {}",
                 original_dst, outbound_tag, e
             );
-            result.error = Some(format!("Upstream connection failed: {}", e));
+            result.error = Some(format!("Upstream connection failed: {e}"));
             return result;
         }
     };
@@ -153,7 +150,7 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
                 "Connection error: {} -> {}: {}",
                 client_addr, original_dst, e
             );
-            result.error = Some(format!("Transfer error: {}", e));
+            result.error = Some(format!("Transfer error: {e}"));
         }
     }
 

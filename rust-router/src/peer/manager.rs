@@ -1,4 +1,4 @@
-//! PeerManager - Multi-node peer management for Phase 6
+//! `PeerManager` - Multi-node peer management for Phase 6
 //!
 //! This module implements peer discovery, pairing, and tunnel management
 //! for multi-node VPN routing.
@@ -6,16 +6,16 @@
 //! # Phase 6 Implementation Status
 //!
 //! - [x] 6.5.1 Input Validation (see validation.rs)
-//! - [x] 6.5.2 PeerManager Structure
+//! - [x] 6.5.2 `PeerManager` Structure
 //! - [x] 6.5.3 Port Allocator
 //! - [x] 6.5.4 Health Checker
 //! - [x] 6.5.5 Pairing Flow
 //!
 //! # Architecture
 //!
-//! The PeerManager handles:
+//! The `PeerManager` handles:
 //! - Peer lifecycle management (add, remove, connect, disconnect)
-//! - WireGuard tunnel creation via boringtun
+//! - `WireGuard` tunnel creation via boringtun
 //! - Xray tunnel creation via SOCKS5 bridge
 //! - Bidirectional pairing with pre-generated keys
 //! - Health monitoring with hysteresis
@@ -23,10 +23,10 @@
 //! # Lock Ordering
 //!
 //! When acquiring multiple locks, always follow this order to prevent deadlocks:
-//! 1. `peers` (RwLock)
-//! 2. `wg_tunnels` (RwLock)
-//! 3. `xray_outbounds` (RwLock)
-//! 4. `pending_requests` (RwLock)
+//! 1. `peers` (`RwLock`)
+//! 2. `wg_tunnels` (`RwLock`)
+//! 3. `xray_outbounds` (`RwLock`)
+//! 4. `pending_requests` (`RwLock`)
 //!
 //! # Example
 //!
@@ -113,7 +113,7 @@ pub enum PeerError {
     #[error("Missing pre-generated key for bidirectional pairing")]
     MissingBidirectionalKey,
 
-    /// Missing WireGuard key
+    /// Missing `WireGuard` key
     #[error("Missing WireGuard public key")]
     MissingWgKey,
 
@@ -159,9 +159,9 @@ pub struct PendingPairRequest {
     pub local_tag: String,
     /// Remote node tag (from the request we sent)
     pub remote_tag: String,
-    /// Local WireGuard private key
+    /// Local `WireGuard` private key
     pub local_private_key: String,
-    /// Local WireGuard public key
+    /// Local `WireGuard` public key
     pub local_public_key: String,
     /// Pre-generated remote private key (for bidirectional)
     pub remote_private_key: Option<String>,
@@ -197,19 +197,19 @@ struct PeerStateInternal {
     last_error: Option<String>,
 }
 
-/// PeerManager handles multi-node peer connections
+/// `PeerManager` handles multi-node peer connections
 ///
 /// # Lock Ordering
 ///
 /// When acquiring multiple locks, always follow this order to prevent deadlocks:
-/// 1. `peers` (RwLock)
-/// 2. `wg_tunnels` (RwLock)
-/// 3. `xray_outbounds` (RwLock)
-/// 4. `pending_requests` (RwLock)
+/// 1. `peers` (`RwLock`)
+/// 2. `wg_tunnels` (`RwLock`)
+/// 3. `xray_outbounds` (`RwLock`)
+/// 4. `pending_requests` (`RwLock`)
 pub struct PeerManager {
     /// Map of peer tag to peer state
     peers: RwLock<HashMap<String, PeerStateInternal>>,
-    /// Active WireGuard tunnels
+    /// Active `WireGuard` tunnels
     wg_tunnels: RwLock<HashMap<String, Arc<Box<dyn WgTunnel>>>>,
     /// Active Xray/SOCKS5 outbounds
     xray_outbounds: RwLock<HashMap<String, Arc<Socks5Outbound>>>,
@@ -226,7 +226,7 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
-    /// Create a new PeerManager
+    /// Create a new `PeerManager`
     ///
     /// # Arguments
     ///
@@ -250,7 +250,7 @@ impl PeerManager {
         }
     }
 
-    /// Create a new PeerManager with custom allocators
+    /// Create a new `PeerManager` with custom allocators
     ///
     /// # Arguments
     ///
@@ -294,10 +294,10 @@ impl PeerManager {
     /// # Flow
     ///
     /// 1. Validate input configuration
-    /// 2. Generate local WireGuard keys
+    /// 2. Generate local `WireGuard` keys
     /// 3. Allocate tunnel IPs (pair if bidirectional)
     /// 4. Allocate tunnel port
-    /// 5. Create PairRequest struct
+    /// 5. Create `PairRequest` struct
     /// 6. Store pending request for later completion
     /// 7. Encode and return the pairing code
     pub fn generate_pair_request(&self, config: PairRequestConfig) -> Result<String, PeerError> {
@@ -344,18 +344,15 @@ impl PeerManager {
         };
 
         // Allocate tunnel port - if this fails, release IPs
-        let tunnel_port = match self.tunnel_port_allocator.allocate() {
-            Ok(port) => port,
-            Err(_) => {
-                // Release allocated IPs on port allocation failure
-                if let Some(ip) = local_tunnel_ip {
-                    self.tunnel_ip_allocator.release(ip);
-                }
-                if let Some(ip) = remote_tunnel_ip {
-                    self.tunnel_ip_allocator.release(ip);
-                }
-                return Err(PeerError::PortExhausted);
+        let tunnel_port = if let Ok(port) = self.tunnel_port_allocator.allocate() { port } else {
+            // Release allocated IPs on port allocation failure
+            if let Some(ip) = local_tunnel_ip {
+                self.tunnel_ip_allocator.release(ip);
             }
+            if let Some(ip) = remote_tunnel_ip {
+                self.tunnel_ip_allocator.release(ip);
+            }
+            return Err(PeerError::PortExhausted);
         };
 
         // Get current timestamp
@@ -470,10 +467,10 @@ impl PeerManager {
     ///
     /// 1. Decode and validate the pairing code
     /// 2. Validate timestamp (max 7 days old)
-    /// 3. Generate local WireGuard keys or use pre-generated remote keys
+    /// 3. Generate local `WireGuard` keys or use pre-generated remote keys
     /// 4. Allocate tunnel IPs
-    /// 5. Create peer entry in `peers` HashMap with state `Configured`
-    /// 6. Create PairResponse and return encoded
+    /// 5. Create peer entry in `peers` `HashMap` with state `Configured`
+    /// 6. Create `PairResponse` and return encoded
     pub async fn import_pair_request(
         &self,
         code: &str,
@@ -582,10 +579,10 @@ impl PeerManager {
             // Find the last colon to handle both IPv4 (host:port) and IPv6 ([host]:port)
             if let Some(colon_pos) = user_endpoint.rfind(':') {
                 let host_part = &user_endpoint[..colon_pos];
-                format!("{}:{}", host_part, tunnel_port)
+                format!("{host_part}:{tunnel_port}")
             } else {
                 // No port in the user endpoint, append the tunnel_port
-                format!("{}:{}", user_endpoint, tunnel_port)
+                format!("{user_endpoint}:{tunnel_port}")
             }
         };
 
@@ -760,11 +757,11 @@ impl PeerManager {
     ///
     /// 1. Look up peer config
     /// 2. Validate peer is configured but not connected
-    /// 3. For WireGuard tunnels:
-    ///    - Create WgTunnelConfig from peer config
-    ///    - Build tunnel using WgTunnelBuilder
+    /// 3. For `WireGuard` tunnels:
+    ///    - Create `WgTunnelConfig` from peer config
+    ///    - Build tunnel using `WgTunnelBuilder`
     ///    - Call tunnel.connect().await
-    ///    - Store tunnel in wg_tunnels
+    ///    - Store tunnel in `wg_tunnels`
     /// 4. Update peer state to Connected
     pub async fn connect(&self, tag: &str) -> Result<(), PeerError> {
         // Get peer config
@@ -805,7 +802,7 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Connect to a peer via WireGuard
+    /// Connect to a peer via `WireGuard`
     async fn connect_wireguard(&self, tag: &str, config: &PeerConfig) -> Result<(), PeerError> {
         // Get required fields
         let private_key = config
@@ -865,9 +862,9 @@ impl PeerManager {
         let socks_port = config.xray_local_socks_port.unwrap_or(37201);
 
         // Create SOCKS5 config
-        let server_addr = format!("127.0.0.1:{}", socks_port)
+        let server_addr = format!("127.0.0.1:{socks_port}")
             .parse()
-            .map_err(|e| PeerError::TunnelCreationFailed(format!("Invalid SOCKS5 address: {}", e)))?;
+            .map_err(|e| PeerError::TunnelCreationFailed(format!("Invalid SOCKS5 address: {e}")))?;
 
         let socks_config = Socks5Config {
             tag: tag.to_string(),
@@ -1034,7 +1031,7 @@ impl PeerManager {
     ///
     /// 1. Disconnect if connected
     /// 2. Release allocated port and IP
-    /// 3. Remove from peers HashMap
+    /// 3. Remove from peers `HashMap`
     pub async fn remove_peer(&self, tag: &str) -> Result<(), PeerError> {
         // Get peer config to release resources
         let config = {
@@ -1113,7 +1110,7 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Add a peer internally (called from import and complete_handshake)
+    /// Add a peer internally (called from import and `complete_handshake`)
     ///
     /// # Thread Safety
     ///
@@ -1159,7 +1156,7 @@ impl PeerManager {
         }
     }
 
-    /// Get a WireGuard tunnel by tag
+    /// Get a `WireGuard` tunnel by tag
     pub fn get_wg_tunnel(&self, tag: &str) -> Option<Arc<Box<dyn WgTunnel>>> {
         let wg_tunnels = self.wg_tunnels.read();
         wg_tunnels.get(tag).cloned()

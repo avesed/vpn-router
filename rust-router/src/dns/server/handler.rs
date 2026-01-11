@@ -31,7 +31,7 @@
 //!
 //! - **Message Parsing**: Full DNS message parsing via hickory-proto
 //! - **Rate Limiting**: Integration with `DnsRateLimiter`
-//! - **Validation**: Query ID, QNAME, and OpCode validation
+//! - **Validation**: Query ID, QNAME, and `OpCode` validation
 //! - **Error Responses**: Proper DNS error response generation
 //!
 //! # Example
@@ -399,7 +399,7 @@ impl DnsHandler {
                 }
                 Err(e) => {
                     warn!(qname = %qname, error = %e, "Upstream query failed");
-                    return Ok(self.generate_servfail_response(query, &format!("upstream error: {}", e)));
+                    return Ok(self.generate_servfail_response(query, &format!("upstream error: {e}")));
                 }
             }
         }
@@ -435,7 +435,7 @@ impl DnsHandler {
         // Parse using hickory-proto
         Message::from_bytes(data).map_err(|e| {
             self.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-            DnsError::parse(format!("failed to parse DNS message: {}", e))
+            DnsError::parse(format!("failed to parse DNS message: {e}"))
         })
     }
 
@@ -507,8 +507,7 @@ impl DnsHandler {
         if name_len > MAX_DOMAIN_LENGTH {
             self.stats.validation_errors.fetch_add(1, Ordering::Relaxed);
             return Err(DnsError::invalid_query(format!(
-                "domain name too long: {} chars (max: {})",
-                name_len, MAX_DOMAIN_LENGTH
+                "domain name too long: {name_len} chars (max: {MAX_DOMAIN_LENGTH})"
             )));
         }
 
@@ -604,7 +603,7 @@ impl DnsHandler {
         }
     }
 
-    /// Map a DnsError to a DNS response code
+    /// Map a `DnsError` to a DNS response code
     fn error_to_rcode(&self, error: &DnsError) -> ResponseCode {
         match error {
             DnsError::ParseError { .. } | DnsError::InvalidQuery { .. } => ResponseCode::FormErr,
@@ -619,7 +618,7 @@ impl DnsHandler {
     /// Serialize a response message to bytes
     fn serialize_response(&self, response: &Message) -> DnsResult<Vec<u8>> {
         response.to_bytes().map_err(|e| {
-            DnsError::serialize(format!("failed to serialize response: {}", e))
+            DnsError::serialize(format!("failed to serialize response: {e}"))
         })
     }
 
@@ -833,7 +832,7 @@ impl DnsHandler {
         response_data: &[u8],
     ) -> DnsResult<Message> {
         let response = Message::from_bytes(response_data).map_err(|e| {
-            DnsError::parse(format!("failed to parse response: {}", e))
+            DnsError::parse(format!("failed to parse response: {e}"))
         })?;
 
         if !self.validate_response(query, &response) {

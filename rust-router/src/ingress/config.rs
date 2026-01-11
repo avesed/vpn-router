@@ -1,13 +1,13 @@
-//! Configuration types for WireGuard Ingress
+//! Configuration types for `WireGuard` Ingress
 //!
-//! This module defines configuration types for the WireGuard ingress manager,
+//! This module defines configuration types for the `WireGuard` ingress manager,
 //! including validation and builder patterns.
 //!
 //! # Configuration Parameters
 //!
 //! | Parameter | Description | Default |
 //! |-----------|-------------|---------|
-//! | `private_key` | WireGuard private key (Base64) | Required |
+//! | `private_key` | `WireGuard` private key (Base64) | Required |
 //! | `listen_addr` | UDP listen address | Required |
 //! | `local_ip` | Local tunnel IP | Required |
 //! | `allowed_subnet` | Allowed client subnet | Required |
@@ -37,15 +37,15 @@ use serde::{Deserialize, Serialize};
 
 use super::error::IngressError;
 
-/// Default MTU for WireGuard tunnels
+/// Default MTU for `WireGuard` tunnels
 pub const DEFAULT_MTU: u16 = 1420;
 
-/// Default listen port for WireGuard ingress
+/// Default listen port for `WireGuard` ingress
 pub const DEFAULT_LISTEN_PORT: u16 = 36100;
 
-/// Configuration for WireGuard ingress manager
+/// Configuration for `WireGuard` ingress manager
 ///
-/// This struct contains all configuration needed to run a WireGuard ingress
+/// This struct contains all configuration needed to run a `WireGuard` ingress
 /// that accepts client connections and routes their traffic.
 ///
 /// # Example
@@ -67,12 +67,12 @@ pub const DEFAULT_LISTEN_PORT: u16 = 36100;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WgIngressConfig {
-    /// WireGuard private key (Base64 encoded)
+    /// `WireGuard` private key (Base64 encoded)
     ///
     /// This must be a valid 32-byte X25519 private key encoded in Base64.
     pub private_key: String,
 
-    /// UDP listen address for incoming WireGuard connections
+    /// UDP listen address for incoming `WireGuard` connections
     ///
     /// Typically `0.0.0.0:36100` for accepting connections on all interfaces.
     pub listen_addr: SocketAddr,
@@ -92,7 +92,7 @@ pub struct WgIngressConfig {
     /// Maximum transmission unit (default: 1420)
     ///
     /// The MTU should be lower than the underlying network MTU to account
-    /// for WireGuard overhead (typically 80 bytes).
+    /// for `WireGuard` overhead (typically 80 bytes).
     #[serde(default = "default_mtu")]
     pub mtu: u16,
 
@@ -183,7 +183,7 @@ impl WgIngressConfig {
 
         let key_bytes = BASE64
             .decode(&self.private_key)
-            .map_err(|e| IngressError::invalid_config(format!("Invalid private key Base64: {}", e)))?;
+            .map_err(|e| IngressError::invalid_config(format!("Invalid private key Base64: {e}")))?;
 
         if key_bytes.len() != 32 {
             return Err(IngressError::invalid_config(format!(
@@ -370,7 +370,7 @@ impl WgIngressConfigBuilder {
     }
 }
 
-/// Peer configuration for WireGuard ingress
+/// Peer configuration for `WireGuard` ingress
 ///
 /// This represents a client that can connect to the ingress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,7 +412,7 @@ impl WgIngressPeerConfig {
         let ip_net = if ip_str.contains('/') {
             ip_str.parse().unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
         } else {
-            format!("{}/32", ip_str).parse().unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
+            format!("{ip_str}/32").parse().unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
         };
 
         Self {
@@ -459,7 +459,7 @@ impl WgIngressPeerConfig {
 
         let key_bytes = BASE64
             .decode(&self.public_key)
-            .map_err(|e| IngressError::invalid_config(format!("Invalid public key Base64: {}", e)))?;
+            .map_err(|e| IngressError::invalid_config(format!("Invalid public key Base64: {e}")))?;
 
         if key_bytes.len() != 32 {
             return Err(IngressError::invalid_config(format!(
@@ -476,7 +476,7 @@ impl WgIngressPeerConfig {
         if let Some(ref psk) = self.preshared_key {
             let psk_bytes = BASE64
                 .decode(psk)
-                .map_err(|e| IngressError::invalid_config(format!("Invalid preshared key Base64: {}", e)))?;
+                .map_err(|e| IngressError::invalid_config(format!("Invalid preshared key Base64: {e}")))?;
 
             if psk_bytes.len() != 32 {
                 return Err(IngressError::invalid_config(format!(
@@ -494,7 +494,7 @@ impl WgIngressPeerConfig {
     /// Returns the first allowed IP's address, typically a /32.
     #[must_use]
     pub fn primary_ip(&self) -> Option<IpAddr> {
-        self.allowed_ips.first().map(|net| net.addr())
+        self.allowed_ips.first().map(ipnet::IpNet::addr)
     }
 }
 

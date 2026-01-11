@@ -38,7 +38,7 @@ impl IoBuffer {
         Self::new(DEFAULT_BUFFER_SIZE)
     }
 
-    /// Get a mutable reference to the underlying BytesMut
+    /// Get a mutable reference to the underlying `BytesMut`
     #[must_use]
     pub fn as_mut(&mut self) -> &mut BytesMut {
         &mut self.inner

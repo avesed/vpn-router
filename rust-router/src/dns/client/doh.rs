@@ -1,6 +1,6 @@
-//! DNS-over-HTTPS (DoH) Client
+//! DNS-over-HTTPS (`DoH`) Client
 //!
-//! This module provides a DoH client implementing RFC 8484 for querying
+//! This module provides a `DoH` client implementing RFC 8484 for querying
 //! upstream DNS servers over HTTPS.
 //!
 //! # Features
@@ -56,15 +56,15 @@ mod inner {
     use crate::dns::config::{UpstreamConfig, UpstreamProtocol};
     use crate::dns::error::{DnsError, DnsResult};
 
-    /// DoH Content-Type for DNS wire format
+    /// `DoH` Content-Type for DNS wire format
     const DOH_CONTENT_TYPE: &str = "application/dns-message";
 
-    /// DoH Accept header for DNS wire format
+    /// `DoH` Accept header for DNS wire format
     const DOH_ACCEPT: &str = "application/dns-message";
 
     /// DNS-over-HTTPS client
     ///
-    /// A DoH client using hyper for HTTP/2 transport. Implements RFC 8484
+    /// A `DoH` client using hyper for HTTP/2 transport. Implements RFC 8484
     /// using POST requests with `application/dns-message` content type.
     ///
     /// # Thread Safety
@@ -94,7 +94,7 @@ mod inner {
         /// Upstream configuration
         config: UpstreamConfig,
 
-        /// Parsed DoH endpoint URI
+        /// Parsed `DoH` endpoint URI
         uri: Uri,
 
         /// HTTP client with HTTPS connector
@@ -119,11 +119,11 @@ mod inner {
     }
 
     impl DohClient {
-        /// Create a new DoH client
+        /// Create a new `DoH` client
         ///
         /// # Arguments
         ///
-        /// * `config` - Upstream configuration with DoH URL
+        /// * `config` - Upstream configuration with `DoH` URL
         ///
         /// # Errors
         ///
@@ -146,11 +146,11 @@ mod inner {
             Self::with_health_config(config, HealthCheckConfig::default())
         }
 
-        /// Create a new DoH client with custom health check configuration
+        /// Create a new `DoH` client with custom health check configuration
         ///
         /// # Arguments
         ///
-        /// * `config` - Upstream configuration with DoH URL
+        /// * `config` - Upstream configuration with `DoH` URL
         /// * `health_config` - Health check configuration
         ///
         /// # Errors
@@ -172,7 +172,7 @@ mod inner {
             let scheme = uri.scheme_str().unwrap_or("");
             if scheme != "https" {
                 return Err(DnsError::config_field(
-                    format!("DoH URL must use HTTPS scheme, got: {}", scheme),
+                    format!("DoH URL must use HTTPS scheme, got: {scheme}"),
                     "upstream.address",
                 ));
             }
@@ -209,7 +209,7 @@ mod inner {
             })
         }
 
-        /// Get the DoH endpoint URI
+        /// Get the `DoH` endpoint URI
         pub fn uri(&self) -> &Uri {
             &self.uri
         }
@@ -219,11 +219,11 @@ mod inner {
             &self.health
         }
 
-        /// Perform a DoH query using POST
+        /// Perform a `DoH` query using POST
         async fn query_post(&self, query: &Message) -> DnsResult<Message> {
             // Serialize the query
             let query_bytes = query.to_vec().map_err(|e| {
-                DnsError::serialize(format!("failed to serialize DNS query: {}", e))
+                DnsError::serialize(format!("failed to serialize DNS query: {e}"))
             })?;
 
             // Build HTTP request
@@ -235,7 +235,7 @@ mod inner {
                 .header(header::CONTENT_LENGTH, query_bytes.len())
                 .body(Full::new(Bytes::from(query_bytes)))
                 .map_err(|e| {
-                    DnsError::internal(format!("failed to build DoH request: {}", e))
+                    DnsError::internal(format!("failed to build DoH request: {e}"))
                 })?;
 
             // Send request with timeout
@@ -248,7 +248,7 @@ mod inner {
                     )
                 })?
                 .map_err(|e| {
-                    DnsError::upstream(&self.config.address, format!("DoH request failed: {}", e))
+                    DnsError::upstream(&self.config.address, format!("DoH request failed: {e}"))
                 })?;
 
             // Check HTTP status
@@ -256,7 +256,7 @@ mod inner {
             if !status.is_success() {
                 return Err(DnsError::upstream(
                     &self.config.address,
-                    format!("DoH request returned HTTP {}", status),
+                    format!("DoH request returned HTTP {status}"),
                 ));
             }
 
@@ -266,7 +266,7 @@ mod inner {
                 if !ct.starts_with(DOH_CONTENT_TYPE) {
                     return Err(DnsError::upstream(
                         &self.config.address,
-                        format!("unexpected Content-Type: {}", ct),
+                        format!("unexpected Content-Type: {ct}"),
                     ));
                 }
             }
@@ -285,7 +285,7 @@ mod inner {
 
             // Parse DNS response
             let dns_response = Message::from_vec(&body_bytes).map_err(|e| {
-                DnsError::parse(format!("failed to parse DoH DNS response: {}", e))
+                DnsError::parse(format!("failed to parse DoH DNS response: {e}"))
             })?;
 
             // Validate response matches query
@@ -312,7 +312,7 @@ mod inner {
                 .map_err(|e| {
                     DnsError::upstream(
                         &self.config.address,
-                        format!("failed to read DoH response body: {}", e),
+                        format!("failed to read DoH response body: {e}"),
                     )
                 })?;
 

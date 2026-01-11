@@ -99,19 +99,16 @@ impl ConnectionManager {
         }
 
         // Try to acquire a permit
-        let permit = match self.semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                self.stats.record_rejected();
-                let current = self.max_connections - self.semaphore.available_permits();
-                warn!(
-                    "Connection limit reached ({}/{}), rejecting connection from {}",
-                    current,
-                    self.max_connections,
-                    conn.client_addr()
-                );
-                return Err(ConnectionError::limit_reached(current, self.max_connections));
-            }
+        let permit = if let Ok(permit) = self.semaphore.clone().try_acquire_owned() { permit } else {
+            self.stats.record_rejected();
+            let current = self.max_connections - self.semaphore.available_permits();
+            warn!(
+                "Connection limit reached ({}/{}), rejecting connection from {}",
+                current,
+                self.max_connections,
+                conn.client_addr()
+            );
+            return Err(ConnectionError::limit_reached(current, self.max_connections));
         };
 
         // Record the accepted connection
@@ -186,7 +183,7 @@ impl ConnectionManager {
     /// Initiate graceful shutdown
     ///
     /// This stops accepting new connections and waits for existing
-    /// connections to complete (up to drain_timeout).
+    /// connections to complete (up to `drain_timeout`).
     pub async fn shutdown(&self) {
         if self
             .shutting_down
@@ -216,7 +213,7 @@ impl ConnectionManager {
             debug!(
                 "Waiting for {} connections to drain ({:.1}s remaining)",
                 active,
-                (self.drain_timeout - drain_start.elapsed()).as_secs_f64()
+                self.drain_timeout.checked_sub(drain_start.elapsed()).unwrap().as_secs_f64()
             );
 
             tokio::time::sleep(check_interval).await;
@@ -273,9 +270,8 @@ pub async fn run_accept_loop(
                 if e.is_recoverable() {
                     debug!("Recoverable accept error: {}", e);
                     continue;
-                } else {
-                    return Err(e.into());
                 }
+                return Err(e.into());
             }
         }
     }

@@ -607,20 +607,18 @@ impl Socks5UdpAssociation {
                 );
 
                 // Use tokio's async DNS resolver
-                let addr_with_port = format!("{}:{}", domain_str, port_num);
+                let addr_with_port = format!("{domain_str}:{port_num}");
                 let resolved = tokio::net::lookup_host(&addr_with_port)
                     .await
                     .map_err(|e| {
                         Socks5UdpError::ConnectionError(format!(
-                            "DNS resolution failed for {}: {}",
-                            domain_str, e
+                            "DNS resolution failed for {domain_str}: {e}"
                         ))
                     })?
                     .next()
                     .ok_or_else(|| {
                         Socks5UdpError::ConnectionError(format!(
-                            "DNS resolution returned no addresses for {}",
-                            domain_str
+                            "DNS resolution returned no addresses for {domain_str}"
                         ))
                     })?;
 

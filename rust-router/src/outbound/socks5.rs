@@ -945,7 +945,7 @@ impl Outbound for Socks5Outbound {
         self.stats.active()
     }
 
-    fn outbound_type(&self) -> &str {
+    fn outbound_type(&self) -> &'static str {
         "socks5"
     }
 

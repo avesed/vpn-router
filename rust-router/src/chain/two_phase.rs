@@ -99,7 +99,7 @@ impl std::fmt::Display for TwoPhaseState {
             Self::Committing => write!(f, "committing"),
             Self::Committed => write!(f, "committed"),
             Self::Aborted => write!(f, "aborted"),
-            Self::Failed(msg) => write!(f, "failed: {}", msg),
+            Self::Failed(msg) => write!(f, "failed: {msg}"),
         }
     }
 }
@@ -542,7 +542,7 @@ impl TwoPhaseCommit {
 
     /// Send PREPARE to all participants
     ///
-    /// Runs PREPARE sequentially on all participants. Updates transaction_state
+    /// Runs PREPARE sequentially on all participants. Updates `transaction_state`
     /// to Preparing, then to Prepared if all succeed, or to Failed if any fail.
     ///
     /// Note: Sequential execution is used due to Rust's borrowing rules with
@@ -743,7 +743,7 @@ impl TwoPhaseCommit {
     /// Send ABORT to all participants
     ///
     /// Best-effort abort - continues even if some nodes fail to respond.
-    /// Updates transaction_state to Aborted.
+    /// Updates `transaction_state` to Aborted.
     ///
     /// Note: Aborts are executed sequentially due to Rust's borrowing rules
     /// with `&mut self`. For abort operations, sequential execution is acceptable

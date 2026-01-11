@@ -184,16 +184,16 @@ pub struct IpcHandler {
     /// ECMP group manager for load balancing (Phase 6.7)
     ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
-    /// WireGuard ingress manager (Phase 6.3)
+    /// `WireGuard` ingress manager (Phase 6.3)
     wg_ingress_manager: Option<Arc<WgIngressManager>>,
 
-    /// WireGuard ingress forwarding stats (Phase 6.3)
+    /// `WireGuard` ingress forwarding stats (Phase 6.3)
     ingress_forwarding_stats: Option<Arc<ForwardingStats>>,
 
-    /// WireGuard ingress reply stats (Phase 6.3)
+    /// `WireGuard` ingress reply stats (Phase 6.3)
     ingress_reply_stats: Option<Arc<IngressReplyStats>>,
 
-    /// WireGuard egress manager (Phase 6.4)
+    /// `WireGuard` egress manager (Phase 6.4)
     wg_egress_manager: Option<Arc<WgEgressManager>>,
 
     // ========================================================================
@@ -369,9 +369,9 @@ impl IpcHandler {
         self
     }
 
-    /// Set the WireGuard ingress manager after construction
+    /// Set the `WireGuard` ingress manager after construction
     ///
-    /// This allows adding WireGuard ingress capability to an existing handler.
+    /// This allows adding `WireGuard` ingress capability to an existing handler.
     pub fn with_wg_ingress_manager(mut self, wg_ingress_manager: Arc<WgIngressManager>) -> Self {
         self.wg_ingress_manager = Some(wg_ingress_manager);
         self
@@ -388,9 +388,9 @@ impl IpcHandler {
         self
     }
 
-    /// Set the WireGuard egress manager after construction
+    /// Set the `WireGuard` egress manager after construction
     ///
-    /// This allows adding WireGuard egress capability to an existing handler.
+    /// This allows adding `WireGuard` egress capability to an existing handler.
     pub fn with_wg_egress_manager(mut self, wg_egress_manager: Arc<WgEgressManager>) -> Self {
         self.wg_egress_manager = Some(wg_egress_manager);
         self
@@ -782,7 +782,7 @@ impl IpcHandler {
                 warn!("Failed to load config: {}", e);
                 return IpcResponse::error(
                     ErrorCode::OperationFailed,
-                    format!("Failed to load configuration: {}", e),
+                    format!("Failed to load configuration: {e}"),
                 );
             }
         };
@@ -860,7 +860,7 @@ impl IpcHandler {
         if !self.outbound_manager.contains(tag) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Outbound '{}' not found", tag),
+                format!("Outbound '{tag}' not found"),
             );
         }
 
@@ -878,7 +878,7 @@ impl IpcHandler {
 
         self.outbound_manager.remove(tag);
         info!("Removed outbound: {}", tag);
-        IpcResponse::success_with_message(format!("Outbound '{}' removed", tag))
+        IpcResponse::success_with_message(format!("Outbound '{tag}' removed"))
     }
 
     /// Handle enable/disable outbound command
@@ -888,13 +888,13 @@ impl IpcHandler {
         if !self.outbound_manager.contains(tag) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Outbound '{}' not found", tag),
+                format!("Outbound '{tag}' not found"),
             );
         }
 
         let action = if enable { "enabled" } else { "disabled" };
         info!("Outbound '{}' {}", tag, action);
-        IpcResponse::success_with_message(format!("Outbound '{}' {}", tag, action))
+        IpcResponse::success_with_message(format!("Outbound '{tag}' {action}"))
     }
 
     /// Handle get outbound command
@@ -913,14 +913,14 @@ impl IpcHandler {
                     routing_mark: None,
                 })
             }
-            None => IpcResponse::error(ErrorCode::NotFound, format!("Outbound '{}' not found", tag)),
+            None => IpcResponse::error(ErrorCode::NotFound, format!("Outbound '{tag}' not found")),
         }
     }
 
     /// Handle list outbounds command
     ///
-    /// Phase 11-Fix.AA: Now includes WgEgressManager tunnels in addition to
-    /// OutboundManager outbounds.
+    /// Phase 11-Fix.AA: Now includes `WgEgressManager` tunnels in addition to
+    /// `OutboundManager` outbounds.
     fn handle_list_outbounds(&self) -> IpcResponse {
         let mut outbounds: Vec<OutboundInfo> = self
             .outbound_manager
@@ -1113,8 +1113,7 @@ impl IpcHandler {
         }
 
         IpcResponse::success_with_message(format!(
-            "Rules reloaded (version {})",
-            new_version
+            "Rules reloaded (version {new_version})"
         ))
     }
 
@@ -1134,7 +1133,7 @@ impl IpcHandler {
         if self.outbound_manager.contains(&tag) {
             return IpcResponse::error(
                 ErrorCode::AlreadyExists,
-                format!("Outbound '{}' already exists", tag),
+                format!("Outbound '{tag}' already exists"),
             );
         }
 
@@ -1144,7 +1143,7 @@ impl IpcHandler {
             Err(e) => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Invalid server address '{}': {}", server_addr, e),
+                    format!("Invalid server address '{server_addr}': {e}"),
                 );
             }
         };
@@ -1166,7 +1165,7 @@ impl IpcHandler {
             Err(e) => {
                 return IpcResponse::error(
                     ErrorCode::OperationFailed,
-                    format!("Failed to create SOCKS5 outbound: {}", e),
+                    format!("Failed to create SOCKS5 outbound: {e}"),
                 );
             }
         };
@@ -1175,7 +1174,7 @@ impl IpcHandler {
         self.outbound_manager.add(Box::new(outbound));
 
         info!("Added SOCKS5 outbound '{}' -> {}", tag, server_addr);
-        IpcResponse::success_with_message(format!("SOCKS5 outbound '{}' added", tag))
+        IpcResponse::success_with_message(format!("SOCKS5 outbound '{tag}' added"))
     }
 
     /// Handle get pool stats command
@@ -1203,14 +1202,14 @@ impl IpcHandler {
                     } else {
                         return IpcResponse::error(
                             ErrorCode::InvalidParameters,
-                            format!("Outbound '{}' is not a SOCKS5 outbound", specific_tag),
+                            format!("Outbound '{specific_tag}' is not a SOCKS5 outbound"),
                         );
                     }
                 }
                 None => {
                     return IpcResponse::error(
                         ErrorCode::NotFound,
-                        format!("Outbound '{}' not found", specific_tag),
+                        format!("Outbound '{specific_tag}' not found"),
                     );
                 }
             }
@@ -1241,9 +1240,9 @@ impl IpcHandler {
     // Phase 3.3: IPC Protocol v2.1 Handler Implementations
     // ========================================================================
 
-    /// Handle add WireGuard outbound command
+    /// Handle add `WireGuard` outbound command
     ///
-    /// Creates a DirectOutbound bound to a WireGuard interface.
+    /// Creates a `DirectOutbound` bound to a `WireGuard` interface.
     fn handle_add_wireguard_outbound(
         &self,
         tag: String,
@@ -1257,7 +1256,7 @@ impl IpcHandler {
         if self.outbound_manager.get(&tag).is_some() {
             return IpcResponse::error(
                 ErrorCode::AlreadyExists,
-                format!("Outbound '{}' already exists", tag),
+                format!("Outbound '{tag}' already exists"),
             );
         }
 
@@ -1265,7 +1264,7 @@ impl IpcHandler {
         if let Err(e) = wireguard::validate_interface_exists(&interface) {
             return IpcResponse::error(
                 ErrorCode::InvalidParameters,
-                format!("WireGuard interface validation failed: {}", e),
+                format!("WireGuard interface validation failed: {e}"),
             );
         }
 
@@ -1293,7 +1292,7 @@ impl IpcHandler {
             "Added WireGuard outbound '{}' -> interface '{}' (mark={:?})",
             tag, interface, routing_mark
         );
-        IpcResponse::success_with_message(format!("WireGuard outbound '{}' added", tag))
+        IpcResponse::success_with_message(format!("WireGuard outbound '{tag}' added"))
     }
 
     /// Handle drain outbound command
@@ -1311,7 +1310,7 @@ impl IpcHandler {
             None => {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
-                    format!("Outbound '{}' not found", tag),
+                    format!("Outbound '{tag}' not found"),
                 );
             }
         };
@@ -1323,7 +1322,7 @@ impl IpcHandler {
         let initial_count = outbound.active_connections();
 
         // Wait for connections to drain
-        let timeout = Duration::from_secs(timeout_secs as u64);
+        let timeout = Duration::from_secs(u64::from(timeout_secs));
         let poll_interval = Duration::from_millis(100);
         let deadline = start + timeout;
 
@@ -1355,7 +1354,7 @@ impl IpcHandler {
         if self.outbound_manager.remove(&tag).is_none() {
             return IpcResponse::error(
                 ErrorCode::OperationFailed,
-                format!("Failed to remove outbound '{}' after drain", tag),
+                format!("Failed to remove outbound '{tag}' after drain"),
             );
         }
 
@@ -1376,10 +1375,10 @@ impl IpcHandler {
 
     /// Handle update routing command
     ///
-    /// Atomically updates routing rules via ArcSwap.
+    /// Atomically updates routing rules via `ArcSwap`.
     ///
-    /// Phase 11-Fix.Z: Properly rebuild domain_matcher and geoip_matcher
-    /// using RoutingSnapshotBuilder instead of just cloning existing matchers.
+    /// Phase 11-Fix.Z: Properly rebuild `domain_matcher` and `geoip_matcher`
+    /// using `RoutingSnapshotBuilder` instead of just cloning existing matchers.
     /// This ensures domain/geoip rules are actually matched by the high-performance
     /// Aho-Corasick and CIDR matchers.
     fn handle_update_routing(
@@ -1394,7 +1393,7 @@ impl IpcHandler {
         if self.outbound_manager.get(&default_outbound).is_none() {
             return IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Default outbound '{}' not found", default_outbound),
+                format!("Default outbound '{default_outbound}' not found"),
             );
         }
 
@@ -1440,7 +1439,7 @@ impl IpcHandler {
                 other => {
                     return IpcResponse::error(
                         ErrorCode::InvalidParameters,
-                        format!("Unknown rule type: {}", other),
+                        format!("Unknown rule type: {other}"),
                     );
                 }
             };
@@ -1504,7 +1503,7 @@ impl IpcHandler {
             Err(e) => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Failed to build routing snapshot: {}", e),
+                    format!("Failed to build routing snapshot: {e}"),
                 );
             }
         };
@@ -1540,7 +1539,7 @@ impl IpcHandler {
         if self.outbound_manager.get(&tag).is_none() {
             return IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Outbound '{}' not found", tag),
+                format!("Outbound '{tag}' not found"),
             );
         }
 
@@ -1562,7 +1561,7 @@ impl IpcHandler {
         self.rule_engine.reload(new_snapshot);
 
         info!("Default outbound changed to '{}'", tag);
-        IpcResponse::success_with_message(format!("Default outbound set to '{}'", tag))
+        IpcResponse::success_with_message(format!("Default outbound set to '{tag}'"))
     }
 
     /// Handle get outbound health command
@@ -1633,8 +1632,7 @@ impl IpcHandler {
         }
 
         IpcResponse::success_with_message(format!(
-            "Egress change notification processed: {:?} '{}' ({})",
-            action, tag, egress_type
+            "Egress change notification processed: {action:?} '{tag}' ({egress_type})"
         ))
     }
 
@@ -1798,7 +1796,7 @@ impl IpcHandler {
             let health_str = health.to_string();
             // Output 1 for current status, 0 for others
             for status in &["healthy", "degraded", "unhealthy", "unknown"] {
-                let value = if *status == health_str { 1u64 } else { 0u64 };
+                let value = u64::from(*status == health_str);
                 write_metric_value(
                     &mut output,
                     "rust_router_outbound_health",
@@ -1976,7 +1974,7 @@ impl IpcHandler {
     // Phase 5.5: UDP IPC Handler Implementations
     // ========================================================================
 
-    /// Handle GetUdpStats command
+    /// Handle `GetUdpStats` command
     ///
     /// Returns comprehensive UDP statistics including session manager, worker pool,
     /// and buffer pool stats.
@@ -2059,7 +2057,7 @@ impl IpcHandler {
         })
     }
 
-    /// Handle ListUdpSessions command
+    /// Handle `ListUdpSessions` command
     ///
     /// Returns a list of active UDP session snapshots with optional limit.
     fn handle_list_udp_sessions(&self, limit: usize) -> IpcResponse {
@@ -2101,7 +2099,7 @@ impl IpcHandler {
         })
     }
 
-    /// Handle GetUdpSession command
+    /// Handle `GetUdpSession` command
     ///
     /// Returns detailed information about a specific UDP session.
     fn handle_get_udp_session(&self, client_addr: &str, dest_addr: &str) -> IpcResponse {
@@ -2111,7 +2109,7 @@ impl IpcHandler {
             Err(_) => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Invalid client address: {}", client_addr),
+                    format!("Invalid client address: {client_addr}"),
                 );
             }
         };
@@ -2121,7 +2119,7 @@ impl IpcHandler {
             Err(_) => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Invalid destination address: {}", dest_addr),
+                    format!("Invalid destination address: {dest_addr}"),
                 );
             }
         };
@@ -2161,7 +2159,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetUdpWorkerStats command
+    /// Handle `GetUdpWorkerStats` command
     ///
     /// Returns statistics about the UDP worker pool.
     fn handle_get_udp_worker_stats(&self) -> IpcResponse {
@@ -2188,7 +2186,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetBufferPoolStats command
+    /// Handle `GetBufferPoolStats` command
     ///
     /// Returns statistics about the lock-free UDP buffer pool.
     fn handle_get_buffer_pool_stats(&self) -> IpcResponse {
@@ -2220,7 +2218,7 @@ impl IpcHandler {
     // Phase 6.6.5: Chain Management Handler Implementations
     // ========================================================================
 
-    /// Handle CreateChain command
+    /// Handle `CreateChain` command
     ///
     /// Creates a new chain with the given configuration.
     async fn handle_create_chain(&self, tag: String, config: ChainConfig) -> IpcResponse {
@@ -2241,8 +2239,7 @@ impl IpcHandler {
             Ok(dscp_value) => {
                 info!("Created chain '{}' with DSCP value {}", tag, dscp_value);
                 IpcResponse::success_with_message(format!(
-                    "Chain '{}' created with DSCP value {}",
-                    tag, dscp_value
+                    "Chain '{tag}' created with DSCP value {dscp_value}"
                 ))
             }
             Err(e) => {
@@ -2255,7 +2252,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle RemoveChain command
+    /// Handle `RemoveChain` command
     ///
     /// Removes an existing chain.
     async fn handle_remove_chain(&self, tag: &str) -> IpcResponse {
@@ -2269,7 +2266,7 @@ impl IpcHandler {
         match chain_manager.remove_chain(tag).await {
             Ok(()) => {
                 info!("Removed chain '{}'", tag);
-                IpcResponse::success_with_message(format!("Chain '{}' removed", tag))
+                IpcResponse::success_with_message(format!("Chain '{tag}' removed"))
             }
             Err(e) => {
                 warn!("Failed to remove chain '{}': {}", tag, e);
@@ -2281,7 +2278,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle ActivateChain command
+    /// Handle `ActivateChain` command
     ///
     /// Activates a chain using Two-Phase Commit protocol.
     async fn handle_activate_chain(&self, tag: &str) -> IpcResponse {
@@ -2295,7 +2292,7 @@ impl IpcHandler {
         match chain_manager.activate_chain(tag).await {
             Ok(()) => {
                 info!("Activated chain '{}'", tag);
-                IpcResponse::success_with_message(format!("Chain '{}' activated", tag))
+                IpcResponse::success_with_message(format!("Chain '{tag}' activated"))
             }
             Err(e) => {
                 warn!("Failed to activate chain '{}': {}", tag, e);
@@ -2307,7 +2304,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle DeactivateChain command
+    /// Handle `DeactivateChain` command
     ///
     /// Deactivates an active chain.
     async fn handle_deactivate_chain(&self, tag: &str) -> IpcResponse {
@@ -2321,7 +2318,7 @@ impl IpcHandler {
         match chain_manager.deactivate_chain(tag).await {
             Ok(()) => {
                 info!("Deactivated chain '{}'", tag);
-                IpcResponse::success_with_message(format!("Chain '{}' deactivated", tag))
+                IpcResponse::success_with_message(format!("Chain '{tag}' deactivated"))
             }
             Err(e) => {
                 warn!("Failed to deactivate chain '{}': {}", tag, e);
@@ -2333,7 +2330,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetChainStatus command
+    /// Handle `GetChainStatus` command
     ///
     /// Returns status information for a specific chain.
     fn handle_get_chain_status(&self, tag: &str) -> IpcResponse {
@@ -2348,12 +2345,12 @@ impl IpcHandler {
             Some(status) => IpcResponse::ChainStatus(status),
             None => IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Chain '{}' not found", tag),
+                format!("Chain '{tag}' not found"),
             ),
         }
     }
 
-    /// Handle ListChains command
+    /// Handle `ListChains` command
     ///
     /// Returns a list of all configured chains.
     fn handle_list_chains(&self) -> IpcResponse {
@@ -2365,7 +2362,7 @@ impl IpcHandler {
         IpcResponse::ChainList(ChainListResponse { chains })
     }
 
-    /// Handle GetChainRole command
+    /// Handle `GetChainRole` command
     ///
     /// Returns the local node's role in a specific chain.
     fn handle_get_chain_role(&self, chain_tag: &str) -> IpcResponse {
@@ -2379,19 +2376,19 @@ impl IpcHandler {
         if !chain_manager.chain_exists(chain_tag) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Chain '{}' not found", chain_tag),
+                format!("Chain '{chain_tag}' not found"),
             );
         }
 
         let role = chain_manager.get_chain_role(chain_tag);
         IpcResponse::ChainRole(ChainRoleResponse {
             chain_tag: chain_tag.to_string(),
-            role: role.clone(),
+            role,
             in_chain: role.is_some(),
         })
     }
 
-    /// Handle UpdateChainState command
+    /// Handle `UpdateChainState` command
     ///
     /// Updates the state of a chain (used for persistence and recovery).
     fn handle_update_chain_state(
@@ -2407,12 +2404,11 @@ impl IpcHandler {
             );
         };
 
-        match chain_manager.update_chain_state(tag, state.clone(), last_error) {
+        match chain_manager.update_chain_state(tag, state, last_error) {
             Ok(()) => {
                 debug!("Updated chain '{}' state to {:?}", tag, state);
                 IpcResponse::success_with_message(format!(
-                    "Chain '{}' state updated to {}",
-                    tag, state
+                    "Chain '{tag}' state updated to {state}"
                 ))
             }
             Err(e) => {
@@ -2425,7 +2421,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle UpdateChain command
+    /// Handle `UpdateChain` command
     ///
     /// Updates an existing chain configuration. Chain must be inactive.
     async fn handle_update_chain(
@@ -2449,7 +2445,7 @@ impl IpcHandler {
             None => {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
-                    format!("Chain '{}' not found", tag),
+                    format!("Chain '{tag}' not found"),
                 );
             }
         };
@@ -2468,7 +2464,7 @@ impl IpcHandler {
             None => {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
-                    format!("Chain '{}' configuration not found", tag),
+                    format!("Chain '{tag}' configuration not found"),
                 );
             }
         };
@@ -2487,7 +2483,7 @@ impl IpcHandler {
         match chain_manager.update_chain(&tag, updated_config).await {
             Ok(()) => {
                 info!("Updated chain '{}'", tag);
-                IpcResponse::success_with_message(format!("Chain '{}' updated", tag))
+                IpcResponse::success_with_message(format!("Chain '{tag}' updated"))
             }
             Err(e) => {
                 warn!("Failed to update chain '{}': {}", tag, e);
@@ -2503,7 +2499,7 @@ impl IpcHandler {
     // Phase 6.6.5: Two-Phase Commit Handler Implementations
     // ========================================================================
 
-    /// Handle PrepareChainRoute command (2PC Phase 1)
+    /// Handle `PrepareChainRoute` command (2PC Phase 1)
     ///
     /// Validates chain configuration without applying routing rules.
     /// Called by the coordinator to prepare remote nodes.
@@ -2529,7 +2525,7 @@ impl IpcHandler {
                 );
                 IpcResponse::PrepareResult(PrepareResponse {
                     success: true,
-                    message: Some(format!("Prepared for chain '{}'", chain_tag)),
+                    message: Some(format!("Prepared for chain '{chain_tag}'")),
                     node: self.local_node_tag.clone(),
                 })
             }
@@ -2547,7 +2543,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle CommitChainRoute command (2PC Phase 2a)
+    /// Handle `CommitChainRoute` command (2PC Phase 2a)
     ///
     /// Applies routing rules after all nodes have been prepared.
     /// Called by the coordinator to commit remote nodes.
@@ -2569,7 +2565,7 @@ impl IpcHandler {
                     "COMMIT succeeded for chain '{}' from node '{}'",
                     chain_tag, source_node
                 );
-                IpcResponse::success_with_message(format!("Committed chain '{}'", chain_tag))
+                IpcResponse::success_with_message(format!("Committed chain '{chain_tag}'"))
             }
             Err(e) => {
                 warn!(
@@ -2584,7 +2580,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle AbortChainRoute command (2PC Phase 2b)
+    /// Handle `AbortChainRoute` command (2PC Phase 2b)
     ///
     /// Rolls back prepared state when 2PC fails.
     /// Called by the coordinator to abort remote nodes.
@@ -2606,7 +2602,7 @@ impl IpcHandler {
                     "ABORT handled for chain '{}' from node '{}'",
                     chain_tag, source_node
                 );
-                IpcResponse::success_with_message(format!("Aborted chain '{}'", chain_tag))
+                IpcResponse::success_with_message(format!("Aborted chain '{chain_tag}'"))
             }
             Err(e) => {
                 // ABORT should generally succeed even if there's nothing to abort
@@ -2616,8 +2612,7 @@ impl IpcHandler {
                 );
                 // Still return success - abort is best-effort
                 IpcResponse::success_with_message(format!(
-                    "Abort processed for chain '{}' (with warnings)",
-                    chain_tag
+                    "Abort processed for chain '{chain_tag}' (with warnings)"
                 ))
             }
         }
@@ -2627,9 +2622,9 @@ impl IpcHandler {
     // Phase 6.9: WireGuard Tunnel Handler Implementations
     // ========================================================================
 
-    /// Handle CreateWgTunnel command
+    /// Handle `CreateWgTunnel` command
     ///
-    /// Creates a new userspace WireGuard tunnel via egress manager.
+    /// Creates a new userspace `WireGuard` tunnel via egress manager.
     async fn handle_create_wg_tunnel(
         &self,
         tag: String,
@@ -2667,7 +2662,7 @@ impl IpcHandler {
         match egress_manager.create_tunnel(egress_config).await {
             Ok(()) => {
                 info!("Created WireGuard tunnel '{}'", tag);
-                IpcResponse::success_with_message(format!("WireGuard tunnel '{}' created", tag))
+                IpcResponse::success_with_message(format!("WireGuard tunnel '{tag}' created"))
             }
             Err(e) => {
                 warn!("Failed to create WireGuard tunnel '{}': {}", tag, e);
@@ -2679,9 +2674,9 @@ impl IpcHandler {
         }
     }
 
-    /// Handle RemoveWgTunnel command
+    /// Handle `RemoveWgTunnel` command
     ///
-    /// Removes a userspace WireGuard tunnel with optional drain timeout.
+    /// Removes a userspace `WireGuard` tunnel with optional drain timeout.
     async fn handle_remove_wg_tunnel(
         &self,
         tag: &str,
@@ -2694,12 +2689,12 @@ impl IpcHandler {
             );
         };
 
-        let drain_timeout = drain_timeout_secs.map(|s| std::time::Duration::from_secs(s as u64));
+        let drain_timeout = drain_timeout_secs.map(|s| std::time::Duration::from_secs(u64::from(s)));
 
         match egress_manager.remove_tunnel(tag, drain_timeout).await {
             Ok(()) => {
                 info!("Removed WireGuard tunnel '{}'", tag);
-                IpcResponse::success_with_message(format!("WireGuard tunnel '{}' removed", tag))
+                IpcResponse::success_with_message(format!("WireGuard tunnel '{tag}' removed"))
             }
             Err(e) => {
                 warn!("Failed to remove WireGuard tunnel '{}': {}", tag, e);
@@ -2711,9 +2706,9 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetWgTunnelStatus command
+    /// Handle `GetWgTunnelStatus` command
     ///
-    /// Returns status information for a specific WireGuard tunnel.
+    /// Returns status information for a specific `WireGuard` tunnel.
     fn handle_get_wg_tunnel_status(&self, tag: &str) -> IpcResponse {
         let Some(egress_manager) = &self.wg_egress_manager else {
             return IpcResponse::error(
@@ -2739,14 +2734,14 @@ impl IpcHandler {
             }
             None => IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("WireGuard tunnel '{}' not found", tag),
+                format!("WireGuard tunnel '{tag}' not found"),
             ),
         }
     }
 
-    /// Handle ListWgTunnels command
+    /// Handle `ListWgTunnels` command
     ///
-    /// Returns a list of all userspace WireGuard tunnels.
+    /// Returns a list of all userspace `WireGuard` tunnels.
     fn handle_list_wg_tunnels(&self) -> IpcResponse {
         let mut tunnels = Vec::new();
 
@@ -2797,9 +2792,9 @@ impl IpcHandler {
     // Phase 11-Fix.AA: Ingress Peer Handler Implementations
     // ========================================================================
 
-    /// Handle AddIngressPeer command
+    /// Handle `AddIngressPeer` command
     ///
-    /// Adds a new peer to the userspace WireGuard ingress.
+    /// Adds a new peer to the userspace `WireGuard` ingress.
     async fn handle_add_ingress_peer(
         &self,
         public_key: String,
@@ -2840,14 +2835,14 @@ impl IpcHandler {
                     error = %e,
                     "Failed to add ingress peer"
                 );
-                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to add peer: {}", e))
+                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to add peer: {e}"))
             }
         }
     }
 
-    /// Handle RemoveIngressPeer command
+    /// Handle `RemoveIngressPeer` command
     ///
-    /// Removes a peer from the userspace WireGuard ingress.
+    /// Removes a peer from the userspace `WireGuard` ingress.
     async fn handle_remove_ingress_peer(&self, public_key: String) -> IpcResponse {
         let Some(ingress_manager) = &self.wg_ingress_manager else {
             return IpcResponse::error(
@@ -2867,12 +2862,12 @@ impl IpcHandler {
                     error = %e,
                     "Failed to remove ingress peer"
                 );
-                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to remove peer: {}", e))
+                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to remove peer: {e}"))
             }
         }
     }
 
-    /// Handle ListIngressPeers command
+    /// Handle `ListIngressPeers` command
     ///
     /// Returns a list of all peers registered with the ingress.
     fn handle_list_ingress_peers(&self) -> IpcResponse {
@@ -2901,7 +2896,7 @@ impl IpcHandler {
         IpcResponse::IngressPeerList(IngressPeerListResponse { peers })
     }
 
-    /// Handle GetIngressStats command
+    /// Handle `GetIngressStats` command
     ///
     /// Returns ingress manager, forwarding, and reply statistics.
     fn handle_get_ingress_stats(&self) -> IpcResponse {
@@ -2939,7 +2934,7 @@ impl IpcHandler {
     // Phase 6.9: ECMP Group Handler Implementations
     // ========================================================================
 
-    /// Handle CreateEcmpGroup command
+    /// Handle `CreateEcmpGroup` command
     ///
     /// Creates a new ECMP load balancing group.
     fn handle_create_ecmp_group(
@@ -2982,7 +2977,7 @@ impl IpcHandler {
         match ecmp_manager.add_group(internal_config) {
             Ok(()) => {
                 info!("Created ECMP group '{}'", tag);
-                IpcResponse::success_with_message(format!("ECMP group '{}' created", tag))
+                IpcResponse::success_with_message(format!("ECMP group '{tag}' created"))
             }
             Err(e) => {
                 warn!("Failed to create ECMP group '{}': {}", tag, e);
@@ -2994,7 +2989,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle RemoveEcmpGroup command
+    /// Handle `RemoveEcmpGroup` command
     ///
     /// Removes an ECMP load balancing group.
     fn handle_remove_ecmp_group(&self, tag: &str) -> IpcResponse {
@@ -3008,7 +3003,7 @@ impl IpcHandler {
         match ecmp_manager.remove_group(tag) {
             Ok(()) => {
                 info!("Removed ECMP group '{}'", tag);
-                IpcResponse::success_with_message(format!("ECMP group '{}' removed", tag))
+                IpcResponse::success_with_message(format!("ECMP group '{tag}' removed"))
             }
             Err(e) => {
                 warn!("Failed to remove ECMP group '{}': {}", tag, e);
@@ -3020,7 +3015,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetEcmpGroupStatus command
+    /// Handle `GetEcmpGroupStatus` command
     ///
     /// Returns status information for a specific ECMP group.
     fn handle_get_ecmp_group_status(&self, tag: &str) -> IpcResponse {
@@ -3067,12 +3062,12 @@ impl IpcHandler {
             }
             None => IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("ECMP group '{}' not found", tag),
+                format!("ECMP group '{tag}' not found"),
             ),
         }
     }
 
-    /// Handle ListEcmpGroups command
+    /// Handle `ListEcmpGroups` command
     ///
     /// Returns a list of all ECMP groups.
     fn handle_list_ecmp_groups(&self) -> IpcResponse {
@@ -3121,7 +3116,7 @@ impl IpcHandler {
         IpcResponse::EcmpGroupList(EcmpGroupListResponse { groups })
     }
 
-    /// Handle UpdateEcmpGroupMembers command
+    /// Handle `UpdateEcmpGroupMembers` command
     ///
     /// Replaces the members of an existing ECMP group.
     fn handle_update_ecmp_group_members(
@@ -3142,7 +3137,7 @@ impl IpcHandler {
             None => {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
-                    format!("ECMP group '{}' not found", tag),
+                    format!("ECMP group '{tag}' not found"),
                 );
             }
         };
@@ -3179,14 +3174,14 @@ impl IpcHandler {
         }
 
         info!("Updated ECMP group '{}' members", tag);
-        IpcResponse::success_with_message(format!("ECMP group '{}' members updated", tag))
+        IpcResponse::success_with_message(format!("ECMP group '{tag}' members updated"))
     }
 
     // ========================================================================
     // Phase 6.9: Peer Management Handler Implementations
     // ========================================================================
 
-    /// Handle GeneratePairRequest command
+    /// Handle `GeneratePairRequest` command
     ///
     /// Generates an offline pairing request code.
     fn handle_generate_pair_request(
@@ -3236,7 +3231,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle ImportPairRequest command
+    /// Handle `ImportPairRequest` command
     ///
     /// Imports a pairing request and generates a response code.
     async fn handle_import_pair_request(
@@ -3285,7 +3280,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle CompleteHandshake command
+    /// Handle `CompleteHandshake` command
     ///
     /// Completes the pairing handshake with a response code.
     async fn handle_complete_handshake(&self, code: String) -> IpcResponse {
@@ -3318,7 +3313,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle ConnectPeer command
+    /// Handle `ConnectPeer` command
     ///
     /// Connects to a configured peer node.
     async fn handle_connect_peer(&self, tag: &str) -> IpcResponse {
@@ -3332,7 +3327,7 @@ impl IpcHandler {
         match peer_manager.connect(tag).await {
             Ok(()) => {
                 info!("Connected to peer '{}'", tag);
-                IpcResponse::success_with_message(format!("Connected to peer '{}'", tag))
+                IpcResponse::success_with_message(format!("Connected to peer '{tag}'"))
             }
             Err(e) => {
                 warn!("Failed to connect to peer '{}': {}", tag, e);
@@ -3344,7 +3339,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle DisconnectPeer command
+    /// Handle `DisconnectPeer` command
     ///
     /// Disconnects from a connected peer.
     async fn handle_disconnect_peer(&self, tag: &str) -> IpcResponse {
@@ -3358,7 +3353,7 @@ impl IpcHandler {
         match peer_manager.disconnect(tag).await {
             Ok(()) => {
                 info!("Disconnected from peer '{}'", tag);
-                IpcResponse::success_with_message(format!("Disconnected from peer '{}'", tag))
+                IpcResponse::success_with_message(format!("Disconnected from peer '{tag}'"))
             }
             Err(e) => {
                 warn!("Failed to disconnect from peer '{}': {}", tag, e);
@@ -3370,7 +3365,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetPeerStatus command
+    /// Handle `GetPeerStatus` command
     ///
     /// Returns status information for a specific peer.
     fn handle_get_peer_status(&self, tag: &str) -> IpcResponse {
@@ -3385,12 +3380,12 @@ impl IpcHandler {
             Some(status) => IpcResponse::PeerStatus(status),
             None => IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Peer '{}' not found", tag),
+                format!("Peer '{tag}' not found"),
             ),
         }
     }
 
-    /// Handle GetPeerTunnelHealth command
+    /// Handle `GetPeerTunnelHealth` command
     ///
     /// Returns health information for a peer's tunnel.
     fn handle_get_peer_tunnel_health(&self, tag: &str) -> IpcResponse {
@@ -3410,12 +3405,12 @@ impl IpcHandler {
             }
             None => IpcResponse::error(
                 ErrorCode::NotFound,
-                format!("Peer '{}' not found", tag),
+                format!("Peer '{tag}' not found"),
             ),
         }
     }
 
-    /// Handle ListPeers command
+    /// Handle `ListPeers` command
     ///
     /// Returns a list of all configured peers.
     fn handle_list_peers(&self) -> IpcResponse {
@@ -3427,7 +3422,7 @@ impl IpcHandler {
         IpcResponse::PeerList(PeerListResponse { peers })
     }
 
-    /// Handle RemovePeer command
+    /// Handle `RemovePeer` command
     ///
     /// Removes a peer configuration.
     async fn handle_remove_peer(&self, tag: &str) -> IpcResponse {
@@ -3441,7 +3436,7 @@ impl IpcHandler {
         match peer_manager.remove_peer(tag).await {
             Ok(()) => {
                 info!("Removed peer '{}'", tag);
-                IpcResponse::success_with_message(format!("Peer '{}' removed", tag))
+                IpcResponse::success_with_message(format!("Peer '{tag}' removed"))
             }
             Err(e) => {
                 warn!("Failed to remove peer '{}': {}", tag, e);
@@ -3457,7 +3452,7 @@ impl IpcHandler {
     // Error Code Conversion Helpers
     // ========================================================================
 
-    /// Convert EgressError to IPC ErrorCode
+    /// Convert `EgressError` to IPC `ErrorCode`
     fn egress_error_to_code(err: &crate::egress::error::EgressError) -> ErrorCode {
         use crate::egress::error::EgressError;
         match err {
@@ -3469,7 +3464,7 @@ impl IpcHandler {
         }
     }
 
-    /// Convert EcmpGroupError to IPC ErrorCode
+    /// Convert `EcmpGroupError` to IPC `ErrorCode`
     fn ecmp_error_to_code(err: &crate::ecmp::group::EcmpGroupError) -> ErrorCode {
         use crate::ecmp::group::EcmpGroupError;
         match err {
@@ -3489,7 +3484,7 @@ impl IpcHandler {
         }
     }
 
-    /// Convert PeerError to IPC ErrorCode
+    /// Convert `PeerError` to IPC `ErrorCode`
     fn peer_error_to_code(err: &crate::peer::manager::PeerError) -> ErrorCode {
         use crate::peer::manager::PeerError;
         match err {
@@ -3512,7 +3507,7 @@ impl IpcHandler {
         }
     }
 
-    /// Convert ChainError to IPC ErrorCode
+    /// Convert `ChainError` to IPC `ErrorCode`
     fn chain_error_to_code(err: &crate::chain::ChainError) -> ErrorCode {
         use crate::chain::ChainError;
         match err {
@@ -3549,7 +3544,7 @@ impl IpcHandler {
     // Phase 7.7: DNS Command Handler Implementations
     // ========================================================================
 
-    /// Handle GetDnsStats command
+    /// Handle `GetDnsStats` command
     ///
     /// Returns comprehensive DNS statistics including cache, blocking, and upstream metrics.
     fn handle_get_dns_stats(&self) -> IpcResponse {
@@ -3584,7 +3579,7 @@ impl IpcHandler {
         })
     }
 
-    /// Handle GetDnsCacheStats command
+    /// Handle `GetDnsCacheStats` command
     ///
     /// Returns detailed cache statistics.
     fn handle_get_dns_cache_stats(&self) -> IpcResponse {
@@ -3620,7 +3615,7 @@ impl IpcHandler {
         })
     }
 
-    /// Handle FlushDnsCache command
+    /// Handle `FlushDnsCache` command
     ///
     /// Flushes cache entries matching the optional pattern.
     fn handle_flush_dns_cache(&self, pattern: Option<String>) -> IpcResponse {
@@ -3631,23 +3626,20 @@ impl IpcHandler {
             );
         };
 
-        let flushed = match pattern {
-            Some(p) => {
-                let count = dns_engine.cache().flush(Some(&p));
-                info!("Flushed {} DNS cache entries matching pattern: {}", count, p);
-                format!("Flushed {} entries matching '{}'", count, p)
-            }
-            None => {
-                let count = dns_engine.cache().flush(None);
-                info!("Flushed {} DNS cache entries", count);
-                format!("Flushed {} cache entries", count)
-            }
+        let flushed = if let Some(p) = pattern {
+            let count = dns_engine.cache().flush(Some(&p));
+            info!("Flushed {} DNS cache entries matching pattern: {}", count, p);
+            format!("Flushed {count} entries matching '{p}'")
+        } else {
+            let count = dns_engine.cache().flush(None);
+            info!("Flushed {} DNS cache entries", count);
+            format!("Flushed {count} cache entries")
         };
 
         IpcResponse::success_with_message(flushed)
     }
 
-    /// Handle GetDnsBlockStats command
+    /// Handle `GetDnsBlockStats` command
     ///
     /// Returns DNS blocking/filtering statistics.
     fn handle_get_dns_block_stats(&self) -> IpcResponse {
@@ -3682,7 +3674,7 @@ impl IpcHandler {
         })
     }
 
-    /// Handle ReloadDnsBlocklist command
+    /// Handle `ReloadDnsBlocklist` command
     ///
     /// Reloads blocking rules (hot-reload).
     fn handle_reload_dns_blocklist(&self) -> IpcResponse {
@@ -3702,7 +3694,7 @@ impl IpcHandler {
         IpcResponse::success_with_message("Blocklist reload completed")
     }
 
-    /// Handle AddDnsUpstream command
+    /// Handle `AddDnsUpstream` command
     ///
     /// Adds a new upstream DNS server.
     async fn handle_add_dns_upstream(
@@ -3745,7 +3737,7 @@ impl IpcHandler {
         )
     }
 
-    /// Handle RemoveDnsUpstream command
+    /// Handle `RemoveDnsUpstream` command
     ///
     /// Removes an upstream DNS server by tag.
     async fn handle_remove_dns_upstream(&self, tag: &str) -> IpcResponse {
@@ -3765,7 +3757,7 @@ impl IpcHandler {
         )
     }
 
-    /// Handle GetDnsUpstreamStatus command
+    /// Handle `GetDnsUpstreamStatus` command
     ///
     /// Returns status information for upstream servers.
     fn handle_get_dns_upstream_status(&self, tag: Option<String>) -> IpcResponse {
@@ -3783,7 +3775,7 @@ impl IpcHandler {
 
         let upstreams: Vec<DnsUpstreamInfo> = all_upstreams
             .into_iter()
-            .filter(|u| tag.is_none() || tag.as_ref().map(|t| t == &u.tag).unwrap_or(false))
+            .filter(|u| tag.is_none() || tag.as_ref().is_some_and(|t| t == &u.tag))
             .map(|u| DnsUpstreamInfo {
                 tag: u.tag,
                 address: u.address,
@@ -3801,7 +3793,7 @@ impl IpcHandler {
             if upstreams.is_empty() {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
-                    format!("Upstream '{}' not found", t),
+                    format!("Upstream '{t}' not found"),
                 );
             }
         }
@@ -3809,7 +3801,7 @@ impl IpcHandler {
         IpcResponse::DnsUpstreamStatus(DnsUpstreamStatusResponse { upstreams })
     }
 
-    /// Handle AddDnsRoute command
+    /// Handle `AddDnsRoute` command
     ///
     /// Adds a DNS routing rule.
     fn handle_add_dns_route(
@@ -3835,8 +3827,7 @@ impl IpcHandler {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
                     format!(
-                        "Invalid match_type '{}': must be exact, suffix, keyword, or regex",
-                        match_type
+                        "Invalid match_type '{match_type}': must be exact, suffix, keyword, or regex"
                     ),
                 );
             }
@@ -3850,8 +3841,7 @@ impl IpcHandler {
                     pattern, match_type, upstream_tag
                 );
                 IpcResponse::success_with_message(format!(
-                    "Route added: {} -> {}",
-                    pattern, upstream_tag
+                    "Route added: {pattern} -> {upstream_tag}"
                 ))
             }
             Err(e) => {
@@ -3861,7 +3851,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle RemoveDnsRoute command
+    /// Handle `RemoveDnsRoute` command
     ///
     /// Removes a DNS routing rule by pattern.
     fn handle_remove_dns_route(&self, pattern: &str) -> IpcResponse {
@@ -3876,11 +3866,11 @@ impl IpcHandler {
             Ok(removed) => {
                 if removed {
                     info!("Removed DNS route: {}", pattern);
-                    IpcResponse::success_with_message(format!("Route '{}' removed", pattern))
+                    IpcResponse::success_with_message(format!("Route '{pattern}' removed"))
                 } else {
                     IpcResponse::error(
                         ErrorCode::NotFound,
-                        format!("Route '{}' not found", pattern),
+                        format!("Route '{pattern}' not found"),
                     )
                 }
             }
@@ -3891,7 +3881,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetDnsQueryLog command
+    /// Handle `GetDnsQueryLog` command
     ///
     /// Returns recent DNS query log entries with pagination.
     fn handle_get_dns_query_log(&self, limit: usize, offset: usize) -> IpcResponse {
@@ -3916,7 +3906,7 @@ impl IpcHandler {
         })
     }
 
-    /// Handle DnsQuery command
+    /// Handle `DnsQuery` command
     ///
     /// Performs a test DNS query.
     async fn handle_dns_query(
@@ -3945,7 +3935,7 @@ impl IpcHandler {
             n => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Unsupported query type: {}", n),
+                    format!("Unsupported query type: {n}"),
                 );
             }
         };
@@ -3956,7 +3946,7 @@ impl IpcHandler {
             Err(e) => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Invalid domain name: {}", e),
+                    format!("Invalid domain name: {e}"),
                 );
             }
         };
@@ -3991,7 +3981,7 @@ impl IpcHandler {
                 let answers: Vec<String> = response
                     .answers()
                     .iter()
-                    .map(|r| r.data().map(|d| d.to_string()).unwrap_or_default())
+                    .map(|r| r.data().map(std::string::ToString::to_string).unwrap_or_default())
                     .collect();
 
                 IpcResponse::DnsQueryResult(DnsQueryResponse {
@@ -4023,7 +4013,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle GetDnsConfig command
+    /// Handle `GetDnsConfig` command
     ///
     /// Returns the current DNS engine configuration.
     fn handle_get_dns_config(&self) -> IpcResponse {
@@ -4090,8 +4080,8 @@ impl IpcHandler {
 /// Write a metric header (HELP and TYPE lines)
 fn write_metric_header(output: &mut String, name: &str, help: &str, metric_type: &str) {
     use std::fmt::Write;
-    let _ = writeln!(output, "# HELP {} {}", name, help);
-    let _ = writeln!(output, "# TYPE {} {}", name, metric_type);
+    let _ = writeln!(output, "# HELP {name} {help}");
+    let _ = writeln!(output, "# TYPE {name} {metric_type}");
 }
 
 /// Write a metric value with optional labels
@@ -4103,9 +4093,9 @@ fn write_metric_value(output: &mut String, name: &str, labels: Option<&[(&str, &
             .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
             .collect::<Vec<_>>()
             .join(",");
-        let _ = writeln!(output, "{}{{{}}} {}", name, label_str, value);
+        let _ = writeln!(output, "{name}{{{label_str}}} {value}");
     } else {
-        let _ = writeln!(output, "{} {}", name, value);
+        let _ = writeln!(output, "{name} {value}");
     }
 }
 
@@ -4133,8 +4123,7 @@ fn chrono_lite_format(secs: u64) -> String {
     let day = (day_of_year % 30) + 1;
 
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, mins, secs
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}Z"
     )
 }
 

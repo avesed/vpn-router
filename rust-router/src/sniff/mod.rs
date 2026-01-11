@@ -2,11 +2,11 @@
 //!
 //! This module provides protocol detection and parsing capabilities,
 //! primarily for extracting SNI (Server Name Indication) from
-//! TLS ClientHello and QUIC Initial packets.
+//! TLS `ClientHello` and QUIC Initial packets.
 //!
 //! # Supported Protocols
 //!
-//! - TLS: SNI extraction from ClientHello
+//! - TLS: SNI extraction from `ClientHello`
 //! - QUIC: SNI extraction from Initial packets
 //! - HTTP: Host header extraction (future)
 //!

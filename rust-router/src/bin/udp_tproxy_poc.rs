@@ -135,7 +135,7 @@ fn recv_with_original_dst(fd: RawFd, buf: &mut [u8]) -> Result<(usize, SocketAdd
 
     // Prepare the source address buffer
     let mut src_addr: libc::sockaddr_in = unsafe { mem::zeroed() };
-    let mut src_addr_len: libc::socklen_t = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let src_addr_len: libc::socklen_t = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
     // Prepare the control message buffer
     // Size calculation: CMSG_SPACE for sockaddr_in
@@ -346,11 +346,7 @@ async fn handle_upstream_replies(
         // Read from upstream in the session
         let recv_result: Option<io::Result<usize>> = {
             let sessions_read = sessions.read().await;
-            if let Some(session) = sessions_read.get(&session_key) {
-                Some(session.upstream_socket.try_recv(&mut buf))
-            } else {
-                None
-            }
+            sessions_read.get(&session_key).map(|session| session.upstream_socket.try_recv(&mut buf))
         };
 
         match recv_result {

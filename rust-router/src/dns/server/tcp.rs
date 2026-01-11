@@ -430,7 +430,7 @@ impl TcpDnsServer {
         config: TcpServerConfig,
     ) -> DnsResult<Self> {
         let listener = TcpListener::bind(addr).await.map_err(|e| {
-            DnsError::network_io(format!("failed to bind TCP socket to {}", addr), e)
+            DnsError::network_io(format!("failed to bind TCP socket to {addr}"), e)
         })?;
 
         let local_addr = listener.local_addr().map_err(|e| {
@@ -684,15 +684,13 @@ impl TcpDnsServer {
         // Validate length
         if len < MIN_DNS_MESSAGE_SIZE {
             return Err(DnsError::parse(format!(
-                "message too small: {} bytes (min: {})",
-                len, MIN_DNS_MESSAGE_SIZE
+                "message too small: {len} bytes (min: {MIN_DNS_MESSAGE_SIZE})"
             )));
         }
 
         if len > max_size {
             return Err(DnsError::parse(format!(
-                "message too large: {} bytes (max: {})",
-                len, max_size
+                "message too large: {len} bytes (max: {max_size})"
             )));
         }
 

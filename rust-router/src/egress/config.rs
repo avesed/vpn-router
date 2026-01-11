@@ -1,6 +1,6 @@
-//! Configuration types for WireGuard Egress
+//! Configuration types for `WireGuard` Egress
 //!
-//! This module defines configuration types for WireGuard egress tunnels,
+//! This module defines configuration types for `WireGuard` egress tunnels,
 //! including different tunnel types (PIA, Custom, Peer) and validation.
 //!
 //! # Configuration Parameters
@@ -9,7 +9,7 @@
 //! |-----------|-------------|---------|
 //! | `tag` | Unique tunnel identifier | Required |
 //! | `tunnel_type` | Tunnel type (PIA, Custom, Peer) | Required |
-//! | `private_key` | WireGuard private key (Base64) | Required |
+//! | `private_key` | `WireGuard` private key (Base64) | Required |
 //! | `peer_public_key` | Peer's public key (Base64) | Required |
 //! | `peer_endpoint` | Peer's endpoint (IP:port) | Required |
 //! | `local_ip` | Local tunnel IP | Optional |
@@ -176,7 +176,7 @@ impl std::fmt::Display for EgressState {
     }
 }
 
-/// Default MTU for WireGuard tunnels
+/// Default MTU for `WireGuard` tunnels
 pub const DEFAULT_MTU: u16 = 1420;
 
 /// Default persistent keepalive interval in seconds
@@ -203,7 +203,7 @@ pub enum EgressTunnelType {
         /// PIA region identifier (e.g., "us-west", "eu-frankfurt")
         region: String,
     },
-    /// Custom WireGuard endpoint
+    /// Custom `WireGuard` endpoint
     Custom {
         /// User-defined name for the custom tunnel
         name: String,
@@ -285,7 +285,7 @@ impl std::fmt::Display for EgressTunnelType {
     }
 }
 
-/// Configuration for a WireGuard egress tunnel
+/// Configuration for a `WireGuard` egress tunnel
 ///
 /// Contains all parameters needed to create and manage an egress tunnel.
 ///
@@ -315,7 +315,7 @@ pub struct WgEgressConfig {
     /// Type of tunnel (PIA, Custom, or Peer)
     pub tunnel_type: EgressTunnelType,
 
-    /// WireGuard private key (Base64 encoded)
+    /// `WireGuard` private key (Base64 encoded)
     ///
     /// Must be a valid 32-byte X25519 private key.
     pub private_key: String,
@@ -327,7 +327,7 @@ pub struct WgEgressConfig {
 
     /// Peer endpoint (IP:port)
     ///
-    /// The remote WireGuard endpoint to connect to.
+    /// The remote `WireGuard` endpoint to connect to.
     pub peer_endpoint: String,
 
     /// Local tunnel IP address (optional)
@@ -354,7 +354,7 @@ pub struct WgEgressConfig {
     /// Maximum transmission unit
     ///
     /// Should be lower than the underlying network MTU to account for
-    /// WireGuard overhead (typically 80 bytes).
+    /// `WireGuard` overhead (typically 80 bytes).
     /// Defaults to 1420.
     #[serde(default = "default_mtu")]
     pub mtu: Option<u16>,
@@ -413,7 +413,7 @@ impl WgEgressConfig {
     ///
     /// * `tag` - Unique tunnel identifier
     /// * `tunnel_type` - Type of tunnel (PIA, Custom, Peer)
-    /// * `private_key` - WireGuard private key (Base64)
+    /// * `private_key` - `WireGuard` private key (Base64)
     /// * `peer_public_key` - Peer's public key (Base64)
     /// * `peer_endpoint` - Peer's endpoint (IP:port)
     ///

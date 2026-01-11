@@ -1,7 +1,7 @@
-//! Userspace WireGuard tunnel via boringtun for Phase 6
+//! Userspace `WireGuard` tunnel via boringtun for Phase 6
 //!
-//! This module implements userspace WireGuard tunnels using the
-//! boringtun library for Rust-native WireGuard support.
+//! This module implements userspace `WireGuard` tunnels using the
+//! boringtun library for Rust-native `WireGuard` support.
 //!
 //! # Phase 6.1 Implementation
 //!
@@ -16,10 +16,10 @@
 //!
 //! # Phase 6.2 Implementation
 //!
-//! - [x] WgTunnel trait encrypt/decrypt methods
+//! - [x] `WgTunnel` trait encrypt/decrypt methods
 //! - [x] Peer management (single-peer egress mode)
-//! - [x] trigger_handshake/shutdown trait methods
-//! - [x] get_peer/list_peers for single peer
+//! - [x] `trigger_handshake/shutdown` trait methods
+//! - [x] `get_peer/list_peers` for single peer
 //!
 //! # Architecture
 //!
@@ -94,7 +94,7 @@ use crate::tunnel::config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConf
 use crate::tunnel::handshake::{HandshakeConfig, HandshakeTracker};
 use crate::tunnel::traits::{BoxFuture, DecryptResult, WgTunnel, WgTunnelError, WgTunnelStats};
 
-/// WireGuard transport data packet overhead
+/// `WireGuard` transport data packet overhead
 ///
 /// For transport data packets:
 /// - 4 bytes: message type
@@ -105,7 +105,7 @@ use crate::tunnel::traits::{BoxFuture, DecryptResult, WgTunnel, WgTunnelError, W
 /// Total: 32 bytes overhead added to the encrypted payload
 pub const WG_TRANSPORT_OVERHEAD: usize = 32;
 
-/// WireGuard handshake initiation packet size
+/// `WireGuard` handshake initiation packet size
 ///
 /// Handshake initiation is the largest packet type:
 /// - 4 bytes: message type (1)
@@ -119,7 +119,7 @@ pub const WG_TRANSPORT_OVERHEAD: usize = 32;
 /// Total: 148 bytes
 pub const WG_HANDSHAKE_INIT_SIZE: usize = 148;
 
-/// WireGuard handshake response packet size
+/// `WireGuard` handshake response packet size
 ///
 /// - 4 bytes: message type (2)
 /// - 4 bytes: sender index
@@ -136,10 +136,10 @@ pub const WG_HANDSHAKE_RESPONSE_SIZE: usize = 92;
 #[deprecated(since = "0.2.0", note = "Use WG_TRANSPORT_OVERHEAD instead")]
 pub const WG_OVERHEAD: usize = WG_TRANSPORT_OVERHEAD;
 
-/// Minimum buffer size for WireGuard packets (must fit handshake initiation)
+/// Minimum buffer size for `WireGuard` packets (must fit handshake initiation)
 pub const MIN_BUFFER_SIZE: usize = WG_HANDSHAKE_INIT_SIZE;
 
-/// Maximum transmission unit for WireGuard (default)
+/// Maximum transmission unit for `WireGuard` (default)
 pub const DEFAULT_MTU: usize = 1420;
 
 /// Timer tick interval in milliseconds
@@ -167,9 +167,9 @@ const DEFAULT_SO_SNDBUF: usize = 212_992; // 208 KB
 /// Default tag for tunnels created without an explicit tag
 const DEFAULT_TUNNEL_TAG: &str = "unnamed";
 
-/// Userspace WireGuard tunnel using boringtun
+/// Userspace `WireGuard` tunnel using boringtun
 ///
-/// This implementation uses the boringtun library for WireGuard
+/// This implementation uses the boringtun library for `WireGuard`
 /// cryptographic operations in pure Rust.
 ///
 /// # Thread Safety
@@ -186,11 +186,11 @@ const DEFAULT_TUNNEL_TAG: &str = "unnamed";
 ///
 /// When acquiring multiple locks, always follow this order to prevent deadlocks:
 /// 1. `shared.tunn` (Mutex)
-/// 2. `shared.socket` (RwLock)
-/// 3. `shared.recv_tx` (RwLock)
-/// 4. `shared.local_ip` (RwLock)
-/// 5. `shared.allowed_ips` (RwLock)
-/// 6. `shared.peer_state` (RwLock) - Phase 6.2
+/// 2. `shared.socket` (`RwLock`)
+/// 3. `shared.recv_tx` (`RwLock`)
+/// 4. `shared.local_ip` (`RwLock`)
+/// 5. `shared.allowed_ips` (`RwLock`)
+/// 6. `shared.peer_state` (`RwLock`) - Phase 6.2
 ///
 /// # Peer Mode
 ///
@@ -235,11 +235,11 @@ pub struct UserspaceWgTunnel {
 ///
 /// When acquiring multiple locks, ALWAYS follow this order:
 /// 1. `tunn` (Mutex) - Acquired first, released last
-/// 2. `socket` (RwLock)
-/// 3. `recv_tx` (RwLock)
-/// 4. `local_ip` (RwLock)
-/// 5. `allowed_ips` (RwLock)
-/// 6. `peer_state` (RwLock) - Phase 6.2
+/// 2. `socket` (`RwLock`)
+/// 3. `recv_tx` (`RwLock`)
+/// 4. `local_ip` (`RwLock`)
+/// 5. `allowed_ips` (`RwLock`)
+/// 6. `peer_state` (`RwLock`) - Phase 6.2
 ///
 /// The `handshake_tx` is a watch channel and does not require ordering.
 struct TunnelShared {
@@ -315,7 +315,7 @@ struct PeerStateInner {
     rx_bytes: AtomicU64,
     /// Last handshake timestamp (Unix seconds)
     last_handshake: AtomicU64,
-    /// Whether last_handshake contains a valid value
+    /// Whether `last_handshake` contains a valid value
     last_handshake_valid: AtomicBool,
 }
 
@@ -336,7 +336,7 @@ impl PeerStateInner {
         }
     }
 
-    /// Convert to WgPeerInfo
+    /// Convert to `WgPeerInfo`
     fn to_peer_info(&self) -> WgPeerInfo {
         let last_handshake = if self.last_handshake_valid.load(Ordering::Relaxed) {
             Some(self.last_handshake.load(Ordering::Relaxed))
@@ -386,7 +386,7 @@ impl Default for TunnelStatsInner {
 }
 
 impl UserspaceWgTunnel {
-    /// Create a new userspace WireGuard tunnel
+    /// Create a new userspace `WireGuard` tunnel
     ///
     /// # Arguments
     ///
@@ -667,7 +667,7 @@ impl UserspaceWgTunnel {
         Ok(())
     }
 
-    /// Wait for the WireGuard handshake to complete
+    /// Wait for the `WireGuard` handshake to complete
     ///
     /// This method blocks until the handshake with the peer is successful
     /// or the timeout expires.
@@ -804,7 +804,7 @@ impl UserspaceWgTunnel {
 
     /// Send a packet through the tunnel
     ///
-    /// The packet will be encrypted using WireGuard and sent to the peer.
+    /// The packet will be encrypted using `WireGuard` and sent to the peer.
     ///
     /// # Arguments
     ///
@@ -966,7 +966,7 @@ impl UserspaceWgTunnel {
             .map(|addr| addr.port())
     }
 
-    /// Initiate WireGuard handshake
+    /// Initiate `WireGuard` handshake
     async fn initiate_handshake(&self) -> Result<(), WgTunnelError> {
         let socket = self
             .shared
@@ -1012,7 +1012,7 @@ impl UserspaceWgTunnel {
 
     /// Spawn background tasks for timer events and packet receiving
     ///
-    /// Returns the JoinHandle for monitoring the task status.
+    /// Returns the `JoinHandle` for monitoring the task status.
     fn spawn_background_tasks(
         &self,
         socket: Arc<UdpSocket>,
@@ -1036,7 +1036,7 @@ impl UserspaceWgTunnel {
 
     /// Configure socket buffer sizes
     ///
-    /// Sets the SO_RCVBUF and SO_SNDBUF socket options for the UDP socket.
+    /// Sets the `SO_RCVBUF` and `SO_SNDBUF` socket options for the UDP socket.
     /// Must be called before `connect()`.
     ///
     /// # Arguments
@@ -1074,7 +1074,7 @@ impl UserspaceWgTunnel {
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
-                &recv_buf_i32 as *const _ as *const libc::c_void,
+                (&raw const recv_buf_i32).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
@@ -1098,7 +1098,7 @@ impl UserspaceWgTunnel {
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
-                &send_buf_i32 as *const _ as *const libc::c_void,
+                (&raw const send_buf_i32).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             )
         };
@@ -1141,11 +1141,7 @@ async fn run_background_task(
                 // Update timers
                 let result = {
                     let mut tunn_guard = shared.tunn.lock();
-                    if let Some(tunn) = tunn_guard.as_mut() {
-                        Some(tunn.update_timers(&mut timer_buf))
-                    } else {
-                        None
-                    }
+                    tunn_guard.as_mut().map(|tunn| tunn.update_timers(&mut timer_buf))
                 };
 
                 if let Some(result) = result {
@@ -1217,11 +1213,7 @@ async fn run_background_task(
                         // Process incoming packet
                         let process_result = {
                             let mut tunn_guard = shared.tunn.lock();
-                            if let Some(tunn) = tunn_guard.as_mut() {
-                                Some(tunn.decapsulate(None, &recv_buf[..len], &mut dst_buf))
-                            } else {
-                                None
-                            }
+                            tunn_guard.as_mut().map(|tunn| tunn.decapsulate(None, &recv_buf[..len], &mut dst_buf))
                         };
 
                         if let Some(result) = process_result {
@@ -1276,7 +1268,7 @@ fn extract_source_ip(packet: &[u8]) -> Option<IpAddr> {
     }
 }
 
-/// Check if an IP address is allowed by the allowed_ips list
+/// Check if an IP address is allowed by the `allowed_ips` list
 fn is_ip_allowed(ip: IpAddr, allowed_ips: &[IpNet]) -> bool {
     // Empty allowed_ips means allow all (0.0.0.0/0 behavior)
     if allowed_ips.is_empty() {
@@ -1401,11 +1393,7 @@ async fn handle_decapsulate_result(
             while continue_processing {
                 let additional_result = {
                     let mut tunn_guard = shared.tunn.lock();
-                    if let Some(tunn) = tunn_guard.as_mut() {
-                        Some(tunn.decapsulate(None, &[], &mut cont_buf))
-                    } else {
-                        None
-                    }
+                    tunn_guard.as_mut().map(|tunn| tunn.decapsulate(None, &[], &mut cont_buf))
                 };
 
                 match additional_result {
@@ -1533,13 +1521,13 @@ impl WgTunnel for UserspaceWgTunnel {
 
     /// Get the UDP socket for batch I/O operations (Phase 6.8)
     ///
-    /// Returns an Arc-wrapped UdpSocket if the tunnel is connected.
+    /// Returns an Arc-wrapped `UdpSocket` if the tunnel is connected.
     /// This allows batch send/receive operations using `sendmmsg`/`recvmmsg`.
     ///
     /// # Safety
     ///
     /// The returned socket should not be used for direct send/receive operations
-    /// without proper WireGuard encryption/decryption handling.
+    /// without proper `WireGuard` encryption/decryption handling.
     fn socket(&self) -> Option<Arc<UdpSocket>> {
         self.shared.socket.try_read().ok().and_then(|guard| guard.clone())
     }
@@ -1609,8 +1597,7 @@ impl WgTunnel for UserspaceWgTunnel {
                     Ok(())
                 }
                 Some(_) => Err(WgTunnelError::PeerNotFound(format!(
-                    "No peer with public key: {}",
-                    public_key
+                    "No peer with public key: {public_key}"
                 ))),
                 None => Err(WgTunnelError::Internal("Peer state not initialized".into())),
             }
@@ -1758,7 +1745,7 @@ impl WgTunnel for UserspaceWgTunnel {
         peer_public_key: Option<&str>,
     ) -> BoxFuture<'_, Result<(), WgTunnelError>> {
         // Clone the peer_public_key option since we need 'static lifetime for the future
-        let peer_public_key = peer_public_key.map(|s| s.to_string());
+        let peer_public_key = peer_public_key.map(std::string::ToString::to_string);
 
         Box::pin(async move {
             if !self.shared.connected.load(Ordering::Acquire) {
@@ -1798,9 +1785,9 @@ impl WgTunnel for UserspaceWgTunnel {
 // Key Generation Functions
 // ============================================================================
 
-/// Generate a new WireGuard private key
+/// Generate a new `WireGuard` private key
 ///
-/// Generates a random 32-byte private key suitable for WireGuard.
+/// Generates a random 32-byte private key suitable for `WireGuard`.
 /// The key is clamped according to X25519 requirements.
 ///
 /// # Returns
@@ -1862,7 +1849,7 @@ pub fn derive_public_key(private_key: &str) -> Result<String, WgTunnelError> {
     Ok(BASE64.encode(public.as_bytes()))
 }
 
-/// Validate a WireGuard key (private or public)
+/// Validate a `WireGuard` key (private or public)
 ///
 /// Checks that the key is valid Base64 and decodes to exactly 32 bytes.
 ///
@@ -1890,7 +1877,7 @@ pub fn validate_key(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Decode a Base64-encoded private key to StaticSecret
+/// Decode a Base64-encoded private key to `StaticSecret`
 fn decode_private_key(key: &str) -> Result<StaticSecret, WgTunnelError> {
     let bytes = BASE64
         .decode(key)
@@ -1908,7 +1895,7 @@ fn decode_private_key(key: &str) -> Result<StaticSecret, WgTunnelError> {
     Ok(StaticSecret::from(key_array))
 }
 
-/// Decode a Base64-encoded public key to PublicKey
+/// Decode a Base64-encoded public key to `PublicKey`
 fn decode_public_key(key: &str) -> Result<PublicKey, WgTunnelError> {
     let bytes = BASE64
         .decode(key)

@@ -274,7 +274,7 @@ impl TproxyUdpListener {
     /// - Listener is not active
     /// - recvmsg fails
     /// - Original destination cannot be retrieved from cmsg
-    /// - Control message was truncated (MSG_CTRUNC)
+    /// - Control message was truncated (`MSG_CTRUNC`)
     pub async fn recv_pooled<B: UdpBuffer>(&self, buf: B) -> Result<UdpPacketInfo, UdpError> {
         // Use a loop instead of recursion to handle spurious wakeups
         let mut buf = buf;
@@ -477,7 +477,7 @@ fn recv_with_original_dst(
     Ok((n as usize, src, dst))
 }
 
-/// Receive a UDP packet with original destination address and MSG_CTRUNC check.
+/// Receive a UDP packet with original destination address and `MSG_CTRUNC` check.
 ///
 /// This is an enhanced version of `recv_with_original_dst` that:
 /// 1. Accepts a `PooledBuffer` for zero-copy receive
@@ -486,7 +486,7 @@ fn recv_with_original_dst(
 /// # Arguments
 ///
 /// * `fd` - Raw file descriptor of the TPROXY UDP socket
-/// * `buf` - PooledBuffer to receive packet data
+/// * `buf` - `PooledBuffer` to receive packet data
 ///
 /// # Returns
 ///
@@ -496,7 +496,7 @@ fn recv_with_original_dst(
 ///
 /// Returns an error if:
 /// - recvmsg fails
-/// - Control message was truncated (MSG_CTRUNC)
+/// - Control message was truncated (`MSG_CTRUNC`)
 /// - Original destination not found in cmsg
 #[allow(clippy::cast_possible_truncation)] // socklen_t is always u32
 #[allow(clippy::borrow_as_ptr)] // Required for libc FFI

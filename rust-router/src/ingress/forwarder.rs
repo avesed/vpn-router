@@ -1,6 +1,6 @@
-//! Ingress packet forwarding - consumes ProcessedPacket and forwards to outbounds
+//! Ingress packet forwarding - consumes `ProcessedPacket` and forwards to outbounds
 //!
-//! This module bridges the gap between WireGuard ingress (which decrypts packets)
+//! This module bridges the gap between `WireGuard` ingress (which decrypts packets)
 //! and the outbound system (which sends packets to the internet or other tunnels).
 //!
 //! # Architecture
@@ -22,7 +22,7 @@
 //! # Session Tracking
 //!
 //! The forwarder maintains a session tracker to route reply packets back to
-//! the correct WireGuard peer. When a packet is forwarded, a session entry
+//! the correct `WireGuard` peer. When a packet is forwarded, a session entry
 //! is created with the 5-tuple key and the peer's information.
 //!
 //! # Example
@@ -128,7 +128,7 @@ pub struct TcpConnection {
     pub state: TcpConnectionState,
     /// Outbound tag used for routing
     pub outbound_tag: String,
-    /// Peer's WireGuard public key (for reply routing)
+    /// Peer's `WireGuard` public key (for reply routing)
     pub peer_public_key: String,
     /// Peer's external endpoint
     pub peer_endpoint: SocketAddr,
@@ -352,11 +352,7 @@ impl TcpDetails {
     /// Get payload length if any
     #[must_use]
     pub fn payload_len(&self, packet_len: usize) -> usize {
-        if self.payload_offset < packet_len {
-            packet_len - self.payload_offset
-        } else {
-            0
-        }
+        packet_len.saturating_sub(self.payload_offset)
     }
 
     /// Get a human-readable description of the flags
@@ -545,10 +541,10 @@ impl std::fmt::Display for FiveTuple {
 /// Session information for reply routing
 ///
 /// Stores the information needed to route reply packets back to the
-/// correct WireGuard peer.
+/// correct `WireGuard` peer.
 #[derive(Debug, Clone)]
 pub struct PeerSession {
-    /// Peer's WireGuard public key (Base64)
+    /// Peer's `WireGuard` public key (Base64)
     pub peer_public_key: String,
     /// Peer's external endpoint (IP:port)
     pub peer_endpoint: SocketAddr,
@@ -600,7 +596,7 @@ impl PeerSession {
 
 /// Tracks active sessions for reply routing
 ///
-/// Uses a concurrent hash map (DashMap) for thread-safe access
+/// Uses a concurrent hash map (`DashMap`) for thread-safe access
 /// from multiple async tasks.
 pub struct IngressSessionTracker {
     /// Active sessions indexed by 5-tuple
@@ -625,13 +621,13 @@ impl IngressSessionTracker {
 
     /// Register or update a session
     ///
-    /// If a session already exists, updates the last_seen timestamp and bytes.
+    /// If a session already exists, updates the `last_seen` timestamp and bytes.
     /// Otherwise, creates a new session entry.
     ///
     /// # Arguments
     ///
     /// * `key` - 5-tuple key for the session
-    /// * `peer_public_key` - Peer's WireGuard public key
+    /// * `peer_public_key` - Peer's `WireGuard` public key
     /// * `peer_endpoint` - Peer's external endpoint
     /// * `outbound_tag` - Outbound tag used for routing
     /// * `bytes` - Bytes being sent in this packet
@@ -1214,7 +1210,7 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 ///
 /// * `packet_rx` - Receiver for processed packets from ingress
 /// * `outbound_manager` - Manager for direct/SOCKS5 outbounds
-/// * `wg_egress_manager` - Manager for WireGuard egress tunnels
+/// * `wg_egress_manager` - Manager for `WireGuard` egress tunnels
 /// * `tcp_manager` - TCP connection manager for stateful connection tracking
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
@@ -1462,9 +1458,9 @@ pub async fn run_reply_router_loop(
 /// - Data packets: Forward through established connection
 /// - FIN/RST packets: Mark connection as closing
 ///
-/// # WireGuard Egress
+/// # `WireGuard` Egress
 ///
-/// For WireGuard egress tunnels (wg-, pia-, peer-), the full IP packet
+/// For `WireGuard` egress tunnels (wg-, pia-, peer-), the full IP packet
 /// is forwarded through the tunnel. The tunnel handles encapsulation.
 ///
 /// # Direct/SOCKS5
@@ -1923,7 +1919,7 @@ async fn create_direct_udp_socket(dst_addr: SocketAddr) -> std::io::Result<UdpSo
 ///
 /// * `packet_rx` - Receiver for processed packets from ingress
 /// * `outbound_manager` - Manager for direct/SOCKS5 outbounds
-/// * `wg_egress_manager` - Manager for WireGuard egress tunnels
+/// * `wg_egress_manager` - Manager for `WireGuard` egress tunnels
 /// * `tcp_manager` - TCP connection manager for stateful connection tracking
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector

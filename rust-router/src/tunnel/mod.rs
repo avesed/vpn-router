@@ -1,12 +1,12 @@
-//! WireGuard tunnel module for Phase 6
+//! `WireGuard` tunnel module for Phase 6
 //!
-//! This module provides userspace WireGuard tunnel implementations
-//! using boringtun for full Rust-native WireGuard support.
+//! This module provides userspace `WireGuard` tunnel implementations
+//! using boringtun for full Rust-native `WireGuard` support.
 //!
 //! # Overview
 //!
 //! The tunnel module handles:
-//! - Userspace WireGuard tunnel creation and management
+//! - Userspace `WireGuard` tunnel creation and management
 //! - Tunnel abstraction trait for different implementations
 //! - Configuration types for tunnel setup
 //! - Key generation and derivation utilities
@@ -42,21 +42,21 @@
 //! # Submodules
 //!
 //! - [`traits`]: Tunnel abstraction trait and builder
-//! - [`userspace`]: Userspace WireGuard via boringtun
+//! - [`userspace`]: Userspace `WireGuard` via boringtun
 //! - [`config`]: Tunnel configuration types
 //!
 //! # Phase 6 Implementation Status
 //!
 //! - [x] 6.1 boringtun integration
-//! - [x] 6.1 Key generation (generate_private_key, derive_public_key)
+//! - [x] 6.1 Key generation (`generate_private_key`, `derive_public_key`)
 //! - [x] 6.1 Handshake handling
 //! - [x] 6.1 Packet encryption/decryption
 //! - [x] 6.1 Timer task (keepalive, rekey)
 //! - [x] 6.2 Tunnel abstraction trait (extended)
 //! - [x] 6.2 Configuration types and validation
 //! - [x] 6.2 Peer management (single-peer egress mode)
-//! - [ ] 6.3 WireGuard ingress
-//! - [ ] 6.4 WireGuard egress
+//! - [ ] 6.3 `WireGuard` ingress
+//! - [ ] 6.4 `WireGuard` egress
 //!
 //! # Architecture
 //!
@@ -76,7 +76,7 @@
 //!
 //! # Key Generation
 //!
-//! WireGuard uses X25519 elliptic curve Diffie-Hellman for key exchange.
+//! `WireGuard` uses X25519 elliptic curve Diffie-Hellman for key exchange.
 //! This module provides utilities for generating key pairs:
 //!
 //! ```
@@ -94,7 +94,7 @@
 //! # References
 //!
 //! - boringtun: <https://github.com/cloudflare/boringtun>
-//! - WireGuard Protocol: <https://www.wireguard.com/protocol/>
+//! - `WireGuard` Protocol: <https://www.wireguard.com/protocol/>
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Sections 6.1-6.4
 
 pub mod config;

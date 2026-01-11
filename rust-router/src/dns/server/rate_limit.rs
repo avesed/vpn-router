@@ -25,7 +25,7 @@
 //! - **Per-client limiting**: Each client IP gets independent rate limits
 //! - **Token bucket algorithm**: Allows short bursts while enforcing average rate
 //! - **Automatic cleanup**: Stale entries can be removed to prevent memory growth
-//! - **Lock-free reads**: Using DashMap for high concurrency
+//! - **Lock-free reads**: Using `DashMap` for high concurrency
 //!
 //! # Example
 //!
@@ -159,7 +159,7 @@ pub struct RateLimiterStats {
     unique_clients: AtomicU64,
     /// Stale entries cleaned up
     entries_cleaned: AtomicU64,
-    /// Entries evicted due to max_clients limit (LRU eviction)
+    /// Entries evicted due to `max_clients` limit (LRU eviction)
     entries_evicted: AtomicU64,
 }
 
@@ -199,7 +199,7 @@ impl RateLimiterStats {
         self.entries_cleaned.load(Ordering::Relaxed)
     }
 
-    /// Get evicted entries count (LRU eviction when max_clients exceeded)
+    /// Get evicted entries count (LRU eviction when `max_clients` exceeded)
     #[must_use]
     pub fn entries_evicted(&self) -> u64 {
         self.entries_evicted.load(Ordering::Relaxed)
@@ -243,7 +243,7 @@ pub struct RateLimiterStatsSnapshot {
     pub unique_clients: u64,
     /// Stale entries cleaned
     pub entries_cleaned: u64,
-    /// Entries evicted due to max_clients limit
+    /// Entries evicted due to `max_clients` limit
     pub entries_evicted: u64,
 }
 
@@ -394,37 +394,34 @@ impl DnsRateLimiter {
         entry.request_count.fetch_add(1, Ordering::Relaxed);
 
         // Check rate limit
-        match entry.limiter.check() {
-            Ok(()) => {
-                self.stats.allowed_requests.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(_) => {
-                self.stats.rejected_requests.fetch_add(1, Ordering::Relaxed);
-                entry.rejected_count.fetch_add(1, Ordering::Relaxed);
+        if let Ok(()) = entry.limiter.check() {
+            self.stats.allowed_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        } else {
+            self.stats.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            entry.rejected_count.fetch_add(1, Ordering::Relaxed);
 
-                // Create a socket address for error reporting
-                // Use port 0 since we only have IP
-                let socket_addr = std::net::SocketAddr::new(client, 0);
+            // Create a socket address for error reporting
+            // Use port 0 since we only have IP
+            let socket_addr = std::net::SocketAddr::new(client, 0);
 
-                Err(DnsError::rate_limit(
-                    socket_addr,
-                    self.qps_limit, // Current rate (approximate)
-                    self.qps_limit,
-                ))
-            }
+            Err(DnsError::rate_limit(
+                socket_addr,
+                self.qps_limit, // Current rate (approximate)
+                self.qps_limit,
+            ))
         }
     }
 
     /// Evict the oldest (least recently used) entry to make room for new clients
     ///
-    /// This method finds the entry with the oldest last_access time and removes it.
+    /// This method finds the entry with the oldest `last_access` time and removes it.
     fn evict_oldest_entry(&self) {
         let mut oldest_ip: Option<IpAddr> = None;
         let mut oldest_time: u64 = 0;
 
         // Find the oldest entry
-        for entry in self.limiters.iter() {
+        for entry in &self.limiters {
             let elapsed = entry.value().last_access_elapsed_ms();
             if oldest_ip.is_none() || elapsed > oldest_time {
                 oldest_ip = Some(*entry.key());

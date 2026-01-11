@@ -6,8 +6,8 @@
 //! # Lock Ordering
 //!
 //! To prevent deadlocks, locks must be acquired in this order:
-//! 1. `matcher` (ArcSwap - lockless read, only writer needs ordering)
-//! 2. `upstreams` (RwLock)
+//! 1. `matcher` (`ArcSwap` - lockless read, only writer needs ordering)
+//! 2. `upstreams` (`RwLock`)
 //!
 //! # Performance
 //!
@@ -194,7 +194,7 @@ struct MatcherState {
     /// The compiled domain matcher
     matcher: DomainMatcher,
 
-    /// Route information: pattern -> (match_type, upstream_tag)
+    /// Route information: pattern -> (`match_type`, `upstream_tag`)
     routes: HashMap<String, (DomainMatchType, String)>,
 }
 
@@ -233,8 +233,8 @@ impl MatcherState {
 /// # Lock Ordering
 ///
 /// To prevent deadlocks:
-/// 1. matcher (ArcSwap - lockless)
-/// 2. upstreams (RwLock)
+/// 1. matcher (`ArcSwap` - lockless)
+/// 2. upstreams (`RwLock`)
 ///
 /// # Example
 ///
@@ -253,11 +253,11 @@ impl MatcherState {
 /// ```
 pub struct DnsRouter {
     /// The domain matcher with route information
-    /// Wrapped in ArcSwap for lock-free hot reload
+    /// Wrapped in `ArcSwap` for lock-free hot reload
     matcher: ArcSwap<MatcherState>,
 
     /// Upstream pools by tag
-    /// Uses RwLock since reads are much more frequent than writes
+    /// Uses `RwLock` since reads are much more frequent than writes
     upstreams: RwLock<HashMap<String, Arc<UpstreamPool>>>,
 
     /// Default upstream tag (used when no rule matches)
@@ -660,7 +660,7 @@ impl DnsRouter {
                 DomainMatchType::Regex => {
                     builder = builder.add_regex(pattern, upstream_tag).map_err(|e| {
                         DnsError::config_field(
-                            format!("invalid regex pattern '{}': {}", pattern, e),
+                            format!("invalid regex pattern '{pattern}': {e}"),
                             "dns.split.routes",
                         )
                     })?;
@@ -670,7 +670,7 @@ impl DnsRouter {
 
         let matcher = builder
             .build()
-            .map_err(|e| DnsError::internal(format!("failed to build domain matcher: {}", e)))?;
+            .map_err(|e| DnsError::internal(format!("failed to build domain matcher: {e}")))?;
 
         let count = routes.len();
         let state = MatcherState::new(matcher, routes);

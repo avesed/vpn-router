@@ -1,6 +1,6 @@
-//! Error types for the WireGuard Egress module
+//! Error types for the `WireGuard` Egress module
 //!
-//! This module defines error types specific to WireGuard egress operations,
+//! This module defines error types specific to `WireGuard` egress operations,
 //! including tunnel management, packet sending, and configuration validation.
 //!
 //! # Error Categories
@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::tunnel::traits::WgTunnelError;
 
-/// Error types for WireGuard egress operations
+/// Error types for `WireGuard` egress operations
 #[derive(Debug, Error)]
 pub enum EgressError {
     /// Tunnel not found
@@ -29,7 +29,7 @@ pub enum EgressError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
-    /// Error from the underlying WireGuard tunnel
+    /// Error from the underlying `WireGuard` tunnel
     #[error("Tunnel error: {0}")]
     TunnelError(#[from] WgTunnelError),
 
@@ -235,7 +235,7 @@ impl EgressError {
     }
 }
 
-/// Type alias for Result with EgressError
+/// Type alias for Result with `EgressError`
 pub type EgressResult<T> = std::result::Result<T, EgressError>;
 
 #[cfg(test)]

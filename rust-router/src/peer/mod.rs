@@ -15,7 +15,7 @@
 //! # Submodules
 //!
 //! - [`validation`]: Input validation utilities for peer operations
-//! - [`manager`]: PeerManager for lifecycle management (Phase 6.5)
+//! - [`manager`]: `PeerManager` for lifecycle management (Phase 6.5)
 //! - [`pairing`]: Offline pairing protocol (Phase 6.5)
 //! - [`port_allocator`]: Tunnel port allocation (Phase 6.5)
 //! - [`ip_allocator`]: Tunnel IP allocation (Phase 6.5)
@@ -24,7 +24,7 @@
 //! # Phase 6 Implementation Status
 //!
 //! - [x] 6.5.1 Input validation
-//! - [ ] 6.5.2 PeerManager structure
+//! - [ ] 6.5.2 `PeerManager` structure
 //! - [ ] 6.5.3 Port/IP allocators
 //! - [ ] 6.5.4 Health checker
 

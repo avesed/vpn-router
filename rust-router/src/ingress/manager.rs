@@ -1,7 +1,7 @@
-//! WireGuard Ingress Manager for Phase 6.3
+//! `WireGuard` Ingress Manager for Phase 6.3
 //!
 //! This module provides the main `WgIngressManager` struct that manages
-//! the WireGuard ingress tunnel, including peer management, packet
+//! the `WireGuard` ingress tunnel, including peer management, packet
 //! processing, and statistics collection.
 //!
 //! # Architecture
@@ -34,12 +34,12 @@
 //! # Lock Ordering (Critical for Deadlock Prevention)
 //!
 //! When acquiring multiple locks in `WgIngressManager`, always follow this order:
-//! 1. `state` (RwLock) - State machine
-//! 2. `peers` (RwLock) - Peer registry
-//! 3. `socket` (RwLock) - UDP socket
-//! 4. `shutdown_tx` (RwLock) - Shutdown signal
-//! 5. `task_handle` (RwLock) - Background task handle
-//! 6. `packet_rx` (tokio::Mutex) - Packet receiver
+//! 1. `state` (`RwLock`) - State machine
+//! 2. `peers` (`RwLock`) - Peer registry
+//! 3. `socket` (`RwLock`) - UDP socket
+//! 4. `shutdown_tx` (`RwLock`) - Shutdown signal
+//! 5. `task_handle` (`RwLock`) - Background task handle
+//! 6. `packet_rx` (`tokio::Mutex`) - Packet receiver
 //! 7. Per-peer tunnel locks (see `UserspaceWgTunnel` lock ordering)
 //!
 //! Never hold a higher-numbered lock while acquiring a lower-numbered lock.
@@ -107,10 +107,10 @@ const UDP_RECV_BUFFER_SIZE: usize = 65536;
 /// Channel capacity for processed packets
 const PACKET_CHANNEL_CAPACITY: usize = 256;
 
-/// WireGuard transport data packet overhead
+/// `WireGuard` transport data packet overhead
 const WG_TRANSPORT_OVERHEAD: usize = 32;
 
-/// Minimum buffer size for WireGuard packets (must fit handshake initiation)
+/// Minimum buffer size for `WireGuard` packets (must fit handshake initiation)
 #[allow(dead_code)]
 const MIN_BUFFER_SIZE: usize = 148;
 
@@ -167,7 +167,7 @@ pub struct IngressPeerListItem {
     pub last_handshake: Option<u64>,
 }
 
-/// Statistics for the WireGuard ingress manager
+/// Statistics for the `WireGuard` ingress manager
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WgIngressStats {
     /// Total bytes received from all peers
@@ -224,8 +224,8 @@ impl StatsInner {
 ///
 /// # Lock Ordering
 ///
-/// When acquiring locks on RegisteredPeer:
-/// 1. `tunn` (Mutex) - WireGuard crypto state
+/// When acquiring locks on `RegisteredPeer`:
+/// 1. `tunn` (Mutex) - `WireGuard` crypto state
 /// 2. `allowed_ips_parsed` - Read-only after initialization (no lock needed)
 ///
 /// These locks are level 7 in the global ordering (per-peer tunnel locks).
@@ -259,12 +259,12 @@ impl RegisteredPeer {
     fn new(config: WgIngressPeerConfig, private_key: &StaticSecret, tunnel_index: u32) -> Result<Self, IngressError> {
         // Parse peer public key
         let peer_public = decode_public_key(&config.public_key)
-            .map_err(|e| IngressError::invalid_config(format!("Invalid peer public key: {}", e)))?;
+            .map_err(|e| IngressError::invalid_config(format!("Invalid peer public key: {e}")))?;
 
         // Parse preshared key if present
         let psk = config.preshared_key.as_ref().map(|psk| {
             decode_psk(psk)
-        }).transpose().map_err(|e| IngressError::invalid_config(format!("Invalid preshared key: {}", e)))?;
+        }).transpose().map_err(|e| IngressError::invalid_config(format!("Invalid preshared key: {e}")))?;
 
         // Create boringtun tunnel for this peer
         let tunn = Tunn::new(
@@ -274,7 +274,7 @@ impl RegisteredPeer {
             config.persistent_keepalive,
             tunnel_index,
             None, // No rate limiter
-        ).map_err(|e| IngressError::internal(format!("Failed to create tunnel for peer: {}", e)))?;
+        ).map_err(|e| IngressError::internal(format!("Failed to create tunnel for peer: {e}")))?;
 
         // Parse allowed IPs
         let allowed_ips_parsed: Vec<IpNet> = config.allowed_ips
@@ -360,9 +360,9 @@ impl RegisteredPeer {
     }
 }
 
-/// Result of decrypting a WireGuard packet
+/// Result of decrypting a `WireGuard` packet
 struct DecryptedPacket {
-    /// Decrypted plaintext data (empty if needs_response is true)
+    /// Decrypted plaintext data (empty if `needs_response` is true)
     data: Vec<u8>,
     /// Whether a response needs to be sent
     needs_response: bool,
@@ -370,11 +370,11 @@ struct DecryptedPacket {
     response: Option<Vec<u8>>,
 }
 
-/// Decode a Base64-encoded private key to StaticSecret
+/// Decode a Base64-encoded private key to `StaticSecret`
 fn decode_private_key(key: &str) -> Result<StaticSecret, String> {
     let bytes = BASE64
         .decode(key)
-        .map_err(|e| format!("Invalid Base64: {}", e))?;
+        .map_err(|e| format!("Invalid Base64: {e}"))?;
 
     if bytes.len() != 32 {
         return Err(format!("Key must be 32 bytes, got {}", bytes.len()));
@@ -385,11 +385,11 @@ fn decode_private_key(key: &str) -> Result<StaticSecret, String> {
     Ok(StaticSecret::from(key_array))
 }
 
-/// Decode a Base64-encoded public key to PublicKey
+/// Decode a Base64-encoded public key to `PublicKey`
 fn decode_public_key(key: &str) -> Result<PublicKey, String> {
     let bytes = BASE64
         .decode(key)
-        .map_err(|e| format!("Invalid Base64: {}", e))?;
+        .map_err(|e| format!("Invalid Base64: {e}"))?;
 
     if bytes.len() != 32 {
         return Err(format!("Key must be 32 bytes, got {}", bytes.len()));
@@ -404,7 +404,7 @@ fn decode_public_key(key: &str) -> Result<PublicKey, String> {
 fn decode_psk(key: &str) -> Result<[u8; 32], String> {
     let bytes = BASE64
         .decode(key)
-        .map_err(|e| format!("Invalid Base64: {}", e))?;
+        .map_err(|e| format!("Invalid Base64: {e}"))?;
 
     if bytes.len() != 32 {
         return Err(format!("PSK must be 32 bytes, got {}", bytes.len()));
@@ -415,9 +415,9 @@ fn decode_psk(key: &str) -> Result<[u8; 32], String> {
     Ok(key_array)
 }
 
-/// WireGuard Ingress Manager
+/// `WireGuard` Ingress Manager
 ///
-/// Manages a WireGuard ingress tunnel, accepting connections from clients
+/// Manages a `WireGuard` ingress tunnel, accepting connections from clients
 /// and routing their traffic based on DSCP values and rule matching.
 ///
 /// # Thread Safety
@@ -438,20 +438,20 @@ fn decode_psk(key: &str) -> Result<[u8; 32], String> {
 /// # Lock Ordering (Critical for Deadlock Prevention)
 ///
 /// When acquiring multiple locks, always follow this order:
-/// 1. `state` (RwLock)
-/// 2. `peers` (RwLock)
-/// 3. `socket` (RwLock)
-/// 4. `shutdown_tx` (RwLock)
-/// 5. `task_handle` (RwLock)
-/// 6. `packet_rx` (tokio::Mutex)
-/// 7. Per-peer `tunn` locks (Mutex) - see RegisteredPeer
+/// 1. `state` (`RwLock`)
+/// 2. `peers` (`RwLock`)
+/// 3. `socket` (`RwLock`)
+/// 4. `shutdown_tx` (`RwLock`)
+/// 5. `task_handle` (`RwLock`)
+/// 6. `packet_rx` (`tokio::Mutex`)
+/// 7. Per-peer `tunn` locks (Mutex) - see `RegisteredPeer`
 ///
 /// Never hold a higher-numbered lock while acquiring a lower-numbered lock.
 pub struct WgIngressManager {
     /// Configuration
     config: WgIngressConfig,
 
-    /// Private key for WireGuard operations (decoded from config)
+    /// Private key for `WireGuard` operations (decoded from config)
     private_key: StaticSecret,
 
     /// Packet processor
@@ -460,7 +460,7 @@ pub struct WgIngressManager {
     /// Current state
     state: RwLock<IngressState>,
 
-    /// Registered peers (public_key -> peer info)
+    /// Registered peers (`public_key` -> peer info)
     peers: RwLock<HashMap<String, Arc<RegisteredPeer>>>,
 
     /// Statistics
@@ -500,7 +500,7 @@ pub struct ProcessedPacket {
 }
 
 impl WgIngressManager {
-    /// Create a new WireGuard ingress manager
+    /// Create a new `WireGuard` ingress manager
     ///
     /// # Arguments
     ///
@@ -529,7 +529,7 @@ impl WgIngressManager {
 
         // Decode private key
         let private_key = decode_private_key(&config.private_key)
-            .map_err(|e| IngressError::invalid_config(format!("Invalid private key: {}", e)))?;
+            .map_err(|e| IngressError::invalid_config(format!("Invalid private key: {e}")))?;
 
         let processor = Arc::new(IngressProcessor::new(rule_engine));
 
@@ -557,7 +557,7 @@ impl WgIngressManager {
         })
     }
 
-    /// Create a new WireGuard ingress manager with custom socket buffers
+    /// Create a new `WireGuard` ingress manager with custom socket buffers
     ///
     /// # Arguments
     ///
@@ -732,7 +732,7 @@ impl WgIngressManager {
 
     /// Add a peer (client) to the ingress
     ///
-    /// The peer will be allowed to connect to the WireGuard ingress.
+    /// The peer will be allowed to connect to the `WireGuard` ingress.
     ///
     /// # Arguments
     ///
@@ -887,7 +887,7 @@ impl WgIngressManager {
             .iter()
             .map(|(public_key, p)| IngressPeerListItem {
                 public_key: public_key.clone(),
-                allowed_ips: p.config.allowed_ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(","),
+                allowed_ips: p.config.allowed_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(","),
                 name: None, // Name is stored in database, not in WireGuard config
                 rx_bytes: p.rx_bytes.load(Ordering::Relaxed),
                 tx_bytes: p.tx_bytes.load(Ordering::Relaxed),
@@ -918,11 +918,10 @@ impl WgIngressManager {
         let peers = self.peers.read();
         peers
             .get(peer_public_key)
-            .map(|peer| peer.is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip))
-            .unwrap_or(false)
+            .is_some_and(|peer| peer.is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip))
     }
 
-    /// Send a decrypted IP packet back to a WireGuard peer
+    /// Send a decrypted IP packet back to a `WireGuard` peer
     pub async fn send_to_peer(
         &self,
         peer_public_key: &str,
@@ -969,8 +968,7 @@ impl WgIngressManager {
                 Ok(())
             }
             TunnResult::Err(err) => Err(IngressError::internal(format!(
-                "Failed to encapsulate packet for peer {}: {:?}",
-                peer_public_key, err
+                "Failed to encapsulate packet for peer {peer_public_key}: {err:?}"
             ))),
             _ => {
                 warn!(
@@ -985,9 +983,9 @@ impl WgIngressManager {
     /// Background packet processing loop
     ///
     /// This loop:
-    /// 1. Receives encrypted WireGuard packets from the socket
+    /// 1. Receives encrypted `WireGuard` packets from the socket
     /// 2. Identifies the peer by trying decryption with each registered peer's tunnel
-    /// 3. Validates the source IP against the peer's allowed_ips (AFTER decryption)
+    /// 3. Validates the source IP against the peer's `allowed_ips` (AFTER decryption)
     /// 4. Processes the decrypted packet through the rule engine
     /// 5. Sends handshake responses back to the client if needed
     ///
@@ -1185,13 +1183,10 @@ impl WgIngressManager {
         // WireGuard uses the receiver's public key index to identify
         // which peer sent the packet, but boringtun handles this internally
         let (decrypted_data, peer_public_key, peer_ref) =
-            match Self::identify_and_decrypt(peers, encrypted_data, decrypt_buf, stats) {
-                Some(result) => result,
-                None => {
-                    trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
-                    stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            if let Some(result) = Self::identify_and_decrypt(peers, encrypted_data, decrypt_buf, stats) { result } else {
+                trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
+                stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+                return;
             };
 
         // Handle handshake responses
@@ -1285,7 +1280,7 @@ impl WgIngressManager {
 
     /// Identify the peer that sent a packet and decrypt it
     ///
-    /// WireGuard packets contain a receiver index that identifies the session,
+    /// `WireGuard` packets contain a receiver index that identifies the session,
     /// but we need to try decryption with each peer's tunnel since boringtun
     /// doesn't expose the receiver index directly.
     ///
@@ -1299,7 +1294,7 @@ impl WgIngressManager {
         // Try to decrypt with each peer's tunnel
         // In a real implementation with many peers, we'd use the receiver index
         // to look up the peer directly, but boringtun handles sessions internally
-        for (public_key, peer) in peers.iter() {
+        for (public_key, peer) in peers {
             if let Some(decrypted) = peer.decrypt(encrypted, dst) {
                 return Some((decrypted, public_key.clone(), peer));
             }
@@ -1376,7 +1371,7 @@ impl Drop for WgIngressManager {
 
 /// Configure socket buffer sizes
 ///
-/// Sets the SO_RCVBUF and SO_SNDBUF socket options.
+/// Sets the `SO_RCVBUF` and `SO_SNDBUF` socket options.
 ///
 /// # Arguments
 ///
@@ -1404,7 +1399,7 @@ fn configure_socket_buffers(socket: &UdpSocket, recv_buf: usize, send_buf: usize
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
-            &recv_buf_i32 as *const _ as *const libc::c_void,
+            (&raw const recv_buf_i32).cast::<libc::c_void>(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
@@ -1420,7 +1415,7 @@ fn configure_socket_buffers(socket: &UdpSocket, recv_buf: usize, send_buf: usize
             fd,
             libc::SOL_SOCKET,
             libc::SO_SNDBUF,
-            &send_buf_i32 as *const _ as *const libc::c_void,
+            (&raw const send_buf_i32).cast::<libc::c_void>(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };

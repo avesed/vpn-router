@@ -7,8 +7,8 @@
 //!
 //! - **UDP** - Plain DNS over UDP (RFC 1035)
 //! - **TCP** - Plain DNS over TCP (RFC 1035)
-//! - **DoH** - DNS over HTTPS (RFC 8484) - requires `dns-doh` feature
-//! - **DoT** - DNS over TLS (RFC 7858) - requires `dns-dot` feature
+//! - **`DoH`** - DNS over HTTPS (RFC 8484) - requires `dns-doh` feature
+//! - **`DoT`** - DNS over TLS (RFC 7858) - requires `dns-dot` feature
 //!
 //! # Architecture
 //!

@@ -1,13 +1,13 @@
 //! Input validation module for peer operations
 //!
 //! This module provides validation utilities for peer-related operations,
-//! including tag validation, WireGuard key validation, endpoint parsing,
+//! including tag validation, `WireGuard` key validation, endpoint parsing,
 //! and DSCP value validation.
 //!
 //! # Validation Rules
 //!
 //! - **Tags**: Alphanumeric with hyphens and underscores, 1-64 characters
-//! - **WireGuard Keys**: Base64 encoded, 44 characters (32 bytes)
+//! - **`WireGuard` Keys**: Base64 encoded, 44 characters (32 bytes)
 //! - **Endpoints**: IP:port or hostname:port format
 //! - **DSCP Values**: 1-63 (0 and 64+ are reserved)
 //!
@@ -29,10 +29,10 @@
 use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 
-/// WireGuard key length in bytes (before Base64 encoding)
+/// `WireGuard` key length in bytes (before Base64 encoding)
 pub const WG_KEY_LENGTH: usize = 32;
 
-/// WireGuard key Base64 length (32 bytes = 44 chars in Base64 with padding)
+/// `WireGuard` key Base64 length (32 bytes = 44 chars in Base64 with padding)
 pub const WG_KEY_BASE64_LENGTH: usize = 44;
 
 /// Maximum tag length
@@ -59,7 +59,7 @@ pub const MAX_PEER_PORT: u16 = 36299;
 /// Regex pattern for valid tags (alphanumeric, hyphens, underscores)
 pub const TAG_PATTERN: &str = r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$";
 
-/// Regex pattern for WireGuard Base64 keys
+/// Regex pattern for `WireGuard` Base64 keys
 pub const WG_KEY_PATTERN: &str = r"^[A-Za-z0-9+/]{43}=$";
 
 /// Validation error types
@@ -81,11 +81,11 @@ pub enum ValidationError {
     #[error("Tag must start with an alphanumeric character")]
     InvalidTagStart,
 
-    /// WireGuard key has invalid length
+    /// `WireGuard` key has invalid length
     #[error("WireGuard key has invalid length: expected {WG_KEY_BASE64_LENGTH}, got {length}")]
     InvalidKeyLength { length: usize },
 
-    /// WireGuard key has invalid Base64 encoding
+    /// `WireGuard` key has invalid Base64 encoding
     #[error("WireGuard key has invalid Base64 encoding")]
     InvalidKeyEncoding,
 
@@ -166,14 +166,14 @@ pub fn validate_peer_tag(tag: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Validate a chain tag (alias for validate_peer_tag)
+/// Validate a chain tag (alias for `validate_peer_tag`)
 pub fn validate_chain_tag(tag: &str) -> Result<(), ValidationError> {
     validate_peer_tag(tag)
 }
 
-/// Validate a WireGuard public or private key
+/// Validate a `WireGuard` public or private key
 ///
-/// WireGuard keys are 32 bytes encoded as Base64, resulting in 44 characters.
+/// `WireGuard` keys are 32 bytes encoded as Base64, resulting in 44 characters.
 ///
 /// # Examples
 ///
@@ -212,7 +212,7 @@ pub fn validate_wg_key(key: &str) -> Result<(), ValidationError> {
 
     // Optionally verify actual Base64 decoding
     let decoded = base64_decode(key);
-    if decoded.is_none() || decoded.as_ref().map(|v| v.len() != WG_KEY_LENGTH).unwrap_or(true) {
+    if decoded.is_none() || decoded.as_ref().is_none_or(|v| v.len() != WG_KEY_LENGTH) {
         return Err(ValidationError::InvalidKeyEncoding);
     }
 
@@ -229,7 +229,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     }
 
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
 
@@ -316,7 +316,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
         // Validate IPv6
         if ip_part.parse::<std::net::Ipv6Addr>().is_err() {
             return Err(ValidationError::InvalidEndpoint {
-                message: format!("Invalid IPv6 address: {}", ip_part),
+                message: format!("Invalid IPv6 address: {ip_part}"),
             });
         }
 
@@ -350,7 +350,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
 
     // Validate port
     let port: u16 = port_str.parse().map_err(|_| ValidationError::InvalidEndpoint {
-        message: format!("Invalid port number: {}", port_str),
+        message: format!("Invalid port number: {port_str}"),
     })?;
 
     if port == 0 {
@@ -372,12 +372,12 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
         for label in host.split('.') {
             if label.is_empty() || label.len() > 63 {
                 return Err(ValidationError::InvalidEndpoint {
-                    message: format!("Invalid hostname label: {}", label),
+                    message: format!("Invalid hostname label: {label}"),
                 });
             }
             if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err(ValidationError::InvalidEndpoint {
-                    message: format!("Invalid hostname characters in: {}", label),
+                    message: format!("Invalid hostname characters in: {label}"),
                 });
             }
         }
@@ -403,7 +403,7 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
 /// assert!(validate_dscp_value(64).is_err());
 /// ```
 pub fn validate_dscp_value(value: u8) -> Result<(), ValidationError> {
-    if value < MIN_DSCP_VALUE || value > MAX_DSCP_VALUE {
+    if !(MIN_DSCP_VALUE..=MAX_DSCP_VALUE).contains(&value) {
         return Err(ValidationError::InvalidDscpValue { value });
     }
     Ok(())
@@ -448,7 +448,7 @@ pub fn validate_tunnel_ip(ip: &str) -> Result<(), ValidationError> {
 /// assert!(validate_peer_port(36300).is_err());
 /// ```
 pub fn validate_peer_port(port: u16) -> Result<(), ValidationError> {
-    if port < MIN_PEER_PORT || port > MAX_PEER_PORT {
+    if !(MIN_PEER_PORT..=MAX_PEER_PORT).contains(&port) {
         return Err(ValidationError::InvalidPeerPort { port });
     }
     Ok(())

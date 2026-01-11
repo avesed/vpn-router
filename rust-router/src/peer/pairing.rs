@@ -17,14 +17,14 @@
 //!
 //! 1. **Pair Request**: Node A generates a pairing code containing:
 //!    - Node metadata (tag, description, endpoint)
-//!    - WireGuard public key
+//!    - `WireGuard` public key
 //!    - Tunnel IP allocation
 //!    - Optional: Pre-generated keys for bidirectional pairing
 //!
 //! 2. **Pair Response**: Node B imports the code and generates a response:
 //!    - Node B's metadata and keys
 //!    - Tunnel IP assignments
-//!    - Configured WireGuard tunnel
+//!    - Configured `WireGuard` tunnel
 //!
 //! 3. **Complete Handshake**: Node A imports the response to finalize
 //!
@@ -70,16 +70,16 @@ pub struct PairRequestConfig {
     pub local_api_port: u16,
     /// Whether to enable bidirectional auto-connect
     pub bidirectional: bool,
-    /// Tunnel type (WireGuard or Xray)
+    /// Tunnel type (`WireGuard` or Xray)
     pub tunnel_type: TunnelType,
 }
 
-/// Default value for pair_request message type
+/// Default value for `pair_request` message type
 fn default_pair_request_type() -> String {
     "pair_request".to_string()
 }
 
-/// Default value for pair_response message type
+/// Default value for `pair_response` message type
 fn default_pair_response_type() -> String {
     "pair_response".to_string()
 }
@@ -99,11 +99,11 @@ pub struct PairRequest {
     pub node_tag: String,
     /// Human-readable node description
     pub node_description: String,
-    /// WireGuard endpoint (IP:port or hostname:port)
+    /// `WireGuard` endpoint (IP:port or hostname:port)
     pub endpoint: String,
     /// Web API port for post-tunnel communication
     pub api_port: u16,
-    /// Tunnel type (WireGuard or Xray)
+    /// Tunnel type (`WireGuard` or Xray)
     pub tunnel_type: TunnelType,
     /// Unix timestamp of request generation
     pub timestamp: u64,
@@ -111,7 +111,7 @@ pub struct PairRequest {
     pub bidirectional: bool,
 
     // WireGuard-specific fields
-    /// WireGuard public key (Base64)
+    /// `WireGuard` public key (Base64)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wg_public_key: Option<String>,
     /// Tunnel IP address for this node
@@ -161,17 +161,17 @@ pub struct PairResponse {
     pub node_tag: String,
     /// Human-readable node description
     pub node_description: String,
-    /// WireGuard endpoint (IP:port or hostname:port)
+    /// `WireGuard` endpoint (IP:port or hostname:port)
     pub endpoint: String,
     /// Web API port for post-tunnel communication
     pub api_port: u16,
-    /// Tunnel type (WireGuard or Xray)
+    /// Tunnel type (`WireGuard` or Xray)
     pub tunnel_type: TunnelType,
     /// Unix timestamp of response generation
     pub timestamp: u64,
 
     // WireGuard-specific fields
-    /// WireGuard public key (Base64)
+    /// `WireGuard` public key (Base64)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wg_public_key: Option<String>,
     /// Local tunnel IP for this node

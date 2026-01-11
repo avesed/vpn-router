@@ -1,15 +1,15 @@
-//! WireGuard Ingress module for Phase 6.3
+//! `WireGuard` Ingress module for Phase 6.3
 //!
-//! This module provides WireGuard ingress functionality, allowing the rust-router
-//! to accept incoming WireGuard connections from clients and route their traffic
+//! This module provides `WireGuard` ingress functionality, allowing the rust-router
+//! to accept incoming `WireGuard` connections from clients and route their traffic
 //! based on DSCP values and rule matching.
 //!
 //! # Phase 6.3 Implementation Status
 //!
-//! - [x] WgIngressConfig configuration type
-//! - [x] IngressError error types
-//! - [x] IngressProcessor for packet processing
-//! - [x] WgIngressManager for tunnel management
+//! - [x] `WgIngressConfig` configuration type
+//! - [x] `IngressError` error types
+//! - [x] `IngressProcessor` for packet processing
+//! - [x] `WgIngressManager` for tunnel management
 //! - [x] DSCP extraction and rule matching
 //! - [x] Multi-peer support
 //!
@@ -68,7 +68,7 @@
 //! The ingress manager extracts DSCP values from incoming IP packets and uses them
 //! for chain routing decisions:
 //!
-//! 1. Decrypt incoming WireGuard packet
+//! 1. Decrypt incoming `WireGuard` packet
 //! 2. Extract DSCP from IP header using `chain/dscp::get_dscp()`
 //! 3. If DSCP > 0 and matches a configured chain, route to that chain tag
 //!    (terminal nodes route to the exit egress and clear DSCP)
@@ -77,7 +77,7 @@
 //! # References
 //!
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.3
-//! - WireGuard Protocol: <https://www.wireguard.com/protocol/>
+//! - `WireGuard` Protocol: <https://www.wireguard.com/protocol/>
 
 pub mod config;
 pub mod error;

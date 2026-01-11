@@ -1,6 +1,6 @@
 //! TLS SNI (Server Name Indication) parsing
 //!
-//! This module implements parsing of TLS ClientHello messages to extract
+//! This module implements parsing of TLS `ClientHello` messages to extract
 //! the Server Name Indication extension, which contains the hostname
 //! the client is trying to connect to.
 //!
@@ -13,7 +13,7 @@
 //! Fragment (variable)
 //! ```
 //!
-//! ## ClientHello Format (simplified)
+//! ## `ClientHello` Format (simplified)
 //!
 //! ```text
 //! HandshakeType (1 byte) = 0x01
@@ -39,10 +39,10 @@
 
 use tracing::trace;
 
-/// TLS ContentType for Handshake
+/// TLS `ContentType` for Handshake
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 
-/// TLS HandshakeType for ClientHello
+/// TLS `HandshakeType` for `ClientHello`
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 
 /// SNI extension type
@@ -54,14 +54,14 @@ const TLS_SNI_NAME_TYPE_HOSTNAME: u8 = 0x00;
 /// Minimum TLS record header size
 const TLS_RECORD_HEADER_SIZE: usize = 5;
 
-/// Minimum ClientHello size (header + version + random + session_id length)
+/// Minimum `ClientHello` size (header + version + random + `session_id` length)
 const MIN_CLIENT_HELLO_SIZE: usize = 38;
 
-/// Parse TLS ClientHello and extract SNI hostname
+/// Parse TLS `ClientHello` and extract SNI hostname
 ///
 /// # Arguments
 ///
-/// * `data` - Raw bytes that might contain a TLS ClientHello
+/// * `data` - Raw bytes that might contain a TLS `ClientHello`
 ///
 /// # Returns
 ///
@@ -234,7 +234,7 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
     None
 }
 
-/// Check if data looks like TLS ClientHello
+/// Check if data looks like TLS `ClientHello`
 #[must_use]
 pub fn looks_like_tls(data: &[u8]) -> bool {
     if data.len() < TLS_RECORD_HEADER_SIZE {

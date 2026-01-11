@@ -189,7 +189,7 @@ impl UdpClient {
     async fn query_once(&self, query: &Message) -> DnsResult<Message> {
         // Serialize the query
         let query_bytes = query.to_vec().map_err(|e| {
-            DnsError::serialize(format!("failed to serialize DNS query: {}", e))
+            DnsError::serialize(format!("failed to serialize DNS query: {e}"))
         })?;
 
         // Check message size
@@ -230,7 +230,7 @@ impl UdpClient {
 
                 // Parse the response
                 let response = Message::from_vec(&recv_buf[..len]).map_err(|e| {
-                    DnsError::parse(format!("failed to parse DNS response: {}", e))
+                    DnsError::parse(format!("failed to parse DNS response: {e}"))
                 })?;
 
                 // Validate response matches query

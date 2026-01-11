@@ -14,11 +14,11 @@
 //! # Performance Characteristics
 //!
 //! - **Domain matching**: O(1) for exact match, O(n) for suffix match via Aho-Corasick
-//! - **Pattern lookup for BlockReason**: O(n) scan of patterns HashMap when a match is found.
+//! - **Pattern lookup for `BlockReason`**: O(n) scan of patterns `HashMap` when a match is found.
 //!   This is acceptable because:
 //!   1. It only executes when a domain is actually blocked (not on every query)
 //!   2. Blocked queries are typically <1% of total queries
-//!   3. The scan is over a HashMap, which has good cache locality
+//!   3. The scan is over a `HashMap`, which has good cache locality
 //!   4. The cost is amortized over the entire blocklist lifetime
 //!
 //! # Example
@@ -142,7 +142,7 @@ impl BlockFilterStats {
 /// assert!(filter.is_blocked("google.com").is_none());
 /// ```
 pub struct BlockFilter {
-    /// The domain matcher, wrapped in ArcSwap for hot reload
+    /// The domain matcher, wrapped in `ArcSwap` for hot reload
     matcher: ArcSwap<MatcherWithPatterns>,
 
     /// Blocking configuration
@@ -161,7 +161,7 @@ struct MatcherWithPatterns {
     matcher: DomainMatcher,
 
     /// Original patterns for generating block reasons
-    /// Maps normalized domain -> (original_pattern, rule_type)
+    /// Maps normalized domain -> (`original_pattern`, `rule_type`)
     patterns: std::collections::HashMap<String, (String, String)>,
 }
 
@@ -335,9 +335,7 @@ impl BlockFilter {
         if total_count > MAX_RULES {
             return Err(DnsError::config_field(
                 format!(
-                    "blocklist exceeds maximum size: {} rules (max: {})",
-                    total_count,
-                    MAX_RULES
+                    "blocklist exceeds maximum size: {total_count} rules (max: {MAX_RULES})"
                 ),
                 "blocking.rules",
             ));
@@ -387,7 +385,7 @@ impl BlockFilter {
             }
             builder = builder
                 .add_regex(pattern, "blocked")
-                .map_err(|e| DnsError::internal(format!("Invalid regex pattern '{}': {}", pattern, e)))?;
+                .map_err(|e| DnsError::internal(format!("Invalid regex pattern '{pattern}': {e}")))?;
             patterns.insert(pattern.to_string(), (pattern.to_string(), "regex".to_string()));
         }
 
@@ -436,7 +434,7 @@ impl BlockFilter {
     ///
     /// - Domain matching is O(1) for exact match via Aho-Corasick
     /// - When a match is found, generating the [`BlockReason`] requires an O(n)
-    ///   scan of the patterns HashMap to find the specific rule that matched.
+    ///   scan of the patterns `HashMap` to find the specific rule that matched.
     ///   This is acceptable because:
     ///   - It only occurs on blocked queries (typically <1% of total queries)
     ///   - The scan has good cache locality
@@ -486,14 +484,13 @@ impl BlockFilter {
             // Try suffix patterns
             for (pattern, (original, rule_type)) in &matcher_guard.patterns {
                 if rule_type == "suffix" {
-                    if normalized == *pattern || normalized.ends_with(&format!(".{}", pattern)) {
+                    if normalized == *pattern || normalized.ends_with(&format!(".{pattern}")) {
                         return Some(BlockReason::new(domain, original, rule_type));
                     }
-                } else if rule_type == "keyword" {
-                    if normalized.contains(pattern) {
+                } else if rule_type == "keyword"
+                    && normalized.contains(pattern) {
                         return Some(BlockReason::new(domain, original, rule_type));
                     }
-                }
             }
 
             // Fallback: return generic blocked reason

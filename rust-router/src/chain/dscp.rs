@@ -43,7 +43,7 @@
 //! # Security Considerations
 //!
 //! - DSCP values may be stripped or modified by intermediate networks
-//! - Reserved DSCP values (standard QoS classes) are protected from allocation
+//! - Reserved DSCP values (standard `QoS` classes) are protected from allocation
 //!
 //! # References
 //!

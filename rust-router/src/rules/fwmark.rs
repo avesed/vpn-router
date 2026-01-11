@@ -106,10 +106,10 @@ pub mod tables {
     pub const PEER_MAX: u32 = 599;
 }
 
-/// Reserved DSCP values (commonly used for QoS).
+/// Reserved DSCP values (commonly used for `QoS`).
 ///
 /// These values should be avoided for chain routing to prevent conflicts
-/// with network QoS policies.
+/// with network `QoS` policies.
 ///
 /// Includes:
 /// - 0: BE (Best Effort, default)
@@ -188,7 +188,7 @@ impl ChainMark {
     /// ```
     #[must_use]
     pub fn from_dscp(dscp_value: u8) -> Option<Self> {
-        if dscp_value < DSCP_MIN || dscp_value > DSCP_MAX {
+        if !(DSCP_MIN..=DSCP_MAX).contains(&dscp_value) {
             return None;
         }
         Some(Self {
@@ -269,7 +269,7 @@ impl ChainMark {
         Self::from_dscp(dscp_value)
     }
 
-    /// Check if this DSCP value is reserved (commonly used for QoS).
+    /// Check if this DSCP value is reserved (commonly used for `QoS`).
     ///
     /// # Example
     ///
@@ -327,7 +327,7 @@ impl std::fmt::Display for ChainMark {
 /// ```
 #[derive(Debug, Clone)]
 pub struct FwmarkRouter {
-    /// Chain tag -> ChainMark mapping.
+    /// Chain tag -> `ChainMark` mapping.
     chains: HashMap<String, ChainMark>,
 
     /// Default mark for non-chain traffic (None = no mark).
@@ -472,7 +472,7 @@ impl Default for FwmarkRouter {
 /// ```
 #[derive(Debug, Clone)]
 pub struct FwmarkRouterBuilder {
-    /// Chain tag -> ChainMark mapping being built.
+    /// Chain tag -> `ChainMark` mapping being built.
     chains: HashMap<String, ChainMark>,
 
     /// Default mark for non-chain traffic.
@@ -598,7 +598,7 @@ impl FwmarkRouterBuilder {
         }
 
         // Validate DSCP range
-        if dscp < DSCP_MIN || dscp > DSCP_MAX {
+        if !(DSCP_MIN..=DSCP_MAX).contains(&dscp) {
             return Err(RuleError::DscpOutOfRange(dscp));
         }
 
@@ -840,7 +840,7 @@ pub const fn is_peer_table(table: u32) -> bool {
     table >= tables::PEER_MIN && table <= tables::PEER_MAX
 }
 
-/// Check if a DSCP value is reserved (commonly used for QoS).
+/// Check if a DSCP value is reserved (commonly used for `QoS`).
 ///
 /// # Arguments
 ///

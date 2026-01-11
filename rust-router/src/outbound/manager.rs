@@ -138,7 +138,7 @@ impl OutboundManager {
 
     /// Log current status of all outbounds
     pub fn log_status(&self) {
-        for entry in self.outbounds.iter() {
+        for entry in &self.outbounds {
             let outbound = entry.value();
             let stats = outbound.stats();
             debug!(
@@ -168,7 +168,7 @@ impl std::fmt::Debug for OutboundManager {
     }
 }
 
-/// Builder for creating an OutboundManager from configuration
+/// Builder for creating an `OutboundManager` from configuration
 pub struct OutboundManagerBuilder {
     manager: OutboundManager,
 }

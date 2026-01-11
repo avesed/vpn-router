@@ -107,7 +107,7 @@
 //!
 //! This phase adds the DNS blocking/filtering module:
 //!
-//! - [`filter::BlockFilter`]: High-performance domain blocker with ArcSwap hot-reload
+//! - [`filter::BlockFilter`]: High-performance domain blocker with `ArcSwap` hot-reload
 //! - [`filter::CnameDetector`]: CNAME chain detection for bypass prevention
 //! - [`filter::BlockedResponseBuilder`]: Response generator for blocked queries
 //!
@@ -115,7 +115,7 @@
 //!
 //! This phase adds the DNS splitting module:
 //!
-//! - [`split::DnsRouter`]: Per-domain upstream routing with ArcSwap hot-reload
+//! - [`split::DnsRouter`]: Per-domain upstream routing with `ArcSwap` hot-reload
 //! - [`split::DomainMatchType`]: Match types (Exact, Suffix, Keyword, Regex)
 //! - [`split::RouteInfo`]: Route configuration information
 //! - [`split::DnsRouterStats`]: Routing statistics with atomic counters

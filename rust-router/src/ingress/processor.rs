@@ -1,6 +1,6 @@
 //! Ingress packet processor for Phase 6.3
 //!
-//! This module handles packet processing for WireGuard ingress traffic,
+//! This module handles packet processing for `WireGuard` ingress traffic,
 //! including DSCP extraction, rule matching, and routing decisions.
 //!
 //! # Processing Pipeline
@@ -103,7 +103,7 @@ pub struct RoutingDecision {
 
     /// Optional routing mark for kernel policy routing
     ///
-    /// If Some, this mark should be set via SO_MARK on the outbound socket.
+    /// If Some, this mark should be set via `SO_MARK` on the outbound socket.
     /// This enables Linux policy routing for ECMP or chain routing.
     pub routing_mark: Option<u32>,
 
@@ -179,7 +179,7 @@ impl Default for RoutingDecision {
 
 /// Ingress packet processor
 ///
-/// Processes decrypted packets from WireGuard ingress, extracting
+/// Processes decrypted packets from `WireGuard` ingress, extracting
 /// connection information and making routing decisions.
 ///
 /// # Thread Safety
@@ -244,18 +244,16 @@ impl IngressProcessor {
             }
             Err(DscpError::PacketTooShort(got, need)) => {
                 return Err(IngressError::invalid_packet(format!(
-                    "packet too short: {} < {}",
-                    got, need
+                    "packet too short: {got} < {need}"
                 )));
             }
             Err(DscpError::InvalidIpVersion(v)) => {
                 return Err(IngressError::invalid_packet(format!(
-                    "invalid IP version: {}",
-                    v
+                    "invalid IP version: {v}"
                 )));
             }
             Err(e) => {
-                return Err(IngressError::processing(format!("DSCP extraction failed: {}", e)));
+                return Err(IngressError::processing(format!("DSCP extraction failed: {e}")));
             }
         };
 
@@ -368,8 +366,7 @@ impl IngressProcessor {
             4 => self.extract_ipv4_info(packet),
             6 => self.extract_ipv6_info(packet),
             _ => Err(IngressError::invalid_packet(format!(
-                "invalid IP version: {}",
-                version
+                "invalid IP version: {version}"
             ))),
         }
     }

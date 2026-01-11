@@ -153,7 +153,7 @@ impl DnsConfig {
         Self::default()
     }
 
-    /// Create DnsConfig from environment variables
+    /// Create `DnsConfig` from environment variables
     ///
     /// Reads the following environment variables:
     /// - `RUST_ROUTER_DNS_PORT`: DNS listen port (default: 7853)
@@ -172,47 +172,43 @@ impl DnsConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let port = match std::env::var("RUST_ROUTER_DNS_PORT") {
-            Ok(val) => match val.parse::<u16>() {
-                Ok(p) => {
-                    if p == 0 {
-                        tracing::warn!(
-                            value = %val,
-                            "RUST_ROUTER_DNS_PORT=0 is invalid, using default {}",
-                            Self::DEFAULT_PORT
-                        );
-                        Self::DEFAULT_PORT
-                    } else if p < 1024 {
-                        tracing::warn!(
-                            port = p,
-                            "RUST_ROUTER_DNS_PORT {} is a privileged port, may require root",
-                            p
-                        );
-                        p
-                    } else {
-                        p
-                    }
-                }
-                Err(_) => {
+            Ok(val) => if let Ok(p) = val.parse::<u16>() {
+                if p == 0 {
                     tracing::warn!(
                         value = %val,
-                        "Invalid RUST_ROUTER_DNS_PORT value, using default {}",
+                        "RUST_ROUTER_DNS_PORT=0 is invalid, using default {}",
                         Self::DEFAULT_PORT
                     );
                     Self::DEFAULT_PORT
+                } else if p < 1024 {
+                    tracing::warn!(
+                        port = p,
+                        "RUST_ROUTER_DNS_PORT {} is a privileged port, may require root",
+                        p
+                    );
+                    p
+                } else {
+                    p
                 }
+            } else {
+                tracing::warn!(
+                    value = %val,
+                    "Invalid RUST_ROUTER_DNS_PORT value, using default {}",
+                    Self::DEFAULT_PORT
+                );
+                Self::DEFAULT_PORT
             },
             Err(_) => Self::DEFAULT_PORT,
         };
 
         let enabled = std::env::var("RUST_ROUTER_DNS_ENABLED")
             .ok()
-            .map(|s| s == "true" || s == "1")
-            .unwrap_or(true);
+            .is_none_or(|s| s == "true" || s == "1");
 
-        let udp_addr = format!("127.0.0.1:{}", port)
+        let udp_addr = format!("127.0.0.1:{port}")
             .parse()
             .expect("valid listen address");
-        let tcp_addr = format!("127.0.0.1:{}", port)
+        let tcp_addr = format!("127.0.0.1:{port}")
             .parse()
             .expect("valid listen address");
 
@@ -467,7 +463,7 @@ pub struct UpstreamConfig {
 
     /// Server Name Indication (SNI) for TLS connections
     ///
-    /// Required when using IP address with DoT and server requires
+    /// Required when using IP address with `DoT` and server requires
     /// hostname verification. If not set, the hostname from the address
     /// will be used.
     #[serde(default)]

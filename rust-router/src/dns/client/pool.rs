@@ -508,7 +508,7 @@ impl UpstreamPool {
             let entry = upstreams
                 .iter()
                 .find(|e| e.upstream.tag() == tag)
-                .ok_or_else(|| DnsError::no_upstream(format!("upstream '{}' not found", tag)))?;
+                .ok_or_else(|| DnsError::no_upstream(format!("upstream '{tag}' not found")))?;
 
             if !entry.upstream.is_healthy() {
                 return Err(DnsError::upstream(tag, "upstream is unhealthy"));
@@ -640,7 +640,7 @@ impl std::ops::Deref for UpstreamRef<'_> {
     }
 }
 
-/// Builder for creating UpstreamPool with custom configuration
+/// Builder for creating `UpstreamPool` with custom configuration
 pub struct UpstreamPoolBuilder {
     upstreams: Vec<(Box<dyn DnsUpstream>, u32)>,
     strategy: SelectionStrategy,

@@ -1,11 +1,11 @@
-//! Error types for the WireGuard Ingress module
+//! Error types for the `WireGuard` Ingress module
 //!
-//! This module defines error types specific to WireGuard ingress operations,
+//! This module defines error types specific to `WireGuard` ingress operations,
 //! including tunnel management, packet processing, and peer management.
 //!
 //! # Error Categories
 //!
-//! - **Tunnel errors**: Issues with the underlying WireGuard tunnel
+//! - **Tunnel errors**: Issues with the underlying `WireGuard` tunnel
 //! - **DSCP errors**: Packet processing and DSCP extraction failures
 //! - **Configuration errors**: Invalid configuration parameters
 //! - **State errors**: Invalid state transitions (already started, not started)
@@ -19,10 +19,10 @@ use thiserror::Error;
 use crate::chain::dscp::DscpError;
 use crate::tunnel::traits::WgTunnelError;
 
-/// Error types for WireGuard ingress operations
+/// Error types for `WireGuard` ingress operations
 #[derive(Debug, Error)]
 pub enum IngressError {
-    /// Tunnel error from the underlying WireGuard implementation
+    /// Tunnel error from the underlying `WireGuard` implementation
     #[error("Tunnel error: {0}")]
     TunnelError(#[from] WgTunnelError),
 
@@ -158,7 +158,7 @@ impl IngressError {
     }
 }
 
-/// Type alias for Result with IngressError
+/// Type alias for Result with `IngressError`
 pub type IngressResult<T> = std::result::Result<T, IngressError>;
 
 #[cfg(test)]

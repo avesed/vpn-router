@@ -121,7 +121,7 @@ pub struct ListenConfig {
     #[serde(default = "default_udp_timeout_secs")]
     pub udp_timeout_secs: u64,
 
-    /// Enable SO_REUSEPORT for multi-core scaling
+    /// Enable `SO_REUSEPORT` for multi-core scaling
     #[serde(default = "default_true")]
     pub reuse_port: bool,
 
@@ -129,9 +129,9 @@ pub struct ListenConfig {
     #[serde(default = "default_sniff_timeout_ms")]
     pub sniff_timeout_ms: u64,
 
-    /// Number of UDP workers (default: num_cpus)
+    /// Number of UDP workers (default: `num_cpus`)
     ///
-    /// Each worker binds to the same address with SO_REUSEPORT.
+    /// Each worker binds to the same address with `SO_REUSEPORT`.
     /// The kernel distributes packets across workers based on 4-tuple hash.
     #[serde(default)]
     pub udp_workers: Option<usize>,
@@ -206,7 +206,7 @@ pub struct OutboundConfig {
     #[serde(rename = "type")]
     pub outbound_type: OutboundType,
 
-    /// Bind to specific interface (SO_BINDTODEVICE)
+    /// Bind to specific interface (`SO_BINDTODEVICE`)
     #[serde(default)]
     pub bind_interface: Option<String>,
 
@@ -214,7 +214,7 @@ pub struct OutboundConfig {
     #[serde(default)]
     pub bind_address: Option<SocketAddr>,
 
-    /// Set routing mark (SO_MARK)
+    /// Set routing mark (`SO_MARK`)
     #[serde(default)]
     pub routing_mark: Option<u32>,
 
@@ -278,8 +278,7 @@ impl OutboundConfig {
         if let Some(ref iface) = self.bind_interface {
             if iface.len() > 15 {
                 return Err(ConfigError::ValidationError(format!(
-                    "Interface name '{}' too long (max 15 chars)",
-                    iface
+                    "Interface name '{iface}' too long (max 15 chars)"
                 )));
             }
         }
@@ -461,11 +460,11 @@ pub struct RulesConfig {
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
 
-    /// Path to domain catalog JSON file (for GeoSite matching)
+    /// Path to domain catalog JSON file (for `GeoSite` matching)
     #[serde(default)]
     pub domain_catalog_path: Option<PathBuf>,
 
-    /// Path to GeoIP catalog directory (for GeoIP matching)
+    /// Path to `GeoIP` catalog directory (for `GeoIP` matching)
     #[serde(default)]
     pub geoip_catalog_path: Option<PathBuf>,
 }
@@ -502,8 +501,7 @@ impl RulesConfig {
             // Validate target is not empty
             if rule.target.trim().is_empty() {
                 return Err(ConfigError::ValidationError(format!(
-                    "Rule {} has empty target",
-                    index
+                    "Rule {index} has empty target"
                 )));
             }
         }
@@ -519,8 +517,8 @@ pub struct RuleConfig {
     #[serde(default)]
     pub id: u64,
 
-    /// Rule type: "domain", "domain_suffix", "domain_keyword", "domain_regex",
-    /// "geoip", "geosite", "ip_cidr", "port", "protocol"
+    /// Rule type: "domain", "`domain_suffix`", "`domain_keyword`", "`domain_regex`",
+    /// "geoip", "geosite", "`ip_cidr`", "port", "protocol"
     #[serde(rename = "type")]
     pub rule_type: String,
 
