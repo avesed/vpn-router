@@ -543,7 +543,7 @@ impl UdpPacketProcessor {
         } else {
             // Condition 2: Check interval-based cleanup
             let decrement_count = self.decrement_counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if decrement_count.is_multiple_of(CLEANUP_CHECK_INTERVAL_DECREMENTS) {
+            if decrement_count % CLEANUP_CHECK_INTERVAL_DECREMENTS == 0 {
                 // Enough decrements have occurred, check time
                 // Use try_lock to avoid blocking - if another thread is cleaning, skip
                 if let Ok(mut last) = self.last_cleanup.try_lock() {

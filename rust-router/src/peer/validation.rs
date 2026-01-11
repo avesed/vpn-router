@@ -229,7 +229,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     }
 
     let bytes = input.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
         return None;
     }
 

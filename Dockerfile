@@ -1,4 +1,9 @@
 # ==========================================
+# Stage 0: Shared CA certificates for slim images
+# ==========================================
+FROM golang:1.23-bookworm AS ca-certs
+
+# ==========================================
 # Stage 1: Build xray-lite from source
 # ==========================================
 # [Phase XL] Build minimized Xray supporting only VLESS + XHTTP + REALITY
@@ -70,6 +75,8 @@ FROM debian:12-slim AS usque-downloader
 
 ARG USQUE_VERSION=1.4.2
 ARG TARGETARCH
+
+COPY --from=ca-certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eux; \
     for file in /etc/apt/sources.list \
@@ -182,6 +189,8 @@ RUN npm run build
 # Stage 6: Production Runtime
 # ==========================================
 FROM debian:12-slim
+
+COPY --from=ca-certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 RUN set -eux; \
     for file in /etc/apt/sources.list \

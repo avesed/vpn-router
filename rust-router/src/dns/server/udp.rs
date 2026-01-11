@@ -445,7 +445,7 @@ impl UdpDnsServer {
             Err(e) => {
                 let error_count = self.stats.record_recv_error();
                 let dns_error = DnsError::network_io("UDP recv_from failed".to_string(), e);
-                if Self::is_degraded_error(&dns_error) && error_count.is_multiple_of(10) {
+                if Self::is_degraded_error(&dns_error) && error_count % 10 == 0 {
                     warn!(
                         consecutive_errors = error_count,
                         "Consecutive degraded recv errors detected"
