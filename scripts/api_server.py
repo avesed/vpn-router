@@ -3892,8 +3892,16 @@ def api_add_custom_rule(payload: CustomRuleRequest):
         # 批量插入所有规则
         added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
 
+        # Phase 11-Fix: Sync rules to rust-router via IPC
+        sync_message = ""
+        try:
+            sync_message = _sync_rules_to_rust_router(db)
+        except Exception as sync_err:
+            logging.warning(f"Failed to sync rules to rust-router: {sync_err}")
+            sync_message = f", rust-router sync error: {sync_err}"
+
         return {
-            "message": f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）",
+            "message": f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）{sync_message}",
             "tag": payload.tag,
             "outbound": payload.outbound,
             "count": added_count
@@ -3914,7 +3922,15 @@ def api_delete_custom_rule(rule_id: int):
     if not success:
         raise HTTPException(status_code=404, detail=f"规则 ID {rule_id} 不存在")
 
-    return {"message": f"规则 ID {rule_id} 已删除"}
+    # Phase 11-Fix: Sync rules to rust-router via IPC
+    sync_message = ""
+    try:
+        sync_message = _sync_rules_to_rust_router(db)
+    except Exception as sync_err:
+        logging.warning(f"Failed to sync rules to rust-router after delete: {sync_err}")
+        sync_message = f", rust-router sync error: {sync_err}"
+
+    return {"message": f"规则 ID {rule_id} 已删除{sync_message}"}
 
 
 @app.delete("/api/rules/custom/by-tag/{tag}")
@@ -8605,6 +8621,72 @@ def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
         return {"success": False, "delay": -1, "message": str(e)}
 
 
+def _test_interface_connection(interface: str, test_url: str, timeout_sec: float) -> dict:
+    """Phase 6-Fix.AC: Test connection via specific network interface"""
+    try:
+        curl_cmd = [
+            "curl", "-s", "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}",
+            "--interface", interface,
+            "--max-time", str(int(timeout_sec + 1)),
+            test_url
+        ]
+
+        start_time = time.time()
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|")
+            if len(parts) == 2:
+                http_code = parts[0]
+                time_total = float(parts[1])
+                delay_ms = int(time_total * 1000)
+
+                if http_code in ("200", "204", "301", "302"):
+                    return {"success": True, "delay": delay_ms, "message": f"{delay_ms}ms"}
+                else:
+                    return {"success": False, "delay": -1, "message": f"HTTP {http_code}"}
+
+        return {"success": False, "delay": -1, "message": "Connection failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+def _test_simple_curl(test_url: str, timeout_sec: float) -> dict:
+    """Phase 6-Fix.AC: Simple curl test without interface binding"""
+    try:
+        curl_cmd = [
+            "curl", "-s", "-o", "/dev/null",
+            "-w", "%{http_code}|%{time_total}",
+            "--max-time", str(int(timeout_sec + 1)),
+            test_url
+        ]
+
+        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=timeout_sec + 2)
+
+        if result.returncode == 0:
+            parts = result.stdout.strip().split("|")
+            if len(parts) == 2:
+                http_code = parts[0]
+                time_total = float(parts[1])
+                delay_ms = int(time_total * 1000)
+
+                if http_code in ("200", "204", "301", "302"):
+                    return {"success": True, "delay": delay_ms, "message": f"{delay_ms}ms"}
+                else:
+                    return {"success": False, "delay": -1, "message": f"HTTP {http_code}"}
+
+        return {"success": False, "delay": -1, "message": "Connection failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
 def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
     """测试 WireGuard 端点
 
@@ -8612,6 +8694,7 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
     clash_api 的延迟测试对 WireGuard 端点有时会失败，即使隧道正常工作。
 
     策略:
+    0. Phase 6-Fix.AC: 如果 rust-router 可用，优先使用其健康检查 API
     1. 检查是否有活跃流量通过该端点
     2. 如果有活跃流量，认为连接正常
     3. 如果没有活跃流量，尝试 clash_api 延迟测试
@@ -8620,6 +8703,48 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
     import urllib.request
     import urllib.error
     import urllib.parse
+    import asyncio
+
+    # Phase 6-Fix.AC: Try rust-router health check first (userspace WG support)
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            async def _check_rust_router_health():
+                try:
+                    client = await _get_rust_router_client()
+                    if client:
+                        health_info = await client.get_outbound_health()
+                        for h in health_info:
+                            if h.tag == tag:
+                                if h.health != "healthy":
+                                    return {"success": False, "delay": -1, "message": f"Unhealthy: {h.health}"}
+                                # Outbound exists and healthy, do an actual latency test
+                                # Get bind interface from outbound info
+                                outbounds = await client.list_outbounds()
+                                bind_interface = None
+                                for out in outbounds:
+                                    if out.tag == tag and out.bind_interface:
+                                        bind_interface = out.bind_interface
+                                        break
+                                return {"bind_interface": bind_interface}  # Signal to do interface test
+                except Exception:
+                    pass
+                return None  # Fallback to Clash API
+
+            result = asyncio.run(_check_rust_router_health())
+            if result is not None:
+                # If outbound found in rust-router, do interface-based test
+                if "bind_interface" in result:
+                    bind_if = result.get("bind_interface")
+                    if bind_if:
+                        return _test_interface_connection(bind_if, test_url, timeout / 1000)
+                    else:
+                        # No interface binding, but outbound is healthy
+                        # Do a simple curl test without binding
+                        return _test_simple_curl(test_url, timeout / 1000)
+                else:
+                    return result  # Return error from health check
+        except Exception:
+            pass  # Fallback to original method
 
     # 首先检查是否有活跃流量通过该端点
     try:
@@ -9160,6 +9285,69 @@ def _regenerate_and_reload():
     if not reload_result.get("success"):
         error_msg = reload_result.get("message", "未知错误")
         raise RuntimeError(f"配置重载失败: {error_msg}")
+
+
+def _sync_rules_to_rust_router(db=None) -> str:
+    """Sync routing rules from database to rust-router via IPC.
+    
+    Phase 11-Fix: Called after adding/deleting rules to sync with rust-router.
+    
+    Args:
+        db: Optional DatabaseManager instance. If None, will get from _get_db().
+        
+    Returns:
+        str: Status message about the sync operation.
+    """
+    import asyncio
+    
+    if db is None:
+        db = _get_db()
+    
+    try:
+        # Get the event loop or create a new one
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Get rust-router client
+        client = loop.run_until_complete(_get_rust_router_client())
+        if not client:
+            return ", rust-router not available"
+        
+        # Get all enabled rules from database
+        all_rules = db.get_routing_rules(enabled_only=True)
+        rule_configs = []
+        for rule in all_rules:
+            rule_type = rule.get("rule_type", "")
+            target = rule.get("target", "")
+            outbound = rule.get("outbound", "direct")
+            rule_configs.append({
+                "rule_type": rule_type,
+                "target": target,
+                "outbound": outbound,
+            })
+        
+        # Get default outbound
+        default_outbound = db.get_setting("default_outbound", "direct") or "direct"
+        
+        # Sync to rust-router
+        result = loop.run_until_complete(
+            client.update_routing(rule_configs, default_outbound)
+        )
+        
+        if result.success:
+            return f", rust-router synced ({result.rule_count} rules)"
+        else:
+            return ", rust-router sync failed"
+            
+    except Exception as e:
+        logging.warning(f"Failed to sync rules to rust-router: {e}")
+        return f", rust-router sync error: {e}"
 
 
 def _full_regenerate_after_import():
@@ -14332,15 +14520,38 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
         except Exception as e:
             logging.warning(f"[peers] 级联通知目标节点失败: {e}")
 
-    # 清理 WireGuard/Xray 隧道接口（无论数据库状态如何，确保内核接口被删除）
-    try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        manager.disconnect_node(tag)
-        logging.info(f"[peers] 删除前清理隧道接口: {tag}")
-    except Exception as e:
-        # 接口可能不存在，忽略错误继续删除
-        logging.debug(f"[peers] 清理隧道接口: {e}")
+    # 清理 WireGuard/Xray 隧道接口
+    # Phase 11-Fix: 根据模式选择清理方式
+    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
+    tunnel_type = node.get("tunnel_type", "wireguard")
+    
+    if userspace_wg and tunnel_type == "wireguard":
+        # Userspace WG 模式：通过 rust-router IPC 删除 peer
+        try:
+            from rust_router_client import RustRouterClient
+            client = RustRouterClient()
+            
+            async def _remove_peer_ipc():
+                return await client.remove_peer(tag)
+            
+            response = _run_async_ipc(_remove_peer_ipc())
+            if response.success:
+                logging.info(f"[peers] rust-router peer 已删除: {tag}")
+            else:
+                logging.warning(f"[peers] rust-router 删除 peer 失败: {response.error}")
+        except Exception as e:
+            # rust-router 可能不可用或 peer 不存在，继续删除数据库记录
+            logging.warning(f"[peers] rust-router IPC 删除失败: {e}")
+    else:
+        # 内核模式：通过 PeerTunnelManager 清理接口
+        try:
+            from peer_tunnel_manager import PeerTunnelManager
+            manager = PeerTunnelManager()
+            manager.disconnect_node(tag)
+            logging.info(f"[peers] 删除前清理隧道接口: {tag}")
+        except Exception as e:
+            # 接口可能不存在，忽略错误继续删除
+            logging.debug(f"[peers] 清理隧道接口: {e}")
 
     # 删除数据库记录
     success = db.delete_peer_node(tag)

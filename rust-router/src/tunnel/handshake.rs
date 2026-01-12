@@ -68,7 +68,9 @@ use tokio::sync::watch;
 use tracing::{debug, trace, warn};
 
 /// Default maximum number of handshake retry attempts
-const DEFAULT_MAX_RETRIES: u32 = 5;
+/// Increased from 5 to 30 to handle bidirectional pairing scenarios where
+/// the peer may not be ready yet (Phase 11-Fix.6A)
+const DEFAULT_MAX_RETRIES: u32 = 30;
 
 /// Default initial backoff duration in milliseconds
 const DEFAULT_INITIAL_BACKOFF_MS: u64 = 500;

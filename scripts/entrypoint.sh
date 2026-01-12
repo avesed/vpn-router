@@ -154,6 +154,9 @@ cleanup_wireguard_interfaces() {
   ${IPTABLES} -t nat -D PREROUTING -i xray-tun0 -p udp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT:-7853}" 2>/dev/null || true
   ${IPTABLES} -t nat -D PREROUTING -i xray-tun0 -p tcp --dport 53 -j REDIRECT --to-port "${RUST_ROUTER_DNS_PORT:-7853}" 2>/dev/null || true
 
+  # Phase 6 Fix: Cleanup peer tunnel subnet route
+  ip route del local 10.200.200.0/24 dev lo 2>/dev/null || true
+
   # Cleanup ip rules
   ip rule del fwmark 1 lookup 100 2>/dev/null || true
 }
@@ -1171,6 +1174,21 @@ elif [ "${USERSPACE_WG}" = "true" ]; then
   # No iptables TPROXY rules needed as traffic goes directly to rust-router's WireGuard listener
   echo "[entrypoint] Full userspace mode: rust-router handles all routing internally"
   echo "[entrypoint] Skipping iptables TPROXY setup (not needed for userspace WireGuard)"
+
+  # Phase 6 Fix: Configure peer tunnel subnet routing (10.200.200.0/24)
+  # This allows remote nodes to reach this node's API via tunnel IP
+  echo "[entrypoint] Configuring peer tunnel subnet routing (10.200.200.0/24)"
+  if ip route add local 10.200.200.0/24 dev lo 2>/dev/null; then
+    echo "[entrypoint] Added local route for peer tunnel subnet"
+  else
+    # Route may already exist, verify it
+    if ip route show table local | grep -q "local 10.200.200.0/24"; then
+      echo "[entrypoint] Peer tunnel subnet route already exists"
+    else
+      echo "[entrypoint] WARNING: Failed to add peer tunnel subnet route" >&2
+    fi
+  fi
+
   # DNS is handled internally by rust-router in userspace mode
   echo "[entrypoint] DNS engine handled internally by rust-router"
 else

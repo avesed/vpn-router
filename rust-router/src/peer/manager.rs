@@ -614,21 +614,33 @@ impl PeerManager {
             "Pairing response generated"
         );
 
-        // For bidirectional pairing, automatically connect to the peer
-        // This ensures both sides establish the tunnel after pairing completes
+        // Phase 11-Fix.6A: For bidirectional pairing, connect to establish our listening socket
+        // but expect initial handshake to fail (peer hasn't completed handshake yet).
+        //
+        // Why we still connect here:
+        // 1. `connect()` binds our UDP socket to the tunnel port (e.g., 36200)
+        // 2. This allows the peer to reach us once they complete the handshake
+        // 3. WireGuard handshake will eventually succeed when both sides are ready
+        //
+        // Flow:
+        // - Node A generates request code
+        // - Node B imports request, connects (binds port, initial handshake may fail)
+        // - Node A completes handshake, connects
+        // - Both sides' WireGuard handshakes retry and eventually succeed
         if request.bidirectional {
             info!(
                 remote_tag = %request.node_tag,
-                "Bidirectional pairing: auto-connecting to peer"
+                "Bidirectional pairing: establishing tunnel (handshake may be delayed)"
             );
+            // Connect to establish our socket. Initial handshake failure is expected
+            // because the peer hasn't set up their tunnel yet.
             if let Err(e) = self.connect(&request.node_tag).await {
-                warn!(
+                // Log but don't fail - the handshake will complete later via retries
+                debug!(
                     remote_tag = %request.node_tag,
                     error = %e,
-                    "Failed to auto-connect after bidirectional pairing import"
+                    "Initial connection attempt expected to fail - peer not ready yet"
                 );
-                // Don't fail the pairing - the response code is still valid
-                // and the user can manually connect later
             }
         }
 
