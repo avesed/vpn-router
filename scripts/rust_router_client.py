@@ -1556,10 +1556,11 @@ class RustRouterClient:
     async def create_chain(
         self,
         tag: str,
-        hops: List[str],
-        exit_egress: str,
+        hops: Optional[List[str]] = None,
+        exit_egress: Optional[str] = None,
         description: str = "",
         allow_transitive: bool = False,
+        config: Optional[Dict[str, Any]] = None,
     ) -> IpcResponse:
         """Create a multi-hop chain.
 
@@ -1569,10 +1570,21 @@ class RustRouterClient:
             exit_egress: Egress tag on the terminal node
             description: Chain description
             allow_transitive: Allow terminal node to select egress dynamically
+            config: Full chain config payload (IPC v3.2+)
 
         Returns:
             IpcResponse indicating success or failure
         """
+        if config is not None:
+            if "tag" not in config:
+                config = dict(config)
+                config["tag"] = tag
+            return await self._send_command({
+                "type": "create_chain",
+                "tag": tag,
+                "config": config,
+            })
+
         return await self._send_command({
             "type": "create_chain",
             "tag": tag,

@@ -233,6 +233,8 @@ struct Phase6Config {
     node_tag: String,
     /// WireGuard ingress local IP
     wg_local_ip: IpAddr,
+    /// Enable batch I/O for userspace WireGuard ingress
+    wg_batch_io: bool,
 }
 
 impl Phase6Config {
@@ -263,6 +265,11 @@ impl Phase6Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(10, 25, 0, 1)));
 
+        // Batch I/O can cause readiness spin with userspace WG; keep default disabled.
+        let wg_batch_io = std::env::var("RUST_ROUTER_WG_BATCH_IO")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         Self {
             userspace_wg,
             wg_listen_port,
@@ -270,6 +277,7 @@ impl Phase6Config {
             wg_subnet,
             node_tag,
             wg_local_ip,
+            wg_batch_io,
         }
     }
 
@@ -485,6 +493,7 @@ async fn main() -> Result<()> {
             .listen_addr(listen_addr)
             .local_ip(phase6_config.wg_local_ip)
             .allowed_subnet(allowed_subnet)
+            .use_batch_io(phase6_config.wg_batch_io)
             .build();
 
         match WgIngressManager::new(wg_ingress_config, Arc::clone(&rule_engine)) {

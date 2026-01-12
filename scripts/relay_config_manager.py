@@ -18,6 +18,7 @@ Phase 11.4: 对于 WireGuard 多跳链路，中间节点需要 iptables 规则�
 """
 
 import logging
+import os
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -286,6 +287,10 @@ class RelayConfigManager:
         """释放 fwmark（当前实现中不需要特别处理，只是记录日志）"""
         logger.debug(f"[relay] 释放 fwmark={fwmark}")
 
+    def _userspace_wg_enabled(self) -> bool:
+        """检查是否启用 userspace WireGuard 模式"""
+        return os.environ.get("USERSPACE_WG", "true").lower() == "true"
+
     def _setup_dscp_relay(self, rule: RelayRule) -> bool:
         """设置 DSCP 匹配的中继转发
 
@@ -294,6 +299,13 @@ class RelayConfigManager:
         3. ip route add default dev {target} table {table}
         """
         try:
+            if self._userspace_wg_enabled():
+                logger.info(
+                    "[relay] USERSPACE_WG=true, skipping kernel DSCP relay setup: "
+                    f"chain={rule.chain_tag}, dscp={rule.dscp_value}"
+                )
+                return True
+
             # 1. 添加 iptables 规则 - DSCP 匹配并设置 fwmark
             iptables_cmd = [
                 "iptables", "-t", "mangle", "-A", "PREROUTING",
@@ -334,6 +346,9 @@ class RelayConfigManager:
 
     def _cleanup_dscp_relay(self, rule: RelayRule) -> bool:
         """清理 DSCP 中继规则"""
+        if self._userspace_wg_enabled():
+            return True
+
         success = True
 
         # 1. 删除路由

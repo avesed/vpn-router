@@ -25,11 +25,14 @@ Usage:
 """
 
 import asyncio
+import json
 import ipaddress
 import logging
 import os
 import socket
 import sys
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -262,12 +265,235 @@ class RustRouterManager:
         self._db = None  # Lazy loaded
         # Phase 11-Fix.AB: Detect userspace WireGuard mode
         self._userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
+        self._peer_repair_attempted_tags: Set[str] = set()
 
     def _get_db(self):
         """Get database instance (lazy load)"""
         if self._db is None:
             self._db = _get_db()
         return self._db
+
+    def _get_local_node_tag(self) -> str:
+        """Match rust-router's local node tag resolution."""
+        return os.environ.get("RUST_ROUTER_NODE_TAG") or socket.gethostname()
+
+    def _parse_chain_hops(self, hops: Any) -> List[str]:
+        """Parse hops from DB (list or JSON string)."""
+        if isinstance(hops, list):
+            return [str(h) for h in hops]
+        if isinstance(hops, str):
+            if not hops.strip():
+                return []
+            try:
+                parsed = json.loads(hops)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(parsed, list):
+                return [str(h) for h in parsed]
+        return []
+
+    def _build_chain_config(self, chain: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build IPC v3.2 ChainConfig payload."""
+        tag = chain.get("tag", "")
+        if not tag:
+            return None
+
+        hops = self._parse_chain_hops(chain.get("hops", []))
+        if not hops:
+            return None
+
+        local_tag = self._get_local_node_tag()
+        if local_tag in hops:
+            full_hops = hops
+        else:
+            full_hops = [local_tag] + hops
+
+        if len(full_hops) < 2:
+            return None
+
+        hop_configs = []
+        for idx, hop_tag in enumerate(full_hops):
+            if idx == 0:
+                role = "entry"
+            elif idx == len(full_hops) - 1:
+                role = "terminal"
+            else:
+                role = "relay"
+
+            tunnel_type = "wireguard"
+            if hop_tag != local_tag:
+                peer = self._get_db().get_peer_node(hop_tag)
+                if peer:
+                    tunnel_type = (peer.get("tunnel_type") or "wireguard").lower()
+            if tunnel_type not in ("wireguard", "xray"):
+                tunnel_type = "wireguard"
+
+            hop_configs.append({
+                "node_tag": hop_tag,
+                "role": role,
+                "tunnel_type": tunnel_type,
+            })
+
+        dscp_value = chain.get("dscp_value")
+        try:
+            dscp_value = int(dscp_value) if dscp_value is not None else 0
+        except (TypeError, ValueError):
+            dscp_value = 0
+
+        return {
+            "tag": tag,
+            "description": chain.get("description") or "",
+            "dscp_value": dscp_value,
+            "hops": hop_configs,
+            "rules": [],
+            "exit_egress": chain.get("exit_egress") or "",
+            "allow_transitive": bool(chain.get("allow_transitive", False)),
+        }
+
+    def _extract_host(self, endpoint: str) -> Optional[str]:
+        if not endpoint:
+            return None
+        if endpoint.startswith("["):
+            end_idx = endpoint.find("]")
+            if end_idx != -1:
+                return endpoint[1:end_idx]
+        if ":" in endpoint:
+            return endpoint.rsplit(":", 1)[0]
+        return endpoint
+
+    def _get_local_tag_for_pairing(self) -> str:
+        return (
+            os.environ.get("VPN_ROUTER_NODE_ID")
+            or os.environ.get("RUST_ROUTER_NODE_TAG")
+            or socket.gethostname()
+        )
+
+    def _get_local_api_port(self) -> int:
+        return int(os.environ.get("WEB_PORT", "36000"))
+
+    def _get_json(self, url: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.debug(f"Failed to GET {url}: {exc}")
+            return None
+
+    def _post_json(self, url: str, payload: Dict[str, Any], timeout: int = 10) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.warning(f"Failed to POST {url}: {exc}")
+            return None
+
+    async def _get_json_async(self, url: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._get_json(url, timeout))
+
+    async def _post_json_async(self, url: str, payload: Dict[str, Any], timeout: int = 10) -> Optional[Dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._post_json(url, payload, timeout))
+
+    async def _discover_local_endpoint(self, peer: Dict[str, Any], local_tag: str) -> Optional[str]:
+        peer_endpoint = peer.get("endpoint", "")
+        peer_host = self._extract_host(peer_endpoint)
+        if not peer_host:
+            return None
+        url = f"http://{peer_host}:8000/api/peers/{urllib.parse.quote(local_tag)}"
+        data = await self._get_json_async(url)
+        if not data:
+            return None
+        return data.get("endpoint")
+
+    async def _repair_userspace_peer_via_api(self, peer: Dict[str, Any]) -> bool:
+        """Recreate userspace WG peer via pairing APIs when rust-router lost state."""
+        local_tag = self._get_local_tag_for_pairing()
+        local_endpoint = None
+        for _ in range(5):
+            local_endpoint = await self._discover_local_endpoint(peer, local_tag)
+            if local_endpoint:
+                break
+            await asyncio.sleep(3)
+        if not local_endpoint:
+            logger.warning(f"Cannot discover local endpoint for pairing with {peer.get('tag')}")
+            return False
+
+        local_api_port = self._get_local_api_port()
+        gen_payload = {
+            "node_tag": local_tag,
+            "node_description": local_tag,
+            "endpoint": local_endpoint,
+            "api_port": local_api_port,
+            "bidirectional": True,
+            "tunnel_type": "wireguard",
+        }
+        gen_resp = await self._post_json_async(
+            "http://127.0.0.1:8000/api/peer/generate-pair-request",
+            gen_payload,
+        )
+        if not gen_resp or not gen_resp.get("code"):
+            logger.warning(f"Failed to generate pairing request for {peer.get('tag')}")
+            return False
+
+        peer_endpoint = peer.get("endpoint", "")
+        peer_host = self._extract_host(peer_endpoint)
+        if not peer_host:
+            logger.warning(f"Missing endpoint for peer {peer.get('tag')}")
+            return False
+
+        import_payload = {
+            "code": gen_resp["code"],
+            "local_node_tag": peer.get("tag"),
+            "local_node_description": peer.get("tag"),
+            "local_endpoint": peer_endpoint,
+            "api_port": peer.get("api_port") or 36000,
+        }
+        import_resp = None
+        for _ in range(5):
+            import_resp = await self._post_json_async(
+                f"http://{peer_host}:8000/api/peer/import-pair-request",
+                import_payload,
+            )
+            if import_resp and import_resp.get("success"):
+                break
+            await asyncio.sleep(3)
+        if not import_resp or not import_resp.get("success"):
+            logger.warning(f"Failed to import pairing request on {peer.get('tag')}")
+            return False
+
+        response_code = import_resp.get("response_code")
+        if response_code:
+            pending_request = gen_resp.get("pending_request") or {}
+            pending_request.setdefault("code", gen_resp["code"])
+            pending_request.setdefault("node_tag", local_tag)
+            pending_request.setdefault("tunnel_type", "wireguard")
+            complete_payload = {
+                "code": response_code,
+                "pending_request": pending_request,
+            }
+            complete_resp = None
+            for _ in range(3):
+                complete_resp = await self._post_json_async(
+                    "http://127.0.0.1:8000/api/peer/complete-pairing",
+                    complete_payload,
+                )
+                if complete_resp and complete_resp.get("success"):
+                    break
+                await asyncio.sleep(2)
+            if not complete_resp or not complete_resp.get("success"):
+                logger.warning(f"Failed to complete pairing with {peer.get('tag')}")
+                return False
+
+        return True
 
     async def _get_client(self) -> RustRouterClient:
         """Create a new client instance"""
@@ -758,6 +984,29 @@ class RustRouterManager:
                     # Track synced peers
                     synced = 0
 
+                    if self._userspace_wg and peers:
+                        local_tag = self._get_local_tag_for_pairing()
+                        missing = [
+                            p for p in peers
+                            if p.get("enabled", False)
+                            and p.get("tunnel_type", "wireguard") == "wireguard"
+                            and p.get("tag") not in current_tags
+                            and local_tag < (p.get("tag") or "")
+                        ]
+                        for peer in missing:
+                            tag = peer.get("tag")
+                            if not tag or tag in self._peer_repair_attempted_tags:
+                                continue
+                            repaired = await self._repair_userspace_peer_via_api(peer)
+                            if repaired:
+                                self._peer_repair_attempted_tags.add(tag)
+                                logger.info(f"Repaired userspace peer via pairing: {tag}")
+                                synced += 1
+
+                        if missing:
+                            current_peers = await client.list_peers()
+                            current_tags = {p.tag for p in current_peers}
+
                     for peer in peers:
                         tag = peer.get("tag", "")
                         if not tag:
@@ -1100,10 +1349,10 @@ class RustRouterManager:
 
                         enabled = chain.get("enabled", False)
                         chain_state = chain.get("chain_state", "inactive")
-                        hops = chain.get("hops", [])
-                        exit_egress = chain.get("exit_egress", "")
-                        description = chain.get("description", "")
-                        allow_transitive = chain.get("allow_transitive", False)
+                        chain_config = self._build_chain_config(chain)
+                        if not chain_config or not chain_config.get("exit_egress"):
+                            result.errors.append(f"Invalid chain config for {tag}")
+                            continue
 
                         if not enabled:
                             # If chain is disabled and exists, delete it
@@ -1120,10 +1369,7 @@ class RustRouterManager:
                             # Create new chain
                             create_response = await client.create_chain(
                                 tag=tag,
-                                hops=hops,
-                                exit_egress=exit_egress,
-                                description=description,
-                                allow_transitive=allow_transitive,
+                                config=chain_config,
                             )
                             if not create_response.success:
                                 result.errors.append(f"Failed to create chain {tag}: {create_response.error}")
@@ -1213,10 +1459,10 @@ class RustRouterManager:
                     response = await client.delete_chain(chain_tag)
                     return response.success
 
-                hops = chain.get("hops", [])
-                exit_egress = chain.get("exit_egress", "")
-                description = chain.get("description", "")
-                allow_transitive = chain.get("allow_transitive", False)
+                chain_config = self._build_chain_config(chain)
+                if not chain_config or not chain_config.get("exit_egress"):
+                    logger.warning(f"Invalid chain config for {chain_tag}")
+                    return False
                 chain_state = chain.get("chain_state", "inactive")
 
                 # Check if chain exists in rust-router
@@ -1226,10 +1472,7 @@ class RustRouterManager:
                 if action == "created" or not exists:
                     response = await client.create_chain(
                         tag=chain_tag,
-                        hops=hops,
-                        exit_egress=exit_egress,
-                        description=description,
-                        allow_transitive=allow_transitive,
+                        config=chain_config,
                     )
                     if not response.success:
                         logger.warning(f"Failed to create chain {chain_tag}: {response.error}")
@@ -1249,10 +1492,10 @@ class RustRouterManager:
 
                     response = await client.update_chain(
                         tag=chain_tag,
-                        hops=hops,
-                        exit_egress=exit_egress,
-                        description=description,
-                        allow_transitive=allow_transitive,
+                        hops=chain_config["hops"],
+                        exit_egress=chain_config["exit_egress"],
+                        description=chain_config["description"],
+                        allow_transitive=chain_config["allow_transitive"],
                     )
                     if not response.success:
                         logger.warning(f"Failed to update chain {chain_tag}: {response.error}")

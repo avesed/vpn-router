@@ -4848,7 +4848,9 @@ async def _import_pair_request_via_ipc(
         )
 
         if result.success:
-            response_code = result.data.get("response_code", "") if result.data else ""
+            response_code = ""
+            if result.data:
+                response_code = result.data.get("response_code") or result.data.get("code") or ""
             remote_tag = result.data.get("remote_node_tag") if result.data else None
             return True, response_code, remote_tag, result.data or {}
         else:
@@ -4914,6 +4916,120 @@ def _run_async_ipc(coro):
     except Exception as e:
         logging.error(f"[pairing] IPC communication error: {e}")
         raise HTTPException(status_code=503, detail=f"IPC communication error: {e}")
+
+
+def _sync_userspace_peer_from_codes(
+    db,
+    request_code: Optional[str],
+    response_code: Optional[str],
+    local_tag: str,
+    local_endpoint: Optional[str] = None,
+    tunnel_status: str = "connected",
+) -> Optional[str]:
+    """Sync peer_nodes for userspace WG pairing using decoded request/response codes."""
+    if not HAS_PAIRING:
+        return None
+
+    try:
+        from peer_pairing import PairingCodeGenerator
+
+        generator = PairingCodeGenerator(db)
+        request_data = generator.decode_pairing_code(request_code) if request_code else None
+        response_data = generator.decode_pairing_code(response_code) if response_code else None
+
+        remote_tag = None
+        tunnel_type = "wireguard"
+
+        response_is_local = False
+        if response_data and response_data.get("type") == "pair_response":
+            response_node_tag = response_data.get("node_tag")
+            request_node_tag = response_data.get("request_node_tag")
+            response_is_local = response_node_tag == local_tag
+            if response_is_local:
+                remote_tag = request_node_tag
+            else:
+                remote_tag = response_node_tag
+            tunnel_type = response_data.get("tunnel_type", tunnel_type)
+        elif request_data and request_data.get("type") == "pair_request":
+            remote_tag = request_data.get("node_tag")
+            tunnel_type = request_data.get("tunnel_type", tunnel_type)
+
+        if not remote_tag or remote_tag == local_tag:
+            return None
+
+        remote_endpoint = None
+        remote_api_port = None
+        tunnel_remote_ip = None
+        tunnel_local_ip = None
+        tunnel_api_endpoint = None
+        wg_peer_public_key = None
+
+        if request_data and request_data.get("type") == "pair_request":
+            remote_endpoint = request_data.get("endpoint") or remote_endpoint
+            remote_api_port = request_data.get("api_port") or remote_api_port
+            tunnel_remote_ip = request_data.get("tunnel_ip") or tunnel_remote_ip
+            tunnel_local_ip = request_data.get("remote_tunnel_ip") or tunnel_local_ip
+            wg_peer_public_key = request_data.get("wg_public_key") or wg_peer_public_key
+            if not local_endpoint:
+                local_endpoint = request_data.get("endpoint")
+
+        if response_data and response_data.get("type") == "pair_response" and not response_is_local:
+            remote_endpoint = response_data.get("endpoint") or remote_endpoint
+            remote_api_port = response_data.get("api_port") or remote_api_port
+            tunnel_remote_ip = response_data.get("tunnel_local_ip") or tunnel_remote_ip
+            tunnel_local_ip = response_data.get("tunnel_remote_ip") or tunnel_local_ip
+            tunnel_api_endpoint = response_data.get("tunnel_api_endpoint") or tunnel_api_endpoint
+            wg_peer_public_key = response_data.get("wg_public_key") or wg_peer_public_key
+
+        if not tunnel_api_endpoint and tunnel_remote_ip and remote_api_port:
+            tunnel_api_endpoint = f"{tunnel_remote_ip}:{remote_api_port}"
+
+        local_port = None
+        if local_endpoint and ":" in local_endpoint:
+            try:
+                local_port = int(local_endpoint.rsplit(":", 1)[1])
+            except ValueError:
+                local_port = None
+
+        existing = db.get_peer_node(remote_tag)
+        if existing:
+            db.update_peer_node(
+                remote_tag,
+                endpoint=remote_endpoint or existing.get("endpoint"),
+                api_port=remote_api_port or existing.get("api_port"),
+                tunnel_type=tunnel_type,
+                tunnel_status=tunnel_status,
+                tunnel_local_ip=tunnel_local_ip or existing.get("tunnel_local_ip"),
+                tunnel_remote_ip=tunnel_remote_ip or existing.get("tunnel_remote_ip"),
+                tunnel_port=local_port or existing.get("tunnel_port"),
+                tunnel_api_endpoint=tunnel_api_endpoint or existing.get("tunnel_api_endpoint"),
+                wg_peer_public_key=wg_peer_public_key or existing.get("wg_peer_public_key"),
+                bidirectional_status="bidirectional",
+                last_error=None,
+            )
+        else:
+            db.add_peer_node(
+                tag=remote_tag,
+                name=remote_tag,
+                description="",
+                endpoint=remote_endpoint or "",
+                api_port=remote_api_port,
+                tunnel_type=tunnel_type,
+                tunnel_status=tunnel_status,
+                tunnel_local_ip=tunnel_local_ip,
+                tunnel_remote_ip=tunnel_remote_ip,
+                tunnel_port=local_port,
+                tunnel_api_endpoint=tunnel_api_endpoint,
+                wg_peer_public_key=wg_peer_public_key,
+                auto_reconnect=False,
+                enabled=True,
+                bidirectional_status="bidirectional",
+            )
+
+        return remote_tag
+    except Exception as exc:
+        logging.warning(f"[pairing] userspace peer DB sync failed: {exc}")
+        return None
 
 
 @app.get("/api/ingress")
@@ -13716,9 +13832,13 @@ def _check_peer_tunnel_status(node: dict) -> str:
 
     db_status = node.get("tunnel_status", "disconnected")
     tunnel_type = node.get("tunnel_type", "wireguard")
+    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
     # 如果数据库状态不是已连接，直接返回
     if db_status != "connected":
+        return db_status
+
+    if userspace_wg and tunnel_type == "wireguard":
         return db_status
 
     if tunnel_type == "wireguard":
@@ -14584,7 +14704,16 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
 
         # Check if tunnel was established directly (no response code needed)
         tunnel_status = response_data.get("tunnel_status")
-        bidirectional = response_data.get("bidirectional", False)
+        bidirectional = response_data.get("bidirectional", request_obj.bidirectional)
+
+        _sync_userspace_peer_from_codes(
+            db,
+            request_code=payload.code,
+            response_code=response_code_or_error,
+            local_tag=payload.local_node_tag,
+            local_endpoint=endpoint,
+            tunnel_status="connected" if bidirectional else "disconnected",
+        )
 
         logging.info(f"[pairing] 导入配对请求 (IPC): remote_tag={remote_tag}, tunnel_status={tunnel_status}")
         return ImportPairRequestResponse(
@@ -14829,6 +14958,14 @@ def api_complete_pairing(payload: CompletePairingRequest):
                 message=message_or_error,
                 created_node_tag=None
             )
+
+        _sync_userspace_peer_from_codes(
+            db,
+            request_code=payload.pending_request.get("code"),
+            response_code=payload.code,
+            local_tag=payload.pending_request.get("node_tag", ""),
+            tunnel_status="connected",
+        )
 
         logging.info(f"[pairing] 配对完成 (IPC): node_tag={peer_tag}")
         return CompletePairingResponse(

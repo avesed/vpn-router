@@ -192,3 +192,4 @@ docs/
 tests/test_1c1g_full.sh
 docker-compose.1c1g-test.yml
 AGENTS.md
+test-multi-hop/
