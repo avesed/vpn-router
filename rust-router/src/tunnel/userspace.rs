@@ -275,6 +275,7 @@ struct TunnelShared {
     /// Prevents busy loop when connecting to unreachable peers.
     #[cfg(feature = "handshake_retry")]
     handshake_tracker: HandshakeTracker,
+
 }
 
 /// Internal statistics tracking
@@ -607,10 +608,16 @@ impl UserspaceWgTunnel {
             .unwrap_or(listen_port);
         debug!("Bound UDP socket to port {}", actual_port);
 
-        // Connect socket to peer (enables send without specifying address)
-        socket.connect(peer_addr).await.map_err(|e| {
-            WgTunnelError::IoError(format!("Failed to connect UDP socket to peer: {e}"))
-        })?;
+        // Phase 11-Fix.6C: Do NOT call socket.connect()
+        // Using connected UDP sockets causes problems with ICMP errors:
+        // - When peer is not ready, we get ICMP "Port Unreachable"
+        // - This error is cached on the connected socket
+        // - All subsequent send() calls fail with "Connection refused"
+        // - Even after peer becomes ready, the socket remains broken
+        //
+        // Solution: Use unconnected socket with send_to() instead of send()
+        // This allows the socket to recover from transient errors.
+        debug!("Using unconnected UDP socket (peer: {})", peer_addr);
 
         let socket = Arc::new(socket);
 
@@ -852,7 +859,8 @@ impl UserspaceWgTunnel {
         // Process result
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
-                socket.send(encrypted).await.map_err(|e| {
+                // Phase 11-Fix.6C: Use send_to() instead of send() for unconnected socket
+                socket.send_to(encrypted, self.peer_addr_parsed).await.map_err(|e| {
                     WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
                 })?;
 
@@ -989,7 +997,8 @@ impl UserspaceWgTunnel {
 
         match result {
             TunnResult::WriteToNetwork(handshake) => {
-                socket.send(handshake).await.map_err(|e| {
+                // Phase 11-Fix.6C: Use send_to() instead of send()
+                socket.send_to(handshake, self.peer_addr_parsed).await.map_err(|e| {
                     WgTunnelError::IoError(format!("Failed to send handshake: {e}"))
                 })?;
                 debug!("Sent handshake initiation");
@@ -1016,7 +1025,7 @@ impl UserspaceWgTunnel {
     fn spawn_background_tasks(
         &self,
         socket: Arc<UdpSocket>,
-        _peer_addr: SocketAddr,
+        peer_addr: SocketAddr,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> JoinHandle<()> {
         // Clone Arc for the background task
@@ -1024,8 +1033,9 @@ impl UserspaceWgTunnel {
         let buffer_pool = Arc::clone(&self.buffer_pool);
 
         // Spawn combined background task
+        // Phase 11-Fix.6C: Pass peer_addr for send_to() calls
         tokio::spawn(async move {
-            run_background_task(socket, shutdown_rx, shared, buffer_pool).await;
+            run_background_task(socket, shutdown_rx, shared, buffer_pool, peer_addr).await;
         })
     }
 
@@ -1117,6 +1127,7 @@ async fn run_background_task(
     mut shutdown_rx: oneshot::Receiver<()>,
     shared: Arc<TunnelShared>,
     buffer_pool: Arc<UdpBufferPool>,
+    peer_addr: SocketAddr,  // Phase 11-Fix.6C: peer address for send_to()
 ) {
     let mut timer_interval = interval(Duration::from_millis(TIMER_TICK_MS));
     // Use buffer pool for receive buffer (H1 fix)
@@ -1157,11 +1168,12 @@ async fn run_background_task(
                                 if shared.handshake_tracker.can_initiate() {
                                     match shared.handshake_tracker.on_initiate() {
                                         Ok(attempt) => {
-                                            if let Err(e) = socket.send(data).await {
+                                            // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                                            if let Err(e) = socket.send_to(data, peer_addr).await {
                                                 warn!("Failed to send handshake attempt {}: {}", attempt, e);
                                                 shared.handshake_tracker.on_network_error();
                                             } else {
-                                                debug!("Sent handshake initiation attempt {} ({} bytes)", attempt, data.len());
+                                                info!("Sent handshake initiation attempt {} ({} bytes) to {}", attempt, data.len(), peer_addr);
                                             }
                                         }
                                         Err(e) => {
@@ -1181,7 +1193,8 @@ async fn run_background_task(
                                 }
                             } else {
                                 // Not a handshake init (keepalive, data, etc.) - send immediately
-                                if let Err(e) = socket.send(data).await {
+                                // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                                if let Err(e) = socket.send_to(data, peer_addr).await {
                                     warn!("Failed to send timer packet: {}", e);
                                 } else {
                                     trace!("Sent timer packet ({} bytes)", data.len());
@@ -1192,7 +1205,8 @@ async fn run_background_task(
                         // Without handshake_retry feature, send all packets immediately
                         #[cfg(not(feature = "handshake_retry"))]
                         {
-                            if let Err(e) = socket.send(data).await {
+                            // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                            if let Err(e) = socket.send_to(data, peer_addr).await {
                                 warn!("Failed to send timer packet: {}", e);
                             } else {
                                 trace!("Sent timer packet ({} bytes)", data.len());
@@ -1203,11 +1217,19 @@ async fn run_background_task(
             }
 
             // Receive incoming packets
-            result = socket.recv(&mut recv_buf) => {
+            // Phase 11-Fix.6C: Use recv_from() for unconnected socket
+            result = socket.recv_from(&mut recv_buf) => {
                 match result {
-                    Ok(len) => {
+                    Ok((len, src_addr)) => {
                         if !shared.connected.load(Ordering::Acquire) {
                             break;
+                        }
+
+                        // Validate source address matches expected peer
+                        // (basic security check - only accept packets from our peer)
+                        if src_addr != peer_addr {
+                            trace!("Ignoring packet from unexpected source: {} (expected {})", src_addr, peer_addr);
+                            continue;
                         }
 
                         // Process incoming packet
@@ -1221,6 +1243,7 @@ async fn run_background_task(
                                 result,
                                 &socket,
                                 &shared,
+                                peer_addr,  // Phase 11-Fix.6C
                             ).await;
                         }
                     }
@@ -1283,6 +1306,7 @@ async fn handle_decapsulate_result(
     result: TunnResult<'_>,
     socket: &Arc<UdpSocket>,
     shared: &Arc<TunnelShared>,
+    peer_addr: SocketAddr,  // Phase 11-Fix.6C: peer address for send_to()
 ) {
     match result {
         TunnResult::WriteToTunnelV4(data, _addr) => {
@@ -1363,10 +1387,11 @@ async fn handle_decapsulate_result(
 
         TunnResult::WriteToNetwork(response) => {
             // Need to send response (handshake response, keepalive, etc.)
-            if let Err(e) = socket.send(response).await {
+            // Phase 11-Fix.6C: Use send_to() for unconnected socket
+            if let Err(e) = socket.send_to(response, peer_addr).await {
                 warn!("Failed to send response: {}", e);
             } else {
-                trace!("Sent response ({} bytes)", response.len());
+                info!("Sent WG response ({} bytes) to {}", response.len(), peer_addr);
 
                 // Update handshake timestamp
                 let now = SystemTime::now()
@@ -1434,7 +1459,8 @@ async fn handle_decapsulate_result(
                         }
                     }
                     Some(TunnResult::WriteToNetwork(data)) => {
-                        let _ = socket.send(data).await;
+                        // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                        let _ = socket.send_to(data, peer_addr).await;
                     }
                     _ => {
                         continue_processing = false;
