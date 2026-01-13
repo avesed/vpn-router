@@ -1649,6 +1649,12 @@ class XrayManager:
             except ProcessLookupError:
                 pass
 
+            # 收割子进程，避免僵尸进程
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass  # 子进程已被收割或不存在
+
         self.process.pid = None
 
         # 清理 TUN 设备（从实例变量或数据库配置获取设备名）
@@ -2086,8 +2092,22 @@ async def main():
             logger.info("收到停止信号")
             manager.stop_daemon()
 
+        def sigchld_handler():
+            # 收割所有僵尸子进程
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                    logger.debug(f"已收割子进程: {pid}")
+                except ChildProcessError:
+                    break
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
+
+        # 添加 SIGCHLD 处理器，自动收割僵尸进程
+        loop.add_signal_handler(signal.SIGCHLD, sigchld_handler)
 
         await manager.run_daemon()
 
