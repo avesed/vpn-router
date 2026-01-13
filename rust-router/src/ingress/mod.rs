@@ -85,6 +85,7 @@ pub mod error;
 pub mod forwarder;
 pub mod manager;
 pub mod processor;
+pub mod socks5_server;
 
 // Re-export commonly used types
 pub use config::WgIngressConfig;
@@ -99,3 +100,4 @@ pub use forwarder::{
 };
 pub use manager::{WgIngressManager, WgIngressStats};
 pub use processor::{IngressProcessor, RoutingDecision};
+pub use socks5_server::{Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot};

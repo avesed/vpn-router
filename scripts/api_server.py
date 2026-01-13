@@ -8059,13 +8059,13 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
     # 如果未提供 UUID，自动生成
     user_uuid = payload.uuid or str(uuid_module.uuid4())
 
-    # 添加用户
+    # 添加用户 (VLESS only - Xray-lite, password/alter_id removed)
     user_id = db.add_v2ray_user(
         name=payload.name,
         email=payload.email,
         uuid=user_uuid,
-        password=payload.password,
-        alter_id=payload.alter_id,
+        password=None,  # VLESS doesn't use password
+        alter_id=None,  # VLESS doesn't use alter_id
         flow=payload.flow,
     )
 

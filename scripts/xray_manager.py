@@ -909,9 +909,11 @@ class XrayManager:
             # 启用统计功能（用于客户端在线检测）
             "stats": {},
             # V2Ray API 用于查询 per-user 统计数据
+            # listen 字段直接指定 gRPC 监听地址，无需额外的入站配置
             "api": {
                 "tag": "api",
-                "services": ["StatsService"]
+                "listen": f"127.0.0.1:{XRAY_INGRESS_API_PORT}",
+                "services": ["StatsService", "HandlerService", "LoggerService"]
             },
             # 策略配置：启用入站/出站统计和 per-user 统计
             "policy": {
@@ -929,29 +931,12 @@ class XrayManager:
                 }
             },
             # DNS 由 sing-box 处理（通过 SOCKS5 UDP 转发）
-            "inbounds": [
-                # API 入站 (gRPC 端口)
-                {
-                    "tag": "api",
-                    "port": XRAY_INGRESS_API_PORT,
-                    "listen": "127.0.0.1",
-                    "protocol": "dokodemo-door",
-                    "settings": {
-                        "address": "127.0.0.1"
-                    }
-                }
-            ],
+            # NOTE: API 通过 api.listen 字段直接暴露 gRPC 端口，无需额外入站
+            "inbounds": [],
             "outbounds": [],
             "routing": {
                 "domainStrategy": "AsIs",
-                "rules": [
-                    # API 路由规则
-                    {
-                        "type": "field",
-                        "inboundTag": ["api"],
-                        "outboundTag": "api"
-                    }
-                ]
+                "rules": []
             }
         }
 
@@ -978,9 +963,11 @@ class XrayManager:
                     "level": 0  # 关联到 policy.levels.0 以启用 per-user 统计
                 }
                 # XTLS-Vision flow - 只在 TCP 传输时启用 (不支持 ws/grpc/h2 等)
+                # 用户可以单独设置 flow 字段，即使全局 xtls_vision_enabled 未启用
                 transport_type = config.get("transport_type", "tcp")
-                if config.get("xtls_vision_enabled") and transport_type == "tcp":
-                    client["flow"] = user.get("flow") or "xtls-rprx-vision"
+                user_flow = user.get("flow")
+                if transport_type == "tcp" and (config.get("xtls_vision_enabled") or user_flow):
+                    client["flow"] = user_flow or "xtls-rprx-vision"
                 clients.append(client)
 
             # 添加 Peer 节点的 UUID（允许 peer 连接到本节点）
@@ -1121,27 +1108,52 @@ class XrayManager:
 
         xray_config["inbounds"].append(inbound)
 
-        # 出站配置 - 通过 SOCKS5 连接到 sing-box 路由引擎
-        # 使用 SOCKS5 代替 WireGuard，避免复杂的路由问题
-        XRAY_SOCKS_PORT = 38501  # sing-box 的 SOCKS5 入站端口 (xray-in)，避免与 WARP SOCKS (38001+) 冲突
-        xray_config["outbounds"].append({
-            "tag": "socks-out",
-            "protocol": "socks",
-            "settings": {
-                "servers": [{
-                    "address": "127.0.0.1",
-                    "port": XRAY_SOCKS_PORT
-                }]
-            }
-        })
-        logger.info(f"Xray 配置 SOCKS5 出站: 127.0.0.1:{XRAY_SOCKS_PORT}")
-
-        # 直连出口（备用）
-        xray_config["outbounds"].append({
-            "tag": "freedom",
-            "protocol": "freedom",
-            "settings": {}
-        })
+        # 出站配置
+        # 检查是否启用 rust-router SOCKS5 入站
+        rust_router_socks5_enabled = os.environ.get("RUST_ROUTER_SOCKS5_INBOUND", "").lower() == "true"
+        XRAY_SOCKS_PORT = 38501  # rust-router 的 SOCKS5 入站端口
+        
+        if rust_router_socks5_enabled:
+            # rust-router 模式：socks-out 作为第一个 outbound（默认出站）
+            # 这样所有未匹配规则的流量都会走 rust-router 进行域名路由
+            xray_config["outbounds"].append({
+                "tag": "socks-out",
+                "protocol": "socks",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": XRAY_SOCKS_PORT
+                    }]
+                }
+            })
+            logger.info(f"Xray 配置 SOCKS5 出站: 127.0.0.1:{XRAY_SOCKS_PORT} (默认出站，rust-router 域名路由)")
+            
+            # freedom 作为备用出站
+            xray_config["outbounds"].append({
+                "tag": "freedom",
+                "protocol": "freedom",
+                "settings": {}
+            })
+        else:
+            # 直连模式：freedom 作为第一个 outbound（默认出站）
+            xray_config["outbounds"].append({
+                "tag": "freedom",
+                "protocol": "freedom",
+                "settings": {}
+            })
+            
+            # SOCKS5 作为备用出站
+            xray_config["outbounds"].append({
+                "tag": "socks-out",
+                "protocol": "socks",
+                "settings": {
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": XRAY_SOCKS_PORT
+                    }]
+                }
+            })
+            logger.info(f"Xray 配置 SOCKS5 出站: 127.0.0.1:{XRAY_SOCKS_PORT} (备用)")
 
         # ============ Peer 节点出站配置 ============
         # 为每个需要连接的 peer 节点创建:
@@ -1443,7 +1455,10 @@ class XrayManager:
         if entry_count > 0:
             logger.info(f"共添加 {entry_count} 条入口链路配置")
 
-        # 路由配置已在上面添加，默认流量走 socks-out 到 sing-box
+        # v2ray-in 的路由通过默认 outbound 处理（第一个 outbound）
+        # 如果启用了 rust-router，socks-out 是第一个 outbound
+        # 否则 freedom 是第一个 outbound
+        # 不需要显式添加 inboundTag 路由规则，因为 Xray 存在 inboundTag 匹配问题
 
         return xray_config
 

@@ -1,11 +1,15 @@
 syntax = "proto3";
 
-package v2ray.core.app.stats.command;
+// Package name uses xray namespace to match xray-lite's native proto.
+// This ensures gRPC service discovery works correctly with xray-lite.
+package xray.app.stats.command;
 
-option go_package = "github.com/sagernet/sing-box/experimental/v2rayapi";
+option go_package = "github.com/xtls/xray-core/app/stats/command";
 
 message GetStatsRequest {
+  // Name of the stat counter.
   string name = 1;
+  // Whether or not to reset the counter after fetching its value.
   bool reset = 2;
 }
 
@@ -19,10 +23,10 @@ message GetStatsResponse {
 }
 
 message QueryStatsRequest {
-  string pattern = 1 [deprecated = true];
+  // Pattern to match stat names (supports wildcards).
+  string pattern = 1;
+  // Whether or not to reset the counters after fetching their values.
   bool reset = 2;
-  repeated string patterns = 3;
-  bool regexp = 4;
 }
 
 message QueryStatsResponse {
@@ -44,8 +48,15 @@ message SysStatsResponse {
   uint32 Uptime = 10;
 }
 
+message GetStatsOnlineIpListResponse {
+  string name = 1;
+  map<string, int64> ips = 2;
+}
+
 service StatsService {
-  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
-  rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse);
-  rpc GetSysStats(SysStatsRequest) returns (SysStatsResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
+  rpc GetStatsOnline(GetStatsRequest) returns (GetStatsResponse) {}
+  rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse) {}
+  rpc GetSysStats(SysStatsRequest) returns (SysStatsResponse) {}
+  rpc GetStatsOnlineIpList(GetStatsRequest) returns (GetStatsOnlineIpListResponse) {}
 }

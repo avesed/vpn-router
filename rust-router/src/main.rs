@@ -235,6 +235,10 @@ struct Phase6Config {
     wg_local_ip: IpAddr,
     /// Enable batch I/O for userspace WireGuard ingress
     wg_batch_io: bool,
+    /// Enable SOCKS5 inbound server for Xray integration
+    socks5_inbound_enabled: bool,
+    /// SOCKS5 inbound listen port
+    socks5_inbound_port: u16,
 }
 
 impl Phase6Config {
@@ -270,6 +274,16 @@ impl Phase6Config {
             .map(|v| v == "true")
             .unwrap_or(false);
 
+        // SOCKS5 inbound for Xray integration (default: disabled)
+        let socks5_inbound_enabled = std::env::var("RUST_ROUTER_SOCKS5_INBOUND")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let socks5_inbound_port = std::env::var("RUST_ROUTER_SOCKS5_INBOUND_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(38501);
+
         Self {
             userspace_wg,
             wg_listen_port,
@@ -278,6 +292,8 @@ impl Phase6Config {
             node_tag,
             wg_local_ip,
             wg_batch_io,
+            socks5_inbound_enabled,
+            socks5_inbound_port,
         }
     }
 
@@ -700,6 +716,40 @@ async fn main() -> Result<()> {
     );
 
     // ========================================================================
+    // SOCKS5 Inbound Server (for Xray integration)
+    // ========================================================================
+    let socks5_server_handle: Option<tokio::task::JoinHandle<()>> = if phase6_config.socks5_inbound_enabled {
+        use rust_router::ingress::{Socks5Server, Socks5ServerConfig};
+
+        let socks5_config = Socks5ServerConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), phase6_config.socks5_inbound_port),
+            ..Default::default()
+        };
+
+        let socks5_server = Socks5Server::new(
+            socks5_config,
+            Arc::clone(&rule_engine),
+            Arc::clone(&outbound_manager),
+        );
+
+        info!(
+            "SOCKS5 inbound server starting on 127.0.0.1:{}",
+            phase6_config.socks5_inbound_port
+        );
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = socks5_server.run().await {
+                error!("SOCKS5 inbound server error: {}", e);
+            }
+        });
+
+        Some(handle)
+    } else {
+        debug!("SOCKS5 inbound server not enabled (set RUST_ROUTER_SOCKS5_INBOUND=true to enable)");
+        None
+    };
+
+    // ========================================================================
     // Phase 6: Start userspace WireGuard ingress if enabled
     // ========================================================================
     // Track forwarding task handle for graceful shutdown
@@ -831,6 +881,16 @@ async fn main() -> Result<()> {
     ).await;
 
     info!("DNS servers shutdown complete");
+
+    // ========================================================================
+    // Shutdown SOCKS5 inbound server if running
+    // ========================================================================
+    if let Some(handle) = socks5_server_handle {
+        info!("Shutting down SOCKS5 inbound server...");
+        handle.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        info!("SOCKS5 inbound server shutdown complete");
+    }
 
     // ========================================================================
     // Phase 6: Shutdown WireGuard ingress if running

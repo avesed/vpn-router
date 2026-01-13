@@ -2241,6 +2241,99 @@ async fn forward_tcp_packet(
     }
 }
 
+/// DNS hijacking statistics
+#[derive(Debug, Default)]
+pub struct DnsHijackStats {
+    /// Total DNS queries hijacked
+    pub queries_hijacked: AtomicU64,
+    /// Successful DNS responses sent back to client
+    pub responses_sent: AtomicU64,
+    /// DNS queries that failed to get a response from local engine
+    pub query_failures: AtomicU64,
+    /// DNS responses that failed to send to client
+    pub send_failures: AtomicU64,
+}
+
+impl DnsHijackStats {
+    /// Create a new DNS hijack stats tracker
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get a snapshot of current statistics
+    pub fn snapshot(&self) -> DnsHijackStatsSnapshot {
+        DnsHijackStatsSnapshot {
+            queries_hijacked: self.queries_hijacked.load(Ordering::Relaxed),
+            responses_sent: self.responses_sent.load(Ordering::Relaxed),
+            query_failures: self.query_failures.load(Ordering::Relaxed),
+            send_failures: self.send_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Snapshot of DNS hijack statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsHijackStatsSnapshot {
+    pub queries_hijacked: u64,
+    pub responses_sent: u64,
+    pub query_failures: u64,
+    pub send_failures: u64,
+}
+
+/// Local DNS engine address
+const LOCAL_DNS_ENGINE_ADDR: &str = "127.0.0.1:7853";
+
+/// DNS hijacking timeout for queries to local engine
+const DNS_HIJACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Query the local DNS engine and return the response
+///
+/// This function sends a DNS query to the local DNS engine (127.0.0.1:7853)
+/// and waits for a response. Used for DNS hijacking in userspace WireGuard mode.
+///
+/// # Arguments
+///
+/// * `query_payload` - The raw DNS query payload (UDP payload, not including IP/UDP headers)
+///
+/// # Returns
+///
+/// The DNS response payload on success, or an error message on failure.
+async fn query_local_dns_engine(query_payload: &[u8]) -> Result<Vec<u8>, String> {
+    // Create a UDP socket to talk to local DNS engine
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("Failed to bind DNS socket: {}", e))?;
+
+    let dns_addr: SocketAddr = LOCAL_DNS_ENGINE_ADDR
+        .parse()
+        .map_err(|e| format!("Invalid DNS engine address: {}", e))?;
+
+    // Send query to local DNS engine
+    socket
+        .send_to(query_payload, dns_addr)
+        .await
+        .map_err(|e| format!("Failed to send DNS query: {}", e))?;
+
+    // Wait for response with timeout
+    let mut response_buf = vec![0u8; 4096];
+    match tokio::time::timeout(DNS_HIJACK_TIMEOUT, socket.recv_from(&mut response_buf)).await {
+        Ok(Ok((n, _addr))) => {
+            response_buf.truncate(n);
+            Ok(response_buf)
+        }
+        Ok(Err(e)) => Err(format!("DNS recv error: {}", e)),
+        Err(_) => Err("DNS query timeout".to_string()),
+    }
+}
+
+/// Global DNS hijack statistics (lazily initialized)
+static DNS_HIJACK_STATS: Lazy<DnsHijackStats> = Lazy::new(DnsHijackStats::new);
+
+/// Get a reference to the global DNS hijack statistics
+pub fn dns_hijack_stats() -> &'static DnsHijackStats {
+    &DNS_HIJACK_STATS
+}
+
 /// Forward a UDP packet to the appropriate outbound
 async fn forward_udp_packet(
     processed: &ProcessedPacket,
@@ -2264,6 +2357,107 @@ async fn forward_udp_packet(
         stats.forward_errors.fetch_add(1, Ordering::Relaxed);
         return;
     };
+
+    // =========================================================================
+    // DNS Hijacking: Intercept DNS queries (port 53) and forward to local engine
+    // =========================================================================
+    // This enables domain-based routing in userspace WireGuard mode where
+    // iptables TPROXY rules are not available to redirect DNS traffic.
+    if dst_port == 53 {
+        // Extract UDP payload (DNS query)
+        let payload_offset = parsed.ip_header_len + 8; // IP header + 8 bytes UDP header
+        if processed.data.len() > payload_offset {
+            let dns_query = &processed.data[payload_offset..];
+            
+            DNS_HIJACK_STATS.queries_hijacked.fetch_add(1, Ordering::Relaxed);
+            info!(
+                "DNS hijack: {}:{} -> {}:{} (query {} bytes)",
+                parsed.src_ip, src_port, parsed.dst_ip, dst_port, dns_query.len()
+            );
+
+            // Query the local DNS engine
+            match query_local_dns_engine(dns_query).await {
+                Ok(dns_response) => {
+                    debug!(
+                        "DNS hijack got response: {} bytes for {}:{} -> {}:{}",
+                        dns_response.len(), parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                    );
+
+                    // Build reply packet: swap src/dst to send response back to client
+                    // The response appears to come from the original DNS server (dst_ip:53)
+                    let reply_packet = match (parsed.dst_ip, parsed.src_ip) {
+                        (IpAddr::V4(server_ip), IpAddr::V4(client_ip)) => {
+                            build_udp_reply_packet(
+                                server_ip,    // Reply from: original DNS server IP
+                                dst_port,     // Reply from: port 53
+                                client_ip,    // Reply to: client IP
+                                src_port,     // Reply to: client's source port
+                                &dns_response,
+                            )
+                        }
+                        (IpAddr::V6(server_ip), IpAddr::V6(client_ip)) => {
+                            build_udp_reply_packet_v6(
+                                server_ip,
+                                dst_port,
+                                client_ip,
+                                src_port,
+                                &dns_response,
+                            )
+                        }
+                        _ => {
+                            warn!("DNS hijack: IP version mismatch, dropping");
+                            DNS_HIJACK_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
+
+                    // Send reply back to the WireGuard client through the reply channel
+                    if let Some(ref reply_tx) = direct_reply_tx {
+                        // Register session so the reply router can find the peer
+                        let five_tuple = FiveTuple::new(
+                            parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP
+                        );
+                        session_tracker.register(
+                            five_tuple,
+                            processed.peer_public_key.clone(),
+                            processed.src_addr,
+                            "dns-hijack".to_string(), // Special tag for DNS hijack
+                            parsed.total_len as u64,
+                        );
+
+                        let reply = ReplyPacket {
+                            packet: reply_packet,
+                            tunnel_tag: "dns-hijack".to_string(),
+                        };
+
+                        if let Err(e) = reply_tx.try_send(reply) {
+                            warn!("DNS hijack: failed to send reply to router: {}", e);
+                            DNS_HIJACK_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            info!(
+                                "DNS hijack: sent {} byte response to {}:{}",
+                                dns_response.len(), parsed.src_ip, src_port
+                            );
+                            DNS_HIJACK_STATS.responses_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        warn!("DNS hijack: no reply channel available");
+                        DNS_HIJACK_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    warn!("DNS hijack: query to local engine failed: {}", e);
+                    DNS_HIJACK_STATS.query_failures.fetch_add(1, Ordering::Relaxed);
+                    // Fall through to normal forwarding as fallback
+                    // This allows DNS to still work if local engine is down
+                }
+            }
+            // DNS hijack handled (or fell through on error), return
+            return;
+        } else {
+            warn!("DNS hijack: packet too short for payload");
+        }
+    }
 
     // Register session for reply routing
     let five_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP);
