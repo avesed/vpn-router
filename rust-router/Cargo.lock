@@ -1694,6 +1694,7 @@ dependencies = [
  "moka",
  "nix 0.29.0",
  "num_cpus",
+ "once_cell",
  "parking_lot",
  "rand",
  "regex",

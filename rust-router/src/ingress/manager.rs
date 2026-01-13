@@ -461,7 +461,8 @@ pub struct WgIngressManager {
     state: RwLock<IngressState>,
 
     /// Registered peers (`public_key` -> peer info)
-    peers: RwLock<HashMap<String, Arc<RegisteredPeer>>>,
+    /// Wrapped in Arc so it can be shared with the packet loop task
+    peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
 
     /// Statistics
     stats: Arc<StatsInner>,
@@ -545,7 +546,7 @@ impl WgIngressManager {
             private_key,
             processor,
             state: RwLock::new(IngressState::Created),
-            peers: RwLock::new(HashMap::new()),
+            peers: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(StatsInner::default()),
             socket: RwLock::new(None),
             shutdown_tx: RwLock::new(None),
@@ -644,11 +645,8 @@ impl WgIngressManager {
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
         *self.packet_rx.lock().await = Some(packet_rx);
 
-        // Clone peers map for the background task
-        let task_peers = {
-            let peers = self.peers.read();
-            peers.clone()
-        };
+        // Share peers reference with the background task (not a copy!)
+        let task_peers = Arc::clone(&self.peers);
 
         // Spawn background task
         let task_socket = Arc::clone(&socket);
@@ -998,7 +996,7 @@ impl WgIngressManager {
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
         config: WgIngressConfig,
-        peers: HashMap<String, Arc<RegisteredPeer>>,
+        peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
         packet_tx: mpsc::Sender<ProcessedPacket>,
         shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -1039,7 +1037,7 @@ impl WgIngressManager {
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
         config: WgIngressConfig,
-        peers: HashMap<String, Arc<RegisteredPeer>>,
+        peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
         packet_tx: mpsc::Sender<ProcessedPacket>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -1058,6 +1056,8 @@ impl WgIngressManager {
                 result = socket.recv_from(&mut recv_buf) => {
                     match result {
                         Ok((len, src_addr)) => {
+                            // Get current peers snapshot for this packet
+                            let peers_snapshot = peers.read().clone();
                             Self::process_single_packet(
                                 &recv_buf[..len],
                                 src_addr,
@@ -1065,7 +1065,7 @@ impl WgIngressManager {
                                 &processor,
                                 &stats,
                                 &config,
-                                &peers,
+                                &peers_snapshot,
                                 &packet_tx,
                                 &mut decrypt_buf,
                             ).await;
@@ -1088,7 +1088,7 @@ impl WgIngressManager {
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
         config: WgIngressConfig,
-        peers: HashMap<String, Arc<RegisteredPeer>>,
+        peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
         packet_tx: mpsc::Sender<ProcessedPacket>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -1127,6 +1127,8 @@ impl WgIngressManager {
                     // Try to receive a batch of packets
                     match batch_receiver.recv_batch() {
                         Ok(packets) => {
+                            // Get current peers snapshot for this batch
+                            let peers_snapshot = peers.read().clone();
                             for received in packets {
                                 Self::process_single_packet(
                                     &received.data[..received.len],
@@ -1135,7 +1137,7 @@ impl WgIngressManager {
                                     &processor,
                                     &stats,
                                     &config,
-                                    &peers,
+                                    &peers_snapshot,
                                     &packet_tx,
                                     &mut decrypt_buf,
                                 ).await;

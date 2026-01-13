@@ -186,11 +186,19 @@ impl Default for RoutingDecision {
 ///
 /// The processor is thread-safe and can be shared across multiple tasks.
 /// It uses `Arc<RuleEngine>` for lock-free rule matching.
+///
+/// # Domain Resolution
+///
+/// The processor can be configured with an `IpDomainCache` to enable
+/// domain-based routing for WireGuard ingress traffic. When set, destination
+/// IP addresses are looked up in the cache to find the associated domain name.
 pub struct IngressProcessor {
     /// Rule engine for routing decisions
     rule_engine: Arc<RuleEngine>,
     /// Optional chain manager for terminal routing decisions
     chain_manager: Arc<RwLock<Option<Arc<ChainManager>>>>,
+    /// Optional IP-to-domain cache for domain-based routing
+    dns_cache: Arc<RwLock<Option<Arc<super::dns_cache::IpDomainCache>>>>,
 }
 
 impl IngressProcessor {
@@ -211,7 +219,26 @@ impl IngressProcessor {
         Self {
             rule_engine,
             chain_manager: Arc::new(RwLock::new(None)),
+            dns_cache: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set the IP-to-domain cache for domain-based routing
+    ///
+    /// When set, destination IP addresses will be looked up in this cache
+    /// to find associated domain names for rule matching.
+    pub fn set_dns_cache(&self, dns_cache: Arc<super::dns_cache::IpDomainCache>) {
+        *self.dns_cache.write() = Some(dns_cache);
+    }
+
+    /// Clear the DNS cache
+    pub fn clear_dns_cache(&self) {
+        *self.dns_cache.write() = None;
+    }
+
+    /// Get a reference to the DNS cache (if set)
+    pub fn dns_cache(&self) -> Option<Arc<super::dns_cache::IpDomainCache>> {
+        self.dns_cache.read().clone()
     }
 
     /// Process a decrypted packet and return a routing decision
@@ -426,14 +453,28 @@ impl IngressProcessor {
             }
         };
 
+        // Look up domain from DNS cache if available
+        let domain = self.lookup_domain(IpAddr::V4(dest_ip));
+        if domain.is_some() {
+            trace!(dest_ip = %dest_ip, domain = ?domain, "Resolved domain from DNS cache");
+        }
+
         Ok(ConnectionInfo {
-            domain: None,
+            domain,
             dest_ip: Some(IpAddr::V4(dest_ip)),
             dest_port,
             source_ip: Some(IpAddr::V4(src_ip)),
             protocol: protocol_str,
             sniffed_protocol: None,
         })
+    }
+
+    /// Look up a domain name for an IP address from the DNS cache
+    fn lookup_domain(&self, ip: IpAddr) -> Option<String> {
+        self.dns_cache
+            .read()
+            .as_ref()
+            .and_then(|cache| cache.get(&ip))
     }
 
     /// Extract connection info from IPv6 packet
@@ -527,8 +568,14 @@ impl IngressProcessor {
             }
         };
 
+        // Look up domain from DNS cache if available
+        let domain = self.lookup_domain(IpAddr::V6(dest_ip));
+        if domain.is_some() {
+            trace!(dest_ip = %dest_ip, domain = ?domain, "Resolved domain from DNS cache (IPv6)");
+        }
+
         Ok(ConnectionInfo {
-            domain: None,
+            domain,
             dest_ip: Some(IpAddr::V6(dest_ip)),
             dest_port,
             source_ip: Some(IpAddr::V6(src_ip)),

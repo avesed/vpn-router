@@ -733,7 +733,20 @@ async fn main() -> Result<()> {
                 );
                 let fwd_stats = Arc::clone(&forwarding_stats);
 
+                // Create IP-to-domain cache for domain-based routing
+                // This cache is populated by parsing DNS responses
+                let dns_cache = Arc::new(rust_router::ingress::IpDomainCache::new(
+                    10000, // Max 10,000 IP-domain mappings
+                    300,   // Default TTL: 5 minutes
+                ));
+                info!("IP-domain cache enabled for WireGuard ingress routing");
+
+                // Set DNS cache on the processor for domain lookups
+                ingress_mgr.processor().set_dns_cache(Arc::clone(&dns_cache));
+
                 let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1024);
+                // Clone reply_tx for direct UDP reply handling before storing in reply_router_tx
+                let direct_reply_tx = reply_tx.clone();
                 *reply_router_tx.write() = Some(reply_tx);
 
                 let reply_handle = rust_router::ingress::spawn_reply_router(
@@ -741,6 +754,7 @@ async fn main() -> Result<()> {
                     Arc::clone(ingress_mgr),
                     Arc::clone(&session_tracker),
                     Arc::clone(&reply_stats),
+                    Some(dns_cache), // Pass DNS cache to reply router for parsing DNS responses
                 );
 
                 let forward_handle = rust_router::ingress::spawn_forwarding_task(
@@ -750,6 +764,7 @@ async fn main() -> Result<()> {
                     tcp_manager,
                     session_tracker,
                     Arc::clone(&fwd_stats),
+                    Some(direct_reply_tx), // Enable direct UDP reply handling
                 );
 
                 info!("Ingress reply router task started");

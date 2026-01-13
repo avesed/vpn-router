@@ -80,6 +80,7 @@
 //! - `WireGuard` Protocol: <https://www.wireguard.com/protocol/>
 
 pub mod config;
+pub mod dns_cache;
 pub mod error;
 pub mod forwarder;
 pub mod manager;
@@ -87,6 +88,7 @@ pub mod processor;
 
 // Re-export commonly used types
 pub use config::WgIngressConfig;
+pub use dns_cache::{IpDomainCache, IpDomainCacheStats, IpDomainCacheStatsSnapshot};
 pub use error::IngressError;
 pub use forwarder::{
     parse_ip_packet, parse_tcp_details, run_forwarding_loop, run_reply_router_loop,

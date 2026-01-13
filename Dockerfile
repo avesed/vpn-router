@@ -175,14 +175,14 @@ RUN touch src/main.rs src/lib.rs && \
     ls -lh target/release/rust-router
 
 # ==========================================
-# Stage 5: Build Frontend
+# Stage 5: Build Frontend (shadcn/ui rebuild)
 # ==========================================
 FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app
-COPY frontend/package*.json ./
+COPY frontend-new/package*.json ./
 RUN npm ci
-COPY frontend/ ./
+COPY frontend-new/ ./
 RUN npm run build
 
 # ==========================================
@@ -281,7 +281,7 @@ RUN chmod +x /usr/local/bin/rust-router && \
 COPY --from=frontend-builder /app/dist /var/www/html
 
 # Copy nginx configuration template (processed by entrypoint.sh with envsubst)
-COPY frontend/nginx.conf.template /etc/nginx/nginx.conf.template
+COPY frontend-new/nginx.conf.template /etc/nginx/nginx.conf.template
 
 # Configure nginx (use conf.d for dynamic config generation)
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default && \

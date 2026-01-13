@@ -50,8 +50,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, trace, warn};
@@ -68,6 +69,10 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_ICMPV6: u8 = 58;
+
+/// Global storage for TCP write halves (used for forwarding client data to server)
+static TCP_WRITE_HALVES: Lazy<DashMap<FiveTuple, Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TcpStream>>>>> =
+    Lazy::new(DashMap::new);
 
 // ============================================================================
 // TCP Connection Tracking (Phase 3)
@@ -902,6 +907,342 @@ impl ForwardingStatsSnapshot {
     }
 }
 
+// ============================================================================
+// Direct UDP Reply Packet Building
+// ============================================================================
+
+/// Build a UDP reply packet with IP and UDP headers.
+///
+/// This function creates a complete IPv4 UDP packet that can be sent to the
+/// reply router. It's used for direct outbound UDP replies where we need to
+/// reconstruct the IP packet from the raw UDP payload received from the destination.
+///
+/// # Arguments
+///
+/// * `src_ip` - Source IP (the destination that sent the reply)
+/// * `src_port` - Source port (the destination port that sent the reply)
+/// * `dst_ip` - Destination IP (the original client IP)
+/// * `dst_port` - Destination port (the original client port)
+/// * `payload` - The UDP payload data
+///
+/// # Returns
+///
+/// A complete IPv4 UDP packet as a `Vec<u8>`.
+fn build_udp_reply_packet(
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let total_len = 20 + udp_len;
+
+    let mut packet = vec![0u8; total_len];
+
+    // IPv4 header (20 bytes minimum)
+    packet[0] = 0x45; // Version 4, IHL 5 (20 bytes)
+    packet[1] = 0x00; // DSCP/ECN
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes()); // Total length
+    packet[4..6].copy_from_slice(&[0x00, 0x00]); // Identification
+    packet[6..8].copy_from_slice(&[0x40, 0x00]); // Don't fragment flag
+    packet[8] = 64; // TTL
+    packet[9] = IPPROTO_UDP; // Protocol
+    // Checksum calculated below
+    packet[12..16].copy_from_slice(&src_ip.octets()); // Source IP
+    packet[16..20].copy_from_slice(&dst_ip.octets()); // Dest IP
+
+    // Calculate IPv4 header checksum
+    let checksum = ipv4_header_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    // UDP header (8 bytes)
+    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // UDP checksum left as 0 (optional for IPv4)
+
+    // Payload
+    if !payload.is_empty() {
+        packet[28..].copy_from_slice(payload);
+    }
+
+    packet
+}
+
+/// Build a UDP reply packet for IPv6.
+///
+/// Similar to `build_udp_reply_packet` but for IPv6 addresses.
+fn build_udp_reply_packet_v6(
+    src_ip: Ipv6Addr,
+    src_port: u16,
+    dst_ip: Ipv6Addr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let total_len = 40 + udp_len; // IPv6 header is 40 bytes
+
+    let mut packet = vec![0u8; total_len];
+
+    // IPv6 header (40 bytes)
+    packet[0] = 0x60; // Version 6
+    // packet[1..4] = Traffic class + flow label (left as 0)
+    packet[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes()); // Payload length
+    packet[6] = IPPROTO_UDP; // Next header
+    packet[7] = 64; // Hop limit
+    packet[8..24].copy_from_slice(&src_ip.octets()); // Source IP
+    packet[24..40].copy_from_slice(&dst_ip.octets()); // Dest IP
+
+    // UDP header (8 bytes)
+    packet[40..42].copy_from_slice(&src_port.to_be_bytes());
+    packet[42..44].copy_from_slice(&dst_port.to_be_bytes());
+    packet[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // UDP checksum required for IPv6, but we'll leave as 0 for now
+    // (WireGuard will recalculate anyway)
+
+    // Payload
+    if !payload.is_empty() {
+        packet[48..].copy_from_slice(payload);
+    }
+
+    packet
+}
+
+/// Calculate IPv4 header checksum.
+fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for i in (0..header.len()).step_by(2) {
+        if i == 10 {
+            // Skip checksum field
+            continue;
+        }
+        let word = if i + 1 < header.len() {
+            u16::from_be_bytes([header[i], header[i + 1]])
+        } else {
+            u16::from_be_bytes([header[i], 0])
+        };
+        sum = sum.wrapping_add(u32::from(word));
+    }
+    // Fold 32-bit sum to 16 bits
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+// ============================================================================
+// TCP Packet Building
+// ============================================================================
+
+/// TCP flags constants
+pub mod tcp_flag_bits {
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const PSH: u8 = 0x08;
+    pub const ACK: u8 = 0x10;
+}
+
+/// Build a TCP packet with IP header.
+///
+/// Creates a complete IPv4 TCP packet for sending back to the WireGuard client.
+///
+/// # Arguments
+///
+/// * `src_ip` - Source IP address (server)
+/// * `src_port` - Source port (server)
+/// * `dst_ip` - Destination IP address (client)
+/// * `dst_port` - Destination port (client)
+/// * `seq_num` - TCP sequence number
+/// * `ack_num` - TCP acknowledgment number
+/// * `flags` - TCP flags (SYN, ACK, FIN, etc.)
+/// * `window` - TCP window size
+/// * `payload` - TCP payload data
+fn build_tcp_packet(
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+    seq_num: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let tcp_header_len = 20; // No options
+    let tcp_len = tcp_header_len + payload.len();
+    let total_len = 20 + tcp_len; // IP header + TCP
+
+    let mut packet = vec![0u8; total_len];
+
+    // IPv4 header (20 bytes)
+    packet[0] = 0x45; // Version 4, IHL 5
+    packet[1] = 0x00; // DSCP/ECN
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&rand::random::<u16>().to_be_bytes()); // ID
+    packet[6..8].copy_from_slice(&[0x40, 0x00]); // Don't fragment
+    packet[8] = 64; // TTL
+    packet[9] = IPPROTO_TCP;
+    // Checksum calculated below
+    packet[12..16].copy_from_slice(&src_ip.octets());
+    packet[16..20].copy_from_slice(&dst_ip.octets());
+
+    // Calculate IP header checksum
+    let ip_checksum = ipv4_header_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    // TCP header (20 bytes minimum)
+    let tcp_start = 20;
+    packet[tcp_start..tcp_start + 2].copy_from_slice(&src_port.to_be_bytes());
+    packet[tcp_start + 2..tcp_start + 4].copy_from_slice(&dst_port.to_be_bytes());
+    packet[tcp_start + 4..tcp_start + 8].copy_from_slice(&seq_num.to_be_bytes());
+    packet[tcp_start + 8..tcp_start + 12].copy_from_slice(&ack_num.to_be_bytes());
+    packet[tcp_start + 12] = (tcp_header_len as u8 / 4) << 4; // Data offset
+    packet[tcp_start + 13] = flags;
+    packet[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
+    // Checksum calculated below
+    // Urgent pointer = 0
+
+    // Copy payload
+    if !payload.is_empty() {
+        packet[tcp_start + 20..].copy_from_slice(payload);
+    }
+
+    // Calculate TCP checksum (includes pseudo-header)
+    let tcp_checksum = tcp_checksum(&packet[tcp_start..], src_ip, dst_ip);
+    packet[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+    packet
+}
+
+/// Calculate TCP checksum including pseudo-header.
+fn tcp_checksum(tcp_segment: &[u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Pseudo-header
+    let src = src_ip.octets();
+    let dst = dst_ip.octets();
+    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([src[0], src[1]])));
+    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([src[2], src[3]])));
+    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([dst[0], dst[1]])));
+    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([dst[2], dst[3]])));
+    sum = sum.wrapping_add(u32::from(IPPROTO_TCP)); // Protocol
+    sum = sum.wrapping_add(tcp_segment.len() as u32); // TCP length
+
+    // TCP segment (skip checksum field at offset 16-17)
+    for i in (0..tcp_segment.len()).step_by(2) {
+        if i == 16 {
+            continue; // Skip checksum field
+        }
+        let word = if i + 1 < tcp_segment.len() {
+            u16::from_be_bytes([tcp_segment[i], tcp_segment[i + 1]])
+        } else {
+            u16::from_be_bytes([tcp_segment[i], 0])
+        };
+        sum = sum.wrapping_add(u32::from(word));
+    }
+
+    // Fold to 16 bits
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+// ============================================================================
+// ICMP Packet Building
+// ============================================================================
+
+/// ICMP types
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+
+/// Build an ICMP Echo Reply packet.
+///
+/// Used to construct reply packets from ICMP echo responses received from the network.
+fn build_icmp_reply_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    id: u16,
+    seq: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let icmp_len = 8 + payload.len(); // ICMP header (8) + payload
+    let total_len = 20 + icmp_len;
+
+    let mut packet = vec![0u8; total_len];
+
+    // IPv4 header (20 bytes)
+    packet[0] = 0x45;
+    packet[1] = 0x00;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&rand::random::<u16>().to_be_bytes());
+    packet[6..8].copy_from_slice(&[0x40, 0x00]);
+    packet[8] = 64; // TTL
+    packet[9] = IPPROTO_ICMP;
+    packet[12..16].copy_from_slice(&src_ip.octets());
+    packet[16..20].copy_from_slice(&dst_ip.octets());
+
+    let ip_checksum = ipv4_header_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    // ICMP header
+    let icmp_start = 20;
+    packet[icmp_start] = ICMP_ECHO_REPLY; // Type
+    packet[icmp_start + 1] = 0; // Code
+    // Checksum calculated below
+    packet[icmp_start + 4..icmp_start + 6].copy_from_slice(&id.to_be_bytes());
+    packet[icmp_start + 6..icmp_start + 8].copy_from_slice(&seq.to_be_bytes());
+
+    // Payload
+    if !payload.is_empty() {
+        packet[icmp_start + 8..].copy_from_slice(payload);
+    }
+
+    // ICMP checksum
+    let icmp_checksum = icmp_checksum(&packet[icmp_start..]);
+    packet[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    packet
+}
+
+/// Calculate ICMP checksum.
+fn icmp_checksum(icmp_data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for i in (0..icmp_data.len()).step_by(2) {
+        if i == 2 {
+            continue; // Skip checksum field
+        }
+        let word = if i + 1 < icmp_data.len() {
+            u16::from_be_bytes([icmp_data[i], icmp_data[i + 1]])
+        } else {
+            u16::from_be_bytes([icmp_data[i], 0])
+        };
+        sum = sum.wrapping_add(u32::from(word));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Parse ICMP Echo Request to extract ID and sequence number.
+fn parse_icmp_echo(packet: &[u8], ip_header_len: usize) -> Option<(u8, u8, u16, u16, Vec<u8>)> {
+    let icmp_start = ip_header_len;
+    if packet.len() < icmp_start + 8 {
+        return None;
+    }
+
+    let icmp_type = packet[icmp_start];
+    let icmp_code = packet[icmp_start + 1];
+    let id = u16::from_be_bytes([packet[icmp_start + 4], packet[icmp_start + 5]]);
+    let seq = u16::from_be_bytes([packet[icmp_start + 6], packet[icmp_start + 7]]);
+    let payload = packet[icmp_start + 8..].to_vec();
+
+    Some((icmp_type, icmp_code, id, seq, payload))
+}
+
 /// Parsed IP packet information
 #[derive(Debug, Clone)]
 pub struct ParsedPacket {
@@ -1214,6 +1555,7 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 /// * `tcp_manager` - TCP connection manager for stateful connection tracking
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
+/// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 pub async fn run_forwarding_loop(
     mut packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
@@ -1221,6 +1563,7 @@ pub async fn run_forwarding_loop(
     tcp_manager: Arc<TcpConnectionManager>,
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<ForwardingStats>,
+    direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
 ) {
     info!("Ingress forwarding loop started");
 
@@ -1279,6 +1622,7 @@ pub async fn run_forwarding_loop(
                     &outbound_manager,
                     &session_tracker,
                     &stats,
+                    direct_reply_tx.clone(),
                 )
                 .await;
             }
@@ -1295,6 +1639,7 @@ pub async fn run_forwarding_loop(
                         &tcp_manager,
                         &session_tracker,
                         &stats,
+                        direct_reply_tx.clone(),
                     )
                     .await;
                 } else {
@@ -1310,11 +1655,16 @@ pub async fn run_forwarding_loop(
             }
             IPPROTO_ICMP | IPPROTO_ICMPV6 => {
                 stats.icmp_packets.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    "ICMP packet: {} -> {}, outbound='{}' (forwarding not yet implemented)",
-                    parsed.src_ip, parsed.dst_ip, outbound_tag
-                );
-                // TODO: ICMP forwarding may be added later
+                // Forward ICMP packet (ping support)
+                forward_icmp_packet(
+                    &processed,
+                    &parsed,
+                    &session_tracker,
+                    &stats,
+                    direct_reply_tx.clone(),
+                    outbound_tag,
+                )
+                .await;
             }
             _ => {
                 stats.unknown_protocol.fetch_add(1, Ordering::Relaxed);
@@ -1352,11 +1702,18 @@ pub async fn run_forwarding_loop(
 /// Reply routing loop
 ///
 /// Consumes decrypted reply packets and sends them back to the appropriate ingress peer.
+///
+/// # DNS Response Parsing
+///
+/// If an `IpDomainCache` is provided, DNS responses (UDP from port 53) are parsed
+/// to populate the IP-to-domain cache. This enables domain-based routing for
+/// subsequent connections.
 pub async fn run_reply_router_loop(
     mut reply_rx: mpsc::Receiver<ReplyPacket>,
     ingress_manager: Arc<WgIngressManager>,
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<IngressReplyStats>,
+    dns_cache: Option<Arc<super::dns_cache::IpDomainCache>>,
 ) {
     info!("Ingress reply router started");
 
@@ -1366,6 +1723,87 @@ pub async fn run_reply_router_loop(
             warn!("Failed to parse reply IP header");
             continue;
         };
+
+        // Parse DNS responses to populate IP-domain cache
+        if let Some(ref cache) = dns_cache {
+            if parsed.protocol == IPPROTO_UDP {
+                if let Some(src_port) = parsed.src_port {
+                    if src_port == 53 {
+                        // Extract UDP payload (DNS response)
+                        let payload_offset = parsed.ip_header_len + 8; // IP header + UDP header
+                        if reply.packet.len() > payload_offset {
+                            let dns_payload = &reply.packet[payload_offset..];
+                            info!(
+                                "DNS response detected: {}:{} -> {} (payload {} bytes)",
+                                parsed.src_ip, src_port, parsed.dst_ip, dns_payload.len()
+                            );
+                            let count = cache.parse_dns_response(dns_payload);
+                            if count > 0 {
+                                info!("Parsed {} DNS records from reply", count);
+                            } else {
+                                debug!("DNS response parsed but no A/AAAA records found");
+                            }
+                        }
+                    } else {
+                        trace!(
+                            "UDP reply from non-DNS port: {} (src_port={})",
+                            parsed.src_ip, src_port
+                        );
+                    }
+                }
+            }
+        } else {
+            // Log once when dns_cache is None (should not happen if properly initialized)
+            static DNS_CACHE_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !DNS_CACHE_WARN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                warn!("DNS cache not available in reply router");
+            }
+        }
+
+        // Handle ICMP separately (no ports)
+        if parsed.protocol == IPPROTO_ICMP || parsed.protocol == IPPROTO_ICMPV6 {
+            // For ICMP, extract ID from the ICMP header and use it as port
+            if let Some((icmp_type, _, id, seq, _)) = parse_icmp_echo(&reply.packet, parsed.ip_header_len) {
+                // ICMP Echo Reply (type 0) - find session using ID
+                if icmp_type == ICMP_ECHO_REPLY {
+                    let lookup_key = FiveTuple::new(
+                        parsed.dst_ip, // Original client IP
+                        id,            // Use ID as "port"
+                        parsed.src_ip, // Original destination (server)
+                        0,
+                        IPPROTO_ICMP,
+                    );
+
+                    if let Some(session) = session_tracker.get(&lookup_key) {
+                        if ingress_manager.is_peer_ip_allowed(&session.peer_public_key, parsed.dst_ip) {
+                            match ingress_manager
+                                .send_to_peer(&session.peer_public_key, session.peer_endpoint, &reply.packet)
+                                .await
+                            {
+                                Ok(()) => {
+                                    stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                                    info!(
+                                        "ICMP reply sent to peer {}: {} -> {} (id={}, seq={})",
+                                        session.peer_public_key, parsed.src_ip, parsed.dst_ip, id, seq
+                                    );
+                                }
+                                Err(e) => {
+                                    stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                                    warn!("Failed to send ICMP reply to peer: {}", e);
+                                }
+                            }
+                        } else {
+                            stats.peer_ip_rejected.fetch_add(1, Ordering::Relaxed);
+                            debug!("ICMP reply dest IP not allowed for peer");
+                        }
+                    } else {
+                        stats.session_misses.fetch_add(1, Ordering::Relaxed);
+                        debug!("No session for ICMP reply: {} -> {} (id={})", parsed.src_ip, parsed.dst_ip, id);
+                    }
+                }
+            }
+            continue;
+        }
 
         if parsed.protocol != IPPROTO_TCP && parsed.protocol != IPPROTO_UDP {
             if parsed.src_ip.is_ipv6() && is_ipv6_extension_header(parsed.protocol) {
@@ -1454,7 +1892,7 @@ pub async fn run_reply_router_loop(
 /// Forward a TCP packet through the appropriate outbound
 ///
 /// Handles TCP connection state tracking and data forwarding:
-/// - SYN packets: Establish outbound connection
+/// - SYN packets: Establish outbound connection and send SYN-ACK back
 /// - Data packets: Forward through established connection
 /// - FIN/RST packets: Mark connection as closing
 ///
@@ -1466,8 +1904,8 @@ pub async fn run_reply_router_loop(
 /// # Direct/SOCKS5
 ///
 /// For direct or SOCKS5 outbounds, we establish a TCP connection on the
-/// first SYN packet and forward payload data on subsequent packets.
-/// The reply path (SYN-ACK, data from server) will be handled in Phase 4.
+/// first SYN packet, send a synthetic SYN-ACK back to the client, and
+/// spawn a reader task to forward server responses.
 async fn forward_tcp_packet(
     processed: &ProcessedPacket,
     parsed: &ParsedPacket,
@@ -1477,6 +1915,7 @@ async fn forward_tcp_packet(
     tcp_manager: &Arc<TcpConnectionManager>,
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
+    direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
 ) {
     let outbound_tag = &processed.routing.outbound;
 
@@ -1552,8 +1991,8 @@ async fn forward_tcp_packet(
         parsed.total_len as u64,
     );
 
-    if tcp_details.is_syn() {
-        // New connection - establish outbound
+    if tcp_details.is_syn() && !tcp_details.is_ack() {
+        // New connection (SYN without ACK) - establish outbound
         let dst_addr = SocketAddr::new(parsed.dst_ip, tcp_details.dst_port);
 
         if let Some(outbound) = outbound_manager.get(outbound_tag) {
@@ -1569,6 +2008,9 @@ async fn forward_tcp_packet(
                         tcp_details.dst_port
                     );
 
+                    // Generate server's initial sequence number
+                    let server_seq: u32 = rand::random();
+
                     // Store connection for future packets
                     let tracked = tcp_manager.get_or_create(
                         five_tuple,
@@ -1577,17 +2019,75 @@ async fn forward_tcp_packet(
                         outbound_tag.clone(),
                     );
 
+                    // Get the stream for the reader task
+                    let stream = conn.into_stream();
+                    let (read_half, write_half) = tokio::io::split(stream);
+
                     {
                         let mut conn_guard = tracked.write().await;
                         conn_guard.state = TcpConnectionState::Established;
-                        conn_guard.outbound_stream = Some(conn.into_stream());
                         conn_guard.client_seq = tcp_details.seq_num;
+                        conn_guard.server_seq = server_seq;
+                        // Store write half for sending data
+                        // Note: We'll need to modify TcpConnection to store OwnedWriteHalf
+                        // For now, we'll handle writes differently
                     }
 
-                    // Note: We've established the outbound connection
-                    // The reply path (SYN-ACK back to client) will be handled in Phase 4
+                    // Send SYN-ACK back to client
+                    if let Some(ref reply_tx) = direct_reply_tx {
+                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
+                            let syn_ack = build_tcp_packet(
+                                server_ip,
+                                tcp_details.dst_port,
+                                client_ip,
+                                tcp_details.src_port,
+                                server_seq,
+                                tcp_details.seq_num.wrapping_add(1), // ACK = client_seq + 1
+                                tcp_flag_bits::SYN | tcp_flag_bits::ACK,
+                                65535, // Window size
+                                &[],
+                            );
+
+                            let reply = ReplyPacket {
+                                packet: syn_ack,
+                                tunnel_tag: outbound_tag.clone(),
+                            };
+
+                            if let Err(e) = reply_tx.try_send(reply) {
+                                warn!("Failed to send SYN-ACK to reply router: {}", e);
+                            } else {
+                                debug!(
+                                    "Sent SYN-ACK: {}:{} -> {}:{} (seq={}, ack={})",
+                                    server_ip, tcp_details.dst_port,
+                                    client_ip, tcp_details.src_port,
+                                    server_seq, tcp_details.seq_num.wrapping_add(1)
+                                );
+                            }
+
+                            // Spawn TCP reader task to forward server responses
+                            spawn_tcp_reader_task(
+                                read_half,
+                                reply_tx.clone(),
+                                server_ip,
+                                tcp_details.dst_port,
+                                client_ip,
+                                tcp_details.src_port,
+                                server_seq.wrapping_add(1), // Start after SYN-ACK
+                                tcp_details.seq_num.wrapping_add(1),
+                                outbound_tag.clone(),
+                                Arc::clone(&tracked),
+                            );
+                        }
+                    }
+
+                    // Store write half in a separate structure for sending
+                    // We'll use a channel-based approach for the write half
+                    let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
+                    TCP_WRITE_HALVES.insert(five_tuple, write_half);
+
                     debug!(
-                        "TCP SYN processed, outbound connection established. Reply path pending Phase 4."
+                        "TCP connection fully established with reply path: {}:{} -> {}:{}",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
                     );
                 }
                 Err(e) => {
@@ -1596,6 +2096,27 @@ async fn forward_tcp_packet(
                         outbound_tag, dst_addr, e
                     );
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+
+                    // Send RST back to client
+                    if let Some(ref reply_tx) = direct_reply_tx {
+                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
+                            let rst = build_tcp_packet(
+                                server_ip,
+                                tcp_details.dst_port,
+                                client_ip,
+                                tcp_details.src_port,
+                                0,
+                                tcp_details.seq_num.wrapping_add(1),
+                                tcp_flag_bits::RST | tcp_flag_bits::ACK,
+                                0,
+                                &[],
+                            );
+                            let _ = reply_tx.try_send(ReplyPacket {
+                                packet: rst,
+                                tunnel_tag: outbound_tag.clone(),
+                            });
+                        }
+                    }
                 }
             }
         } else {
@@ -1634,7 +2155,7 @@ async fn forward_tcp_packet(
             let payload_len = tcp_details.payload_len(processed.data.len());
             let payload = &processed.data[tcp_details.payload_offset..];
 
-            let mut conn_guard = conn.write().await;
+            let conn_guard = conn.write().await;
 
             if conn_guard.state != TcpConnectionState::Established {
                 debug!(
@@ -1649,15 +2170,22 @@ async fn forward_tcp_packet(
                 return;
             }
 
-            if let Some(ref mut stream) = conn_guard.outbound_stream {
+            // Try to use the write half from our global storage
+            drop(conn_guard); // Release lock before async operation
+            if let Some(write_half) = TCP_WRITE_HALVES.get(&five_tuple) {
+                let mut stream = write_half.lock().await;
                 match stream.write_all(payload).await {
                     Ok(()) => {
+                        let conn_guard = conn.read().await;
                         conn_guard.add_bytes_sent(payload_len as u64);
-                        conn_guard.touch();
+                        drop(conn_guard);
+                        if let Some(c) = tcp_manager.get(&five_tuple) {
+                            let mut cg = c.write().await;
+                            cg.touch();
+                        }
                         debug!(
-                            "Forwarded {} bytes TCP payload via '{}': {}:{} -> {}:{}",
+                            "Forwarded {} bytes TCP payload: {}:{} -> {}:{}",
                             payload_len,
-                            conn_guard.outbound_tag,
                             parsed.src_ip,
                             tcp_details.src_port,
                             parsed.dst_ip,
@@ -1671,12 +2199,17 @@ async fn forward_tcp_packet(
                         );
                         stats.forward_errors.fetch_add(1, Ordering::Relaxed);
                         // Mark connection as closing on write error
-                        conn_guard.state = TcpConnectionState::Closing;
+                        if let Some(c) = tcp_manager.get(&five_tuple) {
+                            let mut cg = c.write().await;
+                            cg.state = TcpConnectionState::Closing;
+                        }
+                        // Remove write half
+                        TCP_WRITE_HALVES.remove(&five_tuple);
                     }
                 }
             } else {
                 debug!(
-                    "TCP data for connection without stream - may be establishing: {}:{} -> {}:{}",
+                    "TCP data for connection without write half: {}:{} -> {}:{}",
                     parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
                 );
             }
@@ -1716,6 +2249,7 @@ async fn forward_udp_packet(
     outbound_manager: &Arc<OutboundManager>,
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
+    direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
 ) {
     let outbound_tag = &processed.routing.outbound;
 
@@ -1767,7 +2301,7 @@ async fn forward_udp_packet(
             }
         }
     } else if outbound_tag == "direct" || outbound_tag.starts_with("direct-") {
-        // Direct outbound - send UDP directly to destination
+        // Direct outbound - send UDP directly to destination and listen for reply
         let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
 
         // Extract UDP payload (skip IP header + UDP header)
@@ -1778,6 +2312,14 @@ async fn forward_udp_packet(
             return;
         }
         let udp_payload = &processed.data[payload_offset..];
+
+        // Capture values needed for reply handling
+        let client_ip = parsed.src_ip;
+        let client_port = src_port;
+        let server_ip = parsed.dst_ip;
+        let server_port = dst_port;
+        let outbound_tag_owned = outbound_tag.clone();
+        let reply_tx = direct_reply_tx.clone();
 
         if let Some(outbound) = outbound_manager.get(outbound_tag) {
             // Check if outbound supports UDP
@@ -1794,8 +2336,21 @@ async fn forward_udp_packet(
                         Ok(bytes_sent) => {
                             debug!(
                                 "Forwarded UDP via direct '{}': {} -> {}:{} ({} bytes)",
-                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, bytes_sent
+                                outbound_tag, client_ip, server_ip, server_port, bytes_sent
                             );
+
+                            // Spawn reply listener task if we have a reply channel
+                            if let Some(tx) = reply_tx {
+                                spawn_direct_udp_reply_listener(
+                                    handle,
+                                    tx,
+                                    client_ip,
+                                    client_port,
+                                    server_ip,
+                                    server_port,
+                                    outbound_tag_owned,
+                                );
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to send UDP via direct '{}': {}", outbound_tag, e);
@@ -1817,8 +2372,23 @@ async fn forward_udp_packet(
                         Ok(bytes_sent) => {
                             debug!(
                                 "Forwarded UDP direct (fallback): {} -> {}:{} ({} bytes)",
-                                parsed.src_ip, parsed.dst_ip, dst_port, bytes_sent
+                                client_ip, server_ip, server_port, bytes_sent
                             );
+
+                            // Spawn reply listener task if we have a reply channel
+                            if let Some(tx) = reply_tx {
+                                // Wrap socket in Arc for the spawned task
+                                let socket = Arc::new(socket);
+                                spawn_direct_udp_reply_listener_raw(
+                                    socket,
+                                    tx,
+                                    client_ip,
+                                    client_port,
+                                    server_ip,
+                                    server_port,
+                                    outbound_tag_owned,
+                                );
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to send UDP direct (fallback): {}", e);
@@ -1910,6 +2480,478 @@ async fn create_direct_udp_socket(dst_addr: SocketAddr) -> std::io::Result<UdpSo
     Ok(socket)
 }
 
+// ============================================================================
+// Direct UDP Reply Listener
+// ============================================================================
+
+/// Default timeout for waiting for UDP replies (5 seconds)
+const DIRECT_UDP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum UDP payload size for receiving replies
+const MAX_UDP_REPLY_SIZE: usize = 65535;
+
+/// Spawn a task to listen for UDP replies on an outbound handle.
+///
+/// This function spawns an async task that waits for a reply from the destination
+/// server and forwards it to the reply router for delivery back to the WireGuard client.
+///
+/// # Arguments
+///
+/// * `handle` - The UDP outbound handle (from `OutboundManager`)
+/// * `reply_tx` - Channel to send reply packets to the reply router
+/// * `client_ip` - The original client's IP address (reply destination)
+/// * `client_port` - The original client's port (reply destination port)
+/// * `server_ip` - The server's IP address (reply source)
+/// * `server_port` - The server's port (reply source port)
+/// * `outbound_tag` - The outbound tag for session matching
+fn spawn_direct_udp_reply_listener(
+    handle: crate::outbound::UdpOutboundHandle,
+    reply_tx: mpsc::Sender<ReplyPacket>,
+    client_ip: IpAddr,
+    client_port: u16,
+    server_ip: IpAddr,
+    server_port: u16,
+    outbound_tag: String,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_UDP_REPLY_SIZE];
+
+        // Wait for reply with timeout
+        match tokio::time::timeout(DIRECT_UDP_REPLY_TIMEOUT, handle.recv(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let reply_payload = &buf[..n];
+
+                // Build complete IP packet for the reply
+                let reply_packet = match (server_ip, client_ip) {
+                    (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                        build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
+                    }
+                    (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                        build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
+                    }
+                    _ => {
+                        warn!(
+                            "IP version mismatch in direct UDP reply: server={}, client={}",
+                            server_ip, client_ip
+                        );
+                        return;
+                    }
+                };
+
+                // Send to reply router
+                let reply = ReplyPacket {
+                    packet: reply_packet,
+                    tunnel_tag: outbound_tag.clone(),
+                };
+
+                if let Err(e) = reply_tx.try_send(reply) {
+                    warn!(
+                        "Failed to send direct UDP reply to router ({}): {} -> {}:{}",
+                        e, server_ip, client_ip, client_port
+                    );
+                } else {
+                    trace!(
+                        "Direct UDP reply forwarded: {}:{} -> {}:{} ({} bytes)",
+                        server_ip, server_port, client_ip, client_port, n
+                    );
+                }
+            }
+            Ok(Ok(_)) => {
+                // Zero-length reply, ignore
+                trace!("Empty direct UDP reply from {}:{}", server_ip, server_port);
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "Error receiving direct UDP reply from {}:{}: {}",
+                    server_ip, server_port, e
+                );
+            }
+            Err(_) => {
+                // Timeout - normal for UDP, no reply expected or reply lost
+                trace!(
+                    "Direct UDP reply timeout: {}:{} -> {}:{}",
+                    client_ip, client_port, server_ip, server_port
+                );
+            }
+        }
+    });
+}
+
+/// Spawn a task to listen for UDP replies on a raw socket.
+///
+/// Similar to `spawn_direct_udp_reply_listener` but for the fallback case
+/// where we use a raw `UdpSocket` instead of an `UdpOutboundHandle`.
+fn spawn_direct_udp_reply_listener_raw(
+    socket: Arc<UdpSocket>,
+    reply_tx: mpsc::Sender<ReplyPacket>,
+    client_ip: IpAddr,
+    client_port: u16,
+    server_ip: IpAddr,
+    server_port: u16,
+    outbound_tag: String,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_UDP_REPLY_SIZE];
+
+        // Wait for reply with timeout
+        match tokio::time::timeout(DIRECT_UDP_REPLY_TIMEOUT, socket.recv(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let reply_payload = &buf[..n];
+
+                // Build complete IP packet for the reply
+                let reply_packet = match (server_ip, client_ip) {
+                    (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                        build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
+                    }
+                    (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                        build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
+                    }
+                    _ => {
+                        warn!(
+                            "IP version mismatch in direct UDP reply: server={}, client={}",
+                            server_ip, client_ip
+                        );
+                        return;
+                    }
+                };
+
+                // Send to reply router
+                let reply = ReplyPacket {
+                    packet: reply_packet,
+                    tunnel_tag: outbound_tag.clone(),
+                };
+
+                if let Err(e) = reply_tx.try_send(reply) {
+                    warn!(
+                        "Failed to send direct UDP reply to router ({}): {} -> {}:{}",
+                        e, server_ip, client_ip, client_port
+                    );
+                } else {
+                    trace!(
+                        "Direct UDP reply (raw) forwarded: {}:{} -> {}:{} ({} bytes)",
+                        server_ip, server_port, client_ip, client_port, n
+                    );
+                }
+            }
+            Ok(Ok(_)) => {
+                // Zero-length reply, ignore
+                trace!("Empty direct UDP reply from {}:{}", server_ip, server_port);
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "Error receiving direct UDP reply from {}:{}: {}",
+                    server_ip, server_port, e
+                );
+            }
+            Err(_) => {
+                // Timeout - normal for UDP
+                trace!(
+                    "Direct UDP reply timeout (raw): {}:{} -> {}:{}",
+                    client_ip, client_port, server_ip, server_port
+                );
+            }
+        }
+    });
+}
+
+// ============================================================================
+// TCP Reader Task
+// ============================================================================
+
+/// Maximum TCP segment size for reading server responses
+const MAX_TCP_SEGMENT_SIZE: usize = 65535;
+
+/// Spawn a task to read server responses and forward them to the client.
+///
+/// This task reads data from the server and constructs TCP packets to send
+/// back to the WireGuard client via the reply router.
+fn spawn_tcp_reader_task(
+    mut read_half: tokio::io::ReadHalf<TcpStream>,
+    reply_tx: mpsc::Sender<ReplyPacket>,
+    server_ip: Ipv4Addr,
+    server_port: u16,
+    client_ip: Ipv4Addr,
+    client_port: u16,
+    initial_seq: u32,
+    initial_ack: u32,
+    outbound_tag: String,
+    connection: Arc<RwLock<TcpConnection>>,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_TCP_SEGMENT_SIZE];
+        let mut seq_num = initial_seq;
+        let ack_num = initial_ack;
+
+        loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) => {
+                    // Connection closed by server - send FIN
+                    debug!(
+                        "Server closed TCP connection: {}:{} -> {}:{}",
+                        server_ip, server_port, client_ip, client_port
+                    );
+
+                    let fin_packet = build_tcp_packet(
+                        server_ip,
+                        server_port,
+                        client_ip,
+                        client_port,
+                        seq_num,
+                        ack_num,
+                        tcp_flag_bits::FIN | tcp_flag_bits::ACK,
+                        65535,
+                        &[],
+                    );
+
+                    let _ = reply_tx.try_send(ReplyPacket {
+                        packet: fin_packet,
+                        tunnel_tag: outbound_tag.clone(),
+                    });
+
+                    // Update connection state
+                    {
+                        let mut conn_guard = connection.write().await;
+                        conn_guard.state = TcpConnectionState::Closing;
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    // Data received from server - forward to client
+                    let payload = &buf[..n];
+
+                    let data_packet = build_tcp_packet(
+                        server_ip,
+                        server_port,
+                        client_ip,
+                        client_port,
+                        seq_num,
+                        ack_num,
+                        tcp_flag_bits::ACK | tcp_flag_bits::PSH,
+                        65535,
+                        payload,
+                    );
+
+                    if let Err(e) = reply_tx.try_send(ReplyPacket {
+                        packet: data_packet,
+                        tunnel_tag: outbound_tag.clone(),
+                    }) {
+                        warn!("Failed to send TCP data to reply router: {}", e);
+                        break;
+                    }
+
+                    trace!(
+                        "TCP data: {}:{} -> {}:{} ({} bytes, seq={})",
+                        server_ip, server_port, client_ip, client_port, n, seq_num
+                    );
+
+                    // Update sequence number for next packet
+                    seq_num = seq_num.wrapping_add(n as u32);
+
+                    // Update connection stats
+                    {
+                        let conn_guard = connection.read().await;
+                        conn_guard.add_bytes_received(n as u64);
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "TCP read error: {}:{} -> {}:{}: {}",
+                        server_ip, server_port, client_ip, client_port, e
+                    );
+
+                    // Send RST on error
+                    let rst_packet = build_tcp_packet(
+                        server_ip,
+                        server_port,
+                        client_ip,
+                        client_port,
+                        seq_num,
+                        ack_num,
+                        tcp_flag_bits::RST,
+                        0,
+                        &[],
+                    );
+
+                    let _ = reply_tx.try_send(ReplyPacket {
+                        packet: rst_packet,
+                        tunnel_tag: outbound_tag.clone(),
+                    });
+                    break;
+                }
+            }
+        }
+
+        debug!(
+            "TCP reader task finished: {}:{} -> {}:{}",
+            server_ip, server_port, client_ip, client_port
+        );
+    });
+}
+
+// ============================================================================
+// ICMP Forwarding
+// ============================================================================
+
+/// Forward an ICMP packet and handle the reply.
+///
+/// For ICMP Echo Request (ping), we send the request to the destination
+/// and wait for the Echo Reply, then forward it back to the client.
+async fn forward_icmp_packet(
+    processed: &ProcessedPacket,
+    parsed: &ParsedPacket,
+    session_tracker: &Arc<IngressSessionTracker>,
+    stats: &Arc<ForwardingStats>,
+    direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
+    outbound_tag: &str,
+) {
+    // Only handle IPv4 ICMP for now
+    let IpAddr::V4(dst_ip) = parsed.dst_ip else {
+        debug!("ICMPv6 forwarding not yet implemented");
+        return;
+    };
+    let IpAddr::V4(src_ip) = parsed.src_ip else {
+        return;
+    };
+
+    // Parse ICMP header
+    let Some((icmp_type, _icmp_code, id, seq, payload)) = parse_icmp_echo(&processed.data, parsed.ip_header_len) else {
+        debug!("Failed to parse ICMP packet");
+        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    // Only handle Echo Request (type 8)
+    if icmp_type != ICMP_ECHO_REQUEST {
+        debug!("ICMP type {} not supported for forwarding", icmp_type);
+        return;
+    }
+
+    info!(
+        "ICMP Echo Request: {} -> {} (id={}, seq={})",
+        src_ip, dst_ip, id, seq
+    );
+
+    // Register session for reply routing
+    let five_tuple = FiveTuple::new(
+        parsed.src_ip,
+        id, // Use ICMP ID as "port"
+        parsed.dst_ip,
+        0,
+        IPPROTO_ICMP,
+    );
+    session_tracker.register(
+        five_tuple,
+        processed.peer_public_key.clone(),
+        processed.src_addr,
+        outbound_tag.to_string(),
+        parsed.total_len as u64,
+    );
+
+    // Create raw socket for ICMP
+    let Some(reply_tx) = direct_reply_tx else {
+        debug!("No reply channel for ICMP forwarding");
+        return;
+    };
+
+    // Spawn ICMP send/receive task
+    let client_ip = src_ip;
+    let server_ip = dst_ip;
+    let outbound_tag = outbound_tag.to_string();
+
+    tokio::spawn(async move {
+        // Create raw ICMP socket
+        match create_icmp_socket().await {
+            Ok(socket) => {
+                // Build ICMP Echo Request
+                let mut icmp_packet = vec![0u8; 8 + payload.len()];
+                icmp_packet[0] = ICMP_ECHO_REQUEST;
+                icmp_packet[1] = 0; // Code
+                icmp_packet[4..6].copy_from_slice(&id.to_be_bytes());
+                icmp_packet[6..8].copy_from_slice(&seq.to_be_bytes());
+                if !payload.is_empty() {
+                    icmp_packet[8..].copy_from_slice(&payload);
+                }
+
+                // Calculate ICMP checksum
+                let checksum = icmp_checksum(&icmp_packet);
+                icmp_packet[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+                // Send ICMP packet
+                let dst_addr = SocketAddr::new(IpAddr::V4(server_ip), 0);
+                if let Err(e) = socket.send_to(&icmp_packet, dst_addr).await {
+                    debug!("Failed to send ICMP: {}", e);
+                    return;
+                }
+
+                // Wait for reply with timeout
+                // Note: SOCK_DGRAM with IPPROTO_ICMP returns only ICMP data (no IP header)
+                let mut recv_buf = vec![0u8; 1500];
+                match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut recv_buf)).await {
+                    Ok(Ok((n, _from))) => {
+                        // Parse received ICMP reply (no IP header with SOCK_DGRAM)
+                        if n >= 8 {
+                            let recv_type = recv_buf[0];
+                            if recv_type == ICMP_ECHO_REPLY {
+                                // Use original ID and seq from the request, since kernel may change them
+                                let recv_payload = if n > 8 {
+                                    recv_buf[8..n].to_vec()
+                                } else {
+                                    Vec::new()
+                                };
+
+                                // Build reply packet for client using ORIGINAL id/seq
+                                let reply_packet = build_icmp_reply_packet(
+                                    server_ip,
+                                    client_ip,
+                                    id,   // Use original ID
+                                    seq,  // Use original seq
+                                    &recv_payload,
+                                );
+
+                                if let Err(e) = reply_tx.try_send(ReplyPacket {
+                                    packet: reply_packet,
+                                    tunnel_tag: outbound_tag,
+                                }) {
+                                    warn!("Failed to send ICMP reply: {}", e);
+                                } else {
+                                    info!(
+                                        "ICMP Echo Reply forwarded: {} -> {} (id={}, seq={})",
+                                        server_ip, client_ip, id, seq
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("ICMP recv error: {}", e);
+                    }
+                    Err(_) => {
+                        trace!("ICMP reply timeout: {} -> {}", client_ip, server_ip);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to create ICMP socket: {}", e);
+            }
+        }
+    });
+}
+
+/// Create a raw socket for ICMP.
+async fn create_icmp_socket() -> std::io::Result<UdpSocket> {
+    // Use a UDP socket bound to protocol ICMP
+    // On Linux, we need CAP_NET_RAW or use SOCK_DGRAM with IPPROTO_ICMP
+    // For simplicity, we'll use the socket2 crate to create a raw socket
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?;
+    socket.set_nonblocking(true)?;
+
+    // Convert to tokio UdpSocket
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
 /// Spawn the forwarding loop as a tokio task
 ///
 /// Returns a `JoinHandle` that can be used to wait for the task to complete
@@ -1923,6 +2965,7 @@ async fn create_direct_udp_socket(dst_addr: SocketAddr) -> std::io::Result<UdpSo
 /// * `tcp_manager` - TCP connection manager for stateful connection tracking
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
+/// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 ///
 /// # Returns
 ///
@@ -1934,6 +2977,7 @@ pub fn spawn_forwarding_task(
     tcp_manager: Arc<TcpConnectionManager>,
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<ForwardingStats>,
+    direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_forwarding_loop(
         packet_rx,
@@ -1942,6 +2986,7 @@ pub fn spawn_forwarding_task(
         tcp_manager,
         session_tracker,
         stats,
+        direct_reply_tx,
     ))
 }
 
@@ -1951,12 +2996,14 @@ pub fn spawn_reply_router(
     ingress_manager: Arc<WgIngressManager>,
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<IngressReplyStats>,
+    dns_cache: Option<Arc<super::dns_cache::IpDomainCache>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_reply_router_loop(
         reply_rx,
         ingress_manager,
         session_tracker,
         stats,
+        dns_cache,
     ))
 }
 
@@ -2009,6 +3056,7 @@ mod tests {
             ingress_manager,
             session_tracker,
             stats,
+            None, // No DNS cache for tests
         ));
 
         tx.send(reply).await.unwrap();
