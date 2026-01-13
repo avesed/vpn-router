@@ -218,6 +218,7 @@ class PairingResponse:
     # Xray REALITY 参数
     xray_reality_public_key: Optional[str] = None
     xray_reality_short_id: Optional[str] = None
+    xray_uuid: Optional[str] = None  # Phase 11-Fix.Xray: UUID for inbound authentication
 
     # 隧道 API 端点
     tunnel_api_endpoint: Optional[str] = None
@@ -245,6 +246,8 @@ class PairingResponse:
             d["xray_reality_public_key"] = self.xray_reality_public_key
         if self.xray_reality_short_id:
             d["xray_reality_short_id"] = self.xray_reality_short_id
+        if self.xray_uuid:
+            d["xray_uuid"] = self.xray_uuid
         if self.tunnel_api_endpoint:
             d["tunnel_api_endpoint"] = self.tunnel_api_endpoint
         # Phase 11-Fix.K: API 端口
@@ -269,6 +272,7 @@ class PairingResponse:
             wg_public_key=d.get("wg_public_key"),
             xray_reality_public_key=d.get("xray_reality_public_key"),
             xray_reality_short_id=d.get("xray_reality_short_id"),
+            xray_uuid=d.get("xray_uuid"),  # Phase 11-Fix.Xray: UUID for inbound auth
             tunnel_api_endpoint=d.get("tunnel_api_endpoint"),
             timestamp=d.get("timestamp", 0),
         )
@@ -994,6 +998,7 @@ class PairingManager:
         elif request.tunnel_type == "xray":
             response.xray_reality_public_key = public_key
             response.xray_reality_short_id = short_id
+            response.xray_uuid = xray_uuid  # Phase 11-Fix.Xray: Include UUID for inbound auth
 
         response_code = self.generator.encode_pairing_code(response.to_dict())
 
@@ -1083,9 +1088,10 @@ class PairingManager:
                     )
             elif tunnel_type == "xray":
                 # Phase 11.3: Xray 双向自动连接
-                # Phase 6 Issue 21: 生成 xray_uuid 用于隧道 API 认证
+                # Phase 11-Fix.Xray: Use xray_uuid from response for inbound authentication
+                # The response contains the peer's UUID that they will use when connecting to us
                 import uuid
-                xray_uuid = str(uuid.uuid4())
+                xray_uuid = response.xray_uuid if hasattr(response, 'xray_uuid') and response.xray_uuid else str(uuid.uuid4())
 
                 self.db.add_peer_node(
                     tag=response.node_tag,
@@ -1103,7 +1109,7 @@ class PairingManager:
                     xray_reality_short_id=pending_request.get("xray_short_id"),
                     xray_peer_reality_public_key=response.xray_reality_public_key,
                     xray_peer_reality_short_id=response.xray_reality_short_id,
-                    xray_uuid=xray_uuid,  # Phase 6 Issue 21: 存储 xray_uuid
+                    xray_uuid=xray_uuid,  # Phase 11-Fix.Xray: Use peer's UUID for inbound auth
                     tunnel_api_endpoint=tunnel_api_endpoint,  # Issue 14: 使用计算后的值
                     bidirectional_status="pending",  # Phase 11.3: 标记待双向连接
                 )

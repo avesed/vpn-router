@@ -14718,6 +14718,17 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
                 else:
                     logging.info(f"[pairing] 分配隧道监听端口: {listen_port} (用户指定端口 {port})")
 
+        # Phase 11-Fix.Xray: Pre-allocate inbound port for Xray
+        # Xray tunnels need to know the inbound port upfront so it can be encoded in pairing code
+        xray_inbound_port = None
+        if payload.tunnel_type == "xray":
+            try:
+                xray_inbound_port = db.get_next_peer_inbound_port()
+                actual_endpoint = f"{host}:{xray_inbound_port}"
+                logging.info(f"[pairing] Xray 入站端口预分配: {xray_inbound_port} (用户指定端口 {port})")
+            except ValueError as e:
+                raise HTTPException(status_code=500, detail=f"无法分配 Xray 入站端口: {e}")
+
         # Step 2: 生成配对码和密钥对（包含隧道 IP 和正确的端口）
         # Phase 11-Fix.K: 传递 api_port
         code, _, request_obj = generator.generate_pair_request(
@@ -15629,35 +15640,35 @@ def api_enable_peer_inbound(tag: str):
         xray_reality_short_id=short_id,
     )
 
-    # 合并架构: reload 主 Xray 进程以加载新的 peer UUID
+    # Phase 11-Fix.Xray: 启动独立的 Xray 入站进程
+    # 使用 xray_peer_inbound_manager 启动专用入站进程，而不是 reload 主进程
     try:
         import subprocess
         result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
+            ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "start", tag],
+            capture_output=True, text=True, timeout=15
         )
         if result.returncode == 0:
-            logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (合并架构, Xray reloaded)")
-            return {
-                "success": True,
-                "message": "入站监听已启用",
-                "tag": tag,
-                "inbound_port": unified_port,  # 合并架构使用统一端口
-                "inbound_uuid": inbound_uuid,
-                "reality_public_key": public_key,
-                "reality_short_id": short_id,
-            }
+            logging.info(f"[peers] 节点 '{tag}' 入站进程已启动")
+            logging.debug(f"[peers] xray_peer_inbound_manager output: {result.stdout}")
         else:
-            logging.error(f"[peers] Xray reload 失败: {result.stderr}")
-            raise HTTPException(status_code=500, detail=f"Xray reload 失败: {result.stderr}")
+            logging.warning(f"[peers] 入站进程启动可能失败: {result.stderr}")
+            # 不抛出异常，数据库已更新，进程可以稍后手动启动
     except subprocess.TimeoutExpired:
-        logging.error("[peers] Xray reload 超时")
-        raise HTTPException(status_code=500, detail="Xray reload 超时")
-    except HTTPException:
-        raise
+        logging.warning(f"[peers] 入站进程启动超时，但数据库已更新")
     except Exception as e:
-        logging.error(f"[peers] 启动入站监听失败: {e}")
-        raise HTTPException(status_code=500, detail=f"启动入站监听失败: {str(e)}")
+        logging.warning(f"[peers] 启动入站进程失败: {e}，但数据库已更新")
+
+    logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (独立进程模式)")
+    return {
+        "success": True,
+        "message": "入站监听已启用",
+        "tag": tag,
+        "inbound_port": inbound_port,
+        "inbound_uuid": inbound_uuid,
+        "reality_public_key": public_key,
+        "reality_short_id": short_id,
+    }
 
 
 @app.post("/api/peers/{tag}/inbound/disable")
