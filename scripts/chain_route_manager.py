@@ -123,7 +123,7 @@ class ChainRouteManager:
         profiles = self.db.get_pia_profiles(enabled_only=True)
         for p in profiles:
             if p["name"] == egress_tag:
-                # 使用与 setup_kernel_wg_egress.py 相同的命名逻辑
+                # 使用 db_helper 的统一命名逻辑
                 from db_helper import get_egress_interface_name
                 return get_egress_interface_name(egress_tag, is_pia=True)
 
@@ -138,9 +138,8 @@ class ChainRouteManager:
         warp_list = self.db.get_warp_egress_list(enabled_only=True)
         for e in warp_list:
             if e["tag"] == egress_tag and e.get("protocol") == "wireguard":
-                # Phase 11-Fix.I: 使用统一的接口命名函数，确保与 setup_kernel_wg_egress.py 一致
-                from setup_kernel_wg_egress import get_egress_interface_name as get_wg_egress_iface
-                return get_wg_egress_iface(egress_tag, egress_type="warp")
+                from db_helper import get_egress_interface_name
+                return get_egress_interface_name(egress_tag, egress_type="warp")
 
         # 检查 OpenVPN（有 tun 设备）
         openvpn_list = self.db.get_openvpn_egress_list(enabled_only=True)

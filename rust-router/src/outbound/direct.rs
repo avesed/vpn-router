@@ -364,6 +364,7 @@ impl Outbound for DirectOutbound {
             Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
             Err(e) => {
                 // Socket is dropped here, closing the fd
+                self.stats.record_error();
                 return Err(OutboundError::connection_failed(addr, e.to_string()));
             }
         }
@@ -371,8 +372,13 @@ impl Outbound for DirectOutbound {
         // Convert socket to TcpStream immediately after connect initiation
         // This ensures proper ownership - TcpStream will close fd on drop
         let std_stream: std::net::TcpStream = socket.into();
-        let stream = TcpStream::from_std(std_stream)
-            .map_err(|e| OutboundError::connection_failed(addr, e.to_string()))?;
+        let stream = match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                self.stats.record_error();
+                return Err(OutboundError::connection_failed(addr, e.to_string()));
+            }
+        };
 
         // Wait for connection to complete with timeout
         let connect_result = timeout(connect_timeout, async {

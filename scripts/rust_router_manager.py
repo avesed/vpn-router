@@ -147,7 +147,7 @@ def _get_db():
 
 def _get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str = None) -> str:
     """Get WireGuard interface name for an egress"""
-    from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
     return get_egress_interface_name(tag, is_pia=is_pia, egress_type=egress_type)
 
 
@@ -158,6 +158,85 @@ def _is_ip_address(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _parse_wg_config_file(config_path: str) -> Optional[Dict[str, str]]:
+    """Parse a WireGuard config file and extract key fields.
+
+    Phase 6-Fix.AG: WARP WireGuard config is stored in wg.conf format.
+    This helper extracts the fields needed for rust-router's CreateWgTunnel.
+
+    Args:
+        config_path: Path to the wg.conf file
+
+    Returns:
+        Dict with private_key, peer_public_key, endpoint, local_ip, or None if failed
+    """
+    try:
+        if not os.path.exists(config_path):
+            logger.warning(f"WireGuard config file not found: {config_path}")
+            return None
+
+        with open(config_path, "r") as f:
+            content = f.read()
+
+        result = {
+            "private_key": None,
+            "peer_public_key": None,
+            "endpoint": None,
+            "local_ip": None,
+        }
+
+        current_section = None
+        for line in content.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            # Section headers
+            if line.startswith("[") and line.endswith("]"):
+                current_section = line[1:-1].lower()
+                continue
+
+            # Key-value pairs
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip().lower()
+                value = value.strip()
+
+                if current_section == "interface":
+                    if key == "privatekey":
+                        result["private_key"] = value
+                    elif key == "address":
+                        # Take first address (IPv4 preferred)
+                        addresses = [a.strip() for a in value.split(",")]
+                        for addr in addresses:
+                            if "/" in addr and ":" not in addr:  # IPv4 with CIDR
+                                result["local_ip"] = addr
+                                break
+                        if not result["local_ip"] and addresses:
+                            result["local_ip"] = addresses[0]
+
+                elif current_section == "peer":
+                    if key == "publickey":
+                        result["peer_public_key"] = value
+                    elif key == "endpoint":
+                        result["endpoint"] = value
+
+        # Validate required fields
+        if not all([result["private_key"], result["peer_public_key"], result["endpoint"]]):
+            logger.warning(f"WireGuard config missing required fields: {config_path}")
+            return None
+
+        # Default local_ip if not found
+        if not result["local_ip"]:
+            result["local_ip"] = "10.0.0.2/32"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to parse WireGuard config {config_path}: {e}")
+        return None
 
 
 async def _resolve_hostname_async(
@@ -532,49 +611,57 @@ class RustRouterManager:
                 # Collect all egress from database
                 db_outbounds: Dict[str, Dict[str, Any]] = {}
 
-                # PIA profiles
-                for profile in db.get_pia_profiles(enabled_only=True):
-                    tag = profile.get("name", "")
-                    if tag:
-                        interface = _get_egress_interface_name(tag, is_pia=True)
-                        db_outbounds[tag] = {
-                            "type": "wireguard",
-                            "interface": interface,
-                            "egress_type": "pia",
-                        }
+                # Phase 6-Fix.AE: In userspace WG mode, PIA/Custom/WARP WireGuard egress
+                # are handled by sync_wg_egress_tunnels() using CreateWgTunnel IPC command,
+                # NOT as Direct outbounds with bind_interface (which requires kernel interfaces).
+                # We only add them here in kernel WG mode.
+                if not self._userspace_wg:
+                    # PIA profiles (kernel WG mode only)
+                    for profile in db.get_pia_profiles(enabled_only=True):
+                        tag = profile.get("name", "")
+                        if tag:
+                            interface = _get_egress_interface_name(tag, is_pia=True)
+                            db_outbounds[tag] = {
+                                "type": "wireguard",
+                                "interface": interface,
+                                "egress_type": "pia",
+                            }
 
-                # Custom WireGuard egress
-                for egress in db.get_custom_egress_list(enabled_only=True):
-                    tag = egress.get("tag", "")
-                    if tag:
-                        interface = _get_egress_interface_name(tag, is_pia=False)
-                        db_outbounds[tag] = {
-                            "type": "wireguard",
-                            "interface": interface,
-                            "egress_type": "custom",
-                        }
+                    # Custom WireGuard egress (kernel WG mode only)
+                    for egress in db.get_custom_egress_list(enabled_only=True):
+                        tag = egress.get("tag", "")
+                        if tag:
+                            interface = _get_egress_interface_name(tag, is_pia=False)
+                            db_outbounds[tag] = {
+                                "type": "wireguard",
+                                "interface": interface,
+                                "egress_type": "custom",
+                            }
 
-                # WARP egress
-                for egress in db.get_warp_egress_list(enabled_only=True):
-                    tag = egress.get("tag", "")
-                    protocol = egress.get("protocol", "wireguard")
-                    if tag:
-                        if protocol == "wireguard":
+                    # WARP WireGuard egress (kernel WG mode only)
+                    for egress in db.get_warp_egress_list(enabled_only=True):
+                        tag = egress.get("tag", "")
+                        protocol = egress.get("protocol", "wireguard")
+                        if tag and protocol == "wireguard":
                             interface = _get_egress_interface_name(tag, egress_type="warp")
                             db_outbounds[tag] = {
                                 "type": "wireguard",
                                 "interface": interface,
                                 "egress_type": "warp",
                             }
-                        else:
-                            # WARP MASQUE uses SOCKS5
-                            socks_port = egress.get("socks_port")
-                            if socks_port:
-                                db_outbounds[tag] = {
-                                    "type": "socks5",
-                                    "server_addr": f"127.0.0.1:{socks_port}",
-                                    "egress_type": "warp-masque",
-                                }
+
+                # WARP MASQUE uses SOCKS5 (both modes)
+                for egress in db.get_warp_egress_list(enabled_only=True):
+                    tag = egress.get("tag", "")
+                    protocol = egress.get("protocol", "wireguard")
+                    if tag and protocol != "wireguard":
+                        socks_port = egress.get("socks_port")
+                        if socks_port:
+                            db_outbounds[tag] = {
+                                "type": "socks5",
+                                "server_addr": f"127.0.0.1:{socks_port}",
+                                "egress_type": "warp-masque",
+                            }
 
                 # V2Ray egress (SOCKS5)
                 for egress in db.get_v2ray_egress_list(enabled_only=True):
@@ -772,68 +859,71 @@ class RustRouterManager:
                         }
 
                 # WARP WireGuard egress (not MASQUE)
+                # Phase 6-Fix.AG: WARP WireGuard config is stored in wg.conf files,
+                # not directly in the database. Read from config_path.
                 for egress in db.get_warp_egress_list(enabled_only=True):
                     protocol = egress.get("protocol", "wireguard")
                     if protocol != "wireguard":
                         continue  # Skip WARP MASQUE (uses SOCKS5)
 
                     tag = egress.get("tag", "")
-                    private_key = egress.get("private_key")
-                    peer_public_key = egress.get("public_key")
-                    endpoint = egress.get("endpoint")
-                    local_ip = egress.get("local_ip")
+                    config_path = egress.get("config_path", "")
 
-                    if tag and private_key and peer_public_key and endpoint:
-                        # Phase 11-Fix.AC: Parse endpoint and resolve hostname if needed
-                        # WARP endpoint format is usually "host:port"
-                        resolved_endpoint = endpoint
-                        if ":" in endpoint:
-                            # Split into host and port
-                            last_colon = endpoint.rfind(":")
-                            host_part = endpoint[:last_colon]
-                            port_part = endpoint[last_colon + 1:]
+                    if not tag:
+                        continue
 
-                            # Handle IPv6 addresses in brackets [::1]:port
-                            if host_part.startswith("[") and host_part.endswith("]"):
-                                host_part = host_part[1:-1]  # Remove brackets
+                    # Phase 6-Fix.AG: Read WireGuard config from file
+                    if config_path:
+                        wg_config = _parse_wg_config_file(config_path)
+                    else:
+                        # Try default path based on tag
+                        default_path = f"/etc/sing-box/warp/{tag}/wg.conf"
+                        wg_config = _parse_wg_config_file(default_path)
 
-                            try:
-                                port_num = int(port_part)
-                            except ValueError:
-                                logger.warning(
-                                    f"Skipping WARP egress {tag}: invalid port in endpoint '{endpoint}'"
-                                )
-                                continue
+                    if not wg_config:
+                        logger.warning(f"Skipping WARP egress {tag}: could not parse WireGuard config")
+                        continue
 
-                            resolved_host = await _resolve_hostname_async(host_part, port_num, dns_cache)
-                            if resolved_host is None:
-                                logger.warning(
-                                    f"Skipping WARP egress {tag}: failed to resolve endpoint hostname '{host_part}'"
-                                )
-                                continue
+                    private_key = wg_config["private_key"]
+                    peer_public_key = wg_config["peer_public_key"]
+                    endpoint = wg_config["endpoint"]
+                    local_ip = wg_config["local_ip"]
 
-                            # Phase 11-Fix.AC: Add brackets for IPv6 addresses
-                            if ":" in resolved_host:  # IPv6 address
-                                resolved_endpoint = f"[{resolved_host}]:{port_num}"
-                            else:
-                                resolved_endpoint = f"{resolved_host}:{port_num}"
+                    # Resolve hostname in endpoint if needed
+                    resolved_endpoint = endpoint
+                    if ":" in endpoint:
+                        last_colon = endpoint.rfind(":")
+                        host_part = endpoint[:last_colon]
+                        port_part = endpoint[last_colon + 1:]
+
+                        # Handle IPv6 addresses in brackets [::1]:port
+                        if host_part.startswith("[") and host_part.endswith("]"):
+                            host_part = host_part[1:-1]
+
+                        try:
+                            port_num = int(port_part)
+                        except ValueError:
+                            logger.warning(f"Skipping WARP egress {tag}: invalid port in endpoint '{endpoint}'")
+                            continue
+
+                        resolved_host = await _resolve_hostname_async(host_part, port_num, dns_cache)
+                        if resolved_host is None:
+                            logger.warning(f"Skipping WARP egress {tag}: failed to resolve '{host_part}'")
+                            continue
+
+                        if ":" in resolved_host:  # IPv6 address
+                            resolved_endpoint = f"[{resolved_host}]:{port_num}"
                         else:
-                            # No port in endpoint - unusual, but try to resolve anyway
-                            resolved_host = await _resolve_hostname_async(endpoint, 0, dns_cache)
-                            if resolved_host is None:
-                                logger.warning(
-                                    f"Skipping WARP egress {tag}: failed to resolve endpoint '{endpoint}'"
-                                )
-                                continue
-                            resolved_endpoint = resolved_host
+                            resolved_endpoint = f"{resolved_host}:{port_num}"
 
-                        wg_egress[tag] = {
-                            "private_key": private_key,
-                            "peer_public_key": peer_public_key,
-                            "endpoint": resolved_endpoint,
-                            "local_ip": local_ip or "10.0.0.2/32",
-                            "type": "warp",
-                        }
+                    wg_egress[tag] = {
+                        "private_key": private_key,
+                        "peer_public_key": peer_public_key,
+                        "endpoint": resolved_endpoint,
+                        "local_ip": local_ip,
+                        "type": "warp",
+                    }
+                    logger.info(f"Found WARP WG egress {tag}: endpoint={resolved_endpoint}, local_ip={local_ip}")
 
                 # Get current tunnels from rust-router
                 # Note: list_wg_tunnels() returns List[WgTunnelInfo], not IpcResponse

@@ -99,10 +99,7 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
         接口名，如果无法确定则返回 None
     """
     # 导入接口名生成函数
-    try:
-        from db_helper import get_egress_interface_name
-    except ImportError:
-        from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
 
     # 检查 PIA profile
     profile = db.get_pia_profile_by_name(tag)
@@ -124,9 +121,7 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
     if warp:
         # WARP WireGuard 协议使用内核接口
         if warp.get("protocol") == "wireguard":
-            # 使用 setup_kernel_wg_egress 的版本（支持 egress_type 参数）
-            from setup_kernel_wg_egress import get_egress_interface_name as get_warp_iface
-            return get_warp_iface(tag, egress_type="warp")
+            return get_egress_interface_name(tag, egress_type="warp")
         else:
             # WARP MASQUE 使用 SOCKS 代理，不是内核接口
             logger.warning(f"WARP egress '{tag}' uses SOCKS proxy, not kernel interface")

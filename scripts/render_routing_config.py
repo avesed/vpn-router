@@ -589,11 +589,33 @@ class RustRouterConfigGenerator:
             if outbound_dict:
                 outbounds.append(outbound_dict)
                 valid_outbound_tags.add(outbound_dict["tag"])
+            elif ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER):
+                # Phase 11-Fix.AE: WireGuard outbounds are valid even though managed via IPC
+                # Rules referencing them should NOT be remapped to default
+                valid_outbound_tags.add(ob.tag)
+                logger.debug(f"Marked WireGuard outbound '{ob.tag}' as valid (managed via IPC)")
+            elif ob.egress_type in (EgressType.V2RAY, EgressType.WARP_MASQUE):
+                # Phase 11-Fix.AE: SOCKS5 outbounds are also managed via IPC
+                valid_outbound_tags.add(ob.tag)
+                logger.debug(f"Marked SOCKS5 outbound '{ob.tag}' as valid (managed via IPC)")
 
-        # Phase 11-Fix.AB: Check if default outbound was skipped (e.g., WireGuard in userspace mode)
-        # If so, remap to "direct" which always exists
+        # Phase 6-Fix.AF: Check if default outbound is IPC-managed (SOCKS5/WireGuard)
+        # These outbounds are added dynamically via IPC, not in static config.
+        # Set static default to "direct", then Python manager sets real default via IPC.
         default_outbound = config.default_outbound
-        if default_outbound not in valid_outbound_tags:
+
+        # Build set of outbound tags that are IPC-managed (not in static config)
+        ipc_managed_tags = set()
+        for ob in config.outbounds:
+            if ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER,
+                                  EgressType.V2RAY, EgressType.WARP_MASQUE):
+                ipc_managed_tags.add(ob.tag)
+
+        if default_outbound in ipc_managed_tags:
+            logger.info(f"Default outbound '{default_outbound}' is IPC-managed, using 'direct' in static config")
+            logger.info(f"Python manager will set real default '{default_outbound}' via IPC after startup")
+            default_outbound = "direct"
+        elif default_outbound not in valid_outbound_tags:
             logger.warning(f"Default outbound '{default_outbound}' was skipped, remapping to 'direct'")
             default_outbound = "direct"
 
@@ -674,12 +696,8 @@ class RustRouterConfigGenerator:
         in config. WireGuard-based outbounds use Direct with bind_interface.
         SOCKS5 outbounds (V2Ray, WARP MASQUE) are not yet supported and will be skipped.
 
-        Phase 11-Fix.AB: In userspace WireGuard mode (USERSPACE_WG=true), WireGuard
-        outbounds should NOT be included in static config - they will be managed via
-        IPC by rust_router_manager.py.
+        WireGuard outbounds are managed via IPC by rust_router_manager.py (userspace mode).
         """
-        # Phase 11-Fix.AB: Check if userspace WireGuard mode is enabled
-        userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
 
         if ob.egress_type == EgressType.DIRECT:
             result: Dict[str, Any] = {
@@ -701,23 +719,10 @@ class RustRouterConfigGenerator:
             }
 
         elif ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER):
-            # Phase 11-Fix.AB: In userspace WireGuard mode, skip these outbounds in static config
-            # They will be added via IPC as userspace WireGuard tunnels by rust_router_manager.py
-            if userspace_wg:
-                logger.info(f"Skipping WireGuard outbound '{ob.tag}' in static config (USERSPACE_WG=true)")
-                return None
-
-            # WireGuard-based (kernel mode): use direct with bind_interface
-            # rust-router treats these as direct outbounds bound to WireGuard interfaces
-            result = {
-                "type": "direct",  # lowercase to match serde deserialization
-                "tag": ob.tag,
-                "enabled": ob.enabled,
-                "bind_interface": ob.interface,  # The wg-pia-*/wg-eg-*/wg-warp-* interface
-            }
-            if ob.routing_mark:
-                result["routing_mark"] = ob.routing_mark
-            return result
+            # WireGuard-based outbounds are managed via IPC (userspace mode)
+            # They will be added by rust_router_manager.py
+            logger.info(f"Skipping WireGuard outbound '{ob.tag}' in static config (managed via IPC)")
+            return None
 
         elif ob.egress_type in (EgressType.V2RAY, EgressType.WARP_MASQUE):
             # SOCKS5-based outbounds are not yet supported in rust-router config

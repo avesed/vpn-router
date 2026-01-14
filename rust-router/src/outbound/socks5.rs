@@ -903,9 +903,13 @@ impl Outbound for Socks5Outbound {
 
                 // Take ownership of the stream from the pooled connection
                 // This ensures the connection won't be returned to pool
-                let stream = conn.take_stream().ok_or_else(|| {
-                    OutboundError::connection_failed(addr, "stream already taken")
-                })?;
+                let stream = match conn.take_stream() {
+                    Some(s) => s,
+                    None => {
+                        self.stats.record_error();
+                        return Err(OutboundError::connection_failed(addr, "stream already taken"));
+                    }
+                };
 
                 Ok(OutboundConnection::new(stream, addr))
             }

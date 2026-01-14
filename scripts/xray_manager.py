@@ -202,9 +202,9 @@ def get_chain_egress_info(db, egress_tag: str, mark_value: int) -> Optional[Chai
             if e.get("tag") == egress_tag:
                 protocol = e.get("protocol", "masque")
                 if protocol == "wireguard":
-                    # Phase 11-Fix.I: 使用统一的接口命名函数
-                    from setup_kernel_wg_egress import get_egress_interface_name as get_wg_egress_iface
-                    interface = get_wg_egress_iface(egress_tag, egress_type="warp")
+                    # 使用 db_helper 的统一接口命名函数
+                    from db_helper import get_egress_interface_name
+                    interface = get_egress_interface_name(egress_tag, egress_type="warp")
                     return ChainEgressInfo(
                         egress_tag=egress_tag,
                         egress_type="interface",

@@ -317,8 +317,6 @@ COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
 COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
 COPY scripts/v2ray_stats_client.py /usr/local/bin/v2ray_stats_client.py
 COPY scripts/v2ray_uri_parser.py /usr/local/bin/v2ray_uri_parser.py
-COPY scripts/setup_kernel_wg.py /usr/local/bin/setup_kernel_wg.py
-COPY scripts/setup_kernel_wg_egress.py /usr/local/bin/setup_kernel_wg_egress.py
 COPY scripts/key_manager.py /usr/local/bin/key_manager.py
 COPY scripts/ecmp_manager.py /usr/local/bin/ecmp_manager.py
 COPY scripts/health_checker.py /usr/local/bin/health_checker.py
@@ -339,8 +337,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
     /usr/local/bin/api_server.py /usr/local/bin/init_user_db.py \
     /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
-    /usr/local/bin/setup_kernel_wg.py \
-    /usr/local/bin/setup_kernel_wg_egress.py /usr/local/bin/xray_manager.py \
+    /usr/local/bin/xray_manager.py \
     /usr/local/bin/xray_egress_manager.py /usr/local/bin/xray_peer_inbound_manager.py \
     /usr/local/bin/warp_manager.py \
     /usr/local/bin/warp_endpoint_optimizer.py /usr/local/bin/ecmp_manager.py \

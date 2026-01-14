@@ -150,8 +150,8 @@ pub enum IpcCommand {
 
     /// Add a `WireGuard` outbound using `DirectOutbound` with `bind_interface`
     ///
-    /// Creates a direct outbound bound to a `WireGuard` interface (e.g., wg-pia-us-east).
-    /// The interface must already exist (created by Python `setup_kernel_wg_egress.py`).
+    /// Creates a direct outbound bound to a `WireGuard` tunnel (e.g., wg-pia-us-east).
+    /// In userspace mode, tunnels are managed by rust-router's boringtun integration.
     AddWireguardOutbound {
         /// Unique tag for this outbound
         tag: String,

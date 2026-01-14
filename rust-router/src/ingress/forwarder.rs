@@ -45,7 +45,7 @@
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,45 @@ const IPPROTO_ICMPV6: u8 = 58;
 /// Global storage for TCP write halves (used for forwarding client data to server)
 static TCP_WRITE_HALVES: Lazy<DashMap<FiveTuple, Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TcpStream>>>>> =
     Lazy::new(DashMap::new);
+
+/// Global storage for UDP sessions (used for QUIC and other UDP traffic)
+/// Key: (client_ip, client_port, server_ip, server_port)
+/// Value: (UdpSocket, last_activity)
+static UDP_SESSIONS: Lazy<DashMap<FiveTuple, Arc<UdpSessionEntry>>> = Lazy::new(DashMap::new);
+
+/// UDP session entry for reusing connections
+struct UdpSessionEntry {
+    socket: Arc<UdpSocket>,
+    last_activity: std::sync::atomic::AtomicU64,
+}
+
+impl UdpSessionEntry {
+    fn new(socket: Arc<UdpSocket>) -> Self {
+        Self {
+            socket,
+            last_activity: std::sync::atomic::AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn last_activity_secs(&self) -> u64 {
+        self.last_activity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 // ============================================================================
 // TCP Connection Tracking (Phase 3)
@@ -149,6 +188,10 @@ pub struct TcpConnection {
     pub client_seq: u32,
     /// Server's initial sequence number (from SYN-ACK)
     pub server_seq: u32,
+    /// Outbound stats reference for recording completion
+    pub outbound_stats: Option<Arc<crate::connection::OutboundStats>>,
+    /// Flag to prevent double-counting stats
+    pub stats_recorded: AtomicBool,
 }
 
 impl TcpConnection {
@@ -169,7 +212,37 @@ impl TcpConnection {
             last_activity: Instant::now(),
             client_seq: 0,
             server_seq: 0,
+            outbound_stats: None,
+            stats_recorded: AtomicBool::new(false),
         }
+    }
+    
+    /// Record connection completion in outbound stats (only once)
+    /// Returns true if this was the first call that recorded stats
+    pub fn record_stats_completion(&self) -> bool {
+        // Use compare_exchange to ensure only one caller records stats
+        if self.stats_recorded.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if let Some(ref stats) = self.outbound_stats {
+                let bytes_rx = self.bytes_received.load(Ordering::Relaxed);
+                let bytes_tx = self.bytes_sent.load(Ordering::Relaxed);
+                stats.record_completed(bytes_rx, bytes_tx);
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Record connection error in outbound stats (only once)
+    /// Returns true if this was the first call that recorded stats
+    pub fn record_stats_error(&self) -> bool {
+        // Use compare_exchange to ensure only one caller records stats
+        if self.stats_recorded.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if let Some(ref stats) = self.outbound_stats {
+                stats.record_error();
+                return true;
+            }
+        }
+        false
     }
 
     /// Update the last activity timestamp
@@ -258,13 +331,14 @@ impl TcpConnectionManager {
     /// Cleanup stale connections
     ///
     /// Removes connections that have been idle longer than `connection_timeout`.
+    /// Also records stats completion for cleaned up connections.
     ///
     /// # Returns
     ///
     /// Number of connections removed.
     pub fn cleanup(&self) -> usize {
         let timeout = self.connection_timeout;
-        let before = self.connections.len();
+        let _before = self.connections.len();
         
         // Collect keys to remove
         let keys_to_remove: Vec<FiveTuple> = self.connections
@@ -283,8 +357,14 @@ impl TcpConnectionManager {
             .collect();
         
         // Remove from both connections and TCP_WRITE_HALVES
+        // Record stats completion for each removed connection
         for key in &keys_to_remove {
-            self.connections.remove(key);
+            if let Some((_, conn)) = self.connections.remove(key) {
+                // Try to record stats completion before dropping
+                if let Ok(guard) = conn.try_read() {
+                    guard.record_stats_completion();
+                }
+            }
             TCP_WRITE_HALVES.remove(key);
         }
         
@@ -2103,16 +2183,31 @@ async fn forward_tcp_packet(
 
         if let Some(outbound) = outbound_manager.get(outbound_tag) {
             // Try to establish TCP connection
+            let connect_start = Instant::now();
             match outbound.connect(dst_addr, Duration::from_secs(10)).await {
                 Ok(conn) => {
-                    info!(
-                        "Established TCP connection via '{}': {}:{} -> {}:{}",
-                        outbound_tag,
-                        parsed.src_ip,
-                        tcp_details.src_port,
-                        parsed.dst_ip,
-                        tcp_details.dst_port
-                    );
+                    let connect_time = connect_start.elapsed();
+                    if connect_time.as_millis() > 100 {
+                        info!(
+                            "Established TCP connection via '{}': {}:{} -> {}:{} ({}ms - SLOW)",
+                            outbound_tag,
+                            parsed.src_ip,
+                            tcp_details.src_port,
+                            parsed.dst_ip,
+                            tcp_details.dst_port,
+                            connect_time.as_millis()
+                        );
+                    } else {
+                        info!(
+                            "Established TCP connection via '{}': {}:{} -> {}:{} ({}ms)",
+                            outbound_tag,
+                            parsed.src_ip,
+                            tcp_details.src_port,
+                            parsed.dst_ip,
+                            tcp_details.dst_port,
+                            connect_time.as_millis()
+                        );
+                    }
 
                     // Generate server's initial sequence number
                     let server_seq: u32 = rand::random();
@@ -2122,10 +2217,13 @@ async fn forward_tcp_packet(
                     let (read_half, write_half) = tokio::io::split(stream);
 
                     // Update connection state (already created before connect)
+                    // Store outbound_stats for proper cleanup tracking
+                    let outbound_stats = outbound.stats();
                     {
                         let mut conn_guard = tracked.write().await;
                         conn_guard.state = TcpConnectionState::Established;
                         conn_guard.server_seq = server_seq;
+                        conn_guard.outbound_stats = Some(Arc::clone(&outbound_stats));
                         // Store write half for sending data
                         // Note: We'll need to modify TcpConnection to store OwnedWriteHalf
                         // For now, we'll handle writes differently
@@ -2175,7 +2273,6 @@ async fn forward_tcp_packet(
                                 outbound_tag.clone(),
                                 Arc::clone(&tracked),
                                 five_tuple, // Pass five_tuple for cleanup
-                                outbound.stats(), // Pass outbound stats for proper tracking
                             );
                         }
                     }
@@ -2237,6 +2334,11 @@ async fn forward_tcp_packet(
                 let mut conn_guard = conn.write().await;
                 conn_guard.state = TcpConnectionState::Closing;
                 conn_guard.touch();
+            }
+            // Record stats completion (only if not already recorded by reader task)
+            {
+                let conn_guard = conn.read().await;
+                conn_guard.record_stats_completion();
             }
             debug!(
                 "TCP connection closing: {}:{} -> {}:{} (flags={})",
@@ -2757,25 +2859,180 @@ async fn forward_udp_packet(
             }
             let udp_payload = &processed.data[payload_offset..];
 
-            // Connect via the outbound (SOCKS5, etc.) and send
-            match outbound.connect_udp(dst_addr, Duration::from_secs(10)).await {
+            // Capture values for session management
+            let client_ip = parsed.src_ip;
+            let client_port = src_port;
+            let server_ip = parsed.dst_ip;
+            let server_port = dst_port;
+            let outbound_tag_owned = outbound_tag.clone();
+            let reply_tx = direct_reply_tx.clone();
+
+            // Check for existing UDP session
+            if let Some(session) = UDP_SESSIONS.get(&five_tuple) {
+                // Reuse existing session
+                session.touch();
+                match session.socket.send(udp_payload).await {
+                    Ok(bytes_sent) => {
+                        trace!(
+                            "Forwarded UDP via existing session '{}': {} -> {}:{} ({} bytes)",
+                            outbound_tag, client_ip, server_ip, server_port, bytes_sent
+                        );
+                    }
+                    Err(e) => {
+                        debug!("UDP session send failed, removing: {}", e);
+                        UDP_SESSIONS.remove(&five_tuple);
+                    }
+                }
+                return;
+            }
+
+            // Create new UDP session
+            match outbound.connect_udp(dst_addr, Duration::from_secs(5)).await {
                 Ok(handle) => {
-                    match handle.send(udp_payload).await {
+                    // Extract the socket from the handle
+                    let socket: Arc<UdpSocket> = match handle {
+                        crate::outbound::UdpOutboundHandle::Direct(direct_handle) => {
+                            Arc::clone(direct_handle.socket())
+                        }
+                        _ => {
+                            // For non-direct handles, just send and return
+                            match handle.send(udp_payload).await {
+                                Ok(bytes_sent) => {
+                                    debug!(
+                                        "Forwarded UDP via '{}': {} -> {}:{} ({} bytes)",
+                                        outbound_tag, client_ip, server_ip, server_port, bytes_sent
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to send UDP via '{}': {}", outbound_tag, e);
+                                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            return;
+                        }
+                    };
+
+                    // Record UDP session in outbound stats
+                    let outbound_stats = outbound.stats();
+                    outbound_stats.record_connection();
+
+                    // Send the packet
+                    match socket.send(udp_payload).await {
                         Ok(bytes_sent) => {
                             debug!(
-                                "Forwarded UDP via '{}': {} -> {}:{} ({} bytes)",
-                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, bytes_sent
+                                "Forwarded UDP via new session '{}': {} -> {}:{} ({} bytes)",
+                                outbound_tag, client_ip, server_ip, server_port, bytes_sent
                             );
+
+                            // Store session for reuse
+                            let session = Arc::new(UdpSessionEntry::new(socket));
+                            
+                            // Spawn reply listener (or cleanup task if no reply channel)
+                            let session_clone = Arc::clone(&session);
+                            let ft = five_tuple;
+                            let outbound_stats_clone = Arc::clone(&outbound_stats);
+                            
+                            if let Some(tx) = reply_tx {
+                                tokio::spawn(async move {
+                                    let mut buf = vec![0u8; 65535];
+                                    loop {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(30),
+                                            session_clone.socket.recv(&mut buf)
+                                        ).await {
+                                            Ok(Ok(n)) if n > 0 => {
+                                                session_clone.touch();
+                                                // Build UDP reply packet based on IP version
+                                                let reply_packet = match (server_ip, client_ip) {
+                                                    (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                                                        build_udp_reply_packet(
+                                                            src,
+                                                            server_port,
+                                                            dst,
+                                                            client_port,
+                                                            &buf[..n],
+                                                        )
+                                                    }
+                                                    (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                                                        build_udp_reply_packet_v6(
+                                                            src,
+                                                            server_port,
+                                                            dst,
+                                                            client_port,
+                                                            &buf[..n],
+                                                        )
+                                                    }
+                                                    _ => {
+                                                        debug!("IP version mismatch in UDP reply");
+                                                        break;
+                                                    }
+                                                };
+                                                if let Err(e) = tx.try_send(ReplyPacket {
+                                                    packet: reply_packet,
+                                                    tunnel_tag: outbound_tag_owned.clone(),
+                                                }) {
+                                                    debug!("Failed to send UDP reply: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                            Ok(Ok(_)) => {
+                                                // Zero bytes read, connection closed
+                                                break;
+                                            }
+                                            Ok(Err(e)) => {
+                                                debug!("UDP recv error: {}", e);
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                // Timeout - check if session is still active
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                if now - session_clone.last_activity_secs() > 60 {
+                                                    debug!("UDP session idle timeout");
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Cleanup session and record completion
+                                    UDP_SESSIONS.remove(&ft);
+                                    outbound_stats_clone.record_completed(0, 0);
+                                    debug!("UDP session closed: {:?}", ft);
+                                });
+                            } else {
+                                // No reply channel - spawn a cleanup task that times out after idle period
+                                tokio::spawn(async move {
+                                    loop {
+                                        tokio::time::sleep(Duration::from_secs(30)).await;
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        if now - session_clone.last_activity_secs() > 60 {
+                                            UDP_SESSIONS.remove(&ft);
+                                            outbound_stats_clone.record_completed(0, 0);
+                                            debug!("UDP session (no reply) closed: {:?}", ft);
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                            
+                            UDP_SESSIONS.insert(five_tuple, session);
                         }
                         Err(e) => {
                             warn!("Failed to send UDP via '{}': {}", outbound_tag, e);
                             stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                            outbound_stats.record_error();
                         }
                     }
                 }
                 Err(e) => {
                     warn!("Failed to connect UDP via '{}' to {}: {}", outbound_tag, dst_addr, e);
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                    // Note: No outbound_stats.record_error() here since connection wasn't established
                 }
             }
         } else {
@@ -3019,7 +3276,6 @@ fn spawn_tcp_reader_task(
     outbound_tag: String,
     connection: Arc<RwLock<TcpConnection>>,
     five_tuple: FiveTuple,
-    outbound_stats: Arc<crate::connection::OutboundStats>,
 ) {
     tokio::spawn(async move {
         // Use a larger read buffer for better throughput
@@ -3036,10 +3292,10 @@ fn spawn_tcp_reader_task(
                         server_ip, server_port, client_ip, client_port
                     );
 
-                    // Get current client_seq and byte counts from connection for ACK and stats
-                    let (ack_num, bytes_sent, bytes_recv) = {
+                    // Get current client_seq from connection for ACK
+                    let ack_num = {
                         let conn_guard = connection.read().await;
-                        (conn_guard.client_seq, conn_guard.get_bytes_sent(), conn_guard.get_bytes_received())
+                        conn_guard.client_seq
                     };
 
                     let fin_packet = build_tcp_packet(
@@ -3065,8 +3321,11 @@ fn spawn_tcp_reader_task(
                         conn_guard.state = TcpConnectionState::Closing;
                     }
                     TCP_WRITE_HALVES.remove(&five_tuple);
-                    // Record connection completion in outbound stats
-                    outbound_stats.record_completed(bytes_recv, bytes_sent);
+                    // Record connection completion in outbound stats (only if not already recorded)
+                    {
+                        let conn_guard = connection.read().await;
+                        conn_guard.record_stats_completion();
+                    }
                     break;
                 }
                 Ok(n) => {
@@ -3097,7 +3356,10 @@ fn spawn_tcp_reader_task(
                     }).await {
                         warn!("Failed to send TCP data to reply router: {}", e);
                         TCP_WRITE_HALVES.remove(&five_tuple);
-                        outbound_stats.record_error();
+                        {
+                            let conn_guard = connection.read().await;
+                            conn_guard.record_stats_error();
+                        }
                         return;
                     }
 
@@ -3144,9 +3406,12 @@ fn spawn_tcp_reader_task(
                         packet: rst_packet,
                         tunnel_tag: outbound_tag.clone(),
                     });
-                    // Cleanup on error and record error in stats
+                    // Cleanup on error and record error in stats (only if not already recorded)
                     TCP_WRITE_HALVES.remove(&five_tuple);
-                    outbound_stats.record_error();
+                    {
+                        let conn_guard = connection.read().await;
+                        conn_guard.record_stats_error();
+                    }
                     break;
                 }
             }

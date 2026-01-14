@@ -1,12 +1,12 @@
 //! `WireGuard` interface utilities
 //!
-//! This module provides utilities for working with `WireGuard` interfaces,
+//! This module provides utilities for working with `WireGuard` tunnels,
 //! including interface name generation that matches the Python implementation
-//! in `scripts/setup_kernel_wg_egress.py`.
+//! in `scripts/db_helper.py`.
 //!
 //! # Interface Naming Convention
 //!
-//! `WireGuard` interfaces follow Linux's interface name limit of 15 characters
+//! `WireGuard` tunnel names follow Linux's interface name limit of 15 characters
 //! (IFNAMSIZ - 1 for null terminator). The naming convention is:
 //!
 //! - PIA profiles: `wg-pia-{tag}` (prefix 7 chars, leaves 8 for tag)
@@ -34,10 +34,8 @@
 //!
 //! # Note
 //!
-//! This module provides UTILITIES only. The actual `WireGuard` connections are
-//! handled by `DirectOutbound` with `bind_interface` and `routing_mark` options.
-//! The kernel `WireGuard` interfaces are created by the Python script
-//! `setup_kernel_wg_egress.py`.
+//! This module provides utilities for tunnel name generation. In userspace mode,
+//! `WireGuard` tunnels are managed by rust-router's boringtun integration via IPC.
 
 use std::fs;
 use std::io;
@@ -125,10 +123,10 @@ impl std::str::FromStr for EgressType {
     }
 }
 
-/// Generate a kernel `WireGuard` interface name for the given egress tag and type
+/// Generate a `WireGuard` tunnel name for the given egress tag and type
 ///
 /// This function produces output **identical** to the Python function
-/// `get_egress_interface_name()` in `scripts/setup_kernel_wg_egress.py`.
+/// `get_egress_interface_name()` in `scripts/db_helper.py`.
 ///
 /// # Arguments
 ///

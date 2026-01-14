@@ -436,6 +436,41 @@ impl IpcHandler {
         &self.local_node_tag
     }
 
+    /// Check if an outbound tag is valid (exists in outbound_manager or wg_egress_manager,
+    /// or is a WireGuard-prefixed tag that will be added via IPC).
+    ///
+    /// Phase 11-Fix.AE: This fixes the routing validation bug where WireGuard outbounds
+    /// in wg_egress_manager were not recognized, causing all traffic to fall back to "direct".
+    fn is_valid_outbound_tag(&self, tag: &str) -> bool {
+        // Check outbound_manager first (Direct/SOCKS5 outbounds)
+        if self.outbound_manager.get(tag).is_some() {
+            return true;
+        }
+
+        // Check wg_egress_manager for existing WireGuard tunnels
+        if let Some(ref egress_mgr) = self.wg_egress_manager {
+            if egress_mgr.has_tunnel(tag) {
+                return true;
+            }
+        }
+
+        // Allow WireGuard-prefixed tags that may be added later via IPC
+        // These prefixes match the forwarder's is_wg_egress check
+        if tag.starts_with("wg-")
+            || tag.starts_with("pia-")
+            || tag.starts_with("peer-")
+        {
+            return true;
+        }
+
+        // Also check "block" and "adblock" special tags
+        if tag == "block" || tag == "adblock" {
+            return true;
+        }
+
+        false
+    }
+
     /// Handle an IPC command and return a response
     pub async fn handle(&self, command: IpcCommand) -> IpcResponse {
         debug!("Handling IPC command: {:?}", command);
@@ -1389,8 +1424,8 @@ impl IpcHandler {
         use super::protocol::UpdateRoutingResponse;
         use crate::rules::RuleType;
 
-        // Validate default outbound exists
-        if self.outbound_manager.get(&default_outbound).is_none() {
+        // Validate default outbound exists (Phase 11-Fix.AE: check both managers + WG prefixes)
+        if !self.is_valid_outbound_tag(&default_outbound) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
                 format!("Default outbound '{default_outbound}' not found"),
@@ -1418,8 +1453,8 @@ impl IpcHandler {
                 continue;
             }
 
-            // Validate outbound exists
-            if self.outbound_manager.get(&rule_cfg.outbound).is_none() {
+            // Validate outbound exists (Phase 11-Fix.AE: check both managers + WG prefixes)
+            if !self.is_valid_outbound_tag(&rule_cfg.outbound) {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
                     format!("Rule references unknown outbound '{}'", rule_cfg.outbound),
@@ -1535,8 +1570,8 @@ impl IpcHandler {
     fn handle_set_default_outbound(&self, tag: String) -> IpcResponse {
         use crate::rules::RoutingSnapshot;
 
-        // Validate outbound exists
-        if self.outbound_manager.get(&tag).is_none() {
+        // Validate outbound exists (Phase 11-Fix.AE: check both managers + WG prefixes)
+        if !self.is_valid_outbound_tag(&tag) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
                 format!("Outbound '{tag}' not found"),

@@ -96,10 +96,11 @@ def validate_dict(data: Any, field_name: str = "field") -> Optional[Dict]:
 # WireGuard egress interface naming constants
 WG_PIA_PREFIX = "wg-pia-"     # 8 chars, leaves 7 for tag
 WG_CUSTOM_PREFIX = "wg-eg-"   # 6 chars, leaves 9 for tag
+WG_WARP_PREFIX = "wg-warp-"   # 8 chars, leaves 7 for tag
 WG_MAX_IFACE_LEN = 15         # Linux interface name limit
 
 
-def get_egress_interface_name(tag: str, is_pia: bool) -> str:
+def get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str = None) -> str:
     """Generate kernel WireGuard interface name for egress
 
     H12 修复: 使用 hash 确保唯一性，避免长标签截断冲突
@@ -107,6 +108,7 @@ def get_egress_interface_name(tag: str, is_pia: bool) -> str:
     Naming convention:
     - PIA profiles: wg-pia-{tag} (e.g., wg-pia-new_york)
     - Custom egress: wg-eg-{tag} (e.g., wg-eg-cn2-la)
+    - WARP egress: wg-warp-{tag} (e.g., wg-warp-cf)
 
     For tags that would be truncated, we use a hash-based suffix to ensure uniqueness:
     - If tag fits: wg-pia-hk (full tag)
@@ -114,12 +116,20 @@ def get_egress_interface_name(tag: str, is_pia: bool) -> str:
 
     Args:
         tag: The egress profile tag/name
-        is_pia: True for PIA profiles, False for custom egress
+        is_pia: True for PIA profiles, False for custom egress (legacy parameter)
+        egress_type: One of "pia", "custom", "warp" (takes precedence over is_pia)
 
     Returns:
         Interface name, max 15 characters (Linux limit), guaranteed unique per tag
     """
-    prefix = WG_PIA_PREFIX if is_pia else WG_CUSTOM_PREFIX
+    # Determine prefix based on egress_type or is_pia fallback
+    if egress_type == "warp":
+        prefix = WG_WARP_PREFIX
+    elif egress_type == "pia" or (egress_type is None and is_pia):
+        prefix = WG_PIA_PREFIX
+    else:
+        prefix = WG_CUSTOM_PREFIX
+
     max_tag_len = WG_MAX_IFACE_LEN - len(prefix)
 
     if len(tag) <= max_tag_len:

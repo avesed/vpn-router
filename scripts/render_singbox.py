@@ -587,9 +587,8 @@ def ensure_endpoints(config: dict, pia_profiles: dict, profile_map: Dict[str, st
 def ensure_kernel_wg_egress_outbounds(config: dict, pia_profiles: dict, custom_egress: List[dict]) -> List[str]:
     """为 PIA 和自定义 WireGuard 出口创建 direct outbound（绑定到内核接口）
 
-    替代之前的 sing-box WireGuard endpoints，现在使用：
-    - 内核 WireGuard 接口由 setup_kernel_wg_egress.py 创建
-    - sing-box 使用 direct outbound + bind_interface 将流量发送到内核接口
+    注意：用户态 WireGuard 模式下，此函数仅用于 sing-box 配置兼容性。
+    实际的 WireGuard 隧道由 rust-router 的 boringtun 处理。
 
     Args:
         config: sing-box 配置
@@ -1579,7 +1578,7 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
         return []
 
     # Import here to avoid circular dependency
-    from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
 
     outbounds = config.setdefault("outbounds", [])
     existing_tags = {ob.get("tag") for ob in outbounds}
@@ -2697,9 +2696,8 @@ def main() -> None:
     pia_profiles = load_pia_profiles_from_db()
     custom_egress = load_custom_egress()
 
-    # 使用内核 WireGuard 模块处理所有 WireGuard 出口
-    # 这些接口由 setup_kernel_wg_egress.py 在容器启动时创建
-    # sing-box 使用 direct outbound + bind_interface 将流量发送到内核接口
+    # 创建 WireGuard 出口的 sing-box 配置（仅用于兼容性）
+    # 用户态模式下，实际的 WireGuard 隧道由 rust-router 的 boringtun 处理
     wg_egress_tags = ensure_kernel_wg_egress_outbounds(config, pia_profiles, custom_egress)
 
     if wg_egress_tags:

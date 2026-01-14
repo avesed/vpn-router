@@ -35,8 +35,7 @@ from typing import Dict, List, Optional, Any
 # 添加脚本目录到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-from db_helper import get_db
-from setup_kernel_wg_egress import get_egress_interface_name
+from db_helper import get_db, get_egress_interface_name
 
 logging.basicConfig(
     level=logging.INFO,
@@ -670,48 +669,137 @@ PersistentKeepalive = 25
             return False
 
     def _start_wireguard_interface(self, tag: str, egress: dict) -> bool:
-        """启动 WireGuard 内核接口"""
-        from setup_kernel_wg_egress import (
-            get_egress_interface_name,
-            create_egress_interface,
-            parse_warp_wg_conf
-        )
-
+        """启动 WireGuard 隧道（用户态模式，通过 rust-router IPC）"""
         config_path = egress.get("config_path", "")
         if not config_path or not os.path.exists(config_path):
             logger.error(f"[{tag}] WireGuard 配置文件不存在: {config_path}")
             return False
 
         # 解析 wg.conf 文件
-        wg_config = parse_warp_wg_conf(config_path)
+        wg_config = self._parse_warp_wg_conf(config_path)
         if not wg_config:
             logger.error(f"[{tag}] 无法解析 WireGuard 配置")
             return False
 
         interface = get_egress_interface_name(tag, egress_type="warp")
-        logger.info(f"[{tag}] 设置 WireGuard 内核接口: {interface}")
+        logger.info(f"[{tag}] 设置 WireGuard 隧道: {interface} (用户态模式)")
 
         try:
-            success = create_egress_interface(
-                interface=interface,
-                private_key=wg_config.get("private_key"),
-                peer_ip=wg_config.get("address"),
-                server=wg_config.get("endpoint_host"),
-                server_port=wg_config.get("endpoint_port", 2408),
-                public_key=wg_config.get("peer_public_key"),
-                mtu=1420
-            )
+            # Phase 6-Fix.AF: Handle async context properly
+            # When called from daemon (async context), we need to schedule the coroutine
+            # without blocking the event loop
+            import asyncio
+            from rust_router_client import RustRouterClient
+
+            async def create_tunnel():
+                import socket
+
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    # Phase 6-Fix.AF: Resolve hostname to IP address
+                    endpoint_host = wg_config.get('endpoint_host')
+                    endpoint_port = wg_config.get('endpoint_port', 2408)
+
+                    # Check if it's already an IP address
+                    try:
+                        socket.inet_pton(socket.AF_INET, endpoint_host)
+                        resolved_host = endpoint_host  # Already IPv4
+                    except socket.error:
+                        try:
+                            socket.inet_pton(socket.AF_INET6, endpoint_host)
+                            resolved_host = endpoint_host  # Already IPv6
+                        except socket.error:
+                            # Need to resolve hostname
+                            logger.info(f"[{tag}] Resolving hostname: {endpoint_host}")
+                            try:
+                                addrs = socket.getaddrinfo(endpoint_host, endpoint_port, socket.AF_INET)
+                                if addrs:
+                                    resolved_host = addrs[0][4][0]  # Get first IPv4 address
+                                    logger.info(f"[{tag}] Resolved to: {resolved_host}")
+                                else:
+                                    logger.error(f"[{tag}] No addresses found for {endpoint_host}")
+                                    return False
+                            except socket.gaierror as e:
+                                logger.error(f"[{tag}] DNS resolution failed: {e}")
+                                return False
+
+                    result = await client.create_wg_tunnel(
+                        tag=tag,
+                        private_key=wg_config.get("private_key"),
+                        peer_public_key=wg_config.get("peer_public_key"),
+                        endpoint=f"{resolved_host}:{endpoint_port}",
+                        local_ip=wg_config.get("address") or "10.0.0.2/32",
+                        mtu=1420
+                    )
+                    return result.success if hasattr(result, 'success') else False
+                finally:
+                    await client.close()
+
+            # Phase 6-Fix.AF: Check if event loop is running
+            try:
+                loop = asyncio.get_running_loop()
+                # Event loop is running - schedule the coroutine as a task and wait synchronously
+                # Using a new thread to avoid "event loop already running" error
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, create_tunnel())
+                    success = future.result(timeout=30)
+            except RuntimeError:
+                # No event loop running - use asyncio.run()
+                success = asyncio.run(create_tunnel())
 
             if success:
-                logger.info(f"[{tag}] WireGuard 接口已设置: {interface}")
+                logger.info(f"[{tag}] WireGuard 隧道已创建: {interface}")
                 return True
             else:
-                logger.error(f"[{tag}] WireGuard 接口设置失败")
+                logger.error(f"[{tag}] WireGuard 隧道创建失败")
                 return False
 
         except Exception as e:
-            logger.error(f"[{tag}] WireGuard 接口设置异常: {e}")
+            logger.error(f"[{tag}] WireGuard 隧道创建异常: {e}")
             return False
+
+    def _parse_warp_wg_conf(self, config_path: str) -> Optional[dict]:
+        """解析 WARP WireGuard 配置文件"""
+        try:
+            config = {}
+            current_section = None
+            with open(config_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('[') and line.endswith(']'):
+                        current_section = line[1:-1].lower()
+                        continue
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip().lower().replace(' ', '_')
+                        value = value.strip()
+
+                        if current_section == 'interface':
+                            if key == 'privatekey':
+                                config['private_key'] = value
+                            elif key == 'address':
+                                # 提取 IP 地址（去掉 CIDR）
+                                config['address'] = value.split('/')[0]
+                        elif current_section == 'peer':
+                            if key == 'publickey':
+                                config['peer_public_key'] = value
+                            elif key == 'endpoint':
+                                # 解析 endpoint
+                                if ':' in value:
+                                    host, port = value.rsplit(':', 1)
+                                    config['endpoint_host'] = host
+                                    config['endpoint_port'] = int(port)
+                                else:
+                                    config['endpoint_host'] = value
+                                    config['endpoint_port'] = 2408
+            return config if config.get('private_key') else None
+        except Exception as e:
+            logger.error(f"解析 WireGuard 配置失败: {e}")
+            return None
 
     async def stop_proxy(self, tag: str) -> bool:
         """停止 WARP SOCKS5 代理"""

@@ -57,10 +57,7 @@ _shutdown_event = threading.Event()
 
 def get_interface_for_egress(db, tag: str) -> Optional[str]:
     """获取出口 tag 对应的内核网络接口名"""
-    try:
-        from db_helper import get_egress_interface_name
-    except ImportError:
-        from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
 
     # 检查 PIA profile
     profile = db.get_pia_profile_by_name(tag)
@@ -87,8 +84,7 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
 
 def get_warp_interface_name(tag: str) -> Optional[str]:
     """获取 WARP WireGuard 出口的内核接口名"""
-    # setup_kernel_wg_egress.py 的版本支持 egress_type 参数
-    from setup_kernel_wg_egress import get_egress_interface_name
+    from db_helper import get_egress_interface_name
     return get_egress_interface_name(tag, egress_type="warp")
 
 
