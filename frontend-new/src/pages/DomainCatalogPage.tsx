@@ -1,9 +1,11 @@
+import { useTranslation } from "react-i18next";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { CategoryList } from "../components/domain-catalog/CategoryList";
 import { useDomainCatalog, useIpCatalog } from "../api/hooks/useDomainCatalog";
 import { Loader2 } from "lucide-react";
 
 export default function DomainCatalogPage() {
+  const { t } = useTranslation();
   const { data: domainCatalog, isLoading: isDomainLoading } = useDomainCatalog();
   const { data: ipCatalog, isLoading: isIpLoading } = useIpCatalog();
 
@@ -36,22 +38,22 @@ export default function DomainCatalogPage() {
   return (
     <div className="space-y-6 p-6">
       <div>
-        <h1 className="text-3xl font-bold tracking-tight">Domain & IP Catalog</h1>
+        <h1 className="text-3xl font-bold tracking-tight">{t("catalog.title")}</h1>
         <p className="text-muted-foreground">
-          Browse and create routing rules from predefined lists of domains and IP ranges.
+          {t("catalog.subtitle")}
         </p>
       </div>
 
       <Tabs defaultValue="geosite" className="space-y-4">
         <TabsList>
-          <TabsTrigger value="geosite">Domain Categories (Geosite)</TabsTrigger>
-          <TabsTrigger value="geoip">IP Categories (GeoIP)</TabsTrigger>
+          <TabsTrigger value="geosite">{t("catalog.byDomain")}</TabsTrigger>
+          <TabsTrigger value="geoip">{t("catalog.byIp")}</TabsTrigger>
         </TabsList>
-        
+
         <TabsContent value="geosite" className="space-y-4">
           <CategoryList categories={domainList} type="domain" />
         </TabsContent>
-        
+
         <TabsContent value="geoip" className="space-y-4">
           <CategoryList categories={ipList} type="ip" />
         </TabsContent>

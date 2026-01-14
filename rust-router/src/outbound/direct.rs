@@ -391,6 +391,10 @@ impl Outbound for DirectOutbound {
         match connect_result {
             Ok(Ok(())) => {
                 self.update_health(true);
+                // Disable Nagle's algorithm for lower latency
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!("Failed to set TCP_NODELAY: {}", e);
+                }
                 debug!(
                     "Direct connection to {} via {} successful",
                     addr, self.config.tag

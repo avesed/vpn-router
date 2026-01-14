@@ -794,7 +794,7 @@ async fn main() -> Result<()> {
                 // Set DNS cache on the processor for domain lookups
                 ingress_mgr.processor().set_dns_cache(Arc::clone(&dns_cache));
 
-                let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(1024);
+                let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(8192);
                 // Clone reply_tx for direct UDP reply handling before storing in reply_router_tx
                 let direct_reply_tx = reply_tx.clone();
                 *reply_router_tx.write() = Some(reply_tx);
@@ -815,6 +815,7 @@ async fn main() -> Result<()> {
                     session_tracker,
                     Arc::clone(&fwd_stats),
                     Some(direct_reply_tx), // Enable direct UDP reply handling
+                    Some(phase6_config.wg_local_ip), // Local IP for responding to pings to gateway
                 );
 
                 info!("Ingress reply router task started");

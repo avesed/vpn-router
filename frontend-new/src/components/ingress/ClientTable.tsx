@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Table,
   TableBody,
@@ -61,13 +62,23 @@ interface ClientTableProps {
 }
 
 export function ClientTable({ clients }: ClientTableProps) {
+  const { t } = useTranslation();
   const [configClient, setConfigClient] = useState<IngressPeer | null>(null);
   const [deleteClient, setDeleteClient] = useState<IngressPeer | null>(null);
   const [editClient, setEditClient] = useState<IngressPeer | null>(null);
-  
+
   const { mutate: deletePeer, isPending: isDeleting } = useDeleteIngressClient();
   const { mutate: updatePeer, isPending: isUpdating } = useUpdateIngressClient();
   const { data: outboundData } = useIngressOutbound();
+
+  // Helper function to determine if a client is online based on last_handshake
+  // WireGuard keepalive is typically 180 seconds
+  const isClientOnline = (client: IngressPeer) => {
+    if (client.last_handshake === 0) return false;
+    const now = Date.now() / 1000; // Convert to seconds
+    const timeSinceHandshake = now - client.last_handshake;
+    return timeSinceHandshake < 180; // Consider online if handshake within last 3 minutes
+  };
 
   const handleDelete = () => {
     if (deleteClient) {
@@ -97,42 +108,44 @@ export function ClientTable({ clients }: ClientTableProps) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>IP Address</TableHead>
-              <TableHead>Transfer</TableHead>
-              <TableHead>Outbound</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
+              <TableHead>{t("common.name")}</TableHead>
+              <TableHead>{t("common.status")}</TableHead>
+              <TableHead>{t("ingress.ipAddress")}</TableHead>
+              <TableHead>{t("ingress.transfer")}</TableHead>
+              <TableHead>{t("ingress.outbound")}</TableHead>
+              <TableHead className="text-right">{t("common.actions")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {clients.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={6} className="text-center h-24 text-muted-foreground">
-                  No clients found. Add one to get started.
+                  {t("ingress.noClients")}
                 </TableCell>
               </TableRow>
             ) : (
-              clients.map((client) => (
-                <TableRow key={client.public_key}>
-                  <TableCell className="font-medium">{client.name}</TableCell>
-                  <TableCell>
-                    <div className="flex items-center gap-2">
-                      <div
-                        className={`h-2 w-2 rounded-full ${
-                          client.is_online ? "bg-green-500" : "bg-gray-300"
-                        }`}
-                      />
-                      <span className="text-sm text-muted-foreground">
-                        {client.is_online ? "Online" : "Offline"}
-                      </span>
-                    </div>
-                    {client.last_handshake > 0 && (
-                      <div className="text-xs text-muted-foreground mt-1">
-                        Last seen: {new Date(client.last_handshake * 1000).toLocaleString()}
+              clients.map((client) => {
+                const isOnline = isClientOnline(client);
+                return (
+                  <TableRow key={client.public_key}>
+                    <TableCell className="font-medium">{client.name}</TableCell>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <div
+                          className={`h-2 w-2 rounded-full ${
+                            isOnline ? "bg-green-500 animate-pulse" : "bg-gray-300"
+                          }`}
+                        />
+                        <span className="text-sm text-muted-foreground">
+                          {isOnline ? t("common.online") : t("common.offline")}
+                        </span>
                       </div>
-                    )}
-                  </TableCell>
+                      {client.last_handshake > 0 && (
+                        <div className="text-xs text-muted-foreground mt-1">
+                          {t("ingress.lastSeen")}: {new Date(client.last_handshake * 1000).toLocaleString()}
+                        </div>
+                      )}
+                    </TableCell>
                   <TableCell>
                     <div className="flex flex-col gap-1">
                       {client.allowed_ips.map((ip) => (
@@ -156,26 +169,26 @@ export function ClientTable({ clients }: ClientTableProps) {
                   </TableCell>
                   <TableCell>
                     <Badge variant="outline">
-                      {client.default_outbound || "Global Default"}
+                      {client.default_outbound || t("ingress.globalDefault")}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <Button variant="ghost" className="h-8 w-8 p-0">
-                          <span className="sr-only">Open menu</span>
+                          <span className="sr-only">{t("common.actions")}</span>
                           <MoreHorizontal className="h-4 w-4" />
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuLabel>Actions</DropdownMenuLabel>
+                        <DropdownMenuLabel>{t("common.actions")}</DropdownMenuLabel>
                         <DropdownMenuItem onClick={() => setConfigClient(client)}>
                           <QrCode className="mr-2 h-4 w-4" />
-                          Show Config / QR
+                          {t("ingress.showConfig")}
                         </DropdownMenuItem>
                         <DropdownMenuItem onClick={() => setEditClient(client)}>
                           <Settings className="mr-2 h-4 w-4" />
-                          Settings
+                          {t("common.settings", "Settings")}
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
@@ -183,13 +196,14 @@ export function ClientTable({ clients }: ClientTableProps) {
                           onClick={() => setDeleteClient(client)}
                         >
                           <Trash2 className="mr-2 h-4 w-4" />
-                          Delete Client
+                          {t("ingress.deleteClient")}
                         </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </TableCell>
                 </TableRow>
-              ))
+              );
+              })
             )}
           </TableBody>
         </Table>
@@ -204,20 +218,22 @@ export function ClientTable({ clients }: ClientTableProps) {
       <AlertDialog open={!!deleteClient} onOpenChange={(open) => !open && setDeleteClient(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+            <AlertDialogTitle>{t("common.confirm")}</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete the client <strong>{deleteClient?.name}</strong>.
-              This action cannot be undone.
+              {t("ingress.deleteConfirm", {
+                name: deleteClient?.name,
+                defaultValue: `This will permanently delete the client ${deleteClient?.name}. This action cannot be undone.`
+              })}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDelete}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={isDeleting}
             >
-              {isDeleting ? "Deleting..." : "Delete"}
+              {isDeleting ? t("common.deleting", "Deleting...") : t("common.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -226,24 +242,24 @@ export function ClientTable({ clients }: ClientTableProps) {
       <Dialog open={!!editClient} onOpenChange={(open) => !open && setEditClient(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Client Settings: {editClient?.name}</DialogTitle>
+            <DialogTitle>{t("ingress.clientSettings")}: {editClient?.name}</DialogTitle>
             <DialogDescription>
-              Configure specific settings for this client.
+              {t("ingress.clientSettingsDesc")}
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-4 py-4">
             <div className="grid gap-2">
-              <Label>Default Outbound</Label>
+              <Label>{t("ingress.defaultOutbound")}</Label>
               <Select
                 value={editClient?.default_outbound || "null"}
                 onValueChange={handleUpdateOutbound}
                 disabled={isUpdating}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select outbound..." />
+                  <SelectValue placeholder={t("ingress.selectOutbound")} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="null">Global Default</SelectItem>
+                  <SelectItem value="null">{t("ingress.globalDefault")}</SelectItem>
                   {outboundData?.available_outbounds.map((outbound) => (
                     <SelectItem key={outbound} value={outbound}>
                       {outbound}
@@ -255,7 +271,7 @@ export function ClientTable({ clients }: ClientTableProps) {
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditClient(null)}>
-              Close
+              {t("common.close")}
             </Button>
           </DialogFooter>
         </DialogContent>

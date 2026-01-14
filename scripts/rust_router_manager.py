@@ -86,6 +86,7 @@ class SyncResult:
     chains_synced: int = 0
     wg_tunnels_synced: int = 0  # Phase 11-Fix.AB
     wg_tunnels_removed: int = 0  # Phase 11-Fix.AB
+    wg_ingress_peers_synced: int = 0  # Phase 11-Fix.AD: WireGuard ingress client peers
     errors: List[str] = field(default_factory=list)
 
 
@@ -883,6 +884,118 @@ class RustRouterManager:
         return result
 
     # =========================================================================
+    # WireGuard Ingress Peer Sync (Phase 11-Fix.AD)
+    # =========================================================================
+
+    async def sync_wg_ingress_peers(self) -> SyncResult:
+        """Sync WireGuard ingress client peers from database to rust-router.
+
+        Phase 11-Fix.AD: This method syncs WireGuard client peers (from the
+        wireguard_peers table) to rust-router's ingress WireGuard interface.
+
+        This method:
+        1. Gets all enabled WireGuard peers from database (db.get_wireguard_peers())
+        2. Gets current ingress peers from rust-router (client.list_ingress_peers())
+        3. Adds missing peers, removes stale peers
+
+        Returns:
+            SyncResult with wg_ingress_peers_synced count and errors
+        """
+        result = SyncResult(success=True)
+
+        async with self._sync_lock:
+            try:
+                if not await self.is_available():
+                    result.success = False
+                    result.errors.append("rust-router is not available")
+                    return result
+
+                db = self._get_db()
+
+                # Get enabled WireGuard peers from database
+                db_peers = db.get_wireguard_peers(enabled_only=True)
+                logger.debug(f"Found {len(db_peers)} enabled WG ingress peers in database")
+
+                # Build a map of public_key -> peer info for database peers
+                db_peers_by_pubkey: Dict[str, Dict[str, Any]] = {}
+                for peer in db_peers:
+                    pubkey = peer.get("public_key")
+                    if pubkey:
+                        db_peers_by_pubkey[pubkey] = peer
+
+                async with await self._get_client() as client:
+                    # Get current ingress peers from rust-router
+                    current_peers = await client.list_ingress_peers()
+                    current_pubkeys = {p.get("public_key") for p in current_peers if p.get("public_key")}
+
+                    logger.debug(f"Found {len(current_pubkeys)} ingress peers in rust-router")
+
+                    added = 0
+                    removed = 0
+
+                    # Add missing peers
+                    for pubkey, peer in db_peers_by_pubkey.items():
+                        if pubkey in current_pubkeys:
+                            logger.debug(f"WG ingress peer {peer.get('name', pubkey[:8])} already exists")
+                            continue
+
+                        # Add the peer to rust-router
+                        name = peer.get("name", "")
+                        allowed_ips = peer.get("allowed_ips", "")
+                        preshared_key = peer.get("preshared_key")
+
+                        logger.info(f"Adding WG ingress peer: {name} ({pubkey[:8]}...) allowed_ips={allowed_ips}")
+
+                        resp = await client.add_ingress_peer(
+                            public_key=pubkey,
+                            allowed_ips=allowed_ips,
+                            name=name,
+                            preshared_key=preshared_key,
+                        )
+
+                        if resp.success:
+                            added += 1
+                            logger.info(f"Added WG ingress peer: {name}")
+                        else:
+                            error_msg = f"Failed to add WG ingress peer {name}: {resp.error}"
+                            result.errors.append(error_msg)
+                            logger.error(error_msg)
+
+                    # Remove stale peers (in rust-router but not in database or disabled)
+                    for peer in current_peers:
+                        pubkey = peer.get("public_key")
+                        if not pubkey:
+                            continue
+
+                        if pubkey not in db_peers_by_pubkey:
+                            peer_name = peer.get("name", pubkey[:8])
+                            logger.info(f"Removing stale WG ingress peer: {peer_name}")
+
+                            resp = await client.remove_ingress_peer(pubkey)
+                            if resp.success:
+                                removed += 1
+                            else:
+                                logger.warning(f"Failed to remove stale peer {peer_name}: {resp.error}")
+
+                    result.wg_ingress_peers_synced = added
+
+                if result.errors:
+                    result.success = False
+
+                logger.info(
+                    f"WG ingress peer sync complete: added={added}, removed={removed}, "
+                    f"errors={len(result.errors)}"
+                )
+
+            except Exception as e:
+                result.success = False
+                error_msg = f"WG ingress peer sync failed: {e}"
+                result.errors.append(error_msg)
+                logger.error(error_msg)
+
+        return result
+
+    # =========================================================================
     # Routing Rules Sync
     # =========================================================================
 
@@ -1516,7 +1629,7 @@ class RustRouterManager:
     # =========================================================================
 
     async def full_sync(self) -> SyncResult:
-        """Full sync: outbounds + rules + peers + ecmp groups + chains.
+        """Full sync: outbounds + rules + peers + ecmp groups + chains + wg ingress peers.
 
         This should be called on startup to ensure rust-router
         is in sync with the database.
@@ -1568,6 +1681,11 @@ class RustRouterManager:
         result.chains_synced = chains_result.chains_synced
         result.errors.extend(chains_result.errors)
 
+        # Phase 11-Fix.AD: Sync WireGuard ingress client peers
+        wg_ingress_result = await self.sync_wg_ingress_peers()
+        result.wg_ingress_peers_synced = wg_ingress_result.wg_ingress_peers_synced
+        result.errors.extend(wg_ingress_result.errors)
+
         # Overall success (includes wg_tunnel_result for userspace WG mode)
         result.success = (
             outbound_result.success and
@@ -1575,7 +1693,8 @@ class RustRouterManager:
             rules_result.success and
             peers_result.success and
             ecmp_result.success and
-            chains_result.success
+            chains_result.success and
+            wg_ingress_result.success
         )
 
         logger.info(
@@ -1587,6 +1706,7 @@ class RustRouterManager:
             f"peers_synced={result.peers_synced}, "
             f"ecmp_groups_synced={result.ecmp_groups_synced}, "
             f"chains_synced={result.chains_synced}, "
+            f"wg_ingress_peers_synced={result.wg_ingress_peers_synced}, "
             f"success={result.success}"
         )
 

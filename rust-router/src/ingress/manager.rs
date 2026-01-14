@@ -104,8 +104,8 @@ use crate::rules::RuleEngine;
 /// Default buffer size for UDP receive
 const UDP_RECV_BUFFER_SIZE: usize = 65536;
 
-/// Channel capacity for processed packets
-const PACKET_CHANNEL_CAPACITY: usize = 256;
+/// Channel capacity for processed packets - increased for better throughput
+const PACKET_CHANNEL_CAPACITY: usize = 1024;
 
 /// `WireGuard` transport data packet overhead
 const WG_TRANSPORT_OVERHEAD: usize = 32;
@@ -253,6 +253,8 @@ struct RegisteredPeer {
     /// Tunnel index for boringtun (reserved for future session lookup optimization)
     #[allow(dead_code)]
     tunnel_index: u32,
+    /// Last known endpoint address (for sending timer-generated packets)
+    last_endpoint: RwLock<Option<SocketAddr>>,
 }
 
 impl RegisteredPeer {
@@ -293,6 +295,7 @@ impl RegisteredPeer {
             last_handshake: AtomicU64::new(0),
             allowed_ips_parsed,
             tunnel_index,
+            last_endpoint: RwLock::new(None),
         })
     }
 
@@ -357,6 +360,17 @@ impl RegisteredPeer {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.last_activity.store(now, Ordering::Relaxed);
+    }
+
+    /// Update activity timestamp and endpoint address
+    fn update_activity_with_endpoint(&self, endpoint: SocketAddr) {
+        self.update_activity();
+        *self.last_endpoint.write() = Some(endpoint);
+    }
+
+    /// Get the last known endpoint address
+    fn get_last_endpoint(&self) -> Option<SocketAddr> {
+        *self.last_endpoint.read()
     }
 }
 
@@ -1043,6 +1057,11 @@ impl WgIngressManager {
     ) {
         let mut recv_buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
         let mut decrypt_buf = vec![0u8; UDP_RECV_BUFFER_SIZE + WG_TRANSPORT_OVERHEAD];
+        
+        // Timer interval for calling update_timers() on all peers (100ms per WireGuard spec)
+        let mut timer_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        timer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut timer_buf = vec![0u8; 148]; // Buffer for timer-generated packets (max handshake size)
 
         loop {
             tokio::select! {
@@ -1075,6 +1094,62 @@ impl WgIngressManager {
                         }
                     }
                 }
+
+                _ = timer_interval.tick() => {
+                    // Call update_timers() on all connected peers
+                    let peers_snapshot = peers.read().clone();
+                    for (public_key, peer) in peers_snapshot.iter() {
+                        // Skip disconnected or removed peers
+                        if !peer.is_connected.load(Ordering::Relaxed) || peer.is_removed.load(Ordering::Relaxed) {
+                            continue;
+                        }
+
+                        // Get the peer's last known endpoint
+                        let Some(endpoint) = peer.get_last_endpoint() else {
+                            continue;
+                        };
+
+                        // Call update_timers() on the peer's tunnel
+                        let result = {
+                            let mut tunn_guard = peer.tunn.lock();
+                            tunn_guard.as_mut().map(|tunn| tunn.update_timers(&mut timer_buf))
+                        };
+
+                        if let Some(result) = result {
+                            match result {
+                                TunnResult::WriteToNetwork(data) => {
+                                    // Send keepalive or handshake
+                                    if let Err(e) = socket.try_send_to(data, endpoint) {
+                                        trace!(
+                                            error = %e,
+                                            peer = %public_key,
+                                            "Failed to send timer packet"
+                                        );
+                                    } else {
+                                        trace!(
+                                            peer = %public_key,
+                                            len = data.len(),
+                                            "Sent timer packet (keepalive/handshake)"
+                                        );
+                                    }
+                                }
+                                TunnResult::Done => {
+                                    // No action needed
+                                }
+                                TunnResult::Err(e) => {
+                                    trace!(
+                                        error = ?e,
+                                        peer = %public_key,
+                                        "Timer update error"
+                                    );
+                                }
+                                _ => {
+                                    // Unexpected result, ignore
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1102,6 +1177,11 @@ impl WgIngressManager {
         let fd = socket.as_raw_fd();
         let mut batch_receiver = BatchReceiver::new(fd, batch_config);
         let mut decrypt_buf = vec![0u8; UDP_RECV_BUFFER_SIZE + WG_TRANSPORT_OVERHEAD];
+
+        // Timer interval for calling update_timers() on all peers (100ms per WireGuard spec)
+        let mut timer_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        timer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut timer_buf = vec![0u8; 148]; // Buffer for timer-generated packets (max handshake size)
 
         info!(
             batch_size = batch_size,
@@ -1152,6 +1232,62 @@ impl WgIngressManager {
                         }
                     }
                 }
+
+                _ = timer_interval.tick() => {
+                    // Call update_timers() on all connected peers
+                    let peers_snapshot = peers.read().clone();
+                    for (public_key, peer) in peers_snapshot.iter() {
+                        // Skip disconnected or removed peers
+                        if !peer.is_connected.load(Ordering::Relaxed) || peer.is_removed.load(Ordering::Relaxed) {
+                            continue;
+                        }
+
+                        // Get the peer's last known endpoint
+                        let Some(endpoint) = peer.get_last_endpoint() else {
+                            continue;
+                        };
+
+                        // Call update_timers() on the peer's tunnel
+                        let result = {
+                            let mut tunn_guard = peer.tunn.lock();
+                            tunn_guard.as_mut().map(|tunn| tunn.update_timers(&mut timer_buf))
+                        };
+
+                        if let Some(result) = result {
+                            match result {
+                                TunnResult::WriteToNetwork(data) => {
+                                    // Send keepalive or handshake
+                                    if let Err(e) = socket.try_send_to(data, endpoint) {
+                                        trace!(
+                                            error = %e,
+                                            peer = %public_key,
+                                            "Failed to send timer packet"
+                                        );
+                                    } else {
+                                        trace!(
+                                            peer = %public_key,
+                                            len = data.len(),
+                                            "Sent timer packet (keepalive/handshake)"
+                                        );
+                                    }
+                                }
+                                TunnResult::Done => {
+                                    // No action needed
+                                }
+                                TunnResult::Err(e) => {
+                                    trace!(
+                                        error = ?e,
+                                        peer = %public_key,
+                                        "Timer update error"
+                                    );
+                                }
+                                _ => {
+                                    // Unexpected result, ignore
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1199,6 +1335,8 @@ impl WgIngressManager {
                 trace!(src_addr = %src_addr, "Sent handshake response");
                 stats.handshake_count.fetch_add(1, Ordering::Relaxed);
                 peer_ref.update_handshake();
+                // Update endpoint on handshake so timer can send keepalives
+                peer_ref.update_activity_with_endpoint(src_addr);
                 let was_connected = peer_ref.is_connected.swap(true, Ordering::Relaxed);
                 if !was_connected {
                     if peer_ref.is_removed.load(Ordering::Relaxed) {
@@ -1254,8 +1392,8 @@ impl WgIngressManager {
             return;
         }
 
-        // Update peer activity
-        peer_ref.update_activity();
+        // Update peer activity and endpoint
+        peer_ref.update_activity_with_endpoint(src_addr);
         peer_ref.rx_bytes.fetch_add(decrypted_data.data.len() as u64, Ordering::Relaxed);
 
         // Process decrypted packet through rule engine
@@ -1293,16 +1431,39 @@ impl WgIngressManager {
         dst: &mut [u8],
         stats: &StatsInner,
     ) -> Option<(DecryptedPacket, String, &'a Arc<RegisteredPeer>)> {
+        // Log packet type for debugging
+        let msg_type = if encrypted.len() >= 4 { encrypted[0] } else { 0 };
+        let type_name = match msg_type {
+            1 => "handshake_init",
+            2 => "handshake_resp",
+            3 => "cookie_reply",
+            4 => "transport_data",
+            _ => "unknown",
+        };
+
         // Try to decrypt with each peer's tunnel
         // In a real implementation with many peers, we'd use the receiver index
         // to look up the peer directly, but boringtun handles sessions internally
         for (public_key, peer) in peers {
             if let Some(decrypted) = peer.decrypt(encrypted, dst) {
+                debug!(
+                    msg_type = type_name,
+                    peer = %public_key,
+                    has_response = decrypted.response.is_some(),
+                    data_len = decrypted.data.len(),
+                    "Decrypted WireGuard packet"
+                );
                 return Some((decrypted, public_key.clone(), peer));
             }
         }
 
-        // If no registered peer could decrypt, increment stats
+        // If no registered peer could decrypt, log details and increment stats
+        debug!(
+            msg_type = type_name,
+            packet_len = encrypted.len(),
+            peer_count = peers.len(),
+            "No peer could decrypt packet"
+        );
         stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
         None
     }

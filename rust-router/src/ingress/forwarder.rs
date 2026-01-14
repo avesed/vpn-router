@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, trace, warn};
@@ -265,15 +265,30 @@ impl TcpConnectionManager {
     pub fn cleanup(&self) -> usize {
         let timeout = self.connection_timeout;
         let before = self.connections.len();
-        self.connections.retain(|_, conn| {
-            if let Ok(guard) = conn.try_read() {
-                guard.last_activity.elapsed() < timeout
-            } else {
-                // Keep connections that are currently locked (in use)
-                true
-            }
-        });
-        before.saturating_sub(self.connections.len())
+        
+        // Collect keys to remove
+        let keys_to_remove: Vec<FiveTuple> = self.connections
+            .iter()
+            .filter_map(|entry| {
+                if let Ok(guard) = entry.value().try_read() {
+                    if guard.last_activity.elapsed() >= timeout {
+                        Some(*entry.key())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        // Remove from both connections and TCP_WRITE_HALVES
+        for key in &keys_to_remove {
+            self.connections.remove(key);
+            TCP_WRITE_HALVES.remove(key);
+        }
+        
+        keys_to_remove.len()
     }
 
     /// Get the number of active connections
@@ -649,6 +664,14 @@ impl IngressSessionTracker {
             .and_modify(|session| {
                 session.touch();
                 session.add_bytes_sent(bytes);
+                // Update peer endpoint in case client's IP changed (mobile roaming/NAT rebinding)
+                if session.peer_endpoint != peer_endpoint {
+                    tracing::info!(
+                        "Peer endpoint changed for {}: {} -> {}",
+                        key, session.peer_endpoint, peer_endpoint
+                    );
+                    session.peer_endpoint = peer_endpoint;
+                }
             })
             .or_insert_with(|| {
                 let mut session = PeerSession::new(peer_public_key, peer_endpoint, outbound_tag);
@@ -1070,7 +1093,11 @@ fn build_tcp_packet(
     window: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let tcp_header_len = 20; // No options
+    // Check if this is a SYN or SYN-ACK packet (needs MSS option)
+    let is_syn = (flags & tcp_flag_bits::SYN) != 0;
+    
+    // TCP header length: 20 bytes base + 4 bytes MSS option if SYN
+    let tcp_header_len = if is_syn { 24 } else { 20 };
     let tcp_len = tcp_header_len + payload.len();
     let total_len = 20 + tcp_len; // IP header + TCP
 
@@ -1092,7 +1119,7 @@ fn build_tcp_packet(
     let ip_checksum = ipv4_header_checksum(&packet[..20]);
     packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
-    // TCP header (20 bytes minimum)
+    // TCP header
     let tcp_start = 20;
     packet[tcp_start..tcp_start + 2].copy_from_slice(&src_port.to_be_bytes());
     packet[tcp_start + 2..tcp_start + 4].copy_from_slice(&dst_port.to_be_bytes());
@@ -1104,9 +1131,17 @@ fn build_tcp_packet(
     // Checksum calculated below
     // Urgent pointer = 0
 
-    // Copy payload
+    // Add MSS option for SYN packets
+    // MSS = 1300 to fit within WireGuard MTU after encryption
+    if is_syn {
+        packet[tcp_start + 20] = 0x02; // MSS option kind
+        packet[tcp_start + 21] = 0x04; // MSS option length
+        packet[tcp_start + 22..tcp_start + 24].copy_from_slice(&1300u16.to_be_bytes()); // MSS value
+    }
+
+    // Copy payload (after options if any)
     if !payload.is_empty() {
-        packet[tcp_start + 20..].copy_from_slice(payload);
+        packet[tcp_start + tcp_header_len..].copy_from_slice(payload);
     }
 
     // Calculate TCP checksum (includes pseudo-header)
@@ -1556,6 +1591,7 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
+/// * `local_ip` - Gateway's local IP for responding to pings to self
 pub async fn run_forwarding_loop(
     mut packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
@@ -1564,6 +1600,7 @@ pub async fn run_forwarding_loop(
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
+    local_ip: Option<IpAddr>,
 ) {
     info!("Ingress forwarding loop started");
 
@@ -1663,6 +1700,7 @@ pub async fn run_forwarding_loop(
                     &stats,
                     direct_reply_tx.clone(),
                     outbound_tag,
+                    local_ip,
                 )
                 .await;
             }
@@ -1995,6 +2033,74 @@ async fn forward_tcp_packet(
         // New connection (SYN without ACK) - establish outbound
         let dst_addr = SocketAddr::new(parsed.dst_ip, tcp_details.dst_port);
 
+        // Check if connection already exists (handles SYN retransmissions)
+        if let Some(existing_conn) = tcp_manager.get(&five_tuple) {
+            let conn_guard = existing_conn.read().await;
+            match conn_guard.state {
+                TcpConnectionState::Established => {
+                    // Connection exists, resend SYN-ACK for the retransmitted SYN
+                    if let Some(ref reply_tx) = direct_reply_tx {
+                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
+                            let syn_ack = build_tcp_packet(
+                                server_ip,
+                                tcp_details.dst_port,
+                                client_ip,
+                                tcp_details.src_port,
+                                conn_guard.server_seq,
+                                tcp_details.seq_num.wrapping_add(1),
+                                tcp_flag_bits::SYN | tcp_flag_bits::ACK,
+                                65535,
+                                &[],
+                            );
+                            let reply = ReplyPacket {
+                                packet: syn_ack,
+                                tunnel_tag: outbound_tag.clone(),
+                            };
+                            if reply_tx.try_send(reply).is_ok() {
+                                debug!(
+                                    "Resent SYN-ACK for retransmitted SYN: {}:{} -> {}:{}",
+                                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                                );
+                            }
+                        }
+                    }
+                    return; // Don't create duplicate connection
+                }
+                TcpConnectionState::SynReceived => {
+                    // Connection is being established, drop duplicate SYN
+                    debug!(
+                        "Dropping duplicate SYN (connection in progress): {}:{} -> {}:{}",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                    );
+                    return;
+                }
+                TcpConnectionState::Closing | TcpConnectionState::Closed => {
+                    // Old connection is closing, remove it and establish new one
+                    drop(conn_guard);
+                    tcp_manager.remove(&five_tuple);
+                    TCP_WRITE_HALVES.remove(&five_tuple);
+                    debug!(
+                        "Removed stale connection for new SYN: {}:{} -> {}:{}",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                    );
+                }
+            }
+        }
+
+        // Create connection entry BEFORE async connect to prevent race with SYN retransmit
+        let tracked = tcp_manager.get_or_create(
+            five_tuple,
+            processed.peer_public_key.clone(),
+            processed.src_addr,
+            outbound_tag.clone(),
+        );
+        // Mark as SynReceived immediately
+        {
+            let mut conn_guard = tracked.write().await;
+            conn_guard.state = TcpConnectionState::SynReceived;
+            conn_guard.client_seq = tcp_details.seq_num;
+        }
+
         if let Some(outbound) = outbound_manager.get(outbound_tag) {
             // Try to establish TCP connection
             match outbound.connect(dst_addr, Duration::from_secs(10)).await {
@@ -2011,22 +2117,14 @@ async fn forward_tcp_packet(
                     // Generate server's initial sequence number
                     let server_seq: u32 = rand::random();
 
-                    // Store connection for future packets
-                    let tracked = tcp_manager.get_or_create(
-                        five_tuple,
-                        processed.peer_public_key.clone(),
-                        processed.src_addr,
-                        outbound_tag.clone(),
-                    );
-
                     // Get the stream for the reader task
                     let stream = conn.into_stream();
                     let (read_half, write_half) = tokio::io::split(stream);
 
+                    // Update connection state (already created before connect)
                     {
                         let mut conn_guard = tracked.write().await;
                         conn_guard.state = TcpConnectionState::Established;
-                        conn_guard.client_seq = tcp_details.seq_num;
                         conn_guard.server_seq = server_seq;
                         // Store write half for sending data
                         // Note: We'll need to modify TcpConnection to store OwnedWriteHalf
@@ -2076,6 +2174,8 @@ async fn forward_tcp_packet(
                                 tcp_details.seq_num.wrapping_add(1),
                                 outbound_tag.clone(),
                                 Arc::clone(&tracked),
+                                five_tuple, // Pass five_tuple for cleanup
+                                outbound.stats(), // Pass outbound stats for proper tracking
                             );
                         }
                     }
@@ -2096,6 +2196,9 @@ async fn forward_tcp_packet(
                         outbound_tag, dst_addr, e
                     );
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+
+                    // Cleanup the connection entry we created before attempting connect
+                    tcp_manager.remove(&five_tuple);
 
                     // Send RST back to client
                     if let Some(ref reply_tx) = direct_reply_tx {
@@ -2121,10 +2224,14 @@ async fn forward_tcp_packet(
             }
         } else {
             warn!("Unknown outbound '{}' for TCP connection", outbound_tag);
+            // Cleanup the connection entry we created
+            tcp_manager.remove(&five_tuple);
             stats.forward_errors.fetch_add(1, Ordering::Relaxed);
         }
     } else if tcp_details.is_fin() || tcp_details.is_rst() {
-        // Connection closing
+        // Connection closing - clean up resources
+        TCP_WRITE_HALVES.remove(&five_tuple);
+        
         if let Some(conn) = tcp_manager.get(&five_tuple) {
             {
                 let mut conn_guard = conn.write().await;
@@ -2172,18 +2279,46 @@ async fn forward_tcp_packet(
 
             // Try to use the write half from our global storage
             drop(conn_guard); // Release lock before async operation
-            if let Some(write_half) = TCP_WRITE_HALVES.get(&five_tuple) {
+            // IMPORTANT: Clone the Arc and drop the DashMap Ref before any .await
+            // Holding a DashMap Ref across .await can cause deadlocks due to
+            // the internal sharded locking mechanism.
+            let write_half = TCP_WRITE_HALVES.get(&five_tuple).map(|r| Arc::clone(&*r));
+            if let Some(write_half) = write_half {
                 let mut stream = write_half.lock().await;
                 match stream.write_all(payload).await {
                     Ok(()) => {
-                        let conn_guard = conn.read().await;
-                        conn_guard.add_bytes_sent(payload_len as u64);
-                        drop(conn_guard);
-                        if let Some(c) = tcp_manager.get(&five_tuple) {
-                            let mut cg = c.write().await;
-                            cg.touch();
+                        // Combine connection updates into a single lock acquisition
+                        let server_seq = {
+                            let mut conn_guard = conn.write().await;
+                            conn_guard.add_bytes_sent(payload_len as u64);
+                            conn_guard.touch();
+                            conn_guard.client_seq = tcp_details.seq_num.wrapping_add(payload_len as u32);
+                            conn_guard.server_seq
+                        };
+                        
+                        // Send ACK back to client to acknowledge received data
+                        // This is critical for TCP flow control
+                        if let Some(ref reply_tx) = direct_reply_tx {
+                            if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
+                                let ack_packet = build_tcp_packet(
+                                    server_ip,
+                                    tcp_details.dst_port,
+                                    client_ip,
+                                    tcp_details.src_port,
+                                    server_seq,
+                                    tcp_details.seq_num.wrapping_add(payload_len as u32),
+                                    tcp_flag_bits::ACK,
+                                    65535,
+                                    &[],
+                                );
+                                let _ = reply_tx.try_send(ReplyPacket {
+                                    packet: ack_packet,
+                                    tunnel_tag: outbound_tag.clone(),
+                                });
+                            }
                         }
-                        debug!(
+                        
+                        trace!(
                             "Forwarded {} bytes TCP payload: {}:{} -> {}:{}",
                             payload_len,
                             parsed.src_ip,
@@ -2199,9 +2334,9 @@ async fn forward_tcp_packet(
                         );
                         stats.forward_errors.fetch_add(1, Ordering::Relaxed);
                         // Mark connection as closing on write error
-                        if let Some(c) = tcp_manager.get(&five_tuple) {
-                            let mut cg = c.write().await;
-                            cg.state = TcpConnectionState::Closing;
+                        {
+                            let mut conn_guard = conn.write().await;
+                            conn_guard.state = TcpConnectionState::Closing;
                         }
                         // Remove write half
                         TCP_WRITE_HALVES.remove(&five_tuple);
@@ -2853,37 +2988,59 @@ fn spawn_direct_udp_reply_listener_raw(
 // ============================================================================
 
 /// Maximum TCP segment size for reading server responses
-const MAX_TCP_SEGMENT_SIZE: usize = 65535;
+/// 
+/// This is set to fit within WireGuard's MTU after encryption:
+/// - WireGuard MTU: typically 1420 bytes
+/// - IP header: 20 bytes
+/// - TCP header: 20-60 bytes (with options)
+/// - WireGuard overhead: 32 bytes (transport header + auth tag)
+/// - Safety margin: additional bytes for IPv6, options, etc.
+/// 
+/// Conservative value: 1420 - 20 (IP) - 60 (TCP max) - 32 (WG) - 8 (safety) = 1300
+const MAX_TCP_SEGMENT_SIZE: usize = 1300;
+
+/// Read buffer size for TCP reader - larger buffer reduces syscall overhead
+/// We read into a larger buffer but still send in MSS-sized chunks
+const TCP_READ_BUFFER_SIZE: usize = 65536;
 
 /// Spawn a task to read server responses and forward them to the client.
 ///
 /// This task reads data from the server and constructs TCP packets to send
 /// back to the WireGuard client via the reply router.
 fn spawn_tcp_reader_task(
-    mut read_half: tokio::io::ReadHalf<TcpStream>,
+    read_half: tokio::io::ReadHalf<TcpStream>,
     reply_tx: mpsc::Sender<ReplyPacket>,
     server_ip: Ipv4Addr,
     server_port: u16,
     client_ip: Ipv4Addr,
     client_port: u16,
     initial_seq: u32,
-    initial_ack: u32,
+    _initial_ack: u32, // Now read from connection.client_seq for accurate ACK tracking
     outbound_tag: String,
     connection: Arc<RwLock<TcpConnection>>,
+    five_tuple: FiveTuple,
+    outbound_stats: Arc<crate::connection::OutboundStats>,
 ) {
     tokio::spawn(async move {
+        // Use a larger read buffer for better throughput
+        let mut reader = BufReader::with_capacity(TCP_READ_BUFFER_SIZE, read_half);
         let mut buf = vec![0u8; MAX_TCP_SEGMENT_SIZE];
         let mut seq_num = initial_seq;
-        let ack_num = initial_ack;
 
         loop {
-            match read_half.read(&mut buf).await {
+            match reader.read(&mut buf).await {
                 Ok(0) => {
-                    // Connection closed by server - send FIN
+                    // Connection closed by server - send FIN and cleanup
                     debug!(
                         "Server closed TCP connection: {}:{} -> {}:{}",
                         server_ip, server_port, client_ip, client_port
                     );
+
+                    // Get current client_seq and byte counts from connection for ACK and stats
+                    let (ack_num, bytes_sent, bytes_recv) = {
+                        let conn_guard = connection.read().await;
+                        (conn_guard.client_seq, conn_guard.get_bytes_sent(), conn_guard.get_bytes_received())
+                    };
 
                     let fin_packet = build_tcp_packet(
                         server_ip,
@@ -2902,16 +3059,25 @@ fn spawn_tcp_reader_task(
                         tunnel_tag: outbound_tag.clone(),
                     });
 
-                    // Update connection state
+                    // Update connection state and cleanup
                     {
                         let mut conn_guard = connection.write().await;
                         conn_guard.state = TcpConnectionState::Closing;
                     }
+                    TCP_WRITE_HALVES.remove(&five_tuple);
+                    // Record connection completion in outbound stats
+                    outbound_stats.record_completed(bytes_recv, bytes_sent);
                     break;
                 }
                 Ok(n) => {
                     // Data received from server - forward to client
                     let payload = &buf[..n];
+                    
+                    // Get current client_seq from connection for ACK
+                    let ack_num = {
+                        let conn_guard = connection.read().await;
+                        conn_guard.client_seq
+                    };
 
                     let data_packet = build_tcp_packet(
                         server_ip,
@@ -2925,12 +3091,14 @@ fn spawn_tcp_reader_task(
                         payload,
                     );
 
-                    if let Err(e) = reply_tx.try_send(ReplyPacket {
+                    if let Err(e) = reply_tx.send(ReplyPacket {
                         packet: data_packet,
                         tunnel_tag: outbound_tag.clone(),
-                    }) {
+                    }).await {
                         warn!("Failed to send TCP data to reply router: {}", e);
-                        break;
+                        TCP_WRITE_HALVES.remove(&five_tuple);
+                        outbound_stats.record_error();
+                        return;
                     }
 
                     trace!(
@@ -2953,6 +3121,12 @@ fn spawn_tcp_reader_task(
                         server_ip, server_port, client_ip, client_port, e
                     );
 
+                    // Get current client_seq from connection for ACK
+                    let ack_num = {
+                        let conn_guard = connection.read().await;
+                        conn_guard.client_seq
+                    };
+
                     // Send RST on error
                     let rst_packet = build_tcp_packet(
                         server_ip,
@@ -2970,6 +3144,9 @@ fn spawn_tcp_reader_task(
                         packet: rst_packet,
                         tunnel_tag: outbound_tag.clone(),
                     });
+                    // Cleanup on error and record error in stats
+                    TCP_WRITE_HALVES.remove(&five_tuple);
+                    outbound_stats.record_error();
                     break;
                 }
             }
@@ -2990,6 +3167,9 @@ fn spawn_tcp_reader_task(
 ///
 /// For ICMP Echo Request (ping), we send the request to the destination
 /// and wait for the Echo Reply, then forward it back to the client.
+/// 
+/// If the destination is the gateway's local IP, we respond directly
+/// with an Echo Reply without forwarding.
 async fn forward_icmp_packet(
     processed: &ProcessedPacket,
     parsed: &ParsedPacket,
@@ -2997,6 +3177,7 @@ async fn forward_icmp_packet(
     stats: &Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     outbound_tag: &str,
+    local_ip: Option<IpAddr>,
 ) {
     // Only handle IPv4 ICMP for now
     let IpAddr::V4(dst_ip) = parsed.dst_ip else {
@@ -3024,6 +3205,52 @@ async fn forward_icmp_packet(
         "ICMP Echo Request: {} -> {} (id={}, seq={})",
         src_ip, dst_ip, id, seq
     );
+
+    // Check if ping is to our local gateway IP - respond directly
+    if let Some(IpAddr::V4(local_ipv4)) = local_ip {
+        if dst_ip == local_ipv4 {
+            info!(
+                "ICMP Echo Request to local gateway, sending reply: {} -> {} (id={}, seq={})",
+                dst_ip, src_ip, id, seq
+            );
+            
+            // Register session so reply router can find the peer
+            // The reply packet has src=gateway, dst=client, so we register with
+            // key = (client_ip, id, gateway_ip, 0, ICMP) to match the reply lookup
+            let five_tuple = FiveTuple::new(
+                parsed.src_ip, // client IP
+                id,            // Use ICMP ID as "port"
+                parsed.dst_ip, // gateway IP
+                0,
+                IPPROTO_ICMP,
+            );
+            session_tracker.register(
+                five_tuple,
+                processed.peer_public_key.clone(),
+                processed.src_addr,
+                outbound_tag.to_string(),
+                parsed.total_len as u64,
+            );
+            
+            // Build Echo Reply directly
+            let reply_packet = build_icmp_reply_packet(dst_ip, src_ip, id, seq, &payload);
+            
+            if let Some(ref reply_tx) = direct_reply_tx {
+                if let Err(e) = reply_tx.try_send(ReplyPacket {
+                    packet: reply_packet,
+                    tunnel_tag: outbound_tag.to_string(),
+                }) {
+                    warn!("Failed to send local ICMP reply: {}", e);
+                } else {
+                    info!(
+                        "ICMP Echo Reply sent to local: {} -> {} (id={}, seq={})",
+                        dst_ip, src_ip, id, seq
+                    );
+                }
+            }
+            return;
+        }
+    }
 
     // Register session for reply routing
     let five_tuple = FiveTuple::new(
@@ -3160,6 +3387,7 @@ async fn create_icmp_socket() -> std::io::Result<UdpSocket> {
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
+/// * `local_ip` - Gateway's local IP for responding to pings to self
 ///
 /// # Returns
 ///
@@ -3172,6 +3400,7 @@ pub fn spawn_forwarding_task(
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
+    local_ip: Option<IpAddr>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_forwarding_loop(
         packet_rx,
@@ -3181,6 +3410,7 @@ pub fn spawn_forwarding_task(
         session_tracker,
         stats,
         direct_reply_tx,
+        local_ip,
     ))
 }
 

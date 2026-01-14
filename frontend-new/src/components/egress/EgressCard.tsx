@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { EgressItem } from "../../types";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "../ui/card";
 import { Badge } from "../ui/badge";
@@ -16,6 +17,7 @@ interface EgressCardProps {
 }
 
 export function EgressCard({ egress, onDelete, onEdit, showActions = true }: EgressCardProps) {
+  const { t } = useTranslation();
   const [testResult, setTestResult] = useState<{ success: boolean; delay: number; message: string } | null>(null);
   const testEgress = useTestEgress();
 
@@ -24,12 +26,12 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
     toast.promise(
       testEgress.mutateAsync({ tag: egress.tag }),
       {
-        loading: "Testing connection...",
+        loading: t("egress.testing"),
         success: (data) => {
           setTestResult(data);
-          return `Test complete: ${data.message}`;
+          return `${t("egress.testComplete")}: ${data.message}`;
         },
-        error: (err) => `Test failed: ${err.message}`,
+        error: (err) => `${t("egress.testFailed")}: ${err.message}`,
       }
     );
   };
@@ -61,7 +63,7 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
             {getIcon()}
             <div>
               <CardTitle className="text-lg">{egress.tag}</CardTitle>
-              <CardDescription className="text-xs mt-1">{egress.description || "No description"}</CardDescription>
+              <CardDescription className="text-xs mt-1">{egress.description || t("egress.noDescription")}</CardDescription>
             </div>
           </div>
           <Badge variant={egress.is_configured ? "default" : "secondary"}>
@@ -73,19 +75,19 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
         <div className="grid grid-cols-2 gap-2">
           {egress.server && (
             <div className="flex flex-col">
-              <span className="text-xs text-muted-foreground">Server</span>
+              <span className="text-xs text-muted-foreground">{t("egress.server")}</span>
               <span className="font-medium truncate" title={egress.server}>{egress.server}</span>
             </div>
           )}
           {egress.port && (
             <div className="flex flex-col">
-              <span className="text-xs text-muted-foreground">Port</span>
+              <span className="text-xs text-muted-foreground">{t("common.port")}</span>
               <span className="font-medium">{egress.port}</span>
             </div>
           )}
           {egress.bind_interface && (
             <div className="flex flex-col">
-              <span className="text-xs text-muted-foreground">Interface</span>
+              <span className="text-xs text-muted-foreground">{t("egress.interface")}</span>
               <span className="font-medium">{egress.bind_interface}</span>
             </div>
           )}
@@ -93,7 +95,7 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
             <div className="col-span-2 mt-2">
               <div className={cn("text-xs px-2 py-1 rounded flex items-center gap-2", getStatusColor(testResult.success ? testResult.delay : -1))}>
                 <Activity className="h-3 w-3" />
-                {testResult.success ? `${testResult.delay}ms` : "Failed"}
+                {testResult.success ? `${testResult.delay}ms` : t("common.failed")}
               </div>
             </div>
           )}

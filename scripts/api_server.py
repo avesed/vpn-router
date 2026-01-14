@@ -5122,20 +5122,24 @@ def detect_lan_subnet() -> Optional[str]:
     return None
 
 
-def calculate_allowed_ips_excluding_subnet(exclude_subnet: str) -> str:
+def calculate_allowed_ips_excluding_subnet(exclude_subnet: str, vpn_subnet: str = "10.25.0.0/24") -> str:
     """计算 Split Tunnel 的 AllowedIPs
 
     排除所有 RFC1918 私有地址范围 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)，
-    使本地局域网流量不走 VPN。包含 1.1.1.1/32 确保 DNS 查询走 VPN。
+    使本地局域网流量不走 VPN。但保留 VPN 内部子网，确保客户端可以访问 VPN 网关。
+    包含 1.1.1.1/32 确保 DNS 查询走 VPN。
 
     Args:
         exclude_subnet: 要排除的子网（用于日志记录）
+        vpn_subnet: VPN 内部子网，必须包含在 AllowedIPs 中（默认 10.25.0.0/24）
 
     Returns:
         Split Tunnel 的 CIDR 列表
     """
     # 精确排除 RFC1918 私有地址，覆盖所有公网 IP + Cloudflare DNS
-    return ("1.0.0.0/8, 2.0.0.0/8, 3.0.0.0/8, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, "
+    # 重要：必须包含 VPN 子网 (如 10.25.0.0/24)，否则客户端无法访问 VPN 网关
+    return (f"{vpn_subnet}, "
+            "1.0.0.0/8, 2.0.0.0/8, 3.0.0.0/8, 4.0.0.0/6, 8.0.0.0/7, 11.0.0.0/8, "
             "12.0.0.0/6, 16.0.0.0/4, 32.0.0.0/3, 64.0.0.0/2, 128.0.0.0/3, "
             "160.0.0.0/5, 168.0.0.0/6, 172.0.0.0/12, 172.32.0.0/11, 172.64.0.0/10, "
             "172.128.0.0/9, 173.0.0.0/8, 174.0.0.0/7, 176.0.0.0/4, 192.0.0.0/9, "
@@ -5375,7 +5379,22 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
     if allow_lan and lan_subnet:
         # 启用保留局域网连接：Split Tunnel，排除本地 LAN 网段
         # 本地局域网流量直接走本地网络，其他流量走 VPN
-        allowed_ips = calculate_allowed_ips_excluding_subnet(lan_subnet)
+        # 获取 VPN 子网，确保客户端可以访问 VPN 网关
+        vpn_subnet = "10.25.0.0/24"  # 默认 VPN 子网
+        if HAS_DATABASE and USER_DB_PATH.exists():
+            try:
+                db = _get_db()
+                wg_server = db.get_wireguard_server()
+                if wg_server and wg_server.get("address"):
+                    # 从服务器地址提取子网，如 10.25.0.1/24 -> 10.25.0.0/24
+                    import ipaddress
+                    server_addr = wg_server["address"]
+                    if "/" in server_addr:
+                        network = ipaddress.ip_network(server_addr, strict=False)
+                        vpn_subnet = str(network)
+            except Exception:
+                pass  # 使用默认值
+        allowed_ips = calculate_allowed_ips_excluding_subnet(lan_subnet, vpn_subnet)
     else:
         # 默认：全部流量走 VPN
         allowed_ips = "0.0.0.0/0"

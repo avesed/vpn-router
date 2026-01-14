@@ -14,11 +14,29 @@
     ],
     "strategy": "ipv4_only"
   },
-  "inbounds": [],
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "listen_port": 7893,
+      "sniff": true,
+      "sniff_override_destination": false
+    }
+  ],
   "outbounds": [
     {
       "type": "direct",
       "tag": "direct"
+    },
+    {
+      "type": "selector",
+      "tag": "default-exit",
+      "outbounds": [
+        "direct"
+      ],
+      "default": "direct",
+      "interrupt_exist_connections": false
     },
     {
       "type": "block",
@@ -31,8 +49,52 @@
   ],
   "endpoints": [],
   "route": {
-    "rules": [],
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "tls",
+          "http",
+          "quic",
+          "bittorrent",
+          "stun",
+          "dtls"
+        ],
+        "timeout": "300ms"
+      },
+      {
+        "action": "hijack-dns",
+        "protocol": "dns"
+      },
+      {
+        "ip_cidr": [
+          "10.1.1.0/24"
+        ],
+        "outbound": "direct"
+      }
+    ],
     "rule_set": [],
-    "final": "direct"
+    "final": "default-exit"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": ""
+    },
+    "v2ray_api": {
+      "listen": "127.0.0.1:10085",
+      "stats": {
+        "enabled": true,
+        "outbounds": [
+          "direct",
+          "block",
+          "adblock"
+        ]
+      }
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "/etc/sing-box/cache.db"
+    }
   }
 }

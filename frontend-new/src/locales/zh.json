@@ -63,7 +63,12 @@
     "custom": "自定义",
     "searchResults": "搜索结果",
     "noMatchingResults": "没有找到匹配的结果",
-    "lists": "个列表"
+    "lists": "个列表",
+    "clients": "客户端",
+    "qrCode": "二维码",
+    "configFile": "配置文件",
+    "copy": "复制",
+    "download": "下载"
   },
   "nav": {
     "title": "网关控制台",

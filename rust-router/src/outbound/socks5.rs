@@ -412,7 +412,13 @@ impl Socks5ConnectionManager {
         .await;
 
         match result {
-            Ok(Ok(())) => Ok(stream),
+            Ok(Ok(())) => {
+                // Disable Nagle's algorithm for lower latency
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!("Failed to set TCP_NODELAY for SOCKS5: {}", e);
+                }
+                Ok(stream)
+            },
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Socks5Error::HandshakeTimeout),
         }

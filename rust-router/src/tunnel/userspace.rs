@@ -148,8 +148,8 @@ const TIMER_TICK_MS: u64 = 250;
 /// Buffer size for UDP receive operations
 const UDP_RECV_BUFFER_SIZE: usize = 65536;
 
-/// Channel capacity for received packets
-const RECV_CHANNEL_CAPACITY: usize = 256;
+/// Channel capacity for received packets - increased for better throughput
+const RECV_CHANNEL_CAPACITY: usize = 1024;
 
 /// Default buffer pool capacity for tunnel operations
 const BUFFER_POOL_CAPACITY: usize = 64;

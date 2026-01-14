@@ -1055,14 +1055,25 @@ start_rust_router() {
     export RUST_ROUTER_WG_LISTEN_PORT="${WG_LISTEN_PORT}"
 
     # Phase 11-Fix.Z: Retrieve WireGuard private key from database for userspace WG
+    # Fix: Read encryption key from file if SQLCIPHER_KEY env var is not set
     RUST_ROUTER_WG_PRIVATE_KEY=$(python3 -c "
 import sys
 sys.path.insert(0, '/usr/local/bin')
 from db_helper import get_db
 import os
+from pathlib import Path
+
+# Get encryption key from env var or file
+encryption_key = os.environ.get('SQLCIPHER_KEY')
+if not encryption_key:
+    key_file = Path(os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')).parent / 'encryption.key'
+    if key_file.exists():
+        encryption_key = key_file.read_text().strip()
+
 db = get_db(
     os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db'),
-    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+    os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db'),
+    encryption_key
 )
 server = db.get_wireguard_server()
 if server and server.get('private_key'):

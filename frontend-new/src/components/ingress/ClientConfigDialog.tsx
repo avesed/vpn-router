@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import {
   Dialog,
   DialogContent,
@@ -21,6 +22,7 @@ interface ClientConfigDialogProps {
 }
 
 export function ClientConfigDialog({ clientName, privateKey, open, onOpenChange }: ClientConfigDialogProps) {
+  const { t } = useTranslation();
   const [qrCodeUrl, setQrCodeUrl] = useState<string | null>(null);
   const [configText, setConfigText] = useState<string | null>(null);
   const { mutate: getQrCode, isPending: isLoadingQr } = useGetClientQrCode();
@@ -56,7 +58,7 @@ export function ClientConfigDialog({ clientName, privateKey, open, onOpenChange 
   const handleCopyConfig = () => {
     if (configText) {
       navigator.clipboard.writeText(configText);
-      toast.success("Configuration copied to clipboard");
+      toast.success(t("ingress.copied"));
     }
   };
 
@@ -78,40 +80,39 @@ export function ClientConfigDialog({ clientName, privateKey, open, onOpenChange 
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[500px]">
         <DialogHeader>
-          <DialogTitle>Client Configuration: {clientName}</DialogTitle>
+          <DialogTitle>{t("ingress.clientConfig")}: {clientName}</DialogTitle>
           <DialogDescription>
-            Scan the QR code or copy the configuration file.
+            {t("ingress.qrCodeHint")}
           </DialogDescription>
         </DialogHeader>
 
         <Tabs defaultValue="qrcode" className="w-full">
           <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="qrcode">QR Code</TabsTrigger>
-            <TabsTrigger value="config">Config File</TabsTrigger>
+            <TabsTrigger value="qrcode">{t("common.qrCode", "QR Code")}</TabsTrigger>
+            <TabsTrigger value="config">{t("common.configFile", "Config File")}</TabsTrigger>
           </TabsList>
-          
+
           <TabsContent value="qrcode" className="flex flex-col items-center justify-center p-4">
             {isLoadingQr ? (
               <Loader2 className="h-32 w-32 animate-spin text-muted-foreground" />
             ) : qrCodeUrl ? (
-              <img src={qrCodeUrl} alt="WireGuard QR Code" className="h-64 w-64 border rounded-lg" />
+              <img src={qrCodeUrl} alt={t("ingress.qrCodeAlt")} className="h-64 w-64 border rounded-lg" />
             ) : (
-              <p className="text-muted-foreground">Failed to load QR code</p>
+              <p className="text-muted-foreground">{t("common.loadFailed")}</p>
             )}
             <p className="text-sm text-muted-foreground mt-4 text-center">
-              Scan this code with the WireGuard mobile app
+              {t("ingress.scanQrCode")}
             </p>
             {!privateKey && (
               <Alert variant="destructive" className="mt-4">
                 <AlertTriangle className="h-4 w-4" />
                 <AlertDescription>
-                  Private key is not available. If you see "YOUR_PRIVATE_KEY" in the config, 
-                  you need to use the private key saved when this client was created.
+                  {t("ingress.privateKeyHint")}
                 </AlertDescription>
               </Alert>
             )}
           </TabsContent>
-          
+
           <TabsContent value="config" className="space-y-4">
             <div className="relative">
               {isLoadingConfig ? (
@@ -119,19 +120,19 @@ export function ClientConfigDialog({ clientName, privateKey, open, onOpenChange 
                   <Loader2 className="h-8 w-8 animate-spin" />
                 </div>
               ) : (
-                <pre className="p-4 rounded-lg bg-muted overflow-x-auto text-xs font-mono h-64 border">
-                  {configText || "Failed to load configuration"}
+                <pre className="p-4 rounded-lg bg-muted overflow-auto text-xs font-mono h-64 border whitespace-pre-wrap break-words">
+                  {configText || t("common.loadFailed")}
                 </pre>
               )}
             </div>
             <div className="flex gap-2 justify-end">
               <Button variant="outline" size="sm" onClick={handleCopyConfig} disabled={!configText}>
                 <Copy className="mr-2 h-4 w-4" />
-                Copy
+                {t("common.copy", "Copy")}
               </Button>
               <Button variant="outline" size="sm" onClick={handleDownloadConfig} disabled={!configText}>
                 <Download className="mr-2 h-4 w-4" />
-                Download
+                {t("common.download", "Download")}
               </Button>
             </div>
           </TabsContent>

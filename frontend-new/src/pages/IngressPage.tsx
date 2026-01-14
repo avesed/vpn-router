@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useIngressConfig } from "@/api/hooks/useIngress";
 import { IngressSettings } from "@/components/ingress/IngressSettings";
 import { ClientTable } from "@/components/ingress/ClientTable";
@@ -10,6 +11,7 @@ import { Plus, Loader2 } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export default function IngressPage() {
+  const { t } = useTranslation();
   const { data: ingressData, isLoading } = useIngressConfig();
   const [isAddClientOpen, setIsAddClientOpen] = useState(false);
   const [configClientName, setConfigClientName] = useState<string | null>(null);
@@ -27,29 +29,29 @@ export default function IngressPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">WireGuard Ingress</h1>
+          <h1 className="text-3xl font-bold tracking-tight">{t("nav.ingressClient")}</h1>
           <p className="text-muted-foreground">
-            Manage WireGuard server and clients for incoming connections.
+            {t("ingress.subtitle")}
           </p>
         </div>
         <Button onClick={() => setIsAddClientOpen(true)}>
           <Plus className="mr-2 h-4 w-4" />
-          Add Client
+          {t("ingress.addClient")}
         </Button>
       </div>
 
       <Tabs defaultValue="clients" className="space-y-4">
         <TabsList>
-          <TabsTrigger value="clients">Clients</TabsTrigger>
-          <TabsTrigger value="settings">Server Settings</TabsTrigger>
+          <TabsTrigger value="clients">{t("common.clients", "Clients")}</TabsTrigger>
+          <TabsTrigger value="settings">{t("ingress.serverSettings")}</TabsTrigger>
         </TabsList>
-        
+
         <TabsContent value="clients" className="space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle>Connected Clients</CardTitle>
+              <CardTitle>{t("ingress.connectedClients")}</CardTitle>
               <CardDescription>
-                Manage devices allowed to connect to this router via WireGuard.
+                {t("ingress.subtitle")}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -57,7 +59,7 @@ export default function IngressPage() {
             </CardContent>
           </Card>
         </TabsContent>
-        
+
         <TabsContent value="settings">
           <IngressSettings />
         </TabsContent>
