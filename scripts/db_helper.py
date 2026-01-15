@@ -1827,31 +1827,25 @@ class UserDatabase:
         self,
         tag: str,
         description: str = "",
-        protocol: str = "masque",
         config_path: Optional[str] = None,
         license_key: Optional[str] = None,
         account_type: str = "free",
-        mode: str = "socks",
-        socks_port: Optional[int] = None,
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
         enabled: bool = True,
-        account_id: Optional[str] = None  # Phase 2: Cloudflare account ID
+        account_id: Optional[str] = None
     ) -> int:
-        """添加 WARP 出口"""
-        if socks_port is None and mode == "socks":
-            socks_port = self.get_next_warp_socks_port()
-
+        """添加 WARP 出口 (Phase 3: WireGuard only, protocol/mode/socks_port removed)"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO warp_egress
-                (tag, description, protocol, config_path, license_key, account_type,
-                 mode, socks_port, endpoint_v4, endpoint_v6, enabled, account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (tag, description, config_path, license_key, account_type,
+                 endpoint_v4, endpoint_v6, enabled, account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                tag, description, protocol, config_path, license_key, account_type,
-                mode, socks_port, endpoint_v4, endpoint_v6,
+                tag, description, config_path, license_key, account_type,
+                endpoint_v4, endpoint_v6,
                 1 if enabled else 0,
                 account_id
             ))
@@ -1859,10 +1853,11 @@ class UserDatabase:
             return cursor.lastrowid
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:
-        """更新 WARP 出口"""
+        """更新 WARP 出口 (Phase 3: WireGuard only)"""
         allowed_fields = {
-            "description", "protocol", "config_path", "license_key", "account_type",
-            "mode", "socks_port", "endpoint_v4", "endpoint_v6", "enabled", "account_id"  # Phase 2
+            "description", "config_path", "license_key", "account_type",
+            "endpoint_v4", "endpoint_v6", "enabled", "account_id"
+            # Phase 3: Removed protocol, mode, socks_port
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not updates:
@@ -4739,19 +4734,18 @@ class DatabaseManager:
         self,
         tag: str,
         description: str = "",
-        protocol: str = "masque",
         config_path: Optional[str] = None,
         license_key: Optional[str] = None,
         account_type: str = "free",
-        mode: str = "socks",
-        socks_port: Optional[int] = None,
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
-        enabled: bool = True
+        enabled: bool = True,
+        account_id: Optional[str] = None
     ) -> int:
+        """Phase 3: WireGuard only, protocol/mode/socks_port removed"""
         return self.user.add_warp_egress(
-            tag, description, protocol, config_path, license_key, account_type,
-            mode, socks_port, endpoint_v4, endpoint_v6, enabled
+            tag, description, config_path, license_key, account_type,
+            endpoint_v4, endpoint_v6, enabled, account_id
         )
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:

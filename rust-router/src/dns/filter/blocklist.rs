@@ -466,6 +466,10 @@ impl BlockFilter {
         // Increment total queries
         self.total_queries.fetch_add(1, Ordering::Relaxed);
 
+        // Phase 3-Fix: Strip trailing dot from FQDN format (e.g., "ads.google.com." -> "ads.google.com")
+        // DNS QNAME from hickory_proto includes a trailing dot for FQDN, but blocklist rules don't.
+        let domain = domain.trim_end_matches('.');
+
         let matcher_guard = self.matcher.load();
 
         // Check if domain matches any blocking rule
@@ -799,6 +803,31 @@ mod tests {
         assert!(filter.is_blocked("ADS.EXAMPLE.COM").is_some());
         assert!(filter.is_blocked("Ads.Example.Com").is_some());
         assert!(filter.is_blocked("ads.EXAMPLE.com").is_some());
+    }
+
+    #[test]
+    fn test_is_blocked_trailing_dot() {
+        // Phase 3-Fix: Test that trailing dot (FQDN format) is handled correctly
+        // DNS QNAME from hickory_proto includes a trailing dot, e.g., "ads.google.com."
+        let filter = BlockFilter::new(BlockingConfig::default());
+        let domains = vec!["ads.google.com".to_string(), "googleadservices.com".to_string()];
+        filter.load_from_domains(&domains).unwrap();
+
+        // Without trailing dot (standard blocklist format)
+        assert!(filter.is_blocked("ads.google.com").is_some());
+        assert!(filter.is_blocked("googleadservices.com").is_some());
+
+        // With trailing dot (DNS FQDN format from hickory_proto)
+        assert!(filter.is_blocked("ads.google.com.").is_some());
+        assert!(filter.is_blocked("googleadservices.com.").is_some());
+
+        // Subdomains should also work with trailing dot
+        assert!(filter.is_blocked("pagead.ads.google.com.").is_some());
+        assert!(filter.is_blocked("www.googleadservices.com.").is_some());
+
+        // Non-matching domains should still not match
+        assert!(filter.is_blocked("google.com.").is_none());
+        assert!(filter.is_blocked("example.com.").is_none());
     }
 
     // ========================================================================

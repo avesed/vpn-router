@@ -5931,12 +5931,13 @@ def api_announce_port_change(payload: PortChangeAnnouncementRequest):
 
 @app.get("/api/egress")
 def api_list_all_egress():
-    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray）"""
+    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray + WARP）"""
     pia_result = []
     custom_result = []
     direct_result = []
     openvpn_result = []
     v2ray_result = []
+    warp_result = []
 
     # 从数据库获取 PIA profiles
     db = _get_db()
@@ -6012,7 +6013,20 @@ def api_list_all_egress():
             "is_configured": True,
         })
 
-    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result}
+    # 获取 WARP 出口 (Phase 3: WireGuard only)
+    warp_egress = db.get_warp_egress_list()
+    for eg in warp_egress:
+        warp_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "warp",
+            "description": eg.get("description", ""),
+            "account_type": eg.get("account_type", "free"),
+            "account_id": eg.get("account_id"),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,
+        })
+
+    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result, "warp": warp_result}
 
 
 # ============ Default Direct Outbound DNS APIs ============
@@ -7105,32 +7119,50 @@ async def _register_warp_via_rust_router(db, data: WarpEgressCreate):
             raise HTTPException(status_code=500, detail="WARP registration failed (no config returned)")
 
         # Save to database with account_id and license_key
+        # Phase 3: Removed deprecated fields (protocol, mode, socks_port)
         db.add_warp_egress(
             tag=data.tag,
             description=data.description,
-            protocol="wireguard",
             config_path="",  # Not needed for rust-router
             license_key=warp_config.license_key,
             account_type=warp_config.account_type,
-            mode="wireguard",
-            socks_port=None,  # WireGuard doesn't use SOCKS port
             enabled=True,
-            account_id=warp_config.account_id,  # Phase 2: Save account_id
+            account_id=warp_config.account_id,
         )
 
         # Create WireGuard tunnel via IPC
+        # Note: WgTunnelConfig doesn't support WARP-specific 'reserved' bytes yet
+        # The tunnel will work for basic traffic; reserved bytes are for Cloudflare routing optimization
+
+        # Resolve WARP endpoint hostname to IP address
+        # rust-router expects IP:port format, but WARP returns hostname:port
+        endpoint = warp_config.endpoint
+        resolved_endpoint = endpoint  # Default
+        if endpoint:
+            try:
+                host, port = endpoint.rsplit(":", 1)
+                # Check if already an IP address
+                try:
+                    socket.inet_pton(socket.AF_INET, host)
+                    resolved_endpoint = endpoint  # Already IP:port
+                except socket.error:
+                    # Resolve hostname to IP
+                    addrs = socket.getaddrinfo(host, int(port), socket.AF_INET, socket.SOCK_DGRAM)
+                    if addrs:
+                        resolved_ip = addrs[0][4][0]
+                        resolved_endpoint = f"{resolved_ip}:{port}"
+                        logging.info(f"Resolved WARP endpoint {host} -> {resolved_ip}")
+            except Exception as dns_err:
+                logging.warning(f"Failed to resolve WARP endpoint {endpoint}: {dns_err}")
+
         await client.create_wg_tunnel(
             tag=data.tag,
-            tunnel_type="warp",
             private_key=warp_config.private_key,
             peer_public_key=warp_config.peer_public_key,
-            peer_endpoint=warp_config.endpoint,
-            allowed_ips=["0.0.0.0/0", "::/0"],
-            tunnel_ipv4=warp_config.ipv4_address,
-            tunnel_ipv6=warp_config.ipv6_address,
+            endpoint=resolved_endpoint,
+            local_ip=warp_config.ipv4_address,
             mtu=1280,
             persistent_keepalive=25,
-            reserved=warp_config.reserved,
         )
 
         return {
