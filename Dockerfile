@@ -69,49 +69,9 @@ RUN BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && \
     ls -lh /xray
 
 # ==========================================
-# Stage 2: Download usque binary (WARP MASQUE)
+# Stage 2: Build sing-box with v2ray_api
 # ==========================================
-FROM debian:12-slim AS usque-downloader
-
-ARG USQUE_VERSION=1.4.2
-ARG TARGETARCH
-
-COPY --from=ca-certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
-RUN set -eux; \
-    for file in /etc/apt/sources.list \
-        /etc/apt/sources.list.d/debian.sources; do \
-        if [ -f "$file" ]; then \
-            sed -i 's|http://|https://|g' "$file"; \
-        fi; \
-    done
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    unzip \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Download usque binary (release is a zip file)
-# usque provides WARP MASQUE protocol support (RFC 9484 Connect-IP over HTTP/3)
-# https://github.com/Diniboy1123/usque
-# Release format: usque_VERSION_linux_ARCH.zip
-RUN USQUE_ARCH="" && \
-    if [ "$TARGETARCH" = "amd64" ]; then USQUE_ARCH="amd64"; \
-    elif [ "$TARGETARCH" = "arm64" ]; then USQUE_ARCH="arm64"; \
-    else echo "Unsupported architecture: $TARGETARCH" && exit 1; fi && \
-    USQUE_ZIP="usque_${USQUE_VERSION}_linux_${USQUE_ARCH}.zip" && \
-    USQUE_URL="https://github.com/Diniboy1123/usque/releases/download/v${USQUE_VERSION}/${USQUE_ZIP}" && \
-    curl -fsSL -o /tmp/usque.zip "${USQUE_URL}" && \
-    cd /tmp && \
-    unzip usque.zip && \
-    chmod +x usque && \
-    mv usque /usr/local/bin/usque && \
-    echo "usque downloaded successfully"
-
-# ==========================================
-# Stage 3: Build sing-box with v2ray_api
-# ==========================================
+# Phase 3: Removed usque-downloader stage (MASQUE deprecated)
 FROM golang:1.23-bookworm AS singbox-builder
 
 ARG SINGBOX_VERSION=1.12.13
@@ -267,9 +227,7 @@ RUN chmod +x /usr/local/bin/sing-box
 COPY --from=xray-builder /xray /usr/local/bin/xray
 RUN chmod +x /usr/local/bin/xray
 
-# Copy usque binary for WARP MASQUE protocol support
-COPY --from=usque-downloader /usr/local/bin/usque /usr/local/bin/usque
-RUN chmod +x /usr/local/bin/usque
+# Phase 3: Removed usque binary (MASQUE deprecated, WireGuard-only via rust-router)
 
 # Copy rust-router binary (primary data plane, replaces sing-box)
 # [Phase 4] Binary size: ~3.1 MB, LTO optimized, stripped
@@ -311,7 +269,7 @@ COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
 COPY scripts/xray_manager.py /usr/local/bin/xray_manager.py
 COPY scripts/xray_egress_manager.py /usr/local/bin/xray_egress_manager.py
 COPY scripts/xray_peer_inbound_manager.py /usr/local/bin/xray_peer_inbound_manager.py
-COPY scripts/warp_manager.py /usr/local/bin/warp_manager.py
+# Phase 3: warp_manager.py removed - WARP via rust-router IPC
 COPY scripts/warp_endpoint_optimizer.py /usr/local/bin/warp_endpoint_optimizer.py
 COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
 COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
@@ -339,7 +297,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
     /usr/local/bin/xray_manager.py \
     /usr/local/bin/xray_egress_manager.py /usr/local/bin/xray_peer_inbound_manager.py \
-    /usr/local/bin/warp_manager.py \
     /usr/local/bin/warp_endpoint_optimizer.py /usr/local/bin/ecmp_manager.py \
     /usr/local/bin/health_checker.py /usr/local/bin/peer_tunnel_manager.py \
     /usr/local/bin/dscp_manager.py /usr/local/bin/relay_config_manager.py \

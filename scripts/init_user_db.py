@@ -261,21 +261,18 @@ CREATE INDEX IF NOT EXISTS idx_v2ray_egress_tag ON v2ray_egress(tag);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_protocol ON v2ray_egress(protocol);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
 
--- WARP 出口表（Cloudflare WARP via MASQUE 协议）
+-- WARP 出口表（Cloudflare WARP via WireGuard）
+-- Phase 3: Simplified schema - WireGuard only (MASQUE removed)
 CREATE TABLE IF NOT EXISTS warp_egress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag TEXT NOT NULL UNIQUE,                 -- 出口标识，如 "warp-main"
     description TEXT DEFAULT '',               -- 描述
 
-    -- 协议配置
-    protocol TEXT DEFAULT 'masque',            -- masque / wireguard
-    config_path TEXT,                          -- usque/wgcf config 路径
-    license_key TEXT,                          -- WARP+ license key（可选）
-    account_type TEXT DEFAULT 'free',          -- free / warp+ / teams
-
-    -- 运行模式
-    mode TEXT DEFAULT 'socks',                 -- socks / tun
-    socks_port INTEGER UNIQUE,                 -- SOCKS5 端口（38001+）
+    -- WireGuard 配置
+    config_path TEXT,                          -- 保留字段（未来可能使用）
+    license_key TEXT,                          -- Cloudflare auth token
+    account_type TEXT DEFAULT 'free',          -- free / unlimited
+    account_id TEXT,                           -- Cloudflare account ID (for management)
 
     -- 自定义 Endpoint（指定地区）
     endpoint_v4 TEXT,                          -- 自定义 IPv4 endpoint (如 162.159.193.10:2408)
@@ -882,6 +879,72 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
         print("✓ 添加 warp_egress.protocol 字段")
     else:
         print("⊘ warp_egress.protocol 字段已存在，跳过迁移")
+
+    # Phase 2: 添加 account_id 字段（用于 rust-router WARP 注册）
+    if "account_id" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN account_id TEXT")
+        conn.commit()
+        print("✓ 添加 warp_egress.account_id 字段（Phase 2: WARP Integration）")
+    else:
+        print("⊘ warp_egress.account_id 字段已存在，跳过迁移")
+
+    # Phase 3: 移除 MASQUE 专用字段（protocol, mode, socks_port）
+    # 这是一个破坏性迁移，需要重建表
+    if "protocol" in columns or "mode" in columns or "socks_port" in columns:
+        print("Phase 3: 检测到旧表结构（包含 MASQUE 字段），开始迁移...")
+
+        # 禁用所有 MASQUE 条目
+        cursor.execute("SELECT COUNT(*) FROM warp_egress WHERE protocol='masque'")
+        masque_count = cursor.fetchone()[0]
+        if masque_count > 0:
+            print(f"⚠ 发现 {masque_count} 个 MASQUE 条目（已弃用）")
+            print("  这些条目将被禁用。请使用 WireGuard 重新注册。")
+            cursor.execute("UPDATE warp_egress SET enabled=0 WHERE protocol='masque'")
+            conn.commit()
+
+        # 创建新表（WireGuard-only schema）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS warp_egress_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                config_path TEXT,
+                license_key TEXT,
+                account_type TEXT DEFAULT 'free',
+                account_id TEXT,
+                endpoint_v4 TEXT,
+                endpoint_v6 TEXT,
+                enabled INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 复制数据（只复制启用的 WireGuard 条目）
+        cursor.execute("""
+            INSERT INTO warp_egress_new
+            (tag, description, config_path, license_key, account_type, account_id,
+             endpoint_v4, endpoint_v6, enabled, created_at, updated_at)
+            SELECT tag, description, config_path, license_key, account_type, account_id,
+                   endpoint_v4, endpoint_v6, enabled, created_at, updated_at
+            FROM warp_egress
+            WHERE protocol != 'masque' OR protocol IS NULL
+        """)
+
+        # 删除旧表
+        cursor.execute("DROP TABLE warp_egress")
+
+        # 重命名新表
+        cursor.execute("ALTER TABLE warp_egress_new RENAME TO warp_egress")
+
+        # 重建索引
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_warp_egress_tag ON warp_egress(tag)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_warp_egress_enabled ON warp_egress(enabled)")
+
+        conn.commit()
+        print("✓ Phase 3 迁移完成：移除 MASQUE 字段，表结构已简化")
+    else:
+        print("⊘ warp_egress 表已是 Phase 3 结构，跳过迁移")
 
 
 def migrate_outbound_groups(conn: sqlite3.Connection):

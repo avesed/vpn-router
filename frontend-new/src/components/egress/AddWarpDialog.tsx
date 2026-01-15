@@ -6,14 +6,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 import { Button } from "../ui/button";
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "../ui/form";
 import { Input } from "../ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
+// Phase 3: Select component removed (protocol selector no longer needed)
 import { toast } from "sonner";
 
+// Phase 3: protocol field removed - WireGuard only
 const formSchema = z.object({
   tag: z.string().min(1, "Tag is required"),
   description: z.string().optional(),
   license_key: z.string().optional(),
-  protocol: z.enum(["masque", "wireguard"]),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -32,7 +32,7 @@ export function AddWarpDialog({ open, onOpenChange }: AddWarpDialogProps) {
       tag: "warp-1",
       description: "",
       license_key: "",
-      protocol: "masque",
+      // Phase 3: protocol removed - WireGuard only
     },
   });
 
@@ -57,7 +57,7 @@ export function AddWarpDialog({ open, onOpenChange }: AddWarpDialogProps) {
         <DialogHeader>
           <DialogTitle>Register WARP Egress</DialogTitle>
           <DialogDescription>
-            Register a new Cloudflare WARP account.
+            Register a new Cloudflare WARP account (WireGuard protocol).
           </DialogDescription>
         </DialogHeader>
 
@@ -102,27 +102,7 @@ export function AddWarpDialog({ open, onOpenChange }: AddWarpDialogProps) {
                 </FormItem>
               )}
             />
-            <FormField
-              control={form.control}
-              name="protocol"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Protocol</FormLabel>
-                  <Select onValueChange={field.onChange} defaultValue={field.value}>
-                    <FormControl>
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select protocol" />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectItem value="masque">MASQUE (Recommended)</SelectItem>
-                      <SelectItem value="wireguard">WireGuard</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            {/* Phase 3: Protocol selector removed - WireGuard only */}
             <DialogFooter>
               <Button type="submit" disabled={registerWarp.isPending}>
                 Register WARP

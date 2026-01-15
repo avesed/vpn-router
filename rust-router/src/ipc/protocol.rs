@@ -730,6 +730,19 @@ pub enum IpcCommand {
     ///
     /// Returns the current DNS engine configuration.
     GetDnsConfig,
+
+    /// Register a new WARP device
+    ///
+    /// Generates WireGuard keypair, registers with Cloudflare API,
+    /// and returns the complete configuration.
+    RegisterWarp {
+        /// User-defined tag for this WARP device
+        tag: String,
+        /// Display name (optional)
+        name: Option<String>,
+        /// WARP+ license key (optional, for upgrade)
+        warp_plus_license: Option<String>,
+    },
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -934,6 +947,9 @@ pub enum IpcResponse {
 
     /// DNS configuration response
     DnsConfig(DnsConfigResponse),
+
+    /// WARP registration response
+    WarpRegistration(WarpRegistrationResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -2261,6 +2277,31 @@ pub struct DnsConfigResponse {
     /// - "`not_implemented"`: Feature is reserved for future use
     #[serde(default)]
     pub available_features: std::collections::HashMap<String, String>,
+}
+
+/// WARP registration response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarpRegistrationResponse {
+    /// User-defined tag
+    pub tag: String,
+    /// Cloudflare account ID
+    pub account_id: String,
+    /// Account license key (for WARP+ upgrade)
+    pub license_key: String,
+    /// WireGuard private key (base64)
+    pub private_key: String,
+    /// Peer public key (Cloudflare server)
+    pub peer_public_key: String,
+    /// WireGuard endpoint (host:port)
+    pub endpoint: String,
+    /// Reserved bytes (3-byte client identifier)
+    pub reserved: [u8; 3],
+    /// Interface IPv4 address
+    pub ipv4_address: String,
+    /// Interface IPv6 address
+    pub ipv6_address: String,
+    /// Account type (free or plus)
+    pub account_type: String,
 }
 
 /// IPC error

@@ -79,6 +79,7 @@ pub mod rules;
 pub mod sniff;
 pub mod tproxy;
 pub mod tunnel;
+pub mod warp;
 
 // Re-export commonly used types at the crate root
 pub use config::{Config, ListenConfig, OutboundConfig, RuleConfig, RulesConfig};

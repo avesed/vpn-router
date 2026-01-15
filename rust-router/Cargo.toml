@@ -77,6 +77,12 @@ boringtun = "0.6"
 # Random number generation
 rand = "0.8"
 
+# x25519 key exchange for WARP registration (match boringtun version)
+x25519-dalek = "=2.0.0-rc.3"
+
+# Hex encoding for install_id
+hex = "0.4"
+
 # Parking lot for efficient synchronization
 parking_lot = "0.12"
 
@@ -134,6 +140,10 @@ path = "src/bin/tproxy_poc.rs"
 [[bin]]
 name = "udp_tproxy_poc"
 path = "src/bin/udp_tproxy_poc.rs"
+
+[[bin]]
+name = "warp_register_poc"
+path = "src/bin/warp_register_poc.rs"
 
 [lib]
 name = "rust_router"

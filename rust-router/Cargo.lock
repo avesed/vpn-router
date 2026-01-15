@@ -1681,6 +1681,7 @@ dependencies = [
  "deadpool",
  "futures",
  "governor",
+ "hex",
  "hickory-proto",
  "hostname",
  "http",
@@ -1714,6 +1715,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
+ "x25519-dalek",
 ]
 
 [[package]]

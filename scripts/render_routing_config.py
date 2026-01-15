@@ -92,7 +92,7 @@ class EgressType(Enum):
     PIA = "pia"
     CUSTOM = "custom"
     WARP_WG = "warp_wg"
-    WARP_MASQUE = "warp_masque"
+    # Phase 3: WARP_MASQUE removed - WireGuard only
     V2RAY = "v2ray"
     OPENVPN = "openvpn"
     DIRECT = "direct"
@@ -129,7 +129,7 @@ class OutboundConfig:
     routing_mark: Optional[int] = None
     routing_table: Optional[int] = None
 
-    # For SOCKS5-based outbounds (V2Ray, WARP MASQUE)
+    # For SOCKS5-based outbounds (V2Ray only, Phase 3: WARP MASQUE removed)
     socks_addr: Optional[str] = None
     socks_port: Optional[int] = None
     username: Optional[str] = None
@@ -388,7 +388,7 @@ class DatabaseLoader:
         return outbounds
 
     def load_warp_egress(self) -> List[OutboundConfig]:
-        """Load WARP egress (WireGuard or MASQUE)"""
+        """Load WARP egress (Phase 3: WireGuard only, MASQUE removed)"""
         db = self._get_db()
         if not db:
             logger.warning("Database not available for WARP egress loading")
@@ -399,30 +399,19 @@ class DatabaseLoader:
             egress_list = db.get_warp_egress_list(enabled_only=True)
             for egress in egress_list:
                 tag = egress.get("tag")
-                protocol = egress.get("protocol", "wireguard")
 
                 if not tag:
                     continue
 
-                if protocol == "wireguard":
-                    interface = get_egress_interface_name_fallback(tag, EgressType.WARP_WG)
-                    outbounds.append(OutboundConfig(
-                        tag=tag,
-                        egress_type=EgressType.WARP_WG,
-                        enabled=True,
-                        interface=interface,
-                    ))
-                else:  # masque
-                    socks_port = egress.get("socks_port")
-                    if socks_port and validate_port(socks_port, tag):
-                        outbounds.append(OutboundConfig(
-                            tag=tag,
-                            egress_type=EgressType.WARP_MASQUE,
-                            enabled=True,
-                            socks_addr="127.0.0.1",
-                            socks_port=socks_port,
-                        ))
-            logger.info(f"Loaded {len(outbounds)} WARP egress")
+                # Phase 3: Only WireGuard protocol supported
+                interface = get_egress_interface_name_fallback(tag, EgressType.WARP_WG)
+                outbounds.append(OutboundConfig(
+                    tag=tag,
+                    egress_type=EgressType.WARP_WG,
+                    enabled=True,
+                    interface=interface,
+                ))
+            logger.info(f"Loaded {len(outbounds)} WARP WireGuard egress")
         except Exception as e:
             logger.error(f"Failed to load WARP egress: {e}")
 
@@ -594,8 +583,9 @@ class RustRouterConfigGenerator:
                 # Rules referencing them should NOT be remapped to default
                 valid_outbound_tags.add(ob.tag)
                 logger.debug(f"Marked WireGuard outbound '{ob.tag}' as valid (managed via IPC)")
-            elif ob.egress_type in (EgressType.V2RAY, EgressType.WARP_MASQUE):
+            elif ob.egress_type == EgressType.V2RAY:
                 # Phase 11-Fix.AE: SOCKS5 outbounds are also managed via IPC
+                # Phase 3: WARP_MASQUE removed
                 valid_outbound_tags.add(ob.tag)
                 logger.debug(f"Marked SOCKS5 outbound '{ob.tag}' as valid (managed via IPC)")
 
@@ -605,10 +595,11 @@ class RustRouterConfigGenerator:
         default_outbound = config.default_outbound
 
         # Build set of outbound tags that are IPC-managed (not in static config)
+        # Phase 3: WARP_MASQUE removed
         ipc_managed_tags = set()
         for ob in config.outbounds:
             if ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER,
-                                  EgressType.V2RAY, EgressType.WARP_MASQUE):
+                                  EgressType.V2RAY):
                 ipc_managed_tags.add(ob.tag)
 
         if default_outbound in ipc_managed_tags:
@@ -694,7 +685,7 @@ class RustRouterConfigGenerator:
 
         Note: rust-router currently only supports Direct and Block outbound types
         in config. WireGuard-based outbounds use Direct with bind_interface.
-        SOCKS5 outbounds (V2Ray, WARP MASQUE) are not yet supported and will be skipped.
+        SOCKS5 outbounds (V2Ray only, Phase 3: WARP MASQUE removed) are not yet supported and will be skipped.
 
         WireGuard outbounds are managed via IPC by rust_router_manager.py (userspace mode).
         """
@@ -724,7 +715,8 @@ class RustRouterConfigGenerator:
             logger.info(f"Skipping WireGuard outbound '{ob.tag}' in static config (managed via IPC)")
             return None
 
-        elif ob.egress_type in (EgressType.V2RAY, EgressType.WARP_MASQUE):
+        elif ob.egress_type == EgressType.V2RAY:
+            # Phase 3: WARP_MASQUE removed - only V2Ray SOCKS5 remains
             # SOCKS5-based outbounds are not yet supported in rust-router config
             # These will need to be added via IPC when that's implemented
             logger.warning(f"SOCKS5 outbound '{ob.tag}' not yet supported in rust-router, skipping")
@@ -880,7 +872,8 @@ class SingBoxConfigGenerator:
                 "bind_interface": ob.interface,
             }
 
-        elif ob.egress_type in (EgressType.V2RAY, EgressType.WARP_MASQUE):
+        elif ob.egress_type == EgressType.V2RAY:
+            # Phase 3: WARP_MASQUE removed - only V2Ray SOCKS5 remains
             # SOCKS5 outbound
             return {
                 "type": "socks",
@@ -1083,10 +1076,11 @@ def run_tests() -> int:
         """Test EgressType enum"""
 
         def test_all_types(self):
+            # Phase 3: WARP_MASQUE removed - 8 types total
             types = [EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG,
-                     EgressType.WARP_MASQUE, EgressType.V2RAY, EgressType.OPENVPN,
+                     EgressType.V2RAY, EgressType.OPENVPN,
                      EgressType.DIRECT, EgressType.BLOCK, EgressType.PEER]
-            self.assertEqual(len(types), 9)
+            self.assertEqual(len(types), 8)
 
     class TestRuleType(unittest.TestCase):
         """Test RuleType enum"""
@@ -1379,13 +1373,13 @@ def run_tests() -> int:
             self.assertEqual(outbounds[0].socks_port, 37101)
 
         def test_database_loader_get_warp_egress(self):
-            """Test loading WARP egress from mock DB"""
+            """Test loading WARP egress from mock DB (Phase 3: WireGuard only)"""
             from unittest.mock import MagicMock, patch
 
             mock_db = MagicMock()
             mock_db.get_warp_egress_list.return_value = [
                 {"tag": "warp-wg", "protocol": "wireguard", "enabled": True},
-                {"tag": "warp-masque", "protocol": "masque", "socks_port": 38001, "enabled": True},
+                # Phase 3: MASQUE support removed
             ]
 
             loader = DatabaseLoader("/test/geoip.db", "/test/user.db")
@@ -1394,9 +1388,8 @@ def run_tests() -> int:
             with patch.object(loader, '_get_db', return_value=mock_db):
                 outbounds = loader.load_warp_egress()
 
-            self.assertEqual(len(outbounds), 2)
+            self.assertEqual(len(outbounds), 1)
             self.assertEqual(outbounds[0].egress_type, EgressType.WARP_WG)
-            self.assertEqual(outbounds[1].egress_type, EgressType.WARP_MASQUE)
 
         def test_database_loader_get_rules(self):
             """Test loading routing rules from mock DB"""
@@ -1570,25 +1563,7 @@ def run_tests() -> int:
             self.assertEqual(len(outbounds), 1)
             self.assertEqual(outbounds[0].tag, "valid")
 
-        def test_warp_masque_loader_rejects_invalid_port(self):
-            """Test WARP MASQUE loader skips entries with invalid ports"""
-            from unittest.mock import MagicMock, patch
-
-            mock_db = MagicMock()
-            mock_db.get_warp_egress_list.return_value = [
-                {"tag": "valid", "protocol": "masque", "socks_port": 38001, "enabled": True},
-                {"tag": "invalid", "protocol": "masque", "socks_port": -1, "enabled": True},
-            ]
-
-            loader = DatabaseLoader("/test/geoip.db", "/test/user.db")
-            loader._db = mock_db
-
-            with patch.object(loader, '_get_db', return_value=mock_db):
-                outbounds = loader.load_warp_egress()
-
-            # Only valid MASQUE entry should be loaded
-            self.assertEqual(len(outbounds), 1)
-            self.assertEqual(outbounds[0].tag, "valid")
+        # Phase 3: test_warp_masque_loader_rejects_invalid_port removed (MASQUE deprecated)
 
     # Run tests
     print("Running render_routing_config unit tests...")

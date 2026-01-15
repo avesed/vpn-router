@@ -1835,10 +1835,11 @@ class UserDatabase:
         socks_port: Optional[int] = None,
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
-        enabled: bool = True
+        enabled: bool = True,
+        account_id: Optional[str] = None  # Phase 2: Cloudflare account ID
     ) -> int:
         """添加 WARP 出口"""
-        if socks_port is None:
+        if socks_port is None and mode == "socks":
             socks_port = self.get_next_warp_socks_port()
 
         with self._get_conn() as conn:
@@ -1846,12 +1847,13 @@ class UserDatabase:
             cursor.execute("""
                 INSERT INTO warp_egress
                 (tag, description, protocol, config_path, license_key, account_type,
-                 mode, socks_port, endpoint_v4, endpoint_v6, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 mode, socks_port, endpoint_v4, endpoint_v6, enabled, account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, description, protocol, config_path, license_key, account_type,
                 mode, socks_port, endpoint_v4, endpoint_v6,
-                1 if enabled else 0
+                1 if enabled else 0,
+                account_id
             ))
             conn.commit()
             return cursor.lastrowid
@@ -1860,7 +1862,7 @@ class UserDatabase:
         """更新 WARP 出口"""
         allowed_fields = {
             "description", "protocol", "config_path", "license_key", "account_type",
-            "mode", "socks_port", "endpoint_v4", "endpoint_v6", "enabled"
+            "mode", "socks_port", "endpoint_v4", "endpoint_v6", "enabled", "account_id"  # Phase 2
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not updates:

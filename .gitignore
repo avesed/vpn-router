@@ -193,3 +193,10 @@ tests/test_1c1g_full.sh
 docker-compose.1c1g-test.yml
 AGENTS.md
 test-multi-hop/
+e2e_warp_demo.sh
+PHASE3_CLEANUP_PLAN.md
+PHASE3_PROGRESS.md
+verify_phase3.sh
+verify_warp_integration.sh
+WARP_API_VERIFICATION.md
+WARP_REGISTRATION.md

@@ -776,6 +776,13 @@ impl IpcHandler {
             IpcCommand::GetDnsConfig => {
                 self.handle_get_dns_config()
             }
+
+            // ================================================================
+            // WARP Registration Command Handler
+            // ================================================================
+            IpcCommand::RegisterWarp { tag, name, warp_plus_license } => {
+                self.handle_register_warp(tag, name, warp_plus_license).await
+            }
         }
     }
 
@@ -4178,6 +4185,55 @@ impl IpcHandler {
             logging_format: config.logging.format.to_string(),
             available_features,
         })
+    }
+
+    // ================================================================
+    // WARP Registration Handler
+    // ================================================================
+
+    /// Handle WARP device registration
+    ///
+    /// Registers a new WARP device with Cloudflare, generating WireGuard configuration.
+    async fn handle_register_warp(
+        &self,
+        tag: String,
+        name: Option<String>,
+        warp_plus_license: Option<String>,
+    ) -> IpcResponse {
+        use crate::warp::register::register_device;
+        use super::protocol::WarpRegistrationResponse;
+
+        info!("Registering WARP device: tag={}, name={:?}", tag, name);
+
+        match register_device(tag.clone(), warp_plus_license).await {
+            Ok(config) => {
+                info!("WARP registration successful: {}", tag);
+                IpcResponse::WarpRegistration(WarpRegistrationResponse {
+                    tag: config.tag,
+                    account_id: config.account_id,
+                    license_key: config.license_key,
+                    private_key: config.private_key,
+                    peer_public_key: config.peer_public_key,
+                    endpoint: config.endpoint,
+                    reserved: config.reserved,
+                    ipv4_address: config.ipv4_address,
+                    ipv6_address: config.ipv6_address,
+                    account_type: config.account_type,
+                })
+            }
+            Err(e) => {
+                warn!("WARP registration failed for '{}': {}", tag, e);
+
+                // Provide appropriate error code based on error type
+                let error_code = if e.is_recoverable() {
+                    ErrorCode::OperationFailed  // Recoverable errors (rate limit, network)
+                } else {
+                    ErrorCode::InvalidParameters  // Invalid input
+                };
+
+                IpcResponse::error(error_code, format!("WARP registration failed: {}", e))
+            }
+        }
     }
 }
 

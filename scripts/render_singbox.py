@@ -1542,9 +1542,9 @@ def ensure_peer_dns_servers(config: dict, peer_tags: List[str]) -> None:
 
 
 # ============ WARP Egress 支持 ============
-# Cloudflare WARP 通过 usque (MASQUE 协议) 提供出口
-# - 每个 WARP 出口运行独立的 usque SOCKS5 代理
-# - sing-box 通过 SOCKS outbound 连接到 usque
+# Phase 3: Cloudflare WARP 通过 WireGuard 提供出口
+# - MASQUE 协议已弃用，仅支持 WireGuard
+# - sing-box 通过 direct outbound + bind_interface 连接
 
 
 def load_warp_egress() -> List[dict]:
@@ -1563,9 +1563,9 @@ def load_warp_egress() -> List[dict]:
 def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[str]:
     """确保每个 WARP 出口都有对应的 outbound
 
-    WARP 支持两种协议:
-    - MASQUE: 通过 usque SOCKS5 代理桥接 (sing-box SOCKS outbound)
+    Phase 3: WARP 仅支持 WireGuard 协议
     - WireGuard: 通过内核 WireGuard 接口 (sing-box direct outbound + bind_interface)
+    - MASQUE 协议已弃用
 
     Args:
         config: sing-box 配置
@@ -1586,7 +1586,6 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
 
     for egress in warp_egress:
         tag = egress.get("tag")
-        protocol = egress.get("protocol", "masque")
 
         if not tag:
             print(f"[render] 警告: WARP 出口缺少 tag，跳过")
@@ -1594,28 +1593,15 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
 
         warp_tags.append(tag)
 
-        if protocol == "wireguard":
-            # WireGuard 协议: 使用内核 WireGuard 接口
-            interface = get_egress_interface_name(tag, egress_type="warp")
-            outbound = {
-                "type": "direct",
-                "tag": tag,
-                "bind_interface": interface
-            }
-            outbound_type = f"direct -> {interface}"
-        else:
-            # MASQUE 协议: 使用 usque SOCKS5 代理
-            socks_port = egress.get("socks_port")
-            if not socks_port:
-                print(f"[render] 警告: WARP MASQUE 出口 {tag} 缺少 socks_port，跳过")
-                continue
-            outbound = {
-                "type": "socks",
-                "tag": tag,
-                "server": "127.0.0.1",
-                "server_port": socks_port
-            }
-            outbound_type = f"SOCKS -> 127.0.0.1:{socks_port}"
+        # Phase 3: Only WireGuard protocol supported
+        # WireGuard 协议: 使用内核 WireGuard 接口
+        interface = get_egress_interface_name(tag, egress_type="warp")
+        outbound = {
+            "type": "direct",
+            "tag": tag,
+            "bind_interface": interface
+        }
+        outbound_type = f"direct -> {interface}"
 
         if tag in existing_tags:
             # 更新现有 outbound
@@ -2741,11 +2727,11 @@ def main() -> None:
         ensure_v2ray_dns_servers(config, v2ray_tags)
         all_egress_tags.extend(v2ray_tags)
 
-    # 加载并处理 WARP 出口（Cloudflare WARP 通过 usque MASQUE 协议）
-    # 每个 WARP 出口运行独立的 usque SOCKS5 代理
+    # 加载并处理 WARP 出口（Phase 3: WireGuard only, MASQUE deprecated）
+    # sing-box 通过 direct outbound + bind_interface 连接 WireGuard 接口
     warp_egress = load_warp_egress()
     if warp_egress:
-        print(f"[render] 处理 {len(warp_egress)} 个 WARP 出口 (通过 usque SOCKS5)")
+        print(f"[render] 处理 {len(warp_egress)} 个 WARP 出口 (WireGuard)")
         warp_tags = ensure_warp_egress_outbounds(config, warp_egress)
         ensure_warp_dns_servers(config, warp_tags)
         all_egress_tags.extend(warp_tags)

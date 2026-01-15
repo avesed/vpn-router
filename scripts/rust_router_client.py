@@ -364,6 +364,29 @@ class DnsConfig:
     available_features: Dict[str, str] = field(default_factory=dict)
 
 
+# =============================================================================
+# WARP Registration
+# =============================================================================
+
+
+@dataclass
+class WarpRegistration:
+    """WARP device registration result
+
+    Contains WireGuard configuration for connecting to Cloudflare WARP.
+    """
+    tag: str
+    account_id: str
+    license_key: str
+    private_key: str
+    peer_public_key: str
+    endpoint: str
+    reserved: List[int]  # 3-byte array
+    ipv4_address: str
+    ipv6_address: str
+    account_type: str
+
+
 class IpcError(Exception):
     """IPC communication error"""
     pass
@@ -2098,6 +2121,79 @@ class RustRouterClient:
             logging_enabled=response.data.get("logging_enabled", False),
             logging_format=response.data.get("logging_format", "json"),
             available_features=response.data.get("available_features", {}),
+        )
+
+    # =========================================================================
+    # WARP Registration Commands
+    # =========================================================================
+
+    async def register_warp(
+        self,
+        tag: str,
+        name: Optional[str] = None,
+        warp_plus_license: Optional[str] = None,
+    ) -> Optional[WarpRegistration]:
+        """Register a new WARP device with Cloudflare
+
+        Generates WireGuard keypair, registers with Cloudflare API, and returns
+        the complete configuration including reserved bytes and endpoint.
+
+        Args:
+            tag: User-defined tag for this WARP device
+            name: Optional display name
+            warp_plus_license: Optional WARP+ license key for upgrade (format: XXXXXXXX-XXXXXXXX-XXXXXXXX)
+
+        Returns:
+            WarpRegistration with complete config, or None if failed
+
+        Raises:
+            IpcError: If registration fails (rate limit, network error, invalid license)
+        """
+        command = {
+            "type": "register_warp",
+            "tag": tag,
+        }
+        if name:
+            command["name"] = name
+        if warp_plus_license:
+            command["warp_plus_license"] = warp_plus_license
+
+        response = await self._send_command(command)
+
+        if not response.success:
+            # Extract error details for better error messages
+            error_msg = response.error or "Unknown error"
+            if response.error_code == "OperationFailed":
+                # Recoverable errors (rate limit, network)
+                raise IpcError(f"WARP registration failed (recoverable): {error_msg}")
+            elif response.error_code == "InvalidParameters":
+                # Invalid input (bad license format, etc.)
+                raise IpcError(f"WARP registration failed (invalid input): {error_msg}")
+            else:
+                raise IpcError(f"WARP registration failed: {error_msg}")
+
+        if not response.data:
+            return None
+
+        # Parse reserved bytes array
+        reserved_raw = response.data.get("reserved", [])
+        if isinstance(reserved_raw, list) and len(reserved_raw) == 3:
+            reserved = reserved_raw
+        else:
+            self.logger.warning(f"Invalid reserved bytes format: {reserved_raw}")
+            reserved = [0, 0, 0]
+
+        return WarpRegistration(
+            tag=response.data.get("tag", tag),
+            account_id=response.data.get("account_id", ""),
+            license_key=response.data.get("license_key", ""),
+            private_key=response.data.get("private_key", ""),
+            peer_public_key=response.data.get("peer_public_key", ""),
+            endpoint=response.data.get("endpoint", ""),
+            reserved=reserved,
+            ipv4_address=response.data.get("ipv4_address", ""),
+            ipv6_address=response.data.get("ipv6_address", ""),
+            account_type=response.data.get("account_type", ""),
         )
 
     # =========================================================================

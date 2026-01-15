@@ -421,25 +421,7 @@ print(len(egress_list))
   fi
 }
 
-start_warp_manager() {
-  local warp_count
-  warp_count=$(python3 -c "
-import sys
-sys.path.insert(0, '/usr/local/bin')
-from db_helper import get_db
-db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
-egress_list = db.get_warp_egress_list(enabled_only=True)
-print(len(egress_list))
-" 2>/dev/null || echo "0")
-
-  if [ "${warp_count}" -gt "0" ]; then
-    echo "[entrypoint] starting WARP manager for ${warp_count} WARP egress"
-    python3 /usr/local/bin/warp_manager.py daemon >/var/log/warp-manager.log 2>&1 &
-    WARP_MGR_PID=$!
-  else
-    echo "[entrypoint] No WARP egress configured, skipping WARP manager"
-  fi
-}
+# Phase 3: start_warp_manager() removed - MASQUE deprecated, WireGuard managed via rust-router IPC
 
 start_health_checker() {
   local group_count
@@ -662,8 +644,7 @@ else
   exit 1
 fi
 
-# Phase 6-Fix.AF: Start WARP manager AFTER rust-router is ready (needs IPC socket)
-start_warp_manager
+# Phase 3: WARP manager removed - WARP tunnels managed via rust-router IPC
 
 # Configure peer tunnel subnet routing
 echo "[entrypoint] Configuring peer tunnel subnet routing (10.200.200.0/24)"
@@ -749,11 +730,7 @@ while true; do
     start_xray_egress_manager
   fi
 
-  # Check WARP manager
-  if [ -n "${WARP_MGR_PID}" ] && ! kill -0 "${WARP_MGR_PID}" 2>/dev/null; then
-    echo "[entrypoint] WARNING: WARP manager died, restarting..." >&2
-    start_warp_manager
-  fi
+  # Phase 3: WARP manager check removed (deprecated)
 
   # Check health checker
   if [ -n "${HEALTH_CHECKER_PID}" ] && ! kill -0 "${HEALTH_CHECKER_PID}" 2>/dev/null; then

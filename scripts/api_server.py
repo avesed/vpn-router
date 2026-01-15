@@ -7014,11 +7014,11 @@ def api_delete_v2ray_egress(tag: str):
 # ============ WARP Egress APIs ============
 
 class WarpEgressCreate(BaseModel):
-    """WARP 出口创建请求"""
+    """WARP 出口创建请求 (Phase 3: WireGuard only)"""
     tag: str
     description: str = ""
     license_key: Optional[str] = None
-    protocol: str = "masque"  # masque 或 wireguard
+    # Phase 3: Removed protocol field - only WireGuard supported
 
 
 class WarpEgressUpdate(BaseModel):
@@ -7043,57 +7043,7 @@ class WarpEndpointsTest(BaseModel):
     top_n: int = 10
 
 
-def _reload_warp_manager() -> str:
-    """重载 WARP 管理器
-
-    如果守护进程运行中，发送 SIGHUP 信号重载配置。
-    如果守护进程未运行，启动新的守护进程。
-
-    Returns:
-        状态消息
-    """
-    from pathlib import Path
-    import subprocess
-
-    pid_file = Path("/run/warp-manager.pid")
-
-    # 检查守护进程是否运行
-    daemon_running = False
-    if pid_file.exists():
-        try:
-            daemon_pid = int(pid_file.read_text().strip())
-            os.kill(daemon_pid, 0)  # 检查进程是否存在
-            daemon_running = True
-        except (ValueError, ProcessLookupError, PermissionError):
-            # PID 文件无效或进程不存在，清理
-            pid_file.unlink(missing_ok=True)
-
-    if daemon_running:
-        # 发送 SIGHUP 重载
-        try:
-            daemon_pid = int(pid_file.read_text().strip())
-            os.kill(daemon_pid, signal.SIGHUP)
-            print(f"[api] Sent SIGHUP to WARP manager (PID: {daemon_pid})")
-            return ", warp manager reloaded"
-        except (ValueError, ProcessLookupError, PermissionError) as e:
-            print(f"[api] WARP manager reload failed: {e}")
-            return ", warp manager reload failed"
-    else:
-        # 启动新的守护进程
-        try:
-            log_file = open("/var/log/warp-manager.log", "a")
-            subprocess.Popen(
-                ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
-                stdout=log_file,
-                stderr=log_file,
-                start_new_session=True
-            )
-            print("[api] Started WARP manager daemon")
-            time.sleep(1)  # 等待启动
-            return ", warp manager started"
-        except Exception as e:
-            print(f"[api] Failed to start WARP manager: {e}")
-            return f", warp manager start failed: {e}"
+# Phase 3: _reload_warp_manager() removed - MASQUE deprecated
 
 
 @app.get("/api/egress/warp")
@@ -7115,66 +7065,91 @@ def api_get_warp_egress(tag: str):
 
 
 @app.post("/api/egress/warp/register")
-def api_register_warp_egress(data: WarpEgressCreate):
-    """一键注册 WARP 设备并创建出口"""
-    from warp_manager import WarpManager
-
+async def api_register_warp_egress(data: WarpEgressCreate):
+    """一键注册 WARP 设备并创建出口 (Phase 3: WireGuard only via rust-router)"""
     db = _get_db()
 
     # 检查 tag 是否已存在
     if db.get_warp_egress(data.tag):
         raise HTTPException(status_code=400, detail=f"WARP egress '{data.tag}' already exists")
 
-    # 获取下一个可用端口
+    # Phase 3: Require rust-router (MASQUE deprecated)
+    use_rust_router = os.getenv("USE_RUST_ROUTER", "false").lower() == "true"
+    userspace_wg = os.getenv("USERSPACE_WG", "false").lower() == "true"
+
+    if not (use_rust_router and userspace_wg):
+        raise HTTPException(
+            status_code=503,
+            detail="WARP requires rust-router with userspace WireGuard (set USE_RUST_ROUTER=true USERSPACE_WG=true)"
+        )
+
+    # Register via rust-router IPC
+    return await _register_warp_via_rust_router(db, data)
+
+
+async def _register_warp_via_rust_router(db, data: WarpEgressCreate):
+    """Register WARP via rust-router IPC (userspace WireGuard)"""
+    client = await _get_rust_router_client()
+    if not client:
+        raise HTTPException(status_code=503, detail="rust-router not available")
+
     try:
-        socks_port = db.get_next_warp_socks_port()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Call rust-router IPC to register
+        warp_config = await client.register_warp(
+            tag=data.tag,
+            name=data.description or None,
+            warp_plus_license=data.license_key,
+        )
 
-    # 验证协议
-    if data.protocol not in ("masque", "wireguard"):
-        raise HTTPException(status_code=400, detail=f"Invalid protocol: {data.protocol}")
+        if not warp_config:
+            raise HTTPException(status_code=500, detail="WARP registration failed (no config returned)")
 
-    # 调用 warp_manager 进行注册
-    manager = WarpManager()
-    result = manager.register(data.tag, data.license_key, protocol=data.protocol)
+        # Save to database with account_id and license_key
+        db.add_warp_egress(
+            tag=data.tag,
+            description=data.description,
+            protocol="wireguard",
+            config_path="",  # Not needed for rust-router
+            license_key=warp_config.license_key,
+            account_type=warp_config.account_type,
+            mode="wireguard",
+            socks_port=None,  # WireGuard doesn't use SOCKS port
+            enabled=True,
+            account_id=warp_config.account_id,  # Phase 2: Save account_id
+        )
 
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "Registration failed"))
+        # Create WireGuard tunnel via IPC
+        await client.create_wg_tunnel(
+            tag=data.tag,
+            tunnel_type="warp",
+            private_key=warp_config.private_key,
+            peer_public_key=warp_config.peer_public_key,
+            peer_endpoint=warp_config.endpoint,
+            allowed_ips=["0.0.0.0/0", "::/0"],
+            tunnel_ipv4=warp_config.ipv4_address,
+            tunnel_ipv6=warp_config.ipv6_address,
+            mtu=1280,
+            persistent_keepalive=25,
+            reserved=warp_config.reserved,
+        )
 
-    # 保存到数据库
-    config_path = result.get("config_path", "")
-    account_type = result.get("account_type", "free")
+        return {
+            "message": f"WARP egress '{data.tag}' registered via rust-router",
+            "tag": data.tag,
+            "account_id": warp_config.account_id,
+            "account_type": warp_config.account_type,
+            "ipv4_address": warp_config.ipv4_address,
+            "ipv6_address": warp_config.ipv6_address,
+            "endpoint": warp_config.endpoint,
+            "method": "rust-router",
+        }
 
-    db.add_warp_egress(
-        tag=data.tag,
-        description=data.description,
-        protocol=data.protocol,
-        config_path=config_path,
-        license_key=data.license_key,
-        account_type=account_type,
-        mode="socks",
-        socks_port=socks_port,
-        enabled=True
-    )
+    except Exception as e:
+        logging.error(f"WARP registration via rust-router failed: {e}")
+        raise HTTPException(status_code=500, detail=f"WARP registration failed: {str(e)}")
 
-    # 重新渲染配置并重载
-    reload_status = ""
-    try:
-        _regenerate_and_reload()
-        reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
-    except Exception as exc:
-        print(f"[api] Reload failed: {exc}")
-        reload_status = f", reload failed: {exc}"
 
-    return {
-        "message": f"WARP egress '{data.tag}' registered{reload_status}",
-        "tag": data.tag,
-        "socks_port": socks_port,
-        "account_type": account_type,
-        "device_id": result.get("device_id", "")
-    }
+# Phase 3: _register_warp_via_manager() removed - MASQUE deprecated
 
 
 @app.put("/api/egress/warp/{tag}")
@@ -7199,12 +7174,12 @@ def api_update_warp_egress(tag: str, data: WarpEgressUpdate):
     if updates:
         db.update_warp_egress(tag, **updates)
 
-    # 重新渲染配置并重载
+    # Phase 3: No need to reload warp_manager (deprecated)
+    # rust-router tunnels are managed via IPC, no config file reload needed
     reload_status = ""
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -7213,20 +7188,21 @@ def api_update_warp_egress(tag: str, data: WarpEgressUpdate):
 
 
 @app.delete("/api/egress/warp/{tag}")
-def api_delete_warp_egress(tag: str):
-    """删除 WARP 出口"""
-    from warp_manager import WarpManager
-
+async def api_delete_warp_egress(tag: str):
+    """删除 WARP 出口 (Phase 3: rust-router IPC)"""
     db = _get_db()
 
     if not db.get_warp_egress(tag):
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
 
-    # 停止代理并删除配置
-    manager = WarpManager()
-    import asyncio
-    asyncio.run(manager.stop_proxy(tag))
-    manager.delete_config(tag)
+    # Phase 3: Delete WireGuard tunnel via rust-router IPC
+    client = await _get_rust_router_client()
+    if client:
+        try:
+            await client.remove_wg_tunnel(tag)
+        except Exception as e:
+            logging.warning(f"Failed to remove WG tunnel via IPC: {e}")
+            # Continue with database deletion even if IPC fails
 
     # 从数据库删除
     db.delete_warp_egress(tag)
@@ -7236,7 +7212,6 @@ def api_delete_warp_egress(tag: str):
     try:
         _regenerate_and_reload()
         reload_status = ", config reloaded"
-        reload_status += _reload_warp_manager()
     except Exception as exc:
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
@@ -7244,122 +7219,21 @@ def api_delete_warp_egress(tag: str):
     return {"message": f"WARP egress '{tag}' deleted{reload_status}"}
 
 
-@app.post("/api/egress/warp/{tag}/reregister")
-def api_reregister_warp_egress(tag: str):
-    """重新注册 WARP 设备（修复 TLS 握手失败等问题）"""
-    from warp_manager import WarpManager
-    import asyncio
-
-    db = _get_db()
-
-    egress = db.get_warp_egress(tag)
-    if not egress:
-        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    # 停止当前代理
-    manager = WarpManager()
-    asyncio.run(manager.stop_proxy(tag))
-
-    # 删除旧配置文件（但保留数据库记录）
-    manager.delete_config(tag)
-
-    # 重新注册
-    license_key = egress.get("license_key")
-    protocol = egress.get("protocol", "masque")
-    result = manager.register(tag, license_key, protocol=protocol)
-
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail=result.get("error", "Re-registration failed"))
-
-    # 更新数据库中的配置路径和账户类型
-    config_path = result.get("config_path", "")
-    account_type = result.get("account_type", "free")
-    db.update_warp_egress(tag, config_path=config_path, account_type=account_type)
-
-    # 立即启动新代理（不依赖 reload 机制）
-    proxy_status = ""
-    try:
-        started = asyncio.run(manager.start_proxy(tag))
-        if started:
-            proxy_status = ", proxy started"
-        else:
-            proxy_status = ", proxy start failed"
-    except Exception as exc:
-        print(f"[api] Proxy start failed: {exc}")
-        proxy_status = f", proxy start failed: {exc}"
-
-    # 重新渲染配置并重载 sing-box
-    reload_status = ""
-    try:
-        _regenerate_and_reload()
-        reload_status = ", config reloaded"
-    except Exception as exc:
-        print(f"[api] Reload failed: {exc}")
-        reload_status = f", reload failed: {exc}"
-
-    return {
-        "message": f"WARP egress '{tag}' re-registered{proxy_status}{reload_status}",
-        "account_type": account_type,
-        "device_id": result.get("device_id", "")
-    }
-
-
-@app.get("/api/egress/warp/{tag}/status")
-def api_get_warp_status(tag: str):
-    """获取 WARP 代理状态"""
-    from warp_manager import WarpManager
-
-    db = _get_db()
-    egress = db.get_warp_egress(tag)
-    if not egress:
-        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    manager = WarpManager()
-    status = manager.get_status(tag)
-
-    return status
-
-
-@app.post("/api/egress/warp/{tag}/apply-license")
-def api_apply_warp_license(tag: str, license_key: str = Body(..., embed=True)):
-    """应用 WARP+ License"""
-    from warp_manager import WarpManager
-
-    db = _get_db()
-    egress = db.get_warp_egress(tag)
-    if not egress:
-        raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    manager = WarpManager()
-    result = manager.apply_license(tag, license_key)
-
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Failed to apply license"))
-
-    # 更新数据库
-    db.update_warp_egress(tag, license_key=license_key, account_type="warp+")
-
-    # 重载代理以应用新 license
-    reload_status = _reload_warp_manager()
-
-    return {"message": f"WARP+ license applied to '{tag}'{reload_status}"}
+# Phase 3: MASQUE-specific endpoints removed
+# - /api/egress/warp/{tag}/reregister - Not needed with rust-router (just delete and re-register)
+# - /api/egress/warp/{tag}/status - MASQUE proxy status (deprecated)
+# - /api/egress/warp/{tag}/apply-license - WARP+ upgrade done during registration
 
 
 @app.put("/api/egress/warp/{tag}/endpoint")
 def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
     """设置自定义 Endpoint（指定地区节点）"""
-    from warp_manager import WarpManager
+    # Phase 3: warp_manager removed - WireGuard-only via rust-router IPC
 
     db = _get_db()
     egress = db.get_warp_egress(tag)
     if not egress:
         raise HTTPException(status_code=404, detail=f"WARP egress '{tag}' not found")
-
-    manager = WarpManager()
-    result = manager.set_endpoint(tag, data.endpoint_v4, data.endpoint_v6)
-
-    if not result.get("success"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Failed to set endpoint"))
 
     # 更新数据库
     updates = {}
@@ -7370,20 +7244,14 @@ def api_set_warp_endpoint(tag: str, data: WarpEndpointUpdate):
     if updates:
         db.update_warp_egress(tag, **updates)
 
-    protocol = egress.get("protocol", "masque")
+    # Phase 3: WireGuard-only, reload config via rust-router
     reload_status = ""
-
-    if protocol == "wireguard":
-        # WireGuard: 重新渲染配置并重载 sing-box
-        try:
-            _regenerate_and_reload()
-            reload_status = ", config reloaded"
-        except Exception as exc:
-            print(f"[api] Reload failed: {exc}")
-            reload_status = f", reload failed: {exc}"
-    else:
-        # MASQUE: 重载 WARP manager 以应用新 endpoint
-        reload_status = _reload_warp_manager()
+    try:
+        _regenerate_and_reload()
+        reload_status = ", config reloaded"
+    except Exception as exc:
+        print(f"[api] Reload failed: {exc}")
+        reload_status = f", reload failed: {exc}"
 
     return {
         "message": f"Endpoint updated for '{tag}'{reload_status}",
@@ -9501,15 +9369,13 @@ def _full_regenerate_after_import():
         print(f"[backup-import] OpenVPN error: {e}")
 
     # 7. WARP 代理
+    # Phase 3: warp_manager.py removed - WARP tunnels managed via rust-router IPC
     try:
         db = _get_db()
         warp_list = db.get_warp_egress_list()
         if warp_list:
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/warp_manager.py", "daemon"],
-                capture_output=True, text=True, timeout=5
-            )
-            print("[backup-import] WARP manager started")
+            # WARP tunnels will be synced automatically by rust_router_manager
+            print(f"[backup-import] Found {len(warp_list)} WARP egress entries")
             results["warp"] = True
         else:
             results["warp"] = True  # 无配置，视为成功
