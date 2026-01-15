@@ -1613,7 +1613,7 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
             # 在 block 之前插入
             block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
             outbounds.insert(block_idx, outbound)
-            print(f"[render] 创建 WARP 出口 ({protocol}): {tag} -> {outbound_type}")
+            print(f"[render] 创建 WARP 出口 (wireguard): {tag} -> {outbound_type}")
 
     return warp_tags
 

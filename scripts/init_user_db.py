@@ -263,18 +263,26 @@ CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
 
 -- WARP 出口表（Cloudflare WARP via WireGuard）
 -- Phase 3: Simplified schema - WireGuard only (MASQUE removed)
+-- Phase 3-Fix.B: Added WireGuard config fields for persistence
 CREATE TABLE IF NOT EXISTS warp_egress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag TEXT NOT NULL UNIQUE,                 -- 出口标识，如 "warp-main"
     description TEXT DEFAULT '',               -- 描述
 
-    -- WireGuard 配置
+    -- WireGuard 配置（Phase 3-Fix.B: 必需字段）
+    private_key TEXT,                          -- WireGuard 私钥 (base64)
+    peer_public_key TEXT,                      -- WARP 服务器公钥 (base64)
+    endpoint TEXT,                             -- 默认 endpoint (如 engage.cloudflareclient.com:2408)
+    local_ip TEXT,                             -- 分配的 IPv4 地址 (如 172.16.0.2)
+    local_ipv6 TEXT,                           -- 分配的 IPv6 地址
+
+    -- 旧字段（保留兼容性）
     config_path TEXT,                          -- 保留字段（未来可能使用）
     license_key TEXT,                          -- Cloudflare auth token
     account_type TEXT DEFAULT 'free',          -- free / unlimited
     account_id TEXT,                           -- Cloudflare account ID (for management)
 
-    -- 自定义 Endpoint（指定地区）
+    -- 自定义 Endpoint（指定地区，覆盖默认 endpoint）
     endpoint_v4 TEXT,                          -- 自定义 IPv4 endpoint (如 162.159.193.10:2408)
     endpoint_v6 TEXT,                          -- 自定义 IPv6 endpoint
 
@@ -888,9 +896,10 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
     else:
         print("⊘ warp_egress.account_id 字段已存在，跳过迁移")
 
-    # Phase 3: 移除 MASQUE 专用字段（protocol, mode, socks_port）
+    # Phase 3: 移除 MASQUE 专用字段（mode, socks_port）
     # 这是一个破坏性迁移，需要重建表
-    if "protocol" in columns or "mode" in columns or "socks_port" in columns:
+    # Phase 3-Fix.B: 只检查 mode/socks_port，不检查 protocol（避免重复迁移）
+    if "mode" in columns or "socks_port" in columns:
         print("Phase 3: 检测到旧表结构（包含 MASQUE 字段），开始迁移...")
 
         # 禁用所有 MASQUE 条目
@@ -1780,6 +1789,57 @@ def migrate_cascade_delete_tables(conn: sqlite3.Connection):
         print("⊘ 级联删除通知表已存在，跳过迁移")
 
 
+def migrate_warp_egress_wireguard_fields(conn: sqlite3.Connection):
+    """Phase 3-Fix.B: 添加 WireGuard 配置字段到 warp_egress 表
+
+    修复 WARP 出口在容器重启后消失的问题。
+    之前 WireGuard 配置只传给 rust-router，没有持久化到数据库。
+    """
+    cursor = conn.cursor()
+    fields_added = 0
+
+    # 检查表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='warp_egress'")
+    if not cursor.fetchone():
+        print("⊘ warp_egress 表不存在，跳过迁移")
+        return
+
+    # 检查并添加 private_key 字段
+    cursor.execute("PRAGMA table_info(warp_egress)")
+    columns = {col[1] for col in cursor.fetchall()}
+
+    if "private_key" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN private_key TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.private_key 字段")
+
+    if "peer_public_key" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN peer_public_key TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.peer_public_key 字段")
+
+    if "endpoint" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN endpoint TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.endpoint 字段")
+
+    if "local_ip" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN local_ip TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.local_ip 字段")
+
+    if "local_ipv6" not in columns:
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN local_ipv6 TEXT")
+        fields_added += 1
+        print("✓ 添加 warp_egress.local_ipv6 字段")
+
+    if fields_added > 0:
+        conn.commit()
+        print(f"✓ Phase 3-Fix.B: 添加了 {fields_added} 个 WireGuard 配置字段")
+    else:
+        print("⊘ warp_egress WireGuard 字段已存在，跳过迁移")
+
+
 def generate_wireguard_private_key() -> str:
     """生成 WireGuard 私钥"""
     try:
@@ -2021,6 +2081,9 @@ def main():
 
     # Phase 11-Cascade: 级联删除通知支持表
     migrate_cascade_delete_tables(conn)
+
+    # Phase 3-Fix.B: WARP WireGuard 配置持久化
+    migrate_warp_egress_wireguard_fields(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

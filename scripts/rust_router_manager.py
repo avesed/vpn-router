@@ -860,35 +860,37 @@ class RustRouterManager:
                         }
 
                 # WARP WireGuard egress (not MASQUE)
-                # Phase 6-Fix.AG: WARP WireGuard config is stored in wg.conf files,
-                # not directly in the database. Read from config_path.
+                # Phase 3-Fix.B: Read WireGuard config from database (preferred)
+                # Fall back to wg.conf file for backward compatibility
                 for egress in db.get_warp_egress_list(enabled_only=True):
-                    protocol = egress.get("protocol", "wireguard")
-                    if protocol != "wireguard":
-                        continue  # Skip WARP MASQUE (uses SOCKS5)
-
                     tag = egress.get("tag", "")
-                    config_path = egress.get("config_path", "")
-
                     if not tag:
                         continue
 
-                    # Phase 6-Fix.AG: Read WireGuard config from file
-                    if config_path:
-                        wg_config = _parse_wg_config_file(config_path)
-                    else:
-                        # Try default path based on tag
-                        default_path = f"/etc/sing-box/warp/{tag}/wg.conf"
-                        wg_config = _parse_wg_config_file(default_path)
+                    # Phase 3-Fix.B: Read WireGuard config from database fields first
+                    private_key = egress.get("private_key")
+                    peer_public_key = egress.get("peer_public_key")
+                    endpoint = egress.get("endpoint")
+                    local_ip = egress.get("local_ip")
 
-                    if not wg_config:
-                        logger.warning(f"Skipping WARP egress {tag}: could not parse WireGuard config")
-                        continue
+                    # Check if database has all required fields
+                    if not all([private_key, peer_public_key, endpoint, local_ip]):
+                        # Fallback: try reading from wg.conf file (backward compatibility)
+                        config_path = egress.get("config_path", "")
+                        if config_path:
+                            wg_config = _parse_wg_config_file(config_path)
+                        else:
+                            default_path = f"/etc/sing-box/warp/{tag}/wg.conf"
+                            wg_config = _parse_wg_config_file(default_path)
 
-                    private_key = wg_config["private_key"]
-                    peer_public_key = wg_config["peer_public_key"]
-                    endpoint = wg_config["endpoint"]
-                    local_ip = wg_config["local_ip"]
+                        if not wg_config:
+                            logger.warning(f"Skipping WARP egress {tag}: no WireGuard config in database or file")
+                            continue
+
+                        private_key = wg_config["private_key"]
+                        peer_public_key = wg_config["peer_public_key"]
+                        endpoint = wg_config["endpoint"]
+                        local_ip = wg_config["local_ip"]
 
                     # Resolve hostname in endpoint if needed
                     resolved_endpoint = endpoint
@@ -3089,6 +3091,8 @@ Examples:
             print(f"Peers synced: {result.peers_synced}")
             print(f"ECMP groups synced: {result.ecmp_groups_synced}")
             print(f"Chains synced: {result.chains_synced}")
+            print(f"WG tunnels synced: {result.wg_tunnels_synced}")
+            print(f"WG tunnels removed: {result.wg_tunnels_removed}")
             if result.errors:
                 print(f"Errors: {result.errors}")
             return 0 if result.success else 1

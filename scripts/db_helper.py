@@ -1833,31 +1833,40 @@ class UserDatabase:
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
         enabled: bool = True,
-        account_id: Optional[str] = None
+        account_id: Optional[str] = None,
+        # Phase 3-Fix.B: WireGuard config fields for persistence
+        private_key: Optional[str] = None,
+        peer_public_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        local_ip: Optional[str] = None,
+        local_ipv6: Optional[str] = None
     ) -> int:
-        """添加 WARP 出口 (Phase 3: WireGuard only, protocol/mode/socks_port removed)"""
+        """添加 WARP 出口 (Phase 3: WireGuard only, Phase 3-Fix.B: with WG config)"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO warp_egress
                 (tag, description, config_path, license_key, account_type,
-                 endpoint_v4, endpoint_v6, enabled, account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 endpoint_v4, endpoint_v6, enabled, account_id,
+                 private_key, peer_public_key, endpoint, local_ip, local_ipv6)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, description, config_path, license_key, account_type,
                 endpoint_v4, endpoint_v6,
                 1 if enabled else 0,
-                account_id
+                account_id,
+                private_key, peer_public_key, endpoint, local_ip, local_ipv6
             ))
             conn.commit()
             return cursor.lastrowid
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:
-        """更新 WARP 出口 (Phase 3: WireGuard only)"""
+        """更新 WARP 出口 (Phase 3: WireGuard only, Phase 3-Fix.B: with WG config)"""
         allowed_fields = {
             "description", "config_path", "license_key", "account_type",
-            "endpoint_v4", "endpoint_v6", "enabled", "account_id"
-            # Phase 3: Removed protocol, mode, socks_port
+            "endpoint_v4", "endpoint_v6", "enabled", "account_id",
+            # Phase 3-Fix.B: WireGuard config fields
+            "private_key", "peer_public_key", "endpoint", "local_ip", "local_ipv6"
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
         if not updates:
@@ -4740,12 +4749,19 @@ class DatabaseManager:
         endpoint_v4: Optional[str] = None,
         endpoint_v6: Optional[str] = None,
         enabled: bool = True,
-        account_id: Optional[str] = None
+        account_id: Optional[str] = None,
+        # Phase 3-Fix.B: WireGuard config fields
+        private_key: Optional[str] = None,
+        peer_public_key: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        local_ip: Optional[str] = None,
+        local_ipv6: Optional[str] = None
     ) -> int:
-        """Phase 3: WireGuard only, protocol/mode/socks_port removed"""
+        """Phase 3: WireGuard only, Phase 3-Fix.B: with WG config"""
         return self.user.add_warp_egress(
             tag, description, config_path, license_key, account_type,
-            endpoint_v4, endpoint_v6, enabled, account_id
+            endpoint_v4, endpoint_v6, enabled, account_id,
+            private_key, peer_public_key, endpoint, local_ip, local_ipv6
         )
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:

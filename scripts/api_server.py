@@ -7118,8 +7118,9 @@ async def _register_warp_via_rust_router(db, data: WarpEgressCreate):
         if not warp_config:
             raise HTTPException(status_code=500, detail="WARP registration failed (no config returned)")
 
-        # Save to database with account_id and license_key
+        # Save to database with account_id, license_key, and WireGuard config
         # Phase 3: Removed deprecated fields (protocol, mode, socks_port)
+        # Phase 3-Fix.B: Added WireGuard config fields for persistence
         db.add_warp_egress(
             tag=data.tag,
             description=data.description,
@@ -7128,6 +7129,12 @@ async def _register_warp_via_rust_router(db, data: WarpEgressCreate):
             account_type=warp_config.account_type,
             enabled=True,
             account_id=warp_config.account_id,
+            # Phase 3-Fix.B: WireGuard config for restart persistence
+            private_key=warp_config.private_key,
+            peer_public_key=warp_config.peer_public_key,
+            endpoint=warp_config.endpoint,
+            local_ip=warp_config.ipv4_address,
+            local_ipv6=warp_config.ipv6_address,
         )
 
         # Create WireGuard tunnel via IPC
