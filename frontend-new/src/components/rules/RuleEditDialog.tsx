@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -30,6 +31,7 @@ interface RuleEditDialogProps {
 }
 
 export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
+  const { t } = useTranslation();
   const addRule = useAddCustomRule();
   const { data: allEgress } = useAllEgress();
   const { data: domainCatalog } = useDomainCatalog();
@@ -66,14 +68,14 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
         ipCidrs,
       }),
       {
-        loading: "Adding rule...",
+        loading: t("rules.addingRule"),
         success: () => {
           onOpenChange(false);
           form.reset();
           setSelectedCatalogLists([]);
-          return "Rule added successfully";
+          return t("rules.addRuleSuccess");
         },
-        error: (err) => `Failed to add rule: ${err.message}`,
+        error: (err) => t("rules.addRuleFailed", { message: err.message }),
       }
     );
   };
@@ -102,10 +104,8 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
-          <DialogTitle>Add Custom Rule</DialogTitle>
-          <DialogDescription>
-            Create a new routing rule based on domains, keywords, or IPs.
-          </DialogDescription>
+          <DialogTitle>{t("rules.addNewRule")}</DialogTitle>
+          <DialogDescription>{t("rules.addRuleDescription")}</DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
@@ -115,27 +115,31 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
                 control={form.control}
                 name="tag"
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Tag (Name)</FormLabel>
-                    <FormControl>
-                      <Input placeholder="my-rule" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
+                    <FormItem>
+                      <FormLabel>{t("rules.ruleTag")}</FormLabel>
+                      <FormControl>
+                        <Input placeholder={t("rules.ruleTagPlaceholder")} {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+
                 )}
               />
               <FormField
                 control={form.control}
                 name="outbound"
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Target Outbound</FormLabel>
-                    <Select onValueChange={field.onChange} defaultValue={field.value}>
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select outbound" />
-                        </SelectTrigger>
-                      </FormControl>
+                    <FormItem>
+                      <FormLabel>{t("rules.outboundLine")}</FormLabel>
+                      <Select onValueChange={field.onChange} defaultValue={field.value}>
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue
+                              placeholder={t("common.selectPlaceholder", { item: t("rules.outbound") })}
+                            />
+                          </SelectTrigger>
+                        </FormControl>
+
                       <SelectContent>
                         {availableOutbounds.map((tag) => (
                           <SelectItem key={tag} value={tag}>
@@ -152,8 +156,10 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
 
             <Tabs defaultValue="manual" className="w-full">
               <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="manual">Manual Input</TabsTrigger>
-                <TabsTrigger value="catalog">Domain Catalog ({selectedCatalogLists.length} selected)</TabsTrigger>
+                <TabsTrigger value="manual">{t("rules.manualInput")}</TabsTrigger>
+                <TabsTrigger value="catalog">
+                  {t("rules.domainCatalogTab", { count: selectedCatalogLists.length })}
+                </TabsTrigger>
               </TabsList>
 
               <TabsContent value="manual" className="space-y-4 mt-4">
@@ -162,9 +168,13 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
                   name="domains"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Domains (One per line)</FormLabel>
+                      <FormLabel>{t("rules.domainSuffix")}</FormLabel>
                       <FormControl>
-                        <Textarea placeholder="example.com&#10;google.com" className="h-20" {...field} />
+                        <Textarea
+                          placeholder={t("rules.domainSuffixPlaceholder")}
+                          className="h-20"
+                          {...field}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -176,9 +186,13 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
                   name="domainKeywords"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Domain Keywords (One per line)</FormLabel>
+                      <FormLabel>{t("rules.domainKeyword")}</FormLabel>
                       <FormControl>
-                        <Textarea placeholder="google&#10;facebook" className="h-20" {...field} />
+                        <Textarea
+                          placeholder={t("rules.domainKeywordPlaceholder")}
+                          className="h-20"
+                          {...field}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -190,9 +204,13 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
                   name="ipCidrs"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>IP CIDRs (One per line)</FormLabel>
+                      <FormLabel>{t("rules.ipCidr")}</FormLabel>
                       <FormControl>
-                        <Textarea placeholder="1.1.1.1/32&#10;8.8.8.8/32" className="h-20" {...field} />
+                        <Textarea
+                          placeholder={t("rules.ipCidrPlaceholder")}
+                          className="h-20"
+                          {...field}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -202,13 +220,13 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
 
               <TabsContent value="catalog" className="space-y-4 mt-4">
                 <div>
-                  <FormLabel>Select Domain Lists from Catalog</FormLabel>
+                  <FormLabel>{t("rules.catalogSelectTitle")}</FormLabel>
                   <p className="text-sm text-muted-foreground mb-3">
-                    Selected lists will be added as geosite: domains. {selectedCatalogLists.length} lists selected.
+                    {t("rules.catalogSelectDescription", { count: selectedCatalogLists.length })}
                   </p>
                   <div className="max-h-[400px] overflow-y-auto border rounded-md p-4 space-y-3">
                     {catalogCategories.length === 0 ? (
-                      <p className="text-center text-muted-foreground py-8">Loading domain catalog...</p>
+                      <p className="text-center text-muted-foreground py-8">{t("common.loading")}</p>
                     ) : (
                       catalogCategories.map(([categoryId, category]: [string, any]) => (
                         <div key={categoryId} className="space-y-2">
@@ -238,11 +256,12 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
               </TabsContent>
             </Tabs>
 
-            <DialogFooter>
-              <Button type="submit" disabled={addRule.isPending}>
-                Create Rule
-              </Button>
-            </DialogFooter>
+              <DialogFooter>
+                <Button type="submit" disabled={addRule.isPending}>
+                  {t("rules.addRule")}
+                </Button>
+              </DialogFooter>
+
           </form>
         </Form>
       </DialogContent>

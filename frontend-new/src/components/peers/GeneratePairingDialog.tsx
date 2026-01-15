@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -46,9 +47,10 @@ const formSchema = z.object({
 type FormValues = z.infer<typeof formSchema>;
 
 export function GeneratePairingDialog() {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [result, setResult] = useState<{ code: string; psk: string } | null>(null);
-  
+
   const generatePairRequest = useGeneratePairRequest();
 
   const form = useForm<FormValues>({
@@ -76,7 +78,7 @@ export function GeneratePairingDialog() {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    toast.success("Copied to clipboard");
+    toast.success(t("common.copied"));
   };
 
   const reset = () => {
@@ -90,14 +92,12 @@ export function GeneratePairingDialog() {
       if (!val) reset();
     }}>
       <DialogTrigger asChild>
-        <Button>Generate Pairing Code</Button>
+        <Button>{t("pairing.generateButton")}</Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-[500px]">
         <DialogHeader>
-          <DialogTitle>Generate Pairing Code</DialogTitle>
-          <DialogDescription>
-            Generate a code to pair with another node. Share this code securely.
-          </DialogDescription>
+          <DialogTitle>{t("pairing.generateTitle")}</DialogTitle>
+          <DialogDescription>{t("pairing.generateDescription")}</DialogDescription>
         </DialogHeader>
 
         {!result ? (
@@ -107,16 +107,15 @@ export function GeneratePairingDialog() {
                 control={form.control}
                 name="node_tag"
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Node Tag</FormLabel>
-                    <FormControl>
-                      <Input placeholder="e.g. home-router" {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      Unique identifier for this node
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
+                    <FormItem>
+                      <FormLabel>{t("peers.tag")}</FormLabel>
+                      <FormControl>
+                        <Input placeholder={t("peers.tagPlaceholder")} {...field} />
+                      </FormControl>
+                      <FormDescription>{t("peers.tagHint")}</FormDescription>
+                      <FormMessage />
+                    </FormItem>
+
                 )}
               />
 
@@ -126,9 +125,9 @@ export function GeneratePairingDialog() {
                   name="endpoint"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Endpoint</FormLabel>
+                      <FormLabel>{t("peers.endpoint")}</FormLabel>
                       <FormControl>
-                        <Input placeholder="e.g. 1.2.3.4" {...field} />
+                        <Input placeholder={t("peers.endpointPlaceholder")} {...field} />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -140,19 +139,21 @@ export function GeneratePairingDialog() {
                   name="tunnel_type"
                   render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Tunnel Type</FormLabel>
+                      <FormLabel>{t("peers.tunnelType")}</FormLabel>
                       <Select 
                         onValueChange={field.onChange} 
                         defaultValue={field.value}
                       >
                         <FormControl>
                           <SelectTrigger>
-                            <SelectValue placeholder="Select tunnel type" />
+                            <SelectValue
+                              placeholder={t("common.selectPlaceholder", { item: t("peers.tunnelType") })}
+                            />
                           </SelectTrigger>
                         </FormControl>
                         <SelectContent>
-                          <SelectItem value="wireguard">WireGuard</SelectItem>
-                          <SelectItem value="xray">Xray (VLESS)</SelectItem>
+                          <SelectItem value="wireguard">{t("peers.wireguard")}</SelectItem>
+                          <SelectItem value="xray">{t("pairing.tunnelTypeXray")}</SelectItem>
                         </SelectContent>
                       </Select>
                       <FormMessage />
@@ -173,12 +174,8 @@ export function GeneratePairingDialog() {
                       />
                     </FormControl>
                     <div className="space-y-1 leading-none">
-                      <FormLabel>
-                        Bidirectional Connection
-                      </FormLabel>
-                      <FormDescription>
-                        Allow the other node to connect back to this node
-                      </FormDescription>
+                      <FormLabel>{t("pairing.bidirectionalTitle")}</FormLabel>
+                      <FormDescription>{t("pairing.bidirectionalDescription")}</FormDescription>
                     </div>
                   </FormItem>
                 )}
@@ -192,14 +189,14 @@ export function GeneratePairingDialog() {
                 {generatePairRequest.isPending && (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 )}
-                Generate Code
+                {t("pairing.generateCode")}
               </Button>
             </form>
           </Form>
         ) : (
           <div className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium">Pairing Code</label>
+              <label className="text-sm font-medium">{t("pairing.pairingCode")}</label>
               <div className="flex items-center space-x-2">
                 <code className="flex-1 rounded bg-muted p-2 font-mono text-sm break-all">
                   {result.code}
@@ -215,7 +212,7 @@ export function GeneratePairingDialog() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Pre-shared Key (PSK)</label>
+              <label className="text-sm font-medium">{t("pairing.pskLabel")}</label>
               <div className="flex items-center space-x-2">
                 <code className="flex-1 rounded bg-muted p-2 font-mono text-sm break-all">
                   {result.psk}
@@ -231,7 +228,7 @@ export function GeneratePairingDialog() {
             </div>
 
             <Button variant="outline" className="w-full" onClick={reset}>
-              Generate Another
+              {t("pairing.generateAnother")}
             </Button>
           </div>
         )}

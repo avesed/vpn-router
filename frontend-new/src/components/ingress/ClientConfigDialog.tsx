@@ -88,8 +88,8 @@ export function ClientConfigDialog({ clientName, privateKey, open, onOpenChange 
 
         <Tabs defaultValue="qrcode" className="w-full">
           <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="qrcode">{t("common.qrCode", "QR Code")}</TabsTrigger>
-            <TabsTrigger value="config">{t("common.configFile", "Config File")}</TabsTrigger>
+            <TabsTrigger value="qrcode">{t("common.qrCode")}</TabsTrigger>
+            <TabsTrigger value="config">{t("common.configFile")}</TabsTrigger>
           </TabsList>
 
           <TabsContent value="qrcode" className="flex flex-col items-center justify-center p-4">
@@ -128,11 +128,11 @@ export function ClientConfigDialog({ clientName, privateKey, open, onOpenChange 
             <div className="flex gap-2 justify-end">
               <Button variant="outline" size="sm" onClick={handleCopyConfig} disabled={!configText}>
                 <Copy className="mr-2 h-4 w-4" />
-                {t("common.copy", "Copy")}
+                {t("common.copy")}
               </Button>
               <Button variant="outline" size="sm" onClick={handleDownloadConfig} disabled={!configText}>
                 <Download className="mr-2 h-4 w-4" />
-                {t("common.download", "Download")}
+                {t("common.download")}
               </Button>
             </div>
           </TabsContent>

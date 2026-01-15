@@ -222,7 +222,7 @@ function AppSidebar() {
 
 export function AppLayout() {
   const { setOpen } = useCommandPalette();
-  const { i18n } = useTranslation();
+  const { i18n, t } = useTranslation();
 
   return (
     <SidebarProvider>
@@ -234,7 +234,7 @@ export function AppLayout() {
             <Separator orientation="vertical" className="mr-2 h-4" />
             <div className="flex items-center gap-2">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-sm text-muted-foreground">System Online</span>
+              <span className="text-sm text-muted-foreground">{t("nav.systemOnline")}</span>
             </div>
           </div>
           
@@ -246,7 +246,7 @@ export function AppLayout() {
               onClick={() => setOpen(true)}
             >
               <Search className="mr-2 h-4 w-4" />
-              <span>Search...</span>
+              <span>{t("common.search")}...</span>
               <kbd className="pointer-events-none ml-auto inline-flex h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium text-muted-foreground opacity-100">
                 <span className="text-xs">⌘</span>K
               </kbd>
@@ -260,10 +260,10 @@ export function AppLayout() {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onClick={() => i18n.changeLanguage("en")}>
-                  English
+                  {t("language.en")}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => i18n.changeLanguage("zh")}>
-                  中文
+                  {t("language.zh")}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

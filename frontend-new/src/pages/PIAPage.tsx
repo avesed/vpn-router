@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -29,6 +30,7 @@ const addLineSchema = z.object({
 });
 
 export default function PIAPage() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const { data: status, isLoading: isLoadingStatus } = usePIAStatus();
   const { data: regionsData, isLoading: isLoadingRegions } = usePIARegions();
@@ -76,18 +78,17 @@ export default function PIAPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">PIA Integration</h1>
-        <p className="text-muted-foreground">
-          Manage Private Internet Access credentials and connections.
-        </p>
-      </div>
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">{t("pia.title")}</h1>
+          <p className="text-muted-foreground">{t("pia.subtitle")}</p>
+        </div>
+
 
       <div className="grid gap-6 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Account Status</CardTitle>
-            <CardDescription>Check your PIA account connection status</CardDescription>
+            <CardTitle>{t("pia.credentialStatus")}</CardTitle>
+            <CardDescription>{t("pia.credentialStatusDesc")}</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex items-center gap-2 p-4 border rounded-lg bg-muted/50">
@@ -95,7 +96,7 @@ export default function PIAPage() {
                 <>
                   <CheckCircle2 className="h-5 w-5 text-green-500" />
                   <div className="flex-1">
-                    <p className="font-medium">Credentials Configured</p>
+                    <p className="font-medium">{t("pia.hasCredentials")}</p>
                     <p className="text-sm text-muted-foreground">{status.message}</p>
                   </div>
                 </>
@@ -103,8 +104,8 @@ export default function PIAPage() {
                 <>
                   <XCircle className="h-5 w-5 text-destructive" />
                   <div className="flex-1">
-                    <p className="font-medium">Not Configured</p>
-                    <p className="text-sm text-muted-foreground">Please log in to enable PIA integration</p>
+                    <p className="font-medium">{t("pia.noCredentials")}</p>
+                    <p className="text-sm text-muted-foreground">{t("pia.enterCredentials")}</p>
                   </div>
                 </>
               )}
@@ -112,10 +113,10 @@ export default function PIAPage() {
 
             <form onSubmit={handleSubmitLogin(onLogin)} className="space-y-4 mt-4">
               <div className="grid gap-2">
-                <Label htmlFor="username">PIA Username</Label>
+                <Label htmlFor="username">{t("pia.username")}</Label>
                 <Input
                   id="username"
-                  placeholder="p1234567"
+                  placeholder={t("pia.usernamePlaceholder")}
                   {...registerLogin("username")}
                 />
                 {loginErrors.username && (
@@ -123,11 +124,11 @@ export default function PIAPage() {
                 )}
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="password">PIA Password</Label>
+                <Label htmlFor="password">{t("pia.password")}</Label>
                 <Input
                   id="password"
                   type="password"
-                  placeholder="••••••••"
+                  placeholder={t("pia.passwordPlaceholder")}
                   {...registerLogin("password")}
                 />
                 {loginErrors.password && (
@@ -136,7 +137,7 @@ export default function PIAPage() {
               </div>
               <Button type="submit" className="w-full" disabled={isLoggingIn}>
                 {isLoggingIn && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                {status?.has_credentials ? "Update Credentials" : "Log In"}
+                {status?.has_credentials ? t("pia.updateCredentials") : t("pia.login")}
               </Button>
             </form>
           </CardContent>
@@ -145,16 +146,16 @@ export default function PIAPage() {
         {status?.has_credentials && (
           <Card>
             <CardHeader>
-              <CardTitle>Add Connection</CardTitle>
-              <CardDescription>Create a new PIA VPN connection</CardDescription>
+              <CardTitle>{t("egress.addPiaLine")}</CardTitle>
+              <CardDescription>{t("pia.addConnectionDescription")}</CardDescription>
             </CardHeader>
             <CardContent>
               <form onSubmit={handleSubmitAdd(onAddLine)} className="space-y-4">
                 <div className="grid gap-2">
-                  <Label htmlFor="tag">Tag (Unique ID)</Label>
+                  <Label htmlFor="tag">{t("egress.lineTag")}</Label>
                   <Input
                     id="tag"
-                    placeholder="pia-us-east"
+                    placeholder={t("egress.lineTagPlaceholder")}
                     {...registerAdd("tag")}
                   />
                   {addErrors.tag && (
@@ -163,10 +164,10 @@ export default function PIAPage() {
                 </div>
 
                 <div className="grid gap-2">
-                  <Label htmlFor="description">Description</Label>
+                  <Label htmlFor="description">{t("common.description")}</Label>
                   <Input
                     id="description"
-                    placeholder="US East Streaming"
+                    placeholder={t("egress.descriptionPlaceholder")}
                     {...registerAdd("description")}
                   />
                   {addErrors.description && (
@@ -175,10 +176,10 @@ export default function PIAPage() {
                 </div>
 
                 <div className="grid gap-2">
-                  <Label htmlFor="region">Region</Label>
+                  <Label htmlFor="region">{t("egress.region")}</Label>
                   <Select onValueChange={(value) => setAddValue("regionId", value)}>
                     <SelectTrigger>
-                      <SelectValue placeholder="Select region" />
+                      <SelectValue placeholder={t("egress.selectRegion")} />
                     </SelectTrigger>
                     <SelectContent className="max-h-[300px]">
                       {isLoadingRegions ? (
@@ -200,17 +201,17 @@ export default function PIAPage() {
                 </div>
 
                 <div className="grid gap-2">
-                  <Label htmlFor="customDns">Custom DNS (Optional)</Label>
+                  <Label htmlFor="customDns">{t("egress.customDns")}</Label>
                   <Input
                     id="customDns"
-                    placeholder="1.1.1.1"
+                    placeholder={t("egress.customDnsPlaceholder")}
                     {...registerAdd("customDns")}
                   />
                 </div>
 
                 <Button type="submit" className="w-full" disabled={isAddingLine}>
                   {isAddingLine ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}
-                  Add Connection
+                  {t("egress.addLine")}
                 </Button>
               </form>
             </CardContent>

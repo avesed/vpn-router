@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -44,6 +45,7 @@ interface AddClientForm {
 }
 
 export function AddClientDialog({ open, onOpenChange, onClientCreated }: AddClientDialogProps) {
+  const { t } = useTranslation();
   const { mutate: addClient, isPending } = useAddIngressClient();
   const { data: outboundData } = useIngressOutbound();
 
@@ -86,18 +88,16 @@ export function AddClientDialog({ open, onOpenChange, onClientCreated }: AddClie
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add WireGuard Client</DialogTitle>
-          <DialogDescription>
-            Create a new WireGuard client configuration.
-          </DialogDescription>
+          <DialogTitle>{t("ingress.addClient")}</DialogTitle>
+          <DialogDescription>{t("ingress.addClientDesc")}</DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div className="grid gap-2">
-            <Label htmlFor="name">Client Name</Label>
+            <Label htmlFor="name">{t("ingress.clientName")}</Label>
             <Input
               id="name"
               {...register("name")}
-              placeholder="e.g. phone-client"
+              placeholder={t("ingress.clientNamePlaceholder")}
             />
             {errors.name && (
               <p className="text-sm text-destructive">{errors.name.message}</p>
@@ -105,11 +105,11 @@ export function AddClientDialog({ open, onOpenChange, onClientCreated }: AddClie
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="publicKey">Public Key (Optional)</Label>
+            <Label htmlFor="publicKey">{t("ingress.publicKey")}</Label>
             <Input
               id="publicKey"
               {...register("publicKey")}
-              placeholder="Leave empty to generate automatically"
+              placeholder={t("ingress.autoGenerateKeyHint")}
             />
             {errors.publicKey && (
               <p className="text-sm text-destructive">{errors.publicKey.message}</p>
@@ -117,16 +117,16 @@ export function AddClientDialog({ open, onOpenChange, onClientCreated }: AddClie
           </div>
 
           <div className="grid gap-2">
-            <Label>Default Outbound</Label>
+            <Label>{t("ingress.defaultOutbound")}</Label>
             <Select
               onValueChange={(value) => setValue("defaultOutbound", value)}
               defaultValue="null"
             >
               <SelectTrigger>
-                <SelectValue placeholder="Select outbound..." />
+                <SelectValue placeholder={t("ingress.selectOutbound")} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="null">Global Default</SelectItem>
+                <SelectItem value="null">{t("ingress.globalDefault")}</SelectItem>
                 {outboundData?.available_outbounds.map((outbound) => (
                   <SelectItem key={outbound} value={outbound}>
                     {outbound}
@@ -142,16 +142,16 @@ export function AddClientDialog({ open, onOpenChange, onClientCreated }: AddClie
               checked={watch("allowLan")}
               onCheckedChange={(checked) => setValue("allowLan", checked as boolean)}
             />
-            <Label htmlFor="allowLan">Allow LAN Access</Label>
+            <Label htmlFor="allowLan">{t("ingress.allowLanAccess")}</Label>
           </div>
 
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={isPending}>
               {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Add Client
+              {t("ingress.addClient")}
             </Button>
           </DialogFooter>
         </form>

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Label } from "../ui/label";
@@ -26,6 +27,7 @@ export function AddCatalogRuleDialog({
   onSubmit,
   isSubmitting,
 }: AddCatalogRuleDialogProps) {
+  const { t } = useTranslation();
   const { data: egressData } = useAllEgress();
   const [outbound, setOutbound] = useState<string>("");
   const [tag, setTag] = useState<string>(`rule-${categoryId}`);
@@ -37,33 +39,36 @@ export function AddCatalogRuleDialog({
   };
 
   const outbounds = Array.isArray(egressData) ? egressData : [];
+  const actionLabel = type === "domain" ? t("catalog.createRule") : t("catalog.createIpRule");
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Rule for {categoryName}</DialogTitle>
+          <DialogTitle>{t("catalog.addRuleTitle", { name: categoryName })}</DialogTitle>
           <DialogDescription>
-            Route traffic for {type === "domain" ? "domains in" : "IPs in"} {categoryName} through a specific outbound.
+            {t("catalog.addRuleDescription", { name: categoryName })}
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4 py-4">
           <div className="grid gap-2">
-            <Label htmlFor="tag">Rule Tag</Label>
+            <Label htmlFor="tag">{t("rules.ruleTag")}</Label>
             <Input
               id="tag"
               value={tag}
               onChange={(e) => setTag(e.target.value)}
-              placeholder="e.g., rule-google"
+              placeholder={t("catalog.ruleTagPlaceholder")}
             />
           </div>
 
           <div className="grid gap-2">
-            <Label htmlFor="outbound">Outbound Interface</Label>
+            <Label htmlFor="outbound">{t("rules.outboundLine")}</Label>
             <Select value={outbound} onValueChange={setOutbound}>
               <SelectTrigger id="outbound">
-                <SelectValue placeholder="Select outbound" />
+                <SelectValue
+                  placeholder={t("common.selectPlaceholder", { item: t("rules.outbound") })}
+                />
               </SelectTrigger>
               <SelectContent>
                 {outbounds.map((egress) => (
@@ -78,11 +83,11 @@ export function AddCatalogRuleDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button onClick={handleSubmit} disabled={!outbound || isSubmitting}>
             {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Create Rule
+            {actionLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

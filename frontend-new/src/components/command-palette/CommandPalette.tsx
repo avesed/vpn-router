@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import {
   CommandDialog,
   CommandEmpty,
@@ -26,6 +27,7 @@ import { useAllEgress, useTestEgress } from "../../api/hooks/useEgress";
 export function CommandPalette() {
   const { open, setOpen } = useCommandPalette();
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
 
   // Data hooks
@@ -47,44 +49,48 @@ export function CommandPalette() {
 
   return (
     <CommandDialog open={open} onOpenChange={setOpen}>
-      <CommandInput placeholder="Type a command or search..." value={query} onValueChange={setQuery} />
+      <CommandInput
+        placeholder={t("commandPalette.placeholder")}
+        value={query}
+        onValueChange={setQuery}
+      />
       <CommandList>
-        <CommandEmpty>No results found.</CommandEmpty>
+        <CommandEmpty>{t("commandPalette.noResults")}</CommandEmpty>
         
-        <CommandGroup heading="Navigation">
+        <CommandGroup heading={t("commandPalette.navigation")}>
           <CommandItem onSelect={() => runCommand(() => navigate("/"))}>
             <LayoutDashboard className="mr-2 h-4 w-4" />
-            Dashboard
+            {t("nav.dashboard")}
           </CommandItem>
           <CommandItem onSelect={() => runCommand(() => navigate("/topology"))}>
             <Network className="mr-2 h-4 w-4" />
-            Topology
+            {t("nav.topology")}
           </CommandItem>
           <CommandItem onSelect={() => runCommand(() => navigate("/peers"))}>
             <Share2 className="mr-2 h-4 w-4" />
-            Peers
+            {t("nav.peerNodes")}
           </CommandItem>
           <CommandItem onSelect={() => runCommand(() => navigate("/chains"))}>
             <Link className="mr-2 h-4 w-4" />
-            Chains
+            {t("nav.nodeChains")}
           </CommandItem>
           <CommandItem onSelect={() => runCommand(() => navigate("/egress"))}>
             <Globe className="mr-2 h-4 w-4" />
-            Egress
+            {t("nav.egress")}
           </CommandItem>
           <CommandItem onSelect={() => runCommand(() => navigate("/rules"))}>
             <Shield className="mr-2 h-4 w-4" />
-            Rules
+            {t("nav.routeRules")}
           </CommandItem>
           <CommandItem onSelect={() => runCommand(() => navigate("/domain-catalog"))}>
             <Globe className="mr-2 h-4 w-4" />
-            Domain Catalog
+            {t("nav.ruleCatalog")}
           </CommandItem>
         </CommandGroup>
 
         <CommandSeparator />
 
-        <CommandGroup heading="Peers">
+        <CommandGroup heading={t("commandPalette.peers")}>
           {peers.map((peer) => (
             <CommandItem 
               key={peer.tag} 
@@ -99,7 +105,7 @@ export function CommandPalette() {
               <Server className="mr-2 h-4 w-4" />
               {peer.tag}
               <span className="ml-2 text-xs text-muted-foreground">
-                {peer.tunnel_status === "connected" ? "Disconnect" : "Connect"}
+                {peer.tunnel_status === "connected" ? t("peers.disconnect") : t("peers.connect")}
               </span>
             </CommandItem>
           ))}
@@ -107,14 +113,14 @@ export function CommandPalette() {
 
         <CommandSeparator />
 
-        <CommandGroup heading="Egress Actions">
+        <CommandGroup heading={t("commandPalette.egressActions")}>
           {egressList.map((egress) => (
             <CommandItem 
               key={egress.tag} 
               onSelect={() => runCommand(() => testEgress.mutate({ tag: egress.tag }))}
             >
               <Zap className="mr-2 h-4 w-4" />
-              Test {egress.tag}
+              {t("commandPalette.testEgress", { tag: egress.tag })}
               <span className="ml-2 text-xs text-muted-foreground uppercase">
                 {egress.type}
               </span>

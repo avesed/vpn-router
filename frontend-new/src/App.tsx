@@ -1,5 +1,6 @@
 import React, { Suspense, lazy } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
 import { QueryProvider } from "@/providers/QueryProvider";
 import { AuthProvider, useAuth } from "@/providers/AuthProvider";
 import { ThemeProvider } from "@/providers/ThemeProvider";
@@ -13,6 +14,7 @@ import { Loader2 } from "lucide-react";
 
 // Lazy load pages
 const LoginPage = lazy(() => import("@/pages/LoginPage").then(module => ({ default: module.LoginPage })));
+const SetupPage = lazy(() => import("@/pages/SetupPage").then(module => ({ default: module.SetupPage })));
 const DashboardPage = lazy(() => import("@/pages/DashboardPage").then(module => ({ default: module.DashboardPage })));
 const PeersPage = lazy(() => import("@/pages/PeersPage").then(module => ({ default: module.PeersPage })));
 const EgressPage = lazy(() => import("@/pages/EgressPage"));
@@ -37,14 +39,19 @@ function PageLoader() {
 
 // Protected route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading, isSetup } = useAuth();
+  const { t } = useTranslation();
 
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
-        <div className="animate-pulse text-muted-foreground">Loading...</div>
+        <div className="animate-pulse text-muted-foreground">{t("common.loading")}</div>
       </div>
     );
+  }
+
+  if (!isSetup) {
+    return <Navigate to="/setup" replace />;
   }
 
   if (!isAuthenticated) {
@@ -59,6 +66,7 @@ function AppRoutes() {
     <Suspense fallback={<PageLoader />}>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/setup" element={<SetupPage />} />
         <Route
           path="/"
           element={
@@ -76,6 +84,8 @@ function AppRoutes() {
           <Route path="egress" element={<EgressPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="domain-catalog" element={<DomainCatalogPage />} />
+          <Route path="ip-catalog" element={<DomainCatalogPage />} />
+          <Route path="profiles" element={<Navigate to="/egress" replace />} />
           <Route path="adblock" element={<AdBlockPage />} />
           <Route path="pia" element={<PIAPage />} />
           <Route path="backup" element={<BackupPage />} />

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from "../ui/card";
 import { Button } from "../ui/button";
 import { Badge } from "../ui/badge";
@@ -11,10 +12,12 @@ interface CategoryCardProps {
   count?: number;
   tags?: string[];
   lists?: any[];
+  actionLabel: string;
   onAdd: () => void;
 }
 
-export function CategoryCard({ name, description, count, tags, lists, onAdd }: CategoryCardProps) {
+export function CategoryCard({ name, description, count, tags, lists, actionLabel, onAdd }: CategoryCardProps) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
 
   return (
@@ -24,7 +27,7 @@ export function CategoryCard({ name, description, count, tags, lists, onAdd }: C
           <CardTitle className="text-lg">{name}</CardTitle>
           {count !== undefined && (
             <Badge variant="secondary" className="ml-2">
-              {count} rules
+              {t("catalog.ruleCount", { count })}
             </Badge>
           )}
         </div>
@@ -47,7 +50,9 @@ export function CategoryCard({ name, description, count, tags, lists, onAdd }: C
               onClick={() => setExpanded(!expanded)} 
               className="w-full justify-between px-0 hover:bg-transparent"
             >
-              <span className="text-sm font-medium">{lists.length} Sub-lists</span>
+              <span className="text-sm font-medium">
+                {t("catalog.subLists", { count: lists.length })}
+              </span>
               <ChevronDown className={`h-4 w-4 transition-transform ${expanded ? "rotate-180" : ""}`} />
             </Button>
             {expanded && (
@@ -66,7 +71,7 @@ export function CategoryCard({ name, description, count, tags, lists, onAdd }: C
       <CardFooter>
         <Button onClick={onAdd} className="w-full" size="sm">
           <Plus className="w-4 h-4 mr-2" />
-          Create Rule
+          {actionLabel}
         </Button>
       </CardFooter>
     </Card>

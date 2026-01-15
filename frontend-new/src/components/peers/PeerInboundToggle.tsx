@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { Switch } from "@/components/ui/switch";
 import { useEnablePeerInbound, useDisablePeerInbound } from "@/api/hooks/usePeerNodes";
 import type { PeerNode } from "@/types";
@@ -7,6 +8,7 @@ interface PeerInboundToggleProps {
 }
 
 export function PeerInboundToggle({ peer }: PeerInboundToggleProps) {
+  const { t } = useTranslation();
   const enableInbound = useEnablePeerInbound();
   const disableInbound = useDisablePeerInbound();
 
@@ -29,7 +31,7 @@ export function PeerInboundToggle({ peer }: PeerInboundToggleProps) {
       />
       {peer.inbound_enabled ? (
         <span className="text-xs text-muted-foreground">
-          Port: {peer.inbound_port}
+          {t("common.port")}: {peer.inbound_port}
         </span>
       ) : null}
     </div>

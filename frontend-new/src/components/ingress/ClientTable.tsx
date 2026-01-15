@@ -188,7 +188,7 @@ export function ClientTable({ clients }: ClientTableProps) {
                         </DropdownMenuItem>
                         <DropdownMenuItem onClick={() => setEditClient(client)}>
                           <Settings className="mr-2 h-4 w-4" />
-                          {t("common.settings", "Settings")}
+                          {t("ingress.settings")}
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
@@ -233,7 +233,7 @@ export function ClientTable({ clients }: ClientTableProps) {
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               disabled={isDeleting}
             >
-              {isDeleting ? t("common.deleting", "Deleting...") : t("common.delete")}
+              {isDeleting ? t("common.deleting") : t("common.delete")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

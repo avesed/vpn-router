@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -25,6 +26,7 @@ interface ChainCreateDialogProps {
 }
 
 export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps) {
+  const { t } = useTranslation();
   const createChain = useCreateNodeChain();
   const { data: peers } = usePeerNodes();
 
@@ -43,13 +45,13 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
     toast.promise(
       createChain.mutateAsync(values),
       {
-        loading: "Creating chain...",
+        loading: t("common.creating"),
         success: () => {
           onOpenChange(false);
           form.reset();
-          return "Chain created successfully";
+          return t("chains.createSuccess", { name: values.name || values.tag });
         },
-        error: (err) => `Failed to create chain: ${err.message}`,
+        error: () => t("chains.createFailed"),
       }
     );
   };
@@ -60,10 +62,8 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>Create Node Chain</DialogTitle>
-          <DialogDescription>
-            Create a multi-hop chain through peer nodes.
-          </DialogDescription>
+          <DialogTitle>{t("chains.addChain")}</DialogTitle>
+          <DialogDescription>{t("chains.createDescription")}</DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
@@ -73,9 +73,9 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
               name="tag"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Tag</FormLabel>
+                  <FormLabel>{t("chains.tag")}</FormLabel>
                   <FormControl>
-                    <Input placeholder="chain-1" {...field} />
+                    <Input placeholder={t("chains.tagPlaceholder")} {...field} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -86,9 +86,9 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
               name="name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Name</FormLabel>
+                  <FormLabel>{t("chains.name")}</FormLabel>
                   <FormControl>
-                    <Input placeholder="My Chain" {...field} />
+                    <Input placeholder={t("chains.namePlaceholder")} {...field} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -99,9 +99,9 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
               name="description"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Description</FormLabel>
+                  <FormLabel>{t("chains.description")}</FormLabel>
                   <FormControl>
-                    <Input placeholder="Optional description" {...field} />
+                    <Input placeholder={t("chains.descriptionPlaceholder")} {...field} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -113,15 +113,14 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
               name="hops"
               render={() => (
                 <FormItem>
-                  <div className="mb-4">
-                    <FormLabel className="text-base">Select Hops (Ordered)</FormLabel>
-                    <DialogDescription>
-                      Select peer nodes in the order they should be traversed.
-                    </DialogDescription>
-                  </div>
+                    <div className="mb-4">
+                      <FormLabel className="text-base">{t("chains.hops")}</FormLabel>
+                      <DialogDescription>{t("chains.hopsHint")}</DialogDescription>
+                    </div>
+
                   <ScrollArea className="h-40 border rounded-md p-2">
                     {availablePeers.length === 0 ? (
-                      <div className="text-sm text-muted-foreground p-2">No peer nodes available.</div>
+                      <div className="text-sm text-muted-foreground p-2">{t("chains.noNodes")}</div>
                     ) : (
                       availablePeers.map((peer) => (
                         <FormField
@@ -168,9 +167,9 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
               name="exit_egress"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Exit Egress (Optional)</FormLabel>
+                  <FormLabel>{t("chains.exitEgress")}</FormLabel>
                   <FormControl>
-                    <Input placeholder="Tag of egress on the last node" {...field} />
+                    <Input placeholder={t("chains.exitEgressHint")} {...field} />
                   </FormControl>
                   <FormMessage />
                 </FormItem>
@@ -179,7 +178,7 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
 
             <DialogFooter>
               <Button type="submit" disabled={createChain.isPending}>
-                Create Chain
+                {t("chains.addChain")}
               </Button>
             </DialogFooter>
           </form>

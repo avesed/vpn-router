@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import type { RouteRule } from "../../types";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../ui/table";
 import { Button } from "../ui/button";
@@ -11,34 +12,42 @@ interface RulesListProps {
 }
 
 export function RulesList({ rules }: RulesListProps) {
+  const { t } = useTranslation();
   const deleteRule = useDeleteCustomRule();
 
   const handleDelete = (tag: string) => {
-    if (!confirm(`Are you sure you want to delete rule ${tag}?`)) return;
+    if (!confirm(t("rules.confirmDeleteRule", { name: tag }))) return;
     toast.promise(deleteRule.mutateAsync(tag), {
-      loading: "Deleting rule...",
-      success: "Rule deleted",
-      error: "Failed to delete rule",
+      loading: t("rules.deletingRule"),
+      success: t("rules.ruleDeleted", { name: tag }),
+      error: t("common.deleteFailed"),
     });
+  };
+
+  const getTypeLabel = (type?: string) => {
+    if (!type || type === "custom") return t("common.custom");
+    if (type === "protocol") return t("rules.protocolMatching");
+    return type;
   };
 
   return (
     <div className="rounded-md border">
       <Table>
         <TableHeader>
-          <TableRow>
-            <TableHead>Tag</TableHead>
-            <TableHead>Type</TableHead>
-            <TableHead>Target Outbound</TableHead>
-            <TableHead>Criteria</TableHead>
-            <TableHead className="text-right">Actions</TableHead>
-          </TableRow>
+            <TableRow>
+              <TableHead>{t("rules.ruleTag")}</TableHead>
+              <TableHead>{t("common.type")}</TableHead>
+              <TableHead>{t("rules.outboundLine")}</TableHead>
+              <TableHead>{t("rules.criteria")}</TableHead>
+              <TableHead className="text-right">{t("common.actions")}</TableHead>
+            </TableRow>
+
         </TableHeader>
         <TableBody>
           {rules.length === 0 ? (
             <TableRow>
               <TableCell colSpan={5} className="text-center h-24 text-muted-foreground">
-                No custom rules configured.
+                {t("rules.noRulesConfigured")}
               </TableCell>
             </TableRow>
           ) : (
@@ -46,7 +55,7 @@ export function RulesList({ rules }: RulesListProps) {
               <TableRow key={rule.tag}>
                 <TableCell className="font-medium">{rule.tag}</TableCell>
                 <TableCell>
-                  <Badge variant="secondary">{rule.type || "custom"}</Badge>
+                  <Badge variant="secondary">{getTypeLabel(rule.type)}</Badge>
                 </TableCell>
                 <TableCell>
                   <Badge variant="outline">{rule.outbound}</Badge>
@@ -55,17 +64,17 @@ export function RulesList({ rules }: RulesListProps) {
                   <div className="flex flex-wrap gap-1">
                     {rule.domains && rule.domains.length > 0 && (
                       <span className="text-xs text-muted-foreground">
-                        {rule.domains.length} domains
+                        {t("rules.domainSuffixCount", { count: rule.domains.length })}
                       </span>
                     )}
                     {rule.domain_keywords && rule.domain_keywords.length > 0 && (
                       <span className="text-xs text-muted-foreground">
-                        {rule.domain_keywords.length} keywords
+                        {t("rules.domainKeywordCount", { count: rule.domain_keywords.length })}
                       </span>
                     )}
                     {rule.ip_cidrs && rule.ip_cidrs.length > 0 && (
                       <span className="text-xs text-muted-foreground">
-                        {rule.ip_cidrs.length} CIDRs
+                        {t("rules.ipCidrCount", { count: rule.ip_cidrs.length })}
                       </span>
                     )}
                   </div>

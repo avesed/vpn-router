@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useNodeChains } from "../api/hooks/useChains";
 import { ChainTable } from "../components/chains/ChainTable";
 import { ChainCreateDialog } from "../components/chains/ChainCreateDialog";
@@ -6,11 +7,12 @@ import { Button } from "../components/ui/button";
 import { Plus } from "lucide-react";
 
 export default function ChainsPage() {
+  const { t } = useTranslation();
   const { data: chainsData, isLoading, error } = useNodeChains();
   const [showCreateDialog, setShowCreateDialog] = useState(false);
 
-  if (isLoading) return <div>Loading chains...</div>;
-  if (error) return <div>Error loading chains: {error.message}</div>;
+  if (isLoading) return <div>{t("common.loading")}</div>;
+  if (error) return <div>{t("common.error")}: {error.message}</div>;
 
   const chains = chainsData?.chains || [];
 
@@ -18,13 +20,11 @@ export default function ChainsPage() {
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">Node Chains</h1>
-          <p className="text-muted-foreground">
-            Manage multi-hop chains for advanced routing privacy.
-          </p>
+          <h1 className="text-3xl font-bold tracking-tight">{t("chains.title")}</h1>
+          <p className="text-muted-foreground">{t("chains.subtitle")}</p>
         </div>
         <Button onClick={() => setShowCreateDialog(true)}>
-          <Plus className="mr-2 h-4 w-4" /> Create Chain
+          <Plus className="mr-2 h-4 w-4" /> {t("chains.addChain")}
         </Button>
       </div>
 

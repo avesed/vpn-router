@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { 
   Table, 
   TableBody, 
@@ -35,6 +36,7 @@ interface PeerTableProps {
 }
 
 export function PeerTable({ peers }: PeerTableProps) {
+  const { t } = useTranslation();
   const connectPeer = useConnectPeerNode();
   const disconnectPeer = useDisconnectPeerNode();
   const deletePeer = useDeletePeerNode();
@@ -42,13 +44,13 @@ export function PeerTable({ peers }: PeerTableProps) {
   const getStatusBadge = (status: string) => {
     switch (status) {
       case "connected":
-        return <Badge className="bg-green-500">Connected</Badge>;
+        return <Badge className="bg-green-500">{t("peers.status.connected")}</Badge>;
       case "connecting":
-        return <Badge className="bg-yellow-500">Connecting</Badge>;
+        return <Badge className="bg-yellow-500">{t("peers.status.connecting")}</Badge>;
       case "error":
-        return <Badge variant="destructive">Error</Badge>;
+        return <Badge variant="destructive">{t("peers.status.error")}</Badge>;
       default:
-        return <Badge variant="secondary">Disconnected</Badge>;
+        return <Badge variant="secondary">{t("peers.status.disconnected")}</Badge>;
     }
   };
 
@@ -56,20 +58,21 @@ export function PeerTable({ peers }: PeerTableProps) {
     <div className="rounded-md border">
       <Table>
         <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Endpoint</TableHead>
-            <TableHead>Type</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead>Inbound</TableHead>
-            <TableHead className="w-[70px]"></TableHead>
-          </TableRow>
+            <TableRow>
+              <TableHead>{t("peers.name")}</TableHead>
+              <TableHead>{t("peers.endpoint")}</TableHead>
+              <TableHead>{t("peers.tunnelType")}</TableHead>
+              <TableHead>{t("peers.tunnelStatus")}</TableHead>
+              <TableHead>{t("peers.inbound")}</TableHead>
+              <TableHead className="w-[70px]"></TableHead>
+            </TableRow>
+
         </TableHeader>
         <TableBody>
           {peers.length === 0 ? (
             <TableRow>
               <TableCell colSpan={6} className="h-24 text-center">
-                No peers found.
+                {t("peers.noNodes")}
               </TableCell>
             </TableRow>
           ) : (
@@ -91,7 +94,7 @@ export function PeerTable({ peers }: PeerTableProps) {
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
                       <Button variant="ghost" className="h-8 w-8 p-0">
-                        <span className="sr-only">Open menu</span>
+                        <span className="sr-only">{t("common.actions")}</span>
                         <MoreHorizontal className="h-4 w-4" />
                       </Button>
                     </DropdownMenuTrigger>
@@ -99,12 +102,12 @@ export function PeerTable({ peers }: PeerTableProps) {
                       {peer.tunnel_status === "connected" ? (
                         <DropdownMenuItem onClick={() => disconnectPeer.mutate(peer.tag)}>
                           <PowerOff className="mr-2 h-4 w-4" />
-                          Disconnect
+                          {t("peers.disconnect")}
                         </DropdownMenuItem>
                       ) : (
                         <DropdownMenuItem onClick={() => connectPeer.mutate(peer.tag)}>
                           <Power className="mr-2 h-4 w-4" />
-                          Connect
+                          {t("peers.connect")}
                         </DropdownMenuItem>
                       )}
                       
@@ -112,24 +115,23 @@ export function PeerTable({ peers }: PeerTableProps) {
                         <AlertDialogTrigger asChild>
                           <DropdownMenuItem onSelect={(e) => e.preventDefault()} className="text-red-600">
                             <Trash2 className="mr-2 h-4 w-4" />
-                            Delete
+                            {t("common.delete")}
                           </DropdownMenuItem>
                         </AlertDialogTrigger>
                         <AlertDialogContent>
                           <AlertDialogHeader>
-                            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+                            <AlertDialogTitle>{t("peers.confirmDeleteTitle")}</AlertDialogTitle>
                             <AlertDialogDescription>
-                              This will permanently delete the peer node "{peer.name}".
-                              This action cannot be undone.
+                              {t("peers.confirmDeleteMessage", { name: peer.name })}
                             </AlertDialogDescription>
                           </AlertDialogHeader>
                           <AlertDialogFooter>
-                            <AlertDialogCancel>Cancel</AlertDialogCancel>
+                            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
                             <AlertDialogAction 
                               onClick={() => deletePeer.mutate(peer.tag)}
                               className="bg-red-600 hover:bg-red-700"
                             >
-                              Delete
+                              {t("common.delete")}
                             </AlertDialogAction>
                           </AlertDialogFooter>
                         </AlertDialogContent>

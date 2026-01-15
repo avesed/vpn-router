@@ -9,6 +9,7 @@ import {
 
 const TOKEN_KEY = "vpn_gateway_token";
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
+const JWT_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
 interface User {
   username: string;
@@ -19,7 +20,9 @@ interface AuthContextType {
   token: string | null;
   isAuthenticated: boolean;
   isLoading: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  isSetup: boolean;
+  login: (password: string) => Promise<void>;
+  setup: (password: string) => Promise<void>;
   logout: () => void;
 }
 
@@ -32,42 +35,98 @@ interface AuthProviderProps {
 export function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [isSetup, setIsSetup] = useState(true);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Check for existing token on mount
-  useEffect(() => {
-    const storedToken = localStorage.getItem(TOKEN_KEY);
-    if (storedToken) {
-      // Validate token format (JWT: header.payload.signature)
-      const jwtPattern = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
-      if (jwtPattern.test(storedToken)) {
-        setToken(storedToken);
-        // Decode username from JWT payload
-        try {
-          const payload = JSON.parse(atob(storedToken.split(".")[1]));
-          setUser({ username: payload.sub || "admin" });
-        } catch {
-          // Invalid token, clear it
-          localStorage.removeItem(TOKEN_KEY);
-        }
-      } else {
-        // Invalid format, clear it
-        localStorage.removeItem(TOKEN_KEY);
-      }
-    }
-    setIsLoading(false);
+  const logout = useCallback(() => {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken(null);
+    setUser(null);
+    setIsSetup(true);
   }, []);
 
-  const login = useCallback(async (username: string, password: string) => {
-    const response = await fetch(`${API_BASE}/auth/login`, {
+  const refreshToken = useCallback(async () => {
+    if (!token) return;
+
+    const response = await fetch(`${API_BASE}/auth/refresh`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      headers: { Authorization: `Bearer ${token}` },
     });
 
     if (!response.ok) {
-      const error = await response.text();
-      throw new Error(error || "Login failed");
+      logout();
+      return;
+    }
+
+    const data = await response.json();
+    localStorage.setItem(TOKEN_KEY, data.access_token);
+    setToken(data.access_token);
+  }, [token, logout]);
+
+  const checkAuthStatus = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const statusResponse = await fetch(`${API_BASE}/auth/status`);
+      if (!statusResponse.ok) {
+        throw new Error("Failed to fetch auth status");
+      }
+      const statusData = await statusResponse.json();
+      const setup = Boolean(statusData.is_setup);
+      setIsSetup(setup);
+
+      const storedToken = localStorage.getItem(TOKEN_KEY);
+      if (storedToken && setup && JWT_PATTERN.test(storedToken)) {
+        const meResponse = await fetch(`${API_BASE}/auth/me`, {
+          headers: { Authorization: `Bearer ${storedToken}` },
+        });
+
+        if (meResponse.ok) {
+          const meData = await meResponse.json();
+          setToken(storedToken);
+          setUser({ username: meData.username || "admin" });
+          return;
+        }
+
+        localStorage.removeItem(TOKEN_KEY);
+      } else if (storedToken) {
+        localStorage.removeItem(TOKEN_KEY);
+      }
+
+      setToken(null);
+      setUser(null);
+    } catch {
+      setIsSetup(false);
+      setToken(null);
+      setUser(null);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkAuthStatus();
+  }, [checkAuthStatus]);
+
+  useEffect(() => {
+    if (!token) return;
+
+    const interval = setInterval(() => {
+      refreshToken().catch(() => logout());
+    }, 30 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [token, refreshToken, logout]);
+
+  const login = useCallback(async (password: string) => {
+    const response = await fetch(`${API_BASE}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || "Login failed");
     }
 
     const data = await response.json();
@@ -75,13 +134,29 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     localStorage.setItem(TOKEN_KEY, newToken);
     setToken(newToken);
-    setUser({ username });
+    setUser({ username: "admin" });
+    setIsSetup(true);
   }, []);
 
-  const logout = useCallback(() => {
-    localStorage.removeItem(TOKEN_KEY);
-    setToken(null);
-    setUser(null);
+  const setup = useCallback(async (password: string) => {
+    const response = await fetch(`${API_BASE}/auth/setup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || "Setup failed");
+    }
+
+    const data = await response.json();
+    const newToken = data.access_token;
+
+    localStorage.setItem(TOKEN_KEY, newToken);
+    setToken(newToken);
+    setUser({ username: "admin" });
+    setIsSetup(true);
   }, []);
 
   const value: AuthContextType = {
@@ -89,7 +164,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     token,
     isAuthenticated: !!token,
     isLoading,
+    isSetup,
     login,
+    setup,
     logout,
   };
 

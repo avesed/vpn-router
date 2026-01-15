@@ -109,11 +109,11 @@ export function DashboardPage() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {status?.sing_box_running ? "Running" : "Stopped"}
+              {status?.sing_box_running ? t("common.running") : t("common.stopped")}
             </div>
             {status?.timestamp && (
               <p className="text-xs text-muted-foreground">
-                Last updated: {new Date(status.timestamp).toLocaleTimeString()}
+                {t("dashboard.lastUpdate")}: {new Date(status.timestamp).toLocaleTimeString()}
               </p>
             )}
           </CardContent>
@@ -137,7 +137,7 @@ export function DashboardPage() {
                 </div>
               ) : !hasRateData ? (
                 <div className="flex items-center justify-center h-full">
-                  <p className="text-muted-foreground">{t("dashboard.noData", "No traffic data available yet")}</p>
+                  <p className="text-muted-foreground">{t("dashboard.collectingData")}</p>
                 </div>
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
@@ -168,7 +168,7 @@ export function DashboardPage() {
                     <Tooltip
                       contentStyle={{ backgroundColor: 'hsl(var(--background))', borderColor: 'hsl(var(--border))' }}
                       itemStyle={{ color: 'hsl(var(--foreground))' }}
-                      formatter={(value: number | undefined) => [formatBytes((value || 0) * 1024) + '/s', 'Rate'] as [string, string]}
+                      formatter={(value: number | undefined) => [formatBytes((value || 0) * 1024) + '/s', t("dashboard.rate")] as [string, string]}
                     />
                     {rateKeys.map((key, index) => (
                       <Area
@@ -204,7 +204,7 @@ export function DashboardPage() {
                 </div>
               ) : !hasTrafficData ? (
                 <div className="flex items-center justify-center h-full">
-                  <p className="text-muted-foreground">{t("dashboard.noData", "No traffic data available yet")}</p>
+                  <p className="text-muted-foreground">{t("dashboard.noTrafficData")}</p>
                 </div>
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
@@ -223,7 +223,7 @@ export function DashboardPage() {
                       ))}
                     </Pie>
                     <Tooltip
-                      formatter={(value: number | undefined) => [formatBytes(value || 0), "Traffic"] as [string, string]}
+                      formatter={(value: number | undefined) => [formatBytes(value || 0), t("dashboard.traffic")] as [string, string]}
                       contentStyle={{ backgroundColor: 'hsl(var(--background))', borderColor: 'hsl(var(--border))' }}
                       itemStyle={{ color: 'hsl(var(--foreground))' }}
                     />

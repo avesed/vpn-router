@@ -1,10 +1,12 @@
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useDefaultOutbound, useSwitchDefaultOutbound } from "../../api/hooks/useRules";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { Label } from "../ui/label";
 import { toast } from "sonner";
-import { useEffect, useState } from "react";
 
 export function DefaultOutboundSelect() {
+  const { t } = useTranslation();
   const { data, isLoading } = useDefaultOutbound();
   const switchOutbound = useSwitchDefaultOutbound();
   const [value, setValue] = useState("");
@@ -18,20 +20,22 @@ export function DefaultOutboundSelect() {
   const handleValueChange = (newValue: string) => {
     setValue(newValue);
     toast.promise(switchOutbound.mutateAsync(newValue), {
-      loading: "Switching default outbound...",
-      success: "Default outbound switched",
-      error: "Failed to switch outbound",
+      loading: t("rules.switchingDefaultOutbound"),
+      success: t("rules.switchSuccess"),
+      error: t("rules.switchFailed"),
     });
   };
 
-  if (isLoading || !data) return <div>Loading...</div>;
+  if (isLoading || !data) return <div>{t("common.loading")}</div>;
 
   return (
     <div className="flex items-center gap-4 p-4 border rounded-lg bg-card">
-      <Label className="min-w-[120px]">Default Outbound</Label>
+      <Label className="min-w-[120px]">{t("rules.defaultOutbound")}</Label>
       <Select value={value} onValueChange={handleValueChange} disabled={switchOutbound.isPending}>
         <SelectTrigger className="w-[300px]">
-          <SelectValue placeholder="Select default outbound" />
+          <SelectValue
+            placeholder={t("common.selectPlaceholder", { item: t("rules.defaultOutbound") })}
+          />
         </SelectTrigger>
         <SelectContent>
           {data.available_outbounds.map((outbound) => (
@@ -42,7 +46,7 @@ export function DefaultOutboundSelect() {
         </SelectContent>
       </Select>
       <p className="text-sm text-muted-foreground">
-        Traffic not matching any rule will use this outbound.
+        {t("rules.defaultOutboundDesc")}
       </p>
     </div>
   );

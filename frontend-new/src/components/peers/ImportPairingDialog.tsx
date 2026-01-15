@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -38,6 +39,7 @@ const formSchema = z.object({
 type FormValues = z.infer<typeof formSchema>;
 
 export function ImportPairingDialog() {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [result, setResult] = useState<{ 
     success: boolean; 
@@ -45,7 +47,7 @@ export function ImportPairingDialog() {
     response_code: string | null;
     bidirectional: boolean | null;
   } | null>(null);
-  
+
   const importPairRequest = useImportPairRequest();
 
   const form = useForm<FormValues>({
@@ -75,7 +77,7 @@ export function ImportPairingDialog() {
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    toast.success("Copied to clipboard");
+    toast.success(t("common.copied"));
   };
 
   const reset = () => {
@@ -89,14 +91,12 @@ export function ImportPairingDialog() {
       if (!val) reset();
     }}>
       <DialogTrigger asChild>
-        <Button variant="outline">Import Pairing Code</Button>
+        <Button variant="outline">{t("pairing.importButton")}</Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-[500px]">
         <DialogHeader>
-          <DialogTitle>Import Pairing Code</DialogTitle>
-          <DialogDescription>
-            Enter a pairing code from another node to establish a connection.
-          </DialogDescription>
+          <DialogTitle>{t("pairing.importTitle")}</DialogTitle>
+          <DialogDescription>{t("pairing.importDescription")}</DialogDescription>
         </DialogHeader>
 
         {!result ? (
@@ -106,18 +106,19 @@ export function ImportPairingDialog() {
                 control={form.control}
                 name="code"
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Pairing Code</FormLabel>
-                    <FormControl>
-                      <Textarea 
-                        placeholder="Paste the pairing code here..." 
-                        className="resize-none font-mono text-xs"
-                        rows={4}
-                        {...field} 
-                      />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
+                    <FormItem>
+                      <FormLabel>{t("pairing.pairingCode")}</FormLabel>
+                      <FormControl>
+                        <Textarea 
+                          placeholder={t("pairing.pairingCodePlaceholder")}
+                          className="resize-none font-mono text-xs"
+                          rows={4}
+                          {...field} 
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+
                 )}
               />
 
@@ -125,16 +126,15 @@ export function ImportPairingDialog() {
                 control={form.control}
                 name="local_node_tag"
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Local Node Tag</FormLabel>
-                    <FormControl>
-                      <Input placeholder="e.g. office-router" {...field} />
-                    </FormControl>
-                    <FormDescription>
-                      Identifier for this node on the remote peer
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
+                    <FormItem>
+                      <FormLabel>{t("pairing.localNodeTag")}</FormLabel>
+                      <FormControl>
+                        <Input placeholder={t("pairing.localNodeTagPlaceholder")} {...field} />
+                      </FormControl>
+                      <FormDescription>{t("pairing.localNodeDescription")}</FormDescription>
+                      <FormMessage />
+                    </FormItem>
+
                 )}
               />
 
@@ -142,13 +142,14 @@ export function ImportPairingDialog() {
                 control={form.control}
                 name="local_endpoint"
                 render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Local Endpoint</FormLabel>
-                    <FormControl>
-                      <Input placeholder="e.g. 1.2.3.4" {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
+                    <FormItem>
+                      <FormLabel>{t("pairing.localEndpoint")}</FormLabel>
+                      <FormControl>
+                        <Input placeholder={t("pairing.localEndpointPlaceholder")} {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+
                 )}
               />
 
@@ -160,7 +161,7 @@ export function ImportPairingDialog() {
                 {importPairRequest.isPending && (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 )}
-                Import & Connect
+                {t("pairing.importConnectButton")}
               </Button>
             </form>
           </Form>
@@ -173,9 +174,9 @@ export function ImportPairingDialog() {
             {result.bidirectional && result.response_code && (
               <div className="space-y-2">
                 <div className="rounded-md bg-blue-50 p-3 text-sm text-blue-700 dark:bg-blue-900/20 dark:text-blue-400">
-                  This is a bidirectional connection. Please share the response code below with the other peer to complete the setup.
+                  {t("pairing.bidirectionalNotice")}
                 </div>
-                <label className="text-sm font-medium">Response Code</label>
+                <label className="text-sm font-medium">{t("pairing.responseCode")}</label>
                 <div className="flex items-center space-x-2">
                   <code className="flex-1 rounded bg-muted p-2 font-mono text-sm break-all">
                     {result.response_code}
@@ -192,7 +193,7 @@ export function ImportPairingDialog() {
             )}
 
             <Button variant="outline" className="w-full" onClick={() => setOpen(false)}>
-              Close
+              {t("common.close")}
             </Button>
           </div>
         )}

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -41,6 +42,7 @@ interface SubnetForm {
 }
 
 export function IngressSettings() {
+  const { t } = useTranslation();
   const { data: settings, isLoading: isLoadingSettings } = useIngressSettings();
   const { mutate: updateSettings, isPending: isUpdatingSettings } = useUpdateIngressSettings();
   const { mutate: detectIp, isPending: isDetectingIp } = useDetectIp();
@@ -117,18 +119,18 @@ export function IngressSettings() {
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>Server Settings</CardTitle>
-          <CardDescription>Configure WireGuard server endpoint and port</CardDescription>
+          <CardTitle>{t("ingress.serverSettings")}</CardTitle>
+          <CardDescription>{t("ingress.serverSettingsDesc")}</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmitSettings(onSettingsSubmit)} className="space-y-4">
             <div className="grid gap-2">
-              <Label htmlFor="serverEndpoint">Server Endpoint (Public IP/Domain)</Label>
+              <Label htmlFor="serverEndpoint">{t("ingress.serverPublicAddress")}</Label>
               <div className="flex gap-2">
                 <Input
                   id="serverEndpoint"
                   {...registerSettings("serverEndpoint")}
-                  placeholder="e.g. 203.0.113.1"
+                  placeholder={t("ingress.serverAddressPlaceholder")}
                 />
                 <Button
                   type="button"
@@ -141,7 +143,7 @@ export function IngressSettings() {
                   ) : (
                     <RefreshCw className="h-4 w-4" />
                   )}
-                  <span className="sr-only">Detect IP</span>
+                  <span className="sr-only">{t("ingress.autoDetect")}</span>
                 </Button>
               </div>
               {settingsErrors.serverEndpoint && (
@@ -150,16 +152,16 @@ export function IngressSettings() {
             </div>
 
             <div className="grid gap-2">
-              <Label>Listen Port</Label>
+              <Label>{t("ingress.listenPort")}</Label>
               <Input value={settings?.listen_port} disabled />
               <p className="text-xs text-muted-foreground">
-                Port is managed by the system configuration
+                {t("ingress.listenPortHint")}
               </p>
             </div>
 
             <Button type="submit" disabled={isUpdatingSettings}>
               {isUpdatingSettings && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Save Settings
+              {t("common.save")}
             </Button>
           </form>
         </CardContent>
@@ -167,17 +169,17 @@ export function IngressSettings() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Subnet Configuration</CardTitle>
-          <CardDescription>Configure the internal subnet for WireGuard clients</CardDescription>
+          <CardTitle>{t("ingress.subnetConfigTitle")}</CardTitle>
+          <CardDescription>{t("ingress.subnetConfigDesc")}</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmitSubnet(onSubnetSubmit)} className="space-y-4">
             <div className="grid gap-2">
-              <Label htmlFor="subnetAddress">Subnet Address (CIDR)</Label>
+              <Label htmlFor="subnetAddress">{t("ingress.subnetAddress")}</Label>
               <Input
                 id="subnetAddress"
                 {...registerSubnet("address")}
-                placeholder="e.g. 10.10.0.1/24"
+                placeholder={t("ingress.subnetAddressPlaceholder")}
               />
               {subnetErrors.address && (
                 <p className="text-sm text-destructive">{subnetErrors.address.message}</p>
@@ -190,18 +192,22 @@ export function IngressSettings() {
                 checked={watchSubnet("migratePeers")}
                 onCheckedChange={(checked) => setSubnetValue("migratePeers", checked)}
               />
-              <Label htmlFor="migratePeers">Migrate existing peers to new subnet</Label>
+              <Label htmlFor="migratePeers">{t("ingress.migratePeers")}</Label>
             </div>
 
             {subnet?.conflicts && subnet.conflicts.length > 0 && (
               <Alert variant="destructive">
                 <AlertTriangle className="h-4 w-4" />
-                <AlertTitle>IP Conflicts Detected</AlertTitle>
+                <AlertTitle>{t("ingress.subnetConflictWarning")}</AlertTitle>
                 <AlertDescription>
                   <ul className="list-disc pl-4 mt-2">
                     {subnet.conflicts.map((conflict, i) => (
                       <li key={i}>
-                        {conflict.address} used by {conflict.type} ({conflict.tag})
+                        {t("ingress.subnetConflictItem", {
+                          address: conflict.address,
+                          type: conflict.type,
+                          tag: conflict.tag,
+                        })}
                       </li>
                     ))}
                   </ul>
@@ -211,7 +217,7 @@ export function IngressSettings() {
 
             <Button type="submit" disabled={isUpdatingSubnet}>
               {isUpdatingSubnet && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Update Subnet
+              {t("common.save")}
             </Button>
           </form>
         </CardContent>
@@ -219,25 +225,25 @@ export function IngressSettings() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Default Outbound</CardTitle>
-          <CardDescription>
-            Choose which outbound interface WireGuard clients should use by default
-          </CardDescription>
+          <CardTitle>{t("ingress.defaultOutbound")}</CardTitle>
+          <CardDescription>{t("ingress.defaultOutboundHint")}</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="flex items-end gap-4">
             <div className="grid gap-2 flex-1">
-              <Label>Outbound Interface</Label>
+              <Label>{t("rules.outbound")}</Label>
               <Select
                 value={outboundData?.outbound || "null"}
                 onValueChange={(value) => setOutbound(value === "null" ? null : value)}
                 disabled={isSettingOutbound}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select outbound..." />
+                  <SelectValue placeholder={t("ingress.selectOutbound")} />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="null">Global Default ({outboundData?.global_default})</SelectItem>
+                  <SelectItem value="null">
+                    {t("ingress.globalDefault")} ({outboundData?.global_default})
+                  </SelectItem>
                   {outboundData?.available_outbounds.map((outbound) => (
                     <SelectItem key={outbound} value={outbound}>
                       {outbound}
@@ -252,7 +258,7 @@ export function IngressSettings() {
               ) : (
                 <Save className="h-4 w-4" />
               )}
-              <span className="ml-2">Saved automatically</span>
+              <span className="ml-2">{t("ingress.autoSaved")}</span>
             </Button>
           </div>
         </CardContent>

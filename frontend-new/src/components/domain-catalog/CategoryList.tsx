@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Input } from "../ui/input";
 import { CategoryCard } from "./CategoryCard";
 import { AddCatalogRuleDialog } from "./AddCatalogRuleDialog";
@@ -11,9 +12,10 @@ interface CategoryListProps {
 }
 
 export function CategoryList({ categories, type }: CategoryListProps) {
+  const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<any>(null);
-  
+
   const createDomainRule = useCreateQuickRule();
   const createIpRule = useCreateIpQuickRule();
 
@@ -25,6 +27,14 @@ export function CategoryList({ categories, type }: CategoryListProps) {
       cat.id?.toLowerCase().includes(term)
     );
   });
+
+  const searchPlaceholder =
+    type === "domain" ? t("catalog.searchDomainLists") : t("catalog.searchCountries");
+  const actionLabel =
+    type === "domain" ? t("catalog.createRule") : t("catalog.createIpRule");
+  const emptyMessage = search
+    ? t("catalog.noCategories", { search })
+    : t("common.noData");
 
   const handleAddRule = (outbound: string, tag: string) => {
     if (!selectedCategory) return;
@@ -55,7 +65,7 @@ export function CategoryList({ categories, type }: CategoryListProps) {
         <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
         <Input
           type="search"
-          placeholder={`Search ${type} categories...`}
+          placeholder={searchPlaceholder}
           className="pl-8"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -71,12 +81,13 @@ export function CategoryList({ categories, type }: CategoryListProps) {
             description={cat.description}
             count={cat.rule_count} // Assuming API returns this if configured
             lists={cat.lists}
+            actionLabel={actionLabel}
             onAdd={() => setSelectedCategory(cat)}
           />
         ))}
         {filteredCategories.length === 0 && (
           <div className="col-span-full text-center py-8 text-muted-foreground">
-            No categories found matching "{search}"
+            {emptyMessage}
           </div>
         )}
       </div>
