@@ -69,37 +69,9 @@ RUN BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && \
     ls -lh /xray
 
 # ==========================================
-# Stage 2: Build sing-box with v2ray_api
-# ==========================================
-# Phase 3: Removed usque-downloader stage (MASQUE deprecated)
-FROM golang:1.23-bookworm AS singbox-builder
-
-ARG SINGBOX_VERSION=1.12.13
-
-RUN set -eux; \
-    for file in /etc/apt/sources.list \
-        /etc/apt/sources.list.d/debian.sources; do \
-        if [ -f "$file" ]; then \
-            sed -i 's|http://|https://|g' "$file"; \
-        fi; \
-    done
-
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /src
-RUN git clone --depth 1 --branch v${SINGBOX_VERSION} https://github.com/SagerNet/sing-box.git .
-
-# Build with all required tags including v2ray_api
-# CGO_ENABLED=0 for static linking
-RUN CGO_ENABLED=0 go build -v -trimpath -ldflags "-s -w -buildid=" \
-    -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api" \
-    -o /sing-box ./cmd/sing-box
-
-# ==========================================
-# Stage 4: Build rust-router
+# Stage 2: Build rust-router
 # ==========================================
 # High-performance Rust data plane for TPROXY transparent proxying
-# [Phase 4] Replaces sing-box as primary router (Final score: 9.01/10)
 # - p99 latency: 2.775μs (360x better than target)
 # - Throughput: 50.7M ops/s (50x better than target)
 # - 720+ tests passing with 100% pass rate
@@ -218,9 +190,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
 
-# Copy sing-box binary built from source (with v2ray_api support)
-COPY --from=singbox-builder /sing-box /usr/local/bin/sing-box
-RUN chmod +x /usr/local/bin/sing-box
+# NOTE: sing-box removed - replaced by rust-router for all routing/WireGuard
 
 # Copy xray-lite binary (minimized Xray: VLESS + XHTTP + REALITY only)
 # [Phase XL] ~5.7MB vs ~25MB official Xray binary (77% size reduction)
@@ -229,7 +199,7 @@ RUN chmod +x /usr/local/bin/xray
 
 # Phase 3: Removed usque binary (MASQUE deprecated, WireGuard-only via rust-router)
 
-# Copy rust-router binary (primary data plane, replaces sing-box)
+# Copy rust-router binary (primary data plane)
 # [Phase 4] Binary size: ~3.1 MB, LTO optimized, stripped
 COPY --from=rust-router-builder /build/target/release/rust-router /usr/local/bin/rust-router
 RUN chmod +x /usr/local/bin/rust-router && \
@@ -259,7 +229,7 @@ COPY config/geoip /opt/default-config/geoip
 RUN mkdir -p /opt/pia/ca
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY scripts/fetch-geodata.sh /usr/local/bin/fetch-geodata.sh
-COPY scripts/render_singbox.py /usr/local/bin/render_singbox.py
+# NOTE: render_singbox.py removed - sing-box replaced by rust-router
 COPY scripts/pia/pia_provision.py /usr/local/bin/pia_provision.py
 COPY scripts/api_server.py /usr/local/bin/api_server.py
 COPY scripts/db_helper.py /usr/local/bin/db_helper.py
@@ -276,7 +246,7 @@ COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
 COPY scripts/v2ray_stats_client.py /usr/local/bin/v2ray_stats_client.py
 COPY scripts/v2ray_uri_parser.py /usr/local/bin/v2ray_uri_parser.py
 COPY scripts/key_manager.py /usr/local/bin/key_manager.py
-COPY scripts/ecmp_manager.py /usr/local/bin/ecmp_manager.py
+# NOTE: ecmp_manager.py removed - rust-router handles ECMP internally
 COPY scripts/health_checker.py /usr/local/bin/health_checker.py
 COPY scripts/peer_tunnel_manager.py /usr/local/bin/peer_tunnel_manager.py
 # Phase 11: Multi-node peering scripts
@@ -292,12 +262,12 @@ COPY scripts/render_routing_config.py /usr/local/bin/render_routing_config.py
 COPY scripts/watchdog.py /usr/local/bin/watchdog.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
-    /usr/local/bin/render_singbox.py /usr/local/bin/pia_provision.py \
+    /usr/local/bin/pia_provision.py \
     /usr/local/bin/api_server.py /usr/local/bin/init_user_db.py \
     /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
     /usr/local/bin/xray_manager.py \
     /usr/local/bin/xray_egress_manager.py /usr/local/bin/xray_peer_inbound_manager.py \
-    /usr/local/bin/warp_endpoint_optimizer.py /usr/local/bin/ecmp_manager.py \
+    /usr/local/bin/warp_endpoint_optimizer.py \
     /usr/local/bin/health_checker.py /usr/local/bin/peer_tunnel_manager.py \
     /usr/local/bin/dscp_manager.py /usr/local/bin/relay_config_manager.py \
     /usr/local/bin/peer_pairing.py /usr/local/bin/tunnel_api_client.py \
@@ -320,4 +290,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/api/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["sing-box", "run", "-c", "/etc/sing-box/sing-box.json"]
+# NOTE: sing-box removed - entrypoint.sh starts rust-router directly
+CMD []

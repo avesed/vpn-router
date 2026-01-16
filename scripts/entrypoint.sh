@@ -288,13 +288,11 @@ fi
 # ECMP and Chain Routes
 # ============================================================================
 
+# NOTE: sync_ecmp_routes removed - kernel ECMP routes no longer needed.
+# rust-router handles load balancing internally with userspace WireGuard.
 sync_ecmp_routes() {
-  echo "[entrypoint] syncing ECMP routes for outbound groups"
-  if python3 /usr/local/bin/ecmp_manager.py --sync-all 2>/dev/null; then
-    echo "[entrypoint] ECMP routes synced successfully"
-  else
-    echo "[entrypoint] warning: ECMP route sync failed or no groups configured"
-  fi
+  # Legacy function - now a no-op since rust-router handles ECMP internally
+  echo "[entrypoint] ECMP routes managed by rust-router (userspace mode)"
 }
 
 sync_chain_routes() {
@@ -600,14 +598,9 @@ if [ -n "${PIA_USERNAME:-}" ] && [ -n "${PIA_PASSWORD:-}" ]; then
   fi
 fi
 
-# Render sing-box config (for legacy compatibility)
-export SING_BOX_BASE_CONFIG="${BASE_CONFIG_PATH}"
-export SING_BOX_GENERATED_CONFIG="${GENERATED_CONFIG_PATH}"
-echo "[entrypoint] rendering sing-box config"
-if ! python3 /usr/local/bin/render_singbox.py; then
-  echo "[entrypoint] render sing-box config failed" >&2
-  exit 1
-fi
+# NOTE: render_singbox.py removed - sing-box is no longer used.
+# rust-router handles all routing and WireGuard tunnels in userspace.
+# The sing-box.generated.json file is no longer needed.
 
 # Generate rust-router config
 echo "[entrypoint] rendering rust-router config"

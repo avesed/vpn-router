@@ -3436,13 +3436,13 @@ def api_create_profile(payload: ProfileCreateRequest):
             "SING_BOX_GENERATED_CONFIG": str(generated_config),
         })
         provision_script = ENTRY_DIR / "pia_provision.py"
-        render_script = ENTRY_DIR / "render_singbox.py"
+        # NOTE: render_singbox.py removed - sing-box is no longer used.
 
         try:
             run_command(["python3", str(provision_script)], env=env)
             # 同步内核 WireGuard 接口
             wg_sync_status = _sync_kernel_wg_egress()
-            run_command(["python3", str(render_script)], env=env)
+            # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
             reload_result = reload_singbox()
             provision_result = {"success": True, "reload": reload_result, "wg_sync": wg_sync_status}
         except Exception as exc:
@@ -4121,21 +4121,21 @@ def api_pia_login(payload: PiaLoginRequest):
         }
     )
     provision_script = ENTRY_DIR / "pia_provision.py"
-    render_script = ENTRY_DIR / "render_singbox.py"
+    # NOTE: render_singbox.py removed - sing-box is no longer used.
     run_command(["python3", str(provision_script)], env=env)
 
     if payload.regenerate_config:
-        run_command(["python3", str(render_script)], env=env)
-        # 自动重载 sing-box 使配置生效
+        # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
+        # Sync to rust-router instead
         reload_result = reload_singbox()
         # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
         wg_sync_msg = _sync_kernel_wg_egress()
         return {
-            "message": f"PIA 登录成功，配置已生成并重载{wg_sync_msg}",
+            "message": f"PIA 登录成功，配置已同步到 rust-router{wg_sync_msg}",
             "has_profiles": True,
             "reload": reload_result
         }
-    return {"message": "PIA 登录成功，配置已生成（未重载）", "has_profiles": True}
+    return {"message": "PIA 登录成功，配置已生成（未同步）", "has_profiles": True}
 
 
 @app.post("/api/actions/geodata")
@@ -4146,59 +4146,19 @@ def api_refresh_geodata():
 
 
 def reload_singbox() -> dict:
-    """重新加载 sing-box 配置
+    """重新加载路由配置（已迁移到 rust-router）
 
-    entrypoint.sh 现在会自动监控 sing-box 进程：
-    - 如果 sing-box 退出，entrypoint 会自动用最新配置重启它
-    - 优先使用生成的配置 (/etc/sing-box/sing-box.generated.json)
-
-    重载策略：
-    1. 先尝试 SIGHUP 热重载
-    2. 如果失败，杀掉 sing-box 让 entrypoint 重启
+    NOTE: sing-box 已被 rust-router 取代。此函数现在通过 IPC 同步配置到 rust-router。
+    保留函数名以保持 API 兼容性。
     """
-    generated_config = Path("/etc/sing-box/sing-box.generated.json")
-
     try:
-        # 检查生成的配置是否存在
-        if not generated_config.exists():
-            return {"success": False, "message": "生成的配置文件不存在，请先登录 PIA"}
-
-        # 验证配置文件语法
-        check_result = subprocess.run(
-            ["sing-box", "check", "-c", str(generated_config)],
-            capture_output=True,
-            text=True,
-        )
-        if check_result.returncode != 0:
-            return {"success": False, "message": f"配置文件语法错误: {check_result.stderr}"}
-
-        # 检查 sing-box 是否正在运行
-        if not list_processes("sing-box"):
-            # sing-box 未运行，entrypoint 应该会自动启动
-            # 等待几秒看是否启动
-            time.sleep(3)
-            if list_processes("sing-box"):
-                return {"success": True, "message": "sing-box 已由 entrypoint 启动", "method": "auto"}
-            return {"success": False, "message": "sing-box 未运行，请检查容器状态"}
-
-        # 尝试 SIGHUP 热重载 (sing-box 使用 generated_config 启动，会重新加载该文件)
-        result = subprocess.run(
-            ["pkill", "-HUP", "sing-box"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            time.sleep(1)
-            if list_processes("sing-box"):
-                return {"success": True, "message": "sing-box 配置已重新加载", "method": "SIGHUP"}
-
-        # SIGHUP 失败，杀掉进程让 entrypoint 自动重启
-        subprocess.run(["pkill", "sing-box"], capture_output=True)
-        time.sleep(3)  # 等待 entrypoint 重启 sing-box
-
-        if list_processes("sing-box"):
-            return {"success": True, "message": "sing-box 已重启", "method": "restart"}
-        return {"success": False, "message": "sing-box 重启失败，请检查容器日志"}
+        # 同步规则到 rust-router
+        sync_msg = _sync_rules_to_rust_router()
+        return {
+            "success": True, 
+            "message": "配置已同步到 rust-router" + sync_msg,
+            "method": "rust-router-ipc"
+        }
     except Exception as exc:
         return {"success": False, "message": str(exc)}
 
@@ -4286,12 +4246,12 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
     })
 
     provision_script = ENTRY_DIR / "pia_provision.py"
-    render_script = ENTRY_DIR / "render_singbox.py"
+    # NOTE: render_singbox.py removed - sing-box is no longer used.
 
     try:
         # 只重连指定的 profile
         run_command(["python3", str(provision_script), "--profile", profile_key], env=env)
-        run_command(["python3", str(render_script)], env=env)
+        # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
         reload_result = reload_singbox()
         
         # 先删除旧隧道，再同步新配置（endpoint 可能已变化）
@@ -7559,70 +7519,42 @@ class OutboundGroupUpdate(BaseModel):
 
 
 def _sync_ecmp_for_group(group: Dict) -> str:
-    """同步单个出口组的 ECMP 路由
+    """同步单个出口组的 ECMP 路由（已废弃）
+
+    NOTE: rust-router 在用户态处理负载均衡，不再需要内核 ECMP 路由。
+    此函数保留用于 API 兼容性，但现在是空操作。
 
     Returns:
         状态消息
     """
-    try:
-        from ecmp_manager import sync_group
-        db = _get_db()
-        if sync_group(db, group):
-            return ", ecmp synced"
-        else:
-            return ", ecmp sync failed"
-    except ImportError:
-        return ", ecmp_manager not available"
-    except Exception as e:
-        print(f"[api] ECMP sync failed: {e}")
-        return f", ecmp sync failed: {e}"
+    # rust-router 内部处理 ECMP，不需要内核路由
+    return ""
 
 
 def _teardown_ecmp_for_group(tag: str) -> str:
-    """删除出口组的 ECMP 路由
+    """删除出口组的 ECMP 路由（已废弃）
+
+    NOTE: rust-router 在用户态处理负载均衡，不再需要内核 ECMP 路由。
+    此函数保留用于 API 兼容性，但现在是空操作。
 
     Returns:
         状态消息
     """
-    try:
-        from ecmp_manager import teardown_group
-        db = _get_db()
-        if teardown_group(db, tag):
-            return ", ecmp removed"
-        else:
-            return ", ecmp removal failed"
-    except ImportError:
-        return ", ecmp_manager not available"
-    except Exception as e:
-        print(f"[api] ECMP teardown failed: {e}")
-        return f", ecmp teardown failed: {e}"
+    # rust-router 内部处理 ECMP，不需要内核路由
+    return ""
 
 
 def _sync_all_ecmp_groups() -> str:
-    """同步所有出口组的 ECMP 路由和 SNAT 规则
+    """同步所有出口组的 ECMP 路由（已废弃）
 
-    当 WireGuard 出口重新连接后，peer_ip 可能改变，需要更新 SNAT 规则。
+    NOTE: rust-router 在用户态处理负载均衡，不再需要内核 ECMP 路由。
+    此函数保留用于 API 兼容性，但现在是空操作。
 
     Returns:
         状态消息
     """
-    try:
-        from ecmp_manager import sync_all_groups
-        db = _get_db()
-        results = sync_all_groups(db)
-        success_count = sum(1 for v in results.values() if v)
-        total_count = len(results)
-        if total_count == 0:
-            return ""
-        if success_count == total_count:
-            return f", {total_count} ecmp group(s) synced"
-        else:
-            return f", {success_count}/{total_count} ecmp group(s) synced"
-    except ImportError:
-        return ""
-    except Exception as e:
-        print(f"[api] ECMP sync all failed: {e}")
-        return f", ecmp sync failed: {e}"
+    # rust-router 内部处理 ECMP，不需要内核路由
+    return ""
 
 
 @app.get("/api/outbound-groups")
@@ -9235,13 +9167,32 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
     elif tag in ("block", "adblock"):
         return {"success": False, "speed_mbps": 0, "message": "Block egress, cannot test speed"}
     else:
-        # WireGuard/PIA：使用测速专用 SOCKS 端口
+        # WireGuard/PIA egresses: check if managed by rust-router (userspace)
+        # NOTE: sing-box SOCKS speedtest ports are no longer available.
+        # rust-router uses userspace WireGuard without kernel interfaces,
+        # so curl cannot bind to an interface for speedtest.
+        # 
+        # For now, return a message indicating speedtest is not available.
+        # Future: implement speedtest via rust-router HTTP API or TUN interface.
+        if HAS_DATABASE:
+            db = _get_db()
+            # Check if this is a PIA or custom WireGuard egress
+            pia_profile = db.get_pia_profile_by_tag(tag)
+            custom_wg = db.get_custom_wg_egress(tag)
+            if pia_profile or custom_wg:
+                return {
+                    "success": False, 
+                    "speed_mbps": 0, 
+                    "message": "Speed test not available for userspace WireGuard egresses"
+                }
+        
+        # Fallback: try legacy SOCKS port (for backward compatibility)
         socks_port = _get_speedtest_socks_port(tag)
         if socks_port:
             curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
             proxy_info = f"SOCKS5 :{socks_port}"
         else:
-            return {"success": False, "speed_mbps": 0, "message": "Speed test port not configured, restart container"}
+            return {"success": False, "speed_mbps": 0, "message": "Speed test not available for this egress type"}
 
     curl_cmd.append(test_url)
 
@@ -9450,29 +9401,20 @@ def api_apply_adblock_rules():
 
 
 def _regenerate_and_reload():
-    """重新生成配置并重载 sing-box
+    """Sync routing config to rust-router (sing-box migration complete).
+
+    NOTE: sing-box has been replaced by rust-router. This function now just
+    syncs rules to rust-router via IPC. The render_singbox.py step is no longer needed.
 
     Raises:
-        RuntimeError: 如果配置生成或重载失败
+        RuntimeError: If sync to rust-router fails
     """
-    # 调用 render_singbox.py 重新生成配置
-    result = subprocess.run(
-        ["python3", str(ENTRY_DIR / "render_singbox.py")],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        error_msg = f"配置生成失败: {result.stderr.strip() or result.stdout.strip()}"
-        print(f"[api] render_singbox.py 失败: {result.stderr}")
-        raise RuntimeError(error_msg)
-
-    print(f"[api] render_singbox.py 成功")
-
-    # 重载 sing-box
+    # NOTE: render_singbox.py removed - sing-box is no longer used.
+    # Just sync rules to rust-router via IPC.
     reload_result = reload_singbox()
     if not reload_result.get("success"):
         error_msg = reload_result.get("message", "未知错误")
-        raise RuntimeError(f"配置重载失败: {error_msg}")
+        raise RuntimeError(f"配置同步失败: {error_msg}")
 
 
 def _sync_rules_to_rust_router(db=None) -> str:

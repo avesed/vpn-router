@@ -931,7 +931,9 @@ impl UserspaceWgTunnel {
 
         // Allocate buffer for encrypted packet
         // WG_TRANSPORT_OVERHEAD (32 bytes) includes the Poly1305 tag (16 bytes)
-        let mut dst = vec![0u8; packet_to_send.len() + WG_TRANSPORT_OVERHEAD];
+        // Buffer must be at least WG_HANDSHAKE_INIT_SIZE (148 bytes) to hold handshake
+        // messages that boringtun may generate during rekey
+        let mut dst = vec![0u8; (packet_to_send.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
 
         // Encapsulate packet
         let result = {
@@ -2366,7 +2368,9 @@ impl WgTunnel for UserspaceWgTunnel {
         }
 
         // Allocate buffer for encrypted packet
-        let mut dst = vec![0u8; payload.len() + WG_TRANSPORT_OVERHEAD];
+        // Buffer must be at least WG_HANDSHAKE_INIT_SIZE (148 bytes) to hold handshake
+        // messages that boringtun may generate during rekey
+        let mut dst = vec![0u8; (payload.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
 
         // Encapsulate packet
         let result = {
