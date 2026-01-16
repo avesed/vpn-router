@@ -73,12 +73,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use dashmap::DashMap;
 use ipnet::IpNet;
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -276,6 +277,33 @@ struct TunnelShared {
     #[cfg(feature = "handshake_retry")]
     handshake_tracker: HandshakeTracker,
 
+    /// NAT table for SNAT/DNAT when tunnel has local_ip configured
+    /// Key: (protocol, remote_ip, remote_port, local_port) -> original source IP
+    /// Used to restore original destination IP on incoming packets
+    nat_table: DashMap<NatKey, NatEntry>,
+}
+
+/// Key for NAT table lookup
+/// Uses connection tuple to avoid collisions between different clients
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NatKey {
+    /// IP protocol (6=TCP, 17=UDP, 1=ICMP)
+    protocol: u8,
+    /// Remote IP address (destination on outgoing, source on incoming)
+    remote_ip: IpAddr,
+    /// Remote port (destination port on outgoing, source port on incoming)
+    remote_port: u16,
+    /// Local port (source port on outgoing, destination port on incoming)
+    local_port: u16,
+}
+
+/// NAT table entry tracking original source IP
+#[derive(Clone, Debug)]
+struct NatEntry {
+    /// Original source IP before SNAT
+    original_src_ip: IpAddr,
+    /// When this entry was created (for cleanup)
+    created_at: Instant,
 }
 
 /// Internal statistics tracking
@@ -513,6 +541,7 @@ impl UserspaceWgTunnel {
             peer_state: RwLock::new(Some(Arc::new(peer_state))),
             #[cfg(feature = "handshake_retry")]
             handshake_tracker: HandshakeTracker::new(HandshakeConfig::from_env()),
+            nat_table: DashMap::new(),
         });
 
         // Create or use provided buffer pool (H1 fix)
@@ -835,6 +864,63 @@ impl UserspaceWgTunnel {
             return Err(WgTunnelError::NotConnected);
         }
 
+        // Check if SNAT is needed (tunnel has a local_ip configured)
+        let packet_to_send: std::borrow::Cow<'_, [u8]> = if let Some(ref local_ip_str) = self.config.local_ip {
+            // Parse the tunnel's local IP (strip CIDR suffix like /32 if present)
+            if let Some(tunnel_ip) = parse_ip_strip_cidr(local_ip_str) {
+                // Extract full connection tuple for NAT tracking
+                if let Some(tuple) = extract_connection_tuple(packet) {
+                    // Only SNAT if source IP differs from tunnel IP
+                    if tuple.src_ip != tunnel_ip {
+                        // Rewrite source IP to tunnel's local IP
+                        if let Some(rewritten) = rewrite_source_ip(packet, tunnel_ip) {
+                            // Only record NAT mapping AFTER successful rewrite
+                            // Key uses connection tuple to avoid collisions between clients
+                            let nat_key = NatKey {
+                                protocol: tuple.protocol,
+                                remote_ip: tuple.dst_ip,
+                                remote_port: tuple.dst_port,
+                                local_port: tuple.src_port,
+                            };
+                            self.shared.nat_table.insert(nat_key, NatEntry {
+                                original_src_ip: tuple.src_ip,
+                                created_at: Instant::now(),
+                            });
+                            
+                            debug!(
+                                "Tunnel {} SNAT: {} -> {} (proto={}, {}:{} -> {}:{})",
+                                self.tag, tuple.src_ip, tunnel_ip, tuple.protocol,
+                                tuple.src_ip, tuple.src_port, tuple.dst_ip, tuple.dst_port
+                            );
+                            std::borrow::Cow::Owned(rewritten)
+                        } else {
+                            warn!("Tunnel {} failed to rewrite source IP", self.tag);
+                            std::borrow::Cow::Borrowed(packet)
+                        }
+                    } else {
+                        std::borrow::Cow::Borrowed(packet)
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(packet)
+                }
+            } else {
+                std::borrow::Cow::Borrowed(packet)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(packet)
+        };
+
+        // Log packet details for debugging (after potential SNAT)
+        if let Some(src_ip) = extract_source_ip(&packet_to_send) {
+            debug!(
+                "Tunnel {} send: {} bytes, src_ip={}, tunnel_local_ip={:?}",
+                self.tag,
+                packet_to_send.len(),
+                src_ip,
+                self.config.local_ip
+            );
+        }
+
         let socket = self
             .shared
             .socket
@@ -845,7 +931,7 @@ impl UserspaceWgTunnel {
 
         // Allocate buffer for encrypted packet
         // WG_TRANSPORT_OVERHEAD (32 bytes) includes the Poly1305 tag (16 bytes)
-        let mut dst = vec![0u8; packet.len() + WG_TRANSPORT_OVERHEAD];
+        let mut dst = vec![0u8; packet_to_send.len() + WG_TRANSPORT_OVERHEAD];
 
         // Encapsulate packet
         let result = {
@@ -853,7 +939,7 @@ impl UserspaceWgTunnel {
             let tunn = tunn_guard
                 .as_mut()
                 .ok_or(WgTunnelError::NotConnected)?;
-            tunn.encapsulate(packet, &mut dst)
+            tunn.encapsulate(&packet_to_send, &mut dst)
         };
 
         // Process result
@@ -868,10 +954,10 @@ impl UserspaceWgTunnel {
                 self.shared
                     .stats
                     .tx_bytes
-                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    .fetch_add(packet_to_send.len() as u64, Ordering::Relaxed);
                 self.shared.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
 
-                trace!("Sent {} bytes through tunnel", packet.len());
+                trace!("Sent {} bytes through tunnel", packet_to_send.len());
                 Ok(())
             }
             TunnResult::Done => {
@@ -1221,14 +1307,16 @@ async fn run_background_task(
             result = socket.recv_from(&mut recv_buf) => {
                 match result {
                     Ok((len, src_addr)) => {
+                        // Log received UDP packets at trace level
+                        trace!("UDP recv: {} bytes from {} (expecting {})", len, src_addr, peer_addr);
+                        
                         if !shared.connected.load(Ordering::Acquire) {
                             break;
                         }
 
                         // Validate source address matches expected peer
-                        // (basic security check - only accept packets from our peer)
                         if src_addr != peer_addr {
-                            trace!("Ignoring packet from unexpected source: {} (expected {})", src_addr, peer_addr);
+                            warn!("Ignoring packet from unexpected source: {} (expected {})", src_addr, peer_addr);
                             continue;
                         }
 
@@ -1237,6 +1325,18 @@ async fn run_background_task(
                             let mut tunn_guard = shared.tunn.lock();
                             tunn_guard.as_mut().map(|tunn| tunn.decapsulate(None, &recv_buf[..len], &mut dst_buf))
                         };
+
+                        if let Some(ref result) = process_result {
+                            // Log decapsulate result at trace level
+                            let result_type = match result {
+                                TunnResult::WriteToTunnelV4(data, _) => format!("WriteToTunnelV4({} bytes)", data.len()),
+                                TunnResult::WriteToTunnelV6(data, _) => format!("WriteToTunnelV6({} bytes)", data.len()),
+                                TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
+                                TunnResult::Done => "Done".to_string(),
+                                TunnResult::Err(e) => format!("Err({:?})", e),
+                            };
+                            trace!("Decapsulate: {} bytes -> {}", len, result_type);
+                        }
 
                         if let Some(result) = process_result {
                             handle_decapsulate_result(
@@ -1301,6 +1401,489 @@ fn is_ip_allowed(ip: IpAddr, allowed_ips: &[IpNet]) -> bool {
     allowed_ips.iter().any(|net| net.contains(&ip))
 }
 
+/// Extract destination IP address from an IP packet
+#[allow(dead_code)]
+fn extract_dest_ip(packet: &[u8]) -> Option<IpAddr> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    match version {
+        4 => {
+            // IPv4: minimum header is 20 bytes, dest IP at bytes 16-19
+            if packet.len() < 20 {
+                return None;
+            }
+            let dst_bytes: [u8; 4] = packet[16..20].try_into().ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(dst_bytes)))
+        }
+        6 => {
+            // IPv6: minimum header is 40 bytes, dest IP at bytes 24-39
+            if packet.len() < 40 {
+                return None;
+            }
+            let dst_bytes: [u8; 16] = packet[24..40].try_into().ok()?;
+            Some(IpAddr::V6(Ipv6Addr::from(dst_bytes)))
+        }
+        _ => None,
+    }
+}
+
+/// Extract protocol and source port from an IP packet
+/// Returns (protocol, src_port) or None if packet is malformed
+#[allow(dead_code)]
+fn extract_protocol_and_src_port(packet: &[u8]) -> Option<(u8, u16)> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    match version {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let protocol = packet[9];
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            
+            match protocol {
+                6 | 17 => {
+                    // TCP or UDP: src port is first 2 bytes after IP header
+                    if packet.len() < ihl + 2 {
+                        return None;
+                    }
+                    let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+                    Some((protocol, src_port))
+                }
+                1 => {
+                    // ICMP: use identifier as "port" (bytes 4-5 of ICMP header)
+                    if packet.len() < ihl + 6 {
+                        return None;
+                    }
+                    let icmp_id = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]);
+                    Some((protocol, icmp_id))
+                }
+                _ => Some((protocol, 0)),
+            }
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let protocol = packet[6]; // Next Header
+            
+            match protocol {
+                6 | 17 => {
+                    // TCP or UDP: src port is first 2 bytes after IPv6 header
+                    if packet.len() < 42 {
+                        return None;
+                    }
+                    let src_port = u16::from_be_bytes([packet[40], packet[41]]);
+                    Some((protocol, src_port))
+                }
+                58 => {
+                    // ICMPv6: use identifier as "port"
+                    if packet.len() < 46 {
+                        return None;
+                    }
+                    let icmp_id = u16::from_be_bytes([packet[44], packet[45]]);
+                    Some((protocol, icmp_id))
+                }
+                _ => Some((protocol, 0)),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract protocol and destination port from an IP packet
+#[allow(dead_code)]
+fn extract_protocol_and_dst_port(packet: &[u8]) -> Option<(u8, u16)> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    match version {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let protocol = packet[9];
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            
+            match protocol {
+                6 | 17 => {
+                    // TCP or UDP: dst port is bytes 2-3 after IP header
+                    if packet.len() < ihl + 4 {
+                        return None;
+                    }
+                    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+                    Some((protocol, dst_port))
+                }
+                1 => {
+                    // ICMP: use identifier as "port"
+                    if packet.len() < ihl + 6 {
+                        return None;
+                    }
+                    let icmp_id = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]);
+                    Some((protocol, icmp_id))
+                }
+                _ => Some((protocol, 0)),
+            }
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let protocol = packet[6];
+            
+            match protocol {
+                6 | 17 => {
+                    // TCP or UDP: dst port is bytes 2-3 after IPv6 header
+                    if packet.len() < 44 {
+                        return None;
+                    }
+                    let dst_port = u16::from_be_bytes([packet[42], packet[43]]);
+                    Some((protocol, dst_port))
+                }
+                58 => {
+                    // ICMPv6: use identifier
+                    if packet.len() < 46 {
+                        return None;
+                    }
+                    let icmp_id = u16::from_be_bytes([packet[44], packet[45]]);
+                    Some((protocol, icmp_id))
+                }
+                _ => Some((protocol, 0)),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Connection tuple for NAT tracking
+#[derive(Clone, Copy, Debug)]
+struct ConnectionTuple {
+    protocol: u8,
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
+}
+
+/// Extract full connection tuple from an IP packet
+/// Returns (protocol, src_ip, src_port, dst_ip, dst_port) for TCP/UDP/ICMP
+fn extract_connection_tuple(packet: &[u8]) -> Option<ConnectionTuple> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    match version {
+        4 => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let ihl = (packet[0] & 0x0f) as usize * 4;
+            // Validate IHL (minimum 20 bytes, maximum packet length)
+            if ihl < 20 || packet.len() < ihl {
+                return None;
+            }
+            
+            let protocol = packet[9];
+            let src_ip = IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&packet[12..16]).ok()?));
+            let dst_ip = IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&packet[16..20]).ok()?));
+            
+            let (src_port, dst_port) = match protocol {
+                6 | 17 => {
+                    // TCP or UDP
+                    if packet.len() < ihl + 4 {
+                        return None;
+                    }
+                    let sp = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+                    let dp = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+                    (sp, dp)
+                }
+                1 => {
+                    // ICMP: use identifier as both "ports"
+                    if packet.len() < ihl + 6 {
+                        return None;
+                    }
+                    let id = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]);
+                    (id, id)
+                }
+                _ => (0, 0),
+            };
+            
+            Some(ConnectionTuple { protocol, src_ip, src_port, dst_ip, dst_port })
+        }
+        6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let protocol = packet[6]; // Next Header (simplified, doesn't handle extension headers)
+            let src_ip = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?));
+            let dst_ip = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?));
+            
+            let (src_port, dst_port) = match protocol {
+                6 | 17 => {
+                    // TCP or UDP
+                    if packet.len() < 44 {
+                        return None;
+                    }
+                    let sp = u16::from_be_bytes([packet[40], packet[41]]);
+                    let dp = u16::from_be_bytes([packet[42], packet[43]]);
+                    (sp, dp)
+                }
+                58 => {
+                    // ICMPv6
+                    if packet.len() < 46 {
+                        return None;
+                    }
+                    let id = u16::from_be_bytes([packet[44], packet[45]]);
+                    (id, id)
+                }
+                _ => (0, 0),
+            };
+            
+            Some(ConnectionTuple { protocol, src_ip, src_port, dst_ip, dst_port })
+        }
+        _ => None,
+    }
+}
+
+/// Parse IP address from string, stripping optional CIDR suffix
+fn parse_ip_strip_cidr(s: &str) -> Option<IpAddr> {
+    // Strip CIDR suffix if present (e.g., "10.0.0.1/32" -> "10.0.0.1")
+    let ip_str = s.split('/').next()?;
+    ip_str.parse().ok()
+}
+
+/// Rewrite source IP in a packet and update checksums
+/// Returns the modified packet or None if rewriting failed
+fn rewrite_source_ip(packet: &[u8], new_src_ip: IpAddr) -> Option<Vec<u8>> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    let mut modified = packet.to_vec();
+
+    match (version, new_src_ip) {
+        (4, IpAddr::V4(new_ip)) => {
+            if modified.len() < 20 {
+                return None;
+            }
+            // Get old source IP for checksum delta
+            let old_src: [u8; 4] = modified[12..16].try_into().ok()?;
+            let new_src = new_ip.octets();
+            
+            // Rewrite source IP at bytes 12-15
+            modified[12..16].copy_from_slice(&new_src);
+            
+            // Update IP header checksum
+            update_ipv4_checksum(&mut modified, &old_src, &new_src);
+            
+            // Update transport layer checksum (TCP/UDP use pseudo-header)
+            let protocol = modified[9];
+            let ihl = (modified[0] & 0x0f) as usize * 4;
+            update_transport_checksum(&mut modified, ihl, protocol, &old_src, &new_src, true);
+            
+            Some(modified)
+        }
+        (6, IpAddr::V6(new_ip)) => {
+            if modified.len() < 40 {
+                return None;
+            }
+            // Get old source IP for checksum delta  
+            let old_src: [u8; 16] = modified[8..24].try_into().ok()?;
+            let new_src = new_ip.octets();
+            
+            // Rewrite source IP at bytes 8-23
+            modified[8..24].copy_from_slice(&new_src);
+            
+            // Update transport layer checksum
+            let protocol = modified[6];
+            update_transport_checksum_v6(&mut modified, 40, protocol, &old_src, &new_src, true);
+            
+            Some(modified)
+        }
+        _ => None, // Version mismatch
+    }
+}
+
+/// Rewrite destination IP in a packet and update checksums
+fn rewrite_dest_ip(packet: &[u8], new_dst_ip: IpAddr) -> Option<Vec<u8>> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let version = packet[0] >> 4;
+    let mut modified = packet.to_vec();
+
+    match (version, new_dst_ip) {
+        (4, IpAddr::V4(new_ip)) => {
+            if modified.len() < 20 {
+                return None;
+            }
+            // Get old dest IP for checksum delta
+            let old_dst: [u8; 4] = modified[16..20].try_into().ok()?;
+            let new_dst = new_ip.octets();
+            
+            // Rewrite dest IP at bytes 16-19
+            modified[16..20].copy_from_slice(&new_dst);
+            
+            // Update IP header checksum
+            update_ipv4_checksum(&mut modified, &old_dst, &new_dst);
+            
+            // Update transport layer checksum
+            let protocol = modified[9];
+            let ihl = (modified[0] & 0x0f) as usize * 4;
+            update_transport_checksum(&mut modified, ihl, protocol, &old_dst, &new_dst, false);
+            
+            Some(modified)
+        }
+        (6, IpAddr::V6(new_ip)) => {
+            if modified.len() < 40 {
+                return None;
+            }
+            // Get old dest IP
+            let old_dst: [u8; 16] = modified[24..40].try_into().ok()?;
+            let new_dst = new_ip.octets();
+            
+            // Rewrite dest IP at bytes 24-39
+            modified[24..40].copy_from_slice(&new_dst);
+            
+            // Update transport layer checksum
+            let protocol = modified[6];
+            update_transport_checksum_v6(&mut modified, 40, protocol, &old_dst, &new_dst, false);
+            
+            Some(modified)
+        }
+        _ => None,
+    }
+}
+
+/// Update IPv4 header checksum using incremental update
+/// Based on RFC 1624: only recomputes the delta from changed bytes
+fn update_ipv4_checksum(packet: &mut [u8], old_bytes: &[u8; 4], new_bytes: &[u8; 4]) {
+    if packet.len() < 20 {
+        return;
+    }
+    
+    // Get current checksum
+    let old_check = u16::from_be_bytes([packet[10], packet[11]]);
+    
+    // Calculate checksum delta using one's complement arithmetic
+    let mut delta: i32 = 0;
+    
+    // Subtract old values, add new values (in 16-bit chunks)
+    delta -= u16::from_be_bytes([old_bytes[0], old_bytes[1]]) as i32;
+    delta -= u16::from_be_bytes([old_bytes[2], old_bytes[3]]) as i32;
+    delta += u16::from_be_bytes([new_bytes[0], new_bytes[1]]) as i32;
+    delta += u16::from_be_bytes([new_bytes[2], new_bytes[3]]) as i32;
+    
+    // Apply delta to old checksum (using one's complement)
+    let mut new_check = (!old_check as i32) + delta;
+    
+    // Fold carry bits
+    while new_check >> 16 != 0 {
+        new_check = (new_check & 0xffff) + (new_check >> 16);
+    }
+    
+    let new_check = !new_check as u16;
+    packet[10..12].copy_from_slice(&new_check.to_be_bytes());
+}
+
+/// Update transport layer (TCP/UDP) checksum for IPv4
+/// is_source: true if we're updating source IP, false for dest IP
+fn update_transport_checksum(
+    packet: &mut [u8],
+    ihl: usize,
+    protocol: u8,
+    old_bytes: &[u8; 4],
+    new_bytes: &[u8; 4],
+    _is_source: bool,
+) {
+    let check_offset = match protocol {
+        6 => ihl + 16,  // TCP checksum at offset 16 in TCP header
+        17 => ihl + 6,  // UDP checksum at offset 6 in UDP header
+        _ => return,    // No checksum update for other protocols
+    };
+    
+    if packet.len() < check_offset + 2 {
+        return;
+    }
+    
+    let old_check = u16::from_be_bytes([packet[check_offset], packet[check_offset + 1]]);
+    
+    // UDP checksum of 0 means "no checksum" - don't update it
+    if protocol == 17 && old_check == 0 {
+        return;
+    }
+    
+    // Calculate delta
+    let mut delta: i32 = 0;
+    delta -= u16::from_be_bytes([old_bytes[0], old_bytes[1]]) as i32;
+    delta -= u16::from_be_bytes([old_bytes[2], old_bytes[3]]) as i32;
+    delta += u16::from_be_bytes([new_bytes[0], new_bytes[1]]) as i32;
+    delta += u16::from_be_bytes([new_bytes[2], new_bytes[3]]) as i32;
+    
+    let mut new_check = (!old_check as i32) + delta;
+    while new_check >> 16 != 0 {
+        new_check = (new_check & 0xffff) + (new_check >> 16);
+    }
+    
+    let new_check = !new_check as u16;
+    // Handle the special case where checksum becomes 0 for UDP
+    let final_check = if protocol == 17 && new_check == 0 { 0xffff } else { new_check };
+    packet[check_offset..check_offset + 2].copy_from_slice(&final_check.to_be_bytes());
+}
+
+/// Update transport layer checksum for IPv6
+fn update_transport_checksum_v6(
+    packet: &mut [u8],
+    header_len: usize,
+    protocol: u8,
+    old_bytes: &[u8; 16],
+    new_bytes: &[u8; 16],
+    _is_source: bool,
+) {
+    let check_offset = match protocol {
+        6 => header_len + 16,   // TCP
+        17 => header_len + 6,   // UDP
+        58 => header_len + 2,   // ICMPv6
+        _ => return,
+    };
+    
+    if packet.len() < check_offset + 2 {
+        return;
+    }
+    
+    let old_check = u16::from_be_bytes([packet[check_offset], packet[check_offset + 1]]);
+    
+    // Calculate delta for 16-byte address
+    let mut delta: i32 = 0;
+    for i in 0..8 {
+        delta -= u16::from_be_bytes([old_bytes[i * 2], old_bytes[i * 2 + 1]]) as i32;
+        delta += u16::from_be_bytes([new_bytes[i * 2], new_bytes[i * 2 + 1]]) as i32;
+    }
+    
+    let mut new_check = (!old_check as i32) + delta;
+    while new_check >> 16 != 0 {
+        new_check = (new_check & 0xffff) + (new_check >> 16);
+    }
+    
+    let new_check = !new_check as u16;
+    let final_check = if protocol == 17 && new_check == 0 { 0xffff } else { new_check };
+    packet[check_offset..check_offset + 2].copy_from_slice(&final_check.to_be_bytes());
+}
+
+/// NAT table entry timeout (5 minutes)
+const NAT_ENTRY_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Handle the result of decapsulating a received packet
 async fn handle_decapsulate_result(
     result: TunnResult<'_>,
@@ -1311,7 +1894,42 @@ async fn handle_decapsulate_result(
     match result {
         TunnResult::WriteToTunnelV4(data, _addr) => {
             // Decrypted IPv4 packet ready
-            let packet = data.to_vec();
+            let mut packet = data.to_vec();
+            
+            // Perform DNAT if NAT table has an entry for this packet
+            // Response packet has swapped src/dst compared to outgoing
+            // Outgoing: (proto, dst_ip, dst_port, src_port) -> original_src_ip
+            // Incoming: lookup by (proto, src_ip, src_port, dst_port)
+            if let Some(tuple) = extract_connection_tuple(&packet) {
+                let nat_key = NatKey {
+                    protocol: tuple.protocol,
+                    remote_ip: tuple.src_ip,      // Was dst_ip on outgoing
+                    remote_port: tuple.src_port,  // Was dst_port on outgoing
+                    local_port: tuple.dst_port,   // Was src_port on outgoing
+                };
+                if let Some(entry) = shared.nat_table.get(&nat_key) {
+                    // Check if entry is still valid (not expired)
+                    if entry.created_at.elapsed() < NAT_ENTRY_TIMEOUT {
+                        let original_src_ip = entry.original_src_ip;
+                        drop(entry); // Release DashMap ref before await
+                        
+                        // Rewrite destination IP back to original client IP
+                        if let Some(rewritten) = rewrite_dest_ip(&packet, original_src_ip) {
+                            debug!(
+                                "DNAT: {} -> {} (proto={}, {}:{} -> local:{})",
+                                tuple.dst_ip, original_src_ip, tuple.protocol,
+                                tuple.src_ip, tuple.src_port, tuple.dst_port
+                            );
+                            packet = rewritten;
+                        }
+                    } else {
+                        // Entry expired, remove it
+                        drop(entry);
+                        shared.nat_table.remove(&nat_key);
+                    }
+                }
+            }
+            
             let packet_len = packet.len();
 
             // C3 fix: Validate source IP against allowed_ips
@@ -1349,7 +1967,36 @@ async fn handle_decapsulate_result(
 
         TunnResult::WriteToTunnelV6(data, _addr) => {
             // Decrypted IPv6 packet ready
-            let packet = data.to_vec();
+            let mut packet = data.to_vec();
+            
+            // Perform DNAT if NAT table has an entry for this packet
+            if let Some(tuple) = extract_connection_tuple(&packet) {
+                let nat_key = NatKey {
+                    protocol: tuple.protocol,
+                    remote_ip: tuple.src_ip,
+                    remote_port: tuple.src_port,
+                    local_port: tuple.dst_port,
+                };
+                if let Some(entry) = shared.nat_table.get(&nat_key) {
+                    if entry.created_at.elapsed() < NAT_ENTRY_TIMEOUT {
+                        let original_src_ip = entry.original_src_ip;
+                        drop(entry);
+                        
+                        if let Some(rewritten) = rewrite_dest_ip(&packet, original_src_ip) {
+                            debug!(
+                                "DNAT (v6): {} -> {} (proto={}, {}:{} -> local:{})",
+                                tuple.dst_ip, original_src_ip, tuple.protocol,
+                                tuple.src_ip, tuple.src_port, tuple.dst_port
+                            );
+                            packet = rewritten;
+                        }
+                    } else {
+                        drop(entry);
+                        shared.nat_table.remove(&nat_key);
+                    }
+                }
+            }
+            
             let packet_len = packet.len();
 
             // C3 fix: Validate source IP against allowed_ips
