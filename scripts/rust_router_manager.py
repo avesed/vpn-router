@@ -836,15 +836,16 @@ class RustRouterManager:
                 for profile in db.get_pia_profiles(enabled_only=True):
                     tag = profile.get("name", "")
                     private_key = profile.get("private_key")
-                    peer_public_key = profile.get("public_key")
-                    peer_ip = profile.get("peer_ip")
-                    local_ip = profile.get("local_ip")
+                    peer_public_key = profile.get("server_public_key")  # Fix: use server's public key
+                    server_ip = profile.get("server_ip")  # Fix: use server IP, not peer_ip
+                    server_port = profile.get("server_port", 1337)  # Fix: use actual port (PIA uses 1337)
+                    local_ip = profile.get("peer_ip")  # peer_ip is the client's tunnel IP
 
-                    if tag and private_key and peer_public_key and peer_ip:
+                    if tag and private_key and peer_public_key and server_ip:
                         wg_egress[tag] = {
                             "private_key": private_key,
                             "peer_public_key": peer_public_key,
-                            "endpoint": f"{peer_ip}:51820",
+                            "endpoint": f"{server_ip}:{server_port}",
                             "local_ip": local_ip or "10.0.0.2/32",
                             "type": "pia",
                         }

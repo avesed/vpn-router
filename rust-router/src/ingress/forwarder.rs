@@ -2065,7 +2065,7 @@ async fn forward_tcp_packet(
             );
             match group.select_by_connection(&ecmp_tuple) {
                 Ok(member) => {
-                    info!(
+                    debug!(
                         "ECMP resolved '{}' -> '{}' for TCP {}:{} -> {}:{}",
                         routing_outbound, member, parsed.src_ip, tcp_details.src_port,
                         parsed.dst_ip, tcp_details.dst_port
@@ -2752,7 +2752,7 @@ async fn forward_udp_packet(
             );
             match group.select_by_connection(&ecmp_tuple) {
                 Ok(member) => {
-                    info!(
+                    debug!(
                         "ECMP resolved '{}' -> '{}' for UDP {}:{} -> {}:{}",
                         routing_outbound, member, parsed.src_ip, src_port,
                         parsed.dst_ip, dst_port
