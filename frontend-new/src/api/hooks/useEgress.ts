@@ -16,6 +16,7 @@ export const egressKeys = {
   warp: ["egress", "warp"] as const,
   openvpn: ["egress", "openvpn"] as const,
   v2ray: ["egress", "v2ray"] as const,
+  pia: ["egress", "pia"] as const,
 };
 
 // All Egress
@@ -194,5 +195,17 @@ export function useSetWarpEndpoint() {
 export function useTestWarpEndpoints() {
   return useMutation({
     mutationFn: (data: WarpEndpointTestRequest) => api.testWarpEndpoints(data),
+  });
+}
+
+// PIA Egress
+export function useRefreshPiaCredentials() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (profileTag: string) => api.reconnectProfile(profileTag),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.pia });
+    },
   });
 }

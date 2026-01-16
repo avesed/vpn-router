@@ -4,9 +4,9 @@ import type { EgressItem, EgressTrafficInfo } from "../../types";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { useTestEgress } from "../../api/hooks/useEgress";
+import { useTestEgress, useRefreshPiaCredentials } from "../../api/hooks/useEgress";
 import { toast } from "sonner";
-import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network, ArrowUpDown } from "lucide-react";
+import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network, ArrowUpDown, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface EgressCardProps {
@@ -30,6 +30,18 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true, traff
   const { t } = useTranslation();
   const [testResult, setTestResult] = useState<{ success: boolean; delay: number; message: string } | null>(null);
   const testEgress = useTestEgress();
+  const refreshPia = useRefreshPiaCredentials();
+
+  const handleRefreshPia = () => {
+    toast.promise(
+      refreshPia.mutateAsync(egress.tag),
+      {
+        loading: t("egress.refreshingCredentials"),
+        success: (data) => data.message || t("egress.credentialsRefreshed"),
+        error: (err) => `${t("egress.refreshFailed")}: ${err.message}`,
+      }
+    );
+  };
 
   const handleTest = () => {
     setTestResult(null);
@@ -134,16 +146,27 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true, traff
       </CardContent>
       {showActions && (
         <CardFooter className="pt-2 flex justify-end gap-2">
-          <Button variant="ghost" size="icon" onClick={handleTest} disabled={testEgress.isPending}>
+          <Button variant="ghost" size="icon" onClick={handleTest} disabled={testEgress.isPending} title={t("egress.test")}>
             <Play className="h-4 w-4" />
           </Button>
+          {egress.type === "pia" && (
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              onClick={handleRefreshPia} 
+              disabled={refreshPia.isPending}
+              title={t("egress.refreshCredentials")}
+            >
+              <RefreshCw className={cn("h-4 w-4", refreshPia.isPending && "animate-spin")} />
+            </Button>
+          )}
           {onEdit && (
-            <Button variant="ghost" size="icon" onClick={() => onEdit(egress)}>
+            <Button variant="ghost" size="icon" onClick={() => onEdit(egress)} title={t("common.edit")}>
               <Edit className="h-4 w-4" />
             </Button>
           )}
           {onDelete && (
-            <Button variant="ghost" size="icon" className="text-destructive hover:text-destructive" onClick={() => onDelete(egress.tag)}>
+            <Button variant="ghost" size="icon" className="text-destructive hover:text-destructive" onClick={() => onDelete(egress.tag)} title={t("common.delete")}>
               <Trash2 className="h-4 w-4" />
             </Button>
           )}

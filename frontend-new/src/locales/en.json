@@ -334,15 +334,21 @@
     "loadFailed": "Load failed",
     "testConnection": "Test Connection",
     "testing": "Testing...",
+    "test": "Test Connection",
     "testSuccess": "Connected",
     "testFailed": "Connection Failed",
     "testTimeout": "Connection Timeout",
+    "testComplete": "Test Complete",
     "speedTest": "Speed Test",
     "speedTesting": "Testing speed...",
     "speedTestFailed": "Speed test failed",
     "customDns": "Custom DNS",
     "customDnsPlaceholder": "1.1.1.1 or tls://dns.google",
-    "customDnsHint": "Leave empty to use PIA DNS"
+    "customDnsHint": "Leave empty to use PIA DNS",
+    "refreshCredentials": "Refresh Credentials",
+    "refreshingCredentials": "Refreshing PIA credentials...",
+    "credentialsRefreshed": "PIA credentials refreshed",
+    "refreshFailed": "Refresh failed"
   },
   "rules": {
     "title": "Route Rules",

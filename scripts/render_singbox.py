@@ -578,124 +578,43 @@ def ensure_endpoints(config: dict, pia_profiles: dict, profile_map: Dict[str, st
 # - 更好的性能（内核 vs 用户空间）
 # - wg show 可用于调试
 # - 标准 WireGuard 工具支持
-# - 与入站架构一致
-#
 # 架构：
-# sing-box routing → direct outbound (bind_interface: wg-pia-xxx) → 内核 WireGuard → 远程服务器
+# sing-box routing → rust-router TPROXY → userspace WireGuard (boringtun) → 远程服务器
+# 注意：内核 WireGuard 模式已弃用，所有 WireGuard 出口由 rust-router 的 boringtun 处理
 
 
 def ensure_kernel_wg_egress_outbounds(config: dict, pia_profiles: dict, custom_egress: List[dict]) -> List[str]:
-    """为 PIA 和自定义 WireGuard 出口创建 direct outbound（绑定到内核接口）
+    """获取 PIA 和自定义 WireGuard 出口的 tag 列表
 
-    注意：用户态 WireGuard 模式下，此函数仅用于 sing-box 配置兼容性。
+    注意：内核 WireGuard 模式已弃用。此函数不再创建 direct outbound。
     实际的 WireGuard 隧道由 rust-router 的 boringtun 处理。
+    此函数仅返回 tag 列表供 DNS 配置和 ECMP groups 使用。
 
     Args:
-        config: sing-box 配置
+        config: sing-box 配置（不再修改）
         pia_profiles: PIA profiles 配置（从数据库加载）
         custom_egress: 自定义 WireGuard 出口列表
 
     Returns:
-        所有创建的出口 tag 列表
+        所有 WireGuard 出口的 tag 列表（由 rust-router 管理）
     """
-    outbounds = config.setdefault("outbounds", [])
-    endpoints = config.get("endpoints", [])
     all_tags = []
 
-    # 获取现有的 outbound tags
-    existing_outbound_tags = {ob.get("tag") for ob in outbounds}
-
-    # 获取所有将要创建的 WireGuard 出口 tags
-    wg_egress_tags = set()
-
-    # 处理 PIA profiles
+    # 处理 PIA profiles - 只收集 tags，不创建 outbound
     profiles_data = pia_profiles.get("profiles", {}) if pia_profiles else {}
     for name, profile in profiles_data.items():
         if not profile.get("private_key"):
             continue  # 跳过没有凭证的 profile
+        all_tags.append(name)
 
-        tag = name  # PIA profile 使用 name 作为 tag
-        interface = get_egress_interface_name(tag, is_pia=True)
-        wg_egress_tags.add(tag)
-        all_tags.append(tag)
-
-        if tag in existing_outbound_tags:
-            # 更新现有 outbound
-            for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag:
-                    outbounds[i] = {
-                        "type": "direct",
-                        "tag": tag,
-                        "bind_interface": interface
-                    }
-                    break
-        else:
-            # 创建新 outbound（在 block/adblock 之前插入）
-            block_idx = next(
-                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
-                len(outbounds)
-            )
-            outbounds.insert(block_idx, {
-                "type": "direct",
-                "tag": tag,
-                "bind_interface": interface
-            })
-            print(f"[render] 创建内核 WireGuard 出口: {tag} (接口: {interface})")
-
-    # 处理自定义 WireGuard 出口
+    # 处理自定义 WireGuard 出口 - 只收集 tags
     for egress in custom_egress:
         tag = egress.get("tag")
-        if not tag:
-            continue
+        if tag:
+            all_tags.append(tag)
 
-        interface = get_egress_interface_name(tag, is_pia=False)
-        wg_egress_tags.add(tag)
-        all_tags.append(tag)
-
-        if tag in existing_outbound_tags:
-            # 更新现有 outbound
-            for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag:
-                    outbounds[i] = {
-                        "type": "direct",
-                        "tag": tag,
-                        "bind_interface": interface
-                    }
-                    break
-        else:
-            # 创建新 outbound
-            block_idx = next(
-                (i for i, ob in enumerate(outbounds) if ob.get("tag") in ("block", "adblock")),
-                len(outbounds)
-            )
-            outbounds.insert(block_idx, {
-                "type": "direct",
-                "tag": tag,
-                "bind_interface": interface
-            })
-            print(f"[render] 创建内核 WireGuard 出口: {tag} (接口: {interface})")
-
-    # 移除旧的 WireGuard endpoints（如果有的话）
-    # 这些是从旧架构遗留的，现在使用 direct outbound + bind_interface
-    if endpoints:
-        old_count = len(endpoints)
-        config["endpoints"] = [
-            ep for ep in endpoints
-            if ep.get("tag") not in wg_egress_tags or ep.get("type") != "wireguard"
-        ]
-        removed = old_count - len(config.get("endpoints", []))
-        if removed > 0:
-            print(f"[render] 移除了 {removed} 个旧的 WireGuard endpoints（已迁移到内核 WireGuard）")
-
-    # 同时移除旧的 WireGuard outbounds（类型为 wireguard 的）
-    old_count = len(outbounds)
-    config["outbounds"] = [
-        ob for ob in outbounds
-        if ob.get("tag") not in wg_egress_tags or ob.get("type") != "wireguard"
-    ]
-    removed = old_count - len(config["outbounds"])
-    if removed > 0:
-        print(f"[render] 移除了 {removed} 个旧的 WireGuard outbounds（已迁移到内核 WireGuard）")
+    if all_tags:
+        print(f"[render] WireGuard 出口由 rust-router 管理 (userspace): {all_tags}")
 
     return all_tags
 
@@ -2704,12 +2623,11 @@ def main() -> None:
     pia_profiles = load_pia_profiles_from_db()
     custom_egress = load_custom_egress()
 
-    # 创建 WireGuard 出口的 sing-box 配置（仅用于兼容性）
-    # 用户态模式下，实际的 WireGuard 隧道由 rust-router 的 boringtun 处理
+    # 获取 WireGuard 出口 tags（由 rust-router 的 boringtun 管理）
+    # 内核 WireGuard 模式已弃用
     wg_egress_tags = ensure_kernel_wg_egress_outbounds(config, pia_profiles, custom_egress)
 
     if wg_egress_tags:
-        print(f"[render] 内核 WireGuard 出口: {wg_egress_tags}")
         all_egress_tags.extend(wg_egress_tags)
 
         # 确保 DNS 服务器存在

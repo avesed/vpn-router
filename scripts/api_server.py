@@ -4293,8 +4293,10 @@ def api_reconnect_profile(payload: ProfileReconnectRequest):
         run_command(["python3", str(provision_script), "--profile", profile_key], env=env)
         run_command(["python3", str(render_script)], env=env)
         reload_result = reload_singbox()
-        # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
-        wg_sync_msg = _sync_kernel_wg_egress()
+        
+        # 先删除旧隧道，再同步新配置（endpoint 可能已变化）
+        wg_sync_msg = _refresh_wg_tunnel(profile_key)
+        
         # 同步所有出口组的 ECMP 路由和 SNAT 规则（peer_ip 可能改变）
         ecmp_sync_msg = _sync_all_ecmp_groups()
         return {
@@ -7226,14 +7228,13 @@ async def api_register_warp_egress(data: WarpEgressCreate):
     if db.get_warp_egress(data.tag):
         raise HTTPException(status_code=400, detail=f"WARP egress '{data.tag}' already exists")
 
-    # Phase 3: Require rust-router (MASQUE deprecated)
-    use_rust_router = os.getenv("USE_RUST_ROUTER", "false").lower() == "true"
-    userspace_wg = os.getenv("USERSPACE_WG", "false").lower() == "true"
+    # Phase 3: Require rust-router (kernel WG deprecated)
+    use_rust_router = os.getenv("USE_RUST_ROUTER", "true").lower() == "true"
 
-    if not (use_rust_router and userspace_wg):
+    if not use_rust_router:
         raise HTTPException(
             status_code=503,
-            detail="WARP requires rust-router with userspace WireGuard (set USE_RUST_ROUTER=true USERSPACE_WG=true)"
+            detail="WARP requires rust-router (set USE_RUST_ROUTER=true)"
         )
 
     # Register via rust-router IPC
@@ -9821,8 +9822,8 @@ def _sync_kernel_wg_egress() -> str:
             from rust_router_manager import RustRouterManager
             import asyncio
             manager = RustRouterManager()
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(manager.sync_wg_egress_tunnels())
+            # Use asyncio.run() for thread safety in sync context
+            result = asyncio.run(manager.sync_wg_egress_tunnels())
             if result.success:
                 print(f"[api] WireGuard egress synced via rust-router ({result.wg_tunnels_synced} synced)")
                 return f", WireGuard tunnels synced ({result.wg_tunnels_synced})"
@@ -9835,6 +9836,55 @@ def _sync_kernel_wg_egress() -> str:
     except Exception as e:
         print(f"[api] WireGuard sync error: {e}")
         return f", WireGuard sync error: {e}"
+
+
+def _refresh_wg_tunnel(tag: str) -> str:
+    """刷新指定的 WireGuard 隧道（删除旧隧道并重新创建）
+
+    当 PIA 凭证刷新后，endpoint 可能已变化，需要删除旧隧道后重新创建。
+
+    Args:
+        tag: 隧道标识
+
+    Returns:
+        状态消息
+    """
+    try:
+        if HAS_RUST_ROUTER_CLIENT:
+            from rust_router_client import RustRouterClient
+            from rust_router_manager import RustRouterManager
+            import asyncio
+
+            async def _refresh():
+                # 先删除旧隧道
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    result = await client.remove_wg_tunnel(tag)
+                    if result.success:
+                        print(f"[api] Removed old tunnel '{tag}'")
+                    else:
+                        print(f"[api] Tunnel '{tag}' not found or already removed")
+                finally:
+                    await client.disconnect()
+
+                # 再同步新配置
+                manager = RustRouterManager()
+                sync_result = await manager.sync_wg_egress_tunnels()
+                return sync_result
+
+            result = asyncio.run(_refresh())
+            if result.success:
+                print(f"[api] WireGuard tunnel '{tag}' refreshed ({result.wg_tunnels_synced} synced)")
+                return f", tunnel refreshed"
+            else:
+                return f", tunnel refresh partial"
+        else:
+            print("[api] rust-router client not available")
+            return ", tunnel refresh skipped"
+    except Exception as e:
+        print(f"[api] Tunnel refresh error: {e}")
+        return f", tunnel refresh error: {e}"
 
 
 def _sync_kernel_wg_ingress() -> str:

@@ -344,8 +344,7 @@ class RustRouterManager:
         self._request_timeout = request_timeout
         self._sync_lock = asyncio.Lock()
         self._db = None  # Lazy loaded
-        # Phase 11-Fix.AB: Detect userspace WireGuard mode
-        self._userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
+        # Userspace WireGuard is now the only mode (kernel WG deprecated)
         self._peer_repair_attempted_tags: Set[str] = set()
 
     def _get_db(self):
@@ -612,46 +611,11 @@ class RustRouterManager:
                 # Collect all egress from database
                 db_outbounds: Dict[str, Dict[str, Any]] = {}
 
-                # Phase 6-Fix.AE: In userspace WG mode, PIA/Custom/WARP WireGuard egress
-                # are handled by sync_wg_egress_tunnels() using CreateWgTunnel IPC command,
-                # NOT as Direct outbounds with bind_interface (which requires kernel interfaces).
-                # We only add them here in kernel WG mode.
-                if not self._userspace_wg:
-                    # PIA profiles (kernel WG mode only)
-                    for profile in db.get_pia_profiles(enabled_only=True):
-                        tag = profile.get("name", "")
-                        if tag:
-                            interface = _get_egress_interface_name(tag, is_pia=True)
-                            db_outbounds[tag] = {
-                                "type": "wireguard",
-                                "interface": interface,
-                                "egress_type": "pia",
-                            }
+                # NOTE: PIA/Custom/WARP WireGuard egress are handled by sync_wg_egress_tunnels()
+                # using CreateWgTunnel IPC command (userspace WireGuard via boringtun).
+                # Kernel WireGuard mode has been deprecated.
 
-                    # Custom WireGuard egress (kernel WG mode only)
-                    for egress in db.get_custom_egress_list(enabled_only=True):
-                        tag = egress.get("tag", "")
-                        if tag:
-                            interface = _get_egress_interface_name(tag, is_pia=False)
-                            db_outbounds[tag] = {
-                                "type": "wireguard",
-                                "interface": interface,
-                                "egress_type": "custom",
-                            }
-
-                    # WARP WireGuard egress (kernel WG mode only)
-                    for egress in db.get_warp_egress_list(enabled_only=True):
-                        tag = egress.get("tag", "")
-                        protocol = egress.get("protocol", "wireguard")
-                        if tag and protocol == "wireguard":
-                            interface = _get_egress_interface_name(tag, egress_type="warp")
-                            db_outbounds[tag] = {
-                                "type": "wireguard",
-                                "interface": interface,
-                                "egress_type": "warp",
-                            }
-
-                # WARP MASQUE uses SOCKS5 (both modes)
+                # WARP MASQUE uses SOCKS5
                 for egress in db.get_warp_egress_list(enabled_only=True):
                     tag = egress.get("tag", "")
                     protocol = egress.get("protocol", "wireguard")
@@ -817,11 +781,7 @@ class RustRouterManager:
         """
         result = SyncResult(success=True)
 
-        # Skip if not in userspace WG mode
-        if not self._userspace_wg:
-            logger.debug("sync_wg_egress_tunnels: Skipped (not in userspace WG mode)")
-            return result
-
+        # Userspace WireGuard is now the only mode (kernel WG deprecated)
         async with self._sync_lock:
             try:
                 db = self._get_db()
@@ -1251,7 +1211,8 @@ class RustRouterManager:
                     # Track synced peers
                     synced = 0
 
-                    if self._userspace_wg and peers:
+                    # Userspace WireGuard peer repair (kernel WG deprecated)
+                    if peers:
                         local_tag = self._get_local_tag_for_pairing()
                         missing = [
                             p for p in peers
@@ -1808,14 +1769,12 @@ class RustRouterManager:
         result.outbounds_removed = outbound_result.outbounds_removed
         result.errors.extend(outbound_result.errors)
 
-        # Phase 11-Fix.AB: Sync userspace WG tunnels (after outbounds sync)
-        # Initialize with success=True for non-userspace mode
-        wg_tunnel_result = SyncResult(success=True)
-        if self._userspace_wg:
-            wg_tunnel_result = await self.sync_wg_egress_tunnels()
-            result.wg_tunnels_synced = wg_tunnel_result.wg_tunnels_synced
-            result.wg_tunnels_removed = wg_tunnel_result.wg_tunnels_removed
-            result.errors.extend(wg_tunnel_result.errors)
+        # Sync userspace WG tunnels (after outbounds sync)
+        # Kernel WG mode has been deprecated, always use userspace
+        wg_tunnel_result = await self.sync_wg_egress_tunnels()
+        result.wg_tunnels_synced = wg_tunnel_result.wg_tunnels_synced
+        result.wg_tunnels_removed = wg_tunnel_result.wg_tunnels_removed
+        result.errors.extend(wg_tunnel_result.errors)
 
         # Sync ECMP groups BEFORE routing rules (Phase 6)
         # Default outbound may be an ECMP group tag, so it must exist first

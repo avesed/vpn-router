@@ -334,15 +334,21 @@
     "loadFailed": "加载失败",
     "testConnection": "测试连接",
     "testing": "测试中...",
+    "test": "测试连接",
     "testSuccess": "连接成功",
     "testFailed": "连接失败",
     "testTimeout": "连接超时",
+    "testComplete": "测试完成",
     "speedTest": "测速",
     "speedTesting": "测速中...",
     "speedTestFailed": "测速失败",
     "customDns": "自定义 DNS",
     "customDnsPlaceholder": "1.1.1.1 或 tls://dns.google",
-    "customDnsHint": "留空使用 PIA DNS"
+    "customDnsHint": "留空使用 PIA DNS",
+    "refreshCredentials": "刷新凭证",
+    "refreshingCredentials": "正在刷新 PIA 凭证...",
+    "credentialsRefreshed": "PIA 凭证已刷新",
+    "refreshFailed": "刷新失败"
   },
   "rules": {
     "title": "路由规则",

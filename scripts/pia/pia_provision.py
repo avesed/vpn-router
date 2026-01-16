@@ -86,7 +86,7 @@ def load_profiles_from_db(profile_name: Optional[str] = None) -> List[Dict[str, 
 
 
 def fetch_token(username: str, password: str) -> str:
-    resp = requests.post(TOKEN_URL, json={"username": username, "password": password}, timeout=10)
+    resp = requests.get(TOKEN_URL, auth=(username, password), timeout=10)
     if resp.status_code != 200:
         raise ProvisionError(f"PIA 登陆接口返回 {resp.status_code}: {resp.text}")
     payload = resp.json()
