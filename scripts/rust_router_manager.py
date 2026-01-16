@@ -706,6 +706,16 @@ class RustRouterManager:
                     current_outbounds = await client.list_outbounds()
                     current_tags = {o.tag for o in current_outbounds}
 
+                    # Always get WireGuard tunnel tags to exclude from removal
+                    # WG tunnels are managed by wg_egress_manager, not outbound_manager,
+                    # so remove_outbound() would fail for them
+                    wg_tunnel_tags: set = set()
+                    try:
+                        wg_tunnels = await client.list_wg_tunnels()
+                        wg_tunnel_tags = {t.tag for t in wg_tunnels}
+                    except Exception as e:
+                        logger.debug(f"Failed to get WG tunnel tags: {e}")
+
                     # Add missing outbounds
                     for tag, config in db_outbounds.items():
                         if tag not in current_tags:
@@ -715,15 +725,21 @@ class RustRouterManager:
                             else:
                                 result.errors.append(f"Failed to add {tag}: {add_result.error}")
 
-                    # Remove stale outbounds (except built-in ones)
+                    # Remove stale outbounds (except built-in ones and WireGuard tunnels)
                     builtin_tags = {"direct", "block"}
                     for current_tag in current_tags:
-                        if current_tag not in db_outbounds and current_tag not in builtin_tags:
-                            remove_result = await client.remove_outbound(current_tag)
-                            if remove_result.success:
-                                result.outbounds_removed += 1
-                            else:
-                                result.errors.append(f"Failed to remove {current_tag}: {remove_result.error}")
+                        # Skip built-in tags, WireGuard tunnels, and tags in db_outbounds
+                        if current_tag in builtin_tags:
+                            continue
+                        if current_tag in wg_tunnel_tags:
+                            continue
+                        if current_tag in db_outbounds:
+                            continue
+                        remove_result = await client.remove_outbound(current_tag)
+                        if remove_result.success:
+                            result.outbounds_removed += 1
+                        else:
+                            result.errors.append(f"Failed to remove {current_tag}: {remove_result.error}")
 
                 if result.errors:
                     result.success = False
@@ -1800,7 +1816,13 @@ class RustRouterManager:
             result.wg_tunnels_removed = wg_tunnel_result.wg_tunnels_removed
             result.errors.extend(wg_tunnel_result.errors)
 
-        # Then sync routing rules
+        # Sync ECMP groups BEFORE routing rules (Phase 6)
+        # Default outbound may be an ECMP group tag, so it must exist first
+        ecmp_result = await self.sync_ecmp_groups()
+        result.ecmp_groups_synced = ecmp_result.ecmp_groups_synced
+        result.errors.extend(ecmp_result.errors)
+
+        # Then sync routing rules (after ECMP groups so default_outbound exists)
         rules_result = await self.sync_routing_rules()
         result.rules_synced = rules_result.rules_synced
         result.errors.extend(rules_result.errors)
@@ -1809,11 +1831,6 @@ class RustRouterManager:
         peers_result = await self.sync_peers()
         result.peers_synced = peers_result.peers_synced
         result.errors.extend(peers_result.errors)
-
-        # Sync ECMP groups (Phase 6)
-        ecmp_result = await self.sync_ecmp_groups()
-        result.ecmp_groups_synced = ecmp_result.ecmp_groups_synced
-        result.errors.extend(ecmp_result.errors)
 
         # Sync chains (Phase 6)
         chains_result = await self.sync_chains()

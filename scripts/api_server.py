@@ -2089,12 +2089,13 @@ def _update_traffic_stats():
                     logging.debug(f"sing-box V2Ray API unavailable: {type(e).__name__}: {e}")
                     outbound_stats = None
 
-            # 回退到 rust-router IPC（当 sing-box 不可用时）
-            if outbound_stats is None:
+            # 回退到 rust-router IPC（当 sing-box 不可用或返回空时）
+            # 注意：V2Ray API 可能返回空字典 {} 而不是 None
+            if not outbound_stats:
                 outbound_stats = _get_rust_router_outbound_stats_sync()
 
             # 如果两者都不可用，跳过此周期
-            if outbound_stats is None:
+            if not outbound_stats:
                 time.sleep(_POLL_INTERVAL)
                 continue
 

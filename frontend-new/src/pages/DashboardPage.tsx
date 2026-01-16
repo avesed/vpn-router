@@ -179,6 +179,7 @@ export function DashboardPage() {
                         fillOpacity={1}
                         fill={`url(#color${key})`}
                         stackId="1"
+                        isAnimationActive={false}
                       />
                     ))}
                   </AreaChart>
