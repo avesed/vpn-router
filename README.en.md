@@ -11,27 +11,29 @@ Smart VPN Gateway - High-performance transparent proxy router with Rust data pla
                               │
                               ▼ WireGuard (UDP 36100)
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         vpn-gateway container                        │
-│                                                                      │
+│                         vpn-gateway container                       │
+│                                                                     │
 │  ┌────────────────────────────────────────────────────────────────┐ │
-│  │                    Rust Router (Data Plane)                     │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌───────────────────────┐  │ │
-│  │  │ WireGuard    │  │ TPROXY     │  │ Rule Engine           │  │ │
-│  │  │ Userspace    │→ │ Transparent│→ │ Domain/IP/GeoIP Match │  │ │
-│  │  │ (boringtun)  │  │ TCP + UDP  │  │ Chain Route/ECMP LB   │  │ │
-│  │  └──────────────┘  └────────────┘  └───────────────────────┘  │ │
-│  │                                              │                  │ │
-│  │                    ┌─────────────────────────┼─────────────┐   │ │
-│  │                    ▼             ▼           ▼             ▼   │ │
-│  │                 direct     WireGuard      Xray          WARP   │ │
-│  │                              Egress   (VLESS/REALITY)  Egress  │ │
+│  │                    Rust Router (Data Plane)                    │ │
+│  │                                                                │ │
+│  │  ┌──────────────┐      ┌─────────────────────────────────────┐ │ │
+│  │  │ WireGuard    │      │ Rule Engine                         │ │ │
+│  │  │ Userspace    │ ───→ │ • DNS sniffing for domain extract   │ │ │
+│  │  │ (boringtun)  │      │ • Domain/IP/GeoIP rule matching     │ │ │
+│  │  └──────────────┘      │ • Chain routing / ECMP load balance │ │ │
+│  │                        └─────────────────────────────────────┘ │ │
+│  │                                        │                       │ │
+│  │                 ┌──────────────────────┼──────────────┐        │ │
+│  │                 ▼          ▼           ▼              ▼        │ │
+│  │              direct    WireGuard     Xray           WARP       │ │
+│  │                          Egress   (VLESS/REALITY)   Egress     │ │
 │  └────────────────────────────────────────────────────────────────┘ │
-│                                                                      │
+│                                                                     │
 │  ┌────────────────────────────────────────────────────────────────┐ │
 │  │  Python API (Control Plane)               FastAPI :8000        │ │
 │  │  • Config Mgmt  • Egress Mgmt  • Rules Mgmt  • Hot Reload      │ │
 │  └────────────────────────────────────────────────────────────────┘ │
-│                                                                      │
+│                                                                     │
 │  ┌────────────────────────────────────────────────────────────────┐ │
 │  │  Web UI (React + shadcn/ui)               Nginx :36000         │ │
 │  └────────────────────────────────────────────────────────────────┘ │
