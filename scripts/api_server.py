@@ -9102,6 +9102,9 @@ def _get_warp_socks_port(tag: str) -> Optional[int]:
 def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -> dict:
     """通过下载文件测速
 
+    优先使用 rust-router IPC 进行测速（支持 WireGuard 隧道和 ECMP 组）。
+    对于其他类型的出口，回退到 curl 命令。
+
     Args:
         tag: 出口标识
         size_mb: 下载文件大小 (MB)
@@ -9110,6 +9113,48 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
     Returns:
         测速结果字典
     """
+    import asyncio
+
+    # 首先尝试通过 rust-router IPC 进行测速
+    # 这支持 WireGuard 隧道、ECMP 组和其他 rust-router 管理的出口
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            from rust_router_client import RustRouterClient
+
+            async def _speed_test_via_ipc():
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    result = await client.speed_test(
+                        tag=tag,
+                        size_bytes=size_mb * 1024 * 1024,
+                        timeout_secs=int(timeout_sec),
+                    )
+                    return result
+                finally:
+                    await client.disconnect()
+
+            result = asyncio.run(_speed_test_via_ipc())
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "speed_mbps": round(result.get("speed_mbps", 0), 2),
+                    "download_bytes": result.get("bytes_downloaded", 0),
+                    "duration_sec": round(result.get("duration_ms", 0) / 1000, 2),
+                    "message": f"{result.get('speed_mbps', 0):.1f} Mbps"
+                }
+            elif result.get("error"):
+                # rust-router 返回了具体错误，检查是否需要回退到其他方式
+                error = result.get("error", "")
+                if "not found" not in error.lower():
+                    # 出口存在但测速失败
+                    return {"success": False, "speed_mbps": 0, "message": error}
+                # 否则继续尝试其他方式
+        except Exception as e:
+            print(f"[speedtest] rust-router IPC failed: {e}")
+            # 继续尝试其他方式
+
+    # 回退：使用 curl 命令
     test_url = f"https://speed.cloudflare.com/__down?bytes={size_mb * 1024 * 1024}"
 
     curl_cmd = [
@@ -9124,7 +9169,6 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
         proxy_info = "直连"
     elif tag.startswith("direct-"):
         # Direct 出口：绑定接口
-        # Phase 11-Fix.U: 修复方法名 get_direct_egress_by_tag -> get_direct_egress
         if HAS_DATABASE:
             db = _get_db()
             direct_egress = db.get_direct_egress(tag)
@@ -9144,55 +9188,15 @@ def _test_speed_download(tag: str, size_mb: int = 10, timeout_sec: float = 30) -
         else:
             return {"success": False, "speed_mbps": 0, "message": "OpenVPN tunnel not connected"}
     elif _is_warp_egress(tag):
-        # WARP：根据协议类型选择测试方式
-        if HAS_DATABASE:
-            db = _get_db()
-            warp_egress = db.get_warp_egress(tag)
-            if warp_egress and warp_egress.get("protocol") == "wireguard":
-                # WireGuard 协议：使用接口名（用户态模式下通过 rust-router）
-                from db_helper import get_egress_interface_name
-                interface = get_egress_interface_name(tag, egress_type="warp")
-                curl_cmd.extend(["--interface", interface])
-                proxy_info = f"接口 {interface}"
-            else:
-                # MASQUE 协议：使用 SOCKS 端口
-                socks_port = _get_warp_socks_port(tag)
-                if socks_port:
-                    curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
-                    proxy_info = f"SOCKS5 :{socks_port}"
-                else:
-                    return {"success": False, "speed_mbps": 0, "message": "WARP not connected"}
-        else:
-            return {"success": False, "speed_mbps": 0, "message": "Database not available"}
+        # WARP WireGuard 出口已通过 rust-router IPC 处理（见上方代码）
+        # 如果到这里说明 rust-router IPC 不可用或失败
+        return {"success": False, "speed_mbps": 0, "message": "WARP speed test requires rust-router"}
     elif tag in ("block", "adblock"):
         return {"success": False, "speed_mbps": 0, "message": "Block egress, cannot test speed"}
     else:
-        # WireGuard/PIA egresses: check if managed by rust-router (userspace)
-        # NOTE: sing-box SOCKS speedtest ports are no longer available.
-        # rust-router uses userspace WireGuard without kernel interfaces,
-        # so curl cannot bind to an interface for speedtest.
-        # 
-        # For now, return a message indicating speedtest is not available.
-        # Future: implement speedtest via rust-router HTTP API or TUN interface.
-        if HAS_DATABASE:
-            db = _get_db()
-            # Check if this is a PIA or custom WireGuard egress
-            pia_profile = db.get_pia_profile_by_tag(tag)
-            custom_wg = db.get_custom_wg_egress(tag)
-            if pia_profile or custom_wg:
-                return {
-                    "success": False, 
-                    "speed_mbps": 0, 
-                    "message": "Speed test not available for userspace WireGuard egresses"
-                }
-        
-        # Fallback: try legacy SOCKS port (for backward compatibility)
-        socks_port = _get_speedtest_socks_port(tag)
-        if socks_port:
-            curl_cmd.extend(["--proxy", f"socks5://127.0.0.1:{socks_port}"])
-            proxy_info = f"SOCKS5 :{socks_port}"
-        else:
-            return {"success": False, "speed_mbps": 0, "message": "Speed test not available for this egress type"}
+        # WireGuard/PIA/Custom WG 出口已通过 rust-router IPC 处理
+        # 如果到这里说明 rust-router IPC 不可用或该出口类型不支持
+        return {"success": False, "speed_mbps": 0, "message": "Speed test not available for this egress type"}
 
     curl_cmd.append(test_url)
 

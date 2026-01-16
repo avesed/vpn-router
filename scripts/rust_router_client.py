@@ -2197,6 +2197,61 @@ class RustRouterClient:
         )
 
     # =========================================================================
+    # Speed Test Commands
+    # =========================================================================
+
+    async def speed_test(
+        self,
+        tag: str,
+        size_bytes: int = 10 * 1024 * 1024,
+        timeout_secs: int = 30,
+    ) -> dict:
+        """Run speed test through a specific outbound/tunnel
+
+        Downloads a file through the specified outbound and measures speed.
+        Supports WireGuard tunnels, ECMP groups, and other outbound types.
+
+        Args:
+            tag: Outbound or tunnel tag to test
+            size_bytes: Download size in bytes (default: 10MB)
+            timeout_secs: Timeout in seconds (default: 30)
+
+        Returns:
+            dict with keys:
+                - success: bool
+                - speed_mbps: float (download speed in Mbps)
+                - bytes_downloaded: int
+                - duration_ms: int
+                - outbound: str (tag used for test)
+                - error: Optional[str] (error message if failed)
+        """
+        response = await self._send_command({
+            "type": "speed_test",
+            "tag": tag,
+            "size_bytes": size_bytes,
+            "timeout_secs": timeout_secs,
+        })
+
+        if response.success and response.data:
+            return {
+                "success": response.data.get("success", False),
+                "speed_mbps": response.data.get("speed_mbps", 0.0),
+                "bytes_downloaded": response.data.get("bytes_downloaded", 0),
+                "duration_ms": response.data.get("duration_ms", 0),
+                "outbound": response.data.get("outbound", tag),
+                "error": response.data.get("error"),
+            }
+        else:
+            return {
+                "success": False,
+                "speed_mbps": 0.0,
+                "bytes_downloaded": 0,
+                "duration_ms": 0,
+                "outbound": tag,
+                "error": response.error or "Unknown error",
+            }
+
+    # =========================================================================
     # Lifecycle Commands
     # =========================================================================
 

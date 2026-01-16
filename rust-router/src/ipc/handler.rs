@@ -790,6 +790,13 @@ impl IpcHandler {
             IpcCommand::RegisterWarp { tag, name, warp_plus_license } => {
                 self.handle_register_warp(tag, name, warp_plus_license).await
             }
+
+            // ================================================================
+            // Speed Test Command Handler
+            // ================================================================
+            IpcCommand::SpeedTest { tag, size_bytes, timeout_secs } => {
+                self.handle_speed_test(tag, size_bytes, timeout_secs).await
+            }
         }
     }
 
@@ -4241,6 +4248,246 @@ impl IpcHandler {
                 IpcResponse::error(error_code, format!("WARP registration failed: {}", e))
             }
         }
+    }
+
+    /// Handle speed test command
+    ///
+    /// Downloads a file through the specified outbound/tunnel and measures speed.
+    async fn handle_speed_test(
+        &self,
+        tag: String,
+        size_bytes: u64,
+        timeout_secs: u64,
+    ) -> IpcResponse {
+        use super::protocol::SpeedTestResponse;
+
+        info!("Starting speed test for '{}' (size={}B, timeout={}s)", tag, size_bytes, timeout_secs);
+        let start = Instant::now();
+        let test_url = format!("https://speed.cloudflare.com/__down?bytes={}", size_bytes);
+
+        // Try to find the outbound - check WireGuard tunnels first, then ECMP groups, then regular outbounds
+        let tunnel_found = if let Some(ref wg_manager) = self.wg_egress_manager {
+            wg_manager.has_tunnel(&tag)
+        } else {
+            false
+        };
+
+        let ecmp_found = if let Some(ref ecmp_manager) = self.ecmp_group_manager {
+            ecmp_manager.get_group(&tag).is_some()
+        } else {
+            false
+        };
+
+        let outbound_found = self.outbound_manager.contains(&tag);
+
+        if !tunnel_found && !ecmp_found && !outbound_found {
+            return IpcResponse::SpeedTestResult(SpeedTestResponse {
+                success: false,
+                speed_mbps: 0.0,
+                bytes_downloaded: 0,
+                duration_ms: 0,
+                outbound: tag.clone(),
+                error: Some(format!("Outbound '{}' not found", tag)),
+            });
+        }
+
+        // Perform the HTTP request through the tunnel
+        // For WireGuard tunnels, we need to use the tunnel's socket
+        let result = if tunnel_found {
+            if let Some(ref wg_manager) = self.wg_egress_manager {
+                self.speed_test_via_wg_tunnel(wg_manager, &tag, &test_url, timeout_secs).await
+            } else {
+                Err("WireGuard manager not available".to_string())
+            }
+        } else if ecmp_found {
+            // For ECMP groups, pick a member and test through it
+            if let Some(ref ecmp_manager) = self.ecmp_group_manager {
+                if let Some(group) = ecmp_manager.get_group(&tag) {
+                    let members = group.member_tags();
+                    if members.is_empty() {
+                        Err("ECMP group has no members".to_string())
+                    } else {
+                        // Test through the first healthy member
+                        let member_tag = &members[0];
+                        if let Some(ref wg_manager) = self.wg_egress_manager {
+                            if wg_manager.has_tunnel(member_tag) {
+                                self.speed_test_via_wg_tunnel(wg_manager, member_tag, &test_url, timeout_secs).await
+                            } else {
+                                Err(format!("ECMP member '{}' is not a WireGuard tunnel", member_tag))
+                            }
+                        } else {
+                            Err("WireGuard manager not available".to_string())
+                        }
+                    }
+                } else {
+                    Err(format!("ECMP group '{}' not found", tag))
+                }
+            } else {
+                Err("ECMP manager not available".to_string())
+            }
+        } else {
+            // Regular outbound - not supported for speed test
+            Err("Speed test only supported for WireGuard tunnels and ECMP groups".to_string())
+        };
+
+        let duration = start.elapsed();
+        let duration_ms = duration.as_millis() as u64;
+
+        match result {
+            Ok(bytes) => {
+                let speed_mbps = if duration_ms > 0 {
+                    (bytes as f64 * 8.0) / (duration_ms as f64 / 1000.0) / 1_000_000.0
+                } else {
+                    0.0
+                };
+
+                info!("Speed test completed for '{}': {:.2} Mbps ({} bytes in {}ms)", 
+                    tag, speed_mbps, bytes, duration_ms);
+
+                IpcResponse::SpeedTestResult(SpeedTestResponse {
+                    success: true,
+                    speed_mbps,
+                    bytes_downloaded: bytes,
+                    duration_ms,
+                    outbound: tag,
+                    error: None,
+                })
+            }
+            Err(e) => {
+                warn!("Speed test failed for '{}': {}", tag, e);
+                IpcResponse::SpeedTestResult(SpeedTestResponse {
+                    success: false,
+                    speed_mbps: 0.0,
+                    bytes_downloaded: 0,
+                    duration_ms,
+                    outbound: tag,
+                    error: Some(e),
+                })
+            }
+        }
+    }
+
+    /// Perform speed test through a WireGuard tunnel using hyper
+    #[cfg(feature = "dns-doh")]
+    async fn speed_test_via_wg_tunnel(
+        &self,
+        _wg_manager: &Arc<WgEgressManager>,
+        tag: &str,
+        url: &str,
+        timeout_secs: u64,
+    ) -> Result<u64, String> {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        use http_body_util::BodyExt;
+
+        // Install the default CryptoProvider (ring) for rustls 0.23+
+        // This is idempotent - safe to call multiple times
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Parse URL
+        let uri: hyper::Uri = url.parse()
+            .map_err(|e| format!("Invalid URL: {}", e))?;
+
+        let host = uri.host()
+            .ok_or_else(|| "URL missing host".to_string())?;
+        let port = uri.port_u16().unwrap_or(443);
+        let addr = format!("{}:{}", host, port);
+
+        // Resolve DNS
+        let socket_addrs: Vec<_> = tokio::net::lookup_host(&addr)
+            .await
+            .map_err(|e| format!("DNS lookup failed: {}", e))?
+            .collect();
+
+        let socket_addr = socket_addrs.first()
+            .ok_or_else(|| "DNS lookup returned no addresses".to_string())?;
+
+        // Connect with TLS
+        let tcp_stream = tokio::net::TcpStream::connect(socket_addr)
+            .await
+            .map_err(|e| format!("TCP connect failed: {}", e))?;
+
+        // Setup TLS
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(self.get_root_certs())
+            .with_no_client_auth();
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid server name: {}", e))?;
+
+        let tls_stream = connector.connect(server_name, tcp_stream)
+            .await
+            .map_err(|e| format!("TLS handshake failed: {}", e))?;
+
+        // Create HTTP connection
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("HTTP handshake failed: {}", e))?;
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("HTTP connection error: {}", e);
+            }
+        });
+
+        // Build request
+        let path = uri.path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("Host", host)
+            .header("User-Agent", "rust-router-speedtest/1.0")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .map_err(|e| format!("Failed to build request: {}", e))?;
+
+        // Send request with timeout
+        let response = timeout(
+            Duration::from_secs(timeout_secs),
+            sender.send_request(req)
+        )
+        .await
+        .map_err(|_| "Request timed out".to_string())?
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("HTTP error: {}", response.status()));
+        }
+
+        // Read response body and count bytes
+        let body = response.into_body();
+        let bytes = body.collect()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?
+            .to_bytes();
+
+        info!("Speed test for '{}' downloaded {} bytes", tag, bytes.len());
+        Ok(bytes.len() as u64)
+    }
+
+    /// Fallback when dns-doh feature is not enabled
+    #[cfg(not(feature = "dns-doh"))]
+    async fn speed_test_via_wg_tunnel(
+        &self,
+        _wg_manager: &Arc<WgEgressManager>,
+        _tag: &str,
+        _url: &str,
+        _timeout_secs: u64,
+    ) -> Result<u64, String> {
+        Err("Speed test requires dns-doh feature to be enabled".to_string())
+    }
+
+    /// Get root certificates for TLS
+    #[cfg(feature = "dns-doh")]
+    fn get_root_certs(&self) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        roots
     }
 }
 

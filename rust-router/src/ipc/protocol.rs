@@ -743,6 +743,25 @@ pub enum IpcCommand {
         /// WARP+ license key (optional, for upgrade)
         warp_plus_license: Option<String>,
     },
+
+    // ========================================================================
+    // Speed Test Command
+    // ========================================================================
+
+    /// Run speed test through a specific outbound/tunnel
+    ///
+    /// Downloads a file through the specified outbound and measures speed.
+    /// Supports WireGuard tunnels, ECMP groups, and other outbound types.
+    SpeedTest {
+        /// Outbound or tunnel tag to test
+        tag: String,
+        /// Download size in bytes (default: 10MB)
+        #[serde(default = "default_speed_test_size")]
+        size_bytes: u64,
+        /// Timeout in seconds (default: 30)
+        #[serde(default = "default_speed_test_timeout")]
+        timeout_secs: u64,
+    },
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -773,6 +792,16 @@ fn default_udp_session_limit() -> usize {
 /// Default limit for DNS query log listing
 fn default_dns_query_limit() -> usize {
     100
+}
+
+/// Default speed test download size (10MB)
+fn default_speed_test_size() -> u64 {
+    10 * 1024 * 1024
+}
+
+/// Default speed test timeout (30 seconds)
+fn default_speed_test_timeout() -> u64 {
+    30
 }
 
 /// Egress action type for `NotifyEgressChange`
@@ -950,6 +979,9 @@ pub enum IpcResponse {
 
     /// WARP registration response
     WarpRegistration(WarpRegistrationResponse),
+
+    /// Speed test result response
+    SpeedTestResult(SpeedTestResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -2302,6 +2334,27 @@ pub struct WarpRegistrationResponse {
     pub ipv6_address: String,
     /// Account type (free or plus)
     pub account_type: String,
+}
+
+// ============================================================================
+// Speed Test Response
+// ============================================================================
+
+/// Speed test result response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedTestResponse {
+    /// Whether the test was successful
+    pub success: bool,
+    /// Download speed in Mbps
+    pub speed_mbps: f64,
+    /// Bytes downloaded
+    pub bytes_downloaded: u64,
+    /// Test duration in milliseconds
+    pub duration_ms: u64,
+    /// Outbound/tunnel used for the test
+    pub outbound: String,
+    /// Error message if failed
+    pub error: Option<String>,
 }
 
 /// IPC error
