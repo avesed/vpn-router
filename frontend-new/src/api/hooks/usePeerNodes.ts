@@ -129,3 +129,45 @@ export function useDisablePeerInbound() {
     },
   });
 }
+
+export function useBatchConnectPeerNodes() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (tags: string[]) => api.batchConnectPeerNodes(tags),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["peers"] });
+      const entries = Object.entries(data.results);
+      const successCount = entries.filter(([_, r]) => r.success).length;
+      const failCount = entries.filter(([_, r]) => !r.success).length;
+      if (failCount === 0) {
+        toast.success(`Connected ${successCount} peer(s)`);
+      } else {
+        toast.warning(`Connected ${successCount}, failed ${failCount}`);
+      }
+    },
+    onError: (error: Error) => {
+      toast.error(`Batch connect failed: ${error.message}`);
+    },
+  });
+}
+
+export function useBatchDisconnectPeerNodes() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (tags: string[]) => api.batchDisconnectPeerNodes(tags),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["peers"] });
+      const entries = Object.entries(data.results);
+      const successCount = entries.filter(([_, r]) => r.success).length;
+      const failCount = entries.filter(([_, r]) => !r.success).length;
+      if (failCount === 0) {
+        toast.success(`Disconnected ${successCount} peer(s)`);
+      } else {
+        toast.warning(`Disconnected ${successCount}, failed ${failCount}`);
+      }
+    },
+    onError: (error: Error) => {
+      toast.error(`Batch disconnect failed: ${error.message}`);
+    },
+  });
+}

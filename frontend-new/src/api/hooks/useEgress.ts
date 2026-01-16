@@ -209,3 +209,99 @@ export function useRefreshPiaCredentials() {
     },
   });
 }
+
+// OpenVPN Egress
+export function useOpenVPNEgress() {
+  return useQuery({
+    queryKey: egressKeys.openvpn,
+    queryFn: api.getOpenVPNEgress,
+  });
+}
+
+export function useCreateOpenVPNEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.createOpenVPNEgress,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.openvpn });
+    },
+  });
+}
+
+export function useUpdateOpenVPNEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tag, data }: { tag: string; data: Parameters<typeof api.updateOpenVPNEgress>[1] }) =>
+      api.updateOpenVPNEgress(tag, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.openvpn });
+    },
+  });
+}
+
+export function useDeleteOpenVPNEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteOpenVPNEgress,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.openvpn });
+    },
+  });
+}
+
+export function useParseOpenVPNConfig() {
+  return useMutation({
+    mutationFn: api.parseOpenVPNConfig,
+  });
+}
+
+// V2Ray Egress
+export function useV2RayEgress() {
+  return useQuery({
+    queryKey: egressKeys.v2ray,
+    queryFn: api.getV2RayEgress,
+  });
+}
+
+export function useCreateV2RayEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.createV2RayEgress,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.v2ray });
+    },
+  });
+}
+
+export function useUpdateV2RayEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tag, data }: { tag: string; data: Parameters<typeof api.updateV2RayEgress>[1] }) =>
+      api.updateV2RayEgress(tag, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.v2ray });
+    },
+  });
+}
+
+export function useDeleteV2RayEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteV2RayEgress,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.v2ray });
+    },
+  });
+}
+
+export function useParseV2RayURI() {
+  return useMutation({
+    mutationFn: api.parseV2RayURI,
+  });
+}

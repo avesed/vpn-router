@@ -27,6 +27,7 @@ const PIAPage = lazy(() => import("@/pages/PIAPage"));
 const BackupPage = lazy(() => import("@/pages/BackupPage"));
 const TopologyPage = lazy(() => import("@/pages/TopologyPage"));
 const DomainCatalogPage = lazy(() => import("@/pages/DomainCatalogPage"));
+const IpCatalogPage = lazy(() => import("@/pages/IpCatalogPage"));
 const OutboundGroupsPage = lazy(() => import("@/pages/OutboundGroupsPage"));
 
 // Loading fallback
@@ -86,7 +87,7 @@ function AppRoutes() {
           <Route path="groups" element={<OutboundGroupsPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="domain-catalog" element={<DomainCatalogPage />} />
-          <Route path="ip-catalog" element={<DomainCatalogPage />} />
+          <Route path="ip-catalog" element={<IpCatalogPage />} />
           <Route path="profiles" element={<Navigate to="/egress" replace />} />
           <Route path="adblock" element={<AdBlockPage />} />
           <Route path="pia" element={<PIAPage />} />

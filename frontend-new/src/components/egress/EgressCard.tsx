@@ -4,7 +4,7 @@ import type { EgressItem, EgressTrafficInfo } from "../../types";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { useTestEgress, useRefreshPiaCredentials } from "../../api/hooks/useEgress";
+import { useTestEgress } from "../../api/hooks/useEgress";
 import { toast } from "sonner";
 import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network, ArrowUpDown, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -13,6 +13,7 @@ interface EgressCardProps {
   egress: EgressItem;
   onDelete?: (tag: string) => void;
   onEdit?: (egress: EgressItem) => void;
+  onReconnect?: () => void;
   showActions?: boolean;
   trafficInfo?: EgressTrafficInfo;
 }
@@ -26,22 +27,10 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
 }
 
-export function EgressCard({ egress, onDelete, onEdit, showActions = true, trafficInfo }: EgressCardProps) {
+export function EgressCard({ egress, onDelete, onEdit, onReconnect, showActions = true, trafficInfo }: EgressCardProps) {
   const { t } = useTranslation();
   const [testResult, setTestResult] = useState<{ success: boolean; delay: number; message: string } | null>(null);
   const testEgress = useTestEgress();
-  const refreshPia = useRefreshPiaCredentials();
-
-  const handleRefreshPia = () => {
-    toast.promise(
-      refreshPia.mutateAsync(egress.tag),
-      {
-        loading: t("egress.refreshingCredentials"),
-        success: (data) => data.message || t("egress.credentialsRefreshed"),
-        error: (err) => `${t("egress.refreshFailed")}: ${err.message}`,
-      }
-    );
-  };
 
   const handleTest = () => {
     setTestResult(null);
@@ -149,15 +138,14 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true, traff
           <Button variant="ghost" size="icon" onClick={handleTest} disabled={testEgress.isPending} title={t("egress.test")}>
             <Play className="h-4 w-4" />
           </Button>
-          {egress.type === "pia" && (
+          {onReconnect && (
             <Button 
               variant="ghost" 
               size="icon" 
-              onClick={handleRefreshPia} 
-              disabled={refreshPia.isPending}
-              title={t("egress.refreshCredentials")}
+              onClick={onReconnect}
+              title={t("egress.reconnect", { defaultValue: "Reconnect" })}
             >
-              <RefreshCw className={cn("h-4 w-4", refreshPia.isPending && "animate-spin")} />
+              <RefreshCw className="h-4 w-4" />
             </Button>
           )}
           {onEdit && (

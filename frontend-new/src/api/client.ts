@@ -5,7 +5,6 @@ import type {
   PiaLoginResponse,
   PiaRegionsResponse,
   ProfilesResponse,
-  VpnProfile,
   RouteRulesResponse,
   RouteRule,
   DomainCatalogResponse,
@@ -304,9 +303,9 @@ export const api = {
   // Profile Management
   getProfiles: () => request<ProfilesResponse>("/profiles"),
   createProfile: (tag: string, description: string, regionId: string, customDns?: string) =>
-    request<{ message: string; profile: VpnProfile }>("/profiles", {
+    request<{ message: string; profile_id: number; provision?: { success: boolean; reload?: { success: boolean; message: string }; error?: string } }>("/profiles", {
       method: "POST",
-      body: { tag, description, region_id: regionId, custom_dns: customDns || null }
+      body: { tag, description, region_id: regionId, custom_dns: customDns || "" }
     }),
   updateProfile: (tag: string, data: { description?: string; region_id?: string; custom_dns?: string }) =>
     request<{ message: string }>(`/profiles/${tag}`, {

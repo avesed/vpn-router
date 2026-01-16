@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Table,
@@ -13,11 +14,13 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
-import { MoreHorizontal, Play, Square, Trash2, Activity } from "lucide-react";
+import { MoreHorizontal, Play, Square, Trash2, Activity, Edit } from "lucide-react";
 import type { NodeChain } from "../../types";
 import { ChainHealthStatus } from "./ChainHealthStatus";
+import { ChainEditDialog } from "./ChainEditDialog";
 import { useActivateChain, useDeactivateChain, useDeleteNodeChain, useChainHealthCheck } from "../../api/hooks/useChains";
 import { toast } from "sonner";
 import { Badge } from "../ui/badge";
@@ -28,6 +31,7 @@ interface ChainTableProps {
 
 export function ChainTable({ chains }: ChainTableProps) {
   const { t } = useTranslation();
+  const [editingChain, setEditingChain] = useState<NodeChain | null>(null);
   const activateChain = useActivateChain();
   const deactivateChain = useDeactivateChain();
   const deleteChain = useDeleteNodeChain();
@@ -81,6 +85,7 @@ export function ChainTable({ chains }: ChainTableProps) {
   };
 
   return (
+    <>
     <div className="rounded-md border">
       <Table>
         <TableHeader>
@@ -159,6 +164,10 @@ export function ChainTable({ chains }: ChainTableProps) {
                       <DropdownMenuItem onClick={() => handleHealthCheck(chain.tag)}>
                         <Activity className="mr-2 h-4 w-4" /> {t("chains.checkHealth")}
                       </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onClick={() => setEditingChain(chain)}>
+                        <Edit className="mr-2 h-4 w-4" /> {t("common.edit")}
+                      </DropdownMenuItem>
                       <DropdownMenuItem className="text-destructive" onClick={() => handleDelete(chain.tag)}>
                         <Trash2 className="mr-2 h-4 w-4" /> {t("common.delete")}
                       </DropdownMenuItem>
@@ -171,5 +180,12 @@ export function ChainTable({ chains }: ChainTableProps) {
         </TableBody>
       </Table>
     </div>
+    
+    <ChainEditDialog
+      open={!!editingChain}
+      onOpenChange={(open) => !open && setEditingChain(null)}
+      chain={editingChain}
+    />
+    </>
   );
 }

@@ -22,6 +22,7 @@ import {
   Languages,
   Scale,
 } from "lucide-react";
+import { MobileBottomNav } from "./MobileBottomNav";
 import {
   Sidebar,
   SidebarContent,
@@ -232,9 +233,17 @@ export function AppLayout() {
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4 justify-between">
           <div className="flex items-center gap-2">
-            <SidebarTrigger className="-ml-1" />
-            <Separator orientation="vertical" className="mr-2 h-4" />
-            <div className="flex items-center gap-2">
+            <SidebarTrigger className="-ml-1 hidden md:flex" />
+            <Separator orientation="vertical" className="mr-2 h-4 hidden md:block" />
+            {/* Mobile header - show brand on mobile */}
+            <div className="flex md:hidden items-center gap-2">
+              <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+                <ShieldCheck className="size-4" />
+              </div>
+              <span className="font-semibold">{t("nav.title")}</span>
+            </div>
+            {/* Desktop - show system status */}
+            <div className="hidden md:flex items-center gap-2">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
               <span className="text-sm text-muted-foreground">{t("nav.systemOnline")}</span>
             </div>
@@ -271,10 +280,12 @@ export function AppLayout() {
             </DropdownMenu>
           </div>
         </header>
-        <main className="flex-1 p-4 md:p-6">
+        <main className="flex-1 p-4 md:p-6 pb-20 md:pb-6">
           <Outlet />
         </main>
       </SidebarInset>
+      {/* Mobile bottom navigation */}
+      <MobileBottomNav />
     </SidebarProvider>
   );
 }

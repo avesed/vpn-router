@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useStatus } from "@/api/hooks/useStatus";
 import { useDashboardStats } from "@/api/hooks/useDashboardStats";
 import { 
@@ -25,10 +27,13 @@ import { formatBytes } from "@/lib/utils";
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d'];
 
+type TimeRange = "1m" | "1h" | "24h";
+
 export function DashboardPage() {
   const { t } = useTranslation();
+  const [timeRange, setTimeRange] = useState<TimeRange>("1m");
   const { data: status } = useStatus();
-  const { data: stats, isLoading: isStatsLoading, error: statsError } = useDashboardStats("1m");
+  const { data: stats, isLoading: isStatsLoading, error: statsError } = useDashboardStats(timeRange);
 
   const pieData = stats?.traffic_by_outbound
     ? Object.entries(stats.traffic_by_outbound).map(([name, data]) => ({
@@ -122,8 +127,24 @@ export function DashboardPage() {
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-7">
         <Card className="col-span-4">
-          <CardHeader>
+          <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>{t("dashboard.networkSpeed")}</CardTitle>
+            <ToggleGroup
+              type="single"
+              value={timeRange}
+              onValueChange={(value: string) => value && setTimeRange(value as TimeRange)}
+              className="h-8"
+            >
+              <ToggleGroupItem value="1m" aria-label="1 minute" className="text-xs px-2 h-7">
+                {t("dashboard.1m", { defaultValue: "1m" })}
+              </ToggleGroupItem>
+              <ToggleGroupItem value="1h" aria-label="1 hour" className="text-xs px-2 h-7">
+                {t("dashboard.1h", { defaultValue: "1h" })}
+              </ToggleGroupItem>
+              <ToggleGroupItem value="24h" aria-label="24 hours" className="text-xs px-2 h-7">
+                {t("dashboard.24h", { defaultValue: "24h" })}
+              </ToggleGroupItem>
+            </ToggleGroup>
           </CardHeader>
           <CardContent className="pl-2">
             <div className="h-[300px]">
