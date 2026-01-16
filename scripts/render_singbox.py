@@ -947,8 +947,18 @@ def ensure_outbound_selector(config: dict, all_egress_tags: List[str], default_o
     """
     outbounds = config.setdefault("outbounds", [])
 
-    # 收集所有可用出口（包括 direct）
-    available = ["direct"] + list(all_egress_tags)
+    # 获取实际存在于 config 中的 outbound tags
+    existing_outbound_tags = {ob.get("tag") for ob in outbounds if ob.get("tag")}
+
+    # 收集所有可用出口（只包含实际存在的 outbounds）
+    # Phase 6-Fix: 在 userspace WireGuard 模式下，某些出口（如 WARP）由 rust-router 管理，
+    # 不会在 sing-box config 中创建对应的 outbound。需要过滤掉这些不存在的 tags。
+    available = ["direct"] + [tag for tag in all_egress_tags if tag in existing_outbound_tags]
+
+    # 记录被过滤掉的 tags（便于调试）
+    filtered_tags = [tag for tag in all_egress_tags if tag not in existing_outbound_tags]
+    if filtered_tags:
+        print(f"[render] 过滤掉 {len(filtered_tags)} 个由 IPC 管理的出口: {filtered_tags}")
 
     # 验证 default_outbound 是否有效
     if default_outbound not in available:
@@ -1567,6 +1577,9 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
     - WireGuard: 通过内核 WireGuard 接口 (sing-box direct outbound + bind_interface)
     - MASQUE 协议已弃用
 
+    Phase 6-Fix: 在 userspace WireGuard 模式下，WARP 隧道由 rust-router 管理，
+    不需要在 sing-box 中创建 outbound。只返回 tags 供 all_egress_tags 使用。
+
     Args:
         config: sing-box 配置
         warp_egress: WARP 出口列表
@@ -1576,6 +1589,9 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
     """
     if not warp_egress:
         return []
+
+    # Phase 6-Fix: Check if running in userspace WireGuard mode
+    userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
 
     # Import here to avoid circular dependency
     from db_helper import get_egress_interface_name
@@ -1592,6 +1608,12 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
             continue
 
         warp_tags.append(tag)
+
+        # Phase 6-Fix: 在 userspace 模式下，不创建 sing-box outbound
+        # WARP 隧道由 rust-router 通过 IPC 管理
+        if userspace_wg:
+            print(f"[render] WARP 出口 {tag} 由 rust-router 管理 (userspace WireGuard)")
+            continue
 
         # Phase 3: Only WireGuard protocol supported
         # WireGuard 协议: 使用内核 WireGuard 接口

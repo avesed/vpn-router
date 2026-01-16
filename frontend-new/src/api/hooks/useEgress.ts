@@ -26,6 +26,15 @@ export function useAllEgress() {
   });
 }
 
+// Egress Traffic Stats (for WireGuard tunnels)
+export function useEgressTraffic() {
+  return useQuery({
+    queryKey: ["egress", "traffic"] as const,
+    queryFn: api.getEgressTraffic,
+    refetchInterval: 10000, // Refresh every 10 seconds
+  });
+}
+
 // Test Egress
 export function useTestEgress() {
   return useMutation({

@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use super::stats::{ConnectionStats, StatsSnapshot};
 use super::tcp::{spawn_tcp_handler, TcpConnectionContext};
 use crate::config::ConnectionConfig;
+use crate::ecmp::EcmpGroupManager;
 use crate::error::ConnectionError;
 use crate::outbound::OutboundManager;
 use crate::tproxy::{TproxyConnection, TproxyListener};
@@ -32,6 +33,9 @@ pub struct ConnectionManager {
 
     /// Outbound manager
     outbound_manager: Arc<OutboundManager>,
+
+    /// Phase 6-Fix.AI: ECMP group manager for load balancing
+    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
     /// Default outbound tag
     default_outbound: String,
@@ -70,6 +74,7 @@ impl ConnectionManager {
             max_connections: config.max_connections,
             stats: Arc::new(ConnectionStats::new()),
             outbound_manager,
+            ecmp_group_manager: None,
             default_outbound,
             sniff_timeout,
             connect_timeout: config.connect_timeout(),
@@ -78,6 +83,11 @@ impl ConnectionManager {
             shutdown_tx,
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Phase 6-Fix.AI: Set ECMP group manager for load balancing
+    pub fn set_ecmp_group_manager(&mut self, ecmp_manager: Arc<EcmpGroupManager>) {
+        self.ecmp_group_manager = Some(ecmp_manager);
     }
 
     /// Handle a new connection with backpressure
@@ -122,9 +132,11 @@ impl ConnectionManager {
         );
 
         // Create connection context
+        // Phase 6-Fix.AI: Include ECMP group manager for load balancing support
         let ctx = TcpConnectionContext {
             conn,
             outbound_manager: Arc::clone(&self.outbound_manager),
+            ecmp_group_manager: self.ecmp_group_manager.clone(),
             sniff_timeout: self.sniff_timeout,
             connect_timeout: self.connect_timeout,
             default_outbound: self.default_outbound.clone(),

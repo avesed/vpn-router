@@ -60,6 +60,7 @@ use tracing::{debug, info, trace, warn};
 use super::manager::{ProcessedPacket, WgIngressManager};
 use super::processor::RoutingDecision;
 use crate::chain::dscp::set_dscp;
+use crate::ecmp::{EcmpGroupManager, FiveTuple as EcmpFiveTuple, Protocol as EcmpProtocol};
 use crate::egress::manager::WgEgressManager;
 use crate::outbound::OutboundManager;
 use crate::rules::fwmark::ChainMark;
@@ -1672,6 +1673,7 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 /// * `local_ip` - Gateway's local IP for responding to pings to self
+/// * `ecmp_group_manager` - Optional ECMP group manager for load balancing
 pub async fn run_forwarding_loop(
     mut packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
@@ -1681,6 +1683,7 @@ pub async fn run_forwarding_loop(
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     local_ip: Option<IpAddr>,
+    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 ) {
     info!("Ingress forwarding loop started");
 
@@ -1740,6 +1743,7 @@ pub async fn run_forwarding_loop(
                     &session_tracker,
                     &stats,
                     direct_reply_tx.clone(),
+                    ecmp_group_manager.as_ref(),
                 )
                 .await;
             }
@@ -1757,6 +1761,7 @@ pub async fn run_forwarding_loop(
                         &session_tracker,
                         &stats,
                         direct_reply_tx.clone(),
+                        ecmp_group_manager.as_ref(),
                     )
                     .await;
                 } else {
@@ -2034,8 +2039,9 @@ async fn forward_tcp_packet(
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
+    ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
 ) {
-    let outbound_tag = &processed.routing.outbound;
+    let routing_outbound = &processed.routing.outbound;
 
     // Create 5-tuple for connection tracking
     let five_tuple = FiveTuple::new(
@@ -2045,6 +2051,39 @@ async fn forward_tcp_packet(
         tcp_details.dst_port,
         IPPROTO_TCP,
     );
+
+    // Phase 6-Fix.AI: Resolve ECMP group to member using five-tuple hash
+    let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
+        if let Some(group) = ecmp_mgr.get_group(routing_outbound) {
+            // Create ECMP five-tuple for consistent hashing
+            let ecmp_tuple = EcmpFiveTuple::new(
+                parsed.src_ip,
+                parsed.dst_ip,
+                tcp_details.src_port,
+                tcp_details.dst_port,
+                EcmpProtocol::Tcp,
+            );
+            match group.select_by_connection(&ecmp_tuple) {
+                Ok(member) => {
+                    info!(
+                        "ECMP resolved '{}' -> '{}' for TCP {}:{} -> {}:{}",
+                        routing_outbound, member, parsed.src_ip, tcp_details.src_port,
+                        parsed.dst_ip, tcp_details.dst_port
+                    );
+                    member
+                }
+                Err(e) => {
+                    warn!("ECMP group '{}' selection failed: {}", routing_outbound, e);
+                    routing_outbound.clone()
+                }
+            }
+        } else {
+            routing_outbound.clone()
+        }
+    } else {
+        routing_outbound.clone()
+    };
+    let outbound_tag = &outbound_tag;
 
     // Check if this goes to a WireGuard egress (full IP packet forwarding)
     let is_wg_egress = outbound_tag.starts_with("wg-")
@@ -2580,8 +2619,9 @@ async fn forward_udp_packet(
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
+    ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
 ) {
-    let outbound_tag = &processed.routing.outbound;
+    let routing_outbound = &processed.routing.outbound;
 
     // Get ports
     let Some(src_port) = parsed.src_port else {
@@ -2696,8 +2736,43 @@ async fn forward_udp_packet(
         }
     }
 
-    // Register session for reply routing
+    // Create 5-tuple for session tracking
     let five_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP);
+
+    // Phase 6-Fix.AI: Resolve ECMP group to member using five-tuple hash
+    let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
+        if let Some(group) = ecmp_mgr.get_group(routing_outbound) {
+            // Create ECMP five-tuple for consistent hashing
+            let ecmp_tuple = EcmpFiveTuple::new(
+                parsed.src_ip,
+                parsed.dst_ip,
+                src_port,
+                dst_port,
+                EcmpProtocol::Udp,
+            );
+            match group.select_by_connection(&ecmp_tuple) {
+                Ok(member) => {
+                    info!(
+                        "ECMP resolved '{}' -> '{}' for UDP {}:{} -> {}:{}",
+                        routing_outbound, member, parsed.src_ip, src_port,
+                        parsed.dst_ip, dst_port
+                    );
+                    member
+                }
+                Err(e) => {
+                    warn!("ECMP group '{}' selection failed: {}", routing_outbound, e);
+                    routing_outbound.clone()
+                }
+            }
+        } else {
+            routing_outbound.clone()
+        }
+    } else {
+        routing_outbound.clone()
+    };
+    let outbound_tag = &outbound_tag;
+
+    // Register session for reply routing
     session_tracker.register(
         five_tuple,
         processed.peer_public_key.clone(),
@@ -3666,6 +3741,7 @@ pub fn spawn_forwarding_task(
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     local_ip: Option<IpAddr>,
+    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_forwarding_loop(
         packet_rx,
@@ -3676,6 +3752,7 @@ pub fn spawn_forwarding_task(
         stats,
         direct_reply_tx,
         local_ip,
+        ecmp_group_manager,
     ))
 }
 

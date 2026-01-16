@@ -59,6 +59,7 @@ use moka::sync::Cache;
 use tracing::{debug, trace, warn};
 
 use super::udp::{UdpSessionConfig, UdpSessionKey};
+use crate::ecmp::{EcmpGroupManager, FiveTuple, Protocol};
 use crate::error::UdpError;
 use crate::outbound::{Outbound, OutboundManager, UdpOutboundHandle};
 use crate::rules::engine::{ConnectionInfo, RuleEngine};
@@ -328,6 +329,8 @@ pub struct UdpPacketProcessor {
     decrement_counter: AtomicU64,
     /// SEC-2 FIX: Last cleanup timestamp, protected by Mutex for thread-safe updates
     last_cleanup: Mutex<Instant>,
+    /// Phase 6-Fix.AI: ECMP group manager for load balancing
+    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 }
 
 impl UdpPacketProcessor {
@@ -369,6 +372,7 @@ impl UdpPacketProcessor {
             ip_session_counts,
             decrement_counter: AtomicU64::new(0),
             last_cleanup: Mutex::new(Instant::now()),
+            ecmp_group_manager: None,
         }
     }
 
@@ -376,6 +380,83 @@ impl UdpPacketProcessor {
     #[must_use]
     pub fn new_default() -> Self {
         Self::new(UdpProcessorConfig::default())
+    }
+
+    /// Phase 6-Fix.AI: Set ECMP group manager for load balancing
+    pub fn with_ecmp_group_manager(mut self, ecmp_manager: Arc<EcmpGroupManager>) -> Self {
+        self.ecmp_group_manager = Some(ecmp_manager);
+        self
+    }
+
+    /// Phase 6-Fix.AI: Set ECMP group manager (mutable reference version)
+    pub fn set_ecmp_group_manager(&mut self, ecmp_manager: Arc<EcmpGroupManager>) {
+        self.ecmp_group_manager = Some(ecmp_manager);
+    }
+
+    /// Phase 6-Fix.AI: Resolve an outbound tag, checking ECMP groups if needed.
+    ///
+    /// This method first tries to find the tag in `outbound_manager`. If not found
+    /// and an ECMP group manager is configured, it checks if the tag is an ECMP
+    /// group and selects a member using the five-tuple hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The outbound tag to resolve
+    /// * `packet` - The UDP packet (for building five-tuple)
+    /// * `outbound_manager` - The outbound manager
+    ///
+    /// # Returns
+    ///
+    /// The resolved outbound and its tag, or None if not found.
+    fn resolve_outbound_with_ecmp(
+        &self,
+        tag: &str,
+        packet: &UdpPacketInfo,
+        outbound_manager: &OutboundManager,
+    ) -> Option<(Arc<dyn Outbound>, String)> {
+        // Try direct lookup first
+        if let Some(outbound) = outbound_manager.get(tag) {
+            return Some((outbound, tag.to_string()));
+        }
+
+        // Check if it's an ECMP group
+        if let Some(ref ecmp_mgr) = self.ecmp_group_manager {
+            if ecmp_mgr.has_group(tag) {
+                // Build five-tuple for load balancing
+                let five_tuple = FiveTuple::new(
+                    packet.client_addr.ip(),
+                    packet.original_dst.ip(),
+                    packet.client_addr.port(),
+                    packet.original_dst.port(),
+                    Protocol::Udp,
+                );
+
+                // Select member using the group's load balancing algorithm
+                if let Some(group) = ecmp_mgr.get_group(tag) {
+                    match group.select_by_connection(&five_tuple) {
+                        Ok(member_tag) => {
+                            debug!(
+                                "ECMP group '{}' selected member '{}' for {} -> {}",
+                                tag, member_tag, packet.client_addr, packet.original_dst
+                            );
+                            // Recursively resolve the member (it might be in outbound_manager)
+                            if let Some(outbound) = outbound_manager.get(&member_tag) {
+                                return Some((outbound, member_tag));
+                            }
+                            warn!(
+                                "ECMP member '{}' not found in outbound_manager",
+                                member_tag
+                            );
+                        }
+                        Err(e) => {
+                            warn!("ECMP group '{}' failed to select member: {}", tag, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     /// SEC-1 FIX: Check if source IP has exceeded session limit.
@@ -705,14 +786,23 @@ impl UdpPacketProcessor {
             !match_result.is_default()
         );
 
-        // Get outbound from manager
-        let outbound = if let Some(o) = outbound_manager.get(&match_result.outbound) { o } else {
+        // Phase 6-Fix.AI: Get outbound from manager with ECMP group resolution
+        // This supports both direct outbounds and ECMP load balancing groups
+        let (outbound, actual_outbound_tag) = if let Some(resolved) =
+            self.resolve_outbound_with_ecmp(&match_result.outbound, packet, outbound_manager)
+        {
+            resolved
+        } else {
             warn!(
                 "Outbound '{}' not found, using default",
                 match_result.outbound
             );
-            // Try to get default
-            if let Some(o) = outbound_manager.get(&rule_engine.default_outbound()) { o } else {
+            // Try to resolve the default outbound (which could also be an ECMP group)
+            if let Some(resolved) =
+                self.resolve_outbound_with_ecmp(&rule_engine.default_outbound(), packet, outbound_manager)
+            {
+                resolved
+            } else {
                 // Counter drift fix: decrement counter since session won't be created
                 self.decrement_ip_session_count(source_ip);
                 return ProcessResult::Failed {
@@ -730,9 +820,10 @@ impl UdpPacketProcessor {
 
         // Create routing info - move sniffed_domain instead of cloning
         // since it's not used after this point
+        // Phase 6-Fix.AI: Use actual_outbound_tag which reflects ECMP member selection
         let routing_info = UdpRoutingInfo {
             domain: sniffed_domain,
-            outbound: outbound.tag().to_string(),
+            outbound: actual_outbound_tag,
             routing_mark: match_result.routing_mark,
             rule_matched: !match_result.is_default(),
         };

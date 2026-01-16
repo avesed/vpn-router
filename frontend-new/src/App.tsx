@@ -27,6 +27,7 @@ const PIAPage = lazy(() => import("@/pages/PIAPage"));
 const BackupPage = lazy(() => import("@/pages/BackupPage"));
 const TopologyPage = lazy(() => import("@/pages/TopologyPage"));
 const DomainCatalogPage = lazy(() => import("@/pages/DomainCatalogPage"));
+const OutboundGroupsPage = lazy(() => import("@/pages/OutboundGroupsPage"));
 
 // Loading fallback
 function PageLoader() {
@@ -82,6 +83,7 @@ function AppRoutes() {
           <Route path="chains" element={<ChainsPage />} />
           <Route path="topology" element={<TopologyPage />} />
           <Route path="egress" element={<EgressPage />} />
+          <Route path="groups" element={<OutboundGroupsPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="domain-catalog" element={<DomainCatalogPage />} />
           <Route path="ip-catalog" element={<DomainCatalogPage />} />

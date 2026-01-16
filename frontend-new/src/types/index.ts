@@ -354,6 +354,19 @@ export interface AllEgressResponse {
   warp?: EgressItem[];
 }
 
+// Traffic stats for WireGuard tunnels
+export interface EgressTrafficInfo {
+  tx_bytes: number;
+  rx_bytes: number;
+  active: boolean;
+  endpoint: string;
+  last_handshake: number;
+}
+
+export interface EgressTrafficResponse {
+  traffic: Record<string, EgressTrafficInfo>;
+}
+
 // Direct Egress (绑定特定接口/IP 的直连出口)
 export interface DirectEgress {
   id?: number;

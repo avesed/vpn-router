@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { EgressItem } from "../../types";
+import type { EgressItem, EgressTrafficInfo } from "../../types";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { useTestEgress } from "../../api/hooks/useEgress";
 import { toast } from "sonner";
-import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network } from "lucide-react";
+import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network, ArrowUpDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface EgressCardProps {
@@ -14,9 +14,19 @@ interface EgressCardProps {
   onDelete?: (tag: string) => void;
   onEdit?: (egress: EgressItem) => void;
   showActions?: boolean;
+  trafficInfo?: EgressTrafficInfo;
 }
 
-export function EgressCard({ egress, onDelete, onEdit, showActions = true }: EgressCardProps) {
+// Format bytes to human readable string
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+export function EgressCard({ egress, onDelete, onEdit, showActions = true, trafficInfo }: EgressCardProps) {
   const { t } = useTranslation();
   const [testResult, setTestResult] = useState<{ success: boolean; delay: number; message: string } | null>(null);
   const testEgress = useTestEgress();
@@ -55,6 +65,9 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
     return "bg-orange-100 text-orange-800";
   };
 
+  // Calculate total traffic
+  const totalTraffic = trafficInfo ? trafficInfo.tx_bytes + trafficInfo.rx_bytes : 0;
+
   return (
     <Card className="w-full">
       <CardHeader className="pb-2">
@@ -66,9 +79,17 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
               <CardDescription className="text-xs mt-1">{egress.description || t("egress.noDescription")}</CardDescription>
             </div>
           </div>
-          <Badge variant={egress.is_configured ? "default" : "secondary"}>
-            {egress.type.toUpperCase()}
-          </Badge>
+          <div className="flex items-center gap-2">
+            {trafficInfo && trafficInfo.active && (
+              <Badge variant="outline" className="text-xs text-emerald-600 border-emerald-600">
+                <ArrowUpDown className="h-3 w-3 mr-1" />
+                {formatBytes(totalTraffic)}
+              </Badge>
+            )}
+            <Badge variant={egress.is_configured ? "default" : "secondary"}>
+              {egress.type.toUpperCase()}
+            </Badge>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="pb-2 text-sm">
@@ -89,6 +110,16 @@ export function EgressCard({ egress, onDelete, onEdit, showActions = true }: Egr
             <div className="flex flex-col">
               <span className="text-xs text-muted-foreground">{t("egress.interface")}</span>
               <span className="font-medium">{egress.bind_interface}</span>
+            </div>
+          )}
+          {/* Traffic details for WireGuard tunnels */}
+          {trafficInfo && trafficInfo.active && (
+            <div className="col-span-2 mt-2 flex items-center gap-4 text-xs text-muted-foreground">
+              <span>↑ {formatBytes(trafficInfo.tx_bytes)}</span>
+              <span>↓ {formatBytes(trafficInfo.rx_bytes)}</span>
+              {trafficInfo.endpoint && (
+                <span className="truncate" title={trafficInfo.endpoint}>{trafficInfo.endpoint}</span>
+              )}
             </div>
           )}
           {testResult && (

@@ -134,10 +134,10 @@ class ChainRouteManager:
                 from db_helper import get_egress_interface_name
                 return get_egress_interface_name(egress_tag, is_pia=False)
 
-        # 检查 WARP WireGuard
+        # WARP egress (Phase 3: 所有 WARP 现在都是 WireGuard)
         warp_list = self.db.get_warp_egress_list(enabled_only=True)
         for e in warp_list:
-            if e["tag"] == egress_tag and e.get("protocol") == "wireguard":
+            if e["tag"] == egress_tag:
                 from db_helper import get_egress_interface_name
                 return get_egress_interface_name(egress_tag, egress_type="warp")
 

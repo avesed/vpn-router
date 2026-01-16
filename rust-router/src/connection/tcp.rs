@@ -10,9 +10,10 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
+use crate::ecmp::{EcmpGroupManager, FiveTuple, Protocol};
 use crate::error::{ConnectionError, RustRouterError};
 use crate::io::{bidirectional_copy, CopyResult};
-use crate::outbound::OutboundManager;
+use crate::outbound::{Outbound, OutboundManager};
 use crate::sniff::sniff_tls_sni;
 use crate::tproxy::TproxyConnection;
 
@@ -23,6 +24,9 @@ pub struct TcpConnectionContext {
 
     /// Outbound manager
     pub outbound_manager: Arc<OutboundManager>,
+
+    /// Phase 6-Fix.AI: ECMP group manager for load balancing
+    pub ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
     /// Sniff timeout
     pub sniff_timeout: Duration,
@@ -103,14 +107,24 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
     // For now, use default outbound
     let outbound_tag = &ctx.default_outbound;
 
-    // Get the outbound
-    let outbound = if let Some(o) = ctx.outbound_manager.get(outbound_tag) { o } else {
-        error!("Outbound '{}' not found", outbound_tag);
-        result.error = Some(format!("Outbound '{outbound_tag}' not found"));
-        return result;
+    // Phase 6-Fix.AI: Get the outbound with ECMP group resolution
+    // This supports both direct outbounds and ECMP load balancing groups
+    let (outbound, actual_outbound_tag) = match resolve_outbound_with_ecmp(
+        outbound_tag,
+        client_addr,
+        original_dst,
+        &ctx.outbound_manager,
+        ctx.ecmp_group_manager.as_ref(),
+    ) {
+        Some(resolved) => resolved,
+        None => {
+            error!("Outbound '{}' not found", outbound_tag);
+            result.error = Some(format!("Outbound '{outbound_tag}' not found"));
+            return result;
+        }
     };
 
-    result.outbound_tag = outbound_tag.clone();
+    result.outbound_tag = actual_outbound_tag.clone();
 
     // Connect to upstream
     let upstream = match outbound.connect(original_dst, ctx.connect_timeout).await {
@@ -197,6 +211,75 @@ fn is_tls_port(port: u16) -> bool {
         | 990   // FTPS control
         | 5061  // SIP over TLS
     )
+}
+
+/// Phase 6-Fix.AI: Resolve outbound tag to actual outbound, with ECMP group support.
+///
+/// If the tag refers to an ECMP group, this function selects a member using
+/// five-tuple hashing for connection affinity. Otherwise, it performs a direct
+/// lookup in the outbound manager.
+///
+/// # Arguments
+///
+/// * `tag` - The outbound or group tag to resolve
+/// * `client_addr` - Client socket address
+/// * `original_dst` - Original destination socket address
+/// * `outbound_manager` - Manager for direct outbounds
+/// * `ecmp_group_manager` - Optional ECMP group manager
+///
+/// # Returns
+///
+/// Tuple of (outbound, actual_tag) if found, None otherwise
+fn resolve_outbound_with_ecmp(
+    tag: &str,
+    client_addr: SocketAddr,
+    original_dst: SocketAddr,
+    outbound_manager: &OutboundManager,
+    ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
+) -> Option<(Arc<dyn Outbound>, String)> {
+    // Try direct lookup first
+    if let Some(outbound) = outbound_manager.get(tag) {
+        return Some((outbound, tag.to_string()));
+    }
+
+    // Check if it's an ECMP group
+    if let Some(ecmp_mgr) = ecmp_group_manager {
+        if ecmp_mgr.has_group(tag) {
+            // Build five-tuple for load balancing
+            let five_tuple = FiveTuple::new(
+                client_addr.ip(),
+                original_dst.ip(),
+                client_addr.port(),
+                original_dst.port(),
+                Protocol::Tcp,
+            );
+
+            // Select member using the group's load balancing algorithm
+            if let Some(group) = ecmp_mgr.get_group(tag) {
+                match group.select_by_connection(&five_tuple) {
+                    Ok(member_tag) => {
+                        debug!(
+                            "ECMP group '{}' selected member '{}' for TCP {} -> {}",
+                            tag, member_tag, client_addr, original_dst
+                        );
+                        // Recursively resolve the member
+                        if let Some(outbound) = outbound_manager.get(&member_tag) {
+                            return Some((outbound, member_tag));
+                        }
+                        warn!(
+                            "ECMP member '{}' not found in outbound_manager",
+                            member_tag
+                        );
+                    }
+                    Err(e) => {
+                        warn!("ECMP group '{}' failed to select member: {}", tag, e);
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Spawn a task to handle a TCP connection with proper instrumentation

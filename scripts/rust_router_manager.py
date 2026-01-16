@@ -1439,13 +1439,15 @@ class RustRouterManager:
 
                         # Get members from the group dict (already parsed JSON)
                         members_list = group.get("members", [])
-                        weights_list = group.get("weights") or []
+                        weights_dict = group.get("weights") or {}
 
                         # Build member dicts
+                        # Phase 6-Fix.AI: Use 'outbound' key to match Rust EcmpMemberConfig struct
+                        # Weights is a dict: {"member-tag": weight, ...}
                         members = []
-                        for i, member_tag in enumerate(members_list):
-                            weight = weights_list[i] if i < len(weights_list) else 1
-                            members.append({"tag": member_tag, "weight": weight})
+                        for member_tag in members_list:
+                            weight = weights_dict.get(member_tag, 1) if isinstance(weights_dict, dict) else 1
+                            members.append({"outbound": member_tag, "weight": weight})
 
                         if tag in current_tags:
                             # Update existing group's members

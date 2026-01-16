@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAllEgress, useDeleteCustomEgress, useDeleteDirectEgress, useDeleteWarpEgress } from "../../api/hooks/useEgress";
+import { useAllEgress, useDeleteCustomEgress, useDeleteDirectEgress, useDeleteWarpEgress, useEgressTraffic } from "../../api/hooks/useEgress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { EgressCard } from "./EgressCard";
 import { Button } from "../ui/button";
@@ -14,6 +14,7 @@ import type { EgressItem } from "../../types";
 export function EgressTabs() {
   const { t } = useTranslation();
   const { data: allEgress, isLoading, error } = useAllEgress();
+  const { data: trafficData } = useEgressTraffic(); // Auto-refresh every 10s
   const deleteCustom = useDeleteCustomEgress();
   const deleteDirect = useDeleteDirectEgress();
   const deleteWarp = useDeleteWarpEgress();
@@ -88,6 +89,7 @@ export function EgressTabs() {
             egress={egress}
             onDelete={type !== "pia" && type !== "openvpn" && type !== "v2ray" ? (tag) => handleDelete(type, tag) : undefined}
             showActions={true}
+            trafficInfo={trafficData?.traffic?.[egress.tag]}
           />
         ))}
       </div>

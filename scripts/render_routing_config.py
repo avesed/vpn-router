@@ -151,10 +151,24 @@ class RuleConfig:
 
 
 @dataclass
+class EcmpGroupConfig:
+    """ECMP load balancing group configuration"""
+    tag: str
+    members: List[str]
+    group_type: str = "loadbalance"  # "loadbalance" or "failover"
+    weights: Optional[Dict[str, int]] = None
+    routing_table: Optional[int] = None
+    enabled: bool = True
+    health_check_url: Optional[str] = None
+    health_check_interval: Optional[int] = None
+
+
+@dataclass
 class RoutingConfig:
     """Complete routing configuration"""
     outbounds: List[OutboundConfig] = field(default_factory=list)
     rules: List[RuleConfig] = field(default_factory=list)
+    ecmp_groups: List[EcmpGroupConfig] = field(default_factory=list)
     default_outbound: str = "direct"
     dns_servers: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -527,6 +541,33 @@ class DatabaseLoader:
             logger.error(f"Failed to load default outbound: {e}")
             return "direct"
 
+    def load_outbound_groups(self) -> List[EcmpGroupConfig]:
+        """Load ECMP outbound groups from database"""
+        groups = []
+        db = self._get_db()
+        if not db:
+            logger.warning("Database not available for outbound groups loading")
+            return groups
+
+        try:
+            db_groups = db.get_outbound_groups(enabled_only=True)
+            for group in db_groups:
+                groups.append(EcmpGroupConfig(
+                    tag=group.get("tag", ""),
+                    members=group.get("members", []),
+                    group_type=group.get("type", "loadbalance"),
+                    weights=group.get("weights"),
+                    routing_table=group.get("routing_table"),
+                    enabled=bool(group.get("enabled", True)),
+                    health_check_url=group.get("health_check_url"),
+                    health_check_interval=group.get("health_check_interval"),
+                ))
+            logger.info(f"Loaded {len(groups)} outbound groups")
+        except Exception as e:
+            logger.error(f"Failed to load outbound groups: {e}")
+
+        return groups
+
     def load_all(self) -> RoutingConfig:
         """Load complete routing configuration"""
         outbounds = []
@@ -543,6 +584,9 @@ class DatabaseLoader:
         outbounds.extend(self.load_openvpn_egress())
         outbounds.extend(self.load_direct_egress())
 
+        # Load ECMP groups
+        ecmp_groups = self.load_outbound_groups()
+
         # Load rules and default
         rules = self.load_routing_rules()
         default_outbound = self.load_default_outbound()
@@ -550,6 +594,7 @@ class DatabaseLoader:
         return RoutingConfig(
             outbounds=outbounds,
             rules=rules,
+            ecmp_groups=ecmp_groups,
             default_outbound=default_outbound,
         )
 
@@ -589,6 +634,12 @@ class RustRouterConfigGenerator:
                 valid_outbound_tags.add(ob.tag)
                 logger.debug(f"Marked SOCKS5 outbound '{ob.tag}' as valid (managed via IPC)")
 
+        # Phase 6-Fix.AI: Add ECMP group tags to valid outbounds
+        # Groups are managed via IPC (CreateEcmpGroup command) but rules can reference them
+        for group in config.ecmp_groups:
+            valid_outbound_tags.add(group.tag)
+            logger.debug(f"Marked ECMP group '{group.tag}' as valid (managed via IPC)")
+
         # Phase 6-Fix.AF: Check if default outbound is IPC-managed (SOCKS5/WireGuard)
         # These outbounds are added dynamically via IPC, not in static config.
         # Set static default to "direct", then Python manager sets real default via IPC.
@@ -601,6 +652,9 @@ class RustRouterConfigGenerator:
             if ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER,
                                   EgressType.V2RAY):
                 ipc_managed_tags.add(ob.tag)
+        # ECMP groups are also IPC-managed
+        for group in config.ecmp_groups:
+            ipc_managed_tags.add(group.tag)
 
         if default_outbound in ipc_managed_tags:
             logger.info(f"Default outbound '{default_outbound}' is IPC-managed, using 'direct' in static config")

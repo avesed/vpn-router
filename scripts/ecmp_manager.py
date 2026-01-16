@@ -116,16 +116,10 @@ def get_interface_for_egress(db, tag: str) -> Optional[str]:
     if direct and direct.get("bind_interface"):
         return direct["bind_interface"]
 
-    # 检查 WARP egress
+    # WARP egress (Phase 3: 所有 WARP 现在都是 WireGuard)
     warp = db.get_warp_egress(tag)
     if warp:
-        # WARP WireGuard 协议使用内核接口
-        if warp.get("protocol") == "wireguard":
-            return get_egress_interface_name(tag, egress_type="warp")
-        else:
-            # WARP MASQUE 使用 SOCKS 代理，不是内核接口
-            logger.warning(f"WARP egress '{tag}' uses SOCKS proxy, not kernel interface")
-            return None
+        return get_egress_interface_name(tag, egress_type="warp")
 
     # 检查 OpenVPN egress（使用 TUN 设备）
     openvpn = db.get_openvpn_egress(tag)

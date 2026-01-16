@@ -24,6 +24,7 @@ import type {
   SubnetInfo,
   SubnetUpdateResponse,
   AllEgressResponse,
+  EgressTrafficResponse,
   CustomEgressListResponse,
   CustomEgress,
   CustomEgressCreateRequest,
@@ -461,6 +462,7 @@ export const api = {
 
   // Egress Management
   getAllEgress: () => request<AllEgressResponse>("/egress"),
+  getEgressTraffic: () => request<EgressTrafficResponse>("/egress/traffic"),
   getCustomEgress: () => request<CustomEgressListResponse>("/egress/custom"),
   createCustomEgress: (data: CustomEgressCreateRequest) =>
     request<{ message: string; egress: CustomEgress }>("/egress/custom", {

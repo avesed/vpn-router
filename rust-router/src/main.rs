@@ -348,13 +348,20 @@ async fn main() -> Result<()> {
         .expect("Failed to create default routing snapshot");
     let rule_engine = Arc::new(RuleEngine::new(routing_snapshot));
 
-    // Create connection manager
-    let connection_manager = Arc::new(ConnectionManager::new(
+    // Phase 6-Fix.AI: Create EcmpGroupManager early so we can pass it to ConnectionManager
+    // This is needed for ECMP load balancing group support in routing
+    let ecmp_group_manager = Arc::new(EcmpGroupManager::new());
+    debug!("Created EcmpGroupManager for load balancing");
+
+    // Create connection manager with ECMP support
+    let mut connection_manager = ConnectionManager::new(
         &config.connection,
         Arc::clone(&outbound_manager),
         config.default_outbound.clone(),
         config.listen.sniff_timeout(),
-    ));
+    );
+    connection_manager.set_ecmp_group_manager(Arc::clone(&ecmp_group_manager));
+    let connection_manager = Arc::new(connection_manager);
 
     // Create TPROXY listener (TCP)
     let listener = TproxyListener::bind(&config.listen)
@@ -366,9 +373,12 @@ async fn main() -> Result<()> {
         // The actual session tracking happens inside UdpPacketProcessor's handle_cache
         let session_manager = Arc::new(UdpSessionManager::new(UdpSessionConfig::default()));
 
-        // Create UDP packet processor
+        // Create UDP packet processor with ECMP group manager
+        // Phase 6-Fix.AI: Set ECMP manager for load balancing support
         let processor_config = UdpProcessorConfig::default();
-        let processor = Arc::new(UdpPacketProcessor::new(processor_config));
+        let mut processor = UdpPacketProcessor::new(processor_config);
+        processor.set_ecmp_group_manager(Arc::clone(&ecmp_group_manager));
+        let processor = Arc::new(processor);
 
         // Determine worker count
         let num_workers = config.listen.udp_workers.unwrap_or_else(num_cpus::get);
@@ -436,9 +446,8 @@ async fn main() -> Result<()> {
     let chain_manager = Arc::new(ChainManager::new(phase6_config.node_tag.clone()));
     debug!("Created ChainManager with node tag: {}", phase6_config.node_tag);
 
-    // Create EcmpGroupManager (always created for IPC support)
-    let ecmp_group_manager = Arc::new(EcmpGroupManager::new());
-    debug!("Created EcmpGroupManager");
+    // Phase 6-Fix.AI: EcmpGroupManager is now created earlier (before ConnectionManager)
+    // so it can be passed to both TCP and UDP handlers for load balancing support
 
     // Create WireGuard egress manager (always created for IPC support)
     // The reply handler forwards decrypted packets back to the ingress reply router
@@ -816,6 +825,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&fwd_stats),
                     Some(direct_reply_tx), // Enable direct UDP reply handling
                     Some(phase6_config.wg_local_ip), // Local IP for responding to pings to gateway
+                    Some(Arc::clone(&ecmp_group_manager)), // ECMP group manager for load balancing
                 );
 
                 info!("Ingress reply router task started");

@@ -630,11 +630,8 @@ start_nginx
 start_openvpn_manager
 start_xray_manager
 start_xray_egress_manager
-# Phase 6-Fix.AF: Don't start WARP manager yet - needs rust-router IPC socket
-start_health_checker
-start_peer_tunnel_manager
 
-# Start rust-router
+# Start rust-router first (health_checker needs IPC socket)
 echo "[entrypoint] starting rust-router (userspace WireGuard mode)"
 if start_rust_router; then
   echo "[entrypoint] rust-router started successfully"
@@ -643,6 +640,10 @@ else
   echo "[entrypoint] FATAL: rust-router failed to start" >&2
   exit 1
 fi
+
+# Start health checker AFTER rust-router (needs IPC socket)
+start_health_checker
+start_peer_tunnel_manager
 
 # Phase 3: WARP manager removed - WARP tunnels managed via rust-router IPC
 

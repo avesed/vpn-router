@@ -2006,10 +2006,68 @@ def _update_v2ray_user_activity():
         pass
 
 
+def _get_rust_router_outbound_stats_sync():
+    """获取 rust-router 出口统计（同步版本，用于后台线程）
+
+    返回格式与 V2Ray API 兼容: {tag: {"download": bytes, "upload": bytes}}
+    包括：
+    - 常规出口（direct, block 等）
+    - WireGuard 隧道出口（PIA, Custom, WARP, Peer）
+    """
+    if not HAS_RUST_ROUTER_CLIENT:
+        return None
+
+    try:
+        import asyncio
+
+        async def _fetch_stats():
+            from rust_router_client import RustRouterClient
+            client = RustRouterClient()
+            await client.connect()
+            # 获取常规出口统计
+            outbound_resp = await client._send_command({"type": "get_outbound_stats"})
+            # 获取 WireGuard 隧道统计
+            wg_resp = await client._send_command({"type": "list_wg_tunnels"})
+            await client.close()
+            return outbound_resp, wg_resp
+
+        # Run async function in a new event loop (safe for thread)
+        outbound_resp, wg_resp = asyncio.run(_fetch_stats())
+
+        stats = {}
+
+        # 处理常规出口统计
+        if outbound_resp.success:
+            outbounds_data = outbound_resp.data.get("outbounds", {})
+            for tag, data in outbounds_data.items():
+                stats[tag] = {
+                    "download": data.get("bytes_rx", 0),
+                    "upload": data.get("bytes_tx", 0)
+                }
+
+        # 处理 WireGuard 隧道统计
+        if wg_resp.success:
+            tunnels = wg_resp.data.get("tunnels", [])
+            for tunnel in tunnels:
+                tag = tunnel.get("tag")
+                if tag:
+                    stats[tag] = {
+                        "download": tunnel.get("rx_bytes", 0),
+                        "upload": tunnel.get("tx_bytes", 0)
+                    }
+
+        return stats if stats else None
+
+    except Exception as e:
+        logging.debug(f"rust-router outbound stats unavailable: {type(e).__name__}: {e}")
+        return None
+
+
 def _update_traffic_stats():
     """后台线程：定期更新累计流量统计和实时速率
 
     使用 V2Ray API 获取精确的出口流量统计（100% 准确）
+    当 sing-box 不可用时，回退到 rust-router IPC 获取统计
     """
     global _traffic_stats, _traffic_rates, _rate_history
     global _last_history_time, _rate_samples
@@ -2020,13 +2078,25 @@ def _update_traffic_stats():
 
     while True:
         try:
+            outbound_stats = None
+
+            # 优先使用 sing-box V2Ray API
             client = _get_v2ray_client()
-            if client is None:
+            if client is not None:
+                try:
+                    outbound_stats = client.get_outbound_stats()
+                except Exception as e:
+                    logging.debug(f"sing-box V2Ray API unavailable: {type(e).__name__}: {e}")
+                    outbound_stats = None
+
+            # 回退到 rust-router IPC（当 sing-box 不可用时）
+            if outbound_stats is None:
+                outbound_stats = _get_rust_router_outbound_stats_sync()
+
+            # 如果两者都不可用，跳过此周期
+            if outbound_stats is None:
                 time.sleep(_POLL_INTERVAL)
                 continue
-
-            # 从 sing-box V2Ray API 获取精确的出口流量统计
-            outbound_stats = client.get_outbound_stats()
 
             # 从 Xray 出站获取 V2Ray 出口的流量统计
             xray_client = _get_xray_egress_client()
@@ -2936,7 +3006,10 @@ def api_stats_dashboard(time_range: str = "1m"):
     # 使用缓存的子网前缀（避免频繁数据库查询）
     wg_subnet_prefix = get_cached_wg_subnet_prefix()
 
-    # 从 clash_api 获取活跃连接数和在线客户端
+    # 从 clash_api 或 rust-router 获取活跃连接数和在线客户端
+    got_connection_stats = False
+
+    # 优先尝试 Clash API (sing-box)
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{DEFAULT_CLASH_API_PORT}/connections", timeout=2) as resp:
             data = json.loads(resp.read().decode())
@@ -2953,10 +3026,41 @@ def api_stats_dashboard(time_range: str = "1m"):
                 online_ips.add(src_ip)
 
         stats["online_clients"] = len(online_ips)
+        got_connection_stats = True
 
-    except Exception as e:
-        # clash_api 不可用时返回空数据
+    except Exception:
         pass
+
+    # 回退到 rust-router IPC（当 Clash API 不可用时）
+    if not got_connection_stats and HAS_RUST_ROUTER_CLIENT:
+        try:
+            import asyncio
+
+            async def _get_rust_router_stats():
+                from rust_router_client import RustRouterClient
+                client = RustRouterClient()
+                await client.connect()
+                # 获取总体统计
+                stats_resp = await client._send_command({"type": "get_stats"})
+                # 获取 ingress 统计（在线客户端）
+                ingress_resp = await client._send_command({"type": "get_ingress_stats"})
+                await client.close()
+                return stats_resp, ingress_resp
+
+            stats_resp, ingress_resp = asyncio.run(_get_rust_router_stats())
+
+            if stats_resp.success:
+                stats["active_connections"] = stats_resp.data.get("active", 0)
+
+            if ingress_resp.success and ingress_resp.data:
+                manager_stats = ingress_resp.data.get("manager_stats", {})
+                stats["online_clients"] = manager_stats.get("active_peer_count", 0)
+                # 总客户端也可以从 ingress 获取
+                if manager_stats.get("peer_count", 0) > 0:
+                    stats["total_clients"] = manager_stats.get("peer_count", 0)
+
+        except Exception as e:
+            logging.debug(f"rust-router stats unavailable: {type(e).__name__}: {e}")
 
     # 使用累计流量统计和实时速率（由后台线程更新）
     # 包含所有配置的出口，没有流量的显示为 0
@@ -7060,6 +7164,40 @@ class WarpEndpointsTest(BaseModel):
 # Phase 3: _reload_warp_manager() removed - MASQUE deprecated
 
 
+@app.get("/api/egress/traffic")
+async def api_get_egress_traffic():
+    """获取所有 WireGuard 隧道的流量统计
+
+    Returns:
+        Dict mapping egress tag to traffic info (tx_bytes, rx_bytes, active, endpoint)
+    """
+    traffic_stats = {}
+
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            client = RustRouterClient()
+            await client.connect()
+            try:
+                tunnels = await client.list_wg_tunnels()
+                for tunnel in tunnels:
+                    status = await client.get_wg_tunnel_status(tunnel.tag)
+                    if status.success and status.data:
+                        data = status.data
+                        traffic_stats[tunnel.tag] = {
+                            "tx_bytes": data.get("tx_bytes", 0),
+                            "rx_bytes": data.get("rx_bytes", 0),
+                            "active": data.get("active", False),
+                            "endpoint": data.get("peer_endpoint", ""),
+                            "last_handshake": data.get("last_handshake", 0),
+                        }
+            finally:
+                await client.disconnect()
+        except Exception as e:
+            logger.warning(f"Failed to get tunnel traffic from rust-router: {e}")
+
+    return {"traffic": traffic_stats}
+
+
 @app.get("/api/egress/warp")
 def api_list_warp_egress(enabled_only: bool = False):
     """列出所有 WARP 出口"""
@@ -7516,13 +7654,12 @@ def api_get_available_members():
     只返回支持 ECMP 负载均衡的出口类型（有内核接口的）：
     - PIA WireGuard profiles
     - Custom WireGuard egress
-    - WARP WireGuard egress (protocol == "wireguard")
+    - WARP egress (Phase 3: 所有 WARP 现在都是 WireGuard)
     - Direct egress (with bind_interface)
     - OpenVPN egress (使用 TUN 设备直接绑定)
 
     不支持 ECMP 的类型（使用 SOCKS 代理）：
     - V2Ray egress (通过 SOCKS5 桥接)
-    - WARP MASQUE (通过 SOCKS5 代理)
     """
     db = _get_db()
 
@@ -7566,17 +7703,15 @@ def api_get_available_members():
     except Exception as e:
         print(f"WARNING: Failed to get direct egress: {e}")
 
-    # WARP egress (只包含 WireGuard 协议的)
+    # WARP egress (Phase 3: 所有 WARP 现在都是 WireGuard，不再需要检查 protocol)
     try:
         warp_list = db.get_warp_egress_list()
         for e in warp_list:
-            # 只有 WireGuard 协议的 WARP 才有内核接口，才能参与 ECMP
-            if e.get("protocol") == "wireguard":
-                members.append({
-                    "tag": e.get("tag"),
-                    "type": "warp",
-                    "description": e.get("description", e.get("tag")),
-                })
+            members.append({
+                "tag": e.get("tag"),
+                "type": "warp",
+                "description": e.get("description", e.get("tag")),
+            })
     except Exception as e:
         print(f"WARNING: Failed to get WARP egress: {e}")
 
@@ -7596,7 +7731,6 @@ def api_get_available_members():
 
     # 注意：以下类型不支持 ECMP，不列出
     # - V2Ray egress (SOCKS5 桥接)
-    # - WARP MASQUE (SOCKS5 代理)
     # - builtin "direct" (没有特定接口)
 
     return {"members": members}
@@ -8567,6 +8701,42 @@ def _test_socks_connection(tag: str, test_url: str, timeout_sec: float) -> dict:
         return {"success": False, "delay": -1, "message": str(e)}
 
 
+def _ping_endpoint_ip(ip: str, count: int = 2, timeout: int = 2) -> Optional[int]:
+    """Phase 6-Fix.AH: Ping an IP address and return average latency in ms.
+
+    Args:
+        ip: IP address to ping
+        count: Number of ping attempts
+        timeout: Timeout per ping in seconds
+
+    Returns:
+        Average latency in milliseconds, or None if ping failed
+    """
+    try:
+        result = subprocess.run(
+            ["ping", "-c", str(count), "-W", str(timeout), ip],
+            capture_output=True,
+            text=True,
+            timeout=count * timeout + 2
+        )
+
+        if result.returncode == 0:
+            # Parse ping output for average latency
+            # Format: rtt min/avg/max/mdev = 73.457/74.116/74.798/0.547 ms
+            import re
+            match = re.search(r"rtt.*?=.*?/([\d.]+)/", result.stdout)
+            if match:
+                return int(float(match.group(1)))
+            # Fallback: look for "time=XXms" pattern
+            times = re.findall(r"time[<=]([\d.]+)", result.stdout)
+            if times:
+                avg = sum(float(t) for t in times) / len(times)
+                return int(avg)
+        return None
+    except Exception:
+        return None
+
+
 def _test_interface_connection(interface: str, test_url: str, timeout_sec: float) -> dict:
     """Phase 6-Fix.AC: Test connection via specific network interface"""
     try:
@@ -8656,8 +8826,75 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
         try:
             async def _check_rust_router_health():
                 try:
-                    client = await _get_rust_router_client()
-                    if client:
+                    # Phase 6-Fix.AH: Create fresh client to avoid asyncio.run() state issues
+                    client = RustRouterClient()
+                    await client.connect()
+                    try:
+                        # Phase 6-Fix.AG: First check if this is a WireGuard tunnel
+                        # get_outbound_health() only returns Direct/Block types, not WG tunnels
+                        try:
+                            wg_status = await client.get_wg_tunnel_status(tag)
+                            if wg_status.success and wg_status.data:
+                                data = wg_status.data
+                                active = data.get("active", False)
+                                tx_bytes = data.get("tx_bytes", 0)
+                                rx_bytes = data.get("rx_bytes", 0)
+                                last_handshake = data.get("last_handshake", 0)
+                                peer_endpoint = data.get("peer_endpoint", "")
+                                error = data.get("error")
+
+                                if error:
+                                    return {"success": False, "delay": -1, "message": f"Tunnel error: {error}"}
+
+                                if active and last_handshake > 0:
+                                    # Tunnel is active with valid handshake
+                                    # Phase 6-Fix.AH: Measure actual latency by pinging the peer endpoint
+                                    ping_delay_ms = None
+                                    if peer_endpoint:
+                                        # Extract IP from endpoint (format: IP:PORT)
+                                        try:
+                                            ep_parts = peer_endpoint.rsplit(":", 1)
+                                            ep_ip = ep_parts[0]
+                                            # Handle IPv6 format [IP]:PORT
+                                            if ep_ip.startswith("[") and ep_ip.endswith("]"):
+                                                ep_ip = ep_ip[1:-1]
+                                            ping_delay_ms = _ping_endpoint_ip(ep_ip)
+                                        except Exception:
+                                            pass
+
+                                    total_kb = (tx_bytes + rx_bytes) / 1024
+                                    if total_kb >= 1024:
+                                        traffic_str = f"{total_kb/1024:.1f}MB"
+                                    elif total_kb > 0:
+                                        traffic_str = f"{total_kb:.0f}KB"
+                                    else:
+                                        traffic_str = "0KB"
+
+                                    if ping_delay_ms is not None:
+                                        return {
+                                            "success": True,
+                                            "delay": ping_delay_ms,
+                                            "message": f"{ping_delay_ms}ms ({traffic_str})"
+                                        }
+                                    else:
+                                        return {
+                                            "success": True,
+                                            "delay": 0,
+                                            "message": f"✓ Tunnel active ({peer_endpoint}, {traffic_str})"
+                                        }
+                                elif active:
+                                    # Active but no handshake yet
+                                    return {
+                                        "success": True,
+                                        "delay": 0,
+                                        "message": f"✓ Tunnel connected ({peer_endpoint})"
+                                    }
+                                else:
+                                    return {"success": False, "delay": -1, "message": "Tunnel not active"}
+                        except Exception:
+                            pass  # Not a WG tunnel, try regular outbound health
+
+                        # Check regular outbound health (Direct/Block/SOCKS5)
                         health_info = await client.get_outbound_health()
                         for h in health_info:
                             if h.tag == tag:
@@ -8672,12 +8909,17 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
                                         bind_interface = out.bind_interface
                                         break
                                 return {"bind_interface": bind_interface}  # Signal to do interface test
+                    finally:
+                        await client.disconnect()
                 except Exception:
                     pass
                 return None  # Fallback to Clash API
 
             result = asyncio.run(_check_rust_router_health())
             if result is not None:
+                # If we got a complete success/failure result, return it
+                if "success" in result:
+                    return result
                 # If outbound found in rust-router, do interface-based test
                 if "bind_interface" in result:
                     bind_if = result.get("bind_interface")
@@ -8687,8 +8929,6 @@ def _test_wireguard_endpoint(tag: str, test_url: str, timeout: int) -> dict:
                         # No interface binding, but outbound is healthy
                         # Do a simple curl test without binding
                         return _test_simple_curl(test_url, timeout / 1000)
-                else:
-                    return result  # Return error from health check
         except Exception:
             pass  # Fallback to original method
 

@@ -454,6 +454,13 @@ impl IpcHandler {
             }
         }
 
+        // Phase 6-Fix.AI: Check ecmp_group_manager for ECMP groups
+        if let Some(ref ecmp_mgr) = self.ecmp_group_manager {
+            if ecmp_mgr.has_group(tag) {
+                return true;
+            }
+        }
+
         // Allow WireGuard-prefixed tags that may be added later via IPC
         // These prefixes match the forwarder's is_wg_egress check
         if tag.starts_with("wg-")

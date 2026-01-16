@@ -20,6 +20,7 @@ import {
   ChevronDown,
   Search,
   Languages,
+  Scale,
 } from "lucide-react";
 import {
   Sidebar,
@@ -85,6 +86,7 @@ const navGroups: NavGroup[] = [
     icon: ArrowRightFromLine,
     items: [
       { labelKey: "nav.egressLines", path: "/egress", icon: Server },
+      { labelKey: "nav.loadBalance", path: "/groups", icon: Scale },
       { labelKey: "nav.routeRules", path: "/rules", icon: Sliders },
       { labelKey: "nav.ruleCatalog", path: "/domain-catalog", icon: Layers },
       { labelKey: "nav.adblock", path: "/adblock", icon: ShieldAlert },
