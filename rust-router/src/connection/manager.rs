@@ -225,7 +225,7 @@ impl ConnectionManager {
             debug!(
                 "Waiting for {} connections to drain ({:.1}s remaining)",
                 active,
-                self.drain_timeout.checked_sub(drain_start.elapsed()).unwrap().as_secs_f64()
+                self.drain_timeout.checked_sub(drain_start.elapsed()).unwrap_or(Duration::ZERO).as_secs_f64()
             );
 
             tokio::time::sleep(check_interval).await;

@@ -882,6 +882,27 @@ impl UserspaceWgTunnel {
                                 remote_port: tuple.dst_port,
                                 local_port: tuple.src_port,
                             };
+                            // Check NAT table capacity before inserting
+                            // If over capacity, force cleanup of expired entries first
+                            if self.shared.nat_table.len() >= NAT_TABLE_MAX_CAPACITY {
+                                let before = self.shared.nat_table.len();
+                                self.shared.nat_table.retain(|_, entry| {
+                                    entry.created_at.elapsed() < NAT_ENTRY_TIMEOUT
+                                });
+                                let removed = before.saturating_sub(self.shared.nat_table.len());
+                                if removed > 0 {
+                                    debug!("NAT table at capacity, cleaned {} expired entries", removed);
+                                }
+                                // If still at capacity after cleanup, log warning but still insert
+                                // (will evict on next cleanup cycle)
+                                if self.shared.nat_table.len() >= NAT_TABLE_MAX_CAPACITY {
+                                    warn!(
+                                        "NAT table at max capacity ({}), may cause DNAT failures",
+                                        NAT_TABLE_MAX_CAPACITY
+                                    );
+                                }
+                            }
+                            
                             self.shared.nat_table.insert(nat_key, NatEntry {
                                 original_src_ip: tuple.src_ip,
                                 created_at: Instant::now(),
@@ -1218,6 +1239,8 @@ async fn run_background_task(
     peer_addr: SocketAddr,  // Phase 11-Fix.6C: peer address for send_to()
 ) {
     let mut timer_interval = interval(Duration::from_millis(TIMER_TICK_MS));
+    // NAT table cleanup interval (Issue: memory leak from stale NAT entries)
+    let mut nat_cleanup_interval = interval(NAT_CLEANUP_INTERVAL);
     // Use buffer pool for receive buffer (H1 fix)
     let mut recv_buf = buffer_pool.get();
     let mut dst_buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
@@ -1229,6 +1252,28 @@ async fn run_background_task(
             _ = &mut shutdown_rx => {
                 debug!("Background task received shutdown signal");
                 break;
+            }
+
+            // Periodic NAT table cleanup to prevent memory leaks
+            // Issue: NAT entries were only cleaned when receiving reply packets,
+            // causing unbounded growth for one-way traffic or lost replies
+            _ = nat_cleanup_interval.tick() => {
+                let before_count = shared.nat_table.len();
+                if before_count > 0 {
+                    let now = std::time::Instant::now();
+                    shared.nat_table.retain(|_key, entry| {
+                        entry.created_at.elapsed() < NAT_ENTRY_TIMEOUT
+                    });
+                    let removed = before_count.saturating_sub(shared.nat_table.len());
+                    if removed > 0 {
+                        debug!(
+                            "NAT table cleanup: removed {} expired entries, {} remaining (took {:?})",
+                            removed,
+                            shared.nat_table.len(),
+                            now.elapsed()
+                        );
+                    }
+                }
             }
 
             // Timer tick for keepalive and handshake retransmission
@@ -1885,6 +1930,12 @@ fn update_transport_checksum_v6(
 
 /// NAT table entry timeout (5 minutes)
 const NAT_ENTRY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// NAT table cleanup interval (60 seconds)
+const NAT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// NAT table maximum capacity (prevent unbounded memory growth under high traffic)
+const NAT_TABLE_MAX_CAPACITY: usize = 100_000;
 
 /// Handle the result of decapsulating a received packet
 async fn handle_decapsulate_result(

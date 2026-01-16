@@ -666,8 +666,12 @@ class RustRouterConfigGenerator:
 
         # Filter rules to only include those with valid outbounds
         # For rules referencing skipped outbounds (e.g., SOCKS5), use default outbound
+        # Phase 11-Fix: IPC-managed outbounds (WireGuard, ECMP groups) are valid for Python
+        # but not present in static config, so use "direct" as placeholder.
+        # Python manager will sync correct rules via IPC after startup.
         rules = []
         skipped_count = 0
+        ipc_remap_count = 0
         for rule in config.rules:
             outbound = rule.outbound
             if outbound not in valid_outbound_tags:
@@ -677,6 +681,11 @@ class RustRouterConfigGenerator:
                 # Skip if default outbound is also invalid (shouldn't happen since we validated above)
                 if outbound not in valid_outbound_tags:
                     continue
+            elif outbound in ipc_managed_tags:
+                # Phase 11-Fix: IPC-managed outbound - use "direct" in static config
+                # Python manager will sync correct outbound via IPC after startup
+                ipc_remap_count += 1
+                outbound = "direct"
 
             rules.append({
                 "type": rule.rule_type.value,  # Rust uses #[serde(rename = "type")]
@@ -688,6 +697,8 @@ class RustRouterConfigGenerator:
 
         if skipped_count > 0:
             logger.info(f"Remapped {skipped_count} rules from skipped outbounds to default")
+        if ipc_remap_count > 0:
+            logger.info(f"Remapped {ipc_remap_count} rules from IPC-managed outbounds to 'direct' (will sync via IPC)")
 
         tproxy_port = safe_int_env("RUST_ROUTER_PORT", DEFAULT_TPROXY_PORT)
         listen_addr = os.environ.get("RUST_ROUTER_LISTEN_ADDR", "127.0.0.1")

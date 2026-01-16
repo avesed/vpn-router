@@ -1147,6 +1147,11 @@ class RustRouterManager:
                     if not rule_type or not target:
                         continue
 
+                    # Phase 11-Fix.AF: Use domain_suffix for domain rules to match all subdomains
+                    # e.g., "example.com" matches "www.example.com", "api.example.com", etc.
+                    if rule_type == "domain":
+                        rule_type = "domain_suffix"
+
                     rule_configs.append(RuleConfig(
                         rule_type=rule_type,
                         target=target,

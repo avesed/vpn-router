@@ -1809,10 +1809,22 @@ pub async fn run_forwarding_loop(
         if last_cleanup.elapsed() >= cleanup_interval {
             let sessions_removed = session_tracker.cleanup();
             let tcp_removed = tcp_manager.cleanup();
-            if sessions_removed > 0 || tcp_removed > 0 {
+            
+            // Clean up stale UDP sessions (Issue: UDP_SESSIONS had no periodic cleanup)
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let udp_before = UDP_SESSIONS.len();
+            UDP_SESSIONS.retain(|_, session| {
+                now_secs - session.last_activity_secs() <= 60
+            });
+            let udp_removed = udp_before.saturating_sub(UDP_SESSIONS.len());
+            
+            if sessions_removed > 0 || tcp_removed > 0 || udp_removed > 0 {
                 debug!(
-                    "Cleaned up {} expired sessions, {} TCP connections",
-                    sessions_removed, tcp_removed
+                    "Cleaned up {} expired sessions, {} TCP connections, {} UDP sessions",
+                    sessions_removed, tcp_removed, udp_removed
                 );
             }
             last_cleanup = Instant::now();

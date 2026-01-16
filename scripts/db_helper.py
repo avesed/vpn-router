@@ -552,6 +552,18 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    def delete_routing_rules_by_tag(self, tag: str) -> int:
+        """通过 tag 删除路由规则（删除所有匹配的规则）
+        
+        Returns:
+            删除的规则数量
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM routing_rules WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount
+
     def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
         """删除所有路由规则（用于备份恢复的替换模式）
 
@@ -4440,6 +4452,9 @@ class DatabaseManager:
 
     def delete_routing_rule(self, rule_id: int) -> bool:
         return self.user.delete_routing_rule(rule_id)
+
+    def delete_routing_rules_by_tag(self, tag: str) -> int:
+        return self.user.delete_routing_rules_by_tag(tag)
 
     def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
         return self.user.delete_all_routing_rules(preserve_adblock)

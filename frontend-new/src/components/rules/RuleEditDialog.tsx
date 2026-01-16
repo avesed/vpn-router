@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
-import { useAddCustomRule } from "../../api/hooks/useRules";
+import { useAddCustomRule, useUpdateCustomRule } from "../../api/hooks/useRules";
 import { useAllEgress } from "../../api/hooks/useEgress";
 import { useDomainCatalog } from "../../api/hooks/useDomainCatalog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../ui/dialog";
@@ -16,6 +16,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { Badge } from "../ui/badge";
 import { Checkbox } from "../ui/checkbox";
 import { toast } from "sonner";
+import type { RouteRule } from "../../types";
 
 const formSchema = z.object({
   tag: z.string().min(1, "Tag is required"),
@@ -28,14 +29,18 @@ const formSchema = z.object({
 interface RuleEditDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  rule?: RouteRule; // Optional rule for edit mode
 }
 
-export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
+export function RuleEditDialog({ open, onOpenChange, rule }: RuleEditDialogProps) {
   const { t } = useTranslation();
   const addRule = useAddCustomRule();
+  const updateRule = useUpdateCustomRule();
   const { data: allEgress } = useAllEgress();
   const { data: domainCatalog } = useDomainCatalog();
   const [selectedCatalogLists, setSelectedCatalogLists] = useState<string[]>([]);
+
+  const isEditMode = !!rule;
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -48,6 +53,37 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
     },
   });
 
+  // Reset form when dialog opens/closes or rule changes
+  useEffect(() => {
+    if (open) {
+      if (rule) {
+        // Edit mode: populate form with existing rule data
+        // Filter out geosite: prefixed domains (catalog lists)
+        const regularDomains = rule.domains?.filter(d => !d.startsWith("geosite:")) || [];
+        const catalogLists = rule.domains?.filter(d => d.startsWith("geosite:")).map(d => d.replace("geosite:", "")) || [];
+        
+        form.reset({
+          tag: rule.tag,
+          outbound: rule.outbound,
+          domains: regularDomains.join("\n"),
+          domainKeywords: rule.domain_keywords?.join("\n") || "",
+          ipCidrs: rule.ip_cidrs?.join("\n") || "",
+        });
+        setSelectedCatalogLists(catalogLists);
+      } else {
+        // Add mode: reset to empty
+        form.reset({
+          tag: "",
+          outbound: "",
+          domains: "",
+          domainKeywords: "",
+          ipCidrs: "",
+        });
+        setSelectedCatalogLists([]);
+      }
+    }
+  }, [open, rule, form]);
+
   const onSubmit = (values: z.infer<typeof formSchema>) => {
     let domains = values.domains ? values.domains.split("\n").filter(Boolean) : [];
     const domainKeywords = values.domainKeywords ? values.domainKeywords.split("\n").filter(Boolean) : undefined;
@@ -59,25 +95,45 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
       domains = [...domains, ...catalogDomains];
     }
 
-    toast.promise(
-      addRule.mutateAsync({
-        tag: values.tag,
-        outbound: values.outbound,
-        domains: domains.length > 0 ? domains : undefined,
-        domainKeywords,
-        ipCidrs,
-      }),
-      {
-        loading: t("rules.addingRule"),
-        success: () => {
-          onOpenChange(false);
-          form.reset();
-          setSelectedCatalogLists([]);
-          return t("rules.addRuleSuccess");
-        },
-        error: (err) => t("rules.addRuleFailed", { message: err.message }),
-      }
-    );
+    if (isEditMode) {
+      // Update existing rule
+      toast.promise(
+        updateRule.mutateAsync({
+          tag: rule!.tag, // Use original tag
+          outbound: values.outbound,
+          domains: domains.length > 0 ? domains : undefined,
+          domainKeywords,
+          ipCidrs,
+        }),
+        {
+          loading: t("rules.updatingRule"),
+          success: () => {
+            onOpenChange(false);
+            return t("rules.updateRuleSuccess");
+          },
+          error: (err) => t("rules.updateRuleFailed", { message: err.message }),
+        }
+      );
+    } else {
+      // Add new rule
+      toast.promise(
+        addRule.mutateAsync({
+          tag: values.tag,
+          outbound: values.outbound,
+          domains: domains.length > 0 ? domains : undefined,
+          domainKeywords,
+          ipCidrs,
+        }),
+        {
+          loading: t("rules.addingRule"),
+          success: () => {
+            onOpenChange(false);
+            return t("rules.addRuleSuccess");
+          },
+          error: (err) => t("rules.addRuleFailed", { message: err.message }),
+        }
+      );
+    }
   };
 
   const availableOutbounds = allEgress
@@ -100,12 +156,16 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
     );
   };
 
+  const isPending = addRule.isPending || updateRule.isPending;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-hidden flex flex-col">
         <DialogHeader>
-          <DialogTitle>{t("rules.addNewRule")}</DialogTitle>
-          <DialogDescription>{t("rules.addRuleDescription")}</DialogDescription>
+          <DialogTitle>{isEditMode ? t("rules.editRule") : t("rules.addNewRule")}</DialogTitle>
+          <DialogDescription>
+            {isEditMode ? t("rules.editRuleDescription") : t("rules.addRuleDescription")}
+          </DialogDescription>
         </DialogHeader>
 
         <Form {...form}>
@@ -118,7 +178,11 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
                     <FormItem>
                       <FormLabel>{t("rules.ruleTag")}</FormLabel>
                       <FormControl>
-                        <Input placeholder={t("rules.ruleTagPlaceholder")} {...field} />
+                        <Input 
+                          placeholder={t("rules.ruleTagPlaceholder")} 
+                          {...field} 
+                          disabled={isEditMode}
+                        />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -131,7 +195,7 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
                 render={({ field }) => (
                     <FormItem>
                       <FormLabel>{t("rules.outboundLine")}</FormLabel>
-                      <Select onValueChange={field.onChange} defaultValue={field.value}>
+                      <Select onValueChange={field.onChange} value={field.value}>
                         <FormControl>
                           <SelectTrigger>
                             <SelectValue
@@ -257,8 +321,8 @@ export function RuleEditDialog({ open, onOpenChange }: RuleEditDialogProps) {
             </Tabs>
 
               <DialogFooter>
-                <Button type="submit" disabled={addRule.isPending}>
-                  {t("rules.addRule")}
+                <Button type="submit" disabled={isPending}>
+                  {isEditMode ? t("rules.updateRule") : t("rules.addRule")}
                 </Button>
               </DialogFooter>
 

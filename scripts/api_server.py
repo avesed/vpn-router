@@ -4059,18 +4059,132 @@ def api_delete_custom_rule(rule_id: int):
 
 @app.delete("/api/rules/custom/by-tag/{tag}")
 def api_delete_custom_rule_by_tag(tag: str):
-    """删除自定义路由规则（通过 tag，兼容旧接口）
-    注意：此端点已废弃，建议使用 DELETE /api/rules/custom/{rule_id}
+    """删除自定义路由规则（通过 tag）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+    deleted_count = db.delete_routing_rules_by_tag(tag)
+
+    if deleted_count == 0:
+        raise HTTPException(status_code=404, detail=f"未找到标签为 '{tag}' 的规则")
+
+    # Phase 11-Fix: Sync rules to rust-router via IPC
+    sync_message = ""
+    try:
+        sync_message = _sync_rules_to_rust_router(db)
+    except Exception as sync_err:
+        logging.warning(f"Failed to sync rules to rust-router after delete: {sync_err}")
+        sync_message = f", rust-router sync error: {sync_err}"
+
+    return {"message": f"已删除 {deleted_count} 条标签为 '{tag}' 的规则{sync_message}"}
+
+
+@app.put("/api/rules/custom/by-tag/{tag}")
+def api_update_custom_rule_by_tag(tag: str, payload: CustomRuleRequest):
+    """更新自定义路由规则（通过 tag）
+    
+    删除所有现有规则后重新添加新规则，保持相同的 tag。
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
-    # 由于数据库中没有直接存储 tag，我们无法通过 tag 删除
-    # 返回提示信息，建议使用新的 API
-    raise HTTPException(
-        status_code=410,
-        detail="此 API 已废弃。请使用 DELETE /api/rules/custom/{rule_id} 或通过前端界面删除规则"
-    )
+    # 验证至少有一种匹配规则
+    has_domain_rules = payload.domains or payload.domain_keywords or payload.ip_cidrs
+    has_protocol_rules = payload.protocols or payload.network or payload.ports or payload.port_ranges
+    if not has_domain_rules and not has_protocol_rules:
+        raise HTTPException(
+            status_code=400,
+            detail="至少需要提供一种匹配规则（域名、关键词、IP、协议或端口）"
+        )
+
+    # 验证协议类型
+    if payload.protocols:
+        invalid_protocols = [p for p in payload.protocols if p not in VALID_PROTOCOLS]
+        if invalid_protocols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"无效的协议类型: {', '.join(invalid_protocols)}。支持: {', '.join(VALID_PROTOCOLS)}"
+            )
+
+    # 验证网络类型
+    if payload.network and payload.network not in VALID_NETWORKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效的网络类型: {payload.network}。支持: tcp, udp"
+        )
+
+    db = _get_db()
+
+    try:
+        # 先删除现有规则
+        deleted_count = db.delete_routing_rules_by_tag(tag)
+        
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail=f"未找到标签为 '{tag}' 的规则")
+
+        # 收集所有新规则用于批量插入
+        batch_rules = []
+
+        # 使用 URL 参数中的 tag，忽略 payload 中的 tag
+        rule_tag = tag
+
+        # 收集域名规则
+        if payload.domains:
+            for domain in payload.domains:
+                batch_rules.append(("domain", domain, payload.outbound, rule_tag, 0))
+
+        # 收集域名关键词规则
+        if payload.domain_keywords:
+            for keyword in payload.domain_keywords:
+                batch_rules.append(("domain_keyword", keyword, payload.outbound, rule_tag, 0))
+
+        # 收集 IP 规则
+        if payload.ip_cidrs:
+            for cidr in payload.ip_cidrs:
+                batch_rules.append(("ip", cidr, payload.outbound, rule_tag, 0))
+
+        # 收集协议规则
+        if payload.protocols:
+            for protocol in payload.protocols:
+                batch_rules.append(("protocol", protocol, payload.outbound, rule_tag, 0))
+
+        # 收集网络类型规则
+        if payload.network:
+            batch_rules.append(("network", payload.network, payload.outbound, rule_tag, 0))
+
+        # 收集端口规则
+        if payload.ports:
+            for port in payload.ports:
+                batch_rules.append(("port", str(port), payload.outbound, rule_tag, 0))
+
+        # 收集端口范围规则
+        if payload.port_ranges:
+            for port_range in payload.port_ranges:
+                batch_rules.append(("port_range", port_range, payload.outbound, rule_tag, 0))
+
+        # 批量插入所有新规则
+        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
+
+        # Phase 11-Fix: Sync rules to rust-router via IPC
+        sync_message = ""
+        try:
+            sync_message = _sync_rules_to_rust_router(db)
+        except Exception as sync_err:
+            logging.warning(f"Failed to sync rules to rust-router after update: {sync_err}")
+            sync_message = f", rust-router sync error: {sync_err}"
+
+        return {
+            "message": f"规则 '{tag}' 已更新（删除 {deleted_count} 条，添加 {added_count} 条）{sync_message}",
+            "tag": tag,
+            "outbound": payload.outbound,
+            "deleted_count": deleted_count,
+            "added_count": added_count
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新规则失败: {str(e)}")
 
 
 @app.post("/api/pia/login")
@@ -9425,6 +9539,7 @@ def _sync_rules_to_rust_router(db=None) -> str:
     """Sync routing rules from database to rust-router via IPC.
     
     Phase 11-Fix: Called after adding/deleting rules to sync with rust-router.
+    Phase 11-Fix.AE: Fixed asyncio event loop handling for FastAPI context.
     
     Args:
         db: Optional DatabaseManager instance. If None, will get from _get_db().
@@ -9433,52 +9548,64 @@ def _sync_rules_to_rust_router(db=None) -> str:
         str: Status message about the sync operation.
     """
     import asyncio
+    import concurrent.futures
     
     if db is None:
         db = _get_db()
     
-    try:
-        # Get the event loop or create a new one
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+    # Prepare rule configs before async operations
+    all_rules = db.get_routing_rules(enabled_only=True)
+    rule_configs = []
+    for rule in all_rules:
+        rule_type = rule.get("rule_type", "")
+        target = rule.get("target", "")
+        outbound = rule.get("outbound", "direct")
+        # Phase 11-Fix.AF: Use domain_suffix for domain rules to match all subdomains
+        # e.g., "example.com" matches "www.example.com", "api.example.com", etc.
+        if rule_type == "domain":
+            rule_type = "domain_suffix"
+        rule_configs.append({
+            "rule_type": rule_type,
+            "target": target,
+            "outbound": outbound,
+        })
+    
+    default_outbound = db.get_setting("default_outbound", "direct") or "direct"
+    
+    async def _do_sync():
+        """Inner async function to perform the sync."""
+        client = RustRouterClient()
+        ping_response = await client.ping()
+        if not ping_response.success:
+            return None, "rust-router not available"
         
-        # Get rust-router client
-        client = loop.run_until_complete(_get_rust_router_client())
-        if not client:
-            return ", rust-router not available"
-        
-        # Get all enabled rules from database
-        all_rules = db.get_routing_rules(enabled_only=True)
-        rule_configs = []
-        for rule in all_rules:
-            rule_type = rule.get("rule_type", "")
-            target = rule.get("target", "")
-            outbound = rule.get("outbound", "direct")
-            rule_configs.append({
-                "rule_type": rule_type,
-                "target": target,
-                "outbound": outbound,
-            })
-        
-        # Get default outbound
-        default_outbound = db.get_setting("default_outbound", "direct") or "direct"
-        
-        # Sync to rust-router
-        result = loop.run_until_complete(
-            client.update_routing(rule_configs, default_outbound)
-        )
-        
+        result = await client.update_routing(rule_configs, default_outbound)
         if result.success:
-            return f", rust-router synced ({result.rule_count} rules)"
+            return result, None
         else:
-            return ", rust-router sync failed"
+            return None, "rust-router sync failed"
+    
+    try:
+        # Handle asyncio event loop properly for FastAPI context
+        try:
+            loop = asyncio.get_running_loop()
+            # We're in a running loop (FastAPI) - use thread pool
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _do_sync())
+                result, error = future.result(timeout=10)
+        except RuntimeError:
+            # No running loop - safe to use asyncio.run() directly
+            result, error = asyncio.run(_do_sync())
+        
+        if error:
+            return f", {error}"
+        if result:
+            return f", rust-router synced ({result.rule_count} rules)"
+        return ", rust-router sync failed"
             
+    except concurrent.futures.TimeoutError:
+        logging.warning("rust-router sync timed out")
+        return ", rust-router sync timeout"
     except Exception as e:
         logging.warning(f"Failed to sync rules to rust-router: {e}")
         return f", rust-router sync error: {e}"

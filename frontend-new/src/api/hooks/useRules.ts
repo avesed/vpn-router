@@ -57,6 +57,17 @@ export function useAddCustomRule() {
   });
 }
 
+export function useUpdateCustomRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tag, outbound, domains, domainKeywords, ipCidrs }: { tag: string; outbound: string; domains?: string[]; domainKeywords?: string[]; ipCidrs?: string[] }) =>
+      api.updateCustomRule(tag, outbound, domains, domainKeywords, ipCidrs),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ruleKeys.all });
+    },
+  });
+}
+
 export function useDeleteCustomRule() {
   const queryClient = useQueryClient();
   return useMutation({

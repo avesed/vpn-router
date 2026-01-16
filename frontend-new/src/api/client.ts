@@ -416,8 +416,16 @@ export const api = {
       method: "POST",
       body: { tag, outbound, domains, domain_keywords: domainKeywords, ip_cidrs: ipCidrs }
     }),
+  updateCustomRule: (tag: string, outbound: string, domains?: string[], domainKeywords?: string[], ipCidrs?: string[]) =>
+    request<{ message: string; tag: string; outbound: string; deleted_count: number; added_count: number }>(
+      `/rules/custom/by-tag/${encodeURIComponent(tag)}`,
+      {
+        method: "PUT",
+        body: { tag, outbound, domains, domain_keywords: domainKeywords, ip_cidrs: ipCidrs }
+      }
+    ),
   deleteCustomRule: (tag: string) =>
-    request<{ message: string }>(`/rules/custom/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+    request<{ message: string }>(`/rules/custom/by-tag/${encodeURIComponent(tag)}`, { method: "DELETE" }),
 
   // Ingress WireGuard
   getIngress: () => request<IngressResponse>("/ingress"),
