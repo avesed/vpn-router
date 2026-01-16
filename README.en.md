@@ -1,26 +1,41 @@
-# Smart WireGuard VPN Gateway
+# VPN Router
 
 English | [中文](README.md)
 
-Docker container providing WireGuard ingress + sing-box smart routing (route traffic to different exits by domain/IP/region).
+Smart VPN Gateway - High-performance transparent proxy router with Rust data plane.
+
+## Architecture
 
 ```
-Client Devices
-     │
-     ▼ WireGuard (UDP 36100)
-┌─────────────────────────────────────────┐
-│           vpn-gateway container          │
-│  ┌─────────────────────────────────────┐ │
-│  │  sing-box (wg-server endpoint)      │ │
-│  │         ↓ sniff + route             │ │
-│  │  ┌──────┴──────┬──────────┐        │ │
-│  │  ▼             ▼          ▼        │ │
-│  │ direct    PIA VPN    custom WG     │ │
-│  └─────────────────────────────────────┘ │
-│  ┌─────────────────────────────────────┐ │
-│  │  nginx (port 36000) → API + Frontend│ │
-│  └─────────────────────────────────────┘ │
-└─────────────────────────────────────────┘
+                        Client Devices
+                              │
+                              ▼ WireGuard (UDP 36100)
+┌─────────────────────────────────────────────────────────────────────┐
+│                         vpn-gateway container                        │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │                    Rust Router (Data Plane)                     │ │
+│  │  ┌──────────────┐  ┌────────────┐  ┌───────────────────────┐  │ │
+│  │  │ WireGuard    │  │ TPROXY     │  │ Rule Engine           │  │ │
+│  │  │ Userspace    │→ │ Transparent│→ │ Domain/IP/GeoIP Match │  │ │
+│  │  │ (boringtun)  │  │ TCP + UDP  │  │ Chain Route/ECMP LB   │  │ │
+│  │  └──────────────┘  └────────────┘  └───────────────────────┘  │ │
+│  │                                              │                  │ │
+│  │                    ┌─────────────────────────┼─────────────┐   │ │
+│  │                    ▼             ▼           ▼             ▼   │ │
+│  │                 direct     WireGuard      Xray          WARP   │ │
+│  │                              Egress   (VLESS/REALITY)  Egress  │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Python API (Control Plane)               FastAPI :8000        │ │
+│  │  • Config Mgmt  • Egress Mgmt  • Rules Mgmt  • Hot Reload      │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │  Web UI (React + shadcn/ui)               Nginx :36000         │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -33,7 +48,7 @@ docker compose up -d
 
 Open `http://localhost:36000`
 
-> **Note**: Uses `network_mode: host`, container shares host network directly without port mapping.
+> Container uses `network_mode: host`, sharing host network directly.
 
 ## Ports
 
@@ -45,55 +60,48 @@ Open `http://localhost:36000`
 ## Features
 
 ### Ingress Manager
-Manage WireGuard client device connections:
-- Add/edit/delete client peers
-- Auto-generate client configuration files
-- QR code for easy mobile setup
-- Custom DNS and MTU support
-
-### Profile Manager
-PIA VPN exit line management:
-- One-click PIA login to fetch available regions
-- Add/remove VPN lines
-- Reconnect on disconnect
-- Streaming-optimized region support
-
-### Route Rules
-Flexible traffic routing configuration:
-- Match by domain, domain suffix, or domain keyword
-- Match by IP address/CIDR
-- Custom rule priority
-- Multiple actions: direct, block, VPN exit
-- Set default outbound
-
-### Domain/IP Catalog
-Built-in rich GeoSite/GeoIP data:
-- Browse 675+ domain categories (streaming, social, ads, etc.)
-- Browse 250+ country/region IP ranges
-- One-click add categories to routing rules
-- Custom tag naming support
+- WireGuard client device management
+- Auto-generate config / QR code
+- Custom DNS and MTU
 
 ### Egress Manager
-Custom WireGuard exit configuration:
-- Upload .conf file with auto-parsing
-- Paste configuration text to import
-- Manual configuration input
-- Advanced options: MTU, DNS, preshared key
+- **PIA VPN** - One-click login to fetch regions
+- **Custom WireGuard** - Upload .conf or manual config
+- **Xray** - VLESS + REALITY support
+- **Cloudflare WARP** - Auto registration
+
+### Route Rules
+- Match by domain, suffix, or keyword
+- Match by IP address / CIDR
+- Built-in 675+ GeoSite categories and 250+ GeoIP regions
+- Chain routing (multi-hop)
+- ECMP load balancing
 
 ### Backup/Restore
-Complete configuration import/export:
-- Selective backup (ingress, egress, PIA profiles, routing rules)
-- Sensitive data encryption (private keys, etc.)
-- Merge or replace import modes
-- Batch processing optimized for 10,000+ rules
+- Selective backup (ingress/egress/rules)
+- Sensitive data encryption
+- Fast import for 10,000+ rules
 
 ## Environment Variables
 
-```yaml
-environment:
-  - PIA_USERNAME=xxx           # PIA account (optional)
-  - PIA_PASSWORD=xxx           # PIA password (optional)
-  - WG_SERVER_ENDPOINT=x.x.x.x # WireGuard server public IP
-  - WEB_PORT=36000             # Web UI port (optional)
-  - WG_LISTEN_PORT=36100       # WireGuard port (optional)
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `WG_SERVER_ENDPOINT` | WireGuard public IP | - |
+| `WEB_PORT` | Web UI port | 36000 |
+| `WG_LISTEN_PORT` | WireGuard port | 36100 |
+| `PIA_USERNAME` | PIA account (optional) | - |
+| `PIA_PASSWORD` | PIA password (optional) | - |
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Data Plane | Rust + Tokio + boringtun |
+| Control Plane | Python + FastAPI |
+| Frontend | React + Vite + shadcn/ui |
+| Database | SQLite (SQLCipher encrypted) |
+| Protocols | WireGuard, VLESS/REALITY, WARP |
+
+## License
+
+[AGPL-3.0](LICENSE)
