@@ -29,6 +29,20 @@ const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884d8', '#82ca9d'
 
 type TimeRange = "1m" | "1h" | "24h";
 
+function formatUptime(seconds: number): string {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  } else if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  } else {
+    return `${minutes}m`;
+  }
+}
+
 export function DashboardPage() {
   const { t } = useTranslation();
   const [timeRange, setTimeRange] = useState<TimeRange>("1m");
@@ -108,14 +122,19 @@ export function DashboardPage() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">
-              {t("dashboard.singboxStatus")}
+              {t("dashboard.routerStatus")}
             </CardTitle>
-            <Zap className={`h-4 w-4 ${status?.sing_box_running ? "text-green-500" : "text-red-500"}`} />
+            <Zap className={`h-4 w-4 ${status?.rust_router_running ? "text-green-500" : "text-red-500"}`} />
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {status?.sing_box_running ? t("common.running") : t("common.stopped")}
+              {status?.rust_router_running ? t("common.running") : t("common.stopped")}
             </div>
+            {status?.rust_router?.uptime_secs !== undefined && status.rust_router.uptime_secs > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {t("dashboard.uptime")}: {formatUptime(status.rust_router.uptime_secs)}
+              </p>
+            )}
             {status?.timestamp && (
               <p className="text-xs text-muted-foreground">
                 {t("dashboard.lastUpdate")}: {new Date(status.timestamp).toLocaleTimeString()}

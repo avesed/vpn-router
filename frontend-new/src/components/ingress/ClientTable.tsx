@@ -71,15 +71,6 @@ export function ClientTable({ clients }: ClientTableProps) {
   const { mutate: updatePeer, isPending: isUpdating } = useUpdateIngressClient();
   const { data: outboundData } = useIngressOutbound();
 
-  // Helper function to determine if a client is online based on last_handshake
-  // WireGuard keepalive is typically 180 seconds
-  const isClientOnline = (client: IngressPeer) => {
-    if (client.last_handshake === 0) return false;
-    const now = Date.now() / 1000; // Convert to seconds
-    const timeSinceHandshake = now - client.last_handshake;
-    return timeSinceHandshake < 180; // Consider online if handshake within last 3 minutes
-  };
-
   const handleDelete = () => {
     if (deleteClient) {
       deletePeer(deleteClient.name, {
@@ -125,7 +116,7 @@ export function ClientTable({ clients }: ClientTableProps) {
               </TableRow>
             ) : (
               clients.map((client) => {
-                const isOnline = isClientOnline(client);
+                const isOnline = client.is_online;
                 return (
                   <TableRow key={client.public_key}>
                     <TableCell className="font-medium">{client.name}</TableCell>

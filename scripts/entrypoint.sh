@@ -507,7 +507,11 @@ start_rust_router() {
   export RUST_ROUTER_LISTEN="0.0.0.0:7894"
   export RUST_ROUTER_CONFIG="${RUST_ROUTER_CONFIG}"
   export RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET}"
+  # Log level: RUST_LOG takes precedence, then RUST_ROUTER_LOG_LEVEL
   export RUST_LOG="${RUST_LOG:-info}"
+  if [ -n "${RUST_ROUTER_LOG_LEVEL}" ]; then
+    export RUST_ROUTER_LOG_LEVEL="${RUST_ROUTER_LOG_LEVEL}"
+  fi
 
   # Userspace WireGuard configuration
   export RUST_ROUTER_USERSPACE_WG="true"

@@ -62,13 +62,20 @@ except ImportError:
     HAS_AIOHTTP = False
     aiohttp = None  # type: ignore
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger("watchdog")
+# Configure logging (统一日志配置，通过 LOG_LEVEL 环境变量控制)
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger("watchdog")
+except ImportError:
+    # 回退：如果 log_config 不可用，使用基本配置
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger("watchdog")
 
 
 class RouterType(Enum):

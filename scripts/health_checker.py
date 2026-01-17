@@ -39,13 +39,19 @@ from typing import Dict, List, Optional, Tuple
 # rust-router IPC socket path
 RUST_ROUTER_SOCKET = os.environ.get("RUST_ROUTER_SOCKET", "/run/rust-router.sock")
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# 配置日志（统一日志配置，通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger(__name__)
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
 # 数据库路径
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")

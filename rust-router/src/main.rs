@@ -164,6 +164,12 @@ EXAMPLE:
 }
 
 /// Initialize logging
+///
+/// Log level priority (highest to lowest):
+/// 1. `RUST_LOG` environment variable (standard Rust logging)
+/// 2. `RUST_ROUTER_LOG_LEVEL` environment variable
+/// 3. Config file `log.level` setting
+/// 4. Default: "info"
 fn init_logging(config: &Config) {
     let level = match config.log.level.to_lowercase().as_str() {
         "trace" => Level::TRACE,
@@ -174,10 +180,15 @@ fn init_logging(config: &Config) {
         _ => Level::INFO,
     };
 
+    // Build filter: RUST_LOG takes precedence, then config level as default
+    // EnvFilter::from_default_env() reads RUST_LOG if set
     let filter = EnvFilter::from_default_env()
         .add_directive(level.into())
+        // Reduce noise from dependencies
         .add_directive("hyper=warn".parse().unwrap())
-        .add_directive("tokio=warn".parse().unwrap());
+        .add_directive("tokio=warn".parse().unwrap())
+        .add_directive("h2=warn".parse().unwrap())
+        .add_directive("rustls=warn".parse().unwrap());
 
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -188,6 +199,13 @@ fn init_logging(config: &Config) {
         subscriber.json().init();
     } else {
         subscriber.init();
+    }
+    
+    // Log effective configuration
+    if std::env::var("RUST_LOG").is_ok() {
+        info!("Log level from RUST_LOG environment variable");
+    } else {
+        info!("Log level: {}", config.log.level);
     }
 }
 

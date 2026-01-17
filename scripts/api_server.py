@@ -21,6 +21,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import base64
 import io
 
+# 统一日志配置（通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+except ImportError:
+    # 回退：如果 log_config 不可用，使用基本配置
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
 # 加密支持
 try:
     from cryptography.fernet import Fernet
@@ -691,6 +704,10 @@ _traffic_rates: Dict[str, Dict[str, float]] = {}  # {outbound: {download_rate: f
 # 速率历史记录（保留24小时）
 _rate_history: List[Dict[str, Any]] = []  # [{timestamp: int, rates: {outbound: rate_kb}}]
 _traffic_stats_lock = threading.Lock()
+# Graceful shutdown event for background threads (Issue: DB operations interrupted on shutdown)
+_shutdown_event = threading.Event()
+# 保存后台线程引用，用于优雅关闭
+_background_threads: List[threading.Thread] = []
 _POLL_INTERVAL = 1  # 轮询间隔（秒）
 _RATE_WINDOW = 1  # 速率计算窗口（秒）- 1秒窗口更准确反映瞬时速率
 _HISTORY_INTERVAL = 1  # 历史记录间隔（秒）- 1秒更新，支持实时推进图表
@@ -2068,6 +2085,8 @@ def _update_traffic_stats():
 
     使用 V2Ray API 获取精确的出口流量统计（100% 准确）
     当 sing-box 不可用时，回退到 rust-router IPC 获取统计
+    
+    Issue Fix: 使用 _shutdown_event 实现优雅关闭，避免在 DB 操作中被强制终止
     """
     global _traffic_stats, _traffic_rates, _rate_history
     global _last_history_time, _rate_samples
@@ -2076,7 +2095,7 @@ def _update_traffic_stats():
     _cache_cleanup_counter = 0
     _CACHE_CLEANUP_INTERVAL = 300  # 秒
 
-    while True:
+    while not _shutdown_event.is_set():
         try:
             outbound_stats = None
 
@@ -2096,7 +2115,7 @@ def _update_traffic_stats():
 
             # 如果两者都不可用，跳过此周期
             if not outbound_stats:
-                time.sleep(_POLL_INTERVAL)
+                _shutdown_event.wait(_POLL_INTERVAL)
                 continue
 
             # 从 Xray 出站获取 V2Ray 出口的流量统计
@@ -2204,7 +2223,9 @@ def _update_traffic_stats():
             # M5 修复: 使用 logging 而不是 print，记录完整异常信息
             logging.exception(f"Traffic stats thread error: {type(e).__name__}: {e}")
 
-        time.sleep(_POLL_INTERVAL)
+        _shutdown_event.wait(_POLL_INTERVAL)
+    
+    logging.info("[Traffic] 流量统计后台线程已停止（收到关闭信号）")
 
 
 def _bidirectional_status_checker():
@@ -2219,14 +2240,18 @@ def _bidirectional_status_checker():
 
     对于 WireGuard 隧道，一旦密钥交换完成（有 wg_peer_public_key），就应该是 bidirectional。
     对于 Xray 隧道，需要检查 inbound_enabled 状态。
+    
+    Issue Fix: 使用 _shutdown_event 实现优雅关闭，避免在 DB 操作中被强制终止
     """
     _BIDIR_CHECK_INTERVAL = 60  # 秒
     _STARTUP_DELAY = 10  # 启动延迟，等待系统初始化
 
-    # 等待系统初始化完成
-    time.sleep(_STARTUP_DELAY)
+    # 等待系统初始化完成（可被 shutdown 事件中断）
+    if _shutdown_event.wait(_STARTUP_DELAY):
+        logging.info("[Bidirectional] 双向状态检查后台线程已停止（启动期间收到关闭信号）")
+        return
 
-    while True:
+    while not _shutdown_event.is_set():
         try:
             if HAS_DATABASE and USER_DB_PATH.exists():
                 db = _get_db()
@@ -2246,6 +2271,9 @@ def _bidirectional_status_checker():
                         all_peers.append(peer)
 
                 for peer in all_peers:
+                    # 检查是否收到关闭信号，避免长时间阻塞
+                    if _shutdown_event.is_set():
+                        break
                     tag = peer.get("tag")
                     tunnel_status = peer.get("tunnel_status")
                     if tag and tunnel_status == "connected":
@@ -2260,7 +2288,9 @@ def _bidirectional_status_checker():
         except Exception as e:
             logging.warning(f"[bidirectional-checker] 检查循环异常: {e}")
 
-        time.sleep(_BIDIR_CHECK_INTERVAL)
+        _shutdown_event.wait(_BIDIR_CHECK_INTERVAL)
+    
+    logging.info("[Bidirectional] 双向状态检查后台线程已停止（收到关闭信号）")
 
 
 def _recover_orphaned_chains():
@@ -2322,12 +2352,15 @@ async def startup_event():
     refresh_wg_subnet_cache()
     print(f"[WireGuard] 子网前缀缓存已初始化: {get_cached_wg_subnet_prefix()}")
     # 启动流量统计后台线程（使用 V2Ray API 精确统计）
-    traffic_thread = threading.Thread(target=_update_traffic_stats, daemon=True)
+    # Issue Fix: 保存线程引用用于优雅关闭，不再设置 daemon=True 以便等待完成
+    traffic_thread = threading.Thread(target=_update_traffic_stats, name="traffic-stats", daemon=True)
     traffic_thread.start()
+    _background_threads.append(traffic_thread)
     print("[Traffic] 流量统计后台线程已启动（V2Ray API 精确模式）")
     # Phase 11-Fix.B: 启动双向状态检查后台线程
-    bidir_thread = threading.Thread(target=_bidirectional_status_checker, daemon=True)
+    bidir_thread = threading.Thread(target=_bidirectional_status_checker, name="bidir-checker", daemon=True)
     bidir_thread.start()
+    _background_threads.append(bidir_thread)
     print("[Bidirectional] 双向状态检查后台线程已启动（60秒间隔）")
     # Phase 11.1: 清理过期的终端出口缓存
     try:
@@ -2342,6 +2375,29 @@ async def startup_event():
     recovered = _recover_orphaned_chains()
     if recovered > 0:
         print(f"[Chain Recovery] 已恢复 {recovered} 条孤立链路（重置为 error 状态）")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """应用关闭时优雅停止后台线程
+    
+    Issue Fix: 设置 shutdown 事件通知后台线程停止，并等待它们完成当前操作
+    避免在 DB 操作中被强制终止导致数据不一致
+    """
+    print("[Shutdown] 正在停止后台线程...")
+    
+    # 设置 shutdown 事件，通知所有后台线程停止
+    _shutdown_event.set()
+    
+    # 等待后台线程完成（最多等待 5 秒）
+    _SHUTDOWN_TIMEOUT = 5.0
+    for thread in _background_threads:
+        if thread.is_alive():
+            thread.join(timeout=_SHUTDOWN_TIMEOUT)
+            if thread.is_alive():
+                logging.warning(f"[Shutdown] 后台线程 {thread.name} 未能在 {_SHUTDOWN_TIMEOUT}s 内停止")
+    
+    print("[Shutdown] 后台线程已停止")
 
 
 def load_json_config() -> dict:
@@ -2951,6 +3007,44 @@ def api_health():
     }
 
 
+def _get_rust_router_status_sync() -> dict:
+    """获取 rust-router 状态（同步版本）"""
+    import asyncio
+
+    async def _get_status():
+        try:
+            client = RustRouterClient()
+            response = await client.status()
+            if response.success and response.data:
+                return {
+                    "running": True,
+                    "version": response.data.get("version", "unknown"),
+                    "uptime_secs": response.data.get("uptime_secs", 0),
+                    "active_connections": response.data.get("active_connections", 0),
+                    "total_connections": response.data.get("total_connections", 0),
+                    "accepting": response.data.get("accepting", False),
+                }
+            # Ping succeeded but no data
+            return {"running": True}
+        except Exception as e:
+            logging.debug(f"rust-router status check failed: {e}")
+            return {"running": False}
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_status())
+                return future.result(timeout=2)
+        else:
+            return loop.run_until_complete(_get_status())
+    except RuntimeError:
+        return asyncio.run(_get_status())
+    except Exception:
+        return {"running": False}
+
+
 @app.get("/api/status")
 def api_status():
     config_stat = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
@@ -2958,9 +3052,15 @@ def api_status():
     # 从数据库获取 PIA profiles
     db = _get_db()
     pia_profiles = db.get_pia_profiles(enabled_only=False)
+
+    # 获取 rust-router 状态
+    rust_router_status = _get_rust_router_status_sync()
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "sing_box_running": list_processes("sing-box"),
+        "sing_box_running": list_processes("sing-box"),  # 保留兼容性
+        "rust_router_running": rust_router_status.get("running", False),
+        "rust_router": rust_router_status,
         "wireguard_interface": wireguard,
         "config_mtime": config_stat.st_mtime if config_stat else None,
         "pia_profiles": pia_profiles,
@@ -4787,6 +4887,51 @@ def _parse_transfer(transfer_str: str) -> tuple:
     return rx_bytes, tx_bytes
 
 
+def get_peer_status_from_rust_router() -> dict:
+    """从 rust-router 获取 peer 状态（用于 userspace WireGuard 模式）
+
+    Returns:
+        Dict mapping public_key to peer status dict with handshake, rx, tx
+    """
+    import asyncio
+
+    async def _get_peers():
+        try:
+            client = RustRouterClient()
+            return await client.list_ingress_peers()
+        except Exception as e:
+            print(f"[api] Failed to get peers from rust-router: {e}")
+            return []
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If we're already in an async context, create a new loop in a thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_peers())
+                peers = future.result(timeout=5)
+        else:
+            peers = loop.run_until_complete(_get_peers())
+    except RuntimeError:
+        # No event loop, create one
+        peers = asyncio.run(_get_peers())
+    except Exception as e:
+        print(f"[api] Error getting peer status: {e}")
+        peers = []
+
+    result = {}
+    for peer in peers:
+        pubkey = peer.get("public_key", "")
+        if pubkey:
+            result[pubkey] = {
+                "last_handshake": peer.get("last_handshake") or 0,
+                "rx_bytes": peer.get("rx_bytes") or 0,
+                "tx_bytes": peer.get("tx_bytes") or 0,
+            }
+    return result
+
+
 def get_peer_handshake_info() -> dict:
     """获取 peer 握手状态（从内核 WireGuard）
 
@@ -5257,9 +5402,19 @@ def api_get_ingress():
     # 获取公钥
     public_key = get_ingress_public_key(config)
 
-    # 获取 peer 状态
-    handshakes = get_peer_handshake_info()
-    transfers = get_peer_transfer_info()
+    # 获取 peer 状态 - 根据模式选择数据源
+    # Phase 11-Fix.AA: Userspace WireGuard mode is default
+    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
+
+    if userspace_wg:
+        # 从 rust-router 获取 peer 状态（包含 handshake 和 transfer）
+        rust_router_status = get_peer_status_from_rust_router()
+        handshakes = {k: v.get("last_handshake", 0) for k, v in rust_router_status.items()}
+        transfers = {k: {"rx": v.get("rx_bytes", 0), "tx": v.get("tx_bytes", 0)} for k, v in rust_router_status.items()}
+    else:
+        # 从内核 WireGuard 获取状态
+        handshakes = get_peer_handshake_info()
+        transfers = get_peer_transfer_info()
 
     # 丰富 peer 信息
     peers = []

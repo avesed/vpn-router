@@ -25,12 +25,19 @@ import time
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[warp-opt] %(asctime)s %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# 配置日志（统一日志配置，通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger(__name__)
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='[warp-opt] %(asctime)s %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
 # WARP Endpoint IP 范围（来自 Cloudflare 官方文档）
 # https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/deployment/firewall/

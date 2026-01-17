@@ -39,13 +39,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from db_helper import get_db
 
-# 配置 logger（在其他模块级函数使用前定义）
-logging.basicConfig(
-    level=logging.INFO,
-    format='[xray-mgr] %(asctime)s %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# 配置 logger（统一日志配置，通过 LOG_LEVEL 环境变量控制）
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger(__name__)
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='[xray-mgr] %(asctime)s %(levelname)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
 
 def _safe_int_env(name: str, default: int) -> int:

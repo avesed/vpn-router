@@ -34,6 +34,15 @@ services:
       - WG_SERVER_ENDPOINT=${WG_SERVER_ENDPOINT:-}
       - WEB_PORT=${WEB_PORT:-36000}
       - WG_LISTEN_PORT=${WG_LISTEN_PORT:-36100}
+      # ============ Global Logging Configuration ============
+      # Python scripts: DEBUG, INFO, WARNING, ERROR, CRITICAL
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Rust router (supports fine-grained control):
+      #   Simple: trace, debug, info, warn, error
+      #   Fine-grained: rust_router=debug,hyper=warn,tokio=info
+      - RUST_LOG=${RUST_LOG:-info}
+      # Alternative: RUST_ROUTER_LOG_LEVEL (overrides config file)
+      - RUST_ROUTER_LOG_LEVEL=${RUST_ROUTER_LOG_LEVEL:-}
     #ports:
     #  - "${WEB_PORT:-36000}:${WEB_PORT:-36000}"           # Web UI
     #  - "${WG_LISTEN_PORT:-36100}:${WG_LISTEN_PORT:-36100}/udp"  # WireGuard

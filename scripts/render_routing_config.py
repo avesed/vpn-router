@@ -33,13 +33,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger("render_routing_config")
+# Configure logging (统一日志配置，通过 LOG_LEVEL 环境变量控制)
+try:
+    from log_config import setup_logging, get_logger
+    setup_logging()
+    logger = get_logger("render_routing_config")
+except ImportError:
+    _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger("render_routing_config")
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).parent))

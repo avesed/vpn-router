@@ -120,6 +120,8 @@
     "serviceStopped": "服务已停止",
     "serviceNormal": "服务运行正常",
     "singboxStatus": "Sing-Box 状态",
+    "routerStatus": "路由器状态",
+    "uptime": "运行时长",
     "runningTime": "运行时长",
     "piaLines": "PIA 线路",
     "linesConfigured": "条线路已配置",

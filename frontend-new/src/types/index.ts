@@ -18,9 +18,20 @@ export interface Endpoint {
   peers?: WireGuardPeer[];
 }
 
+export interface RustRouterStatus {
+  running: boolean;
+  version?: string;
+  uptime_secs?: number;
+  active_connections?: number;
+  total_connections?: number;
+  accepting?: boolean;
+}
+
 export interface GatewayStatus {
   timestamp: string;
   sing_box_running: boolean;
+  rust_router_running: boolean;
+  rust_router?: RustRouterStatus;
   wireguard_interface: Record<string, unknown>;
   config_mtime?: number;
   pia_profiles?: PiaProfile[];

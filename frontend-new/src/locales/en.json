@@ -120,6 +120,8 @@
     "serviceStopped": "Service stopped",
     "serviceNormal": "Service running normally",
     "singboxStatus": "Sing-Box Status",
+    "routerStatus": "Router Status",
+    "uptime": "Uptime",
     "runningTime": "Uptime",
     "piaLines": "PIA Lines",
     "linesConfigured": "lines configured",
