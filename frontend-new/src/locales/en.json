@@ -1127,6 +1127,8 @@
     "maxMembers": "Maximum 10",
     "weights": "Weight Configuration",
     "weightHint": "Higher weight means more traffic",
+    "algorithm": "Load Balance Algorithm",
+    "selectAlgorithm": "Select algorithm",
     "healthCheck": "Health Check",
     "healthCheckUrl": "Check URL",
     "healthCheckInterval": "Check Interval (seconds)",

@@ -3104,64 +3104,38 @@ def api_stats_dashboard(time_range: str = "1m"):
     except Exception:
         pass
 
-    # 使用缓存的子网前缀（避免频繁数据库查询）
-    wg_subnet_prefix = get_cached_wg_subnet_prefix()
-
-    # 从 clash_api 或 rust-router 获取活跃连接数和在线客户端
-    got_connection_stats = False
-
-    # 优先尝试 Clash API (sing-box)
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{DEFAULT_CLASH_API_PORT}/connections", timeout=2) as resp:
-            data = json.loads(resp.read().decode())
-
-        connections = data.get("connections", [])
-        stats["active_connections"] = len(connections)
-
-        # 统计在线客户端（WireGuard 网段的唯一 IP）
-        online_ips = set()
-        for conn in connections:
-            metadata = conn.get("metadata", {})
-            src_ip = metadata.get("sourceIP", "")
-            if src_ip.startswith(wg_subnet_prefix):
-                online_ips.add(src_ip)
-
-        stats["online_clients"] = len(online_ips)
-        got_connection_stats = True
-
-    except Exception:
-        pass
-
-    # 回退到 rust-router IPC（当 Clash API 不可用时）
-    if not got_connection_stats and HAS_RUST_ROUTER_CLIENT:
+    # 从 rust-router IPC 获取活跃连接数和在线客户端
+    if HAS_RUST_ROUTER_CLIENT:
         try:
             import asyncio
+            import concurrent.futures
 
             async def _get_rust_router_stats():
-                from rust_router_client import RustRouterClient
                 client = RustRouterClient()
-                await client.connect()
                 # 获取总体统计
-                stats_resp = await client._send_command({"type": "get_stats"})
+                stats_resp = await client.get_stats()
                 # 获取 ingress 统计（在线客户端）
                 ingress_resp = await client._send_command({"type": "get_ingress_stats"})
-                await client.close()
                 return stats_resp, ingress_resp
 
-            stats_resp, ingress_resp = asyncio.run(_get_rust_router_stats())
-
-            if stats_resp.success:
-                stats["active_connections"] = stats_resp.data.get("active", 0)
+            # 使用 asyncio.run() 在新线程中执行以避免与 FastAPI 事件循环冲突
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, _get_rust_router_stats())
+                stats_resp, ingress_resp = future.result(timeout=3)
 
             if ingress_resp.success and ingress_resp.data:
-                manager_stats = ingress_resp.data.get("manager_stats", {})
+                manager_stats = ingress_resp.data.get("manager_stats") or {}
+                
                 stats["online_clients"] = manager_stats.get("active_peer_count", 0)
                 # 总客户端也可以从 ingress 获取
                 if manager_stats.get("peer_count", 0) > 0:
                     stats["total_clients"] = manager_stats.get("peer_count", 0)
+                
+                # 活跃会话数（实际连接数）
+                stats["active_connections"] = ingress_resp.data.get("active_sessions", 0)
 
         except Exception as e:
-            logging.debug(f"rust-router stats unavailable: {type(e).__name__}: {e}")
+            logging.warning(f"rust-router stats unavailable: {type(e).__name__}: {e}")
 
     # 使用累计流量统计和实时速率（由后台线程更新）
     # 包含所有配置的出口，没有流量的显示为 0
@@ -7771,6 +7745,7 @@ class OutboundGroupCreate(BaseModel):
     type: str = Field(..., pattern=r'^(loadbalance|failover)$')
     members: List[str] = Field(..., min_length=2, max_length=10)
     weights: Optional[Dict[str, int]] = None
+    algorithm: str = Field("five_tuple_hash", pattern=r'^(five_tuple_hash|dest_hash|dest_hash_least_load|round_robin|weighted|least_connections|random)$')
     health_check_url: str = "http://www.gstatic.com/generate_204"
     health_check_interval: int = Field(60, ge=10, le=3600)
     health_check_timeout: int = Field(5, ge=1, le=30)
@@ -7781,6 +7756,7 @@ class OutboundGroupUpdate(BaseModel):
     description: Optional[str] = None
     members: Optional[List[str]] = Field(None, min_length=2, max_length=10)
     weights: Optional[Dict[str, int]] = None
+    algorithm: Optional[str] = Field(None, pattern=r'^(five_tuple_hash|dest_hash|dest_hash_least_load|round_robin|weighted|least_connections|random)$')
     health_check_url: Optional[str] = None
     health_check_interval: Optional[int] = Field(None, ge=10, le=3600)
     health_check_timeout: Optional[int] = Field(None, ge=1, le=30)
@@ -7993,6 +7969,7 @@ def api_create_outbound_group(data: OutboundGroupCreate):
             group_type=data.type,
             members=data.members,
             weights=data.weights,
+            algorithm=data.algorithm,
             health_check_url=data.health_check_url,
             health_check_interval=data.health_check_interval,
             health_check_timeout=data.health_check_timeout
@@ -8062,6 +8039,8 @@ def api_update_outbound_group(tag: str, data: OutboundGroupUpdate):
         update_kwargs["members"] = data.members
     if data.weights is not None:
         update_kwargs["weights"] = data.weights
+    if data.algorithm is not None:
+        update_kwargs["algorithm"] = data.algorithm
     if data.health_check_url is not None:
         update_kwargs["health_check_url"] = data.health_check_url
     if data.health_check_interval is not None:

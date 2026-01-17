@@ -15,6 +15,7 @@ import {
   Loader2
 } from "lucide-react";
 import type { OutboundGroup, MemberHealthStatus } from "../../types";
+import { ECMP_ALGORITHMS } from "../../types";
 
 interface GroupCardProps {
   group: OutboundGroup;
@@ -131,6 +132,16 @@ export function GroupCard({
             </p>
           )}
         </div>
+
+        {/* Algorithm (only for loadbalance) */}
+        {isLoadBalance && group.algorithm && (
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-muted-foreground">{t("groups.algorithm")}</span>
+            <span className="text-xs">
+              {ECMP_ALGORITHMS.find(a => a.value === group.algorithm)?.label || group.algorithm}
+            </span>
+          </div>
+        )}
 
         {/* Routing Table */}
         {group.routing_table && (

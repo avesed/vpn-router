@@ -2124,6 +2124,7 @@ class UserDatabase:
         members: List[str],
         description: str = "",
         weights: Optional[Dict[str, int]] = None,
+        algorithm: str = "five_tuple_hash",
         health_check_url: str = "http://www.gstatic.com/generate_204",
         health_check_interval: int = 60,
         health_check_timeout: int = 5,
@@ -2137,6 +2138,7 @@ class UserDatabase:
             members: 成员出口 tag 列表
             description: 描述
             weights: 权重配置（仅 loadbalance 使用）
+            algorithm: ECMP 算法 (five_tuple_hash, dest_hash, round_robin, etc.)
             health_check_url: 健康检查 URL
             health_check_interval: 健康检查间隔（秒）
             health_check_timeout: 健康检查超时（秒）
@@ -2162,12 +2164,12 @@ class UserDatabase:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO outbound_groups
-                (tag, description, type, members, weights,
+                (tag, description, type, members, weights, algorithm,
                  health_check_url, health_check_interval, health_check_timeout,
                  routing_table, enabled)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                tag, description, group_type, members_json, weights_json,
+                tag, description, group_type, members_json, weights_json, algorithm,
                 health_check_url, health_check_interval, health_check_timeout,
                 routing_table, 1 if enabled else 0
             ))
@@ -2177,11 +2179,11 @@ class UserDatabase:
     def update_outbound_group(self, tag: str, **kwargs) -> bool:
         """更新出口组
 
-        支持的字段：description, members, weights,
+        支持的字段：description, members, weights, algorithm,
         health_check_url, health_check_interval, health_check_timeout, enabled
         """
         allowed_fields = {
-            "description", "members", "weights",
+            "description", "members", "weights", "algorithm",
             "health_check_url", "health_check_interval", "health_check_timeout",
             "enabled"
         }
@@ -4823,13 +4825,14 @@ class DatabaseManager:
         members: List[str],
         description: str = "",
         weights: Optional[Dict[str, int]] = None,
+        algorithm: str = "five_tuple_hash",
         health_check_url: str = "http://www.gstatic.com/generate_204",
         health_check_interval: int = 60,
         health_check_timeout: int = 5,
         enabled: bool = True
     ) -> int:
         return self.user.add_outbound_group(
-            tag, group_type, members, description, weights,
+            tag, group_type, members, description, weights, algorithm,
             health_check_url, health_check_interval, health_check_timeout, enabled
         )
 

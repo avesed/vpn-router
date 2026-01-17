@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::ecmp::{EcmpGroupManager, FiveTuple, Protocol};
+use crate::ecmp::{DestKey, EcmpGroupManager, FiveTuple, LbAlgorithm, Protocol};
 use crate::error::{ConnectionError, RustRouterError};
 use crate::io::{bidirectional_copy, CopyResult};
 use crate::outbound::{Outbound, OutboundManager};
@@ -109,10 +109,12 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
 
     // Phase 6-Fix.AI: Get the outbound with ECMP group resolution
     // This supports both direct outbounds and ECMP load balancing groups
+    // Pass SNI for DestHash algorithm (video streaming session affinity)
     let (outbound, actual_outbound_tag) = match resolve_outbound_with_ecmp(
         outbound_tag,
         client_addr,
         original_dst,
+        result.sni.as_deref(),
         &ctx.outbound_manager,
         ctx.ecmp_group_manager.as_ref(),
     ) {
@@ -216,14 +218,17 @@ fn is_tls_port(port: u16) -> bool {
 /// Phase 6-Fix.AI: Resolve outbound tag to actual outbound, with ECMP group support.
 ///
 /// If the tag refers to an ECMP group, this function selects a member using
-/// five-tuple hashing for connection affinity. Otherwise, it performs a direct
-/// lookup in the outbound manager.
+/// the configured load balancing algorithm:
+/// - `FiveTupleHash` (default): Hash src/dst IP+port for connection affinity
+/// - `DestHash`: Hash destination (domain or IP) for session affinity (video streaming)
+/// - `DestHashLeastLoad`: Session affinity + intelligent load balancing for new sessions
 ///
 /// # Arguments
 ///
 /// * `tag` - The outbound or group tag to resolve
 /// * `client_addr` - Client socket address
 /// * `original_dst` - Original destination socket address
+/// * `domain` - Optional domain name from TLS SNI (used by DestHash/DestHashLeastLoad)
 /// * `outbound_manager` - Manager for direct outbounds
 /// * `ecmp_group_manager` - Optional ECMP group manager
 ///
@@ -234,6 +239,7 @@ fn resolve_outbound_with_ecmp(
     tag: &str,
     client_addr: SocketAddr,
     original_dst: SocketAddr,
+    domain: Option<&str>,
     outbound_manager: &OutboundManager,
     ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
 ) -> Option<(Arc<dyn Outbound>, String)> {
@@ -245,22 +251,48 @@ fn resolve_outbound_with_ecmp(
     // Check if it's an ECMP group
     if let Some(ecmp_mgr) = ecmp_group_manager {
         if ecmp_mgr.has_group(tag) {
-            // Build five-tuple for load balancing
-            let five_tuple = FiveTuple::new(
-                client_addr.ip(),
-                original_dst.ip(),
-                client_addr.port(),
-                original_dst.port(),
-                Protocol::Tcp,
-            );
-
             // Select member using the group's load balancing algorithm
             if let Some(group) = ecmp_mgr.get_group(tag) {
-                match group.select_by_connection(&five_tuple) {
+                // Choose selection method based on algorithm
+                let select_result = match group.algorithm() {
+                    LbAlgorithm::DestHash => {
+                        // DestHash: hash(source_ip + domain/dest_ip) for per-client session affinity
+                        // Same client to same domain → same exit; different clients → load balanced
+                        let dest_key = DestKey::new(client_addr.ip(), domain, original_dst.ip());
+                        debug!(
+                            "ECMP group '{}' using DestHash with key: {}",
+                            tag, dest_key
+                        );
+                        group.select_by_dest(&dest_key)
+                    }
+                    LbAlgorithm::DestHashLeastLoad => {
+                        // DestHashLeastLoad: session affinity + intelligent load balancing
+                        // New sessions: select least loaded exit; existing: use cached selection
+                        let dest_key = DestKey::new(client_addr.ip(), domain, original_dst.ip());
+                        debug!(
+                            "ECMP group '{}' using DestHashLeastLoad with key: {}",
+                            tag, dest_key
+                        );
+                        group.select_by_dest_least_load(&dest_key)
+                    }
+                    _ => {
+                        // Default: use five-tuple hash for connection affinity
+                        let five_tuple = FiveTuple::new(
+                            client_addr.ip(),
+                            original_dst.ip(),
+                            client_addr.port(),
+                            original_dst.port(),
+                            Protocol::Tcp,
+                        );
+                        group.select_by_connection(&five_tuple)
+                    }
+                };
+
+                match select_result {
                     Ok(member_tag) => {
                         debug!(
-                            "ECMP group '{}' selected member '{}' for TCP {} -> {}",
-                            tag, member_tag, client_addr, original_dst
+                            "ECMP group '{}' selected member '{}' for TCP {} -> {} (domain: {:?})",
+                            tag, member_tag, client_addr, original_dst, domain
                         );
                         // Recursively resolve the member
                         if let Some(outbound) = outbound_manager.get(&member_tag) {

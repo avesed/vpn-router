@@ -1127,6 +1127,8 @@
     "maxMembers": "最多 10 个",
     "weights": "权重配置",
     "weightHint": "数值越大，分配的流量越多",
+    "algorithm": "负载均衡算法",
+    "selectAlgorithm": "选择算法",
     "healthCheck": "健康检查",
     "healthCheckUrl": "检查 URL",
     "healthCheckInterval": "检查间隔 (秒)",

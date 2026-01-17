@@ -2,7 +2,8 @@
 //!
 //! This module implements various load balancing algorithms for ECMP
 //! groups, including round-robin, weighted, least-connections, random,
-//! and five-tuple hash for connection affinity.
+//! five-tuple hash for connection affinity, and destination hash for
+//! session affinity (video streaming).
 //!
 //! # Phase 6 Implementation Status
 //!
@@ -11,16 +12,20 @@
 //! - [x] 6.7 Least connections
 //! - [x] 6.7 Random selection
 //! - [x] 6.7 Five-tuple hash (connection affinity)
+//! - [x] 6.7 Destination hash (session affinity for video streaming)
+//! - [x] 6.7 Destination hash with least-load (session affinity + smart LB)
 //!
 //! # Algorithms
 //!
 //! | Algorithm | Description |
 //! |-----------|-------------|
 //! | `FiveTupleHash` | Hash 5-tuple for connection affinity (DEFAULT) |
+//! | `DestHash` | Hash destination (domain/IP) for session affinity |
+//! | `DestHashLeastLoad` | Session affinity + intelligent load balancing |
 //! | `RoundRobin` | Cycle through members sequentially |
-//! | Weighted | Distribute based on member weights |
+//! | `Weighted` | Distribute based on member weights |
 //! | `LeastConnections` | Select member with fewest active connections |
-//! | Random | Random selection (no state) |
+//! | `Random` | Random selection (no state) |
 //!
 //! # Example
 //!
@@ -239,6 +244,116 @@ impl std::fmt::Display for FiveTuple {
     }
 }
 
+/// Destination key for session affinity.
+///
+/// Used by `DestHash` algorithm to ensure all connections from the same
+/// client to the same destination (domain or IP) use the same exit.
+/// This is useful for video streaming where a player opens multiple connections.
+///
+/// Hash is computed from: `source_ip + (domain OR dest_ip)`
+///
+/// This ensures:
+/// - Same client to same domain → same exit (session affinity)
+/// - Different clients to same domain → can use different exits (load balancing)
+///
+/// # Example
+///
+/// ```
+/// use rust_router::ecmp::lb::DestKey;
+/// use std::net::IpAddr;
+///
+/// // Same client, same domain, different CDN IPs → same hash
+/// let key1 = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.142".parse().unwrap());
+/// let key2 = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.143".parse().unwrap());
+/// assert_eq!(key1.compute_hash(), key2.compute_hash());
+///
+/// // Different clients, same domain → different hash (load balanced)
+/// let key3 = DestKey::new("10.0.0.2".parse().unwrap(), Some("youtube.com"), "142.250.185.142".parse().unwrap());
+/// assert_ne!(key1.compute_hash(), key3.compute_hash());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestKey {
+    /// Source IP address (client)
+    pub source_ip: IpAddr,
+    /// Domain name (from TLS SNI or QUIC SNI), if available
+    pub domain: Option<String>,
+    /// Destination IP address (used as fallback when domain not available)
+    pub dest_ip: IpAddr,
+}
+
+impl DestKey {
+    /// Create a new `DestKey`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_ip` - Source/client IP address
+    /// * `domain` - Optional domain name (from SNI sniffing)
+    /// * `dest_ip` - Destination IP address
+    #[must_use]
+    pub fn new(source_ip: IpAddr, domain: Option<&str>, dest_ip: IpAddr) -> Self {
+        Self {
+            source_ip,
+            // Normalize domain: lowercase and remove trailing dot
+            // This ensures case-insensitive matching (DNS is case-insensitive)
+            domain: domain.map(|d| Self::normalize_domain(d)),
+            dest_ip,
+        }
+    }
+
+    /// Normalize a domain name for consistent hashing.
+    ///
+    /// - Converts to lowercase (DNS is case-insensitive)
+    /// - Removes trailing dot (FQDN vs non-FQDN)
+    fn normalize_domain(domain: &str) -> String {
+        let lower = domain.to_lowercase();
+        lower.trim_end_matches('.').to_string()
+    }
+
+    /// Compute a hash of this destination key.
+    ///
+    /// Hash includes source_ip + (domain OR dest_ip).
+    /// This ensures same client to same destination always gets same exit,
+    /// while different clients can be load balanced across exits.
+    #[must_use]
+    pub fn compute_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+
+        // Always include source IP for per-client affinity
+        self.source_ip.hash(&mut hasher);
+
+        if let Some(ref domain) = self.domain {
+            // Hash source_ip + domain
+            domain.hash(&mut hasher);
+        } else {
+            // Fallback: hash source_ip + dest_ip
+            self.dest_ip.hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
+
+    /// Returns the key used for hashing (source:domain or source:ip).
+    #[must_use]
+    pub fn key_str(&self) -> String {
+        if let Some(ref domain) = self.domain {
+            format!("{}:{}", self.source_ip, domain)
+        } else {
+            format!("{}:{}", self.source_ip, self.dest_ip)
+        }
+    }
+}
+
+impl std::fmt::Display for DestKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ref domain) = self.domain {
+            write!(f, "{}->domain:{}", self.source_ip, domain)
+        } else {
+            write!(f, "{}->ip:{}", self.source_ip, self.dest_ip)
+        }
+    }
+}
+
 /// Load balancing algorithm
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,6 +363,16 @@ pub enum LbAlgorithm {
     #[serde(rename = "five_tuple_hash")]
     #[default]
     FiveTupleHash,
+    /// Destination hash: Hash destination (domain or IP) for session affinity.
+    /// Useful for video streaming where multiple connections to the same domain
+    /// should use the same exit.
+    #[serde(rename = "dest_hash")]
+    DestHash,
+    /// Destination hash with least-load selection: For NEW sessions, select the
+    /// exit with the lowest load. For EXISTING sessions, maintain affinity.
+    /// This combines session affinity with intelligent load balancing.
+    #[serde(rename = "dest_hash_least_load")]
+    DestHashLeastLoad,
     /// Round-robin: Cycle through members sequentially
     RoundRobin,
     /// Weighted: Distribute based on member weights
@@ -263,6 +388,8 @@ impl std::fmt::Display for LbAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FiveTupleHash => write!(f, "five_tuple_hash"),
+            Self::DestHash => write!(f, "dest_hash"),
+            Self::DestHashLeastLoad => write!(f, "dest_hash_least_load"),
             Self::RoundRobin => write!(f, "round_robin"),
             Self::Weighted => write!(f, "weighted"),
             Self::LeastConnections => write!(f, "least_connections"),
@@ -285,6 +412,10 @@ pub enum LbError {
     /// Missing five-tuple for hash algorithm
     #[error("FiveTupleHash algorithm requires a five-tuple")]
     MissingFiveTuple,
+
+    /// Missing destination key for DestHash algorithm
+    #[error("DestHash algorithm requires a destination key")]
+    MissingDestKey,
 
     /// Internal error
     #[error("Internal error: {0}")]
@@ -408,7 +539,8 @@ impl LoadBalancer {
                 Ok(index)
             }
             LbAlgorithm::FiveTupleHash => Err(LbError::MissingFiveTuple),
-            _ => Err(LbError::Internal(
+            LbAlgorithm::DestHash | LbAlgorithm::DestHashLeastLoad => Err(LbError::MissingDestKey),
+            LbAlgorithm::Weighted | LbAlgorithm::LeastConnections => Err(LbError::Internal(
                 "Algorithm requires detailed member information".into(),
             )),
         }
@@ -457,6 +589,7 @@ impl LoadBalancer {
             LbAlgorithm::Weighted => self.select_weighted(&healthy),
             LbAlgorithm::LeastConnections => self.select_least_connections(&healthy),
             LbAlgorithm::FiveTupleHash => Err(LbError::MissingFiveTuple),
+            LbAlgorithm::DestHash | LbAlgorithm::DestHashLeastLoad => Err(LbError::MissingDestKey),
         }
     }
 
@@ -550,6 +683,106 @@ impl LoadBalancer {
 
         // Compute hash and map to weight range
         let hash = five_tuple.compute_hash();
+        let target = hash % total_weight;
+
+        let mut cumulative: u64 = 0;
+        for member in &healthy {
+            cumulative += u64::from(member.weight);
+            if target < cumulative {
+                return Ok(member.index);
+            }
+        }
+
+        // Fallback to first member (should not happen)
+        Ok(healthy[0].index)
+    }
+
+    /// Select a member using destination hash for session affinity.
+    ///
+    /// All connections to the same destination (domain or IP) will select
+    /// the same healthy member. This is useful for video streaming where
+    /// a player opens multiple connections to the same service.
+    ///
+    /// # Arguments
+    ///
+    /// * `members` - List of member information
+    /// * `dest_key` - The destination key (domain or IP)
+    ///
+    /// # Returns
+    ///
+    /// Selected member index
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::ecmp::lb::{LoadBalancer, LbAlgorithm, LbMember, DestKey};
+    ///
+    /// let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+    /// let members = vec![
+    ///     LbMember::new(0),
+    ///     LbMember::new(1),
+    ///     LbMember::new(2),
+    /// ];
+    ///
+    /// // Same client + same domain → same member (even with different CDN IPs)
+    /// let key1 = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.142".parse().unwrap());
+    /// let key2 = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.143".parse().unwrap());
+    /// let idx1 = lb.select_by_dest(&members, &key1).unwrap();
+    /// let idx2 = lb.select_by_dest(&members, &key2).unwrap();
+    /// assert_eq!(idx1, idx2);
+    /// ```
+    pub fn select_by_dest(
+        &self,
+        members: &[LbMember],
+        dest_key: &DestKey,
+    ) -> Result<usize, LbError> {
+        // Filter healthy members
+        let healthy: Vec<&LbMember> = members.iter().filter(|m| m.healthy).collect();
+
+        if healthy.is_empty() {
+            return Err(LbError::NoMembers);
+        }
+
+        // Compute hash and select member
+        let hash = dest_key.compute_hash();
+        let index = (hash as usize) % healthy.len();
+
+        Ok(healthy[index].index)
+    }
+
+    /// Select a member using destination hash with weighted distribution.
+    ///
+    /// Combines destination hashing with member weights for deterministic
+    /// weighted selection.
+    ///
+    /// # Arguments
+    ///
+    /// * `members` - List of member information
+    /// * `dest_key` - The destination key (domain or IP)
+    ///
+    /// # Returns
+    ///
+    /// Selected member index
+    pub fn select_by_dest_weighted(
+        &self,
+        members: &[LbMember],
+        dest_key: &DestKey,
+    ) -> Result<usize, LbError> {
+        // Filter healthy members
+        let healthy: Vec<&LbMember> = members.iter().filter(|m| m.healthy).collect();
+
+        if healthy.is_empty() {
+            return Err(LbError::NoMembers);
+        }
+
+        let total_weight: u64 = healthy.iter().map(|m| u64::from(m.weight)).sum();
+
+        if total_weight == 0 {
+            return Err(LbError::ZeroWeight);
+        }
+
+        // Compute hash and map to weight range
+        let hash = dest_key.compute_hash();
         let target = hash % total_weight;
 
         let mut cumulative: u64 = 0;
@@ -1299,6 +1532,204 @@ mod tests {
         let members = vec![LbMember::new(0), LbMember::new(1)];
         let result = lb.select(&members);
         assert!(matches!(result, Err(LbError::MissingFiveTuple)));
+    }
+
+    // ========================================================================
+    // LoadBalancer - DestHash Tests (video streaming session affinity)
+    // ========================================================================
+
+    #[test]
+    fn test_dest_hash_domain_affinity() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![LbMember::new(0), LbMember::new(1), LbMember::new(2)];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Same client + same domain with different CDN IPs should select the same member
+        let key1 = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+        let key2 = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.143".parse().unwrap());
+        let key3 = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.144".parse().unwrap());
+
+        let idx1 = lb.select_by_dest(&members, &key1).unwrap();
+        let idx2 = lb.select_by_dest(&members, &key2).unwrap();
+        let idx3 = lb.select_by_dest(&members, &key3).unwrap();
+
+        // All should be the same since client + domain is the same
+        assert_eq!(idx1, idx2, "Same client+domain should select same member");
+        assert_eq!(idx2, idx3, "Same client+domain should select same member");
+    }
+
+    #[test]
+    fn test_dest_hash_different_clients_distribute() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![LbMember::new(0), LbMember::new(1), LbMember::new(2)];
+
+        // Different clients accessing same domain should distribute across members
+        let mut selected = std::collections::HashSet::new();
+        for i in 1..=20 {
+            let client_ip: IpAddr = format!("10.0.0.{}", i).parse().unwrap();
+            let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+            let idx = lb.select_by_dest(&members, &key).unwrap();
+            selected.insert(idx);
+        }
+
+        // Should distribute across multiple members (load balancing)
+        assert!(selected.len() > 1, "Different clients should distribute across members");
+    }
+
+    #[test]
+    fn test_dest_hash_ip_fallback() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![LbMember::new(0), LbMember::new(1), LbMember::new(2)];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Without domain, should hash by client_ip + dest_ip
+        let key1 = DestKey::new(client_ip, None, "8.8.8.8".parse().unwrap());
+        let key2 = DestKey::new(client_ip, None, "8.8.8.8".parse().unwrap());
+
+        let idx1 = lb.select_by_dest(&members, &key1).unwrap();
+        let idx2 = lb.select_by_dest(&members, &key2).unwrap();
+
+        // Same client + same dest IP should select same member
+        assert_eq!(idx1, idx2);
+    }
+
+    #[test]
+    fn test_dest_hash_different_domains_distribute() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![LbMember::new(0), LbMember::new(1), LbMember::new(2)];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let domains = [
+            "youtube.com",
+            "netflix.com",
+            "twitch.tv",
+            "amazon.com",
+            "google.com",
+            "facebook.com",
+            "twitter.com",
+            "github.com",
+            "reddit.com",
+        ];
+
+        let mut selected = std::collections::HashSet::new();
+        for domain in &domains {
+            let key = DestKey::new(client_ip, Some(domain), "1.1.1.1".parse().unwrap());
+            let idx = lb.select_by_dest(&members, &key).unwrap();
+            selected.insert(idx);
+        }
+
+        // Should distribute across multiple members
+        assert!(selected.len() > 1, "Different domains should distribute across members");
+    }
+
+    #[test]
+    fn test_dest_hash_skips_unhealthy() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![
+            LbMember::new(0).with_healthy(false),
+            LbMember::new(1),
+            LbMember::new(2).with_healthy(false),
+        ];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+
+        // Should always select member 1 (only healthy)
+        for _ in 0..10 {
+            let idx = lb.select_by_dest(&members, &key).unwrap();
+            assert_eq!(idx, 1);
+        }
+    }
+
+    #[test]
+    fn test_dest_hash_no_healthy_members() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![
+            LbMember::new(0).with_healthy(false),
+            LbMember::new(1).with_healthy(false),
+        ];
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+        let result = lb.select_by_dest(&members, &key);
+        assert!(matches!(result, Err(LbError::NoMembers)));
+    }
+
+    #[test]
+    fn test_dest_hash_select_error() {
+        let lb = LoadBalancer::new(LbAlgorithm::DestHash);
+        let members = vec![LbMember::new(0), LbMember::new(1)];
+        let result = lb.select(&members);
+        assert!(matches!(result, Err(LbError::MissingDestKey)));
+    }
+
+    #[test]
+    fn test_dest_key_compute_hash() {
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Same client + same domain with different dest IPs → same hash
+        let key1 = DestKey::new(client_ip, Some("example.com"), "1.1.1.1".parse().unwrap());
+        let key2 = DestKey::new(client_ip, Some("example.com"), "2.2.2.2".parse().unwrap());
+        assert_eq!(key1.compute_hash(), key2.compute_hash());
+
+        // Same client + different domains → different hash
+        let key3 = DestKey::new(client_ip, Some("other.com"), "1.1.1.1".parse().unwrap());
+        assert_ne!(key1.compute_hash(), key3.compute_hash());
+
+        // Different clients + same domain → different hash (load balanced)
+        let client_ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let key4 = DestKey::new(client_ip2, Some("example.com"), "1.1.1.1".parse().unwrap());
+        assert_ne!(key1.compute_hash(), key4.compute_hash());
+
+        // Without domain, hash includes client + dest IP
+        let key5 = DestKey::new(client_ip, None, "8.8.8.8".parse().unwrap());
+        let key6 = DestKey::new(client_ip, None, "8.8.8.8".parse().unwrap());
+        let key7 = DestKey::new(client_ip, None, "8.8.4.4".parse().unwrap());
+        assert_eq!(key5.compute_hash(), key6.compute_hash());
+        assert_ne!(key5.compute_hash(), key7.compute_hash());
+    }
+
+    #[test]
+    fn test_dest_key_domain_normalization() {
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Case-insensitive: YouTube.COM == youtube.com
+        let key1 = DestKey::new(client_ip, Some("YouTube.COM"), "1.1.1.1".parse().unwrap());
+        let key2 = DestKey::new(client_ip, Some("youtube.com"), "1.1.1.1".parse().unwrap());
+        assert_eq!(key1.compute_hash(), key2.compute_hash());
+        assert_eq!(key1.domain, key2.domain); // Both normalized to lowercase
+
+        // Trailing dot removal: example.com. == example.com
+        let key3 = DestKey::new(client_ip, Some("example.com."), "1.1.1.1".parse().unwrap());
+        let key4 = DestKey::new(client_ip, Some("example.com"), "1.1.1.1".parse().unwrap());
+        assert_eq!(key3.compute_hash(), key4.compute_hash());
+        assert_eq!(key3.domain, key4.domain);
+
+        // Combined: EXAMPLE.COM. == example.com
+        let key5 = DestKey::new(client_ip, Some("EXAMPLE.COM."), "1.1.1.1".parse().unwrap());
+        assert_eq!(key5.compute_hash(), key4.compute_hash());
+    }
+
+    #[test]
+    fn test_dest_key_display() {
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let key1 = DestKey::new(client_ip, Some("youtube.com"), "1.1.1.1".parse().unwrap());
+        assert_eq!(key1.to_string(), "10.0.0.1->domain:youtube.com");
+
+        let key2 = DestKey::new(client_ip, None, "8.8.8.8".parse().unwrap());
+        assert_eq!(key2.to_string(), "10.0.0.1->ip:8.8.8.8");
+    }
+
+    #[test]
+    fn test_dest_key_key_str() {
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        let key1 = DestKey::new(client_ip, Some("example.com"), "1.1.1.1".parse().unwrap());
+        assert_eq!(key1.key_str(), "10.0.0.1:example.com");
+
+        let key2 = DestKey::new(client_ip, None, "8.8.8.8".parse().unwrap());
+        assert_eq!(key2.key_str(), "10.0.0.1:8.8.8.8");
     }
 
     // ========================================================================

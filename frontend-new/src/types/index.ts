@@ -1044,6 +1044,15 @@ export const WARP_ACCOUNT_TYPES = [
 
 export type OutboundGroupType = "loadbalance" | "failover";
 
+export type EcmpAlgorithm = 
+  | "five_tuple_hash" 
+  | "dest_hash" 
+  | "dest_hash_least_load"
+  | "round_robin" 
+  | "weighted" 
+  | "least_connections" 
+  | "random";
+
 export interface OutboundGroup {
   id: number;
   tag: string;
@@ -1051,6 +1060,7 @@ export interface OutboundGroup {
   type: OutboundGroupType;
   members: string[];  // 解析后的数组
   weights?: Record<string, number>;  // 解析后的对象
+  algorithm?: EcmpAlgorithm;  // ECMP 算法
   health_check_url: string;
   health_check_interval: number;
   health_check_timeout: number;
@@ -1074,6 +1084,7 @@ export interface OutboundGroupCreateRequest {
   type: OutboundGroupType;
   members: string[];
   weights?: Record<string, number>;
+  algorithm?: EcmpAlgorithm;
   health_check_url?: string;
   health_check_interval?: number;
   health_check_timeout?: number;
@@ -1083,6 +1094,7 @@ export interface OutboundGroupUpdateRequest {
   description?: string;
   members?: string[];
   weights?: Record<string, number>;
+  algorithm?: EcmpAlgorithm;
   health_check_url?: string;
   health_check_interval?: number;
   health_check_timeout?: number;
@@ -1112,6 +1124,16 @@ export interface GroupHealthCheckResponse {
 export const OUTBOUND_GROUP_TYPES = [
   { value: "loadbalance", label: "Load Balance", description: "流量均匀分散到所有成员" },
   { value: "failover", label: "Failover", description: "优先使用第一个健康的成员" },
+] as const;
+
+export const ECMP_ALGORITHMS = [
+  { value: "five_tuple_hash", label: "Five Tuple Hash", description: "基于源IP、目标IP、源端口、目标端口、协议的哈希（默认）" },
+  { value: "dest_hash", label: "Dest Hash", description: "基于源IP+域名的哈希，同一客户端访问同一域名始终使用相同出口（视频流优化）" },
+  { value: "dest_hash_least_load", label: "Dest Hash + Least Load", description: "智能调度：新会话选择负载最低出口，已有会话保持亲和性（推荐用于视频）" },
+  { value: "round_robin", label: "Round Robin", description: "轮询，依次使用每个成员" },
+  { value: "weighted", label: "Weighted", description: "按权重比例分配流量" },
+  { value: "least_connections", label: "Least Connections", description: "选择当前连接数最少的成员" },
+  { value: "random", label: "Random", description: "随机选择成员" },
 ] as const;
 
 // ============ Peer Nodes 类型 (对等节点) ============

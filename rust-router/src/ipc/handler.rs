@@ -5,6 +5,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use parking_lot::RwLock;
 
 use tracing::{debug, info, warn};
 
@@ -32,7 +33,7 @@ use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::ecmp::group::EcmpGroupManager;
 use crate::egress::manager::WgEgressManager;
 use crate::ingress::manager::WgIngressManager;
-use crate::ingress::{ForwardingStats, IngressReplyStats};
+use crate::ingress::{ForwardingStats, IngressReplyStats, IngressSessionTracker};
 use crate::io::UdpBufferPool;
 use crate::outbound::OutboundManager;
 use crate::peer::manager::PeerManager;
@@ -193,6 +194,10 @@ pub struct IpcHandler {
     /// `WireGuard` ingress reply stats (Phase 6.3)
     ingress_reply_stats: Option<Arc<IngressReplyStats>>,
 
+    /// `WireGuard` ingress session tracker for active connection count
+    /// Uses RwLock to allow setting after handler is created (Arc wrapped)
+    ingress_session_tracker: RwLock<Option<Arc<IngressSessionTracker>>>,
+
     /// `WireGuard` egress manager (Phase 6.4)
     wg_egress_manager: Option<Arc<WgEgressManager>>,
 
@@ -230,6 +235,7 @@ impl IpcHandler {
             wg_ingress_manager: None,
             ingress_forwarding_stats: None,
             ingress_reply_stats: None,
+            ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -266,6 +272,7 @@ impl IpcHandler {
             wg_ingress_manager: None,
             ingress_forwarding_stats: None,
             ingress_reply_stats: None,
+            ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -301,6 +308,7 @@ impl IpcHandler {
             wg_ingress_manager: None,
             ingress_forwarding_stats: None,
             ingress_reply_stats: None,
+            ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -339,6 +347,7 @@ impl IpcHandler {
             wg_ingress_manager: None,
             ingress_forwarding_stats: None,
             ingress_reply_stats: None,
+            ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
         }
@@ -386,6 +395,21 @@ impl IpcHandler {
         self.ingress_forwarding_stats = Some(forwarding_stats);
         self.ingress_reply_stats = Some(reply_stats);
         self
+    }
+
+    /// Set ingress session tracker after construction for active connection count
+    pub fn with_ingress_session_tracker(
+        self,
+        session_tracker: Arc<IngressSessionTracker>,
+    ) -> Self {
+        *self.ingress_session_tracker.write() = Some(session_tracker);
+        self
+    }
+
+    /// Set ingress session tracker on an already-created handler (via Arc)
+    /// This is needed because session_tracker is created after the handler is wrapped in Arc
+    pub fn set_ingress_session_tracker(&self, session_tracker: Arc<IngressSessionTracker>) {
+        *self.ingress_session_tracker.write() = Some(session_tracker);
     }
 
     /// Set the `WireGuard` egress manager after construction
@@ -2976,6 +3000,12 @@ impl IpcHandler {
         } else {
             None
         };
+        let active_sessions = self
+            .ingress_session_tracker
+            .read()
+            .as_ref()
+            .map(|tracker| tracker.len())
+            .unwrap_or(0);
 
         IpcResponse::IngressStats(IngressStatsResponse {
             ingress_enabled,
@@ -2983,6 +3013,7 @@ impl IpcHandler {
             manager_stats,
             forwarding_stats,
             reply_stats,
+            active_sessions,
         })
     }
 
@@ -3016,6 +3047,8 @@ impl IpcHandler {
             super::protocol::EcmpAlgorithm::RoundRobin => crate::ecmp::lb::LbAlgorithm::RoundRobin,
             super::protocol::EcmpAlgorithm::Random => crate::ecmp::lb::LbAlgorithm::Random,
             super::protocol::EcmpAlgorithm::SourceHash => crate::ecmp::lb::LbAlgorithm::FiveTupleHash,
+            super::protocol::EcmpAlgorithm::DestHash => crate::ecmp::lb::LbAlgorithm::DestHash,
+            super::protocol::EcmpAlgorithm::DestHashLeastLoad => crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad,
             super::protocol::EcmpAlgorithm::Weighted => crate::ecmp::lb::LbAlgorithm::Weighted,
             super::protocol::EcmpAlgorithm::LeastConnections => crate::ecmp::lb::LbAlgorithm::LeastConnections,
         };
@@ -3089,6 +3122,8 @@ impl IpcHandler {
                     crate::ecmp::lb::LbAlgorithm::RoundRobin => super::protocol::EcmpAlgorithm::RoundRobin,
                     crate::ecmp::lb::LbAlgorithm::Random => super::protocol::EcmpAlgorithm::Random,
                     crate::ecmp::lb::LbAlgorithm::FiveTupleHash => super::protocol::EcmpAlgorithm::SourceHash,
+                    crate::ecmp::lb::LbAlgorithm::DestHash => super::protocol::EcmpAlgorithm::DestHash,
+                    crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => super::protocol::EcmpAlgorithm::DestHashLeastLoad,
                     crate::ecmp::lb::LbAlgorithm::Weighted => super::protocol::EcmpAlgorithm::Weighted,
                     crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
                 };
@@ -3141,6 +3176,8 @@ impl IpcHandler {
                         crate::ecmp::lb::LbAlgorithm::RoundRobin => super::protocol::EcmpAlgorithm::RoundRobin,
                         crate::ecmp::lb::LbAlgorithm::Random => super::protocol::EcmpAlgorithm::Random,
                         crate::ecmp::lb::LbAlgorithm::FiveTupleHash => super::protocol::EcmpAlgorithm::SourceHash,
+                        crate::ecmp::lb::LbAlgorithm::DestHash => super::protocol::EcmpAlgorithm::DestHash,
+                        crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => super::protocol::EcmpAlgorithm::DestHashLeastLoad,
                         crate::ecmp::lb::LbAlgorithm::Weighted => super::protocol::EcmpAlgorithm::Weighted,
                         crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
                     };

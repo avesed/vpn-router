@@ -1235,6 +1235,8 @@ class RustRouterClient:
 
         Mapping:
             five_tuple_hash, loadbalance -> source_hash
+            dest_hash -> dest_hash (for video streaming session affinity)
+            dest_hash_least_load -> dest_hash_least_load (session affinity + smart LB)
             round_robin -> round_robin
             random -> random
             weighted -> weighted
@@ -1249,6 +1251,8 @@ class RustRouterClient:
         algorithm_map = {
             "five_tuple_hash": "source_hash",
             "loadbalance": "source_hash",  # sing-box format
+            "dest_hash": "dest_hash",  # Per-client session affinity for video streaming
+            "dest_hash_least_load": "dest_hash_least_load",  # Session affinity + intelligent LB
             "round_robin": "round_robin",
             "random": "random",
             "weighted": "weighted",

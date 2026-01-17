@@ -808,6 +808,8 @@ async fn main() -> Result<()> {
                         std::time::Duration::from_secs(300), // 5 minute session TTL
                     ),
                 );
+                // Clone session_tracker for IPC handler before it's moved to forwarding task
+                let session_tracker_for_ipc = Arc::clone(&session_tracker);
                 let fwd_stats = Arc::clone(&forwarding_stats);
 
                 // Create IP-to-domain cache for domain-based routing
@@ -850,6 +852,9 @@ async fn main() -> Result<()> {
                 reply_task_handle = Some(reply_handle);
                 info!("Ingress packet forwarding task started");
                 forwarding_task_handle = Some(forward_handle);
+                
+                // Set session tracker on IPC handler for active connection count reporting
+                ipc_handler.set_ingress_session_tracker(session_tracker_for_ipc);
             } else {
                 warn!("Failed to take packet receiver from WireGuard ingress - forwarding disabled");
             }

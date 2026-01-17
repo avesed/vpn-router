@@ -1500,8 +1500,17 @@ pub enum EcmpAlgorithm {
     RoundRobin,
     /// Random selection
     Random,
-    /// Hash-based (consistent hashing by source IP)
+    /// Hash-based (consistent hashing by source IP/port - five-tuple)
     SourceHash,
+    /// Destination hash (consistent hashing by domain or destination IP)
+    /// Useful for video streaming where multiple connections to same service
+    /// should use the same exit
+    DestHash,
+    /// Destination hash with least-load selection for new sessions
+    /// Combines session affinity with intelligent load balancing:
+    /// - New sessions: select the exit with lowest active connections
+    /// - Existing sessions: maintain affinity with cached selection
+    DestHashLeastLoad,
     /// Weighted random selection
     Weighted,
     /// Least connections
@@ -2025,6 +2034,9 @@ pub struct IngressStatsResponse {
     pub forwarding_stats: Option<ForwardingStatsSnapshot>,
     /// Reply router statistics (if available)
     pub reply_stats: Option<IngressReplyStatsSnapshot>,
+    /// Number of active sessions (connections) being tracked
+    #[serde(default)]
+    pub active_sessions: usize,
 }
 
 /// Response containing an ECMP group list

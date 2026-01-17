@@ -12,11 +12,13 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { ScrollArea } from "../ui/scroll-area";
 import { Badge } from "../ui/badge";
 import { Loader2, Scale, ArrowRightLeft, Info } from "lucide-react";
 import { useAvailableMembers } from "../../api/hooks/useOutboundGroups";
-import type { OutboundGroup, OutboundGroupType, AvailableMember } from "../../types";
+import type { OutboundGroup, OutboundGroupType, EcmpAlgorithm, AvailableMember } from "../../types";
+import { ECMP_ALGORITHMS } from "../../types";
 
 interface GroupCreateDialogProps {
   open: boolean;
@@ -28,6 +30,7 @@ interface GroupCreateDialogProps {
     type: OutboundGroupType;
     members: string[];
     weights?: Record<string, number>;
+    algorithm?: EcmpAlgorithm;
     health_check_url?: string;
     health_check_interval?: number;
     health_check_timeout?: number;
@@ -55,6 +58,7 @@ export function GroupCreateDialog({
   const [groupType, setGroupType] = useState<OutboundGroupType>("loadbalance");
   const [selectedMembers, setSelectedMembers] = useState<string[]>([]);
   const [weights, setWeights] = useState<Record<string, number>>({});
+  const [algorithm, setAlgorithm] = useState<EcmpAlgorithm>("five_tuple_hash");
   const [healthCheckUrl, setHealthCheckUrl] = useState(DEFAULT_HEALTH_CHECK_URL);
   const [healthCheckInterval, setHealthCheckInterval] = useState(DEFAULT_HEALTH_CHECK_INTERVAL);
   const [healthCheckTimeout, setHealthCheckTimeout] = useState(DEFAULT_HEALTH_CHECK_TIMEOUT);
@@ -71,6 +75,7 @@ export function GroupCreateDialog({
         setGroupType(editGroup.type);
         setSelectedMembers(editGroup.members || []);
         setWeights(editGroup.weights || {});
+        setAlgorithm(editGroup.algorithm || "five_tuple_hash");
         setHealthCheckUrl(editGroup.health_check_url || DEFAULT_HEALTH_CHECK_URL);
         setHealthCheckInterval(editGroup.health_check_interval || DEFAULT_HEALTH_CHECK_INTERVAL);
         setHealthCheckTimeout(editGroup.health_check_timeout || DEFAULT_HEALTH_CHECK_TIMEOUT);
@@ -80,6 +85,7 @@ export function GroupCreateDialog({
         setGroupType("loadbalance");
         setSelectedMembers([]);
         setWeights({});
+        setAlgorithm("five_tuple_hash");
         setHealthCheckUrl(DEFAULT_HEALTH_CHECK_URL);
         setHealthCheckInterval(DEFAULT_HEALTH_CHECK_INTERVAL);
         setHealthCheckTimeout(DEFAULT_HEALTH_CHECK_TIMEOUT);
@@ -120,6 +126,7 @@ export function GroupCreateDialog({
       type: groupType,
       members: selectedMembers,
       weights: groupType === "loadbalance" ? weights : undefined,
+      algorithm: groupType === "loadbalance" ? algorithm : undefined,
       health_check_url: healthCheckUrl || undefined,
       health_check_interval: healthCheckInterval,
       health_check_timeout: healthCheckTimeout,
@@ -220,6 +227,34 @@ export function GroupCreateDialog({
                   </Label>
                 </RadioGroup>
               </div>
+
+              {/* Algorithm Selection (only for loadbalance) */}
+              {groupType === "loadbalance" && (
+                <div className="space-y-3">
+                  <Label>{t("groups.algorithm")}</Label>
+                  <Select
+                    value={algorithm}
+                    onValueChange={(v) => setAlgorithm(v as EcmpAlgorithm)}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder={t("groups.selectAlgorithm")} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {ECMP_ALGORITHMS.map((alg) => (
+                        <SelectItem key={alg.value} value={alg.value}>
+                          <div className="flex flex-col">
+                            <span>{alg.label}</span>
+                            <span className="text-xs text-muted-foreground">{alg.description}</span>
+                          </div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {ECMP_ALGORITHMS.find(a => a.value === algorithm)?.description}
+                  </p>
+                </div>
+              )}
 
               {/* Member Selection */}
               <div className="space-y-3">

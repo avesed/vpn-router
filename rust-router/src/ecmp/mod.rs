@@ -48,6 +48,7 @@
 //! | Algorithm | Description | Use Case |
 //! |-----------|-------------|----------|
 //! | `FiveTupleHash` | Hash 5-tuple for connection affinity (DEFAULT) | Stateful connections |
+//! | `DestHash` | Hash destination (domain/IP) for session affinity | Video streaming, multi-conn apps |
 //! | `RoundRobin` | Cycle through members sequentially | Equal distribution |
 //! | `Weighted` | Distribute based on member weights | Capacity-based |
 //! | `LeastConnections` | Select member with fewest connections | Load-based |
@@ -105,4 +106,4 @@ pub use group::{
 };
 
 // Re-export commonly used types from lb module
-pub use lb::{FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer, Protocol};
+pub use lb::{DestKey, FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer, Protocol};

@@ -59,7 +59,7 @@ use moka::sync::Cache;
 use tracing::{debug, trace, warn};
 
 use super::udp::{UdpSessionConfig, UdpSessionKey};
-use crate::ecmp::{EcmpGroupManager, FiveTuple, Protocol};
+use crate::ecmp::{DestKey, EcmpGroupManager, FiveTuple, LbAlgorithm, Protocol};
 use crate::error::UdpError;
 use crate::outbound::{Outbound, OutboundManager, UdpOutboundHandle};
 use crate::rules::engine::{ConnectionInfo, RuleEngine};
@@ -397,12 +397,16 @@ impl UdpPacketProcessor {
     ///
     /// This method first tries to find the tag in `outbound_manager`. If not found
     /// and an ECMP group manager is configured, it checks if the tag is an ECMP
-    /// group and selects a member using the five-tuple hash.
+    /// group and selects a member using the configured algorithm:
+    /// - `FiveTupleHash` (default): Hash src/dst IP+port for connection affinity
+    /// - `DestHash`: Hash destination (domain or IP) for session affinity (video streaming)
+    /// - `DestHashLeastLoad`: Session affinity + intelligent load balancing for new sessions
     ///
     /// # Arguments
     ///
     /// * `tag` - The outbound tag to resolve
     /// * `packet` - The UDP packet (for building five-tuple)
+    /// * `domain` - Optional domain name from QUIC SNI (used by DestHash/DestHashLeastLoad)
     /// * `outbound_manager` - The outbound manager
     ///
     /// # Returns
@@ -412,6 +416,7 @@ impl UdpPacketProcessor {
         &self,
         tag: &str,
         packet: &UdpPacketInfo,
+        domain: Option<&str>,
         outbound_manager: &OutboundManager,
     ) -> Option<(Arc<dyn Outbound>, String)> {
         // Try direct lookup first
@@ -422,22 +427,48 @@ impl UdpPacketProcessor {
         // Check if it's an ECMP group
         if let Some(ref ecmp_mgr) = self.ecmp_group_manager {
             if ecmp_mgr.has_group(tag) {
-                // Build five-tuple for load balancing
-                let five_tuple = FiveTuple::new(
-                    packet.client_addr.ip(),
-                    packet.original_dst.ip(),
-                    packet.client_addr.port(),
-                    packet.original_dst.port(),
-                    Protocol::Udp,
-                );
-
                 // Select member using the group's load balancing algorithm
                 if let Some(group) = ecmp_mgr.get_group(tag) {
-                    match group.select_by_connection(&five_tuple) {
+                    // Choose selection method based on algorithm
+                    let select_result = match group.algorithm() {
+                        LbAlgorithm::DestHash => {
+                            // DestHash: hash(source_ip + domain/dest_ip) for per-client session affinity
+                            // Same client to same domain → same exit; different clients → load balanced
+                            let dest_key = DestKey::new(packet.client_addr.ip(), domain, packet.original_dst.ip());
+                            debug!(
+                                "ECMP group '{}' using DestHash with key: {}",
+                                tag, dest_key
+                            );
+                            group.select_by_dest(&dest_key)
+                        }
+                        LbAlgorithm::DestHashLeastLoad => {
+                            // DestHashLeastLoad: session affinity + intelligent load balancing
+                            // New sessions: select least loaded exit; existing: use cached selection
+                            let dest_key = DestKey::new(packet.client_addr.ip(), domain, packet.original_dst.ip());
+                            debug!(
+                                "ECMP group '{}' using DestHashLeastLoad with key: {}",
+                                tag, dest_key
+                            );
+                            group.select_by_dest_least_load(&dest_key)
+                        }
+                        _ => {
+                            // Default: use five-tuple hash for connection affinity
+                            let five_tuple = FiveTuple::new(
+                                packet.client_addr.ip(),
+                                packet.original_dst.ip(),
+                                packet.client_addr.port(),
+                                packet.original_dst.port(),
+                                Protocol::Udp,
+                            );
+                            group.select_by_connection(&five_tuple)
+                        }
+                    };
+
+                    match select_result {
                         Ok(member_tag) => {
                             debug!(
-                                "ECMP group '{}' selected member '{}' for {} -> {}",
-                                tag, member_tag, packet.client_addr, packet.original_dst
+                                "ECMP group '{}' selected member '{}' for {} -> {} (domain: {:?})",
+                                tag, member_tag, packet.client_addr, packet.original_dst, domain
                             );
                             // Recursively resolve the member (it might be in outbound_manager)
                             if let Some(outbound) = outbound_manager.get(&member_tag) {
@@ -788,8 +819,9 @@ impl UdpPacketProcessor {
 
         // Phase 6-Fix.AI: Get outbound from manager with ECMP group resolution
         // This supports both direct outbounds and ECMP load balancing groups
+        // Pass domain for DestHash algorithm (video streaming session affinity)
         let (outbound, actual_outbound_tag) = if let Some(resolved) =
-            self.resolve_outbound_with_ecmp(&match_result.outbound, packet, outbound_manager)
+            self.resolve_outbound_with_ecmp(&match_result.outbound, packet, sniffed_domain.as_deref(), outbound_manager)
         {
             resolved
         } else {
@@ -799,7 +831,7 @@ impl UdpPacketProcessor {
             );
             // Try to resolve the default outbound (which could also be an ECMP group)
             if let Some(resolved) =
-                self.resolve_outbound_with_ecmp(&rule_engine.default_outbound(), packet, outbound_manager)
+                self.resolve_outbound_with_ecmp(&rule_engine.default_outbound(), packet, sniffed_domain.as_deref(), outbound_manager)
             {
                 resolved
             } else {

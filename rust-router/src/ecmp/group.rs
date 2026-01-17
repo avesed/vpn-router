@@ -37,13 +37,60 @@
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.7
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::ecmp::lb::{FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer};
+use crate::ecmp::lb::{DestKey, FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer};
+
+/// Default TTL for session affinity cache entries (30 minutes)
+pub const SESSION_AFFINITY_TTL_SECS: u64 = 1800;
+
+/// Maximum entries in session affinity cache per group
+pub const SESSION_AFFINITY_CACHE_MAX_ENTRIES: usize = 10000;
+
+/// Session affinity cache key: (source_ip, domain_or_ip)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionAffinityKey {
+    /// Client source IP
+    pub source_ip: IpAddr,
+    /// Domain name (preferred) or destination IP as string
+    pub destination: String,
+}
+
+impl SessionAffinityKey {
+    /// Create a new session affinity key from a DestKey
+    #[must_use]
+    pub fn from_dest_key(dest_key: &DestKey) -> Self {
+        let destination = if let Some(ref domain) = dest_key.domain {
+            domain.to_lowercase()
+        } else {
+            dest_key.dest_ip.to_string()
+        };
+        Self {
+            source_ip: dest_key.source_ip,
+            destination,
+        }
+    }
+}
+
+/// Session affinity cache entry
+#[derive(Debug, Clone)]
+pub struct SessionAffinityEntry {
+    /// Selected member index
+    pub member_index: usize,
+    /// Selected member tag
+    pub member_tag: String,
+    /// Time when this entry was created
+    pub created_at: Instant,
+    /// Time when this entry was last accessed
+    pub last_accessed: Instant,
+}
 
 /// Minimum routing mark for ECMP groups
 pub const ECMP_ROUTING_MARK_MIN: u32 = 200;
@@ -115,6 +162,7 @@ impl From<LbError> for EcmpGroupError {
             LbError::NoMembers => Self::NoHealthyMembers,
             LbError::ZeroWeight => Self::InvalidWeight(0),
             LbError::MissingFiveTuple => Self::LoadBalancer("Five-tuple required".into()),
+            LbError::MissingDestKey => Self::LoadBalancer("Destination key required".into()),
             LbError::Internal(msg) => Self::Internal(msg),
         }
     }
@@ -212,6 +260,11 @@ pub struct EcmpGroup {
     load_balancer: LoadBalancer,
     /// Total requests processed
     total_requests: AtomicU64,
+    /// Session affinity cache for DestHashLeastLoad algorithm
+    /// Maps (source_ip, domain) -> (member_index, member_tag, timestamp)
+    session_affinity_cache: DashMap<SessionAffinityKey, SessionAffinityEntry>,
+    /// TTL for session affinity cache entries
+    session_affinity_ttl: Duration,
 }
 
 impl EcmpGroup {
@@ -279,6 +332,8 @@ impl EcmpGroup {
             members: RwLock::new(member_states),
             load_balancer,
             total_requests: AtomicU64::new(0),
+            session_affinity_cache: DashMap::new(),
+            session_affinity_ttl: Duration::from_secs(SESSION_AFFINITY_TTL_SECS),
         })
     }
 
@@ -304,6 +359,12 @@ impl EcmpGroup {
     #[must_use]
     pub fn routing_table(&self) -> Option<u32> {
         self.config.routing_table
+    }
+
+    /// Get the load balancing algorithm for this group
+    #[must_use]
+    pub fn algorithm(&self) -> &LbAlgorithm {
+        &self.config.algorithm
     }
 
     /// Get the total number of members
@@ -377,19 +438,35 @@ impl EcmpGroup {
             })
             .collect();
 
-        // For FiveTupleHash, fall back to RoundRobin when no tuple is provided
-        let index = if matches!(self.config.algorithm, LbAlgorithm::FiveTupleHash) {
-            // Use a fallback round-robin for API calls without connection info
-            let healthy: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
-            if healthy.is_empty() {
-                return Err(EcmpGroupError::NoHealthyMembers);
+        // Handle algorithms that require connection info (fall back to simpler selection)
+        let index = match self.config.algorithm {
+            LbAlgorithm::FiveTupleHash => {
+                // Fall back to round-robin when no tuple is provided
+                let healthy: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
+                if healthy.is_empty() {
+                    return Err(EcmpGroupError::NoHealthyMembers);
+                }
+                let counter = self.total_requests.fetch_add(1, Ordering::Relaxed);
+                healthy[(counter as usize) % healthy.len()].index
             }
-            let counter = self.total_requests.fetch_add(1, Ordering::Relaxed);
-            healthy[(counter as usize) % healthy.len()].index
-        } else {
-            // Increment total requests for non-FiveTupleHash algorithms
-            self.total_requests.fetch_add(1, Ordering::Relaxed);
-            self.load_balancer.select(&lb_members)?
+            LbAlgorithm::DestHash | LbAlgorithm::DestHashLeastLoad => {
+                // Fall back to least connections when no dest key is provided
+                let healthy: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
+                if healthy.is_empty() {
+                    return Err(EcmpGroupError::NoHealthyMembers);
+                }
+                self.total_requests.fetch_add(1, Ordering::Relaxed);
+                healthy
+                    .iter()
+                    .min_by_key(|m| m.active_connections)
+                    .unwrap()
+                    .index
+            }
+            _ => {
+                // Other algorithms: use standard selection
+                self.total_requests.fetch_add(1, Ordering::Relaxed);
+                self.load_balancer.select(&lb_members)?
+            }
         };
 
         Ok(members[index].config.tag.clone())
@@ -469,6 +546,258 @@ impl EcmpGroup {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
         Ok(members[index].config.tag.clone())
+    }
+
+    /// Select a member using destination hash for session affinity.
+    ///
+    /// All connections to the same destination (domain or IP) will select
+    /// the same healthy member. This is useful for video streaming where
+    /// a player opens multiple connections to the same service.
+    ///
+    /// # Arguments
+    ///
+    /// * `dest_key` - The destination key (domain preferred, falls back to IP)
+    ///
+    /// # Returns
+    ///
+    /// The tag of the selected member.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EcmpGroupError::NoHealthyMembers` if no healthy members are available.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::ecmp::group::{EcmpGroup, EcmpGroupConfig, EcmpMember};
+    /// use rust_router::ecmp::lb::{LbAlgorithm, DestKey};
+    ///
+    /// let config = EcmpGroupConfig {
+    ///     tag: "test".to_string(),
+    ///     members: vec![
+    ///         EcmpMember::new("m1".to_string()),
+    ///         EcmpMember::new("m2".to_string()),
+    ///     ],
+    ///     algorithm: LbAlgorithm::DestHash,
+    ///     ..Default::default()
+    /// };
+    /// let group = EcmpGroup::new(config).unwrap();
+    ///
+    /// // Same client + same domain → same member (even with different CDN IPs)
+    /// let key1 = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.142".parse().unwrap());
+    /// let key2 = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.143".parse().unwrap());
+    /// let m1 = group.select_by_dest(&key1).unwrap();
+    /// let m2 = group.select_by_dest(&key2).unwrap();
+    /// assert_eq!(m1, m2);
+    ///
+    /// // Different client + same domain → can be different member (load balanced)
+    /// let key3 = DestKey::new("10.0.0.2".parse().unwrap(), Some("youtube.com"), "142.250.185.142".parse().unwrap());
+    /// // key3 may select a different member than key1
+    /// ```
+    pub fn select_by_dest(&self, dest_key: &DestKey) -> Result<String, EcmpGroupError> {
+        let members = self.members.read();
+
+        // Build LbMember list
+        let lb_members: Vec<LbMember> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                LbMember::new(i)
+                    .with_weight(m.config.weight)
+                    .with_active_connections(m.active_connections.load(Ordering::Relaxed))
+                    .with_healthy(m.healthy)
+            })
+            .collect();
+
+        // Use destination hash selection (weighted or unweighted based on algorithm)
+        let index = if matches!(self.config.algorithm, LbAlgorithm::Weighted) {
+            self.load_balancer
+                .select_by_dest_weighted(&lb_members, dest_key)?
+        } else {
+            self.load_balancer.select_by_dest(&lb_members, dest_key)?
+        };
+
+        // Increment total requests
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        Ok(members[index].config.tag.clone())
+    }
+
+    /// Select a member using destination hash with least-load selection for new sessions.
+    ///
+    /// This algorithm combines session affinity with intelligent load balancing:
+    /// - **Existing sessions**: Return the previously selected member (from cache)
+    /// - **New sessions**: Select the member with the lowest active connections, then cache
+    ///
+    /// This is ideal for video streaming where:
+    /// - Same client + same domain should always use the same exit (session affinity)
+    /// - New clients should be directed to the least loaded exit (smart load balancing)
+    ///
+    /// # Arguments
+    ///
+    /// * `dest_key` - The destination key (source_ip + domain/IP)
+    ///
+    /// # Returns
+    ///
+    /// The tag of the selected member.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EcmpGroupError::NoHealthyMembers` if no healthy members are available.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::ecmp::group::{EcmpGroup, EcmpGroupConfig, EcmpMember};
+    /// use rust_router::ecmp::lb::{LbAlgorithm, DestKey};
+    ///
+    /// let config = EcmpGroupConfig {
+    ///     tag: "test".to_string(),
+    ///     members: vec![
+    ///         EcmpMember::new("m1".to_string()),
+    ///         EcmpMember::new("m2".to_string()),
+    ///     ],
+    ///     algorithm: LbAlgorithm::DestHashLeastLoad,
+    ///     ..Default::default()
+    /// };
+    /// let group = EcmpGroup::new(config).unwrap();
+    ///
+    /// // First request: selects least loaded member and caches the selection
+    /// let key = DestKey::new("10.0.0.1".parse().unwrap(), Some("youtube.com"), "142.250.185.142".parse().unwrap());
+    /// let m1 = group.select_by_dest_least_load(&key).unwrap();
+    ///
+    /// // Second request: returns cached selection (session affinity)
+    /// let m2 = group.select_by_dest_least_load(&key).unwrap();
+    /// assert_eq!(m1, m2);
+    /// ```
+    pub fn select_by_dest_least_load(&self, dest_key: &DestKey) -> Result<String, EcmpGroupError> {
+        let cache_key = SessionAffinityKey::from_dest_key(dest_key);
+        let now = Instant::now();
+
+        // Check cache first
+        if let Some(mut entry) = self.session_affinity_cache.get_mut(&cache_key) {
+            // Check if entry is still valid (sliding TTL based on last_accessed)
+            if now.duration_since(entry.last_accessed) < self.session_affinity_ttl {
+                // Verify the cached member is still healthy
+                let members = self.members.read();
+                if let Some(member) = members.get(entry.member_index) {
+                    if member.healthy && member.config.tag == entry.member_tag {
+                        // Update last accessed time (sliding TTL)
+                        entry.last_accessed = now;
+                        // Increment total requests
+                        self.total_requests.fetch_add(1, Ordering::Relaxed);
+                        return Ok(entry.member_tag.clone());
+                    }
+                }
+                // Member is unhealthy or removed, fall through to reselect
+            }
+            // Entry expired or member unhealthy - drop the mut ref before removing
+            // Note: There's a small race window here where another thread could insert
+            // a fresh entry between drop and remove. This is acceptable as it only
+            // causes an extra cache miss, not incorrect behavior.
+            drop(entry);
+            self.session_affinity_cache.remove(&cache_key);
+        }
+
+        // New session: select member with least connections
+        let members = self.members.read();
+
+        // Build LbMember list with only healthy members
+        let lb_members: Vec<LbMember> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                LbMember::new(i)
+                    .with_weight(m.config.weight)
+                    .with_active_connections(m.active_connections.load(Ordering::Relaxed))
+                    .with_healthy(m.healthy)
+            })
+            .collect();
+
+        // Filter to healthy members only
+        let healthy_members: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
+
+        if healthy_members.is_empty() {
+            return Err(EcmpGroupError::NoHealthyMembers);
+        }
+
+        // Select member with least connections
+        let selected = healthy_members
+            .iter()
+            .min_by_key(|m| m.active_connections)
+            .unwrap(); // Safe: we checked healthy_members is not empty
+
+        let selected_index = selected.index;
+        let selected_tag = members[selected_index].config.tag.clone();
+
+        // Cache the selection
+        let entry = SessionAffinityEntry {
+            member_index: selected_index,
+            member_tag: selected_tag.clone(),
+            created_at: now,
+            last_accessed: now,
+        };
+
+        // Enforce cache size limit
+        if self.session_affinity_cache.len() >= SESSION_AFFINITY_CACHE_MAX_ENTRIES {
+            self.cleanup_session_affinity_cache();
+        }
+
+        self.session_affinity_cache.insert(cache_key, entry);
+
+        // Increment total requests
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        Ok(selected_tag)
+    }
+
+    /// Clean up expired entries from the session affinity cache.
+    ///
+    /// This is called automatically when the cache reaches its size limit.
+    /// It removes:
+    /// 1. All expired entries (sliding TTL based on last_accessed)
+    /// 2. If still over limit, removes least recently accessed entries until under 90% capacity
+    pub fn cleanup_session_affinity_cache(&self) {
+        let now = Instant::now();
+
+        // Remove expired entries (sliding TTL)
+        self.session_affinity_cache.retain(|_, entry| {
+            now.duration_since(entry.last_accessed) < self.session_affinity_ttl
+        });
+
+        // If still over limit, remove oldest entries by last_accessed time
+        let current_len = self.session_affinity_cache.len();
+        if current_len >= SESSION_AFFINITY_CACHE_MAX_ENTRIES {
+            // Target 90% capacity to avoid thrashing
+            let target_size = SESSION_AFFINITY_CACHE_MAX_ENTRIES * 9 / 10;
+            let remove_count = current_len.saturating_sub(target_size);
+
+            if remove_count > 0 {
+                // Collect entries sorted by last_accessed (oldest first)
+                let mut entries: Vec<_> = self
+                    .session_affinity_cache
+                    .iter()
+                    .map(|r| (r.key().clone(), r.value().last_accessed))
+                    .collect();
+                entries.sort_by_key(|(_, last_accessed)| *last_accessed);
+
+                // Remove enough entries to get under target size
+                for (key, _) in entries.into_iter().take(remove_count) {
+                    self.session_affinity_cache.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Get the number of entries in the session affinity cache.
+    #[must_use]
+    pub fn session_affinity_cache_size(&self) -> usize {
+        self.session_affinity_cache.len()
+    }
+
+    /// Clear the session affinity cache.
+    pub fn clear_session_affinity_cache(&self) {
+        self.session_affinity_cache.clear();
     }
 
     /// Increment active connections for a member.
@@ -1879,5 +2208,251 @@ mod tests {
         // Should be close to 0 (might not be exactly 0 due to race conditions)
         let conns = group.get_active_connections("member-1").unwrap();
         assert!(conns <= 1000); // Upper bound check
+    }
+
+    // ========================================================================
+    // EcmpGroup DestHashLeastLoad Tests (Session Affinity + Smart Load Balancing)
+    // ========================================================================
+
+    #[test]
+    fn test_dest_hash_least_load_selects_least_loaded() {
+        let config = EcmpGroupConfig {
+            tag: "least-load-test".to_string(),
+            members: vec![
+                EcmpMember::new("busy".to_string()),
+                EcmpMember::new("idle".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // Make "busy" have more connections
+        for _ in 0..10 {
+            group.increment_connections("busy").unwrap();
+        }
+
+        // First request from user A should select "idle" (least loaded)
+        let key = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
+        let selected = group.select_by_dest_least_load(&key).unwrap();
+        assert_eq!(selected, "idle");
+    }
+
+    #[test]
+    fn test_dest_hash_least_load_session_affinity() {
+        let config = EcmpGroupConfig {
+            tag: "affinity-test".to_string(),
+            members: vec![
+                EcmpMember::new("m1".to_string()),
+                EcmpMember::new("m2".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // First request: should select some member
+        let key = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
+        let first = group.select_by_dest_least_load(&key).unwrap();
+
+        // Make the other member have fewer connections (normally would be selected)
+        let other = if first == "m1" { "m2" } else { "m1" };
+        for _ in 0..10 {
+            group.increment_connections(&first).unwrap();
+        }
+
+        // Subsequent requests: should still return the cached member (session affinity)
+        for _ in 0..100 {
+            let selected = group.select_by_dest_least_load(&key).unwrap();
+            assert_eq!(selected, first, "Session affinity should be maintained");
+        }
+
+        // Different CDN IP but same domain: should still use cached member
+        let key2 = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            Some("youtube.com"),
+            "142.250.185.143".parse().unwrap(), // Different CDN IP
+        );
+        let selected = group.select_by_dest_least_load(&key2).unwrap();
+        assert_eq!(selected, first, "Same client+domain should use cached member");
+    }
+
+    #[test]
+    fn test_dest_hash_least_load_different_clients_distribute() {
+        let config = EcmpGroupConfig {
+            tag: "distribute-test".to_string(),
+            members: vec![
+                EcmpMember::new("m1".to_string()),
+                EcmpMember::new("m2".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // Simulate multiple clients, incrementing connections after each selection
+        let mut selections: HashMap<String, usize> = HashMap::new();
+        for i in 1..=10 {
+            let client_ip: std::net::IpAddr = format!("10.0.0.{}", i).parse().unwrap();
+            let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+            let selected = group.select_by_dest_least_load(&key).unwrap();
+            *selections.entry(selected.clone()).or_insert(0) += 1;
+            // Simulate connection to the selected member
+            group.increment_connections(&selected).unwrap();
+        }
+
+        // Should distribute across both members (intelligent load balancing)
+        assert_eq!(selections.len(), 2, "Should distribute across both members");
+        // With proper least-load selection, distribution should be roughly equal
+        let m1_count = *selections.get("m1").unwrap_or(&0);
+        let m2_count = *selections.get("m2").unwrap_or(&0);
+        assert!(m1_count >= 3 && m1_count <= 7, "Should be roughly balanced: m1={}", m1_count);
+        assert!(m2_count >= 3 && m2_count <= 7, "Should be roughly balanced: m2={}", m2_count);
+    }
+
+    #[test]
+    fn test_dest_hash_least_load_reselects_on_unhealthy() {
+        let config = EcmpGroupConfig {
+            tag: "health-test".to_string(),
+            members: vec![
+                EcmpMember::new("m1".to_string()),
+                EcmpMember::new("m2".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // First request: cache a selection
+        let key = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
+        let first = group.select_by_dest_least_load(&key).unwrap();
+
+        // Mark the selected member as unhealthy
+        group.update_member_health(&first, false).unwrap();
+
+        // Next request should select the other member
+        let second = group.select_by_dest_least_load(&key).unwrap();
+        assert_ne!(second, first, "Should reselect when cached member is unhealthy");
+
+        // New selection should be cached
+        let third = group.select_by_dest_least_load(&key).unwrap();
+        assert_eq!(third, second, "New selection should be cached");
+    }
+
+    #[test]
+    fn test_dest_hash_least_load_cache_size() {
+        let config = EcmpGroupConfig {
+            tag: "cache-test".to_string(),
+            members: vec![
+                EcmpMember::new("m1".to_string()),
+                EcmpMember::new("m2".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // Add entries to cache
+        for i in 1..=100 {
+            let client_ip: std::net::IpAddr = format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap();
+            let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+            let _ = group.select_by_dest_least_load(&key);
+        }
+
+        // Cache should have entries
+        assert!(group.session_affinity_cache_size() > 0);
+        assert!(group.session_affinity_cache_size() <= 100);
+
+        // Clear cache
+        group.clear_session_affinity_cache();
+        assert_eq!(group.session_affinity_cache_size(), 0);
+    }
+
+    #[test]
+    fn test_dest_hash_least_load_no_healthy_members() {
+        let config = EcmpGroupConfig {
+            tag: "no-healthy-test".to_string(),
+            members: vec![
+                EcmpMember::new("m1".to_string()),
+                EcmpMember::new("m2".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // Mark all members as unhealthy
+        group.update_member_health("m1", false).unwrap();
+        group.update_member_health("m2", false).unwrap();
+
+        let key = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
+        let result = group.select_by_dest_least_load(&key);
+        assert!(matches!(result, Err(EcmpGroupError::NoHealthyMembers)));
+    }
+
+    #[test]
+    fn test_next_member_dest_hash_least_load_fallback() {
+        let config = EcmpGroupConfig {
+            tag: "fallback-test".to_string(),
+            members: vec![
+                EcmpMember::new("busy".to_string()),
+                EcmpMember::new("idle".to_string()),
+            ],
+            algorithm: LbAlgorithm::DestHashLeastLoad,
+            ..Default::default()
+        };
+        let group = EcmpGroup::new(config).unwrap();
+
+        // Add connections to make "busy" busy
+        for _ in 0..10 {
+            group.increment_connections("busy").unwrap();
+        }
+
+        // next_member should fall back to least connections
+        let selected = group.next_member().unwrap();
+        assert_eq!(selected, "idle");
+    }
+
+    #[test]
+    fn test_session_affinity_key_from_dest_key() {
+        let dest_key = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            Some("YouTube.COM"),
+            "142.250.185.142".parse().unwrap(),
+        );
+        let session_key = SessionAffinityKey::from_dest_key(&dest_key);
+
+        // Domain should be lowercase
+        assert_eq!(session_key.destination, "youtube.com");
+        assert_eq!(session_key.source_ip, "10.0.0.1".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_session_affinity_key_no_domain() {
+        let dest_key = DestKey::new(
+            "10.0.0.1".parse().unwrap(),
+            None,
+            "142.250.185.142".parse().unwrap(),
+        );
+        let session_key = SessionAffinityKey::from_dest_key(&dest_key);
+
+        // Should use dest_ip as string
+        assert_eq!(session_key.destination, "142.250.185.142");
     }
 }

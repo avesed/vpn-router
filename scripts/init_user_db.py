@@ -414,6 +414,7 @@ CREATE TABLE IF NOT EXISTS outbound_groups (
     members TEXT NOT NULL,                 -- JSON 数组 ["us-stream", "jp-stream"]
     -- 负载均衡参数
     weights TEXT,                          -- JSON 对象 {"us-stream": 2, "jp-stream": 1}
+    algorithm TEXT DEFAULT 'five_tuple_hash',  -- ECMP 算法 (five_tuple_hash, dest_hash, round_robin, etc.)
     -- 健康检查参数
     health_check_url TEXT DEFAULT 'http://www.gstatic.com/generate_204',
     health_check_interval INTEGER DEFAULT 60,   -- 秒
@@ -963,7 +964,17 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
     # 检查 outbound_groups 表是否存在
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbound_groups'")
     if cursor.fetchone():
-        print("⊘ outbound_groups 表已存在，跳过迁移")
+        # 表已存在，检查是否需要添加 algorithm 列
+        cursor.execute("PRAGMA table_info(outbound_groups)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "algorithm" not in columns:
+            cursor.execute("""
+                ALTER TABLE outbound_groups ADD COLUMN algorithm TEXT DEFAULT 'five_tuple_hash'
+            """)
+            conn.commit()
+            print("✓ 为 outbound_groups 表添加 algorithm 列")
+        else:
+            print("⊘ outbound_groups 表已存在，跳过迁移")
         return
 
     # 创建表
@@ -975,6 +986,7 @@ def migrate_outbound_groups(conn: sqlite3.Connection):
             type TEXT NOT NULL CHECK(type IN ('loadbalance', 'failover')),
             members TEXT NOT NULL,
             weights TEXT,
+            algorithm TEXT DEFAULT 'five_tuple_hash',
             health_check_url TEXT DEFAULT 'http://www.gstatic.com/generate_204',
             health_check_interval INTEGER DEFAULT 60,
             health_check_timeout INTEGER DEFAULT 5,
