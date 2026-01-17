@@ -509,7 +509,7 @@ start_rust_router() {
   export RUST_ROUTER_SOCKET="${RUST_ROUTER_SOCKET}"
   # Log level: RUST_LOG takes precedence, then RUST_ROUTER_LOG_LEVEL
   export RUST_LOG="${RUST_LOG:-info}"
-  if [ -n "${RUST_ROUTER_LOG_LEVEL}" ]; then
+  if [ -n "${RUST_ROUTER_LOG_LEVEL:-}" ]; then
     export RUST_ROUTER_LOG_LEVEL="${RUST_ROUTER_LOG_LEVEL}"
   fi
 
