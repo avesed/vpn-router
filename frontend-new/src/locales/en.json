@@ -1495,6 +1495,10 @@
     "completeHint": "When you generated a pairing code with \"Bidirectional Connection\" enabled, the peer will receive a response code after importing. Paste that code here.",
     "completeSubmit": "Complete Pairing",
     "createdNode": "Created node",
-    "nodeTagMissing": "Node tag not configured. Please set it in Settings."
+    "nodeTagMissing": "Node tag not configured. Please set it in Settings.",
+    "publicAddress": "Public Address",
+    "publicAddressPlaceholder": "e.g. vpn.example.com or 1.2.3.4",
+    "publicAddressHint": "IP or domain that peers can reach. Port is auto-assigned.",
+    "responseCodeRequired": "Please enter the response code"
   }
 }

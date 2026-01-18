@@ -762,6 +762,45 @@ pub enum IpcCommand {
         #[serde(default = "default_speed_test_timeout")]
         timeout_secs: u64,
     },
+
+    // ========================================================================
+    // Peer API Forwarding
+    // ========================================================================
+
+    /// Forward an HTTP request to a peer node through its WireGuard tunnel
+    ///
+    /// This command allows Python to make API calls to peer nodes by forwarding
+    /// HTTP requests through rust-router's userspace WireGuard tunnels.
+    /// The tunnel handles encryption/decryption transparently.
+    ForwardPeerRequest {
+        /// Peer node tag (for logging)
+        peer_tag: String,
+        /// HTTP method (GET, POST, PUT, DELETE)
+        method: String,
+        /// Request path (e.g., "/api/peer-info/egress")
+        path: String,
+        /// Optional JSON request body
+        #[serde(default)]
+        body: Option<String>,
+        /// Request timeout in seconds (default: 30)
+        #[serde(default = "default_peer_request_timeout")]
+        timeout_secs: u32,
+        /// Peer endpoint (host:port) - if provided, uses this instead of PeerManager lookup
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Tunnel type ("wireguard" or "xray") - required if endpoint is provided
+        #[serde(default)]
+        tunnel_type: Option<String>,
+        /// API port on the peer (default: 36000)
+        #[serde(default)]
+        api_port: Option<u16>,
+        /// Tunnel IP for Xray peers (optional, for routing through tunnel)
+        #[serde(default)]
+        tunnel_ip: Option<String>,
+        /// Custom headers to include in the request (e.g., {"X-Peer-Node-ID": "my-node-tag"})
+        #[serde(default)]
+        headers: Option<std::collections::HashMap<String, String>>,
+    },
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -801,6 +840,11 @@ fn default_speed_test_size() -> u64 {
 
 /// Default speed test timeout (30 seconds)
 fn default_speed_test_timeout() -> u64 {
+    30
+}
+
+/// Default peer request timeout (30 seconds)
+fn default_peer_request_timeout() -> u32 {
     30
 }
 
@@ -982,6 +1026,9 @@ pub enum IpcResponse {
 
     /// Speed test result response
     SpeedTestResult(SpeedTestResponse),
+
+    /// Peer API request result response
+    PeerRequestResult(PeerRequestResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -2365,6 +2412,19 @@ pub struct SpeedTestResponse {
     pub duration_ms: u64,
     /// Outbound/tunnel used for the test
     pub outbound: String,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+/// Peer API request result response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRequestResponse {
+    /// Whether the request was successful
+    pub success: bool,
+    /// HTTP status code from the peer
+    pub status_code: u16,
+    /// Response body (JSON string)
+    pub body: String,
     /// Error message if failed
     pub error: Option<String>,
 }

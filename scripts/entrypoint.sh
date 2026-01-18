@@ -645,6 +645,8 @@ start_peer_tunnel_manager
 # Phase 3: WARP manager removed - WARP tunnels managed via rust-router IPC
 
 # Configure peer tunnel subnet routing
+# NOTE: This local route is for TPROXY to accept traffic destined for tunnel IPs.
+# Peer API requests go through rust-router's userspace WireGuard via IPC forwarding.
 echo "[entrypoint] Configuring peer tunnel subnet routing (10.200.200.0/24)"
 if ip route add local 10.200.200.0/24 dev lo 2>/dev/null; then
   echo "[entrypoint] Added local route for peer tunnel subnet"

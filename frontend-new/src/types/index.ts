@@ -1312,7 +1312,7 @@ export interface NodeChain {
 
 export interface NodeChainCreateRequest {
   tag: string;
-  name: string;
+  name?: string;  // Phase 11-Fix.B: 可选，默认使用 tag
   description?: string;
   hops: string[];
   hop_protocols?: Record<string, string>;

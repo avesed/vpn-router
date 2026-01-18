@@ -403,6 +403,7 @@ mod e2e_ipc {
                 manager_stats: None,
                 forwarding_stats: None,
                 reply_stats: None,
+                active_sessions: 0,
             }),
         ];
 

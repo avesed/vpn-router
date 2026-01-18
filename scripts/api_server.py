@@ -1455,7 +1455,7 @@ class GeneratePairRequestRequest(BaseModel):
     """
     node_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="本节点标识符")
     node_description: str = Field("", description="节点描述")
-    endpoint: str = Field(..., description="隧道端点 (IP:port)")
+    endpoint: str = Field(..., description="本节点公网地址 (IP 或域名，端口自动分配)")
     tunnel_type: str = Field("wireguard", pattern=r"^(wireguard|xray)$", description="隧道类型")
     bidirectional: bool = Field(True, description="启用双向自动连接 (Phase 11.2)")
     api_port: Optional[int] = Field(None, ge=1, le=65535, description="API 端口（默认 36000）Phase 11-Fix.K")
@@ -1506,7 +1506,7 @@ class CompletePairingResponse(BaseModel):
 class NodeChainCreateRequest(BaseModel):
     """创建多跳链路"""
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="链路标识符")
-    name: str = Field(..., description="链路名称")
+    name: Optional[str] = Field(None, description="链路名称（可选，默认使用 tag）")
     description: str = Field("", description="链路描述")
     # Phase 7 Fix: 添加最大长度限制（API 层限制 10 跳，递归验证使用 max_depth=5）
     hops: List[str] = Field(..., min_length=1, max_length=10, description="节点跳转列表（1-10 跳，单跳用于指定远程出口）")
@@ -13528,6 +13528,78 @@ def _verify_peer_request_flexible(
     return None
 
 
+def _verify_peer_endpoint_auth(request: Request, db) -> Optional[Dict]:
+    """验证对等节点通过公网端点 IP 进行的 API 调用
+    
+    Phase 11-Fix.B: 当隧道认证不可用时（如 userspace WireGuard 下的直接 HTTP 调用），
+    允许通过 X-Peer-Node-ID header 进行认证。
+    
+    认证条件：
+    1. 请求头包含 X-Peer-Node-ID（调用方的节点 ID）
+    2. 该节点存在于本地 peer_nodes 表中
+    3. 该节点的 tunnel_status 为 "connected"
+    
+    安全考虑：
+    - 仅限已配对并连接的节点使用
+    - X-Peer-Node-ID 可被伪造，但需要知道有效的节点 ID
+    - 此方法安全性低于隧道认证，仅作为 fallback
+    - 如果 endpoint IP 匹配则额外记录
+    
+    Args:
+        request: FastAPI 请求对象
+        db: 数据库连接
+        
+    Returns:
+        认证成功返回节点信息 dict，失败返回 None
+    """
+    # 获取调用方节点 ID
+    peer_node_id = request.headers.get("X-Peer-Node-ID")
+    if not peer_node_id:
+        return None
+    
+    # 获取直连 IP
+    client_ip = _get_direct_client_ip(request)
+    
+    logging.info(f"[peer-endpoint-auth] 尝试认证: node_id={peer_node_id}, client_ip={client_ip}")
+    
+    # 查找节点
+    try:
+        node = db.get_peer_node(peer_node_id)
+        if not node:
+            logging.warning(f"[peer-endpoint-auth] 节点不存在: {peer_node_id} (from {client_ip})")
+            return None
+        
+        # 检查连接状态
+        if node.get("tunnel_status") != "connected":
+            logging.warning(
+                f"[peer-endpoint-auth] 节点未连接: {peer_node_id} "
+                f"(status={node.get('tunnel_status')}, from {client_ip})"
+            )
+            return None
+        
+        # 验证 endpoint IP（可选，仅用于日志）
+        endpoint = node.get("endpoint", "")
+        endpoint_ip = ""
+        if endpoint:
+            endpoint_ip = endpoint.rsplit(":", 1)[0]  # 移除端口
+            if endpoint_ip.startswith("[") and endpoint_ip.endswith("]"):
+                endpoint_ip = endpoint_ip[1:-1]  # 移除 IPv6 方括号
+        
+        ip_match = (client_ip == endpoint_ip) if endpoint_ip else False
+        
+        # Phase 11-Fix.B: 只要节点存在且已连接，就允许认证
+        # endpoint IP 匹配是额外的安全层，但在 NAT 环境下可能不匹配
+        logging.info(
+            f"[peer-endpoint-auth] 认证成功: {node['tag']} "
+            f"(from {client_ip}, endpoint_ip={endpoint_ip}, ip_match={ip_match})"
+        )
+        return node
+            
+    except Exception as e:
+        logging.warning(f"[peer-endpoint-auth] 验证异常: {e}")
+        return None
+
+
 @app.get("/api/peer-info/egress")
 def api_peer_info_egress(request: Request):
     """获取本节点的可用出口列表
@@ -13549,6 +13621,12 @@ def api_peer_info_egress(request: Request):
 
     # 验证隧道认证（WireGuard IP / Xray UUID）
     node = _verify_tunnel_header(request, db)
+    
+    # Phase 11-Fix.B: 如果隧道认证失败，尝试 endpoint IP 认证
+    # 这支持 userspace WireGuard 模式下的直接 HTTP 调用
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -13626,6 +13704,18 @@ def api_peer_info_egress(request: Request):
         "enabled": True,
         "description": "Default direct connection",
     })
+
+    # 8. 负载均衡/故障转移组 (Phase 11-Fix.B)
+    for group in db.get_outbound_groups(enabled_only=True):
+        group_type = group.get("type", "loadbalance")
+        egress_list.append({
+            "tag": group["tag"],
+            "name": group.get("name") or group["tag"],
+            "type": "group",
+            "enabled": True,
+            "description": f"{'负载均衡' if group_type == 'loadbalance' else '故障转移'}组",
+            "group_type": group_type,
+        })
 
     logging.info(f"[tunnel-api] 返回 {len(egress_list)} 个可用出口给节点 '{node['tag']}'")
     return {"egress": egress_list, "node_tag": node["tag"]}
@@ -15075,18 +15165,20 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
     if not HAS_PAIRING:
         raise HTTPException(status_code=503, detail="Pairing module not available")
 
-    # 验证端点格式 (IP:port 或 域名:port)
+    # 验证端点格式 (IP 或 域名，端口可选，会自动分配)
     endpoint = payload.endpoint.strip()
-    if ':' not in endpoint:
-        raise HTTPException(status_code=400, detail="Endpoint must include port (e.g., '10.1.1.1:36200')")
-
-    host, port_str = endpoint.rsplit(':', 1)
-    try:
-        port = int(port_str)
-        if not (1 <= port <= 65535):
-            raise ValueError("Port out of range")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    if ':' in endpoint:
+        host, port_str = endpoint.rsplit(':', 1)
+        try:
+            port = int(port_str)
+            if not (1 <= port <= 65535):
+                raise ValueError("Port out of range")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    else:
+        # 没有端口，使用占位值（后面会被自动分配的端口替换）
+        host = endpoint
+        port = 0  # 占位值，表示需要自动分配
 
     if not validate_hostname(host):
         raise HTTPException(status_code=400, detail=f"Invalid hostname: {host}")
@@ -15102,12 +15194,19 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
         userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
         if userspace_wg and payload.tunnel_type == "wireguard":
+            # Auto-allocate port if not specified (port == 0)
+            ipc_endpoint = endpoint
+            if port == 0:
+                allocated_port = _allocate_peer_tunnel_port(db)
+                ipc_endpoint = f"{host}:{allocated_port}"
+                logging.info(f"[pairing] IPC 自动分配隧道端口: {allocated_port}")
+
             # Use rust-router IPC for pairing in userspace WG mode
             success, code_or_error, peer_tag, pending_data = _run_async_ipc(
                 _generate_pair_request_via_ipc(
                     node_tag=payload.node_tag,
                     node_description=payload.node_description,
-                    endpoint=endpoint,
+                    endpoint=ipc_endpoint,
                     api_port=payload.api_port,
                     bidirectional=payload.bidirectional,
                     tunnel_type=payload.tunnel_type,
@@ -15154,10 +15253,12 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
             # endpoint 中用户指定的端口可能与保留端口(36100等)冲突，需使用自动分配的端口
             listen_port = _allocate_peer_tunnel_port(db)
 
-            # Issue 7 Fix: 如果用户指定的端口是保留端口，使用分配的端口替换 endpoint
-            if port in RESERVED_PORTS or port != listen_port:
+            # Issue 7 Fix: 如果用户指定的端口是保留端口或未指定，使用分配的端口替换 endpoint
+            if port == 0 or port in RESERVED_PORTS or port != listen_port:
                 actual_endpoint = f"{host}:{listen_port}"
-                if port in RESERVED_PORTS:
+                if port == 0:
+                    logging.info(f"[pairing] 自动分配隧道监听端口: {listen_port}")
+                elif port in RESERVED_PORTS:
                     logging.warning(f"[pairing] 用户指定端口 {port} 是保留端口 ({RESERVED_PORTS[port]})，替换为 {listen_port}")
                 else:
                     logging.info(f"[pairing] 分配隧道监听端口: {listen_port} (用户指定端口 {port})")
@@ -15169,7 +15270,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
             try:
                 xray_inbound_port = db.get_next_peer_inbound_port()
                 actual_endpoint = f"{host}:{xray_inbound_port}"
-                logging.info(f"[pairing] Xray 入站端口预分配: {xray_inbound_port} (用户指定端口 {port})")
+                logging.info(f"[pairing] Xray 自动分配入站端口: {xray_inbound_port}")
             except ValueError as e:
                 raise HTTPException(status_code=500, detail=f"无法分配 Xray 入站端口: {e}")
 
@@ -15315,18 +15416,20 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
     if not HAS_PAIRING:
         raise HTTPException(status_code=503, detail="Pairing module not available")
 
-    # 验证端点格式
+    # 验证端点格式 (端口可选，会自动分配)
     endpoint = payload.local_endpoint.strip()
-    if ':' not in endpoint:
-        raise HTTPException(status_code=400, detail="Endpoint must include port (e.g., '10.1.1.1:36200')")
-
-    host, port_str = endpoint.rsplit(':', 1)
-    try:
-        local_listen_port = int(port_str)
-        if not (1 <= local_listen_port <= 65535):
-            raise ValueError("Port out of range")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    if ':' in endpoint:
+        host, port_str = endpoint.rsplit(':', 1)
+        try:
+            local_listen_port = int(port_str)
+            if not (1 <= local_listen_port <= 65535):
+                raise ValueError("Port out of range")
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid port in endpoint: {port_str}")
+    else:
+        # 没有端口，使用占位值（后面会被自动分配的端口替换）
+        host = endpoint
+        local_listen_port = 0  # 占位值，表示需要自动分配
 
     if not validate_hostname(host):
         raise HTTPException(status_code=400, detail=f"Invalid hostname: {host}")
@@ -15349,13 +15452,20 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
     userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
     if userspace_wg and request_obj.tunnel_type == "wireguard":
+        # Auto-allocate port if not specified (local_listen_port == 0)
+        ipc_endpoint = endpoint
+        if local_listen_port == 0:
+            allocated_port = _allocate_peer_tunnel_port(db)
+            ipc_endpoint = f"{host}:{allocated_port}"
+            logging.info(f"[pairing] IPC 导入自动分配隧道端口: {allocated_port}")
+
         # Use rust-router IPC for importing in userspace WG mode
         success, response_code_or_error, remote_tag, response_data = _run_async_ipc(
             _import_pair_request_via_ipc(
                 code=payload.code,
                 local_tag=payload.local_node_tag,
                 local_description=payload.local_node_description,
-                local_endpoint=endpoint,
+                local_endpoint=ipc_endpoint,
                 local_api_port=payload.api_port or 36000,
             )
         )
@@ -15377,7 +15487,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             request_code=payload.code,
             response_code=response_code_or_error,
             local_tag=payload.local_node_tag,
-            local_endpoint=endpoint,
+            local_endpoint=ipc_endpoint,
             tunnel_status="connected" if bidirectional else "disconnected",
         )
 
@@ -15762,11 +15872,16 @@ def api_get_peer_status(tag: str):
 
 
 @app.get("/api/peers/{tag}/egress")
-def api_get_peer_egress(tag: str):
+async def api_get_peer_egress(tag: str):
     """获取指定对等节点的可用出口列表
     
     用于前端创建多跳链路时选择终端出口。
-    通过隧道 API 查询远程节点的出口列表。
+    通过 rust-router IPC 转发请求到远程节点的 API。
+    
+    Phase 11-Fix: 使用 IPC 转发解决 userspace WireGuard 模式下
+    无法直接路由到隧道 IP 的问题。rust-router 会根据隧道类型：
+    - WireGuard: 使用对端的公网端点发起请求
+    - Xray: 通过 SOCKS5 代理路由请求
     
     Args:
         tag: 对等节点标识
@@ -15796,45 +15911,66 @@ def api_get_peer_egress(tag: str):
         )
     
     try:
-        from tunnel_api_client import TunnelAPIClient
+        # Phase 11-Fix: 使用 IPC 转发而非直接 HTTP 请求
+        # 这解决了 userspace WireGuard 模式下隧道 IP 不可路由的问题
+        client = await _get_rust_router_client()
+        if not client:
+            raise HTTPException(
+                status_code=503,
+                detail="rust-router 不可用，无法转发请求"
+            )
         
-        # 获取隧道 API 端点
-        tunnel_api = node.get("tunnel_api_endpoint")
-        if not tunnel_api:
-            # 回退到隧道远程 IP + API 端口
-            tunnel_remote_ip = node.get("tunnel_remote_ip")
-            api_port = node.get("api_port", 8000)
-            if tunnel_remote_ip:
-                tunnel_api = f"{tunnel_remote_ip}:{api_port}"
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"节点 '{tag}' 缺少隧道 API 端点配置"
-                )
-        
-        tunnel_type = node.get("tunnel_type", "wireguard")
-        socks_port = node.get("xray_socks_port") if tunnel_type == "xray" else None
-        peer_uuid = node.get("xray_uuid") if tunnel_type == "xray" else None
-        
-        client = TunnelAPIClient(
-            node_tag=tag,
-            tunnel_endpoint=tunnel_api,
-            tunnel_type=tunnel_type,
-            socks_port=socks_port,
-            peer_uuid=peer_uuid,
-            timeout=30
+        # 通过 IPC 转发请求到对端节点
+        # 传递 inline config 从数据库，避免需要在 PeerManager 中注册
+        # Phase 11-Fix.B: 传递本地节点 tag 用于 endpoint IP 认证
+        local_node_tag = _get_local_node_tag(db)
+        result = await client.forward_peer_request(
+            peer_tag=tag,
+            method="GET",
+            path="/api/peer-info/egress",
+            timeout_secs=30,
+            # Inline peer config from database
+            endpoint=node.get("endpoint"),
+            tunnel_type=node.get("tunnel_type"),
+            api_port=node.get("api_port", 36000),
+            tunnel_ip=node.get("tunnel_ip"),
+            # Pass local node tag for endpoint IP authentication
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
         )
         
-        egress_list = client.get_egress_list()
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            status_code = result.get("status_code", 0)
+            
+            if status_code == 404:
+                raise HTTPException(status_code=404, detail=f"节点 '{tag}' 的出口列表端点不存在")
+            elif status_code in (401, 403):
+                raise HTTPException(status_code=403, detail=f"访问节点 '{tag}' 被拒绝")
+            elif status_code >= 500:
+                raise HTTPException(status_code=502, detail=f"节点 '{tag}' 服务错误: {error}")
+            else:
+                raise HTTPException(status_code=500, detail=f"获取出口列表失败: {error}")
+        
+        # 解析响应体
+        import json
+        response_body = result.get("body", "{}")
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError as e:
+            logging.error(f"[peers] 解析节点 '{tag}' 响应失败: {e}")
+            raise HTTPException(status_code=500, detail="解析响应失败")
+        
+        # 提取出口列表
+        egress_list = data.get("egress", [])
         
         return {
             "egress": [
                 {
-                    "tag": e.tag,
-                    "name": e.name,
-                    "type": e.type,
-                    "enabled": e.enabled,
-                    "description": e.description,
+                    "tag": e.get("tag", ""),
+                    "name": e.get("name", e.get("tag", "")),
+                    "type": e.get("type", "unknown"),
+                    "enabled": e.get("enabled", True),
+                    "description": e.get("description"),
                 }
                 for e in egress_list
             ],
@@ -16474,9 +16610,11 @@ def api_create_chain(payload: NodeChainCreateRequest):
         _validate_chain_terminal_egress_static(payload.exit_egress)
 
     try:
+        # Phase 11-Fix.B: name 默认使用 tag
+        chain_name = payload.name if payload.name else payload.tag
         chain_id = db.add_node_chain(
             tag=payload.tag,
-            name=payload.name,
+            name=chain_name,
             description=payload.description,
             hops=payload.hops,
             hop_protocols=payload.hop_protocols,

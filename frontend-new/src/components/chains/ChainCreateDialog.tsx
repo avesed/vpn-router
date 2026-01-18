@@ -18,7 +18,7 @@ import { Loader2 } from "lucide-react";
 
 const formSchema = z.object({
   tag: z.string().min(1, "Tag is required").regex(/^[a-z][a-z0-9-]*$/, "Must start with lowercase letter, only lowercase letters, numbers and hyphens"),
-  name: z.string().min(1, "Name is required"),
+  name: z.string().optional(),  // Phase 11-Fix.B: 名称可选，默认使用 tag
   description: z.string().optional(),
   hops: z.array(z.string()).min(1, "At least 1 hop required"),
   exit_egress: z.string().optional(),
@@ -138,7 +138,7 @@ export function ChainCreateDialog({ open, onOpenChange }: ChainCreateDialogProps
               name="name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>{t("chains.name")}</FormLabel>
+                  <FormLabel>{t("chains.name")} <span className="text-muted-foreground text-xs">({t("common.optional")})</span></FormLabel>
                   <FormControl>
                     <Input placeholder={t("chains.namePlaceholder")} {...field} />
                   </FormControl>

@@ -1125,6 +1125,200 @@ class TunnelAPIClient:
         return result.get("success", False)
 
 
+class IpcForwardingTunnelAPIClient:
+    """IPC 转发隧道 API 客户端
+
+    通过 rust-router 的 IPC 接口转发 HTTP 请求到对端节点。
+    这解决了在 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题。
+
+    对于 WireGuard 隧道：rust-router 使用对端的公网端点发起请求
+    对于 Xray 隧道：rust-router 通过 SOCKS5 代理路由请求
+
+    使用示例：
+        client = IpcForwardingTunnelAPIClient("node-tokyo", rust_router_client)
+        egress_list = await client.get_egress_list()
+    """
+
+    def __init__(
+        self,
+        node_tag: str,
+        rust_router_client,  # RustRouterClient instance
+        timeout: int = DEFAULT_TIMEOUT,
+    ):
+        """初始化 IPC 转发客户端
+
+        Args:
+            node_tag: 远程节点标识
+            rust_router_client: RustRouterClient 实例（用于 IPC 通信）
+            timeout: 请求超时时间（秒）
+        """
+        self.node_tag = node_tag
+        self._client = rust_router_client
+        self.timeout = timeout
+
+        logging.debug(f"[ipc-tunnel-api] 初始化 IPC 转发客户端: node={node_tag}")
+
+    async def _make_request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """通过 IPC 发送 API 请求
+
+        Args:
+            method: HTTP 方法 (GET, POST, PUT, DELETE)
+            path: API 路径 (如 /api/peer-info/egress)
+            data: 请求体数据
+
+        Returns:
+            响应 JSON 数据
+
+        Raises:
+            TunnelAPIError: API 调用失败
+        """
+        body = json.dumps(data) if data else None
+
+        logging.debug(f"[ipc-tunnel-api] {method} {path} -> {self.node_tag}")
+
+        result = await self._client.forward_peer_request(
+            peer_tag=self.node_tag,
+            method=method,
+            path=path,
+            body=body,
+            timeout_secs=self.timeout,
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            status_code = result.get("status_code", 0)
+
+            if status_code in (401, 403):
+                raise TunnelAuthError(
+                    f"Authentication failed: {status_code}",
+                    status_code=status_code,
+                )
+            elif status_code == 404:
+                raise TunnelNotFoundError(
+                    f"Resource not found: {status_code}",
+                    status_code=status_code,
+                )
+            elif status_code >= 500:
+                raise TunnelServiceError(
+                    f"Service error: {status_code}",
+                    status_code=status_code,
+                )
+            elif status_code == 0:
+                # Connection-level error
+                raise TunnelAPIError(f"IPC forwarding failed: {error}")
+            else:
+                raise TunnelAPIError(
+                    f"API request failed: {status_code}",
+                    status_code=status_code,
+                )
+
+        # Parse response body as JSON
+        response_body = result.get("body", "")
+        if response_body:
+            try:
+                return json.loads(response_body)
+            except json.JSONDecodeError as e:
+                raise TunnelAPIError(f"Invalid JSON response: {e}")
+        return {"success": True, "message": "Empty response"}
+
+    async def get(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 GET 请求（异步）
+
+        Args:
+            path: API 路径
+            params: URL 参数（将附加到路径）
+
+        Returns:
+            响应 JSON 数据
+        """
+        if params:
+            from urllib.parse import urlencode
+            query = urlencode(params)
+            path = f"{path}?{query}"
+        return await self._make_request("GET", path)
+
+    async def post(
+        self,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 POST 请求（异步）
+
+        Args:
+            path: API 路径
+            json: 请求体数据
+
+        Returns:
+            响应 JSON 数据
+        """
+        return await self._make_request("POST", path, data=json)
+
+    async def delete(
+        self,
+        path: str,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """发送 DELETE 请求（异步）
+
+        Args:
+            path: API 路径
+            json: 请求体数据
+
+        Returns:
+            响应 JSON 数据
+        """
+        return await self._make_request("DELETE", path, data=json)
+
+    async def ping(self) -> bool:
+        """测试隧道连通性（异步）
+
+        Returns:
+            True 如果隧道连通
+        """
+        try:
+            result = await self._make_request("GET", "/api/health")
+            return result.get("status") == "healthy"
+        except TunnelAPIError as e:
+            logging.warning(f"[ipc-tunnel-api] Ping failed for {self.node_tag}: {e}")
+            return False
+
+    async def get_egress_list(self) -> List[EgressInfo]:
+        """获取远程节点的可用出口列表（异步）
+
+        Returns:
+            出口信息列表
+        """
+        try:
+            result = await self._make_request("GET", "/api/peer-info/egress")
+            egress_list = []
+
+            for item in result.get("egress", []):
+                egress_list.append(EgressInfo(
+                    tag=item["tag"],
+                    name=item.get("name", item["tag"]),
+                    type=item.get("type", "unknown"),
+                    enabled=item.get("enabled", True),
+                    description=item.get("description"),
+                    protocol=item.get("protocol"),
+                ))
+
+            logging.info(f"[ipc-tunnel-api] 获取 {self.node_tag} 出口列表: {len(egress_list)} 个")
+            return egress_list
+
+        except TunnelAPIError as e:
+            logging.error(f"[ipc-tunnel-api] 获取出口列表失败 ({self.node_tag}): {e}")
+            raise
+
+
 class TunnelAPIClientManager:
     """隧道 API 客户端管理器
 

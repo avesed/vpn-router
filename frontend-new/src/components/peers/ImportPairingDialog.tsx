@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -31,7 +31,6 @@ import { useIngressConfig } from "@/api/hooks/useIngress";
 
 const formSchema = z.object({
   code: z.string().min(1, "Pairing code is required"),
-  local_node_tag: z.string().min(1, "Local node tag is required"),
   local_node_description: z.string().optional(),
   local_endpoint: z.string().min(1, "Local endpoint is required"),
   api_port: z.coerce.number().optional(),
@@ -56,22 +55,22 @@ export function ImportPairingDialog() {
     resolver: zodResolver(formSchema) as any,
     defaultValues: {
       code: "",
-      local_node_tag: "",
       local_node_description: "",
       local_endpoint: window.location.hostname,
       api_port: 36000,
     },
   });
 
-  // Auto-fill local_node_tag from server
-  useEffect(() => {
-    if (ingressData?.local_node_tag && !form.getValues("local_node_tag")) {
-      form.setValue("local_node_tag", ingressData.local_node_tag);
-    }
-  }, [ingressData, form]);
-
   const onSubmit = (data: FormValues) => {
-    importPairRequest.mutate(data, {
+    const nodeTag = ingressData?.local_node_tag;
+    if (!nodeTag) {
+      toast.error(t("pairing.nodeTagMissing"));
+      return;
+    }
+    importPairRequest.mutate({
+      ...data,
+      local_node_tag: nodeTag,
+    }, {
       onSuccess: (response) => {
         setResult({ 
           success: response.success, 
@@ -84,9 +83,22 @@ export function ImportPairingDialog() {
     });
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    toast.success(t("common.copied"));
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(t("common.copied"));
+    } catch {
+      // Fallback for non-HTTPS environments
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.opacity = "0";
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textArea);
+      toast.success(t("common.copied"));
+    }
   };
 
   const reset = () => {
@@ -131,31 +143,25 @@ export function ImportPairingDialog() {
                 )}
               />
 
-              <FormField
-                control={form.control}
-                name="local_node_tag"
-                render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>{t("pairing.localNodeTag")}</FormLabel>
-                      <FormControl>
-                        <Input placeholder={t("pairing.localNodeTagPlaceholder")} {...field} />
-                      </FormControl>
-                      <FormDescription>{t("pairing.localNodeDescription")}</FormDescription>
-                      <FormMessage />
-                    </FormItem>
-
-                )}
-              />
+              <div className="rounded-md border p-3 bg-muted/50">
+                <div className="text-sm text-muted-foreground">{t("pairing.localNodeTag")}</div>
+                <div className="font-medium">
+                  {ingressData?.local_node_tag || (
+                    <span className="text-destructive">{t("pairing.nodeTagMissing")}</span>
+                  )}
+                </div>
+              </div>
 
               <FormField
                 control={form.control}
                 name="local_endpoint"
                 render={({ field }) => (
                     <FormItem>
-                      <FormLabel>{t("pairing.localEndpoint")}</FormLabel>
+                      <FormLabel>{t("pairing.publicAddress")}</FormLabel>
                       <FormControl>
-                        <Input placeholder={t("pairing.localEndpointPlaceholder")} {...field} />
+                        <Input placeholder={t("pairing.publicAddressPlaceholder")} {...field} />
                       </FormControl>
+                      <FormDescription>{t("pairing.publicAddressHint")}</FormDescription>
                       <FormMessage />
                     </FormItem>
 
@@ -165,7 +171,7 @@ export function ImportPairingDialog() {
               <Button 
                 type="submit" 
                 className="w-full" 
-                disabled={importPairRequest.isPending}
+                disabled={importPairRequest.isPending || !ingressData?.local_node_tag}
               >
                 {importPairRequest.isPending && (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />

@@ -1493,6 +1493,10 @@
     "completeHint": "当您生成配对码时勾选了\"双向连接\"，对端导入后会生成一个响应码，将该响应码粘贴到这里",
     "completeSubmit": "完成配对",
     "createdNode": "创建的节点",
-    "nodeTagMissing": "节点标识未配置，请在设置中设置"
+    "nodeTagMissing": "节点标识未配置，请在设置中设置",
+    "publicAddress": "公网地址",
+    "publicAddressPlaceholder": "如 vpn.example.com 或 1.2.3.4",
+    "publicAddressHint": "对端可访问的 IP 或域名，端口自动分配",
+    "responseCodeRequired": "请输入响应码"
   }
 }

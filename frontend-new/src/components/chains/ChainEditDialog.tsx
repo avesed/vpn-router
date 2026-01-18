@@ -1,10 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { useUpdateNodeChain } from "../../api/hooks/useChains";
 import { usePeerNodes } from "../../api/hooks/usePeerNodes";
+import { api } from "../../api/client";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "../ui/form";
@@ -13,9 +14,16 @@ import { toast } from "sonner";
 import { Checkbox } from "../ui/checkbox";
 import { ScrollArea } from "../ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
-import { useAllEgress } from "../../api/hooks/useEgress";
 import type { NodeChain } from "../../types";
 import { Loader2 } from "lucide-react";
+
+interface EgressOption {
+  tag: string;
+  name: string;
+  type: string;
+  enabled: boolean;
+  description?: string;
+}
 
 const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
@@ -37,7 +45,9 @@ export function ChainEditDialog({ open, onOpenChange, chain }: ChainEditDialogPr
   const { t } = useTranslation();
   const updateChain = useUpdateNodeChain();
   const { data: peers } = usePeerNodes();
-  const { data: allEgress } = useAllEgress();
+  const [terminalEgressOptions, setTerminalEgressOptions] = useState<EgressOption[]>([]);
+  const [loadingEgress, setLoadingEgress] = useState(false);
+  const [egressError, setEgressError] = useState<string | null>(null);
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -49,6 +59,9 @@ export function ChainEditDialog({ open, onOpenChange, chain }: ChainEditDialogPr
       enabled: true,
     },
   });
+
+  const selectedHops = form.watch("hops");
+  const lastHop = selectedHops.length > 0 ? selectedHops[selectedHops.length - 1] : null;
 
   // Reset form when dialog opens with chain data
   useEffect(() => {
@@ -62,6 +75,42 @@ export function ChainEditDialog({ open, onOpenChange, chain }: ChainEditDialogPr
       });
     }
   }, [open, chain, form]);
+
+  // Fetch egress options from the last hop node when it changes
+  useEffect(() => {
+    if (!lastHop) {
+      setTerminalEgressOptions([]);
+      setEgressError(null);
+      return;
+    }
+
+    const fetchEgress = async () => {
+      setLoadingEgress(true);
+      setEgressError(null);
+      setTerminalEgressOptions([]);
+      
+      try {
+        const response = await api.getPeerEgress(lastHop);
+        setTerminalEgressOptions(response.egress.filter(e => e.enabled));
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : "Failed to fetch egress options";
+        setEgressError(message);
+        console.error("Failed to fetch terminal egress:", error);
+      } finally {
+        setLoadingEgress(false);
+      }
+    };
+
+    fetchEgress();
+  }, [lastHop]);
+
+  // Reset exit_egress when hops change (but keep it if it exists in new options)
+  useEffect(() => {
+    const currentEgress = form.getValues("exit_egress");
+    if (currentEgress && !terminalEgressOptions.find(e => e.tag === currentEgress)) {
+      form.setValue("exit_egress", "");
+    }
+  }, [terminalEgressOptions, form]);
 
   const onSubmit = (values: FormValues) => {
     if (!chain) return;
@@ -82,18 +131,7 @@ export function ChainEditDialog({ open, onOpenChange, chain }: ChainEditDialogPr
     );
   };
 
-  const availablePeers = peers?.nodes || [];
-  
-  // Build available egress options
-  const egressOptions: { value: string; label: string }[] = [];
-  if (allEgress) {
-    allEgress.pia?.forEach(e => egressOptions.push({ value: e.tag, label: `${e.tag} (PIA)` }));
-    allEgress.custom?.forEach(e => egressOptions.push({ value: e.tag, label: `${e.tag} (WireGuard)` }));
-    allEgress.direct?.forEach(e => egressOptions.push({ value: e.tag, label: `${e.tag} (Direct)` }));
-    allEgress.warp?.forEach(e => egressOptions.push({ value: e.tag, label: `${e.tag} (WARP)` }));
-    allEgress.openvpn?.forEach(e => egressOptions.push({ value: e.tag, label: `${e.tag} (OpenVPN)` }));
-    allEgress.v2ray?.forEach(e => egressOptions.push({ value: e.tag, label: `${e.tag} (V2Ray)` }));
-  }
+  const availablePeers = peers?.nodes?.filter(p => p.tunnel_status === "connected" && p.enabled) || [];
 
   if (!chain) return null;
 
@@ -196,23 +234,39 @@ export function ChainEditDialog({ open, onOpenChange, chain }: ChainEditDialogPr
               render={({ field }) => (
                 <FormItem>
                   <FormLabel>{t("chains.exitEgress")}</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger>
-                        <SelectValue placeholder={t("chains.exitEgressHint", { defaultValue: "Select exit egress (optional)" })} />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectItem value="">
-                        {t("chains.noExitEgress", { defaultValue: "None (use terminal node's default)" })}
-                      </SelectItem>
-                      {egressOptions.map((opt) => (
-                        <SelectItem key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  {lastHop ? (
+                    <>
+                      <Select onValueChange={field.onChange} value={field.value}>
+                        <FormControl>
+                          <SelectTrigger disabled={loadingEgress}>
+                            {loadingEgress ? (
+                              <div className="flex items-center gap-2">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                <span>{t("common.loading")}</span>
+                              </div>
+                            ) : (
+                              <SelectValue placeholder={t("chains.selectExitEgress")} />
+                            )}
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {terminalEgressOptions.map((egress) => (
+                            <SelectItem key={egress.tag} value={egress.tag}>
+                              {egress.name} ({egress.type})
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      {egressError && (
+                        <p className="text-sm text-destructive">{egressError}</p>
+                      )}
+                      <p className="text-xs text-muted-foreground">
+                        {t("chains.exitEgressFromNode", { node: lastHop })}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">{t("chains.selectHopsFirst")}</p>
+                  )}
                   <FormMessage />
                 </FormItem>
               )}

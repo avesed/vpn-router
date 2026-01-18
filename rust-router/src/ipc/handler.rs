@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 
 use tracing::{debug, info, warn};
@@ -35,7 +35,7 @@ use crate::egress::manager::WgEgressManager;
 use crate::ingress::manager::WgIngressManager;
 use crate::ingress::{ForwardingStats, IngressReplyStats, IngressSessionTracker};
 use crate::io::UdpBufferPool;
-use crate::outbound::OutboundManager;
+use crate::outbound::{Outbound, OutboundManager};
 use crate::peer::manager::PeerManager;
 use crate::peer::pairing::PairRequestConfig;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
@@ -820,6 +820,13 @@ impl IpcHandler {
             // ================================================================
             IpcCommand::SpeedTest { tag, size_bytes, timeout_secs } => {
                 self.handle_speed_test(tag, size_bytes, timeout_secs).await
+            }
+
+            // ================================================================
+            // Peer API Forwarding Command Handler
+            // ================================================================
+            IpcCommand::ForwardPeerRequest { peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, headers } => {
+                self.handle_forward_peer_request(peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, headers).await
             }
         }
     }
@@ -4525,6 +4532,596 @@ impl IpcHandler {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         roots
+    }
+
+    // ========================================================================
+    // Peer API Forwarding Handler
+    // ========================================================================
+
+    // Maximum response size for peer API requests (1 MB)
+    const MAX_PEER_RESPONSE_SIZE: usize = 1024 * 1024;
+
+    /// Validate HTTP method (allow-list)
+    fn validate_http_method(method: &str) -> Result<(), String> {
+        const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+        let upper = method.to_uppercase();
+        if ALLOWED_METHODS.contains(&upper.as_str()) {
+            Ok(())
+        } else {
+            Err(format!("Invalid HTTP method: '{}'", method))
+        }
+    }
+
+    /// Validate request path (must start with /, no CR/LF/spaces for injection prevention)
+    fn validate_request_path(path: &str) -> Result<(), String> {
+        if !path.starts_with('/') {
+            return Err("Path must start with '/'".to_string());
+        }
+        if path.contains('\r') || path.contains('\n') {
+            return Err("Path contains invalid characters (CR/LF)".to_string());
+        }
+        // Check for null bytes
+        if path.contains('\0') {
+            return Err("Path contains null bytes".to_string());
+        }
+        Ok(())
+    }
+
+    /// Allowed API paths for peer forwarding (security allowlist)
+    /// Only these paths can be forwarded to prevent SSRF attacks
+    const ALLOWED_PEER_API_PATHS: &'static [&'static str] = &[
+        "/api/peer-info/egress",
+        "/api/peer-info/status",
+        "/api/health",
+        "/api/peer-notify/connected",
+        "/api/peer-notify/disconnected",
+        "/api/peer-chain/register",
+        "/api/peer-chain/unregister",
+        "/api/peer-event",
+    ];
+
+    /// Validate that the path is in the allowed list
+    fn validate_path_allowlist(path: &str) -> Result<(), String> {
+        // Extract base path (before query string)
+        let base_path = path.split('?').next().unwrap_or(path);
+        
+        if Self::ALLOWED_PEER_API_PATHS.iter().any(|&allowed| base_path == allowed) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Path '{}' is not in the allowed list for peer API forwarding",
+                base_path
+            ))
+        }
+    }
+
+    /// Parse endpoint string to extract host for URL construction (handles IPv6)
+    /// Returns the host in a format suitable for URL construction:
+    /// - IPv6 addresses are returned with brackets: [::1]
+    /// - IPv4 addresses and hostnames are returned as-is
+    fn parse_endpoint_host(endpoint: &str) -> Result<String, String> {
+        // Handle IPv6 addresses in brackets: [::1]:port
+        if endpoint.starts_with('[') {
+            if let Some(bracket_end) = endpoint.find(']') {
+                // Return with brackets for URL construction
+                return Ok(endpoint[..=bracket_end].to_string());
+            }
+            return Err(format!("Invalid IPv6 endpoint format: {}", endpoint));
+        }
+        
+        // Handle IPv4 or hostname: host:port
+        // Find the last colon (for port), but be careful with IPv6 without brackets
+        if let Some(colon_pos) = endpoint.rfind(':') {
+            // Check if there's another colon before this one (could be IPv6 without brackets)
+            let before_colon = &endpoint[..colon_pos];
+            if before_colon.contains(':') {
+                // This looks like IPv6 without brackets, return the whole thing
+                // (though this is technically invalid endpoint format)
+                return Err(format!(
+                    "IPv6 endpoint must be in [host]:port format: {}",
+                    endpoint
+                ));
+            }
+            return Ok(before_colon.to_string());
+        }
+        
+        // No port specified, return the whole string as host
+        Ok(endpoint.to_string())
+    }
+
+    /// Handle forward peer request command
+    ///
+    /// Forwards an HTTP request to a peer node's API. The routing strategy depends
+    /// on the peer's tunnel type:
+    /// - **Xray peers**: Proxies through the SOCKS5 outbound to the peer's tunnel IP
+    /// - **WireGuard peers**: Makes a direct HTTP request to the peer's public endpoint
+    ///
+    /// For WireGuard peers, we cannot easily route TCP traffic through the userspace
+    /// tunnel (which operates at L3), so we use the peer's public API endpoint instead.
+    async fn handle_forward_peer_request(
+        &self,
+        peer_tag: String,
+        method: String,
+        path: String,
+        body: Option<String>,
+        timeout_secs: u32,
+        // Inline config fields - if provided, use these instead of PeerManager lookup
+        endpoint: Option<String>,
+        tunnel_type: Option<String>,
+        api_port: Option<u16>,
+        tunnel_ip: Option<String>,
+        // Custom headers to include in the request
+        headers: Option<std::collections::HashMap<String, String>>,
+    ) -> IpcResponse {
+        use super::protocol::PeerRequestResponse;
+
+        info!(
+            peer = %peer_tag,
+            method = %method,
+            path = %path,
+            has_inline_config = endpoint.is_some(),
+            has_custom_headers = headers.is_some(),
+            "Forwarding peer API request"
+        );
+
+        // Validate method and path to prevent HTTP request smuggling/injection
+        if let Err(e) = Self::validate_http_method(&method) {
+            return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                success: false,
+                status_code: 0,
+                body: String::new(),
+                error: Some(e),
+            });
+        }
+        if let Err(e) = Self::validate_request_path(&path) {
+            return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                success: false,
+                status_code: 0,
+                body: String::new(),
+                error: Some(e),
+            });
+        }
+        // Security: Only allow specific API paths to prevent SSRF
+        if let Err(e) = Self::validate_path_allowlist(&path) {
+            return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                success: false,
+                status_code: 0,
+                body: String::new(),
+                error: Some(e),
+            });
+        }
+
+        // Determine if we should use inline config or PeerManager lookup
+        // Inline config takes precedence - this allows Python to pass peer info
+        // from its database without requiring peers to be registered in PeerManager
+        let (target_url, use_socks5) = if let Some(ref ep) = endpoint {
+            // Use inline config
+            let ttype = tunnel_type.as_deref().unwrap_or("wireguard");
+            let port = api_port.unwrap_or(36000);
+            
+            // Parse the endpoint host
+            let host = match Self::parse_endpoint_host(ep) {
+                Ok(h) => h,
+                Err(e) => {
+                    return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                        success: false,
+                        status_code: 0,
+                        body: String::new(),
+                        error: Some(format!("Invalid endpoint '{}': {}", ep, e)),
+                    });
+                }
+            };
+            
+            // Build target URL
+            let url = if ttype == "xray" && tunnel_ip.is_some() {
+                // For Xray with tunnel IP, use tunnel IP (requires SOCKS5)
+                format!("http://{}:{}{}", tunnel_ip.as_ref().unwrap(), port, path)
+            } else {
+                // Use public endpoint directly
+                format!("http://{}:{}{}", host, port, path)
+            };
+            
+            // Only use SOCKS5 for Xray peers when we have tunnel IP
+            let use_socks = ttype == "xray" && tunnel_ip.is_some();
+            
+            debug!(
+                peer = %peer_tag,
+                tunnel_type = %ttype,
+                url = %url,
+                use_socks5 = use_socks,
+                "Using inline peer config"
+            );
+            
+            (url, use_socks)
+        } else {
+            // Fall back to PeerManager lookup (backward compatibility)
+            let Some(ref peer_manager) = self.peer_manager else {
+                return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                    success: false,
+                    status_code: 0,
+                    body: String::new(),
+                    error: Some("No inline config provided and peer manager not available".to_string()),
+                });
+            };
+
+            let Some(config) = peer_manager.get_peer_config(&peer_tag) else {
+                return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                    success: false,
+                    status_code: 0,
+                    body: String::new(),
+                    error: Some(format!("Peer '{}' not found in PeerManager and no inline config provided", peer_tag)),
+                });
+            };
+
+            // Determine the target URL based on tunnel type
+            let url = match config.tunnel_type {
+                TunnelType::Xray => {
+                    // For Xray peers, use the tunnel IP if available, otherwise public endpoint
+                    if let Some(ref tip) = config.tunnel_remote_ip {
+                        format!("http://{}:{}{}", tip, config.api_port, path)
+                    } else {
+                        // Fallback to public endpoint (with proper IPv6 handling)
+                        let host = match Self::parse_endpoint_host(&config.endpoint) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                                    success: false,
+                                    status_code: 0,
+                                    body: String::new(),
+                                    error: Some(e),
+                                });
+                            }
+                        };
+                        format!("http://{}:{}{}", host, config.api_port, path)
+                    }
+                }
+                TunnelType::WireGuard => {
+                    // For WireGuard peers, use the public endpoint since we can't route
+                    // TCP through the userspace WireGuard tunnel directly
+                    let host = match Self::parse_endpoint_host(&config.endpoint) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                                success: false,
+                                status_code: 0,
+                                body: String::new(),
+                                error: Some(e),
+                            });
+                        }
+                    };
+                    format!("http://{}:{}{}", host, config.api_port, path)
+                }
+            };
+            
+            let use_socks = matches!(config.tunnel_type, TunnelType::Xray);
+            (url, use_socks)
+        };
+
+        debug!(peer = %peer_tag, url = %target_url, use_socks5 = use_socks5, "Target URL for peer request");
+
+        // Route based on tunnel type - SOCKS5 for Xray with tunnel IP, direct for others
+        let result = if use_socks5 {
+            // For Xray peers with tunnel IP, route through the SOCKS5 proxy
+            let Some(ref peer_manager) = self.peer_manager else {
+                return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                    success: false,
+                    status_code: 0,
+                    body: String::new(),
+                    error: Some("SOCKS5 routing requires peer manager".to_string()),
+                });
+            };
+            self.forward_via_socks5(
+                peer_manager,
+                &peer_tag,
+                &target_url,
+                &method,
+                body.as_deref(),
+                Duration::from_secs(timeout_secs as u64),
+            )
+            .await
+        } else {
+            // Direct HTTP request to public endpoint
+            self.forward_direct_http(
+                &target_url,
+                &method,
+                body.as_deref(),
+                Duration::from_secs(timeout_secs as u64),
+                headers.as_ref(),
+            )
+            .await
+        };
+
+        match result {
+            Ok((status_code, response_body)) => {
+                info!(
+                    peer = %peer_tag,
+                    status = status_code,
+                    "Peer API request successful"
+                );
+                IpcResponse::PeerRequestResult(PeerRequestResponse {
+                    success: status_code >= 200 && status_code < 300,
+                    status_code,
+                    body: response_body,
+                    error: None,
+                })
+            }
+            Err(e) => {
+                warn!(peer = %peer_tag, error = %e, "Peer API request failed");
+                IpcResponse::PeerRequestResult(PeerRequestResponse {
+                    success: false,
+                    status_code: 0,
+                    body: String::new(),
+                    error: Some(e),
+                })
+            }
+        }
+    }
+
+    /// Forward HTTP request through SOCKS5 proxy (for Xray peers)
+    #[allow(clippy::unused_async)]
+    async fn forward_via_socks5(
+        &self,
+        peer_manager: &Arc<PeerManager>,
+        peer_tag: &str,
+        url: &str,
+        method: &str,
+        body: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(u16, String), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout as tokio_timeout;
+
+        // Get the SOCKS5 outbound for this peer
+        let outbound = peer_manager
+            .get_xray_outbound(peer_tag)
+            .ok_or_else(|| format!("Xray outbound for peer '{}' not found or not connected", peer_tag))?;
+
+        // Parse the URL to get host, port, and path
+        let uri: hyper::Uri = url
+            .parse()
+            .map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+
+        let host = uri.host().ok_or_else(|| "URL missing host".to_string())?;
+        let port = uri.port_u16().unwrap_or(80);
+        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        // Resolve destination address
+        let dest_addr = format!("{}:{}", host, port);
+        let socket_addrs: Vec<_> = tokio::net::lookup_host(&dest_addr)
+            .await
+            .map_err(|e| format!("DNS lookup failed for '{}': {}", dest_addr, e))?
+            .collect();
+
+        let dest = socket_addrs
+            .first()
+            .ok_or_else(|| format!("DNS lookup returned no addresses for '{}'", dest_addr))?;
+
+        // Connect through SOCKS5
+        let connection = tokio_timeout(timeout, outbound.connect(*dest, timeout))
+            .await
+            .map_err(|_| "SOCKS5 connection timed out".to_string())?
+            .map_err(|e| format!("SOCKS5 connection failed: {}", e))?;
+
+        // Take the stream from the connection
+        let mut stream = connection.into_stream();
+
+        // Build Host header (include port if non-default)
+        let host_header = if port != 80 {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+
+        // Build HTTP request
+        let content_length = body.map(|b| b.len()).unwrap_or(0);
+        let mut request = format!(
+            "{} {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             User-Agent: rust-router/1.0\r\n\
+             Accept: application/json\r\n\
+             Connection: close\r\n",
+            method.to_uppercase(),
+            path,
+            host_header
+        );
+
+        if body.is_some() {
+            request.push_str(&format!(
+                "Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n",
+                content_length
+            ));
+        }
+
+        request.push_str("\r\n");
+
+        if let Some(b) = body {
+            request.push_str(b);
+        }
+
+        // Send request
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to send HTTP request: {}", e))?;
+
+        // Read response with size limit to prevent memory exhaustion
+        let mut response_buf = Vec::with_capacity(8192);
+        let read_result = tokio_timeout(timeout, async {
+            let mut total_read = 0usize;
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break; // EOF
+                }
+                total_read += n;
+                if total_read > Self::MAX_PEER_RESPONSE_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Response too large",
+                    ));
+                }
+                response_buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok(())
+        })
+        .await;
+
+        match read_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Failed to read HTTP response: {}", e)),
+            Err(_) => return Err("HTTP response read timed out".to_string()),
+        }
+
+        // Parse HTTP response
+        let response_str = String::from_utf8_lossy(&response_buf);
+        Self::parse_http_response(&response_str)
+    }
+
+    /// Forward HTTP request directly (for WireGuard peers)
+    async fn forward_direct_http(
+        &self,
+        url: &str,
+        method: &str,
+        body: Option<&str>,
+        timeout: Duration,
+        custom_headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<(u16, String), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::timeout as tokio_timeout;
+
+        // Parse the URL
+        let uri: hyper::Uri = url
+            .parse()
+            .map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+
+        let host = uri.host().ok_or_else(|| "URL missing host".to_string())?;
+        let port = uri.port_u16().unwrap_or(80);
+        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        // Connect to the target
+        let addr = format!("{}:{}", host, port);
+        let stream = tokio_timeout(timeout, tokio::net::TcpStream::connect(&addr))
+            .await
+            .map_err(|_| format!("Connection to '{}' timed out", addr))?
+            .map_err(|e| format!("Failed to connect to '{}': {}", addr, e))?;
+
+        let mut stream = stream;
+
+        // Build Host header (include port if non-default)
+        let host_header = if port != 80 {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+
+        // Build HTTP request
+        let content_length = body.map(|b| b.len()).unwrap_or(0);
+        let mut request = format!(
+            "{} {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             User-Agent: rust-router/1.0\r\n\
+             Accept: application/json\r\n\
+             Connection: close\r\n",
+            method.to_uppercase(),
+            path,
+            host_header
+        );
+
+        // Add custom headers
+        if let Some(headers) = custom_headers {
+            for (name, value) in headers {
+                // Validate header name and value to prevent injection
+                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    && !value.contains('\r') && !value.contains('\n')
+                {
+                    request.push_str(&format!("{}: {}\r\n", name, value));
+                }
+            }
+        }
+
+        if body.is_some() {
+            request.push_str(&format!(
+                "Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n",
+                content_length
+            ));
+        }
+
+        request.push_str("\r\n");
+
+        if let Some(b) = body {
+            request.push_str(b);
+        }
+
+        // Send request
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to send HTTP request: {}", e))?;
+
+        // Read response with size limit to prevent memory exhaustion
+        let mut response_buf = Vec::with_capacity(8192);
+        let read_result = tokio_timeout(timeout, async {
+            let mut total_read = 0usize;
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break; // EOF
+                }
+                total_read += n;
+                if total_read > Self::MAX_PEER_RESPONSE_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Response too large",
+                    ));
+                }
+                response_buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok(())
+        })
+        .await;
+
+        match read_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Failed to read HTTP response: {}", e)),
+            Err(_) => return Err("HTTP response read timed out".to_string()),
+        }
+
+        // Parse HTTP response
+        let response_str = String::from_utf8_lossy(&response_buf);
+        Self::parse_http_response(&response_str)
+    }
+
+    /// Parse HTTP response to extract status code and body
+    fn parse_http_response(response: &str) -> Result<(u16, String), String> {
+        // Find the end of headers
+        let header_end = response
+            .find("\r\n\r\n")
+            .ok_or_else(|| "Invalid HTTP response: no header terminator".to_string())?;
+
+        let headers = &response[..header_end];
+        let body = &response[header_end + 4..];
+
+        // Parse status line
+        let status_line = headers
+            .lines()
+            .next()
+            .ok_or_else(|| "Invalid HTTP response: no status line".to_string())?;
+
+        // Format: "HTTP/1.1 200 OK"
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return Err(format!("Invalid status line: '{}'", status_line));
+        }
+
+        let status_code: u16 = parts[1]
+            .parse()
+            .map_err(|_| format!("Invalid status code: '{}'", parts[1]))?;
+
+        Ok((status_code, body.to_string()))
     }
 }
 

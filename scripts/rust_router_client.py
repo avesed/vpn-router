@@ -2256,6 +2256,88 @@ class RustRouterClient:
             }
 
     # =========================================================================
+    # Peer API Forwarding Commands
+    # =========================================================================
+
+    async def forward_peer_request(
+        self,
+        peer_tag: str,
+        method: str,
+        path: str,
+        body: Optional[str] = None,
+        timeout_secs: int = 30,
+        # Inline peer config - pass these to avoid requiring PeerManager registration
+        endpoint: Optional[str] = None,
+        tunnel_type: Optional[str] = None,
+        api_port: Optional[int] = None,
+        tunnel_ip: Optional[str] = None,
+        # Custom headers to include in the request
+        headers: Optional[Dict[str, str]] = None,
+    ) -> dict:
+        """Forward an HTTP request to a peer node's API via rust-router
+
+        This command allows Python to make API calls to peer nodes by forwarding
+        HTTP requests through rust-router. For Xray peers, this routes through
+        the SOCKS5 proxy. For WireGuard peers, this uses the peer's public API endpoint.
+
+        Args:
+            peer_tag: The peer node's tag identifier
+            method: HTTP method (GET, POST, PUT, DELETE)
+            path: Request path (e.g., "/api/peer-info/egress")
+            body: Optional JSON request body
+            timeout_secs: Request timeout in seconds (default: 30)
+            endpoint: Peer endpoint (host:port) - if provided, uses this instead of PeerManager lookup
+            tunnel_type: Tunnel type ("wireguard" or "xray") - use with endpoint
+            api_port: API port on the peer (default: 36000 if not provided)
+            tunnel_ip: Tunnel IP for Xray peers (optional, for routing through tunnel)
+            headers: Custom headers to include in the request (e.g., {"X-Peer-Node-ID": "my-tag"})
+
+        Returns:
+            dict with keys:
+                - success: bool (True if HTTP 2xx response)
+                - status_code: int (HTTP status code, 0 if connection failed)
+                - body: str (response body)
+                - error: Optional[str] (error message if failed)
+        """
+        command = {
+            "type": "forward_peer_request",
+            "peer_tag": peer_tag,
+            "method": method,
+            "path": path,
+            "timeout_secs": timeout_secs,
+        }
+        if body is not None:
+            command["body"] = body
+        # Add inline config if provided
+        if endpoint is not None:
+            command["endpoint"] = endpoint
+        if tunnel_type is not None:
+            command["tunnel_type"] = tunnel_type
+        if api_port is not None:
+            command["api_port"] = api_port
+        if tunnel_ip is not None:
+            command["tunnel_ip"] = tunnel_ip
+        if headers is not None:
+            command["headers"] = headers
+
+        response = await self._send_command(command)
+
+        if response.success and response.data:
+            return {
+                "success": response.data.get("success", False),
+                "status_code": response.data.get("status_code", 0),
+                "body": response.data.get("body", ""),
+                "error": response.data.get("error"),
+            }
+        else:
+            return {
+                "success": False,
+                "status_code": 0,
+                "body": "",
+                "error": response.error or "Unknown error",
+            }
+
+    # =========================================================================
     # Lifecycle Commands
     # =========================================================================
 
