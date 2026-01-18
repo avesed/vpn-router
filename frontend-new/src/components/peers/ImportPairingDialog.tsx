@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -27,6 +27,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { useImportPairRequest } from "@/api/hooks/usePairing";
+import { useIngressConfig } from "@/api/hooks/useIngress";
 
 const formSchema = z.object({
   code: z.string().min(1, "Pairing code is required"),
@@ -49,6 +50,7 @@ export function ImportPairingDialog() {
   } | null>(null);
 
   const importPairRequest = useImportPairRequest();
+  const { data: ingressData } = useIngressConfig();
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema) as any,
@@ -60,6 +62,13 @@ export function ImportPairingDialog() {
       api_port: 36000,
     },
   });
+
+  // Auto-fill local_node_tag from server
+  useEffect(() => {
+    if (ingressData?.local_node_tag && !form.getValues("local_node_tag")) {
+      form.setValue("local_node_tag", ingressData.local_node_tag);
+    }
+  }, [ingressData, form]);
 
   const onSubmit = (data: FormValues) => {
     importPairRequest.mutate(data, {

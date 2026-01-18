@@ -1509,7 +1509,7 @@ class NodeChainCreateRequest(BaseModel):
     name: str = Field(..., description="链路名称")
     description: str = Field("", description="链路描述")
     # Phase 7 Fix: 添加最大长度限制（API 层限制 10 跳，递归验证使用 max_depth=5）
-    hops: List[str] = Field(..., min_length=2, max_length=10, description="节点跳转列表（2-10 跳）")
+    hops: List[str] = Field(..., min_length=1, max_length=10, description="节点跳转列表（1-10 跳，单跳用于指定远程出口）")
     hop_protocols: Optional[Dict[str, str]] = Field(None, description="每跳协议配置")
     entry_rules: Optional[Dict[str, Any]] = Field(None, description="入口分流规则")
     relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
@@ -1528,7 +1528,7 @@ class NodeChainUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, description="链路名称")
     description: Optional[str] = Field(None, description="链路描述")
     # Phase 7 Fix: 与 NodeChainCreateRequest 保持一致
-    hops: Optional[List[str]] = Field(None, min_length=2, max_length=10, description="节点跳转列表（2-10 跳）")
+    hops: Optional[List[str]] = Field(None, min_length=1, max_length=10, description="节点跳转列表（1-10 跳，单跳用于指定远程出口）")
     hop_protocols: Optional[Dict[str, str]] = Field(None, description="每跳协议配置")
     entry_rules: Optional[Dict[str, Any]] = Field(None, description="入口分流规则")
     relay_rules: Optional[Dict[str, Any]] = Field(None, description="中继分流规则")
@@ -5421,6 +5421,10 @@ def api_get_ingress():
             "default_outbound": peer.get("default_outbound"),
         })
 
+    # 获取本地节点标识
+    db = _get_db() if HAS_DATABASE and USER_DB_PATH.exists() else None
+    local_node_tag = _get_local_node_tag(db) if db else None
+
     return {
         "interface": {
             "name": interface.get("name", "wg-ingress"),
@@ -5431,6 +5435,7 @@ def api_get_ingress():
         },
         "peers": peers,
         "peer_count": len(peers),
+        "local_node_tag": local_node_tag,
     }
 
 
@@ -15749,6 +15754,96 @@ def api_get_peer_status(tag: str):
     return status
 
 
+@app.get("/api/peers/{tag}/egress")
+def api_get_peer_egress(tag: str):
+    """获取指定对等节点的可用出口列表
+    
+    用于前端创建多跳链路时选择终端出口。
+    通过隧道 API 查询远程节点的出口列表。
+    
+    Args:
+        tag: 对等节点标识
+        
+    Returns:
+        {
+            "egress": [
+                {"tag": "...", "name": "...", "type": "...", "enabled": true},
+                ...
+            ],
+            "from_cache": false
+        }
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    
+    db = _get_db()
+    node = db.get_peer_node(tag)
+    
+    if not node:
+        raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
+    
+    if node.get("tunnel_status") != "connected":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"节点 '{tag}' 未连接，无法获取出口列表"
+        )
+    
+    try:
+        from tunnel_api_client import TunnelAPIClient
+        
+        # 获取隧道 API 端点
+        tunnel_api = node.get("tunnel_api_endpoint")
+        if not tunnel_api:
+            # 回退到隧道远程 IP + API 端口
+            tunnel_remote_ip = node.get("tunnel_remote_ip")
+            api_port = node.get("api_port", 8000)
+            if tunnel_remote_ip:
+                tunnel_api = f"{tunnel_remote_ip}:{api_port}"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"节点 '{tag}' 缺少隧道 API 端点配置"
+                )
+        
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        socks_port = node.get("xray_socks_port") if tunnel_type == "xray" else None
+        peer_uuid = node.get("xray_uuid") if tunnel_type == "xray" else None
+        
+        client = TunnelAPIClient(
+            node_tag=tag,
+            tunnel_endpoint=tunnel_api,
+            tunnel_type=tunnel_type,
+            socks_port=socks_port,
+            peer_uuid=peer_uuid,
+            timeout=30
+        )
+        
+        egress_list = client.get_egress_list()
+        
+        return {
+            "egress": [
+                {
+                    "tag": e.tag,
+                    "name": e.name,
+                    "type": e.type,
+                    "enabled": e.enabled,
+                    "description": e.description,
+                }
+                for e in egress_list
+            ],
+            "from_cache": False
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"[peers] 获取节点 '{tag}' 出口列表失败: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取出口列表失败: {str(e)}"
+        )
+
+
 class TunnelStatusUpdateRequest(BaseModel):
     """手动更新隧道状态请求 (Phase 10.4)"""
     status: str = Field(..., pattern=r"^(connected|disconnected|error)$")
@@ -17583,8 +17678,8 @@ def api_get_chain_terminal_egress(tag: str, refresh: bool = False, allow_transit
     # Issue 11/12 修复：使用统一的 hops 解析函数
     hops = _parse_chain_hops(chain, raise_on_error=True)
 
-    if not hops or len(hops) < 2:
-        raise HTTPException(status_code=400, detail="链路至少需要 2 跳")
+    if not hops or len(hops) < 1:
+        raise HTTPException(status_code=400, detail="链路至少需要 1 跳")
 
     # 终端节点是最后一跳
     terminal_tag = hops[-1]
@@ -17969,8 +18064,8 @@ def api_activate_chain(tag: str):
         # Issue 11/12 修复：使用统一的 hops 解析函数
         hops = _parse_chain_hops(chain, raise_on_error=True)
 
-        if not hops or len(hops) < 2:
-            raise HTTPException(status_code=400, detail="链路至少需要 2 跳")
+        if not hops or len(hops) < 1:
+            raise HTTPException(status_code=400, detail="链路至少需要 1 跳")
 
         # 终端节点是最后一跳
         terminal_tag = hops[-1]

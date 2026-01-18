@@ -263,6 +263,7 @@ export interface IngressResponse {
   interface: IngressInterface;
   peers: IngressPeer[];
   peer_count: number;
+  local_node_tag?: string;
 }
 
 export interface IngressPeerCreateResponse {

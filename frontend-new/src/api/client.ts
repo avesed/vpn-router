@@ -770,6 +770,11 @@ export const api = {
       `/peers/${encodeURIComponent(tag)}/status`
     ),
 
+  getPeerEgress: (tag: string) =>
+    request<{ egress: Array<{ tag: string; name: string; type: string; enabled: boolean; description?: string }>; from_cache: boolean }>(
+      `/peers/${encodeURIComponent(tag)}/egress`
+    ),
+
   batchConnectPeerNodes: (tags: string[]) =>
     request<BatchOperationResponse>("/batch/connect", {
       method: "POST",
