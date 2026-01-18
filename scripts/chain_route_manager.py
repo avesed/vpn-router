@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """链路路由管理器
 
+.. deprecated:: Phase 12
+    此模块已弃用。rust-router 现在在用户空间处理链路路由，无需内核 iptables 规则。
+    
+    - 链路路由映射存储在数据库的 chain_routing 表中
+    - rust-router 的 ChainManager 在用户空间执行 DSCP 到出口的路由
+    - 参见 rust-router/src/ingress/processor.rs
+    
+    保留此文件仅用于向后兼容和参考。所有 add_route/remove_route 函数的内核
+    iptables 部分已移除，仅保留数据库操作。
+
+原始功能说明（内核 iptables 部分已废弃）：
 在终端节点管理 DSCP/email 到本地出口的路由映射。
 
 当远程入口节点激活链路时，通过隧道 API 注册路由映射到本终端节点。
 此模块读取 chain_routing 表，应用 iptables 和策略路由规则。
 
-使用示例：
+使用示例（内核部分已废弃）：
     manager = ChainRouteManager(db)
 
     # 从数据库同步所有路由规则
@@ -152,6 +163,25 @@ class ChainRouteManager:
         for e in direct_list:
             if e["tag"] == egress_tag:
                 return e.get("bind_interface")
+
+        # 检查 Outbound Groups（负载均衡/故障转移）
+        # 对于组，获取第一个成员的接口
+        group = self.db.get_outbound_group(egress_tag) if hasattr(self.db, 'get_outbound_group') else None
+        if group and group.get("members"):
+            members = group.get("members", [])
+            if isinstance(members, str):
+                import json
+                try:
+                    members = json.loads(members)
+                except json.JSONDecodeError:
+                    members = []
+            if members:
+                # 递归获取第一个成员的接口
+                first_member = members[0]
+                self._logger.info(
+                    f"Outbound group '{egress_tag}' -> using first member '{first_member}'"
+                )
+                return self._get_egress_interface(first_member)
 
         # V2Ray 和 WARP MASQUE 使用 SOCKS，不适用于 DSCP 路由
         self._logger.warning(f"Cannot determine interface for egress: {egress_tag}")

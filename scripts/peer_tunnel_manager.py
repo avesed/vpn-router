@@ -2,16 +2,26 @@
 """
 对等节点隧道管理器
 
+.. deprecated:: Phase 12
+    此模块已弃用。rust-router 现在在用户空间管理对等节点隧道。
+    
+    - 在 userspace WireGuard 模式下，此管理器不再启动
+    - 对等节点隧道通过 rust-router IPC 管理
+    - 参见 rust-router/src/ingress/manager.rs
+    
+    保留此文件仅用于向后兼容和参考。entrypoint.sh 中已跳过此管理器的启动。
+
+原始功能说明（已废弃）：
 管理节点间的 WireGuard 和 Xray 隧道连接，支持：
 - 从数据库读取节点配置
 - 建立和维护点对点隧道
 - 自动重连机制
 - 隧道状态监控
 
-WireGuard 隧道创建 wg-peer-{tag} 接口，
+WireGuard 隧道创建 wg-peer-{tag} 接口（内核模式，已废弃），
 Xray 隧道使用 SOCKS5 代理桥接。
 
-使用方法:
+使用方法（已废弃）:
     python3 peer_tunnel_manager.py start      # 启动所有启用的隧道
     python3 peer_tunnel_manager.py stop       # 停止所有隧道
     python3 peer_tunnel_manager.py reload     # 重载配置

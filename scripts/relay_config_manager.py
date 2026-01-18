@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """中继节点配置管理器
 
+.. deprecated:: Phase 12
+    此模块已弃用。rust-router 现在在用户空间处理多跳中继路由。
+    
+    - 在 userspace WireGuard 模式下，rust-router 直接处理多跳转发
+    - 无需 iptables DSCP 标记规则
+    - 参见 rust-router/src/tunnel/ 目录
+    
+    保留此文件仅用于向后兼容和参考。
+
+原始功能说明（已废弃）：
 Phase 11.4: 对于 WireGuard 多跳链路，中间节点需要 iptables 规则来转发流量。
 
-架构：
+架构（已迁移到 rust-router 用户空间）：
     入口(A) -> wg-peer-B [DSCP 标记] -> 中继(B) -> wg-peer-C -> 终端(C)
 
 中继规则（在节点 B 上）：
@@ -287,98 +297,25 @@ class RelayConfigManager:
         """释放 fwmark（当前实现中不需要特别处理，只是记录日志）"""
         logger.debug(f"[relay] 释放 fwmark={fwmark}")
 
-    def _userspace_wg_enabled(self) -> bool:
-        """检查是否启用 userspace WireGuard 模式"""
-        return os.environ.get("USERSPACE_WG", "true").lower() == "true"
-
     def _setup_dscp_relay(self, rule: RelayRule) -> bool:
         """设置 DSCP 匹配的中继转发
 
-        1. iptables -t mangle -A PREROUTING -i {source} -m dscp --dscp {value} -j MARK --set-mark {fwmark}
-        2. ip rule add fwmark {fwmark} table {table}
-        3. ip route add default dev {target} table {table}
+        Phase 12: rust-router 在用户空间处理 DSCP 路由，无需内核 iptables 规则。
+        此函数保留用于日志记录和兼容性。
         """
-        try:
-            if self._userspace_wg_enabled():
-                logger.info(
-                    "[relay] USERSPACE_WG=true, skipping kernel DSCP relay setup: "
-                    f"chain={rule.chain_tag}, dscp={rule.dscp_value}"
-                )
-                return True
-
-            # 1. 添加 iptables 规则 - DSCP 匹配并设置 fwmark
-            iptables_cmd = [
-                "iptables", "-t", "mangle", "-A", "PREROUTING",
-                "-i", rule.source_interface,
-                "-m", "dscp", "--dscp", str(rule.dscp_value),
-                "-j", "MARK", "--set-mark", str(rule.fwmark)
-            ]
-            subprocess.run(iptables_cmd, check=True, capture_output=True, timeout=10)
-            logger.debug(f"[relay] 添加 iptables 规则: {' '.join(iptables_cmd)}")
-
-            # 2. 添加策略路由规则
-            rule_cmd = ["ip", "rule", "add", "fwmark", str(rule.fwmark), "table", str(rule.table_id)]
-            subprocess.run(rule_cmd, check=True, capture_output=True, timeout=10)
-            logger.debug(f"[relay] 添加 ip rule: {' '.join(rule_cmd)}")
-
-            # 3. 添加默认路由到目标接口
-            route_cmd = ["ip", "route", "add", "default", "dev", rule.target_interface, "table", str(rule.table_id)]
-            result = subprocess.run(route_cmd, capture_output=True, timeout=10)
-            if result.returncode != 0:
-                # 如果路由已存在，尝试替换
-                route_cmd = ["ip", "route", "replace", "default", "dev", rule.target_interface, "table", str(rule.table_id)]
-                subprocess.run(route_cmd, check=True, capture_output=True, timeout=10)
-            logger.debug(f"[relay] 添加 ip route: {' '.join(route_cmd)}")
-
-            return True
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"[relay] 设置 DSCP 中继失败: {e.stderr.decode() if e.stderr else e}")
-            # 尝试回滚已添加的规则
-            self._cleanup_dscp_relay(rule)
-            return False
-        except subprocess.TimeoutExpired:
-            logger.error("[relay] 设置 DSCP 中继超时")
-            return False
-        except Exception as e:
-            logger.error(f"[relay] 设置 DSCP 中继异常: {e}")
-            return False
+        logger.info(
+            f"[relay] DSCP relay managed by rust-router (userspace mode): "
+            f"chain={rule.chain_tag}, dscp={rule.dscp_value}"
+        )
+        return True
 
     def _cleanup_dscp_relay(self, rule: RelayRule) -> bool:
-        """清理 DSCP 中继规则"""
-        if self._userspace_wg_enabled():
-            return True
+        """清理 DSCP 中继规则
 
-        success = True
-
-        # 1. 删除路由
-        try:
-            route_cmd = ["ip", "route", "del", "default", "table", str(rule.table_id)]
-            subprocess.run(route_cmd, capture_output=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"[relay] 删除路由失败: {e}")
-
-        # 2. 删除策略路由规则
-        try:
-            rule_cmd = ["ip", "rule", "del", "fwmark", str(rule.fwmark), "table", str(rule.table_id)]
-            subprocess.run(rule_cmd, capture_output=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"[relay] 删除 ip rule 失败: {e}")
-
-        # 3. 删除 iptables 规则
-        try:
-            iptables_cmd = [
-                "iptables", "-t", "mangle", "-D", "PREROUTING",
-                "-i", rule.source_interface,
-                "-m", "dscp", "--dscp", str(rule.dscp_value),
-                "-j", "MARK", "--set-mark", str(rule.fwmark)
-            ]
-            subprocess.run(iptables_cmd, capture_output=True, timeout=10)
-        except Exception as e:
-            logger.warning(f"[relay] 删除 iptables 规则失败: {e}")
-            success = False
-
-        return success
+        Phase 12: rust-router 在用户空间处理 DSCP 路由，无需清理内核规则。
+        """
+        logger.debug(f"[relay] DSCP cleanup (no-op in userspace mode): chain={rule.chain_tag}")
+        return True
 
     def _setup_xray_relay(self, rule: RelayRule) -> bool:
         """Xray 中继路由不支持 (Phase 11-Fix.P)

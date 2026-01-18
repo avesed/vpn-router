@@ -4578,6 +4578,9 @@ impl IpcHandler {
         "/api/peer-chain/register",
         "/api/peer-chain/unregister",
         "/api/peer-event",
+        // Phase 11-Fix.R: Add chain-routing endpoints for IPC-based chain activation
+        "/api/chain-routing/register",
+        "/api/chain-routing/unregister",
     ];
 
     /// Validate that the path is in the allowed list
@@ -4713,11 +4716,14 @@ impl IpcHandler {
             };
             
             // Build target URL
-            let url = if ttype == "xray" && tunnel_ip.is_some() {
-                // For Xray with tunnel IP, use tunnel IP (requires SOCKS5)
-                format!("http://{}:{}{}", tunnel_ip.as_ref().unwrap(), port, path)
+            // Use tunnel IP when available for both Xray and WireGuard peers
+            // This ensures requests come from the tunnel subnet (10.200.200.0/24)
+            // which is whitelisted by nginx on the remote node
+            let url = if let Some(ref tip) = tunnel_ip {
+                // Use tunnel IP - works for both Xray (via SOCKS5) and WireGuard (routed via tunnel)
+                format!("http://{}:{}{}", tip, port, path)
             } else {
-                // Use public endpoint directly
+                // Fallback to public endpoint
                 format!("http://{}:{}{}", host, port, path)
             };
             
@@ -4776,20 +4782,26 @@ impl IpcHandler {
                     }
                 }
                 TunnelType::WireGuard => {
-                    // For WireGuard peers, use the public endpoint since we can't route
-                    // TCP through the userspace WireGuard tunnel directly
-                    let host = match Self::parse_endpoint_host(&config.endpoint) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            return IpcResponse::PeerRequestResult(PeerRequestResponse {
-                                success: false,
-                                status_code: 0,
-                                body: String::new(),
-                                error: Some(e),
-                            });
-                        }
-                    };
-                    format!("http://{}:{}{}", host, config.api_port, path)
+                    // For WireGuard peers, prefer tunnel IP when available
+                    // This ensures requests come from the tunnel subnet (10.200.200.0/24)
+                    // which is whitelisted by nginx on the remote node
+                    if let Some(ref tip) = config.tunnel_remote_ip {
+                        format!("http://{}:{}{}", tip, config.api_port, path)
+                    } else {
+                        // Fallback to public endpoint
+                        let host = match Self::parse_endpoint_host(&config.endpoint) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                                    success: false,
+                                    status_code: 0,
+                                    body: String::new(),
+                                    error: Some(e),
+                                });
+                            }
+                        };
+                        format!("http://{}:{}{}", host, config.api_port, path)
+                    }
                 }
             };
             

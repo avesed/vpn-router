@@ -86,24 +86,19 @@ except ImportError:
     HAS_KEY_MANAGER = False
     print("WARNING: Key manager not available, v2.0 backup format disabled")
 
-# [安全] 导入主机名验证函数和隧道管理函数
+# [安全] 导入主机名验证函数
+# Note: Most peer tunnel functions now use rust-router IPC instead of peer_tunnel_manager
+# HAS_PENDING_TUNNEL is always False - kernel WireGuard pending interfaces are no longer used
+HAS_PENDING_TUNNEL = False  # Legacy kernel WireGuard code paths disabled
 try:
     from peer_tunnel_manager import (
         validate_hostname,
-        create_pending_wireguard_interface,
-        teardown_pending_wireguard_interface,
-        rename_wireguard_interface,
-        update_wireguard_peer_endpoint,
-        get_interface_name,
-        create_wireguard_tunnel_with_endpoint,
-        wait_for_wireguard_handshake,
+        get_interface_name,  # Still used for interface naming convention
         PEER_TUNNEL_PORT_MIN,
     )
     HAS_HOSTNAME_VALIDATOR = True
-    HAS_PENDING_TUNNEL = True
 except ImportError:
     HAS_HOSTNAME_VALIDATOR = False
-    HAS_PENDING_TUNNEL = False
     PEER_TUNNEL_PORT_MIN = 36200  # Phase 6: 回退值 (must match valid range 36200-36299)
     # 回退实现：基本验证
     def validate_hostname(hostname: str) -> bool:
@@ -2425,18 +2420,30 @@ def save_json_config(data: dict) -> None:
 
 
 def get_wireguard_status() -> dict:
-    try:
-        result = subprocess.run(
-            ["wg", "show", "wg-ingress"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return {"raw": result.stdout}
-    except subprocess.CalledProcessError as exc:
-        return {"error": exc.stderr.strip() or "failed to read wg status"}
-    except FileNotFoundError:
-        return {"error": "wg binary not available"}
+    """Get WireGuard ingress server status.
+    
+    In userspace mode, queries rust-router IPC for ingress status.
+    The ingress server (wg-ingress) is managed by rust-router.
+    """
+    # Userspace mode: query rust-router for ingress status
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            status = _get_rust_router_status_sync()
+            if status.get("running"):
+                ingress = status.get("ingress", {})
+                return {
+                    "mode": "userspace",
+                    "running": True,
+                    "listen_port": ingress.get("listen_port"),
+                    "public_key": ingress.get("public_key"),
+                    "peer_count": ingress.get("peer_count", 0),
+                }
+            else:
+                return {"mode": "userspace", "running": False, "error": "rust-router not running"}
+        except Exception as e:
+            return {"mode": "userspace", "error": f"IPC query failed: {e}"}
+    
+    return {"error": "rust-router client not available"}
 
 
 def list_processes(pattern: str) -> bool:
@@ -3367,7 +3374,7 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
         if updates:
             db.update_wireguard_server(**updates)
             # 同步内核 WireGuard 入口接口
-            sync_msg = _sync_kernel_wg_ingress()
+            sync_msg = _sync_wg_ingress()
             return {"message": f"endpoint {tag} updated{sync_msg}"}
         return {"message": f"endpoint {tag} updated (no changes)"}
 
@@ -3394,7 +3401,7 @@ def api_update_endpoint(tag: str, payload: EndpointUpdateRequest):
             if updates:
                 db.update_custom_egress(tag, **updates)
                 # 同步内核 WireGuard 出口接口并重载 sing-box
-                wg_sync_msg = _sync_kernel_wg_egress()
+                wg_sync_msg = _sync_wg_egress()
                 try:
                     _regenerate_and_reload()
                     return {"message": f"endpoint {tag} updated{wg_sync_msg}, config reloaded"}
@@ -3515,7 +3522,7 @@ def api_create_profile(payload: ProfileCreateRequest):
         try:
             run_command(["python3", str(provision_script)], env=env)
             # 同步内核 WireGuard 接口
-            wg_sync_status = _sync_kernel_wg_egress()
+            wg_sync_status = _sync_wg_egress()
             # NOTE: render_singbox.py call removed - sing-box replaced by rust-router
             reload_result = reload_singbox()
             provision_result = {"success": True, "reload": reload_result, "wg_sync": wg_sync_status}
@@ -3587,7 +3594,7 @@ def api_delete_profile(tag: str):
     # 同步内核 WireGuard 接口（清理已删除的接口）并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -4317,7 +4324,7 @@ def api_pia_login(payload: PiaLoginRequest):
         # Sync to rust-router instead
         reload_result = reload_singbox()
         # 同步内核 WireGuard 出口接口（PIA 使用 kernel WG）
-        wg_sync_msg = _sync_kernel_wg_egress()
+        wg_sync_msg = _sync_wg_egress()
         return {
             "message": f"PIA 登录成功，配置已同步到 rust-router{wg_sync_msg}",
             "has_profiles": True,
@@ -4742,125 +4749,6 @@ def get_peer_status_from_clash_api() -> dict:
     return peer_status
 
 
-def get_wg_show_info() -> dict:
-    """从内核 WireGuard 获取接口和 peer 状态
-
-    使用 wg show 命令获取真实的 WireGuard 状态，包括:
-    - 握手时间 (latest handshake)
-    - 流量统计 (transfer)
-    - 端点信息 (endpoint)
-    """
-    import time
-    interface = os.environ.get("WG_INTERFACE", "wg-ingress")
-
-    result = {"interface": {}, "peers": {}}
-
-    try:
-        proc = subprocess.run(
-            ["wg", "show", interface],
-            capture_output=True, text=True
-        )
-        if proc.returncode != 0:
-            return result
-
-        current_peer = None
-        for line in proc.stdout.strip().split('\n'):
-            line = line.rstrip()
-
-            if line.startswith('interface:'):
-                result["interface"]["name"] = line.split(':', 1)[1].strip()
-            elif line.startswith('  public key:'):
-                result["interface"]["public_key"] = line.split(':', 1)[1].strip()
-            elif line.startswith('  listening port:'):
-                result["interface"]["listen_port"] = int(line.split(':', 1)[1].strip())
-            elif line.startswith('peer:'):
-                current_peer = line.split(':', 1)[1].strip()
-                result["peers"][current_peer] = {
-                    "public_key": current_peer,
-                    "endpoint": None,
-                    "allowed_ips": None,
-                    "latest_handshake": 0,
-                    "rx_bytes": 0,
-                    "tx_bytes": 0
-                }
-            elif current_peer:
-                if line.startswith('  endpoint:'):
-                    result["peers"][current_peer]["endpoint"] = line.split(':', 1)[1].strip()
-                elif line.startswith('  allowed ips:'):
-                    result["peers"][current_peer]["allowed_ips"] = line.split(':', 1)[1].strip()
-                elif line.startswith('  latest handshake:'):
-                    # Parse "X seconds/minutes/hours ago" or "never"
-                    handshake_str = line.split(':', 1)[1].strip()
-                    if handshake_str != "(none)":
-                        # Convert to timestamp
-                        result["peers"][current_peer]["latest_handshake"] = _parse_handshake_time(handshake_str)
-                elif line.startswith('  transfer:'):
-                    # Parse "X received, Y sent"
-                    transfer_str = line.split(':', 1)[1].strip()
-                    rx, tx = _parse_transfer(transfer_str)
-                    result["peers"][current_peer]["rx_bytes"] = rx
-                    result["peers"][current_peer]["tx_bytes"] = tx
-
-    except Exception as e:
-        print(f"[api] wg show failed: {e}")
-
-    return result
-
-
-def _parse_handshake_time(handshake_str: str) -> int:
-    """解析 wg show 的握手时间字符串，返回 Unix 时间戳"""
-    import time
-    import re
-
-    if not handshake_str or handshake_str == "(none)":
-        return 0
-
-    now = int(time.time())
-
-    # Match patterns like "47 seconds ago", "2 minutes, 30 seconds ago"
-    total_seconds = 0
-
-    # Extract all time components
-    patterns = [
-        (r'(\d+)\s*second', 1),
-        (r'(\d+)\s*minute', 60),
-        (r'(\d+)\s*hour', 3600),
-        (r'(\d+)\s*day', 86400),
-    ]
-
-    for pattern, multiplier in patterns:
-        match = re.search(pattern, handshake_str)
-        if match:
-            total_seconds += int(match.group(1)) * multiplier
-
-    if total_seconds > 0:
-        return now - total_seconds
-
-    return 0
-
-
-def _parse_transfer(transfer_str: str) -> tuple:
-    """解析 wg show 的流量字符串，返回 (rx_bytes, tx_bytes)"""
-    import re
-
-    rx_bytes = 0
-    tx_bytes = 0
-
-    # Match patterns like "47.71 KiB received, 176.50 KiB sent"
-    # or "1.23 MiB received, 456.78 KiB sent"
-    units = {'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3, 'TiB': 1024**4}
-
-    rx_match = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s*received', transfer_str)
-    tx_match = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\s*sent', transfer_str)
-
-    if rx_match:
-        rx_bytes = int(float(rx_match.group(1)) * units.get(rx_match.group(2), 1))
-    if tx_match:
-        tx_bytes = int(float(tx_match.group(1)) * units.get(tx_match.group(2), 1))
-
-    return rx_bytes, tx_bytes
-
-
 def get_peer_status_from_rust_router() -> dict:
     """从 rust-router 获取 peer 状态（用于 userspace WireGuard 模式）
 
@@ -4906,55 +4794,13 @@ def get_peer_status_from_rust_router() -> dict:
     return result
 
 
-def get_peer_handshake_info() -> dict:
-    """获取 peer 握手状态（从内核 WireGuard）
-
-    使用 wg show 命令获取真实的握手时间，比 clash_api 推断更准确。
-    """
-    handshakes = {}
-
-    # 从内核 WireGuard 获取状态
-    wg_info = get_wg_show_info()
-
-    for pubkey, peer_info in wg_info.get("peers", {}).items():
-        handshakes[pubkey] = peer_info.get("latest_handshake", 0)
-
-    return handshakes
-
-
-def get_peer_transfer_info() -> dict:
-    """获取 peer 流量统计（从内核 WireGuard）
-
-    使用 wg show 命令获取真实的流量统计。
-    """
-    transfers = {}
-
-    # 从内核 WireGuard 获取状态
-    wg_info = get_wg_show_info()
-
-    for pubkey, peer_info in wg_info.get("peers", {}).items():
-        transfers[pubkey] = {
-            "rx": peer_info.get("rx_bytes", 0),
-            "tx": peer_info.get("tx_bytes", 0)
-        }
-
-    return transfers
-
-
 def apply_ingress_config(config: dict) -> dict:
     """应用入口 WireGuard 配置到系统
 
-    Phase 11-Fix.AA: 支持用户态和内核 WireGuard 两种模式：
-    - USERSPACE_WG=true (默认): 通过 IPC 调用 rust-router 管理 peer
-    - USERSPACE_WG=false: 通过 wg set 命令直接管理 peer (内核模式)
+    Phase 12: 仅支持用户态 WireGuard 模式，通过 IPC 调用 rust-router 管理 peer。
+    内核 WireGuard 支持已移除。
     """
-    # Phase 11-Fix.AA/AC: Userspace WireGuard mode is default (matches entrypoint.sh)
-    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
-
-    if userspace_wg:
-        return _apply_ingress_config_userspace(config)
-    else:
-        return _apply_ingress_config_kernel(config)
+    return _apply_ingress_config_userspace(config)
 
 
 def _apply_ingress_config_userspace(config: dict) -> dict:
@@ -5040,71 +4886,6 @@ def _apply_ingress_config_userspace(config: dict) -> dict:
     except RuntimeError:
         # No event loop exists, create one
         return asyncio.run(_sync_peers_via_ipc())
-
-
-def _apply_ingress_config_kernel(config: dict) -> dict:
-    """应用入口配置到内核 WireGuard (via wg set)"""
-    try:
-        interface = os.environ.get("WG_INTERFACE", "wg-ingress")
-        peers = config.get("peers", [])
-
-        # 获取当前内核 WireGuard peers
-        result = subprocess.run(
-            ["wg", "show", interface, "peers"],
-            capture_output=True, text=True
-        )
-        current_peers = set()
-        if result.returncode == 0 and result.stdout.strip():
-            current_peers = set(line.strip() for line in result.stdout.strip().split('\n') if line.strip())
-
-        # 计算期望的 peers
-        desired_peers = {p.get("public_key") for p in peers if p.get("public_key")}
-
-        # 删除不在期望列表中的 peers
-        for pubkey in current_peers - desired_peers:
-            if pubkey:
-                subprocess.run(
-                    ["wg", "set", interface, "peer", pubkey, "remove"],
-                    check=True
-                )
-                print(f"[api] Removed peer: {pubkey[:20]}...")
-
-        # 添加或更新 peers
-        for peer in peers:
-            pubkey = peer.get("public_key")
-            if not pubkey:
-                continue
-
-            allowed_ips = peer.get("allowed_ips", get_default_peer_ip())
-            # allowed_ips can be a list or string, wg set expects comma-separated string
-            if isinstance(allowed_ips, list):
-                allowed_ips = ",".join(allowed_ips)
-
-            cmd = ["wg", "set", interface, "peer", pubkey, "allowed-ips", allowed_ips]
-
-            # 处理 preshared key
-            psk_file = None
-            if peer.get("preshared_key"):
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.psk') as f:
-                    f.write(peer["preshared_key"])
-                    psk_file = f.name
-                cmd.extend(["preshared-key", psk_file])
-
-            try:
-                subprocess.run(cmd, check=True)
-                action = "Updated" if pubkey in current_peers else "Added"
-                print(f"[api] {action} peer: {peer.get('name', 'unknown')} ({pubkey[:20]}...)")
-            finally:
-                if psk_file:
-                    os.unlink(psk_file)
-
-        return {"success": True, "message": f"Peers synced via wg set ({len(peers)} peers)"}
-
-    except subprocess.CalledProcessError as exc:
-        return {"success": False, "message": f"wg set failed: {exc}"}
-    except Exception as exc:
-        return {"success": False, "message": str(exc)}
 
 
 # ============ Phase 11-Fix.AC: Userspace WG Pairing Helpers ============
@@ -5253,6 +5034,87 @@ def _run_async_ipc(coro):
         raise HTTPException(status_code=503, detail=f"IPC communication error: {e}")
 
 
+# ============ Peer Tunnel IPC Helpers ============
+# These replace PeerTunnelManager (kernel mode) with rust-router IPC (userspace mode)
+
+async def _connect_peer_ipc(tag: str) -> tuple:
+    """Connect to peer via rust-router IPC.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    if not HAS_RUST_ROUTER_CLIENT:
+        return False, "rust-router client not available"
+    
+    try:
+        client = RustRouterClient()
+        response = await client.connect_peer(tag)
+        await client.close()
+        
+        if response.success:
+            return True, response.message or "Connected"
+        else:
+            return False, response.error or "Connection failed"
+    except Exception as e:
+        logging.error(f"[peer-ipc] Connect failed for '{tag}': {e}")
+        return False, str(e)
+
+
+async def _disconnect_peer_ipc(tag: str) -> tuple:
+    """Disconnect peer via rust-router IPC.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    if not HAS_RUST_ROUTER_CLIENT:
+        return False, "rust-router client not available"
+    
+    try:
+        client = RustRouterClient()
+        response = await client.disconnect_peer(tag)
+        await client.close()
+        
+        if response.success:
+            return True, response.message or "Disconnected"
+        else:
+            return False, response.error or "Disconnect failed"
+    except Exception as e:
+        logging.error(f"[peer-ipc] Disconnect failed for '{tag}': {e}")
+        return False, str(e)
+
+
+def _connect_peer_sync(tag: str) -> tuple:
+    """Sync wrapper for _connect_peer_ipc.
+    
+    Replaces PeerTunnelManager.connect_node() for userspace mode.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        return _run_async_ipc(_connect_peer_ipc(tag))
+    except HTTPException as e:
+        return False, e.detail
+    except Exception as e:
+        return False, str(e)
+
+
+def _disconnect_peer_sync(tag: str) -> tuple:
+    """Sync wrapper for _disconnect_peer_ipc.
+    
+    Replaces PeerTunnelManager.disconnect_node() for userspace mode.
+    
+    Returns:
+        (success: bool, message: str)
+    """
+    try:
+        return _run_async_ipc(_disconnect_peer_ipc(tag))
+    except HTTPException as e:
+        return False, e.detail
+    except Exception as e:
+        return False, str(e)
+
+
 def _sync_userspace_peer_from_codes(
     db,
     request_code: Optional[str],
@@ -5382,19 +5244,10 @@ def api_get_ingress():
     # 获取公钥
     public_key = get_ingress_public_key(config)
 
-    # 获取 peer 状态 - 根据模式选择数据源
-    # Phase 11-Fix.AA: Userspace WireGuard mode is default
-    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
-
-    if userspace_wg:
-        # 从 rust-router 获取 peer 状态（包含 handshake 和 transfer）
-        rust_router_status = get_peer_status_from_rust_router()
-        handshakes = {k: v.get("last_handshake", 0) for k, v in rust_router_status.items()}
-        transfers = {k: {"rx": v.get("rx_bytes", 0), "tx": v.get("tx_bytes", 0)} for k, v in rust_router_status.items()}
-    else:
-        # 从内核 WireGuard 获取状态
-        handshakes = get_peer_handshake_info()
-        transfers = get_peer_transfer_info()
+    # Phase 12: 从 rust-router 获取 peer 状态（仅支持 userspace WireGuard 模式）
+    rust_router_status = get_peer_status_from_rust_router()
+    handshakes = {k: v.get("last_handshake", 0) for k, v in rust_router_status.items()}
+    transfers = {k: {"rx": v.get("rx_bytes", 0), "tx": v.get("tx_bytes", 0)} for k, v in rust_router_status.items()}
 
     # 丰富 peer 信息
     peers = []
@@ -5913,7 +5766,7 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
     _regenerate_and_reload()
 
     # 6. 同步内核 WireGuard 接口（更新地址和 peer allowed_ips）
-    wg_sync_result = _sync_kernel_wg_ingress()
+    wg_sync_result = _sync_wg_ingress()
 
     return {
         "success": True,
@@ -6612,7 +6465,7 @@ def api_create_custom_egress(payload: CustomEgressCreateRequest):
     # 同步内核 WireGuard 接口并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -6691,7 +6544,7 @@ def api_update_custom_egress(tag: str, payload: CustomEgressUpdateRequest):
     # 同步内核 WireGuard 接口并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -6716,7 +6569,7 @@ def api_delete_custom_egress(tag: str):
     # 同步内核 WireGuard 接口（清理已删除的接口）并重新渲染配置
     reload_status = ""
     try:
-        wg_sync_status = _sync_kernel_wg_egress()
+        wg_sync_status = _sync_wg_egress()
         _regenerate_and_reload()
         reload_status = f"，已重载配置{wg_sync_status}"
     except Exception as exc:
@@ -10024,7 +9877,7 @@ def _reload_openvpn_manager() -> str:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
-def _sync_kernel_wg_egress() -> str:
+def _sync_wg_egress() -> str:
     """同步 WireGuard 出口隧道与数据库
 
     创建/更新/删除 PIA 或自定义出口后调用此函数，
@@ -10105,7 +9958,7 @@ def _refresh_wg_tunnel(tag: str) -> str:
         return f", tunnel refresh error: {e}"
 
 
-def _sync_kernel_wg_ingress() -> str:
+def _sync_wg_ingress() -> str:
     """同步 WireGuard 入口配置与数据库
 
     更新 WireGuard 服务器配置后调用此函数。
@@ -11794,19 +11647,15 @@ def api_peer_notify_connected(request: Request, payload: PeerNotifyRequest):
                 detail="Missing peer public key. Provide initiator_public_key or complete key exchange first."
             )
 
-    # 建立本地隧道
+    # 建立本地隧道 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.connect_node(tag)
+        success, message = _connect_peer_sync(tag)
 
         if success:
             logging.info(f"[peer-notify] 节点 '{tag}' 隧道已建立（响应远程通知）")
             return {"success": True, "message": "Tunnel established", "status": "connected"}
         else:
-            updated_node = db.get_peer_node(tag)
-            internal_error = updated_node.get("last_error", "Unknown error")
-            logging.error(f"[peer-notify] 节点 '{tag}' 隧道建立失败: {internal_error}")
+            logging.error(f"[peer-notify] 节点 '{tag}' 隧道建立失败: {message}")
             # 不暴露内部错误详情给客户端
             raise HTTPException(status_code=500, detail="Tunnel setup failed")
     except HTTPException:
@@ -11860,11 +11709,9 @@ def api_peer_notify_disconnected(request: Request, payload: PeerNotifyRequest):
     if current_status == "disconnected":
         return {"success": True, "message": "Already disconnected", "status": "disconnected"}
 
-    # 断开本地隧道
+    # 断开本地隧道 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.disconnect_node(tag)
+        success, message = _disconnect_peer_sync(tag)
 
         # Phase 5: 更新使用该节点的链路状态
         chain_result = _update_chains_for_disconnected_peer(db, tag)
@@ -12019,23 +11866,20 @@ def api_peer_tunnel_reverse_setup(request: Request, payload: ReverseSetupRequest
             "tunnel_status": current_status
         }
 
-    # 尝试建立连接
+    # 尝试建立连接 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-
         # 刷新节点数据（可能已更新）
         node = db.get_peer_node(tag)
 
         if current_status != "connected":
             # 建立隧道连接
             # 注：不需要再通知对方，因为对方调用了此 API 说明已经知道我们要连接
-            success = manager.connect_node(tag)
+            success, message = _connect_peer_sync(tag)
             if success:
                 current_status = "connected"
                 logging.info(f"[reverse-setup] 节点 '{tag}' 隧道已建立")
             else:
-                logging.warning(f"[reverse-setup] 节点 '{tag}' 隧道建立失败")
+                logging.warning(f"[reverse-setup] 节点 '{tag}' 隧道建立失败: {message}")
                 return {
                     "success": False,
                     "message": "Failed to establish tunnel",
@@ -12308,12 +12152,15 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
         if source_peer:
             logging.info(f"[peer-event] 处理删除事件: 清理与 {peer_tag} 的连接 (source_node={payload.source_node})")
 
-            # 断开隧道（如果已连接）
+            # 断开隧道（如果已连接）- via rust-router IPC
             if source_peer.get("tunnel_status") == "connected":
                 try:
-                    from peer_tunnel_manager import disconnect_peer_tunnel
-                    disconnect_peer_tunnel(db, peer_tag)
-                    result["actions_taken"].append(f"disconnected tunnel to {peer_tag}")
+                    success, msg = _disconnect_peer_sync(peer_tag)
+                    if success:
+                        result["actions_taken"].append(f"disconnected tunnel to {peer_tag}")
+                    else:
+                        logging.warning(f"[peer-event] 断开隧道返回失败: {msg}")
+                        result["actions_taken"].append(f"disconnect attempted for {peer_tag}")
                 except Exception as e:
                     logging.error(f"[peer-event] 断开隧道失败: {e}")
 
@@ -12506,7 +12353,6 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
         是否成功建立双向连接
     """
     import requests
-    from peer_tunnel_manager import PeerTunnelManager
 
     node = db.get_peer_node(node_tag)
     if not node:
@@ -12520,12 +12366,11 @@ def _trigger_bidirectional_connect(db, node_tag: str, pending_request: Dict[str,
 
     logging.info(f"[bidirectional] 开始双向自动连接: 节点 '{node_tag}', 类型={tunnel_type}")
 
-    # Step 1: 建立到远程节点的隧道
+    # Step 1: 建立到远程节点的隧道 (via rust-router IPC)
     try:
-        manager = PeerTunnelManager()
-        connect_success = manager.connect_node(node_tag)
+        connect_success, connect_message = _connect_peer_sync(node_tag)
         if not connect_success:
-            logging.warning(f"[bidirectional] 节点 '{node_tag}' 连接失败")
+            logging.warning(f"[bidirectional] 节点 '{node_tag}' 连接失败: {connect_message}")
             db.update_peer_node(node_tag, bidirectional_status="outbound_only")
             return False
         logging.info(f"[bidirectional] 节点 '{node_tag}' 出站隧道已建立")
@@ -13753,7 +13598,7 @@ def _validate_chain_terminal_egress_static(egress_tag: str):
         )
 
 
-def _validate_remote_terminal_egress(
+async def _validate_remote_terminal_egress(
     db,
     chain_hops: list,
     exit_egress: str,
@@ -13761,7 +13606,10 @@ def _validate_remote_terminal_egress(
 ) -> Optional[str]:
     """Phase 11-Fix.Q: 远程验证终端节点出口
 
-    通过隧道查询终端节点的出口列表，验证 exit_egress 存在且兼容 DSCP 路由。
+    通过 IPC 转发查询终端节点的出口列表，验证 exit_egress 存在且兼容 DSCP 路由。
+
+    Phase 11-Fix.R: 使用 IPC forward_peer_request 替代直接 HTTP 请求
+    这解决了 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题。
 
     Args:
         db: 数据库实例
@@ -13772,8 +13620,11 @@ def _validate_remote_terminal_egress(
     Returns:
         错误消息（如有），None 表示验证通过
     """
-    if not chain_hops or len(chain_hops) < 2:
-        return "Chain must have at least 2 hops"
+    import json
+
+    # Phase 11-Fix.B: 允许单跳链路
+    if not chain_hops or len(chain_hops) < 1:
+        return "Chain must have at least 1 hop"
 
     terminal_tag = chain_hops[-1]
 
@@ -13781,70 +13632,354 @@ def _validate_remote_terminal_egress(
     if exit_egress in INVALID_CHAIN_TERMINAL_EGRESS:
         return f"'{exit_egress}' cannot be used as chain terminal egress"
 
-    # 尝试通过隧道查询终端节点的出口列表
+    # Phase 11-Fix.R: 通过 IPC 转发查询终端节点的出口列表
     try:
-        from tunnel_api_client import TunnelAPIClientManager
-        client_mgr = TunnelAPIClientManager(db)
+        client = await _get_rust_router_client()
+        if not client:
+            return f"rust-router 不可用，无法验证终端节点 '{terminal_tag}' 的出口"
 
-        egress_list = []
+        # 获取终端节点信息
+        node = db.get_peer_node(terminal_tag)
+        if not node:
+            return f"Terminal node '{terminal_tag}' not found in database"
 
-        if allow_transitive and len(chain_hops) > 2:
-            # 传递模式：通过第一个中间节点转发查询
-            first_hop = chain_hops[0]
-            first_client = client_mgr.get_client(first_hop)
-            if first_client:
-                try:
-                    egress_list = first_client.get_forwarded_egress_list(terminal_tag)
-                except Exception as e:
-                    logging.warning(f"[validate-egress] 转发查询失败: {e}")
-        else:
-            # 直接模式：查询第一跳（如果第一跳就是终端，或使用直连）
-            # 优先尝试直接连接终端节点
-            terminal_client = client_mgr.get_client(terminal_tag)
-            if terminal_client:
-                try:
-                    egress_list = terminal_client.get_egress_list()
-                except Exception as e:
-                    logging.warning(f"[validate-egress] 直接查询失败: {e}")
+        if node.get("tunnel_status") != "connected":
+            return f"Terminal node '{terminal_tag}' is not connected"
 
-            # 如果直连失败，尝试通过第一跳转发
-            if not egress_list and len(chain_hops) > 1:
-                first_hop = chain_hops[0]
-                first_client = client_mgr.get_client(first_hop)
-                if first_client:
-                    try:
-                        egress_list = first_client.get_forwarded_egress_list(terminal_tag)
-                    except Exception as e:
-                        logging.warning(f"[validate-egress] 转发查询也失败: {e}")
+        # 获取本地节点 tag 用于 endpoint IP 认证
+        local_node_tag = _get_local_node_tag(db)
+
+        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        tunnel_ip = None
+        if tunnel_type == "xray":
+            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
+
+        # 通过 IPC 转发请求到终端节点
+        result = await client.forward_peer_request(
+            peer_tag=terminal_tag,
+            method="GET",
+            path="/api/peer-info/egress",
+            timeout_secs=30,
+            # Inline peer config from database
+            endpoint=node.get("endpoint"),
+            tunnel_type=tunnel_type,
+            api_port=node.get("api_port", 36000),
+            tunnel_ip=tunnel_ip,
+            # Pass local node tag for endpoint IP authentication
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "Unknown error")
+            status_code = result.get("status_code", 0)
+            logging.warning(
+                f"[validate-egress] IPC forward failed for {terminal_tag}: "
+                f"status={status_code}, error={error}"
+            )
+            return f"Cannot reach terminal node '{terminal_tag}' to validate egress: {error}"
+
+        # 解析响应
+        response_body = result.get("body", "{}")
+        try:
+            data = json.loads(response_body)
+        except json.JSONDecodeError as e:
+            logging.error(f"[validate-egress] 解析响应失败: {e}")
+            return f"Failed to parse egress list from terminal node '{terminal_tag}'"
+
+        egress_list = data.get("egress", [])
 
         if not egress_list:
-            # 无法连接终端节点 - 在激活时这是一个问题
-            return f"Cannot reach terminal node '{terminal_tag}' to validate egress"
+            # 终端节点没有可用出口
+            return f"Terminal node '{terminal_tag}' has no available egress"
 
         # 检查 exit_egress 是否存在于终端节点
-        egress_tags = [e.tag for e in egress_list]
+        egress_tags = [e.get("tag", "") for e in egress_list]
         if exit_egress not in egress_tags:
             return f"Egress '{exit_egress}' not found on terminal node '{terminal_tag}'"
 
         # 检查出口类型是否兼容 DSCP 路由
         for egress in egress_list:
-            if egress.tag == exit_egress:
-                if egress.type in ("v2ray", "socks"):
-                    return f"Egress '{exit_egress}' is SOCKS-based ({egress.type}), incompatible with DSCP routing"
+            if egress.get("tag") == exit_egress:
+                egress_type = egress.get("type", "unknown")
+                if egress_type in ("v2ray", "socks"):
+                    return f"Egress '{exit_egress}' is SOCKS-based ({egress_type}), incompatible with DSCP routing"
                 # Phase 11-Fix.Q: 使用 protocol 字段检测 WARP MASQUE
-                if egress.type == "warp" and egress.protocol == "masque":
+                if egress_type == "warp" and egress.get("protocol") == "masque":
                     return f"WARP MASQUE egress '{exit_egress}' is SOCKS-based, incompatible with DSCP routing"
                 break
 
         logging.info(f"[validate-egress] 终端出口验证通过: {exit_egress} on {terminal_tag}")
         return None  # 验证通过
 
-    except ImportError as e:
-        logging.error(f"[validate-egress] 无法导入 TunnelAPIClientManager: {e}")
-        return "Internal error: TunnelAPIClientManager unavailable"
     except Exception as e:
-        logging.error(f"[validate-egress] 验证失败: {e}")
+        logging.error(f"[validate-egress] 验证失败: {e}", exc_info=True)
         return f"Failed to validate egress on terminal node: {str(e)}"
+
+
+async def _ipc_ping_peer(db, node_tag: str) -> bool:
+    """Phase 11-Fix.R: 通过 IPC 转发 ping 对端节点
+
+    使用 /api/peer-info/egress 端点验证节点可达性，
+    因为该端点不需要认证且已存在。
+
+    Args:
+        db: 数据库实例
+        node_tag: 节点标识
+
+    Returns:
+        True 如果节点可达，False 否则
+    """
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            logging.warning(f"[ipc-ping] rust-router 不可用")
+            return False
+
+        node = db.get_peer_node(node_tag)
+        if not node:
+            logging.warning(f"[ipc-ping] 节点 '{node_tag}' 不存在")
+            return False
+
+        local_node_tag = _get_local_node_tag(db)
+
+        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        tunnel_ip = None
+        if tunnel_type == "xray":
+            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
+
+        # 使用 egress 端点验证可达性
+        result = await client.forward_peer_request(
+            peer_tag=node_tag,
+            method="GET",
+            path="/api/peer-info/egress",
+            timeout_secs=10,
+            endpoint=node.get("endpoint"),
+            tunnel_type=tunnel_type,
+            api_port=node.get("api_port", 36000),
+            tunnel_ip=tunnel_ip,
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        success = result.get("success", False)
+        if success:
+            logging.debug(f"[ipc-ping] {node_tag} 可达")
+        else:
+            logging.warning(f"[ipc-ping] {node_tag} 不可达: {result.get('error')}")
+        return success
+
+    except Exception as e:
+        logging.error(f"[ipc-ping] 异常: {e}")
+        return False
+
+
+async def _ipc_register_chain_route(
+    db,
+    node_tag: str,
+    chain_tag: str,
+    mark_value: int,
+    egress_tag: str,
+    mark_type: str = "dscp",
+    source_node: Optional[str] = None,
+    target_node: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Phase 11-Fix.R: 通过 IPC 转发注册链路路由
+
+    Args:
+        db: 数据库实例
+        node_tag: 目标节点标识
+        chain_tag: 链路标识
+        mark_value: DSCP 值
+        egress_tag: 出口标识
+        mark_type: 标记类型
+        source_node: 来源节点
+        target_node: 转发目标节点（传递模式）
+
+    Returns:
+        (success, error_message) 元组
+    """
+    import json
+
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return False, "rust-router 不可用"
+
+        node = db.get_peer_node(node_tag)
+        if not node:
+            return False, f"节点 '{node_tag}' 不存在"
+
+        local_node_tag = _get_local_node_tag(db)
+
+        # 构建请求体
+        data = {
+            "chain_tag": chain_tag,
+            "mark_value": mark_value,
+            "mark_type": mark_type,
+            "egress_tag": egress_tag,
+        }
+        if source_node:
+            data["source_node"] = source_node
+        if target_node:
+            data["target_node"] = target_node
+
+        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
+        # 因为 HTTP 请求无法通过 userspace WireGuard 隧道路由
+        # 对于 Xray peers，使用 tunnel_ip 通过 SOCKS5 代理
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        tunnel_ip = None
+        if tunnel_type == "xray":
+            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
+        
+        result = await client.forward_peer_request(
+            peer_tag=node_tag,
+            method="POST",
+            path="/api/chain-routing/register",
+            body=json.dumps(data),
+            timeout_secs=30,
+            endpoint=node.get("endpoint"),
+            tunnel_type=tunnel_type,
+            api_port=node.get("api_port", 36000),
+            tunnel_ip=tunnel_ip,
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        # 解析响应体 (无论成功或失败都可能有有用信息)
+        response_body = result.get("body", "{}")
+        status_code = result.get("status_code", 0)
+        
+        try:
+            resp_data = json.loads(response_body) if response_body else {}
+        except json.JSONDecodeError:
+            resp_data = {}
+
+        if not result.get("success"):
+            # 从响应体提取错误信息
+            error = (
+                result.get("error") or  # IPC 层错误
+                resp_data.get("detail") or  # FastAPI 错误格式
+                resp_data.get("message") or  # 自定义错误格式
+                f"HTTP {status_code}" if status_code else "Unknown error"
+            )
+            logging.warning(
+                f"[ipc-register] 注册失败 @ {node_tag}: {error} "
+                f"(status={status_code}, body={response_body[:200]})"
+            )
+            return False, error
+
+        if resp_data.get("success"):
+            logging.info(
+                f"[ipc-register] 注册成功: chain={chain_tag}, "
+                f"mark={mark_value}, egress={egress_tag} @ {node_tag}"
+            )
+            return True, None
+        else:
+            error = resp_data.get("message") or resp_data.get("detail") or "Unknown error"
+            return False, error
+
+    except Exception as e:
+        logging.error(f"[ipc-register] 异常: {e}", exc_info=True)
+        return False, str(e)
+
+
+async def _ipc_unregister_chain_route(
+    db,
+    node_tag: str,
+    chain_tag: str,
+    mark_value: int,
+    mark_type: str = "dscp",
+    source_node: Optional[str] = None,
+    target_node: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Phase 11-Fix.R: 通过 IPC 转发注销链路路由
+
+    Args:
+        db: 数据库实例
+        node_tag: 目标节点标识
+        chain_tag: 链路标识
+        mark_value: DSCP 值
+        mark_type: 标记类型
+        source_node: 来源节点
+        target_node: 转发目标节点（传递模式）
+
+    Returns:
+        (success, error_message) 元组
+    """
+    import json
+
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return False, "rust-router 不可用"
+
+        node = db.get_peer_node(node_tag)
+        if not node:
+            # 节点不存在时跳过注销（可能已删除）
+            logging.warning(f"[ipc-unregister] 节点 '{node_tag}' 不存在，跳过注销")
+            return True, None
+
+        local_node_tag = _get_local_node_tag(db)
+
+        # 构建请求体
+        data = {
+            "chain_tag": chain_tag,
+            "mark_value": mark_value,
+            "mark_type": mark_type,
+        }
+        if source_node:
+            data["source_node"] = source_node
+        if target_node:
+            data["target_node"] = target_node
+
+        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        tunnel_ip = None
+        if tunnel_type == "xray":
+            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
+
+        result = await client.forward_peer_request(
+            peer_tag=node_tag,
+            method="POST",
+            path="/api/chain-routing/unregister",
+            body=json.dumps(data),
+            timeout_secs=30,
+            endpoint=node.get("endpoint"),
+            tunnel_type=tunnel_type,
+            api_port=node.get("api_port", 36000),
+            tunnel_ip=tunnel_ip,
+            headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
+        )
+
+        # 解析响应体 (无论成功或失败都可能有有用信息)
+        response_body = result.get("body", "{}")
+        status_code = result.get("status_code", 0)
+        
+        try:
+            resp_data = json.loads(response_body) if response_body else {}
+        except json.JSONDecodeError:
+            resp_data = {}
+
+        if not result.get("success"):
+            # 从响应体提取错误信息
+            error = (
+                result.get("error") or  # IPC 层错误
+                resp_data.get("detail") or  # FastAPI 错误格式
+                resp_data.get("message") or  # 自定义错误格式
+                f"HTTP {status_code}" if status_code else "Unknown error"
+            )
+            logging.warning(
+                f"[ipc-unregister] 注销失败 @ {node_tag}: {error} "
+                f"(status={status_code}, body={response_body[:200]})"
+            )
+            return False, error
+
+        logging.info(f"[ipc-unregister] 注销成功: chain={chain_tag} @ {node_tag}")
+        return True, None
+
+    except Exception as e:
+        logging.error(f"[ipc-unregister] 异常: {e}", exc_info=True)
+        return False, str(e)
 
 
 def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = False):
@@ -13933,6 +14068,11 @@ def _validate_chain_terminal_egress(egress_tag: str, for_tunnel_api: bool = Fals
             if openvpn_egress:
                 return None  # OpenVPN 有效
 
+            # 检查是否为负载均衡/故障转移组
+            outbound_group = db.get_outbound_group(egress_tag) if hasattr(db, 'get_outbound_group') else None
+            if outbound_group:
+                return None  # 出口组有效
+
             # 没找到任何匹配的出口
             msg_en = f"Egress '{egress_tag}' not found in any egress table"
             msg_zh = f"出口 '{egress_tag}' 不存在"
@@ -13998,6 +14138,11 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
 
     # 验证隧道认证（WireGuard IP / Xray UUID）
     node = _verify_tunnel_header(request, db)
+    
+    # 回退到 X-Peer-Node-ID 头认证（支持 userspace WireGuard 模式）
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -14088,74 +14233,15 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
             f"mark={payload.mark_value} -> {payload.egress_tag}"
         )
 
-        # Step 2: 应用 iptables/ip 路由规则
-        try:
-            from chain_route_manager import get_chain_route_manager
-
-            chain_route_mgr = get_chain_route_manager(db)
-            route_applied = chain_route_mgr.add_route(
-                chain_tag=payload.chain_tag,
-                mark_value=payload.mark_value,
-                egress_tag=payload.egress_tag,
-                mark_type=payload.mark_type,
-                source_node=payload.source_node or node["tag"],
-            )
-
-            if not route_applied:
-                # iptables 失败，回滚 DB
-                logging.error(
-                    f"[tunnel-api] iptables 规则应用失败，回滚 DB: "
-                    f"chain={payload.chain_tag}, egress={payload.egress_tag}"
-                )
-                try:
-                    db.delete_chain_routing(
-                        chain_tag=payload.chain_tag,
-                        mark_value=payload.mark_value,
-                        mark_type=payload.mark_type,
-                    )
-                except Exception as rollback_err:
-                    logging.critical(
-                        f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
-                    )
-                return {
-                    "success": False,
-                    "message": f"Failed to apply iptables rules for egress '{payload.egress_tag}'"
-                }
-
-            logging.info(
-                f"[tunnel-api] 链路路由注册完成（DB + iptables）: "
-                f"chain={payload.chain_tag}, mark={payload.mark_value}"
-            )
-            return {"success": True, "message": "Chain route registered", "iptables_applied": True}
-
-        except ImportError as e:
-            # chain_route_manager 模块不可用，回滚 DB
-            logging.error(f"[tunnel-api] chain_route_manager 导入失败: {e}")
-            try:
-                db.delete_chain_routing(
-                    chain_tag=payload.chain_tag,
-                    mark_value=payload.mark_value,
-                    mark_type=payload.mark_type,
-                )
-            except Exception as rollback_err:
-                logging.critical(
-                    f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
-                )
-            return {"success": False, "message": "Chain route manager unavailable"}
-        except Exception as e:
-            # 其他异常，回滚 DB
-            logging.error(f"[tunnel-api] iptables 应用异常: {e}")
-            try:
-                db.delete_chain_routing(
-                    chain_tag=payload.chain_tag,
-                    mark_value=payload.mark_value,
-                    mark_type=payload.mark_type,
-                )
-            except Exception as rollback_err:
-                logging.critical(
-                    f"[tunnel-api] 回滚失败，数据可能不一致: {rollback_err}"
-                )
-            return {"success": False, "message": f"iptables error: {str(e)}"}
+        # Phase 12: 移除 iptables 规则应用 - rust-router 在用户空间处理 DSCP 路由
+        # rust-router 的 ChainManager 会根据 DSCP 值将流量路由到 exit_egress
+        # 参见 rust-router/src/ingress/processor.rs 第 297-313 行
+        logging.info(
+            f"[tunnel-api] 链路路由注册完成: "
+            f"chain={payload.chain_tag}, mark={payload.mark_value} "
+            f"(rust-router userspace DSCP routing)"
+        )
+        return {"success": True, "message": "Chain route registered"}
 
     except ValueError as e:
         logging.warning(f"[tunnel-api] 链路路由参数错误: {e}")
@@ -14222,8 +14308,13 @@ def api_chain_routing_unregister(
 
     db = _get_db()
 
-    # 验证隧道认证（WireGuard IP / Xray UUID）
+    # Phase 11-Fix.R: 支持多种认证方式
+    # 1. 隧道认证（WireGuard IP / Xray UUID）- 最安全
+    # 2. X-Peer-Node-ID header 认证 - 用于 IPC 转发的请求
     node = _verify_tunnel_header(request, db)
+    if not node:
+        # 尝试 X-Peer-Node-ID 认证（用于 userspace WireGuard 下的 IPC 转发）
+        node = _verify_peer_endpoint_auth(request, db)
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -14273,7 +14364,7 @@ def api_chain_routing_unregister(
             return {"success": False, "message": f"Forward failed: {e}"}
 
     try:
-        # Phase 11-Fix.I: 同时清理 DB 和 iptables 规则
+        # Phase 12: 移除 iptables 清理 - rust-router 在用户空间处理 DSCP 路由
         deleted = db.delete_chain_routing(
             chain_tag=chain_tag,
             mark_value=mark_value,
@@ -14281,40 +14372,12 @@ def api_chain_routing_unregister(
         )
         if deleted:
             logging.info(
-                f"[tunnel-api] 链路路由 DB 删除成功: chain={chain_tag}, "
-                f"mark={mark_value}"
+                f"[tunnel-api] 链路路由注销成功: chain={chain_tag}, "
+                f"mark={mark_value} (rust-router userspace DSCP routing)"
             )
-
-            # 清理 iptables 规则（最佳努力，不影响 DB 删除结果）
-            iptables_cleaned = False
-            try:
-                from chain_route_manager import get_chain_route_manager
-
-                chain_route_mgr = get_chain_route_manager(db)
-                iptables_cleaned = chain_route_mgr.remove_route(
-                    chain_tag=chain_tag,
-                    mark_value=mark_value,
-                    mark_type=mark_type,
-                )
-                if iptables_cleaned:
-                    logging.info(
-                        f"[tunnel-api] iptables 规则清理成功: chain={chain_tag}, "
-                        f"mark={mark_value}"
-                    )
-                else:
-                    logging.warning(
-                        f"[tunnel-api] iptables 规则不存在或清理失败: chain={chain_tag}, "
-                        f"mark={mark_value}"
-                    )
-            except ImportError:
-                logging.warning("[tunnel-api] chain_route_manager 不可用，跳过 iptables 清理")
-            except Exception as e:
-                logging.warning(f"[tunnel-api] iptables 清理异常: {e}")
-
             return {
                 "success": True,
                 "message": "Chain route unregistered",
-                "iptables_cleaned": iptables_cleaned
             }
         else:
             logging.warning(
@@ -14534,8 +14597,8 @@ def _validate_endpoint(endpoint: str) -> tuple:
 def _check_peer_tunnel_status(node: dict) -> str:
     """检查对等节点隧道的实时状态
 
-    对于 WireGuard 隧道：检查接口是否存在以及最后握手时间
-    对于 Xray 隧道：检查 SOCKS 端口是否响应
+    Phase 12: WireGuard 隧道状态由数据库管理，无内核接口检查。
+    对于 Xray 隧道：检查 SOCKS 端口是否响应。
 
     Args:
         node: 节点信息字典
@@ -14543,64 +14606,19 @@ def _check_peer_tunnel_status(node: dict) -> str:
     Returns:
         实时状态: "connected", "disconnected", "stale"
     """
-    import time
-
     db_status = node.get("tunnel_status", "disconnected")
     tunnel_type = node.get("tunnel_type", "wireguard")
-    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
 
     # 如果数据库状态不是已连接，直接返回
     if db_status != "connected":
         return db_status
 
-    if userspace_wg and tunnel_type == "wireguard":
+    # Phase 12: WireGuard 隧道在用户空间模式下由 rust-router 管理
+    # 状态信息存储在数据库中，无需检查内核接口
+    if tunnel_type == "wireguard":
         return db_status
 
-    if tunnel_type == "wireguard":
-        tunnel_interface = node.get("tunnel_interface")
-        if not tunnel_interface:
-            return "disconnected"
-
-        try:
-            # 检查接口是否存在
-            result = subprocess.run(
-                ["ip", "link", "show", tunnel_interface],
-                capture_output=True, timeout=5
-            )
-            if result.returncode != 0:
-                return "disconnected"
-
-            # 检查最后握手时间
-            result = subprocess.run(
-                ["wg", "show", tunnel_interface, "latest-handshakes"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode != 0:
-                return "disconnected"
-
-            # 解析握手时间
-            output = result.stdout.strip()
-            if output:
-                parts = output.split()
-                if len(parts) >= 2:
-                    try:
-                        last_handshake = int(parts[1])
-                        # 如果握手时间为0，说明接口已创建但尚未完成握手
-                        # 这是正常的"正在连接"状态，不应该标记为断开
-                        if last_handshake == 0:
-                            return "connecting"  # 接口已创建，等待握手
-                        elapsed = int(time.time()) - last_handshake
-                        if elapsed > 180:
-                            return "stale"  # 握手超时
-                    except ValueError:
-                        pass
-
-            return "connected"
-        except (subprocess.TimeoutExpired, Exception) as e:
-            logging.warning(f"[peers] 检查 WireGuard 隧道状态失败: {e}")
-            return db_status  # 检查失败时返回数据库状态
-
-    elif tunnel_type == "xray":
+    if tunnel_type == "xray":
         xray_socks_port = node.get("xray_socks_port")
         if not xray_socks_port:
             return "disconnected"
@@ -15047,13 +15065,10 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
         except Exception as e:
             logging.warning(f"[peers] 级联通知目标节点失败: {e}")
 
-    # 清理 WireGuard/Xray 隧道接口
-    # Phase 11-Fix: 根据模式选择清理方式
-    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
+    # Phase 12: 清理 WireGuard 隧道通过 rust-router IPC
     tunnel_type = node.get("tunnel_type", "wireguard")
     
-    if userspace_wg and tunnel_type == "wireguard":
-        # Userspace WG 模式：通过 rust-router IPC 删除 peer
+    if tunnel_type == "wireguard":
         try:
             from rust_router_client import RustRouterClient
             client = RustRouterClient()
@@ -15065,27 +15080,14 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
             if response.success:
                 logging.info(f"[peers] rust-router peer 已删除: {tag}")
             else:
-                # "Peer not found" is expected if peer was already cleaned up
                 if "not found" in (response.error or "").lower():
                     logging.debug(f"[peers] rust-router peer 已不存在 (可能已清理): {tag}")
                 else:
                     logging.warning(f"[peers] rust-router 删除 peer 失败: {response.error}")
         except HTTPException:
-            # HTTPException from _run_async_ipc timeout - don't propagate for deletion
             logging.warning(f"[peers] rust-router IPC 超时，继续删除数据库记录: {tag}")
         except Exception as e:
-            # rust-router 可能不可用或 peer 不存在，继续删除数据库记录
             logging.warning(f"[peers] rust-router IPC 删除失败: {e}")
-    else:
-        # 内核模式：通过 PeerTunnelManager 清理接口
-        try:
-            from peer_tunnel_manager import PeerTunnelManager
-            manager = PeerTunnelManager()
-            manager.disconnect_node(tag)
-            logging.info(f"[peers] 删除前清理隧道接口: {tag}")
-        except Exception as e:
-            # 接口可能不存在，忽略错误继续删除
-            logging.debug(f"[peers] 清理隧道接口: {e}")
 
     # 删除数据库记录
     success = db.delete_peer_node(tag)
@@ -15190,10 +15192,8 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
     pairing_id = None  # Phase 6 Issue 30: 用于错误时清理 pending_pairing
 
     try:
-        # Phase 11-Fix.AC: Check userspace WG mode - route to IPC
-        userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
-
-        if userspace_wg and payload.tunnel_type == "wireguard":
+        # Phase 12: WireGuard 隧道通过 rust-router IPC 处理
+        if payload.tunnel_type == "wireguard":
             # Auto-allocate port if not specified (port == 0)
             ipc_endpoint = endpoint
             if port == 0:
@@ -15201,7 +15201,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
                 ipc_endpoint = f"{host}:{allocated_port}"
                 logging.info(f"[pairing] IPC 自动分配隧道端口: {allocated_port}")
 
-            # Use rust-router IPC for pairing in userspace WG mode
+            # Use rust-router IPC for pairing
             success, code_or_error, peer_tag, pending_data = _run_async_ipc(
                 _generate_pair_request_via_ipc(
                     node_tag=payload.node_tag,
@@ -15231,7 +15231,7 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
                 pending_request=pending_request
             )
 
-        # Existing kernel WireGuard code path continues below...
+        # Xray tunnel code path continues below...
         # Step 1: 分配隧道 IP 和端口（需要在生成配对码之前，以便包含在配对码中）
         # Phase 11-Fix.C: 使用确定性分配以避免多节点场景下的冲突
         local_ip = None
@@ -15447,11 +15447,9 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             created_node_tag=None
         )
 
-    # Phase 11-Fix.AC: Check userspace WG mode - route to IPC for WireGuard only
-    # Xray tunnels always use kernel code path
-    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
-
-    if userspace_wg and request_obj.tunnel_type == "wireguard":
+    # Phase 11-Fix.AC: WireGuard tunnels use rust-router IPC (userspace mode)
+    # Xray tunnels use the kernel code path below
+    if request_obj.tunnel_type == "wireguard":
         # Auto-allocate port if not specified (local_listen_port == 0)
         ipc_endpoint = endpoint
         if local_listen_port == 0:
@@ -15510,8 +15508,8 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             bidirectional=bidirectional
         )
 
-    # Existing kernel WireGuard / Xray code path continues below...
-    # (validation already done above at the start of the function)
+    # Xray tunnel code path (WireGuard tunnels handled above via IPC)
+    # Uses PairingManager for Xray/VLESS tunnels which don't use rust-router
 
     # 检查是否已存在同名节点
     remote_node_tag = request_obj.node_tag
@@ -15524,185 +15522,34 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             created_node_tag=None
         )
 
-    # Step 2: 判断使用隧道优先还是旧流程
-    is_tunnel_first = (
-        request_obj.tunnel_type == "wireguard" and
-        request_obj.bidirectional and
-        request_obj.remote_wg_private_key and
-        request_obj.remote_wg_public_key and
-        HAS_PENDING_TUNNEL
-    )
-
-    if not is_tunnel_first:
-        # 回退到旧流程（使用响应码）
-        logging.info(f"[pairing] 使用旧流程（响应码模式）: 缺少预生成密钥或非 WireGuard")
-        manager = PairingManager(db)
-        try:
-            # Phase 11-Fix.K: 传递 api_port
-            # PSK 已废弃，使用隧道 IP/UUID 认证
-            success, message, response_code = manager.import_pair_request(
-                code=payload.code,
-                local_node_tag=payload.local_node_tag,
-                local_node_description=payload.local_node_description,
-                local_endpoint=endpoint,
-                api_port=payload.api_port,
-            )
-            if not success:
-                return ImportPairRequestResponse(
-                    success=False,
-                    message=message,
-                    response_code=None,
-                    created_node_tag=None
-                )
-            return ImportPairRequestResponse(
-                success=True,
-                message=message,
-                response_code=response_code,
-                created_node_tag=remote_node_tag,
-                bidirectional=False
-            )
-        except Exception as e:
-            logging.error(f"[pairing] 旧流程导入失败: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to import pairing request: {e}")
-
-    # ===== 隧道优先流程 =====
-    logging.info(f"[pairing] 使用隧道优先流程: remote_node={remote_node_tag}")
-
-    interface_name = None
+    # Xray pairing flow (response code mode)
+    logging.info(f"[pairing] 使用 Xray 配对流程: tunnel_type={request_obj.tunnel_type}")
+    manager = PairingManager(db)
     try:
-        # Issue 7 Fix: 使用自动分配的端口，避免与保留端口冲突
-        # 用户指定的 endpoint 端口可能是 36100 等保留端口
-        allocated_listen_port = _allocate_peer_tunnel_port(db)
-        if local_listen_port in RESERVED_PORTS:
-            logging.warning(f"[pairing] 用户指定端口 {local_listen_port} 是保留端口 ({RESERVED_PORTS[local_listen_port]})，使用分配端口 {allocated_listen_port}")
-        local_listen_port = allocated_listen_port
-        # 更新 endpoint 以使用正确的端口
-        endpoint = f"{host}:{local_listen_port}"
-
-        # Step 3: 计算 pairing_id（与 generate-pair-request 相同的算法）
-        # Phase 11-Fix.C: 使用完整 code 计算（与生成端保持一致）
-        pairing_id = hashlib.md5(payload.code.encode()).hexdigest()
-
-        # Step 4: 获取隧道 IP（从配对码中）
-        # 注意：我们是 Node B，使用配对码中的 remote_wg_* 作为自己的密钥
-        # IP 分配：A 的 tunnel_local_ip 是 A 的 IP，A 的 tunnel_remote_ip 是给 B 预分配的 IP
-        # 所以对于 B：local_ip = A 的 tunnel_remote_ip，remote_ip = A 的 tunnel_local_ip
-        if request_obj.tunnel_local_ip and request_obj.tunnel_remote_ip:
-            # 使用配对码中的 IP（交换 local/remote）
-            local_ip = request_obj.tunnel_remote_ip  # B 使用 A 预分配的 IP
-            remote_ip = request_obj.tunnel_local_ip  # A 的 IP
-            logging.info(f"[pairing] 使用配对码中的隧道 IP: local={local_ip}, remote={remote_ip}")
-        else:
-            # 回退：使用确定性分配
-            logging.warning("[pairing] 配对码中没有隧道 IP，使用确定性分配")
-            subnet_idx, _, _ = _get_next_peer_tunnel_subnet(db, payload.local_node_tag, remote_node_tag)
-            local_ip = f"10.200.200.{subnet_idx * 4 + 2}"  # B 使用 .2
-            remote_ip = f"10.200.200.{subnet_idx * 4 + 1}"  # A 使用 .1
-
-        # Step 5: 创建 WireGuard 接口并连接
-        interface_name = get_interface_name(remote_node_tag, "wireguard")
-
-        # 使用预生成的密钥
-        local_private_key = request_obj.remote_wg_private_key
-        local_public_key = request_obj.remote_wg_public_key
-        peer_public_key = request_obj.wg_public_key  # A 的公钥
-
-        success, error = create_wireguard_tunnel_with_endpoint(
-            interface_name=interface_name,
-            local_ip=local_ip,
-            remote_ip=remote_ip,
-            listen_port=local_listen_port,
-            private_key=local_private_key,
-            peer_public_key=peer_public_key,
-            remote_endpoint=request_obj.endpoint,  # A 的端点
-        )
-
-        if not success:
-            raise ValueError(f"Failed to create WireGuard tunnel: {error}")
-
-        logging.info(f"[pairing] WireGuard 接口已创建: {interface_name}")
-
-        # Step 6: 等待握手完成
-        if not wait_for_wireguard_handshake(interface_name, timeout_seconds=15):
-            raise ValueError("WireGuard handshake timeout - remote endpoint may not be listening")
-
-        logging.info(f"[pairing] WireGuard 握手成功，开始隧道握手")
-
-        # Step 7: 通过隧道调用对方的 complete-handshake API
-        from tunnel_api_client import TunnelAPIClient
-
-        # Phase 11-Fix.K: 隧道 API 端点使用正确的 api_port
-        remote_api_port = request_obj.api_port or DEFAULT_WEB_PORT
-        tunnel_api_endpoint = f"{remote_ip}:{remote_api_port}"
-
-        client = TunnelAPIClient(
-            node_tag=remote_node_tag,
-            tunnel_endpoint=tunnel_api_endpoint,
-            tunnel_type="wireguard",
-        )
-
-        # Phase 11-Fix.K: 传递本节点 API 端口
-        handshake_result = client.request_complete_handshake(
-            pairing_id=pairing_id,
+        success, message, response_code = manager.import_pair_request(
+            code=payload.code,
             local_node_tag=payload.local_node_tag,
             local_node_description=payload.local_node_description,
             local_endpoint=endpoint,
-            local_tunnel_ip=local_ip,
-            wg_public_key=local_public_key,
-            api_port=payload.api_port,  # Phase 11-Fix.K
+            api_port=payload.api_port,
         )
-
-        if not handshake_result.get("success"):
-            raise ValueError(f"Handshake failed: {handshake_result.get('message', 'Unknown error')}")
-
-        logging.info(f"[pairing] 隧道握手完成")
-
-        # Step 8: 创建本地 peer_node
-        # Phase 11-Fix.K: 保存 api_port 到数据库
-        db.add_peer_node(
-            tag=remote_node_tag,
-            name=remote_node_tag,
-            description=request_obj.node_description or f"Paired from {request_obj.endpoint}",
-            endpoint=request_obj.endpoint,
-            api_port=request_obj.api_port,  # Phase 11-Fix.K: 保存 API 端口
-            tunnel_type="wireguard",
-            tunnel_status="connected",
-            tunnel_interface=interface_name,
-            tunnel_local_ip=local_ip,
-            tunnel_remote_ip=remote_ip,
-            tunnel_port=local_listen_port,
-            wg_private_key=local_private_key,
-            wg_public_key=local_public_key,
-            wg_peer_public_key=peer_public_key,
-            tunnel_api_endpoint=tunnel_api_endpoint,
-            bidirectional_status="bidirectional",
-        )
-
-        logging.info(f"[pairing] 隧道优先配对完成: {remote_node_tag}")
-
+        if not success:
+            return ImportPairRequestResponse(
+                success=False,
+                message=message,
+                response_code=None,
+                created_node_tag=None
+            )
         return ImportPairRequestResponse(
             success=True,
-            message="Pairing completed via tunnel",
-            response_code=None,  # 隧道优先模式不需要响应码
+            message=message,
+            response_code=response_code,
             created_node_tag=remote_node_tag,
-            tunnel_status="connected",
-            bidirectional=True
+            bidirectional=False
         )
-
     except Exception as e:
-        # 清理接口
-        if interface_name:
-            try:
-                subprocess.run(["ip", "link", "delete", interface_name], check=False, timeout=10)
-            except Exception:
-                pass
-        logging.error(f"[pairing] 隧道优先配对失败: {e}")
-        return ImportPairRequestResponse(
-            success=False,
-            message=str(e),
-            response_code=None,
-            created_node_tag=None
-        )
+        logging.error(f"[pairing] Xray 配对流程失败: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to import pairing request: {e}")
 
 
 @app.post("/api/peer/complete-pairing", response_model=CompletePairingResponse)
@@ -15724,13 +15571,11 @@ def api_complete_pairing(payload: CompletePairingRequest):
 
     db = _get_db()
 
-    # Phase 11-Fix.AC: Check userspace WG mode - route to IPC
-    userspace_wg = os.environ.get("USERSPACE_WG", "true").lower() == "true"
-
-    # Check tunnel_type from pending_request to decide routing
+    # Phase 11-Fix.AC: WireGuard tunnels use rust-router IPC (userspace mode)
+    # Xray tunnels use the kernel code path below
     tunnel_type = payload.pending_request.get("tunnel_type", "wireguard")
 
-    if userspace_wg and tunnel_type == "wireguard":
+    if tunnel_type == "wireguard":
         # Use rust-router IPC for completing pairing in userspace WG mode
         success, message_or_error, peer_tag = _run_async_ipc(
             _complete_handshake_via_ipc(payload.code)
@@ -15848,25 +15693,12 @@ def api_get_peer_status(tag: str):
         "enabled": bool(node.get("enabled", 1)),
     }
 
-    # 如果是 WireGuard 隧道，尝试获取接口状态
-    if node.get("tunnel_type") == "wireguard" and node.get("tunnel_interface"):
-        try:
-            result = subprocess.run(
-                ["wg", "show", node["tunnel_interface"]],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                status["wg_status"] = "up"
-                # 解析最后握手时间
-                for line in result.stdout.split("\n"):
-                    if "latest handshake" in line.lower():
-                        status["last_handshake"] = line.split(":", 1)[1].strip()
-            else:
-                status["wg_status"] = "down"
-        except subprocess.TimeoutExpired:
-            status["wg_status"] = "timeout"
-        except Exception as e:
-            status["wg_status"] = f"error: {e}"
+    # WireGuard tunnels are managed by rust-router (userspace mode)
+    # Use /api/egress/wg/interface/{tag} for detailed live status
+    # Here we just return the database status
+    if node.get("tunnel_type") == "wireguard":
+        status["wg_status"] = "userspace"  # Indicates userspace mode
+        status["note"] = "Use /api/egress/wg/interface/{tag} for live tunnel status"
 
     return status
 
@@ -16094,12 +15926,9 @@ def api_peer_connect(tag: str):
         logging.info(f"[peers] 节点 '{tag}' 需要参数交换，自动执行...")
         node = _do_peer_exchange(db, node)
 
-    # 调用隧道管理器连接
+    # 调用隧道管理器连接 (via rust-router IPC)
     try:
-        # 导入并使用 peer_tunnel_manager
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.connect_node(tag)
+        success, connect_message = _connect_peer_sync(tag)
 
         if success:
             # 重新获取更新后的节点信息
@@ -16180,11 +16009,9 @@ def api_peer_disconnect(tag: str):
         except Exception as e:
             logging.warning(f"[peers] 通知远程节点断开失败: {e}")
 
-    # 调用隧道管理器断开本地隧道
+    # 调用隧道管理器断开本地隧道 (via rust-router IPC)
     try:
-        from peer_tunnel_manager import PeerTunnelManager
-        manager = PeerTunnelManager()
-        success = manager.disconnect_node(tag)
+        success, disconnect_message = _disconnect_peer_sync(tag)
 
         if success:
             # Phase 11-Fix.V.5: 使客户端缓存失效
@@ -16567,9 +16394,10 @@ def api_create_chain(payload: NodeChainCreateRequest):
         raise HTTPException(status_code=400, detail=f"链路标识 '{payload.tag}' 已存在")
 
     # Issue 27 修复：验证 hops 列表
+    # Phase 11-Fix.B: 允许单跳链路（用于指定远程出口）
     if payload.hops is not None:
-        if len(payload.hops) < 2:
-            raise HTTPException(status_code=400, detail="链路至少需要 2 个节点")
+        if len(payload.hops) < 1:
+            raise HTTPException(status_code=400, detail="链路至少需要 1 个节点")
         if len(payload.hops) != len(set(payload.hops)):
             raise HTTPException(status_code=400, detail="链路包含重复节点（循环）")
 
@@ -16682,8 +16510,9 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
         update_kwargs["description"] = payload.description
     if payload.hops is not None:
         # Issue 27 修复：验证 hops 列表
-        if len(payload.hops) < 2:
-            raise HTTPException(status_code=400, detail="链路至少需要 2 个节点")
+        # Phase 11-Fix.B: 允许单跳链路
+        if len(payload.hops) < 1:
+            raise HTTPException(status_code=400, detail="链路至少需要 1 个节点")
         if len(payload.hops) != len(set(payload.hops)):
             raise HTTPException(status_code=400, detail="链路包含重复节点（循环）")
 
@@ -16989,8 +16818,13 @@ def api_validate_chain_hops(request: Request, payload: ChainHopsValidateRequest)
 
     db = _get_db()
 
-    # Phase 11-Fix.C 安全修复: 验证 PSK 认证
+    # Phase 11-Fix.R: 支持多种认证方式
+    # 1. 隧道认证（WireGuard IP / Xray UUID）- 最安全
+    # 2. X-Peer-Node-ID header 认证 - 用于 IPC 转发的请求
     node = _verify_tunnel_header(request, db)
+    if not node:
+        # 尝试 X-Peer-Node-ID 认证（用于 userspace WireGuard 下的 IPC 转发）
+        node = _verify_peer_endpoint_auth(request, db)
     if not node:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
@@ -18118,7 +17952,7 @@ def api_peer_forward_egress(request: Request, target_tag: str) -> dict:
 
 
 @app.post("/api/chains/{tag}/activate")
-def api_activate_chain(tag: str):
+async def api_activate_chain(tag: str):
     """激活链路
 
     1. 验证链路配置完整（exit_egress、dscp_value）
@@ -18128,6 +17962,7 @@ def api_activate_chain(tag: str):
     5. 重新生成 sing-box 配置
 
     Phase 6 Issue 29: 使用 try/finally 确保状态转换原子性
+    Phase 11-Fix.R: 改为 async 以支持 IPC 转发验证终端出口
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -18180,22 +18015,25 @@ def api_activate_chain(tag: str):
     if not success:
         if "Expected state" in (error or ""):
             # 状态不匹配 - 可能是并发请求或已激活
+            # Phase 11-Fix.R: 修复字符串匹配顺序，避免 "inactive" 匹配 "active"
             if "activating" in (error or ""):
                 raise HTTPException(
                     status_code=409,
                     detail="链路正在激活中，请稍后再试"
                 )
-            elif "active" in (error or ""):
+            elif "found: error" in (error or "") or ", error" in (error or ""):
+                # 先检查 "error" 状态（避免被 "inactive" 中的 "active" 误匹配）
+                raise HTTPException(
+                    status_code=400,
+                    detail="链路处于错误状态，请先停用后再激活"
+                )
+            elif "found: active" in (error or "") or ", active" in (error or ""):
+                # 检查确切的 "active" 状态
                 return {
                     "message": "链路已处于激活状态",
                     "chain": tag,
                     "chain_state": "active"
                 }
-            elif "error" in (error or ""):
-                raise HTTPException(
-                    status_code=400,
-                    detail="链路处于错误状态，请先重置后再激活"
-                )
         # 其他错误（数据库错误、链路不存在等）
         raise HTTPException(
             status_code=500,
@@ -18215,9 +18053,10 @@ def api_activate_chain(tag: str):
         # 终端节点是最后一跳
         terminal_tag = hops[-1]
 
-        # Phase 11-Fix.Q: 远程验证终端节点出口存在且兼容 DSCP 路由
+        # Phase 11-Fix.Q + R: 远程验证终端节点出口存在且兼容 DSCP 路由
+        # 使用 IPC 转发解决 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题
         allow_transitive = chain.get("allow_transitive", False)
-        egress_error = _validate_remote_terminal_egress(db, hops, exit_egress, allow_transitive)
+        egress_error = await _validate_remote_terminal_egress(db, hops, exit_egress, allow_transitive)
         if egress_error:
             raise HTTPException(
                 status_code=400,
@@ -18245,83 +18084,59 @@ def api_activate_chain(tag: str):
                         detail=f"中继节点 '{relay_tag}' 隧道未连接，请先建立连接"
                     )
 
-        # 获取本地节点 ID（用于 source_node）
-        local_node_id = _get_local_node_id()
+        # Phase 11-Fix.R: 使用本地节点 tag（与 X-Peer-Node-ID header 一致）
+        local_node_id = _get_local_node_tag(db)
 
-        # 在终端节点注册链路路由
+        # Phase 11-Fix.R: 使用 IPC 转发注册链路路由
+        # 这解决了 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题
         from tunnel_api_client import TunnelAPIClientManager, TunnelProxyError
 
-        # Phase 11-Fix.E: 支持传递模式（线性拓扑 A→B→C，A 只知道 B）
-        # allow_transitive 已在上面预检查中定义
         terminal_node = db.get_peer_node(terminal_tag)
-        client_mgr = TunnelAPIClientManager(db)
-        client = None
-        via_relay = None  # 标记是否通过中继到达
+        client_mgr = TunnelAPIClientManager(db)  # 仍需要用于中继路由的 2PC
 
-        if terminal_node:
-            # 直接连接模式：终端节点在本地数据库中
-            if terminal_node.get("tunnel_status") != "connected":
+        if not terminal_node:
+            if allow_transitive:
+                # 传递模式暂不支持 IPC 转发
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"终端节点 '{terminal_tag}' 隧道未连接"
+                    status_code=501,
+                    detail=f"传递模式尚未支持 IPC 转发，请确保终端节点 '{terminal_tag}' 在本地数据库中"
                 )
-            client = client_mgr.get_client(terminal_tag)
-        elif allow_transitive:
-            # 传递模式：通过第一跳到达终端节点
-            logging.info(f"[chains] 使用传递模式激活链路 '{tag}'")
-            terminal_info, relay_client, _ = _get_terminal_node_through_tunnel(db, hops)
-
-            if not terminal_info:
+            else:
                 raise HTTPException(
-                    status_code=503,
-                    detail=f"无法通过中继到达终端节点 '{terminal_tag}'（传递模式失败）"
+                    status_code=404,
+                    detail=f"终端节点 '{terminal_tag}' 不存在"
                 )
 
-            via_relay = terminal_info.get("via_relay")
-            client = relay_client
-            logging.info(f"[chains] 传递模式激活: 通过 '{via_relay}' 代理链路注册")
-        else:
-            # 非传递模式且终端节点不存在
-            raise HTTPException(
-                status_code=404,
-                detail=f"终端节点 '{terminal_tag}' 不存在（启用 allow_transitive 可支持线性拓扑）"
-            )
-
-        if not client:
+        if terminal_node.get("tunnel_status") != "connected":
             raise HTTPException(
                 status_code=400,
-                detail=f"终端节点 '{terminal_tag}' 配置不完整或隧道未就绪"
+                detail=f"终端节点 '{terminal_tag}' 隧道未连接"
             )
 
-        # 验证连通性（直接连接或通过中继）
-        target_desc = f"中继节点 '{via_relay}'" if via_relay else f"终端节点 '{terminal_tag}'"
-        logging.info(f"[chains] 验证 {target_desc} 连通性...")
-        if not client.ping():
-            if terminal_node:
-                client_mgr.invalidate_client(terminal_tag)
+        # Phase 11-Fix.R: 使用 IPC 验证连通性
+        logging.info(f"[chains] 验证终端节点 '{terminal_tag}' 连通性 (IPC)...")
+        if not await _ipc_ping_peer(db, terminal_tag):
             raise HTTPException(
                 status_code=503,
-                detail=f"无法连接到 {target_desc} API，请检查隧道连接状态"
+                detail=f"无法连接到终端节点 '{terminal_tag}' API，请检查隧道连接状态"
             )
-        logging.info(f"[chains] {target_desc} 连通性验证成功")
+        logging.info(f"[chains] 终端节点 '{terminal_tag}' 连通性验证成功")
 
-        # 注册链路路由
-        # Phase 11-Fix.E: 传递模式下，通过中继转发注册到终端节点
-        success = client.register_chain_route(
+        # Phase 11-Fix.R: 使用 IPC 注册链路路由
+        success, error = await _ipc_register_chain_route(
+            db=db,
+            node_tag=terminal_tag,
             chain_tag=tag,
             mark_value=dscp_value,
             egress_tag=exit_egress,
             mark_type=chain_mark_type,
             source_node=local_node_id,
-            target_node=terminal_tag if via_relay else None,  # 传递模式需要转发
         )
 
         if not success:
-            # Phase 10.3: 注册失败也清理客户端缓存，确保下次重试使用新连接
-            client_mgr.invalidate_client(terminal_tag)
             raise HTTPException(
                 status_code=500,
-                detail="在终端节点注册链路路由失败"
+                detail=f"在终端节点注册链路路由失败: {error}"
             )
 
         # Phase 11.4 + Phase 11-Fix.T: 使用 2PC 模式在中间节点注册中继路由
@@ -18401,14 +18216,14 @@ def api_activate_chain(tag: str):
 
                     # 回滚已注册的终端路由
                     try:
-                        if client:
-                            client.unregister_chain_route(
-                                chain_tag=tag,
-                                mark_value=dscp_value,
-                                mark_type=chain_mark_type,
-                                target_node=terminal_tag if via_relay else None,
-                                source_node=local_node_id,  # Phase 11-Fix.V.3
-                            )
+                        await _ipc_unregister_chain_route(
+                            db=db,
+                            node_tag=terminal_tag,
+                            chain_tag=tag,
+                            mark_value=dscp_value,
+                            mark_type=chain_mark_type,
+                            source_node=local_node_id,
+                        )
                     except Exception as rollback_err:
                         logging.warning(f"[chains-2pc] 回滚终端路由时出错: {rollback_err}")
 
@@ -18457,14 +18272,14 @@ def api_activate_chain(tag: str):
 
                 # 回滚: 注销终端和已成功的中继路由
                 try:
-                    if client:
-                        client.unregister_chain_route(
-                            chain_tag=tag,
-                            mark_value=dscp_value,
-                            mark_type=chain_mark_type,
-                            target_node=terminal_tag if via_relay else None,
-                            source_node=local_node_id,  # Phase 11-Fix.V.3
-                        )
+                    await _ipc_unregister_chain_route(
+                        db=db,
+                        node_tag=terminal_tag,
+                        chain_tag=tag,
+                        mark_value=dscp_value,
+                        mark_type=chain_mark_type,
+                        source_node=local_node_id,
+                    )
                     for relay_result in relay_results:
                         if relay_result.get("success"):
                             relay_tag = relay_result["node"]
@@ -18472,7 +18287,7 @@ def api_activate_chain(tag: str):
                             if relay_client:
                                 relay_client.unregister_relay_route(
                                     chain_tag=tag,
-                                    source_node=local_node_id,  # Phase 11-Fix.V.3
+                                    source_node=local_node_id,
                                 )
                 except Exception as rollback_err:
                     logging.warning(f"[chains] 回滚中继路由时出错: {rollback_err}")
@@ -18482,87 +18297,14 @@ def api_activate_chain(tag: str):
                     detail=f"中继节点配置失败: {', '.join(failed_nodes)}"
                 )
 
-        # Phase 4 Issue 3 修复: 设置入口节点 DSCP 规则
-        # sing-box 使用 routing_mark 标记流量，iptables 将 mark 转换为 DSCP
-        # Phase 3: DSCP manager 不可用时必须失败（不再仅警告）
-        if not HAS_DSCP_MANAGER:
-            logging.error(f"[chains] DSCP manager unavailable - cannot activate chain '{tag}'")
-            db.update_node_chain(tag, chain_state="error", last_error="DSCP manager unavailable")
-            raise HTTPException(
-                status_code=503,
-                detail="DSCP manager unavailable - chain activation requires DSCP support"
-            )
-
-        dscp_mgr = get_dscp_manager()
+        # Phase 12: 移除 iptables DSCP 规则 - rust-router 在用户空间处理 DSCP 标记
+        # rust-router 的 forwarder.rs 在转发数据包时会设置 DSCP 值
+        # 参见 rust-router/src/ingress/forwarder.rs 第 1697-1704 行
         routing_mark = ENTRY_ROUTING_MARK_BASE + dscp_value
-
-        if not dscp_mgr.setup_entry_rules(tag, routing_mark, dscp_value):
-            # 回滚: 注销终端和中继路由
-            logging.error(f"[chains] 设置入口 DSCP 规则失败，回滚链路 '{tag}'")
-            try:
-                if client:
-                    client.unregister_chain_route(
-                        chain_tag=tag,
-                        mark_value=dscp_value,
-                        mark_type=chain_mark_type,
-                        target_node=terminal_tag if via_relay else None,
-                        source_node=local_node_id,  # Phase 11-Fix.V.3
-                    )
-                # 注销中继路由
-                for relay_result in relay_results:
-                    if relay_result.get("success"):
-                        relay_tag = relay_result["node"]
-                        relay_client = client_mgr.get_client(relay_tag)
-                        if relay_client:
-                            relay_client.unregister_relay_route(
-                                chain_tag=tag,
-                                source_node=local_node_id,  # Phase 11-Fix.V.3
-                            )
-            except Exception as rollback_err:
-                logging.warning(f"[chains] 回滚链路路由时出错: {rollback_err}")
-
-            db.update_node_chain(tag, chain_state="error", last_error="Entry DSCP rules setup failed")
-            raise HTTPException(
-                status_code=500,
-                detail="设置入口 DSCP 规则失败"
-            )
-
-        # Phase 3: 验证 DSCP 规则是否实际生效
-        if not dscp_mgr.verify_entry_rules(tag, routing_mark, dscp_value):
-            logging.error(f"[chains] Entry DSCP rules verification failed for '{tag}'")
-            # 清理可能部分应用的规则
-            dscp_mgr.cleanup_entry_rules(tag, routing_mark, dscp_value)
-            # 回滚终端和中继路由
-            try:
-                if client:
-                    client.unregister_chain_route(
-                        chain_tag=tag,
-                        mark_value=dscp_value,
-                        mark_type=chain_mark_type,
-                        target_node=terminal_tag if via_relay else None,
-                        source_node=local_node_id,  # Phase 11-Fix.V.3
-                    )
-                for relay_result in relay_results:
-                    if relay_result.get("success"):
-                        relay_tag = relay_result["node"]
-                        relay_client = client_mgr.get_client(relay_tag)
-                        if relay_client:
-                            relay_client.unregister_relay_route(
-                                chain_tag=tag,
-                                source_node=local_node_id,  # Phase 11-Fix.V.3
-                            )
-            except Exception as rollback_err:
-                logging.warning(f"[chains] 回滚链路路由时出错: {rollback_err}")
-
-            db.update_node_chain(tag, chain_state="error", last_error="DSCP rules verification failed")
-            raise HTTPException(
-                status_code=500,
-                detail="DSCP rules verification failed - rules may not have been applied correctly"
-            )
-
         logging.info(
-            f"[chains] 链路 '{tag}' 入口 DSCP 规则已设置并验证: "
-            f"routing_mark={routing_mark}, dscp={dscp_value}"
+            f"[chains] 链路 '{tag}' DSCP 配置: "
+            f"routing_mark={routing_mark}, dscp={dscp_value} "
+            f"(rust-router userspace DSCP marking)"
         )
 
         # 更新为 active（清除之前的错误信息）
@@ -18723,31 +18465,11 @@ def api_deactivate_chain(tag: str):
         "relays": [],
     }
 
-    # Phase 4 Issue 17 修复: 先清理本地入口 DSCP 规则，再进行远程调用
-    # 即使远程调用失败，本地规则也必须清理（否则流量仍会被错误标记）
-    entry_dscp_cleanup_result = None
-    if HAS_DSCP_MANAGER and dscp_value:
-        try:
-            dscp_mgr = get_dscp_manager()
-            routing_mark = ENTRY_ROUTING_MARK_BASE + dscp_value
-            dscp_mgr.cleanup_entry_rules(tag, routing_mark, dscp_value)
-
-            # Phase 3: 验证清理是否成功（规则应该不再存在）
-            if dscp_mgr.verify_entry_rules(tag, routing_mark, dscp_value):
-                # 规则仍然存在 - 清理失败
-                entry_dscp_cleanup_result = "partial"
-                cleanup_results["entry_dscp"]["status"] = "partial"
-                cleanup_results["entry_dscp"]["error"] = "rules still exist after cleanup"
-                logging.error(f"[chains] Entry DSCP rules cleanup verification failed for '{tag}' - rules still exist")
-            else:
-                entry_dscp_cleanup_result = "success"
-                cleanup_results["entry_dscp"]["status"] = "success"
-                logging.info(f"[chains] 链路 '{tag}' 入口 DSCP 规则已清理并验证")
-        except Exception as e:
-            entry_dscp_cleanup_result = f"error: {e}"
-            cleanup_results["entry_dscp"]["status"] = "error"
-            cleanup_results["entry_dscp"]["error"] = str(e)
-            logging.warning(f"[chains] 链路 '{tag}' 入口 DSCP 规则清理失败: {e}")
+    # Phase 12: 移除 iptables DSCP 规则清理 - rust-router 在用户空间处理 DSCP
+    # rust-router 停用链路时会自动清理 DSCP 路由配置
+    entry_dscp_cleanup_result = "success"
+    cleanup_results["entry_dscp"]["status"] = "success"
+    logging.info(f"[chains] 链路 '{tag}' DSCP 由 rust-router userspace 管理，无需清理 iptables 规则")
 
     # Issue 11/12 修复：使用统一的 hops 解析函数
     hops = _parse_chain_hops(chain, raise_on_error=False)
@@ -19237,12 +18959,9 @@ async def api_batch_connect(payload: BatchConnectRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    # [优化] 在循环外获取数据库连接和管理器
     db = _get_db()
-    from peer_tunnel_manager import PeerTunnelManager
-    manager = PeerTunnelManager()
-
     results = []
+    
     for tag in payload.tags:
         try:
             node = db.get_peer_node(tag)
@@ -19255,16 +18974,16 @@ async def api_batch_connect(payload: BatchConnectRequest):
                 results.append({"tag": tag, "success": False, "error": "节点已禁用"})
                 continue
 
-            success = manager.connect_node(tag)
+            # Connect via rust-router IPC
+            success, message = _connect_peer_sync(tag)
 
             if success:
                 results.append({"tag": tag, "success": True})
             else:
-                node = db.get_peer_node(tag)
                 results.append({
                     "tag": tag,
                     "success": False,
-                    "error": node.get("last_error", "连接失败") if node else "连接失败"
+                    "error": message or "连接失败"
                 })
         except Exception as e:
             logging.exception(f"[batch-connect] 连接节点 '{tag}' 失败")
@@ -19285,19 +19004,16 @@ async def api_batch_disconnect(payload: BatchDisconnectRequest):
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    # [优化] 在循环外获取管理器
-    from peer_tunnel_manager import PeerTunnelManager
-    manager = PeerTunnelManager()
-
     results = []
     for tag in payload.tags:
         try:
-            success = manager.disconnect_node(tag)
+            # Disconnect via rust-router IPC
+            success, message = _disconnect_peer_sync(tag)
 
             if success:
                 results.append({"tag": tag, "success": True})
             else:
-                results.append({"tag": tag, "success": False, "error": "断开失败"})
+                results.append({"tag": tag, "success": False, "error": message or "断开失败"})
         except Exception as e:
             logging.exception(f"[batch-disconnect] 断开节点 '{tag}' 失败")
             results.append({"tag": tag, "success": False, "error": "Internal error"})

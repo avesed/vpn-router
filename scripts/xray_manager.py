@@ -734,45 +734,34 @@ class XrayManager:
             raise
 
     def _ensure_xray_wg_peer(self, xray_public_key: str) -> bool:
-        """确保 wg-ingress 中存在 Xray 的 peer，并配置路由"""
+        """确保 wg-ingress 中存在 Xray 的 peer，并配置路由
+
+        .. deprecated:: Phase 12
+            此函数使用内核 WireGuard (wg set)，在 userspace 模式下已废弃。
+            Xray WireGuard peer 现在通过数据库管理，rust-router 会自动同步。
+        """
+        # Phase 12: 仅更新数据库，跳过内核 WireGuard 配置
+        # rust-router 会在 IPC 同步时处理 ingress peers
         try:
-            # 检查是否已存在
             existing = self.db.get_wireguard_peer_by_name(XRAY_WG_PEER_NAME)
             if existing:
-                # 检查公钥是否匹配
-                if existing.get("public_key") == xray_public_key:
-                    logger.info(f"Xray WireGuard peer 已存在: {XRAY_WG_PEER_IP}")
-                else:
-                    # 公钥不匹配，更新 peer
-                    logger.info("更新 Xray WireGuard peer 公钥")
+                if existing.get("public_key") != xray_public_key:
+                    logger.info("更新 Xray WireGuard peer 公钥 (DB only)")
                     self.db.delete_wireguard_peer(existing["id"])
-                    # 添加新的 peer
                     self.db.add_wireguard_peer(
                         name=XRAY_WG_PEER_NAME,
                         public_key=xray_public_key,
                         allowed_ips=f"{XRAY_WG_PEER_IP}/32"
                     )
             else:
-                # 添加新的 peer
-                logger.info(f"创建 Xray WireGuard peer: {XRAY_WG_PEER_NAME} ({XRAY_WG_PEER_IP})")
+                logger.info(f"创建 Xray WireGuard peer (DB only): {XRAY_WG_PEER_NAME}")
                 self.db.add_wireguard_peer(
                     name=XRAY_WG_PEER_NAME,
                     public_key=xray_public_key,
                     allowed_ips=f"{XRAY_WG_PEER_IP}/32"
                 )
 
-            # 使用 wg set 热添加/更新 peer（无需重启 wg-ingress）
-            subprocess.run(
-                ["wg", "set", "wg-ingress", "peer", xray_public_key,
-                 "allowed-ips", f"{XRAY_WG_PEER_IP}/32"],
-                check=True
-            )
-            logger.info("Xray WireGuard peer 已添加到 wg-ingress")
-
-            # 添加路由使响应包通过 wg-ingress 发送
-            # 这是必须的，因为 Xray 的 WireGuard 使用不同子网 (10.23.1.x)
-            self._setup_xray_wg_routes()
-
+            logger.info("Xray WireGuard peer 已保存到数据库 (rust-router 会同步)")
             return True
 
         except Exception as e:
@@ -780,103 +769,26 @@ class XrayManager:
             return False
 
     def _setup_xray_wg_routes(self) -> bool:
-        """设置 Xray WireGuard 子网的路由和 iptables 规则"""
-        try:
-            # 添加路由: 10.23.1.0/24 via wg-ingress (main table)
-            result = subprocess.run(
-                ["ip", "route", "show", XRAY_WG_SUBNET],
-                capture_output=True, text=True
-            )
-            if "wg-ingress" not in result.stdout:
-                logger.info(f"添加路由 {XRAY_WG_SUBNET} dev wg-ingress")
-                subprocess.run(
-                    ["ip", "route", "add", XRAY_WG_SUBNET, "dev", "wg-ingress"],
-                    check=False  # 如果已存在不报错
-                )
+        """设置 Xray WireGuard 子网的路由和 iptables 规则
 
-            # 添加策略路由表 200 用于强制 Xray WireGuard 返回流量走 wg-ingress
-            # 这是必要的，因为 Xray 的 WireGuard 接口会创建 local 路由，导致
-            # sing-box 的 TPROXY 响应被本地投递而不是通过 wg-ingress 加密发送
-            subprocess.run(
-                ["ip", "route", "replace", XRAY_WG_SUBNET, "dev", "wg-ingress", "table", "200"],
-                check=False
-            )
-
-            # 添加策略规则，优先级 0（与 local 表相同，但会在 local 表之后检查）
-            result = subprocess.run(
-                ["ip", "rule", "show", "to", XRAY_WG_SUBNET],
-                capture_output=True, text=True
-            )
-            if "lookup 200" not in result.stdout:
-                logger.info(f"添加策略路由规则: to {XRAY_WG_SUBNET} lookup 200")
-                subprocess.run(
-                    ["ip", "rule", "add", "to", XRAY_WG_SUBNET, "lookup", "200", "priority", "0"],
-                    check=False
-                )
-
-            # 添加 iptables RETURN 规则，防止 Xray 子网内部流量被 TPROXY
-            # 检查规则是否已存在
-            result = subprocess.run(
-                ["iptables", "-t", "mangle", "-C", "PREROUTING",
-                 "-i", "wg-ingress", "-d", XRAY_WG_SUBNET, "-j", "RETURN"],
-                capture_output=True
-            )
-            if result.returncode != 0:
-                logger.info(f"添加 iptables RETURN 规则: {XRAY_WG_SUBNET}")
-                subprocess.run(
-                    ["iptables", "-t", "mangle", "-I", "PREROUTING", "1",
-                     "-i", "wg-ingress", "-d", XRAY_WG_SUBNET, "-j", "RETURN"],
-                    check=True
-                )
-
-            return True
-        except Exception as e:
-            logger.error(f"设置 Xray WireGuard 路由失败: {e}")
-            return False
+        .. deprecated:: Phase 12
+            此函数使用内核 WireGuard 路由，在 userspace 模式下已废弃。
+            rust-router 在用户空间处理路由。
+        """
+        # Phase 12: No-op - rust-router 处理路由
+        logger.debug("Xray WG routes: no-op in userspace mode")
+        return True
 
     def _fix_local_routes_for_xray_wg(self) -> bool:
-        """删除 Xray WireGuard 接口的 local 路由，使响应包走 wg-ingress
+        """删除 Xray WireGuard 接口的 local 路由
 
-        问题: Xray 的 WireGuard 出站会创建接口 (wg0, wg1, wg2) 并分配 IP 10.23.1.200，
-        这导致内核在 local 路由表中创建 local 路由。当 sing-box 发送 TPROXY 响应到
-        10.23.1.200 时，包会被本地投递而不是通过 wg-ingress WireGuard 加密发送。
-
-        解决方案: 删除 local 表中的这些路由，让包走 table 200 的路由到 wg-ingress。
+        .. deprecated:: Phase 12
+            此函数操作内核路由表，在 userspace 模式下已废弃。
+            rust-router 在用户空间处理所有路由。
         """
-        try:
-            # 查找所有 10.23.1.200 的 local 路由
-            result = subprocess.run(
-                ["ip", "route", "show", "table", "local"],
-                capture_output=True, text=True
-            )
-
-            for line in result.stdout.splitlines():
-                if XRAY_WG_PEER_IP in line and "local" in line:
-                    # 解析接口名 (如 "local 10.23.1.200 dev wg0 proto kernel scope host")
-                    parts = line.split()
-                    if len(parts) >= 4 and parts[3] == "dev":
-                        dev = parts[4]
-                        logger.info(f"删除 local 路由: {XRAY_WG_PEER_IP} dev {dev}")
-                        subprocess.run(
-                            ["ip", "route", "del", "local", XRAY_WG_PEER_IP, "dev", dev, "table", "local"],
-                            check=False  # 忽略错误（可能已被删除）
-                        )
-
-            # 验证修复结果
-            result = subprocess.run(
-                ["ip", "route", "get", XRAY_WG_PEER_IP],
-                capture_output=True, text=True
-            )
-            if "wg-ingress" in result.stdout or "table 200" in result.stdout:
-                logger.info(f"Local 路由修复成功: {XRAY_WG_PEER_IP} 现在走 wg-ingress")
-                return True
-            else:
-                logger.warning(f"Local 路由修复可能失败: {result.stdout}")
-                return False
-
-        except Exception as e:
-            logger.error(f"修复 local 路由失败: {e}")
-            return False
+        # Phase 12: No-op - rust-router 处理路由
+        logger.debug("Fix local routes: no-op in userspace mode")
+        return True
 
     def _generate_xray_config(
         self,

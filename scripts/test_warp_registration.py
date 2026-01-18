@@ -36,7 +36,7 @@ async def test_warp_registration(tag: str, license_key: str = None):
     socket_path = "/var/run/rust-router.sock"
     if not os.path.exists(socket_path):
         logger.error(f"rust-router socket not found: {socket_path}")
-        logger.info("Make sure rust-router is running with USE_RUST_ROUTER=true USERSPACE_WG=true")
+        logger.info("Make sure rust-router is running with USE_RUST_ROUTER=true")
         return False
 
     client = RustRouterClient(socket_path=socket_path)
@@ -149,7 +149,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Prerequisites:")
     logger.info("  1. rust-router must be running")
-    logger.info("  2. Environment: USE_RUST_ROUTER=true USERSPACE_WG=true")
+    logger.info("  2. Environment: USE_RUST_ROUTER=true")
     logger.info("  3. Socket path: /var/run/rust-router.sock")
     logger.info("=" * 60)
 

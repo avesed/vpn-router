@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """DSCP 标记管理器
 
+.. deprecated:: Phase 12
+    此模块已弃用。rust-router 现在在用户空间处理 DSCP 路由，无需内核 iptables 规则。
+    
+    - 入口节点 DSCP 标记：rust-router/src/ingress/forwarder.rs
+    - 终端节点 DSCP 路由：rust-router/src/ingress/processor.rs
+    
+    保留此文件仅用于向后兼容和参考。所有 setup/cleanup 函数现在是 no-op。
+
+原始功能说明（已废弃）：
 管理多跳链路的 DSCP iptables 规则，用于 WireGuard 隧道的流量识别和路由。
 
-架构：
+架构（已迁移到 rust-router 用户空间）：
 - 入口节点：sing-box routing_mark → iptables DSCP 设置 → WireGuard
 - 中继节点：透传（Linux 保留 DSCP）
 - 终端节点：iptables DSCP 读取 → fwmark → 策略路由 → 本地出口
 
-使用示例：
+使用示例（已废弃）：
     manager = DSCPManager()
 
     # 入口节点：设置 DSCP 标记规则

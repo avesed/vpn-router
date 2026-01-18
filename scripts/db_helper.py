@@ -101,8 +101,9 @@ WG_MAX_IFACE_LEN = 15         # Linux interface name limit
 
 
 def get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str = None) -> str:
-    """Generate kernel WireGuard interface name for egress
+    """Generate WireGuard tunnel identifier for egress
 
+    用于生成唯一的 WireGuard 隧道标识符，在 rust-router 用户空间模式下用于隧道管理。
     H12 修复: 使用 hash 确保唯一性，避免长标签截断冲突
 
     Naming convention:
@@ -120,7 +121,7 @@ def get_egress_interface_name(tag: str, is_pia: bool = False, egress_type: str =
         egress_type: One of "pia", "custom", "warp" (takes precedence over is_pia)
 
     Returns:
-        Interface name, max 15 characters (Linux limit), guaranteed unique per tag
+        Tunnel identifier, max 15 characters, guaranteed unique per tag
     """
     # Determine prefix based on egress_type or is_pia fallback
     if egress_type == "warp":

@@ -104,9 +104,6 @@ cleanup() {
     ip link delete xray-tun0 2>/dev/null || true
   fi
 
-  # Cleanup peer tunnel subnet route
-  ip route del local 10.200.200.0/24 dev lo 2>/dev/null || true
-
   echo "[entrypoint] cleanup complete"
 }
 
@@ -296,21 +293,16 @@ sync_ecmp_routes() {
 }
 
 sync_chain_routes() {
-  echo "[entrypoint] syncing chain routes for multi-hop chains"
-  if python3 /usr/local/bin/chain_route_manager.py sync 2>/dev/null; then
-    echo "[entrypoint] chain routes synced successfully"
-  else
-    echo "[entrypoint] warning: chain route sync failed or no chains configured"
-  fi
+  # Phase 12: No-op - rust-router handles DSCP routing in userspace
+  # Chain routes are managed by rust-router's ChainManager
+  # See rust-router/src/ingress/processor.rs for DSCP routing logic
+  echo "[entrypoint] chain routes managed by rust-router (userspace DSCP routing)"
 }
 
 restore_dscp_rules() {
-  echo "[entrypoint] restoring DSCP rules from persisted state"
-  if python3 /usr/local/bin/dscp_manager.py restore 2>>/var/log/dscp-restore.log; then
-    echo "[entrypoint] DSCP rules restored successfully"
-  else
-    echo "[entrypoint] warning: DSCP rule restore failed"
-  fi
+  # Phase 12: No-op - rust-router handles DSCP routing in userspace
+  # No kernel iptables/policy routing rules needed
+  echo "[entrypoint] DSCP rules managed by rust-router (userspace mode)"
 }
 
 sync_ecmp_routes
@@ -442,24 +434,10 @@ print(len(groups))
 }
 
 start_peer_tunnel_manager() {
-  local peer_count
-  peer_count=$(python3 -c "
-import sys
-sys.path.insert(0, '/usr/local/bin')
-from db_helper import get_db
-db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
-peers = db.get_peer_nodes()
-count = sum(1 for p in peers if p.get('auto_reconnect', False))
-print(count)
-" 2>/dev/null || echo "0")
-
-  if [ "${peer_count}" -gt "0" ]; then
-    echo "[entrypoint] starting peer tunnel manager for ${peer_count} auto-reconnect peers"
-    python3 /usr/local/bin/peer_tunnel_manager.py daemon >/var/log/peer-tunnel-manager.log 2>&1 &
-    PEER_TUNNEL_MGR_PID=$!
-  else
-    echo "[entrypoint] No auto-reconnect peers configured, skipping peer tunnel manager"
-  fi
+  # Phase 12: peer_tunnel_manager.py uses kernel WireGuard (wg set/show).
+  # In userspace mode, peer tunnels are managed by rust-router via IPC.
+  # Skip this legacy manager.
+  echo "[entrypoint] peer tunnels managed by rust-router (userspace mode)"
 }
 
 start_nginx() {
@@ -644,19 +622,8 @@ start_peer_tunnel_manager
 
 # Phase 3: WARP manager removed - WARP tunnels managed via rust-router IPC
 
-# Configure peer tunnel subnet routing
-# NOTE: This local route is for TPROXY to accept traffic destined for tunnel IPs.
-# Peer API requests go through rust-router's userspace WireGuard via IPC forwarding.
-echo "[entrypoint] Configuring peer tunnel subnet routing (10.200.200.0/24)"
-if ip route add local 10.200.200.0/24 dev lo 2>/dev/null; then
-  echo "[entrypoint] Added local route for peer tunnel subnet"
-else
-  if ip route show table local | grep -q "local 10.200.200.0/24"; then
-    echo "[entrypoint] Peer tunnel subnet route already exists"
-  else
-    echo "[entrypoint] WARNING: Failed to add peer tunnel subnet route" >&2
-  fi
-fi
+# NOTE: Peer tunnel subnet routing removed - userspace WireGuard mode
+# routes HTTP traffic through rust-router's internal WireGuard implementation
 
 echo "[entrypoint] DNS engine: enabled (port ${RUST_ROUTER_DNS_PORT})"
 

@@ -1509,14 +1509,8 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
     if not warp_egress:
         return []
 
-    # Phase 6-Fix: Check if running in userspace WireGuard mode
-    userspace_wg = os.environ.get("USERSPACE_WG", "").lower() in ("true", "1", "yes")
-
-    # Import here to avoid circular dependency
-    from db_helper import get_egress_interface_name
-
-    outbounds = config.setdefault("outbounds", [])
-    existing_tags = {ob.get("tag") for ob in outbounds}
+    # WARP tunnels are managed by rust-router (userspace WireGuard mode)
+    # No sing-box outbounds needed - just collect tags for DNS configuration
     warp_tags = []
 
     for egress in warp_egress:
@@ -1527,34 +1521,7 @@ def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[
             continue
 
         warp_tags.append(tag)
-
-        # Phase 6-Fix: 在 userspace 模式下，不创建 sing-box outbound
-        # WARP 隧道由 rust-router 通过 IPC 管理
-        if userspace_wg:
-            print(f"[render] WARP 出口 {tag} 由 rust-router 管理 (userspace WireGuard)")
-            continue
-
-        # Phase 3: Only WireGuard protocol supported
-        # WireGuard 协议: 使用内核 WireGuard 接口
-        interface = get_egress_interface_name(tag, egress_type="warp")
-        outbound = {
-            "type": "direct",
-            "tag": tag,
-            "bind_interface": interface
-        }
-        outbound_type = f"direct -> {interface}"
-
-        if tag in existing_tags:
-            # 更新现有 outbound
-            for i, ob in enumerate(outbounds):
-                if ob.get("tag") == tag:
-                    outbounds[i] = outbound
-                    break
-        else:
-            # 在 block 之前插入
-            block_idx = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "block"), len(outbounds))
-            outbounds.insert(block_idx, outbound)
-            print(f"[render] 创建 WARP 出口 (wireguard): {tag} -> {outbound_type}")
+        print(f"[render] WARP 出口 {tag} 由 rust-router 管理 (userspace WireGuard)")
 
     return warp_tags
 
