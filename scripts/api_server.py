@@ -14975,7 +14975,14 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
             if response.success:
                 logging.info(f"[peers] rust-router peer 已删除: {tag}")
             else:
-                logging.warning(f"[peers] rust-router 删除 peer 失败: {response.error}")
+                # "Peer not found" is expected if peer was already cleaned up
+                if "not found" in (response.error or "").lower():
+                    logging.debug(f"[peers] rust-router peer 已不存在 (可能已清理): {tag}")
+                else:
+                    logging.warning(f"[peers] rust-router 删除 peer 失败: {response.error}")
+        except HTTPException:
+            # HTTPException from _run_async_ipc timeout - don't propagate for deletion
+            logging.warning(f"[peers] rust-router IPC 超时，继续删除数据库记录: {tag}")
         except Exception as e:
             # rust-router 可能不可用或 peer 不存在，继续删除数据库记录
             logging.warning(f"[peers] rust-router IPC 删除失败: {e}")

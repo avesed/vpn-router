@@ -1494,6 +1494,7 @@
     "completeDescription": "Enter the response code returned by the peer after they imported your pairing code.",
     "completeHint": "When you generated a pairing code with \"Bidirectional Connection\" enabled, the peer will receive a response code after importing. Paste that code here.",
     "completeSubmit": "Complete Pairing",
-    "createdNode": "Created node"
+    "createdNode": "Created node",
+    "nodeTagMissing": "Node tag not configured. Please set it in Settings."
   }
 }

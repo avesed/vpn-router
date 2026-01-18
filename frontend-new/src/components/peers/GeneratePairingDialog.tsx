@@ -34,9 +34,9 @@ import {
 } from "@/components/ui/select";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useGeneratePairRequest } from "@/api/hooks/usePairing";
+import { useIngressConfig } from "@/api/hooks/useIngress";
 
 const formSchema = z.object({
-  node_tag: z.string().min(1, "Node tag is required"),
   node_description: z.string().optional(),
   endpoint: z.string().min(1, "Endpoint is required"),
   tunnel_type: z.enum(["wireguard", "xray"]),
@@ -52,11 +52,11 @@ export function GeneratePairingDialog() {
   const [result, setResult] = useState<{ code: string; psk: string } | null>(null);
 
   const generatePairRequest = useGeneratePairRequest();
+  const { data: ingressConfig, isLoading: isLoadingIngress } = useIngressConfig();
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema) as any,
     defaultValues: {
-      node_tag: "",
       node_description: "",
       endpoint: window.location.hostname,
       tunnel_type: "wireguard",
@@ -66,8 +66,14 @@ export function GeneratePairingDialog() {
   });
 
   const onSubmit = (data: FormValues) => {
+    const nodeTag = ingressConfig?.local_node_tag;
+    if (!nodeTag) {
+      toast.error(t("pairing.nodeTagMissing"));
+      return;
+    }
     generatePairRequest.mutate({
       ...data,
+      node_tag: nodeTag,
       bidirectional: data.bidirectional ?? false,
     }, {
       onSuccess: (response) => {
@@ -103,21 +109,16 @@ export function GeneratePairingDialog() {
         {!result ? (
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-              <FormField
-                control={form.control}
-                name="node_tag"
-                render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>{t("peers.tag")}</FormLabel>
-                      <FormControl>
-                        <Input placeholder={t("peers.tagPlaceholder")} {...field} />
-                      </FormControl>
-                      <FormDescription>{t("peers.tagHint")}</FormDescription>
-                      <FormMessage />
-                    </FormItem>
-
-                )}
-              />
+              <div className="rounded-md border p-3 bg-muted/50">
+                <div className="text-sm text-muted-foreground">{t("peers.tag")}</div>
+                <div className="font-medium">
+                  {isLoadingIngress ? (
+                    <span className="text-muted-foreground">{t("common.loading")}</span>
+                  ) : ingressConfig?.local_node_tag || (
+                    <span className="text-destructive">{t("pairing.nodeTagMissing")}</span>
+                  )}
+                </div>
+              </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <FormField
@@ -184,9 +185,9 @@ export function GeneratePairingDialog() {
               <Button 
                 type="submit" 
                 className="w-full" 
-                disabled={generatePairRequest.isPending}
+                disabled={generatePairRequest.isPending || isLoadingIngress || !ingressConfig?.local_node_tag}
               >
-                {generatePairRequest.isPending && (
+                {(generatePairRequest.isPending || isLoadingIngress) && (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 )}
                 {t("pairing.generateCode")}

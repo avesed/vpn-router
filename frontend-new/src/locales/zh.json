@@ -1492,6 +1492,7 @@
     "completeDescription": "输入对端导入配对码后返回的响应码，完成双向连接配置",
     "completeHint": "当您生成配对码时勾选了\"双向连接\"，对端导入后会生成一个响应码，将该响应码粘贴到这里",
     "completeSubmit": "完成配对",
-    "createdNode": "创建的节点"
+    "createdNode": "创建的节点",
+    "nodeTagMissing": "节点标识未配置，请在设置中设置"
   }
 }
