@@ -5272,6 +5272,10 @@ def _sync_userspace_peer_from_codes(
         request_data = generator.decode_pairing_code(request_code) if request_code else None
         response_data = generator.decode_pairing_code(response_code) if response_code else None
 
+        logging.debug(f"[pairing] DB sync: local_tag={local_tag}")
+        logging.debug(f"[pairing] DB sync: request_data type={request_data.get('type') if request_data else None}, node_tag={request_data.get('node_tag') if request_data else None}")
+        logging.debug(f"[pairing] DB sync: response_data type={response_data.get('type') if response_data else None}, node_tag={response_data.get('node_tag') if response_data else None}")
+
         remote_tag = None
         tunnel_type = "wireguard"
 
@@ -5289,7 +5293,13 @@ def _sync_userspace_peer_from_codes(
             remote_tag = request_data.get("node_tag")
             tunnel_type = request_data.get("tunnel_type", tunnel_type)
 
-        if not remote_tag or remote_tag == local_tag:
+        logging.debug(f"[pairing] DB sync: resolved remote_tag={remote_tag}, tunnel_type={tunnel_type}")
+
+        if not remote_tag:
+            logging.warning(f"[pairing] DB sync skipped: remote_tag is empty (local_tag={local_tag})")
+            return None
+        if remote_tag == local_tag:
+            logging.warning(f"[pairing] DB sync skipped: remote_tag equals local_tag ({remote_tag})")
             return None
 
         remote_endpoint = None
@@ -5319,12 +5329,9 @@ def _sync_userspace_peer_from_codes(
         if not tunnel_api_endpoint and tunnel_remote_ip and remote_api_port:
             tunnel_api_endpoint = f"{tunnel_remote_ip}:{remote_api_port}"
 
-        local_port = None
-        if local_endpoint and ":" in local_endpoint:
-            try:
-                local_port = int(local_endpoint.rsplit(":", 1)[1])
-            except ValueError:
-                local_port = None
+        # Note: For userspace WireGuard (rust-router), we don't set tunnel_port
+        # as the tunnel is managed by rust-router, not kernel WG interfaces.
+        # The tunnel_port field (36200-36299) is only for kernel WG mode.
 
         existing = db.get_peer_node(remote_tag)
         if existing:
@@ -5336,7 +5343,6 @@ def _sync_userspace_peer_from_codes(
                 tunnel_status=tunnel_status,
                 tunnel_local_ip=tunnel_local_ip or existing.get("tunnel_local_ip"),
                 tunnel_remote_ip=tunnel_remote_ip or existing.get("tunnel_remote_ip"),
-                tunnel_port=local_port or existing.get("tunnel_port"),
                 tunnel_api_endpoint=tunnel_api_endpoint or existing.get("tunnel_api_endpoint"),
                 wg_peer_public_key=wg_peer_public_key or existing.get("wg_peer_public_key"),
                 bidirectional_status="bidirectional",
@@ -5353,7 +5359,6 @@ def _sync_userspace_peer_from_codes(
                 tunnel_status=tunnel_status,
                 tunnel_local_ip=tunnel_local_ip,
                 tunnel_remote_ip=tunnel_remote_ip,
-                tunnel_port=local_port,
                 tunnel_api_endpoint=tunnel_api_endpoint,
                 wg_peer_public_key=wg_peer_public_key,
                 auto_reconnect=False,
@@ -5361,9 +5366,10 @@ def _sync_userspace_peer_from_codes(
                 bidirectional_status="bidirectional",
             )
 
+        logging.info(f"[pairing] DB sync successful: created/updated peer '{remote_tag}'")
         return remote_tag
     except Exception as exc:
-        logging.warning(f"[pairing] userspace peer DB sync failed: {exc}")
+        logging.error(f"[pairing] userspace peer DB sync failed: {exc}", exc_info=True)
         return None
 
 
@@ -15354,7 +15360,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
         tunnel_status = response_data.get("tunnel_status")
         bidirectional = response_data.get("bidirectional", request_obj.bidirectional)
 
-        _sync_userspace_peer_from_codes(
+        synced_tag = _sync_userspace_peer_from_codes(
             db,
             request_code=payload.code,
             response_code=response_code_or_error,
@@ -15363,7 +15369,16 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             tunnel_status="connected" if bidirectional else "disconnected",
         )
 
-        logging.info(f"[pairing] 导入配对请求 (IPC): remote_tag={remote_tag}, tunnel_status={tunnel_status}")
+        if not synced_tag:
+            logging.error(f"[pairing] 导入配对请求失败: 数据库同步失败 (IPC succeeded but DB sync failed)")
+            return ImportPairRequestResponse(
+                success=False,
+                message="Pairing imported to rust-router but failed to sync to database",
+                response_code=response_code_or_error,
+                created_node_tag=None
+            )
+
+        logging.info(f"[pairing] 导入配对请求 (IPC): remote_tag={synced_tag}, tunnel_status={tunnel_status}")
         return ImportPairRequestResponse(
             success=True,
             message=response_data.get("message", "Pairing request imported via IPC"),
@@ -15607,7 +15622,7 @@ def api_complete_pairing(payload: CompletePairingRequest):
                 created_node_tag=None
             )
 
-        _sync_userspace_peer_from_codes(
+        synced_tag = _sync_userspace_peer_from_codes(
             db,
             request_code=payload.pending_request.get("code"),
             response_code=payload.code,
@@ -15615,11 +15630,19 @@ def api_complete_pairing(payload: CompletePairingRequest):
             tunnel_status="connected",
         )
 
-        logging.info(f"[pairing] 配对完成 (IPC): node_tag={peer_tag}")
+        if not synced_tag:
+            logging.error(f"[pairing] 完成配对失败: 数据库同步失败 (IPC succeeded but DB sync failed)")
+            return CompletePairingResponse(
+                success=False,
+                message="Handshake completed in rust-router but failed to sync to database",
+                created_node_tag=None
+            )
+
+        logging.info(f"[pairing] 配对完成 (IPC): node_tag={synced_tag}")
         return CompletePairingResponse(
             success=True,
             message=message_or_error,
-            created_node_tag=peer_tag
+            created_node_tag=synced_tag
         )
 
     # Existing kernel WireGuard code path continues below...

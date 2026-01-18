@@ -13,10 +13,10 @@ import { Checkbox } from "../ui/checkbox";
 import { ScrollArea } from "../ui/scroll-area";
 
 const formSchema = z.object({
-  tag: z.string().min(1, "Tag is required"),
+  tag: z.string().min(1, "Tag is required").regex(/^[a-z][a-z0-9-]*$/, "Must start with lowercase letter, only lowercase letters, numbers and hyphens"),
   name: z.string().min(1, "Name is required"),
   description: z.string().optional(),
-  hops: z.array(z.string()).min(1, "At least one hop is required"),
+  hops: z.array(z.string()).min(2, "At least 2 hops required for multi-hop chain"),
   exit_egress: z.string().optional(),
 });
 

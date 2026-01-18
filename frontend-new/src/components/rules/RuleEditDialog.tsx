@@ -6,6 +6,8 @@ import * as z from "zod";
 import { useAddCustomRule, useUpdateCustomRule } from "../../api/hooks/useRules";
 import { useAllEgress } from "../../api/hooks/useEgress";
 import { useDomainCatalog } from "../../api/hooks/useDomainCatalog";
+import { usePeerNodes } from "../../api/hooks/usePeerNodes";
+import { useNodeChains } from "../../api/hooks/useChains";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "../ui/form";
@@ -38,6 +40,8 @@ export function RuleEditDialog({ open, onOpenChange, rule }: RuleEditDialogProps
   const updateRule = useUpdateCustomRule();
   const { data: allEgress } = useAllEgress();
   const { data: domainCatalog } = useDomainCatalog();
+  const { data: peerNodes } = usePeerNodes();
+  const { data: nodeChains } = useNodeChains();
   const [selectedCatalogLists, setSelectedCatalogLists] = useState<string[]>([]);
 
   const isEditMode = !!rule;
@@ -136,16 +140,25 @@ export function RuleEditDialog({ open, onOpenChange, rule }: RuleEditDialogProps
     }
   };
 
-  const availableOutbounds = allEgress
-    ? [
-        ...allEgress.pia.map((e) => e.tag),
-        ...allEgress.custom.map((e) => e.tag),
-        ...allEgress.direct.map((e) => e.tag),
-        ...(allEgress.warp || []).map((e) => e.tag),
-        ...allEgress.openvpn.map((e) => e.tag),
-        ...allEgress.v2ray.map((e) => e.tag),
-      ]
-    : [];
+  // Combine all egress options: VPN providers, peer nodes, and multi-hop chains
+  const availableOutbounds = [
+    // VPN egress options
+    ...(allEgress?.pia.map((e) => e.tag) || []),
+    ...(allEgress?.custom.map((e) => e.tag) || []),
+    ...(allEgress?.direct.map((e) => e.tag) || []),
+    ...(allEgress?.warp || []).map((e) => e.tag),
+    ...(allEgress?.openvpn.map((e) => e.tag) || []),
+    ...(allEgress?.v2ray.map((e) => e.tag) || []),
+    // Peer nodes (only connected peers can be used as outbound)
+    // Use direct tag - sing-box uses the peer tag directly
+    ...(peerNodes?.nodes
+      ?.filter((p) => p.tunnel_status === "connected" && p.enabled)
+      .map((p) => p.tag) || []),
+    // Multi-hop chains (only active chains)
+    ...(nodeChains?.chains
+      ?.filter((c) => c.chain_state === "active" && c.enabled)
+      .map((c) => c.tag) || []),
+  ];
 
   // Get domain catalog categories
   const catalogCategories = domainCatalog?.categories ? Object.entries(domainCatalog.categories) : [];

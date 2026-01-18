@@ -3,6 +3,7 @@ import { usePeerNodes } from "@/api/hooks/usePeerNodes";
 import { PeerTable } from "@/components/peers/PeerTable";
 import { GeneratePairingDialog } from "@/components/peers/GeneratePairingDialog";
 import { ImportPairingDialog } from "@/components/peers/ImportPairingDialog";
+import { CompletePairingDialog } from "@/components/peers/CompletePairingDialog";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export function PeersPage() {
@@ -18,6 +19,7 @@ export function PeersPage() {
         </div>
         <div className="flex gap-2">
           <ImportPairingDialog />
+          <CompletePairingDialog />
           <GeneratePairingDialog />
         </div>
       </div>

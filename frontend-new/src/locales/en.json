@@ -1238,7 +1238,7 @@
     "description": "Description",
     "descriptionPlaceholder": "Access US via Tokyo node",
     "hops": "Hop Configuration",
-    "hopsHint": "Select nodes in order for traffic routing",
+    "hopsHint": "Select at least 2 nodes in order for multi-hop routing",
     "addHop": "Add Hop",
     "removeHop": "Remove",
     "moveUp": "Move Up",
@@ -1281,7 +1281,7 @@
     "confirmDeleteTitle": "Delete Chain",
     "confirmDeleteMessage": "Are you sure you want to delete chain \"{{name}}\"? This action cannot be undone.",
     "fillRequiredFields": "Please fill in all required fields",
-    "minHopsRequired": "At least 1 node is required",
+    "minHopsRequired": "At least 2 nodes are required for multi-hop chain",
     "invalidJson": "Invalid JSON format",
     "hopCount": "{{count}} hops",
     "refresh": "Refresh",
@@ -1481,8 +1481,15 @@
     "bidirectionalDescription": "Allow the other node to connect back to this node",
     "bidirectionalNotice": "This is a bidirectional connection. Share the response code with the peer.",
     "responseCode": "Response Code",
+    "responseCodePlaceholder": "Paste the response code received from the peer...",
     "tunnelTypeXray": "Xray (VLESS)",
     "testEgress": "Test egress",
-    "responseCodeHint": "Share this response code with the peer"
+    "responseCodeHint": "Share this response code with the peer",
+    "completeButton": "Complete Pairing",
+    "completeTitle": "Complete Bidirectional Pairing",
+    "completeDescription": "Enter the response code returned by the peer after they imported your pairing code.",
+    "completeHint": "When you generated a pairing code with \"Bidirectional Connection\" enabled, the peer will receive a response code after importing. Paste that code here.",
+    "completeSubmit": "Complete Pairing",
+    "createdNode": "Created node"
   }
 }

@@ -1238,7 +1238,7 @@
     "description": "描述",
     "descriptionPlaceholder": "经由东京节点访问美国",
     "hops": "跳数配置",
-    "hopsHint": "按顺序选择流量经过的节点",
+    "hopsHint": "按顺序选择至少 2 个节点用于多跳路由",
     "addHop": "添加跳",
     "removeHop": "移除",
     "moveUp": "上移",
@@ -1281,7 +1281,7 @@
     "confirmDeleteTitle": "删除多跳链路",
     "confirmDeleteMessage": "确定要删除多跳链路 \"{{name}}\" 吗？此操作无法撤销。",
     "fillRequiredFields": "请填写所有必填字段",
-    "minHopsRequired": "至少需要选择 1 个节点",
+    "minHopsRequired": "多跳链路至少需要 2 个节点",
     "invalidJson": "JSON 格式无效",
     "hopCount": "{{count}} 跳",
     "refresh": "刷新",
@@ -1479,8 +1479,15 @@
     "bidirectionalDescription": "允许对端回连此节点",
     "bidirectionalNotice": "这是一个双向连接，请将响应码发给对端完成配对",
     "responseCode": "响应码",
+    "responseCodePlaceholder": "粘贴从对端收到的响应码...",
     "tunnelTypeXray": "Xray (VLESS)",
     "testEgress": "测试出口",
-    "responseCodeHint": "将此响应码发送给对端"
+    "responseCodeHint": "将此响应码发送给对端",
+    "completeButton": "完成配对",
+    "completeTitle": "完成双向配对",
+    "completeDescription": "输入对端导入配对码后返回的响应码，完成双向连接配置",
+    "completeHint": "当您生成配对码时勾选了\"双向连接\"，对端导入后会生成一个响应码，将该响应码粘贴到这里",
+    "completeSubmit": "完成配对",
+    "createdNode": "创建的节点"
   }
 }
