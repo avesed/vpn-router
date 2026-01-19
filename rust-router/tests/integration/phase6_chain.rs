@@ -245,6 +245,15 @@ impl DscpRoutingCallback for TrackingRoutingCallback {
             .push(chain_tag.to_string());
         Ok(())
     }
+
+    fn is_chain_registered(&self, chain_tag: &str) -> bool {
+        // Check if setup was called for this chain (simulating registration)
+        self.setup_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(tag, _, _)| tag == chain_tag)
+    }
 }
 
 /// Mock peer connectivity callback

@@ -53,7 +53,7 @@ use rust_router::ingress::WgIngressConfig;
 use rust_router::ipc::{DnsEngine, IpcHandler, IpcServer};
 use rust_router::outbound::{OutboundManager, OutboundManagerBuilder};
 use rust_router::peer::manager::PeerManager;
-use rust_router::rules::{RuleEngine, RoutingSnapshotBuilder};
+use rust_router::rules::{RuleEngine, RuleEngineRoutingCallback, RoutingSnapshotBuilder};
 use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig};
 
 /// Command-line arguments
@@ -463,6 +463,11 @@ async fn main() -> Result<()> {
     // Create ChainManager (always created for IPC support)
     let chain_manager = Arc::new(ChainManager::new(phase6_config.node_tag.clone()));
     debug!("Created ChainManager with node tag: {}", phase6_config.node_tag);
+
+    // Wire up the routing callback so chains register with FwmarkRouter
+    let routing_callback = Arc::new(RuleEngineRoutingCallback::new(Arc::clone(&rule_engine)));
+    chain_manager.set_routing_callback(routing_callback);
+    debug!("Set RuleEngineRoutingCallback on ChainManager");
 
     // Phase 6-Fix.AI: EcmpGroupManager is now created earlier (before ConnectionManager)
     // so it can be passed to both TCP and UDP handlers for load balancing support

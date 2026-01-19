@@ -235,6 +235,20 @@ pub trait DscpRoutingCallback: Send + Sync {
     ///
     /// Called during chain deactivation to remove local routing rules.
     fn teardown_routing(&self, chain_tag: &str) -> Result<(), String>;
+
+    /// Check if a chain is registered in the routing subsystem
+    ///
+    /// Used to verify that `setup_routing` actually registered the chain.
+    /// This is a defensive check to ensure chain activation was successful.
+    ///
+    /// # Arguments
+    ///
+    /// * `chain_tag` - The chain tag to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the chain is registered and can be used for routing, `false` otherwise.
+    fn is_chain_registered(&self, chain_tag: &str) -> bool;
 }
 
 /// No-op routing callback for testing
@@ -253,6 +267,11 @@ impl DscpRoutingCallback for NoOpRoutingCallback {
 
     fn teardown_routing(&self, _chain_tag: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    fn is_chain_registered(&self, _chain_tag: &str) -> bool {
+        // No-op callback always returns true for testing
+        true
     }
 }
 
@@ -984,29 +1003,74 @@ impl ChainManager {
     }
 
     /// Set up local DSCP routing for a chain
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Local node is not part of this chain (`my_role` is `None`)
+    /// - No routing callback is configured
+    /// - The routing callback fails to register the chain
+    /// - Post-registration verification fails
     fn setup_local_routing(
         &self,
         tag: &str,
         config: &ChainConfig,
         my_role: Option<ChainRole>,
     ) -> Result<(), String> {
-        if let Ok(routing_callback_guard) = self.routing_callback.read() {
-            if let Some(callback) = routing_callback_guard.as_ref() {
-                if let Some(role) = my_role {
-                    let exit_egress = if role == ChainRole::Terminal {
-                        Some(config.exit_egress.as_str())
-                    } else {
-                        None
-                    };
+        // Verify my_role is present - local node must be part of this chain
+        let role = my_role.ok_or_else(|| {
+            format!(
+                "Cannot setup routing for chain '{}': local node '{}' is not part of this chain",
+                tag, self.local_node_tag
+            )
+        })?;
 
-                    debug!(
-                        "Setting up DSCP routing for chain {} with role {:?}, DSCP {}",
-                        tag, role, config.dscp_value
-                    );
-                    callback.setup_routing(tag, config.dscp_value, role, exit_egress)?;
-                }
-            }
+        // Acquire routing callback - must be configured for chain routing to work
+        let routing_callback_guard = self
+            .routing_callback
+            .read()
+            .map_err(|e| format!("Failed to acquire routing callback lock: {e}"))?;
+
+        let callback = routing_callback_guard.as_ref().ok_or_else(|| {
+            format!(
+                "No routing callback configured for chain '{}'. \
+                 Chain routing will not work without RuleEngineRoutingCallback.",
+                tag
+            )
+        })?;
+
+        let exit_egress = if role == ChainRole::Terminal {
+            Some(config.exit_egress.as_str())
+        } else {
+            None
+        };
+
+        debug!(
+            "Setting up DSCP routing for chain {} with role {:?}, DSCP {}",
+            tag, role, config.dscp_value
+        );
+
+        // Call the routing callback to register the chain
+        callback.setup_routing(tag, config.dscp_value, role, exit_egress)?;
+
+        // Verify the chain was actually registered (defensive check)
+        if !callback.is_chain_registered(tag) {
+            error!(
+                "Chain '{}' setup_routing succeeded but chain not found in FwmarkRouter! \
+                 This is a bug in the routing callback implementation.",
+                tag
+            );
+            return Err(format!(
+                "Chain '{}' registration verification failed: not found in FwmarkRouter after setup",
+                tag
+            ));
         }
+
+        info!(
+            "Chain '{}' registered to FwmarkRouter: DSCP={}, role={:?}",
+            tag, config.dscp_value, role
+        );
+
         Ok(())
     }
 
@@ -1130,6 +1194,19 @@ impl ChainManager {
         self.chains
             .read()
             .map(|chains| chains.contains_key(tag))
+            .unwrap_or(false)
+    }
+
+    /// Check if a chain exists and is active (Phase 11-Fix)
+    ///
+    /// Only active chains are registered in the FwmarkRouter and can
+    /// properly route traffic. This method should be used for validating
+    /// chain outbounds in routing rules.
+    pub fn is_chain_active(&self, tag: &str) -> bool {
+        self.chains
+            .read()
+            .ok()
+            .and_then(|chains| chains.get(tag).map(|c| c.state == ChainState::Active))
             .unwrap_or(false)
     }
 
@@ -1264,6 +1341,83 @@ impl ChainManager {
         let chains = self.chains.read().ok()?;
         let chain = chains.get(tag)?;
         chain.my_role
+    }
+
+    /// Get chain state
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Chain tag
+    ///
+    /// # Returns
+    ///
+    /// The current chain state, or `None` if chain not found.
+    pub fn get_chain_state(&self, tag: &str) -> Option<ChainState> {
+        let chains = self.chains.read().ok()?;
+        let chain = chains.get(tag)?;
+        Some(chain.state)
+    }
+
+    /// Get chain error message
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Chain tag
+    ///
+    /// # Returns
+    ///
+    /// The last error message, or `None` if no error or chain not found.
+    pub fn get_chain_error(&self, tag: &str) -> Option<String> {
+        let chains = self.chains.read().ok()?;
+        let chain = chains.get(tag)?;
+        chain.last_error.clone()
+    }
+
+    /// Get the next hop's peer tunnel tag for forwarding chain packets
+    ///
+    /// For entry and relay nodes, this returns the peer tunnel tag to use
+    /// for forwarding packets to the next hop in the chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Chain tag
+    ///
+    /// # Returns
+    ///
+    /// - `Some(peer_tunnel_tag)` - The peer tunnel tag (e.g., "peer-node-b") for entry/relay nodes
+    /// - `None` - For terminal nodes (they use exit_egress instead) or if chain not found
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // For a chain: local-node (Entry) -> node-b (Relay) -> node-c (Terminal)
+    /// // If local-node is the entry, this returns "peer-node-b"
+    /// let next_hop = manager.get_next_hop_tunnel("my-chain");
+    /// assert_eq!(next_hop, Some("peer-node-b".to_string()));
+    /// ```
+    pub fn get_next_hop_tunnel(&self, tag: &str) -> Option<String> {
+        let chains = self.chains.read().ok()?;
+        let chain = chains.get(tag)?;
+
+        // Only entry and relay nodes forward to next hop
+        let my_role = chain.my_role?;
+        if my_role == ChainRole::Terminal {
+            return None;
+        }
+
+        // Find local node's position in the hop list
+        let local_idx = chain
+            .config
+            .hops
+            .iter()
+            .position(|hop| hop.node_tag == self.local_node_tag)?;
+
+        // Get the next hop (local_idx + 1)
+        let next_hop = chain.config.hops.get(local_idx + 1)?;
+
+        // Return the peer tunnel tag for the next hop
+        // Convention: peer tunnels are named "peer-{node_tag}"
+        Some(format!("peer-{}", next_hop.node_tag))
     }
 
     /// Handle incoming PREPARE request from another node
@@ -2029,6 +2183,78 @@ mod tests {
         let result = manager.create_chain(config2).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);
+    }
+
+    // =========================================================================
+    // get_next_hop_tunnel tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_next_hop_tunnel_entry_node() {
+        let manager = ChainManager::new("node-a".to_string());
+        let config = create_three_hop_config("test-chain");
+
+        manager.create_chain(config).await.unwrap();
+
+        // node-a is Entry, next hop is node-b (Relay)
+        let next_hop = manager.get_next_hop_tunnel("test-chain");
+        assert_eq!(next_hop, Some("peer-node-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_next_hop_tunnel_relay_node() {
+        let manager = ChainManager::new("node-b".to_string());
+        let config = create_three_hop_config("test-chain");
+
+        manager.create_chain(config).await.unwrap();
+
+        // node-b is Relay, next hop is node-c (Terminal)
+        let next_hop = manager.get_next_hop_tunnel("test-chain");
+        assert_eq!(next_hop, Some("peer-node-c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_next_hop_tunnel_terminal_node_returns_none() {
+        let manager = ChainManager::new("node-c".to_string());
+        let config = create_three_hop_config("test-chain");
+
+        manager.create_chain(config).await.unwrap();
+
+        // node-c is Terminal, should return None (uses exit_egress instead)
+        let next_hop = manager.get_next_hop_tunnel("test-chain");
+        assert!(next_hop.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_next_hop_tunnel_two_hop_chain() {
+        let manager = ChainManager::new("node-a".to_string());
+        let config = create_test_config("test-chain", 10);
+
+        manager.create_chain(config).await.unwrap();
+
+        // node-a is Entry, next hop is node-b (Terminal)
+        let next_hop = manager.get_next_hop_tunnel("test-chain");
+        assert_eq!(next_hop, Some("peer-node-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_next_hop_tunnel_nonexistent_chain() {
+        let manager = ChainManager::new("node-a".to_string());
+
+        let next_hop = manager.get_next_hop_tunnel("nonexistent");
+        assert!(next_hop.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_next_hop_tunnel_node_not_in_chain() {
+        let manager = ChainManager::new("node-x".to_string()); // Not in chain
+        let config = create_test_config("test-chain", 10);
+
+        manager.create_chain(config).await.unwrap();
+
+        // node-x is not in the chain, role is None
+        let next_hop = manager.get_next_hop_tunnel("test-chain");
+        assert!(next_hop.is_none());
     }
 
     // =========================================================================

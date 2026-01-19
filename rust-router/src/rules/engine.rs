@@ -56,7 +56,9 @@ use super::{
     CompiledRuleSet, DomainMatcher, DomainMatcherBuilder, FwmarkRouter, FwmarkRouterBuilder,
     GeoIpMatcher, GeoIpMatcherBuilder, PortRange, Rule, RuleType,
 };
+use crate::chain::manager::DscpRoutingCallback;
 use crate::error::RuleError;
+use crate::ipc::ChainRole;
 
 /// Connection metadata for rule matching.
 ///
@@ -388,6 +390,100 @@ impl RuleEngine {
     #[must_use]
     pub fn default_outbound(&self) -> String {
         self.config.load().default_outbound.clone()
+    }
+
+    /// Add a chain with the specified DSCP value.
+    ///
+    /// This atomically updates the routing configuration to include the new chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Unique chain identifier
+    /// * `dscp` - DSCP value for this chain (1-63)
+    ///
+    /// # Errors
+    ///
+    /// Returns `RuleError` if:
+    /// - The DSCP value is out of range
+    /// - The chain tag already exists
+    pub fn add_chain(&self, tag: &str, dscp: u8) -> Result<(), RuleError> {
+        let current = self.config.load();
+        
+        // Clone the existing fwmark_router and add the new chain
+        let mut fwmark_builder = FwmarkRouterBuilder::new();
+        
+        // Copy existing chains
+        for (existing_tag, chain_mark) in current.fwmark_router.chains() {
+            fwmark_builder = fwmark_builder
+                .add_chain_with_dscp(existing_tag, chain_mark.dscp_value)?;
+        }
+        
+        // Add the new chain
+        fwmark_builder = fwmark_builder.add_chain_with_dscp(tag, dscp)?;
+        
+        // Build new snapshot with updated fwmark_router
+        let new_snapshot = RoutingSnapshot {
+            domain_matcher: current.domain_matcher.clone(),
+            geoip_matcher: current.geoip_matcher.clone(),
+            fwmark_router: fwmark_builder.build(),
+            rules: current.rules.clone(),
+            default_outbound: current.default_outbound.clone(),
+            version: current.version + 1,
+        };
+        
+        self.config.store(Arc::new(new_snapshot));
+        Ok(())
+    }
+
+    /// Remove a chain from the routing configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Chain identifier to remove
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the chain was found and removed, `false` otherwise.
+    pub fn remove_chain(&self, tag: &str) -> bool {
+        let current = self.config.load();
+        
+        // Check if chain exists
+        if current.fwmark_router.get_chain_mark(tag).is_none() {
+            return false;
+        }
+        
+        // Rebuild fwmark_router without the removed chain using fold
+        // Note: add_chain_with_dscp should never fail here since we're copying
+        // existing valid chains (excluding the one being removed)
+        let fwmark_router = current
+            .fwmark_router
+            .chains()
+            .filter(|(existing_tag, _)| *existing_tag != tag)
+            .fold(FwmarkRouterBuilder::new(), |builder, (chain_tag, chain_mark)| {
+                builder
+                    .add_chain_with_dscp(chain_tag, chain_mark.dscp_value)
+                    .expect("existing chain should have valid DSCP")
+            })
+            .build();
+        
+        // Build new snapshot with updated fwmark_router
+        let new_snapshot = RoutingSnapshot {
+            domain_matcher: current.domain_matcher.clone(),
+            geoip_matcher: current.geoip_matcher.clone(),
+            fwmark_router,
+            rules: current.rules.clone(),
+            default_outbound: current.default_outbound.clone(),
+            version: current.version + 1,
+        };
+        
+        self.config.store(Arc::new(new_snapshot));
+        true
+    }
+
+    /// Check if a chain exists in the current configuration.
+    #[must_use]
+    pub fn has_chain(&self, tag: &str) -> bool {
+        self.config.load().fwmark_router.get_chain_mark(tag).is_some()
     }
 }
 
@@ -941,6 +1037,89 @@ impl std::fmt::Debug for RoutingSnapshotBuilder {
             .field("rules_count", &self.rules.len())
             .field("next_rule_id", &self.next_rule_id)
             .finish_non_exhaustive()
+    }
+}
+
+// ============================================================================
+// RuleEngineRoutingCallback
+// ============================================================================
+
+/// Routing callback that registers chains with the RuleEngine's FwmarkRouter.
+///
+/// This callback is set on `ChainManager` to ensure that when chains are
+/// activated or deactivated, the `RuleEngine`'s `FwmarkRouter` is updated
+/// to enable DSCP-based routing.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use rust_router::rules::engine::{RuleEngine, RuleEngineRoutingCallback};
+/// use rust_router::chain::manager::ChainManager;
+///
+/// let rule_engine = Arc::new(RuleEngine::new(snapshot));
+/// let chain_manager = Arc::new(ChainManager::new("local-node".to_string()));
+///
+/// // Wire up the callback
+/// let callback = Arc::new(RuleEngineRoutingCallback::new(Arc::clone(&rule_engine)));
+/// chain_manager.set_routing_callback(callback);
+/// ```
+pub struct RuleEngineRoutingCallback {
+    rule_engine: Arc<RuleEngine>,
+}
+
+impl RuleEngineRoutingCallback {
+    /// Create a new routing callback for the given rule engine.
+    #[must_use]
+    pub fn new(rule_engine: Arc<RuleEngine>) -> Self {
+        Self { rule_engine }
+    }
+}
+
+impl DscpRoutingCallback for RuleEngineRoutingCallback {
+    fn setup_routing(
+        &self,
+        chain_tag: &str,
+        dscp_value: u8,
+        role: ChainRole,
+        _exit_egress: Option<&str>,
+    ) -> Result<(), String> {
+        tracing::info!(
+            chain = %chain_tag,
+            dscp = dscp_value,
+            role = ?role,
+            "RuleEngineRoutingCallback: Adding chain to FwmarkRouter"
+        );
+
+        self.rule_engine
+            .add_chain(chain_tag, dscp_value)
+            .map_err(|e| format!("Failed to add chain to FwmarkRouter: {e}"))
+    }
+
+    fn teardown_routing(&self, chain_tag: &str) -> Result<(), String> {
+        tracing::info!(
+            chain = %chain_tag,
+            "RuleEngineRoutingCallback: Removing chain from FwmarkRouter"
+        );
+
+        let removed = self.rule_engine.remove_chain(chain_tag);
+        if !removed {
+            tracing::warn!(
+                chain = %chain_tag,
+                "Chain was not found in FwmarkRouter during teardown"
+            );
+        }
+        Ok(())
+    }
+
+    fn is_chain_registered(&self, chain_tag: &str) -> bool {
+        let is_registered = self.rule_engine.has_chain(chain_tag);
+        tracing::trace!(
+            chain = %chain_tag,
+            registered = is_registered,
+            "RuleEngineRoutingCallback: Checking chain registration"
+        );
+        is_registered
     }
 }
 

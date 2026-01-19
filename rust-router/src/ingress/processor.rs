@@ -68,7 +68,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::error::IngressError;
 use crate::chain::dscp::{get_dscp, DscpError, IPV4_MIN_HEADER_LEN, IPV6_MIN_HEADER_LEN};
@@ -285,6 +285,7 @@ impl IngressProcessor {
         };
 
         // Check for chain routing (DSCP > 0)
+        // DSCP-marked packets MUST be handled by chain routing - if not found, block to prevent leaks
         if dscp > 0 {
             let snapshot = self.rule_engine.load();
 
@@ -294,7 +295,10 @@ impl IngressProcessor {
                 .find(|(_, chain_mark)| chain_mark.dscp_value == dscp)
             {
                 if let Some(chain_manager) = self.chain_manager.read().clone() {
-                    if chain_manager.get_chain_role(chain_tag) == Some(ChainRole::Terminal) {
+                    let my_role = chain_manager.get_chain_role(chain_tag);
+
+                    if my_role == Some(ChainRole::Terminal) {
+                        // Terminal node: route to exit_egress and clear DSCP
                         if let Some(config) = chain_manager.get_chain_config(chain_tag) {
                             let exit_egress = config.exit_egress;
                             trace!(
@@ -313,31 +317,106 @@ impl IngressProcessor {
                             });
                         }
 
-                        debug!(
+                        // Terminal node config missing - this is an error, block the packet
+                        warn!(
                             peer = src_peer,
+                            dscp = dscp,
                             chain_tag = chain_tag,
-                            "Terminal chain config missing; routing via chain tag"
+                            "Terminal chain config missing; blocking packet to prevent leak"
                         );
+                        return Ok(RoutingDecision {
+                            outbound: "block".to_string(),
+                            dscp_mark: Some(0),
+                            routing_mark: None,
+                            is_chain_packet: true,
+                            match_info: Some(format!("dscp:{} terminal-config-missing", dscp)),
+                        });
+                    } else if my_role == Some(ChainRole::Entry) || my_role == Some(ChainRole::Relay) {
+                        // Entry/Relay node: forward to next hop's peer tunnel
+                        if let Some(next_hop_tunnel) = chain_manager.get_next_hop_tunnel(chain_tag) {
+                            trace!(
+                                peer = src_peer,
+                                dscp = dscp,
+                                chain_tag = chain_tag,
+                                next_hop = %next_hop_tunnel,
+                                role = ?my_role,
+                                "Forwarding chain packet to next hop"
+                            );
+                            return Ok(RoutingDecision {
+                                outbound: next_hop_tunnel,
+                                dscp_mark: Some(dscp), // Preserve DSCP for next hop
+                                routing_mark: Some(chain_mark.routing_mark),
+                                is_chain_packet: true,
+                                match_info: Some(format!("dscp:{} {:?}", chain_mark.dscp_value, my_role)),
+                            });
+                        }
+
+                        // Next hop tunnel not found - block to prevent leak
+                        warn!(
+                            peer = src_peer,
+                            dscp = dscp,
+                            chain_tag = chain_tag,
+                            role = ?my_role,
+                            "Next hop tunnel not found for chain; blocking packet to prevent leak"
+                        );
+                        return Ok(RoutingDecision {
+                            outbound: "block".to_string(),
+                            dscp_mark: Some(0),
+                            routing_mark: None,
+                            is_chain_packet: true,
+                            match_info: Some(format!("dscp:{} next-hop-missing", dscp)),
+                        });
+                    } else {
+                        // Role is None - this node is not part of the chain
+                        warn!(
+                            peer = src_peer,
+                            dscp = dscp,
+                            chain_tag = chain_tag,
+                            "Received chain packet but local node has no role; blocking packet"
+                        );
+                        return Ok(RoutingDecision {
+                            outbound: "block".to_string(),
+                            dscp_mark: Some(0),
+                            routing_mark: None,
+                            is_chain_packet: true,
+                            match_info: Some(format!("dscp:{} no-role", dscp)),
+                        });
                     }
                 }
 
-                trace!(
+                // No chain manager - this is a configuration error
+                warn!(
                     peer = src_peer,
                     dscp = dscp,
                     routing_mark = chain_mark.routing_mark,
                     chain_tag = chain_tag,
-                    "Chain packet detected"
+                    "Chain packet detected but no chain manager available; blocking packet"
                 );
-                // For chain packets, route using the matching chain tag
-                return Ok(RoutingDecision::chain_packet(chain_tag, *chain_mark));
+                return Ok(RoutingDecision {
+                    outbound: "block".to_string(),
+                    dscp_mark: Some(0),
+                    routing_mark: None,
+                    is_chain_packet: true,
+                    match_info: Some(format!("dscp:{} no-chain-manager", dscp)),
+                });
             }
 
-            // DSCP set but no chain registered - log and process normally
-            debug!(
+            // DSCP set but no chain registered - this indicates a chain activation issue
+            // Block the packet to prevent traffic leak to default egress
+            warn!(
                 peer = src_peer,
                 dscp = dscp,
-                "DSCP set but no chain registered, using rule matching"
+                "Received packet with DSCP={} but no chain registered for this value. \
+                 This indicates a chain activation issue. Blocking packet to prevent leak.",
+                dscp
             );
+            return Ok(RoutingDecision {
+                outbound: "block".to_string(),
+                dscp_mark: Some(0),
+                routing_mark: None,
+                is_chain_packet: true,
+                match_info: Some(format!("dscp:{} unregistered", dscp)),
+            });
         }
 
         // Extract connection info for rule matching
@@ -360,6 +439,41 @@ impl IngressProcessor {
             matched = ?result.matched_rule,
             "Routing decision"
         );
+
+        // Check if this is a chain route (entry node with DSCP=0 matching a chain rule)
+        // The rule engine returns the chain tag as outbound with a routing_mark
+        if let Some(chain_mark) = result
+            .routing_mark
+            .and_then(ChainMark::from_routing_mark)
+        {
+            // This is a chain route - resolve chain tag to peer tunnel for entry node
+            if let Some(chain_manager) = self.chain_manager.read().clone() {
+                let chain_tag = &result.outbound;
+                if let Some(next_hop_tunnel) = chain_manager.get_next_hop_tunnel(chain_tag) {
+                    debug!(
+                        peer = src_peer,
+                        chain_tag = chain_tag,
+                        next_hop = %next_hop_tunnel,
+                        dscp = chain_mark.dscp_value,
+                        "Entry node: routing to chain peer tunnel"
+                    );
+                    return Ok(RoutingDecision {
+                        outbound: next_hop_tunnel,
+                        dscp_mark: Some(chain_mark.dscp_value),
+                        routing_mark: Some(chain_mark.routing_mark),
+                        is_chain_packet: true,
+                        match_info: Some(format!("chain:{} entry", chain_tag)),
+                    });
+                }
+
+                // Chain tag exists but no next hop (might be terminal or misconfigured)
+                warn!(
+                    peer = src_peer,
+                    chain_tag = chain_tag,
+                    "Chain route matched but no next hop tunnel found"
+                );
+            }
+        }
 
         let mut decision = RoutingDecision::from_match_result(result);
         if dscp > 0 && decision.dscp_mark.is_none() {
@@ -893,16 +1007,23 @@ mod tests {
         let mut packet = create_ipv4_tcp_packet("10.25.0.2", "8.8.8.8", 443);
         set_dscp(&mut packet, 10).unwrap();
 
-        // No chain registered for DSCP 10, should use normal routing
+        // No chain registered for DSCP 10 - should be BLOCKED to prevent leak
+        // (This is the fix for multi-hop chain traffic leaking to default egress)
         let decision = processor.process(&packet, "test-peer").unwrap();
-        assert_eq!(decision.outbound, "direct");
-        assert!(!decision.is_chain());
-        assert_eq!(decision.dscp_mark, Some(0));
+        assert_eq!(decision.outbound, "block");
+        assert!(decision.is_chain()); // Marked as chain packet even though blocked
+        assert_eq!(decision.dscp_mark, Some(0)); // DSCP cleared
+        assert!(
+            decision.match_info.as_ref().map_or(false, |info| info.contains("unregistered")),
+            "match_info should indicate unregistered DSCP: {:?}",
+            decision.match_info
+        );
     }
 
     #[test]
-    fn test_process_dscp_packet_with_chain() {
-        // Create engine with chain registered
+    fn test_process_dscp_packet_with_chain_no_manager() {
+        // Create engine with chain registered in FwmarkRouter
+        // but no ChainManager configured - should be blocked
         let mut builder = RoutingSnapshotBuilder::new();
         builder.add_chain_with_dscp("test-chain", 10).unwrap();
         let snapshot = builder.default_outbound("direct").build().unwrap();
@@ -912,10 +1033,15 @@ mod tests {
         let mut packet = create_ipv4_tcp_packet("10.25.0.2", "8.8.8.8", 443);
         set_dscp(&mut packet, 10).unwrap();
 
+        // Chain found in FwmarkRouter but no ChainManager - should be BLOCKED
         let decision = processor.process(&packet, "test-peer").unwrap();
-        assert_eq!(decision.outbound, "test-chain");
+        assert_eq!(decision.outbound, "block");
         assert!(decision.is_chain());
-        assert_eq!(decision.dscp_mark, Some(10));
+        assert!(
+            decision.match_info.as_ref().map_or(false, |info| info.contains("no-chain-manager")),
+            "match_info should indicate no chain manager: {:?}",
+            decision.match_info
+        );
     }
 
     #[test]
@@ -963,6 +1089,117 @@ mod tests {
         assert!(decision.is_chain());
         assert_eq!(decision.dscp_mark, Some(0));
         assert!(decision.routing_mark.is_none());
+    }
+
+    #[test]
+    fn test_process_dscp_packet_entry_forwards_to_next_hop() {
+        let mut builder = RoutingSnapshotBuilder::new();
+        builder.add_chain_with_dscp("test-chain", 10).unwrap();
+        let snapshot = builder.default_outbound("direct").build().unwrap();
+        let engine = Arc::new(RuleEngine::new(snapshot));
+
+        // Create chain manager for entry node
+        let chain_manager = Arc::new(ChainManager::new("entry-node".to_string()));
+        let config = ChainConfig {
+            tag: "test-chain".to_string(),
+            description: "Entry forwards to relay".to_string(),
+            dscp_value: 10,
+            hops: vec![
+                ChainHop {
+                    node_tag: "entry-node".to_string(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "relay-node".to_string(),
+                    role: ChainRole::Relay,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "terminal-node".to_string(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            ],
+            rules: vec![],
+            exit_egress: "pia-us-east".to_string(),
+            allow_transitive: false,
+        };
+
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            chain_manager.create_chain(config).await.unwrap();
+        });
+
+        let processor = IngressProcessor::new(engine);
+        processor.set_chain_manager(Arc::clone(&chain_manager));
+
+        let mut packet = create_ipv4_tcp_packet("10.25.0.2", "8.8.8.8", 443);
+        set_dscp(&mut packet, 10).unwrap();
+
+        let decision = processor.process(&packet, "test-peer").unwrap();
+        // Entry node should forward to next hop's peer tunnel
+        assert_eq!(decision.outbound, "peer-relay-node");
+        assert!(decision.is_chain());
+        // DSCP should be preserved for the next hop
+        assert_eq!(decision.dscp_mark, Some(10));
+        // Routing mark should be set
+        assert!(decision.routing_mark.is_some());
+    }
+
+    #[test]
+    fn test_process_dscp_packet_relay_forwards_to_next_hop() {
+        let mut builder = RoutingSnapshotBuilder::new();
+        builder.add_chain_with_dscp("test-chain", 10).unwrap();
+        let snapshot = builder.default_outbound("direct").build().unwrap();
+        let engine = Arc::new(RuleEngine::new(snapshot));
+
+        // Create chain manager for relay node
+        let chain_manager = Arc::new(ChainManager::new("relay-node".to_string()));
+        let config = ChainConfig {
+            tag: "test-chain".to_string(),
+            description: "Relay forwards to terminal".to_string(),
+            dscp_value: 10,
+            hops: vec![
+                ChainHop {
+                    node_tag: "entry-node".to_string(),
+                    role: ChainRole::Entry,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "relay-node".to_string(),
+                    role: ChainRole::Relay,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+                ChainHop {
+                    node_tag: "terminal-node".to_string(),
+                    role: ChainRole::Terminal,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            ],
+            rules: vec![],
+            exit_egress: "pia-us-east".to_string(),
+            allow_transitive: false,
+        };
+
+        let runtime = Runtime::new().unwrap();
+        runtime.block_on(async {
+            chain_manager.create_chain(config).await.unwrap();
+        });
+
+        let processor = IngressProcessor::new(engine);
+        processor.set_chain_manager(Arc::clone(&chain_manager));
+
+        let mut packet = create_ipv4_tcp_packet("10.25.0.2", "8.8.8.8", 443);
+        set_dscp(&mut packet, 10).unwrap();
+
+        let decision = processor.process(&packet, "test-peer").unwrap();
+        // Relay node should forward to terminal node's peer tunnel
+        assert_eq!(decision.outbound, "peer-terminal-node");
+        assert!(decision.is_chain());
+        // DSCP should be preserved for the terminal node
+        assert_eq!(decision.dscp_mark, Some(10));
+        assert!(decision.routing_mark.is_some());
     }
 
     #[test]

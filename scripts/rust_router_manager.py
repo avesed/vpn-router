@@ -1118,8 +1118,9 @@ class RustRouterManager:
 
         This method:
         1. Gets all enabled routing rules from database
-        2. Converts them to RuleConfig format
-        3. Sends UpdateRouting command to rust-router
+        2. Validates outbounds and skips invalid rules (Phase 11-Fix)
+        3. Converts them to RuleConfig format
+        4. Sends UpdateRouting command to rust-router
 
         Returns:
             SyncResult with statistics and errors
@@ -1135,8 +1136,48 @@ class RustRouterManager:
                 # Phase 11-Fix.Z: 使用正确的方法名 get_setting() (不是 get_settings())
                 default_outbound = db.get_setting("default_outbound", "direct") or "direct"
 
-                # Convert to RuleConfig list
+                # Phase 11-Fix: Get valid outbounds from rust-router to pre-validate rules
+                # This prevents the entire sync from failing due to one invalid rule
+                valid_outbounds: Set[str] = {"block", "adblock", "direct"}
+                async with await self._get_client() as client:
+                    # Get regular outbounds
+                    try:
+                        outbounds = await client.list_outbounds()
+                        valid_outbounds.update(o.tag for o in outbounds)
+                    except Exception as e:
+                        logger.warning(f"Failed to get outbounds list: {e}")
+
+                    # Get WG tunnels
+                    try:
+                        tunnels = await client.list_wg_tunnels()
+                        valid_outbounds.update(t.tag for t in tunnels)
+                    except Exception as e:
+                        logger.warning(f"Failed to get WG tunnels list: {e}")
+
+                    # Get ECMP groups
+                    try:
+                        groups = await client.list_ecmp_groups()
+                        valid_outbounds.update(g.tag for g in groups)
+                    except Exception as e:
+                        logger.warning(f"Failed to get ECMP groups list: {e}")
+
+                    # Get active chains
+                    try:
+                        chains = await client.list_chains()
+                        # Only add ACTIVE chains as valid outbounds
+                        valid_outbounds.update(
+                            c.tag for c in chains if c.chain_state == "active"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to get chains list: {e}")
+
+                    # Also allow WireGuard-prefixed tags (may be added later)
+                    # These are checked by rust-router's is_valid_outbound_tag
+
+                # Convert to RuleConfig list, skipping invalid outbounds
                 rule_configs: List[RuleConfig] = []
+                skipped_rules: List[str] = []
+
                 for rule in rules:
                     rule_type = rule.get("rule_type", "")
                     target = rule.get("target", "")
@@ -1147,10 +1188,28 @@ class RustRouterManager:
                     if not rule_type or not target:
                         continue
 
+                    # Phase 11-Fix: Skip rules with invalid outbounds
+                    # Allow WireGuard-prefixed tags as they may be added later
+                    is_wg_prefixed = (
+                        outbound.startswith("wg-") or
+                        outbound.startswith("pia-") or
+                        outbound.startswith("peer-")
+                    )
+                    if outbound not in valid_outbounds and not is_wg_prefixed:
+                        skipped_rules.append(f"{rule_type}:{target}->{outbound}")
+                        logger.warning(
+                            f"Skipping rule with invalid outbound: "
+                            f"{rule_type}:{target} -> {outbound}"
+                        )
+                        continue
+
                     # Phase 11-Fix.AF: Use domain_suffix for domain rules to match all subdomains
                     # e.g., "example.com" matches "www.example.com", "api.example.com", etc.
                     if rule_type == "domain":
                         rule_type = "domain_suffix"
+                    # Phase 11-Fix.AG: Map 'ip' to 'ip_cidr' for rust-router compatibility
+                    elif rule_type == "ip":
+                        rule_type = "ip_cidr"
 
                     rule_configs.append(RuleConfig(
                         rule_type=rule_type,
@@ -1160,14 +1219,23 @@ class RustRouterManager:
                         enabled=True,
                     ))
 
-                # Send to rust-router
+                # Log skipped rules summary
+                if skipped_rules:
+                    result.errors.append(
+                        f"Skipped {len(skipped_rules)} rules with invalid outbounds: "
+                        f"{', '.join(skipped_rules[:5])}"
+                        + (f" and {len(skipped_rules) - 5} more" if len(skipped_rules) > 5 else "")
+                    )
+
+                # Send valid rules to rust-router
                 async with await self._get_client() as client:
                     update_result = await client.update_routing(rule_configs, default_outbound)
 
                     if update_result.success:
                         result.rules_synced = update_result.rule_count
                         logger.info(
-                            f"Routing rules synced: {result.rules_synced} rules, "
+                            f"Routing rules synced: {result.rules_synced} rules "
+                            f"(skipped {len(skipped_rules)} invalid), "
                             f"version={update_result.version}, default={update_result.default_outbound}"
                         )
                     else:
@@ -1614,9 +1682,10 @@ class RustRouterManager:
                         # Activate chain if it should be active
                         if chain_state == "active":
                             # Check current state in rust-router
+                            # Note: Rust ChainStatus uses "state", not "chain_state"
                             status_response = await client.get_chain_status(tag)
                             if status_response.success and status_response.data:
-                                rr_state = status_response.data.get("chain_state", "inactive")
+                                rr_state = status_response.data.get("state", status_response.data.get("chain_state", "inactive"))
                                 if rr_state != "active":
                                     activate_response = await client.activate_chain(tag)
                                     if not activate_response.success:
@@ -1787,20 +1856,21 @@ class RustRouterManager:
         result.ecmp_groups_synced = ecmp_result.ecmp_groups_synced
         result.errors.extend(ecmp_result.errors)
 
-        # Then sync routing rules (after ECMP groups so default_outbound exists)
-        rules_result = await self.sync_routing_rules()
-        result.rules_synced = rules_result.rules_synced
-        result.errors.extend(rules_result.errors)
-
-        # Sync peers (Phase 6)
+        # Sync peers (Phase 6) - before chains since chains may reference peer tunnels
         peers_result = await self.sync_peers()
         result.peers_synced = peers_result.peers_synced
         result.errors.extend(peers_result.errors)
 
-        # Sync chains (Phase 6)
+        # Sync chains BEFORE routing rules (Phase 11-Fix)
+        # Routing rules may reference chain tags as outbounds, so chains must exist first
         chains_result = await self.sync_chains()
         result.chains_synced = chains_result.chains_synced
         result.errors.extend(chains_result.errors)
+
+        # Then sync routing rules (after ECMP groups and chains so outbounds exist)
+        rules_result = await self.sync_routing_rules()
+        result.rules_synced = rules_result.rules_synced
+        result.errors.extend(rules_result.errors)
 
         # Phase 11-Fix.AD: Sync WireGuard ingress client peers
         wg_ingress_result = await self.sync_wg_ingress_peers()

@@ -1727,7 +1727,8 @@ class RustRouterClient:
                     description=item.get("description", ""),
                     hops=item.get("hops", []),
                     exit_egress=item.get("exit_egress", ""),
-                    chain_state=item.get("chain_state", "inactive"),
+                    # Note: Rust ChainStatus uses "state", not "chain_state"
+                    chain_state=item.get("state", item.get("chain_state", "inactive")),
                     dscp_value=item.get("dscp_value"),
                     allow_transitive=item.get("allow_transitive", False),
                     last_error=item.get("last_error"),

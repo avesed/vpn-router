@@ -136,7 +136,7 @@ pub mod types;
 pub use domain::{DomainMatcher, DomainMatcherBuilder};
 pub use engine::{
     ConnectionInfo, MatchResult, MatchedRule, RoutingSnapshot, RoutingSnapshotBuilder, RuleEngine,
-    SnapshotStats,
+    RuleEngineRoutingCallback, SnapshotStats,
 };
 pub use fwmark::{
     dscp_to_routing_mark, dscp_to_routing_table, is_dscp_terminal_table, is_ecmp_table,

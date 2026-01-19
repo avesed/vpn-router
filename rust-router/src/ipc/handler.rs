@@ -10,16 +10,16 @@ use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainListResponse, ChainRoleResponse,
-    ChainState, DnsBlockStatsResponse, DnsCacheStatsResponse, DnsConfigResponse,
-    DnsQueryLogResponse, DnsQueryResponse, DnsStatsResponse,
-    DnsUpstreamInfo, DnsUpstreamStatusResponse, EcmpGroupListResponse, EcmpGroupStatus,
-    EcmpMemberStatus, ErrorCode, IngressStatsResponse, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
-    PairingResponse, PeerListResponse, PeerState, PoolStatsResponse, PrepareResponse,
-    PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus,
-    Socks5PoolStats, TunnelType, UdpProcessorInfo, UdpSessionInfo, UdpSessionResponse,
-    UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse, UdpWorkerPoolInfo,
-    UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
+    BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainDiagnosticsResponse,
+    ChainListResponse, ChainRole, ChainRoleResponse, ChainState, DnsBlockStatsResponse,
+    DnsCacheStatsResponse, DnsConfigResponse, DnsQueryLogResponse, DnsQueryResponse,
+    DnsStatsResponse, DnsUpstreamInfo, DnsUpstreamStatusResponse, EcmpGroupListResponse,
+    EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IngressStatsResponse, IpcCommand, IpcResponse,
+    OutboundInfo, OutboundStatsResponse, PairingResponse, PeerListResponse, PeerState,
+    PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
+    ServerCapabilities, ServerStatus, Socks5PoolStats, TunnelType, UdpProcessorInfo,
+    UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
+    UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
 };
 use crate::chain::ChainManager;
 use crate::dns::cache::DnsCache;
@@ -485,6 +485,15 @@ impl IpcHandler {
             }
         }
 
+        // Phase 11-Fix: Check chain_manager for multi-hop chains
+        // Only ACTIVE chains can be used as outbounds (they're registered in FwmarkRouter)
+        // Inactive chains exist but can't route traffic properly
+        if let Some(ref chain_mgr) = self.chain_manager {
+            if chain_mgr.is_chain_active(tag) {
+                return true;
+            }
+        }
+
         // Allow WireGuard-prefixed tags that may be added later via IPC
         // These prefixes match the forwarder's is_wg_egress check
         if tag.starts_with("wg-")
@@ -744,6 +753,9 @@ impl IpcHandler {
             }
             IpcCommand::GetChainRole { chain_tag } => {
                 self.handle_get_chain_role(&chain_tag)
+            }
+            IpcCommand::DiagnoseChain { tag } => {
+                self.handle_diagnose_chain(&tag)
             }
             IpcCommand::UpdateChainState { tag, state, last_error } => {
                 self.handle_update_chain_state(&tag, state, last_error)
@@ -2475,6 +2487,149 @@ impl IpcHandler {
         })
     }
 
+    /// Handle `DiagnoseChain` command
+    ///
+    /// Returns comprehensive diagnostics for troubleshooting chain routing issues.
+    fn handle_diagnose_chain(&self, tag: &str) -> IpcResponse {
+        let mut issues = Vec::new();
+
+        // Check if chain manager is available
+        let Some(chain_manager) = &self.chain_manager else {
+            return IpcResponse::ChainDiagnostics(ChainDiagnosticsResponse {
+                tag: tag.to_string(),
+                chain_exists: false,
+                chain_state: None,
+                my_role: None,
+                dscp_value: None,
+                fwmark_registered: false,
+                fwmark_dscp: None,
+                fwmark_routing_mark: None,
+                next_hop_tunnel: None,
+                exit_egress: None,
+                last_error: None,
+                issues: vec!["Chain manager not available".to_string()],
+                healthy: false,
+            });
+        };
+
+        // Get chain info from ChainManager
+        let chain_exists = chain_manager.chain_exists(tag);
+        let chain_state = chain_manager.get_chain_state(tag);
+        let my_role = chain_manager.get_chain_role(tag);
+        let chain_config = chain_manager.get_chain_config(tag);
+        let dscp_value = chain_config.as_ref().map(|c| c.dscp_value);
+        let exit_egress = chain_config.as_ref().map(|c| c.exit_egress.clone());
+        let next_hop_tunnel = chain_manager.get_next_hop_tunnel(tag);
+        let last_error = chain_manager.get_chain_error(tag);
+
+        // Check FwmarkRouter registration
+        let snapshot = self.rule_engine.load();
+        let fwmark_registered = snapshot.fwmark_router.is_chain(tag);
+        let fwmark_chain_mark = snapshot.fwmark_router.get_chain_mark(tag);
+        let fwmark_dscp = fwmark_chain_mark.map(|m| m.dscp_value);
+        let fwmark_routing_mark = fwmark_chain_mark.map(|m| m.routing_mark);
+
+        // Detect issues
+        if !chain_exists {
+            issues.push(format!("Chain '{}' does not exist in ChainManager", tag));
+        } else {
+            // Check state consistency
+            if let Some(state) = chain_state {
+                match state {
+                    ChainState::Active => {
+                        // Active chains MUST be registered in FwmarkRouter
+                        if !fwmark_registered {
+                            issues.push(
+                                "Chain is Active but NOT registered in FwmarkRouter - \
+                                 this is the root cause of traffic leaks!"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    ChainState::Activating => {
+                        issues.push("Chain is in Activating state (2PC in progress)".to_string());
+                    }
+                    ChainState::Error => {
+                        issues.push(format!(
+                            "Chain is in Error state: {}",
+                            last_error.as_deref().unwrap_or("unknown error")
+                        ));
+                    }
+                    ChainState::Inactive => {
+                        if fwmark_registered {
+                            issues.push(
+                                "Chain is Inactive but still registered in FwmarkRouter - \
+                                 stale registration"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Check role-specific requirements
+            if let Some(role) = my_role {
+                match role {
+                    ChainRole::Entry | ChainRole::Relay => {
+                        if next_hop_tunnel.is_none() {
+                            issues.push(format!(
+                                "Node role is {:?} but next_hop_tunnel is not configured - \
+                                 packets will be blocked",
+                                role
+                            ));
+                        }
+                    }
+                    ChainRole::Terminal => {
+                        if exit_egress.is_none() {
+                            issues.push(
+                                "Node role is Terminal but exit_egress is not configured - \
+                                 packets will be blocked"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            } else if chain_exists && chain_state == Some(ChainState::Active) {
+                issues.push(
+                    "Chain is Active but local node has no role - \
+                     this node is not part of the chain"
+                        .to_string(),
+                );
+            }
+
+            // Check DSCP consistency
+            if let (Some(cm_dscp), Some(fw_dscp)) = (dscp_value, fwmark_dscp) {
+                if cm_dscp != fw_dscp {
+                    issues.push(format!(
+                        "DSCP value mismatch: ChainManager={}, FwmarkRouter={}",
+                        cm_dscp, fw_dscp
+                    ));
+                }
+            }
+        }
+
+        let healthy = issues.is_empty()
+            && chain_exists
+            && chain_state == Some(ChainState::Active)
+            && fwmark_registered;
+
+        IpcResponse::ChainDiagnostics(ChainDiagnosticsResponse {
+            tag: tag.to_string(),
+            chain_exists,
+            chain_state,
+            my_role,
+            dscp_value,
+            fwmark_registered,
+            fwmark_dscp,
+            fwmark_routing_mark,
+            next_hop_tunnel,
+            exit_egress,
+            last_error,
+            issues,
+            healthy,
+        })
+    }
+
     /// Handle `UpdateChainState` command
     ///
     /// Updates the state of a chain (used for persistence and recovery).
@@ -3150,10 +3305,17 @@ impl IpcHandler {
                     .collect();
 
                 let stats = group.stats();
+                let config = group.config();
                 let status = EcmpGroupStatus {
                     tag: tag.to_string(),
+                    description: config.description.clone(),
                     algorithm,
+                    member_count: member_stats.len(),
+                    healthy_count: member_stats.iter().filter(|m| m.healthy).count(),
                     members,
+                    routing_mark: config.routing_mark,
+                    routing_table: config.routing_table,
+                    health_check: config.health_check,
                     active_connections: stats.total_connections,
                     total_connections: stats.total_requests,
                 };
@@ -3208,8 +3370,14 @@ impl IpcHandler {
                     let stats = group.stats();
                     EcmpGroupStatus {
                         tag: tag.clone(),
+                        description: config.description.clone(),
                         algorithm,
+                        member_count: member_stats.len(),
+                        healthy_count: member_stats.iter().filter(|m| m.healthy).count(),
                         members,
+                        routing_mark: config.routing_mark,
+                        routing_table: config.routing_table,
+                        health_check: config.health_check,
                         active_connections: stats.total_connections,
                         total_connections: stats.total_requests,
                     }
@@ -5196,7 +5364,7 @@ mod tests {
     use crate::ingress::manager::WgIngressManager;
     use crate::ingress::{ForwardingStats, IngressReplyStats};
     use crate::ipc::protocol::{EgressAction, ErrorCode, RuleConfig};
-    use crate::rules::{RuleEngine, RuleType};
+    use crate::rules::{RuleEngine, RuleEngineRoutingCallback, RuleType};
     use ipnet::IpNet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
@@ -6048,6 +6216,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_routing_with_chain_outbound() {
+        // Phase 11-Fix: Test that ACTIVE chain tags are accepted as valid outbounds
+        let handler = create_test_handler_with_chain_manager();
+
+        // First create a chain
+        let config = create_test_chain_config("my-chain");
+        let create_response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "my-chain".into(),
+                config,
+            })
+            .await;
+        assert!(!create_response.is_error(), "Failed to create chain: {:?}", create_response);
+
+        // Activate the chain (required for it to be a valid outbound)
+        let activate_response = handler
+            .handle(IpcCommand::ActivateChain {
+                tag: "my-chain".into(),
+            })
+            .await;
+        assert!(!activate_response.is_error(), "Failed to activate chain: {:?}", activate_response);
+
+        // Now update routing rules with the chain as outbound
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![RuleConfig {
+                    rule_type: "domain".into(),
+                    target: "chain-routed.com".into(),
+                    outbound: "my-chain".into(),  // Use active chain as outbound
+                    priority: 0,
+                    enabled: true,
+                }],
+                default_outbound: "direct".into(),
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        if let IpcResponse::UpdateRoutingResult(result) = response {
+            assert!(result.success);
+            assert_eq!(result.rule_count, 1);
+        } else {
+            panic!("Expected UpdateRoutingResult response");
+        }
+    }
+
+    #[tokio::test]
     async fn test_set_default_outbound_success() {
         let handler = create_test_handler_with_rules();
 
@@ -6065,6 +6279,86 @@ mod tests {
             assert_eq!(stats.default_outbound, "proxy");
         } else {
             panic!("Expected RuleStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_default_outbound_to_chain() {
+        // Phase 11-Fix: Test that ACTIVE chain tags can be used as default outbound
+        let handler = create_test_handler_with_chain_manager();
+
+        // First create a chain
+        let config = create_test_chain_config("default-chain");
+        let create_response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "default-chain".into(),
+                config,
+            })
+            .await;
+        assert!(!create_response.is_error(), "Failed to create chain: {:?}", create_response);
+
+        // Activate the chain (required for it to be a valid outbound)
+        let activate_response = handler
+            .handle(IpcCommand::ActivateChain {
+                tag: "default-chain".into(),
+            })
+            .await;
+        assert!(!activate_response.is_error(), "Failed to activate chain: {:?}", activate_response);
+
+        // Set chain as default outbound
+        let response = handler
+            .handle(IpcCommand::SetDefaultOutbound {
+                tag: "default-chain".into(),
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        // Verify the default was changed
+        let stats_response = handler.handle(IpcCommand::GetRuleStats).await;
+        if let IpcResponse::RuleStats(stats) = stats_response {
+            assert_eq!(stats.default_outbound, "default-chain");
+        } else {
+            panic!("Expected RuleStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_routing_with_chain_as_default() {
+        // Phase 11-Fix: Test that ACTIVE chain tags can be used as default_outbound in UpdateRouting
+        let handler = create_test_handler_with_chain_manager();
+
+        // First create a chain
+        let config = create_test_chain_config("route-default-chain");
+        let create_response = handler
+            .handle(IpcCommand::CreateChain {
+                tag: "route-default-chain".into(),
+                config,
+            })
+            .await;
+        assert!(!create_response.is_error(), "Failed to create chain: {:?}", create_response);
+
+        // Activate the chain (required for it to be a valid outbound)
+        let activate_response = handler
+            .handle(IpcCommand::ActivateChain {
+                tag: "route-default-chain".into(),
+            })
+            .await;
+        assert!(!activate_response.is_error(), "Failed to activate chain: {:?}", activate_response);
+
+        // Update routing with chain as default outbound
+        let response = handler
+            .handle(IpcCommand::UpdateRouting {
+                rules: vec![],
+                default_outbound: "route-default-chain".into(),  // Active chain as default
+            })
+            .await;
+        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+
+        if let IpcResponse::UpdateRoutingResult(result) = response {
+            assert!(result.success);
+            assert_eq!(result.default_outbound, "route-default-chain");
+        } else {
+            panic!("Expected UpdateRoutingResult response");
         }
     }
 
@@ -6506,18 +6800,24 @@ mod tests {
             Duration::from_millis(300),
         ));
 
+        // Create RuleEngine
+        let rule_engine = Arc::new(RuleEngine::new(
+            RoutingSnapshotBuilder::new()
+                .default_outbound("direct")
+                .version(1)
+                .build()
+                .unwrap(),
+        ));
+
+        // Create ChainManager and wire up the routing callback
         let chain_manager = Arc::new(ChainManager::new("local-node".to_string()));
+        let routing_callback = Arc::new(RuleEngineRoutingCallback::new(Arc::clone(&rule_engine)));
+        chain_manager.set_routing_callback(routing_callback);
 
         IpcHandler::new_with_chain_manager(
             connection_manager,
             outbound_manager,
-            Arc::new(RuleEngine::new(
-                RoutingSnapshotBuilder::new()
-                    .default_outbound("direct")
-                    .version(1)
-                    .build()
-                    .unwrap(),
-            )),
+            rule_engine,
             chain_manager,
             "local-node".to_string(),
         )

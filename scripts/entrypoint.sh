@@ -150,6 +150,36 @@ USERSPACE_WG="true"
 export USERSPACE_WG
 
 # ============================================================================
+# Startup Cleanup (for host network mode)
+# ============================================================================
+
+cleanup_stale_interfaces() {
+  # With host network mode, WireGuard interfaces persist after container exit.
+  # Clean them up at startup to prevent port conflicts.
+  echo "[entrypoint] cleaning up stale interfaces from previous run..."
+
+  # Cleanup wg-ingress if it exists
+  if ip link show wg-ingress >/dev/null 2>&1; then
+    echo "[entrypoint] removing stale wg-ingress interface"
+    ip link delete wg-ingress 2>/dev/null || true
+  fi
+
+  # Cleanup PIA egress interfaces (wg-pia-*)
+  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-pia-'); do
+    echo "[entrypoint] removing stale interface: ${iface}"
+    ip link delete "${iface}" 2>/dev/null || true
+  done
+
+  # Cleanup WARP and peer interfaces (wg-warp-*, wg-peer-*)
+  for iface in $(ip -br link show type wireguard 2>/dev/null | awk '{print $1}' | grep -E '^wg-(warp|peer)-'); do
+    echo "[entrypoint] removing stale interface: ${iface}"
+    ip link delete "${iface}" 2>/dev/null || true
+  done
+
+  echo "[entrypoint] stale interface cleanup complete"
+}
+
+# ============================================================================
 # Port Conflict Checks
 # ============================================================================
 
@@ -264,6 +294,9 @@ if [ $? -ne 0 ]; then
   echo "[entrypoint] failed to initialize user database" >&2
   exit 1
 fi
+
+# Cleanup stale interfaces from previous container run (host network mode)
+cleanup_stale_interfaces
 
 # Verify ports
 verify_required_ports

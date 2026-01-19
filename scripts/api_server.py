@@ -2370,6 +2370,47 @@ async def startup_event():
     recovered = _recover_orphaned_chains()
     if recovered > 0:
         print(f"[Chain Recovery] 已恢复 {recovered} 条孤立链路（重置为 error 状态）")
+    # Sync WG_LISTEN_PORT env var to database
+    _sync_wg_listen_port_to_db()
+
+
+def _sync_wg_listen_port_to_db():
+    """Sync WG_LISTEN_PORT environment variable to wireguard_server table.
+    
+    This ensures the database listen_port matches the actual port rust-router
+    is listening on, so generated client configs use the correct port.
+    """
+    env_port = os.environ.get("WG_LISTEN_PORT")
+    if not env_port:
+        return
+    
+    try:
+        env_port_int = int(env_port)
+    except ValueError:
+        logging.warning(f"[WG Sync] Invalid WG_LISTEN_PORT value: {env_port}")
+        return
+    
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return
+    
+    try:
+        db = _get_db()
+        server = db.get_wireguard_server()
+        if not server:
+            return
+        
+        db_port = server.get("listen_port")
+        if db_port != env_port_int:
+            db.set_wireguard_server(
+                interface_name=server.get("interface_name", "wg-ingress"),
+                address=server.get("address", DEFAULT_WG_SUBNET),
+                listen_port=env_port_int,
+                mtu=server.get("mtu", 1420),
+                private_key=server.get("private_key")
+            )
+            print(f"[WG Sync] Updated wireguard_server.listen_port: {db_port} -> {env_port_int}")
+    except Exception as e:
+        logging.warning(f"[WG Sync] Failed to sync listen_port: {e}")
 
 
 @app.on_event("shutdown")
@@ -3748,7 +3789,11 @@ def api_get_rules():
 
 @app.put("/api/rules")
 def api_update_rules(payload: RouteRulesUpdateRequest):
-    """更新路由规则（数据库版本，使用批量操作优化性能）"""
+    """更新路由规则（数据库版本，使用批量操作优化性能）
+
+    Phase 11-Fix.AG: Returns structured response with sync_success/sync_error fields.
+    Raises HTTP 502 on sync failure instead of silently succeeding.
+    """
     if HAS_DATABASE and USER_DB_PATH.exists():
         # 使用数据库存储（方案 B）
         db = _get_db()
@@ -3803,20 +3848,59 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
         # 保存默认出口到数据库
         db.set_setting("default_outbound", payload.default_outbound)
 
-        # 重新生成配置并重载 sing-box
-        reload_status = None
+        # Build base response
+        db_message = f"路由规则已保存到数据库（删除 {deleted_count} 条，添加 {added_count} 条）"
+        response = {
+            "message": db_message,
+            "db_success": True,
+            "deleted_count": deleted_count,
+            "added_count": added_count,
+        }
+
+        # 重新生成配置并重载 rust-router
         if payload.regenerate_config:
             try:
                 _regenerate_and_reload()
-                reload_status = "已重载"
+                response["sync_success"] = True
+                response["message"] = f"{db_message}，已同步到 rust-router"
+            except RuntimeError as exc:
+                # NOTE: _regenerate_and_reload() -> reload_singbox() catches RustRouterSyncError
+                # internally and raises RuntimeError with the error message. So we only need
+                # to catch RuntimeError here.
+                logging.error(f"[api] PUT /api/rules sync failed: {exc}")
+                response["sync_success"] = False
+                response["sync_error"] = str(exc)
+                # Phase 11-Fix.AG: Return HTTP 502 to signal sync failure to frontend
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": f"{db_message}，但同步到 rust-router 失败: {exc}",
+                        "db_success": True,
+                        "sync_success": False,
+                        "sync_error": str(exc),
+                        "deleted_count": deleted_count,
+                        "added_count": added_count,
+                    }
+                )
             except Exception as exc:
-                print(f"[api] 重载配置失败: {exc}")
-                reload_status = f"重载失败: {exc}"
+                logging.error(f"[api] PUT /api/rules unexpected error: {exc}")
+                response["sync_success"] = False
+                response["sync_error"] = str(exc)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": f"{db_message}，重载失败: {exc}",
+                        "db_success": True,
+                        "sync_success": False,
+                        "sync_error": str(exc),
+                    }
+                )
+        else:
+            # No sync requested - mark as not attempted
+            response["sync_success"] = None
+            response["sync_error"] = None
 
-        message = f"路由规则已保存到数据库（删除 {deleted_count} 条，添加 {added_count} 条）"
-        if reload_status:
-            message += f"，{reload_status}"
-        return {"message": message}
+        return response
     else:
         # 降级到 JSON 文件存储
         custom_data = {
@@ -3824,7 +3908,12 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
             "default_outbound": payload.default_outbound,
         }
         save_custom_rules(custom_data)
-        return {"message": "路由规则已保存，需要重新连接 VPN 生效"}
+        return {
+            "message": "路由规则已保存，需要重新连接 VPN 生效",
+            "db_success": True,
+            "sync_success": None,
+            "sync_error": None,
+        }
 
 
 class DefaultOutboundRequest(BaseModel):
@@ -4051,7 +4140,7 @@ def api_add_custom_rule(payload: CustomRuleRequest):
         )
 
     if not HAS_DATABASE or not USER_DB_PATH.exists():
-        raise HTTPException(status_code=500, detail="数据库不可用")
+        raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = _get_db()
 
@@ -4097,29 +4186,52 @@ def api_add_custom_rule(payload: CustomRuleRequest):
         # 批量插入所有规则
         added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
 
-        # Phase 11-Fix: Sync rules to rust-router via IPC
-        sync_message = ""
-        try:
-            sync_message = _sync_rules_to_rust_router(db)
-        except Exception as sync_err:
-            logging.warning(f"Failed to sync rules to rust-router: {sync_err}")
-            sync_message = f", rust-router sync error: {sync_err}"
-
-        return {
-            "message": f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）{sync_message}",
+        # Phase 11-Fix.AG: Sync rules to rust-router via IPC with proper error handling
+        db_message = f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）"
+        response = {
+            "message": db_message,
             "tag": payload.tag,
             "outbound": payload.outbound,
-            "count": added_count
+            "count": added_count,
+            "db_success": True,
         }
+
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            response["sync_success"] = True
+            response["message"] = f"{db_message}，{sync_result.message}"
+        except RustRouterSyncError as sync_err:
+            logging.error(f"Failed to sync rules to rust-router after add: {sync_err}")
+            response["sync_success"] = False
+            response["sync_error"] = str(sync_err)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": f"{db_message}，但同步失败: {sync_err}",
+                    "tag": payload.tag,
+                    "outbound": payload.outbound,
+                    "count": added_count,
+                    "db_success": True,
+                    "sync_success": False,
+                    "sync_error": str(sync_err),
+                }
+            )
+
+        return response
+    except HTTPException:
+        raise  # Re-raise HTTPException as-is
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"添加规则失败: {str(e)}")
 
 
 @app.delete("/api/rules/custom/{rule_id}")
 def api_delete_custom_rule(rule_id: int):
-    """删除自定义路由规则（数据库版本）"""
+    """删除自定义路由规则（数据库版本）
+
+    Phase 11-Fix.AG: Returns structured response with sync_success/sync_error fields.
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
-        raise HTTPException(status_code=500, detail="数据库不可用")
+        raise HTTPException(status_code=503, detail="数据库不可用")
 
     db = _get_db()
     success = db.delete_routing_rule(rule_id)
@@ -4127,20 +4239,40 @@ def api_delete_custom_rule(rule_id: int):
     if not success:
         raise HTTPException(status_code=404, detail=f"规则 ID {rule_id} 不存在")
 
-    # Phase 11-Fix: Sync rules to rust-router via IPC
-    sync_message = ""
-    try:
-        sync_message = _sync_rules_to_rust_router(db)
-    except Exception as sync_err:
-        logging.warning(f"Failed to sync rules to rust-router after delete: {sync_err}")
-        sync_message = f", rust-router sync error: {sync_err}"
+    # Phase 11-Fix.AG: Sync rules to rust-router via IPC with proper error handling
+    db_message = f"规则 ID {rule_id} 已删除"
+    response = {
+        "message": db_message,
+        "rule_id": rule_id,
+        "db_success": True,
+    }
 
-    return {"message": f"规则 ID {rule_id} 已删除{sync_message}"}
+    try:
+        sync_result = _sync_rules_to_rust_router(db)
+        response["sync_success"] = True
+        response["message"] = f"{db_message}，{sync_result.message}"
+    except RustRouterSyncError as sync_err:
+        logging.error(f"Failed to sync rules to rust-router after delete: {sync_err}")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{db_message}，但同步失败: {sync_err}",
+                "rule_id": rule_id,
+                "db_success": True,
+                "sync_success": False,
+                "sync_error": str(sync_err),
+            }
+        )
+
+    return response
 
 
 @app.delete("/api/rules/custom/by-tag/{tag}")
 def api_delete_custom_rule_by_tag(tag: str):
-    """删除自定义路由规则（通过 tag）"""
+    """删除自定义路由规则（通过 tag）
+
+    Phase 11-Fix.AG: Returns structured response with sync_success/sync_error fields.
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
@@ -4150,15 +4282,34 @@ def api_delete_custom_rule_by_tag(tag: str):
     if deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"未找到标签为 '{tag}' 的规则")
 
-    # Phase 11-Fix: Sync rules to rust-router via IPC
-    sync_message = ""
-    try:
-        sync_message = _sync_rules_to_rust_router(db)
-    except Exception as sync_err:
-        logging.warning(f"Failed to sync rules to rust-router after delete: {sync_err}")
-        sync_message = f", rust-router sync error: {sync_err}"
+    # Phase 11-Fix.AG: Sync rules to rust-router via IPC with proper error handling
+    db_message = f"已删除 {deleted_count} 条标签为 '{tag}' 的规则"
+    response = {
+        "message": db_message,
+        "tag": tag,
+        "deleted_count": deleted_count,
+        "db_success": True,
+    }
 
-    return {"message": f"已删除 {deleted_count} 条标签为 '{tag}' 的规则{sync_message}"}
+    try:
+        sync_result = _sync_rules_to_rust_router(db)
+        response["sync_success"] = True
+        response["message"] = f"{db_message}，{sync_result.message}"
+    except RustRouterSyncError as sync_err:
+        logging.error(f"Failed to sync rules to rust-router after delete by tag: {sync_err}")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"{db_message}，但同步失败: {sync_err}",
+                "tag": tag,
+                "deleted_count": deleted_count,
+                "db_success": True,
+                "sync_success": False,
+                "sync_error": str(sync_err),
+            }
+        )
+
+    return response
 
 
 @app.put("/api/rules/custom/by-tag/{tag}")
@@ -4247,21 +4398,38 @@ def api_update_custom_rule_by_tag(tag: str, payload: CustomRuleRequest):
         # 批量插入所有新规则
         added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
 
-        # Phase 11-Fix: Sync rules to rust-router via IPC
-        sync_message = ""
-        try:
-            sync_message = _sync_rules_to_rust_router(db)
-        except Exception as sync_err:
-            logging.warning(f"Failed to sync rules to rust-router after update: {sync_err}")
-            sync_message = f", rust-router sync error: {sync_err}"
-
-        return {
-            "message": f"规则 '{tag}' 已更新（删除 {deleted_count} 条，添加 {added_count} 条）{sync_message}",
+        # Phase 11-Fix.AG: Sync rules to rust-router via IPC with proper error handling
+        db_message = f"规则 '{tag}' 已更新（删除 {deleted_count} 条，添加 {added_count} 条）"
+        response = {
+            "message": db_message,
             "tag": tag,
             "outbound": payload.outbound,
             "deleted_count": deleted_count,
-            "added_count": added_count
+            "added_count": added_count,
+            "db_success": True,
         }
+
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            response["sync_success"] = True
+            response["message"] = f"{db_message}，{sync_result.message}"
+        except RustRouterSyncError as sync_err:
+            logging.error(f"Failed to sync rules to rust-router after update: {sync_err}")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": f"{db_message}，但同步失败: {sync_err}",
+                    "tag": tag,
+                    "outbound": payload.outbound,
+                    "deleted_count": deleted_count,
+                    "added_count": added_count,
+                    "db_success": True,
+                    "sync_success": False,
+                    "sync_error": str(sync_err),
+                }
+            )
+
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -4345,16 +4513,23 @@ def reload_singbox() -> dict:
 
     NOTE: sing-box 已被 rust-router 取代。此函数现在通过 IPC 同步配置到 rust-router。
     保留函数名以保持 API 兼容性。
+
+    Phase 11-Fix.AG: Now properly propagates sync failures instead of silently succeeding.
     """
     try:
-        # 同步规则到 rust-router
-        sync_msg = _sync_rules_to_rust_router()
+        # 同步规则到 rust-router (raise_on_error=True by default)
+        sync_result = _sync_rules_to_rust_router()
         return {
-            "success": True, 
-            "message": "配置已同步到 rust-router" + sync_msg,
-            "method": "rust-router-ipc"
+            "success": True,
+            "message": f"配置已同步到 rust-router, {sync_result.message}",
+            "method": "rust-router-ipc",
+            "rule_count": sync_result.rule_count
         }
+    except RustRouterSyncError as exc:
+        logging.error(f"reload_singbox failed: {exc}")
+        return {"success": False, "message": str(exc), "sync_error": exc.result.error}
     except Exception as exc:
+        logging.error(f"reload_singbox unexpected error: {exc}")
         return {"success": False, "message": str(exc)}
 
 
@@ -9533,24 +9708,54 @@ def _regenerate_and_reload():
         raise RuntimeError(f"配置同步失败: {error_msg}")
 
 
-def _sync_rules_to_rust_router(db=None) -> str:
+class RustRouterSyncResult:
+    """Result of rust-router sync operation for structured error handling."""
+
+    def __init__(self, success: bool, rule_count: int = 0, error: Optional[str] = None):
+        self.success = success
+        self.rule_count = rule_count
+        self.error = error
+
+    @property
+    def message(self) -> str:
+        """Human-readable message for logging/display."""
+        if self.success:
+            return f"rust-router synced ({self.rule_count} rules)"
+        return f"rust-router sync failed: {self.error}"
+
+
+class RustRouterSyncError(Exception):
+    """Exception raised when rust-router sync fails."""
+
+    def __init__(self, message: str, result: RustRouterSyncResult = None):
+        super().__init__(message)
+        self.result = result or RustRouterSyncResult(success=False, error=message)
+
+
+def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRouterSyncResult:
     """Sync routing rules from database to rust-router via IPC.
-    
+
     Phase 11-Fix: Called after adding/deleting rules to sync with rust-router.
     Phase 11-Fix.AE: Fixed asyncio event loop handling for FastAPI context.
-    
+    Phase 11-Fix.AG: Now raises exception on failure instead of returning error string.
+
     Args:
         db: Optional DatabaseManager instance. If None, will get from _get_db().
-        
+        raise_on_error: If True, raises RustRouterSyncError on failure. If False,
+                        returns RustRouterSyncResult with success=False.
+
     Returns:
-        str: Status message about the sync operation.
+        RustRouterSyncResult: Structured result with success status and details.
+
+    Raises:
+        RustRouterSyncError: If sync fails and raise_on_error is True.
     """
     import asyncio
     import concurrent.futures
-    
+
     if db is None:
         db = _get_db()
-    
+
     # Prepare rule configs before async operations
     all_rules = db.get_routing_rules(enabled_only=True)
     rule_configs = []
@@ -9567,22 +9772,30 @@ def _sync_rules_to_rust_router(db=None) -> str:
             "target": target,
             "outbound": outbound,
         })
-    
+
     default_outbound = db.get_setting("default_outbound", "direct") or "direct"
-    
+
     async def _do_sync():
         """Inner async function to perform the sync."""
         client = RustRouterClient()
         ping_response = await client.ping()
         if not ping_response.success:
             return None, "rust-router not available"
-        
+
         result = await client.update_routing(rule_configs, default_outbound)
         if result.success:
             return result, None
         else:
             return None, "rust-router sync failed"
-    
+
+    def _handle_error(error_msg: str) -> RustRouterSyncResult:
+        """Handle sync error - either raise or return failure result."""
+        logging.error(f"rust-router sync failed: {error_msg}")
+        result = RustRouterSyncResult(success=False, error=error_msg)
+        if raise_on_error:
+            raise RustRouterSyncError(error_msg, result)
+        return result
+
     try:
         # Handle asyncio event loop properly for FastAPI context
         try:
@@ -9594,19 +9807,19 @@ def _sync_rules_to_rust_router(db=None) -> str:
         except RuntimeError:
             # No running loop - safe to use asyncio.run() directly
             result, error = asyncio.run(_do_sync())
-        
+
         if error:
-            return f", {error}"
+            return _handle_error(error)
         if result:
-            return f", rust-router synced ({result.rule_count} rules)"
-        return ", rust-router sync failed"
-            
+            return RustRouterSyncResult(success=True, rule_count=result.rule_count)
+        return _handle_error("unknown sync failure")
+
     except concurrent.futures.TimeoutError:
-        logging.warning("rust-router sync timed out")
-        return ", rust-router sync timeout"
+        return _handle_error("sync timed out (10s)")
+    except RustRouterSyncError:
+        raise  # Re-raise our own exception
     except Exception as e:
-        logging.warning(f"Failed to sync rules to rust-router: {e}")
-        return f", rust-router sync error: {e}"
+        return _handle_error(str(e))
 
 
 def _full_regenerate_after_import():
@@ -13480,9 +13693,34 @@ def api_peer_info_egress(request: Request):
     # 收集所有可用出口
     egress_list = []
 
-    # 辅助函数：检查接口是否存在
-    def _check_interface(interface: str) -> bool:
-        """检查内核接口是否存在"""
+    # Phase 12-Fix: 获取 rust-router 出口健康状态（用于 userspace WireGuard 检测）
+    # 当使用 userspace WireGuard 时，内核接口不存在，需要从 rust-router 获取状态
+    rust_router_outbound_health = {}
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            import asyncio
+            from rust_router_client import RustRouterClient
+
+            async def _fetch_outbound_health():
+                client = RustRouterClient()
+                await client.connect()
+                outbounds = await client.list_outbounds()
+                await client.close()
+                return {o.tag: o.health for o in outbounds}
+
+            rust_router_outbound_health = asyncio.run(_fetch_outbound_health())
+            logging.debug(f"[peer-info] rust-router 出口状态: {len(rust_router_outbound_health)} 个出口")
+        except Exception as e:
+            logging.debug(f"[peer-info] 无法获取 rust-router 出口状态: {e}")
+
+    # 辅助函数：检查接口是否存在（支持 kernel 和 userspace WireGuard）
+    def _check_interface(interface: str, egress_tag: str = None) -> bool:
+        """检查接口是否存在/连接
+        
+        支持两种模式：
+        1. 内核 WireGuard：检查 ip link show
+        2. Userspace WireGuard (rust-router)：从 rust-router 获取健康状态
+        """
         try:
             import subprocess
             result = subprocess.run(
@@ -13490,18 +13728,32 @@ def api_peer_info_egress(request: Request):
                 capture_output=True,
                 timeout=5
             )
-            return result.returncode == 0
+            if result.returncode == 0:
+                return True
+            
+            # Phase 12-Fix: 内核接口不存在时，检查 rust-router 出口状态
+            # 这支持 userspace WireGuard 模式（使用 boringtun）
+            if egress_tag and rust_router_outbound_health:
+                health = rust_router_outbound_health.get(egress_tag, "unknown")
+                if health in ("healthy", "unknown"):
+                    # "healthy" 表示出口可用
+                    # "unknown" 表示未配置健康检查，假设可用
+                    logging.debug(f"[peer-info] 出口 '{egress_tag}' 使用 userspace WireGuard，健康状态: {health}")
+                    return True
+            
+            return False
         except Exception:
             return False
 
     # 1. PIA profiles
     for profile in db.get_pia_profiles(enabled_only=True):
         from db_helper import get_egress_interface_name
-        interface = get_egress_interface_name(profile["name"], egress_type="pia")
-        connected = _check_interface(interface)
+        tag = profile["name"]
+        interface = get_egress_interface_name(tag, egress_type="pia")
+        connected = _check_interface(interface, egress_tag=tag)
         egress_list.append({
-            "tag": profile["name"],
-            "name": profile.get("description") or profile["name"],
+            "tag": tag,
+            "name": profile.get("description") or tag,
             "type": "pia",
             "enabled": True,
             "connected": connected,
@@ -13512,11 +13764,12 @@ def api_peer_info_egress(request: Request):
     # 2. Custom WireGuard
     for egress in db.get_custom_egress_list(enabled_only=True):
         from db_helper import get_egress_interface_name
-        interface = get_egress_interface_name(egress["tag"], egress_type="custom")
-        connected = _check_interface(interface)
+        tag = egress["tag"]
+        interface = get_egress_interface_name(tag, egress_type="custom")
+        connected = _check_interface(interface, egress_tag=tag)
         egress_list.append({
-            "tag": egress["tag"],
-            "name": egress.get("description") or egress["tag"],
+            "tag": tag,
+            "name": egress.get("description") or tag,
             "type": "custom",
             "enabled": True,
             "connected": connected,
@@ -13566,18 +13819,19 @@ def api_peer_info_egress(request: Request):
 
     # 6. WARP egress
     for egress in db.get_warp_egress_list(enabled_only=True):
+        tag = egress["tag"]
         protocol = egress.get("protocol", "wireguard")
         # WARP WireGuard 模式检查接口，MASQUE 模式无法检查
         if protocol == "wireguard":
             from db_helper import get_egress_interface_name
-            interface = get_egress_interface_name(egress["tag"], egress_type="warp")
-            connected = _check_interface(interface)
+            interface = get_egress_interface_name(tag, egress_type="warp")
+            connected = _check_interface(interface, egress_tag=tag)
         else:
             interface = None
             connected = True  # MASQUE 模式无法检查
         egress_list.append({
-            "tag": egress["tag"],
-            "name": egress.get("description") or egress["tag"],
+            "tag": tag,
+            "name": egress.get("description") or tag,
             "type": "warp",
             "enabled": True,
             "connected": connected,
@@ -14289,14 +14543,100 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
             f"mark={payload.mark_value} -> {payload.egress_tag}"
         )
 
-        # Phase 12: 移除 iptables 规则应用 - rust-router 在用户空间处理 DSCP 路由
-        # rust-router 的 ChainManager 会根据 DSCP 值将流量路由到 exit_egress
-        # 参见 rust-router/src/ingress/processor.rs 第 297-313 行
-        logging.info(
-            f"[tunnel-api] 链路路由注册完成: "
-            f"chain={payload.chain_tag}, mark={payload.mark_value} "
-            f"(rust-router userspace DSCP routing)"
-        )
+        # Phase 12-Fix: Sync chain to rust-router for DSCP-based terminal routing
+        # The terminal node's rust-router needs to know about this chain to route
+        # incoming DSCP-marked packets to the correct exit_egress.
+        # See rust-router/src/ingress/processor.rs lines 287-313
+        rr_sync_success = False
+        rr_sync_error = None
+        try:
+            import asyncio
+            
+            async def _sync_chain_to_rust_router():
+                client = await _get_rust_router_client()
+                if not client:
+                    return False, "rust-router not available"
+                
+                local_tag = _get_local_node_tag(db)
+                source_tag = payload.source_node or node["tag"]
+                
+                # Build chain config for terminal node
+                # The chain has: entry (source_node) -> terminal (local_node)
+                chain_config = {
+                    "tag": payload.chain_tag,
+                    "description": f"Chain route from {source_tag}",
+                    "dscp_value": payload.mark_value,
+                    "hops": [
+                        {
+                            "node_tag": source_tag,
+                            "role": "entry",
+                            "tunnel_type": "wireguard",
+                        },
+                        {
+                            "node_tag": local_tag,
+                            "role": "terminal",
+                            "tunnel_type": "wireguard",
+                        },
+                    ],
+                    "rules": [],
+                    "exit_egress": payload.egress_tag,
+                    "allow_transitive": False,
+                }
+                
+                # Check if chain already exists
+                list_response = await client.list_chains()
+                existing_tags = set()
+                if list_response.success and list_response.data:
+                    existing_tags = {c.get("tag") for c in list_response.data if c.get("tag")}
+                
+                if payload.chain_tag in existing_tags:
+                    # Update existing chain - first deactivate if active
+                    status_resp = await client.get_chain_status(payload.chain_tag)
+                    if status_resp.success and status_resp.data:
+                        if status_resp.data.get("chain_state") == "active":
+                            await client.deactivate_chain(payload.chain_tag)
+                    
+                    # Delete and recreate (update may not change hops)
+                    await client.delete_chain(payload.chain_tag)
+                
+                # Create the chain
+                create_resp = await client.create_chain(
+                    tag=payload.chain_tag,
+                    config=chain_config,
+                )
+                if not create_resp.success:
+                    return False, f"Failed to create chain: {create_resp.error}"
+                
+                # Activate the chain
+                activate_resp = await client.activate_chain(payload.chain_tag)
+                if not activate_resp.success:
+                    return False, f"Failed to activate chain: {activate_resp.error}"
+                
+                return True, None
+            
+            # Run async function
+            loop = asyncio.new_event_loop()
+            try:
+                rr_sync_success, rr_sync_error = loop.run_until_complete(_sync_chain_to_rust_router())
+            finally:
+                loop.close()
+                
+        except Exception as e:
+            rr_sync_error = str(e)
+            logging.warning(f"[tunnel-api] rust-router sync failed: {e}")
+        
+        if rr_sync_success:
+            logging.info(
+                f"[tunnel-api] 链路路由注册完成: "
+                f"chain={payload.chain_tag}, mark={payload.mark_value} -> {payload.egress_tag} "
+                f"(rust-router synced)"
+            )
+        else:
+            logging.warning(
+                f"[tunnel-api] 链路路由注册完成但 rust-router 同步失败: "
+                f"chain={payload.chain_tag}, error={rr_sync_error}"
+            )
+        
         return {"success": True, "message": "Chain route registered"}
 
     except ValueError as e:
@@ -14427,10 +14767,56 @@ def api_chain_routing_unregister(
             mark_type=mark_type,
         )
         if deleted:
-            logging.info(
-                f"[tunnel-api] 链路路由注销成功: chain={chain_tag}, "
-                f"mark={mark_value} (rust-router userspace DSCP routing)"
-            )
+            # Phase 12-Fix: Remove chain from rust-router
+            try:
+                import asyncio
+                
+                async def _remove_chain_from_rust_router():
+                    client = await _get_rust_router_client()
+                    if not client:
+                        return False, "rust-router not available"
+                    
+                    # Check if chain exists
+                    list_response = await client.list_chains()
+                    existing_tags = set()
+                    if list_response.success and list_response.data:
+                        existing_tags = {c.get("tag") for c in list_response.data if c.get("tag")}
+                    
+                    if chain_tag not in existing_tags:
+                        return True, None  # Chain doesn't exist, nothing to do
+                    
+                    # Deactivate if active
+                    status_resp = await client.get_chain_status(chain_tag)
+                    if status_resp.success and status_resp.data:
+                        if status_resp.data.get("chain_state") == "active":
+                            await client.deactivate_chain(chain_tag)
+                    
+                    # Delete the chain
+                    delete_resp = await client.delete_chain(chain_tag)
+                    if not delete_resp.success:
+                        return False, f"Failed to delete chain: {delete_resp.error}"
+                    
+                    return True, None
+                
+                loop = asyncio.new_event_loop()
+                try:
+                    rr_success, rr_error = loop.run_until_complete(_remove_chain_from_rust_router())
+                finally:
+                    loop.close()
+                
+                if rr_success:
+                    logging.info(
+                        f"[tunnel-api] 链路路由注销成功: chain={chain_tag}, "
+                        f"mark={mark_value} (rust-router synced)"
+                    )
+                else:
+                    logging.warning(
+                        f"[tunnel-api] 链路路由注销成功但 rust-router 同步失败: "
+                        f"chain={chain_tag}, error={rr_error}"
+                    )
+            except Exception as e:
+                logging.warning(f"[tunnel-api] rust-router cleanup failed: {e}")
+            
             return {
                 "success": True,
                 "message": "Chain route unregistered",
@@ -18429,6 +18815,77 @@ async def api_activate_chain(tag: str):
 
         # Phase 6 Issue 29: 标记激活成功
         activation_success = True
+
+        # Phase 12-Fix: Sync chain to rust-router with full configuration
+        # This ensures rust-router knows about the chain hops, DSCP value, and exit_egress
+        try:
+            import asyncio
+            
+            async def _sync_chain_to_local_rust_router():
+                client = await _get_rust_router_client()
+                if not client:
+                    return False, "rust-router not available"
+                
+                # Build chain config for entry node
+                chain_config = {
+                    "tag": tag,
+                    "description": chain.get("description", ""),
+                    "dscp_value": dscp_value,
+                    "hops": [
+                        {
+                            "node_tag": local_node_id,
+                            "role": "entry",
+                            "tunnel_type": "wireguard",
+                        },
+                        {
+                            "node_tag": terminal_tag,
+                            "role": "terminal",
+                            "tunnel_type": "wireguard",
+                        },
+                    ],
+                    "rules": [],
+                    "exit_egress": exit_egress,
+                    "allow_transitive": allow_transitive,
+                }
+                
+                # Check if chain exists
+                list_response = await client.list_chains()
+                existing_tags = set()
+                if list_response.success and list_response.data:
+                    existing_tags = {c.get("tag") for c in list_response.data if c.get("tag")}
+                
+                if tag in existing_tags:
+                    # Deactivate and delete existing chain
+                    status_resp = await client.get_chain_status(tag)
+                    if status_resp.success and status_resp.data:
+                        if status_resp.data.get("state") == "active":
+                            await client.deactivate_chain(tag)
+                    await client.delete_chain(tag)
+                
+                # Create with full config
+                create_resp = await client.create_chain(tag=tag, config=chain_config)
+                if not create_resp.success:
+                    return False, f"Failed to create chain: {create_resp.error}"
+                
+                # Activate
+                activate_resp = await client.activate_chain(tag)
+                if not activate_resp.success:
+                    return False, f"Failed to activate chain: {activate_resp.error}"
+                
+                return True, None
+            
+            loop = asyncio.new_event_loop()
+            try:
+                rr_success, rr_error = loop.run_until_complete(_sync_chain_to_local_rust_router())
+            finally:
+                loop.close()
+            
+            if rr_success:
+                logging.info(f"[chains] 链路 '{tag}' 已同步到 rust-router")
+            else:
+                logging.warning(f"[chains] rust-router 同步失败: {rr_error}")
+        except Exception as e:
+            logging.warning(f"[chains] rust-router 同步异常: {e}")
 
         # 重新生成 sing-box 配置
         reload_status = "success"

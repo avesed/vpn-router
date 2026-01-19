@@ -531,6 +531,20 @@ pub enum IpcCommand {
         chain_tag: String,
     },
 
+    /// Diagnose chain routing status
+    ///
+    /// Returns comprehensive diagnostics for a chain, including:
+    /// - Chain state in ChainManager
+    /// - Registration status in FwmarkRouter
+    /// - Next hop tunnel availability
+    /// - Exit egress configuration
+    ///
+    /// Use this command to troubleshoot chain routing issues.
+    DiagnoseChain {
+        /// Chain tag to diagnose
+        tag: String,
+    },
+
     /// Update chain state in database
     ///
     /// Updates the chain state for persistence and recovery.
@@ -992,6 +1006,9 @@ pub enum IpcResponse {
 
     /// Chain role response
     ChainRole(ChainRoleResponse),
+
+    /// Chain diagnostics response
+    ChainDiagnostics(ChainDiagnosticsResponse),
 
     /// Two-Phase Commit prepare response
     PrepareResult(PrepareResponse),
@@ -1616,10 +1633,28 @@ fn default_health_interval() -> u32 {
 pub struct EcmpGroupStatus {
     /// Group tag
     pub tag: String,
+    /// Group description
+    #[serde(default)]
+    pub description: String,
     /// Load balancing algorithm
     pub algorithm: EcmpAlgorithm,
     /// Member status
     pub members: Vec<EcmpMemberStatus>,
+    /// Number of members (for Python client compatibility)
+    #[serde(default)]
+    pub member_count: usize,
+    /// Number of healthy members (for Python client compatibility)
+    #[serde(default)]
+    pub healthy_count: usize,
+    /// Routing mark
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_mark: Option<u32>,
+    /// Routing table
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_table: Option<u32>,
+    /// Whether health check is enabled
+    #[serde(default)]
+    pub health_check: bool,
     /// Total active connections
     pub active_connections: u64,
     /// Total connections handled
@@ -2132,6 +2167,47 @@ pub struct ChainRoleResponse {
     pub role: Option<ChainRole>,
     /// Whether this node is in the chain
     pub in_chain: bool,
+}
+
+/// Chain diagnostics response
+///
+/// Comprehensive diagnostics for troubleshooting chain routing issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainDiagnosticsResponse {
+    /// Chain tag being diagnosed
+    pub tag: String,
+    /// Whether chain exists in ChainManager
+    pub chain_exists: bool,
+    /// Chain state in ChainManager (if exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_state: Option<ChainState>,
+    /// Local node's role in the chain (if exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub my_role: Option<ChainRole>,
+    /// Allocated DSCP value (if exists)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dscp_value: Option<u8>,
+    /// Whether chain is registered in FwmarkRouter
+    pub fwmark_registered: bool,
+    /// DSCP value in FwmarkRouter (if registered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fwmark_dscp: Option<u8>,
+    /// Routing mark in FwmarkRouter (if registered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fwmark_routing_mark: Option<u32>,
+    /// Next hop tunnel tag (for entry/relay nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_hop_tunnel: Option<String>,
+    /// Exit egress tag (for terminal nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_egress: Option<String>,
+    /// Last error message (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// List of detected issues (empty if healthy)
+    pub issues: Vec<String>,
+    /// Overall health status
+    pub healthy: bool,
 }
 
 /// Response for Two-Phase Commit prepare
