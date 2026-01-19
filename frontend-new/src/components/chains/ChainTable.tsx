@@ -62,12 +62,19 @@ export function ChainTable({ chains }: ChainTableProps) {
     });
   };
 
-  const handleHealthCheck = (tag: string) => {
-    toast.promise(healthCheck.mutateAsync(tag), {
-      loading: t("chains.checking"),
-      success: t("chains.healthCheckSuccess"),
-      error: t("chains.healthCheckFailed"),
-    });
+  const handleHealthCheck = async (tag: string) => {
+    toast.loading(t("chains.checking"), { id: `health-${tag}` });
+    try {
+      const result = await healthCheck.mutateAsync(tag);
+      if (result.healthy) {
+        toast.success(result.message || t("chains.healthCheckSuccess"), { id: `health-${tag}` });
+      } else {
+        // Show detailed message for unhealthy chains
+        toast.error(result.message || t("chains.healthCheckFailed"), { id: `health-${tag}` });
+      }
+    } catch {
+      toast.error(t("chains.healthCheckFailed"), { id: `health-${tag}` });
+    }
   };
 
   const getStateLabel = (state?: string) => {

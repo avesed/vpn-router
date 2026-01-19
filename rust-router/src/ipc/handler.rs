@@ -3244,12 +3244,9 @@ impl IpcHandler {
 
         // Clear existing members and add new ones
         // First, get current members to remove them
-        let current_members: Vec<String> = group
-            .config()
-            .members
-            .iter()
-            .map(|m| m.tag.clone())
-            .collect();
+        // NOTE: Use member_tags() to get the actual runtime member list,
+        // not config().members which is the static initial configuration
+        let current_members: Vec<String> = group.member_tags();
 
         // Remove all current members
         for member_tag in current_members {

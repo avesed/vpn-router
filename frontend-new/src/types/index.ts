@@ -1384,12 +1384,19 @@ export interface ChainHopResult {
   message?: string;
 }
 
+export interface ChainEgressCheckResult {
+  exit_egress: string | null;
+  status: "available" | "unavailable" | "not_configured" | "skipped" | "unknown";
+  message: string | null;
+}
+
 export interface ChainHealthCheckResponse {
   chain: string;
   healthy: boolean;
   message: string;
   total_hops: number;
   hops: ChainHopResult[];
+  egress_check?: ChainEgressCheckResult;
 }
 
 

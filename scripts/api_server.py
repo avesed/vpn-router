@@ -13480,65 +13480,110 @@ def api_peer_info_egress(request: Request):
     # 收集所有可用出口
     egress_list = []
 
+    # 辅助函数：检查接口是否存在
+    def _check_interface(interface: str) -> bool:
+        """检查内核接口是否存在"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["ip", "link", "show", interface],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     # 1. PIA profiles
     for profile in db.get_pia_profiles(enabled_only=True):
+        from db_helper import get_egress_interface_name
+        interface = get_egress_interface_name(profile["name"], egress_type="pia")
+        connected = _check_interface(interface)
         egress_list.append({
             "tag": profile["name"],
             "name": profile.get("description") or profile["name"],
             "type": "pia",
             "enabled": True,
+            "connected": connected,
+            "interface": interface,
             "description": f"PIA {profile.get('region_id', 'Unknown')}",
         })
 
     # 2. Custom WireGuard
     for egress in db.get_custom_egress_list(enabled_only=True):
+        from db_helper import get_egress_interface_name
+        interface = get_egress_interface_name(egress["tag"], egress_type="custom")
+        connected = _check_interface(interface)
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "custom",
             "enabled": True,
+            "connected": connected,
+            "interface": interface,
             "description": "Custom WireGuard",
         })
 
     # 3. Direct egress
     for egress in db.get_direct_egress_list(enabled_only=True):
+        bind_iface = egress.get('bind_interface')
+        connected = _check_interface(bind_iface) if bind_iface else True
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "direct",
             "enabled": True,
-            "description": f"Direct ({egress.get('bind_interface') or egress.get('inet4_bind_address', '')})",
+            "connected": connected,
+            "interface": bind_iface,
+            "description": f"Direct ({bind_iface or egress.get('inet4_bind_address', '')})",
         })
 
     # 4. OpenVPN egress
     for egress in db.get_openvpn_egress_list(enabled_only=True):
+        # OpenVPN 使用 tun 接口，接口名在配置中
+        interface = egress.get("tun_interface", "tun0")
+        connected = _check_interface(interface)
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "openvpn",
             "enabled": True,
+            "connected": connected,
+            "interface": interface,
             "description": f"OpenVPN {egress.get('remote_host', '')}",
         })
 
-    # 5. V2Ray egress
+    # 5. V2Ray egress (SOCKS-based, always "connected" if enabled)
     for egress in db.get_v2ray_egress_list(enabled_only=True):
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "v2ray",
             "enabled": True,
+            "connected": True,  # V2Ray 无法检查实际连接，假设可用
             "description": f"V2Ray {egress.get('protocol', '')}",
         })
 
     # 6. WARP egress
     for egress in db.get_warp_egress_list(enabled_only=True):
+        protocol = egress.get("protocol", "wireguard")
+        # WARP WireGuard 模式检查接口，MASQUE 模式无法检查
+        if protocol == "wireguard":
+            from db_helper import get_egress_interface_name
+            interface = get_egress_interface_name(egress["tag"], egress_type="warp")
+            connected = _check_interface(interface)
+        else:
+            interface = None
+            connected = True  # MASQUE 模式无法检查
         egress_list.append({
             "tag": egress["tag"],
             "name": egress.get("description") or egress["tag"],
             "type": "warp",
             "enabled": True,
-            "description": f"WARP {egress.get('protocol', '')}",
-            "protocol": egress.get("protocol", "wireguard"),  # Phase 11-Fix.Q: 用于 MASQUE 检测
+            "connected": connected,
+            "interface": interface,
+            "description": f"WARP {protocol}",
+            "protocol": protocol,  # Phase 11-Fix.Q: 用于 MASQUE 检测
         })
 
     # 7. 添加内置 direct 出口
@@ -13547,6 +13592,7 @@ def api_peer_info_egress(request: Request):
         "name": "Direct",
         "type": "direct",
         "enabled": True,
+        "connected": True,  # 内置 direct 始终可用
         "description": "Default direct connection",
     })
 
@@ -13558,6 +13604,7 @@ def api_peer_info_egress(request: Request):
             "name": group.get("name") or group["tag"],
             "type": "group",
             "enabled": True,
+            "connected": True,  # 组的连接状态由成员决定，这里不检查
             "description": f"{'负载均衡' if group_type == 'loadbalance' else '故障转移'}组",
             "group_type": group_type,
         })
@@ -13698,15 +13745,24 @@ async def _validate_remote_terminal_egress(
         if exit_egress not in egress_tags:
             return f"Egress '{exit_egress}' not found on terminal node '{terminal_tag}'"
 
-        # 检查出口类型是否兼容 DSCP 路由
+        # 检查出口类型和连接状态
         for egress in egress_list:
             if egress.get("tag") == exit_egress:
                 egress_type = egress.get("type", "unknown")
+                
+                # 检查是否兼容 DSCP 路由
                 if egress_type in ("v2ray", "socks"):
                     return f"Egress '{exit_egress}' is SOCKS-based ({egress_type}), incompatible with DSCP routing"
                 # Phase 11-Fix.Q: 使用 protocol 字段检测 WARP MASQUE
                 if egress_type == "warp" and egress.get("protocol") == "masque":
                     return f"WARP MASQUE egress '{exit_egress}' is SOCKS-based, incompatible with DSCP routing"
+                
+                # 检查出口接口是否实际连接（WireGuard 接口是否存在）
+                connected = egress.get("connected", True)  # 默认为 True（兼容旧版本）
+                if not connected:
+                    interface = egress.get("interface", "unknown")
+                    return f"Egress '{exit_egress}' interface '{interface}' is not connected on terminal node '{terminal_tag}'"
+                
                 break
 
         logging.info(f"[validate-egress] 终端出口验证通过: {exit_egress} on {terminal_tag}")
@@ -17425,16 +17481,18 @@ MAX_CHAIN_HOPS = 10  # 防止 DoS 攻击的最大跳数限制
 
 
 @app.post("/api/chains/{tag}/health-check")
-def api_chain_health_check(tag: str):
+async def api_chain_health_check(tag: str):
     """检查多跳链路的健康状态
 
     遍历链路中的所有跳转，检查每一跳的隧道状态。
     对于多跳链路，使用递归中继查询来获取下游节点的状态。
+    同时验证终端节点的出口可用性，确保流量能正常出网。
 
     例如链路 A → B → C → D：
     1. 检查本节点 (A) 到 B 的隧道状态（直接查询）
     2. 通过 B 查询 B 到 C 的隧道状态（中继查询）
     3. 通过 B 查询 C 到 D 的隧道状态（B 递归转发给 C）
+    4. 验证终端节点 (D) 的 exit_egress 是否存在且可用
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -17529,12 +17587,71 @@ def api_chain_health_check(tag: str):
 
         hop_results.append(hop_result)
 
+    # 验证终端节点的出口配置
+    exit_egress = chain.get("exit_egress")
+    allow_transitive = chain.get("allow_transitive", False)
+    egress_check = {
+        "exit_egress": exit_egress,
+        "status": "unknown",
+        "message": None,
+    }
+
+    if not exit_egress:
+        egress_check["status"] = "not_configured"
+        egress_check["message"] = "链路未配置终端出口 (exit_egress)"
+        all_healthy = False
+    elif all_healthy:
+        # 只有在所有跳都连通的情况下才验证终端出口
+        # 通过 IPC 转发验证终端节点的出口是否存在且可用
+        egress_error = await _validate_remote_terminal_egress(
+            db, hops, exit_egress, allow_transitive
+        )
+        if egress_error:
+            egress_check["status"] = "unavailable"
+            egress_check["message"] = egress_error
+            all_healthy = False
+        else:
+            egress_check["status"] = "available"
+            egress_check["message"] = f"终端出口 '{exit_egress}' 可用"
+    else:
+        egress_check["status"] = "skipped"
+        egress_check["message"] = "隧道未全部连通，跳过终端出口验证"
+
+    # 将健康检查结果保存到数据库
+    # 计算健康状态：隧道全连且出口可用=healthy，部分连接=degraded，全部断开=unhealthy
+    connected_count = sum(1 for h in hop_results if h["status"] == "connected")
+    egress_ok = egress_check["status"] == "available"
+
+    if connected_count == len(hop_results) and egress_ok:
+        new_health_status = "healthy"
+    elif connected_count > 0:
+        new_health_status = "degraded"
+    else:
+        new_health_status = "unhealthy"
+
+    db.update_node_chain(
+        tag,
+        health_status=new_health_status,
+        last_health_check=datetime.now(timezone.utc).isoformat()
+    )
+
+    # 构建消息
+    if all_healthy:
+        message = "链路健康"
+    elif egress_check["status"] == "unavailable":
+        message = f"终端出口不可用: {egress_check['message']}"
+    elif egress_check["status"] == "not_configured":
+        message = "链路未配置终端出口"
+    else:
+        message = "链路存在断开的节点"
+
     return {
         "chain": tag,
         "healthy": all_healthy,
-        "message": "链路健康" if all_healthy else "链路存在断开的节点",
+        "message": message,
         "total_hops": len(hops),
         "hops": hop_results,
+        "egress_check": egress_check,
     }
 
 
