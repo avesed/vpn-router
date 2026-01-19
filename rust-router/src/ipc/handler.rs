@@ -3135,25 +3135,27 @@ impl IpcHandler {
                     crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
                 };
 
-                let members: Vec<EcmpMemberStatus> = config
-                    .members
+                // Use runtime member_stats() instead of static config.members
+                let member_stats = group.member_stats();
+                let members: Vec<EcmpMemberStatus> = member_stats
                     .iter()
                     .map(|m| EcmpMemberStatus {
                         outbound: m.tag.clone(),
                         weight: m.weight,
                         enabled: true,
-                        health: "healthy".to_string(), // TODO: Get from health checker
-                        active_connections: 0,
+                        health: if m.healthy { "healthy" } else { "unhealthy" }.to_string(),
+                        active_connections: m.active_connections,
                         total_connections: 0,
                     })
                     .collect();
 
+                let stats = group.stats();
                 let status = EcmpGroupStatus {
                     tag: tag.to_string(),
                     algorithm,
                     members,
-                    active_connections: 0,
-                    total_connections: 0,
+                    active_connections: stats.total_connections,
+                    total_connections: stats.total_requests,
                 };
 
                 IpcResponse::EcmpGroupStatus(status)
@@ -3189,25 +3191,27 @@ impl IpcHandler {
                         crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
                     };
 
-                    let members: Vec<EcmpMemberStatus> = config
-                        .members
+                    // Use runtime member_stats() instead of static config.members
+                    let member_stats = group.member_stats();
+                    let members: Vec<EcmpMemberStatus> = member_stats
                         .iter()
                         .map(|m| EcmpMemberStatus {
                             outbound: m.tag.clone(),
                             weight: m.weight,
                             enabled: true,
-                            health: "healthy".to_string(),
-                            active_connections: 0,
+                            health: if m.healthy { "healthy" } else { "unhealthy" }.to_string(),
+                            active_connections: m.active_connections,
                             total_connections: 0,
                         })
                         .collect();
 
+                    let stats = group.stats();
                     EcmpGroupStatus {
                         tag: tag.clone(),
                         algorithm,
                         members,
-                        active_connections: 0,
-                        total_connections: 0,
+                        active_connections: stats.total_connections,
+                        total_connections: stats.total_requests,
                     }
                 })
             })
