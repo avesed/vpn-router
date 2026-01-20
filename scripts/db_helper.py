@@ -2669,6 +2669,9 @@ class UserDatabase:
         TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
         TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
 
+        # 获取需要避免的保留端口（防止与入口端口冲突）
+        reserved_ports = self._get_reserved_ports()
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
             # 获取所有已使用的端口
@@ -2679,12 +2682,39 @@ class UserDatabase:
 
             # 从最小端口开始查找可用端口（支持端口复用）
             for port in range(TUNNEL_PORT_MIN, TUNNEL_PORT_MAX + 1):
-                if port not in used_ports:
+                if port not in used_ports and port not in reserved_ports:
                     return port
 
             # Issue 10 Fix: 端口范围耗尽，返回 None 而非抛出异常
             # 让调用者可以提供更友好的错误消息
             return None
+
+    def _get_reserved_ports(self) -> set:
+        """获取所有保留端口，避免分配给 peer tunnel
+
+        Returns:
+            保留端口集合，包括 WireGuard 入口端口和其他系统服务端口
+        """
+        reserved = set()
+
+        # WireGuard 入口端口
+        wg_server = self.get_wireguard_server()
+        if wg_server:
+            wg_port = wg_server.get("listen_port")
+            if wg_port:
+                reserved.add(int(wg_port))
+
+        # 从环境变量获取可能的保留端口
+        env_ports = [
+            ("WG_LISTEN_PORT", 36100),
+            ("WEB_PORT", 36000),
+            ("API_BACKEND_PORT", 8000),
+        ]
+        for env_var, default in env_ports:
+            port = int(os.environ.get(env_var, str(default)))
+            reserved.add(port)
+
+        return reserved
 
     def get_next_peer_xray_socks_port(self) -> int:
         """获取下一个可用的 Xray SOCKS 端口（可通过环境变量配置起始端口）

@@ -310,7 +310,7 @@ impl WgEgressManager {
             peer_endpoint: config.peer_endpoint.clone(),
             local_ip: config.local_ip.clone(),
             allowed_ips: config.allowed_ips.clone(),
-            listen_port: None, // Let the system choose
+            listen_port: config.listen_port, // Use specified port or let the system choose
             persistent_keepalive: config.persistent_keepalive,
             mtu: config.mtu,
         };
@@ -374,6 +374,99 @@ impl WgEgressManager {
         self.stats.tunnels_created.fetch_add(1, Ordering::Relaxed);
 
         info!("Created egress tunnel '{}'", tag);
+
+        Ok(())
+    }
+
+    /// Adopt a pre-built peer tunnel into the egress manager
+    ///
+    /// This method allows peer tunnels created by `PeerManager` to be registered
+    /// in the egress manager for unified routing. The tunnel should already be
+    /// connected before calling this method.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Tunnel tag (should use "peer-{node_tag}" convention)
+    /// * `tunnel` - Arc-wrapped tunnel that is already connected
+    /// * `config` - Egress configuration for the tunnel
+    ///
+    /// # Errors
+    ///
+    /// Returns error if shutdown is in progress or tunnel tag already exists.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After PeerManager creates a tunnel for peer "node-b"
+    /// let peer_tag = format!("peer-{}", peer_node_tag);
+    /// let config = WgEgressConfig::new_peer(
+    ///     &peer_tag,
+    ///     private_key,
+    ///     peer_public_key,
+    ///     endpoint,
+    /// );
+    /// manager.adopt_peer_tunnel(peer_tag, tunnel_arc, config).await?;
+    /// ```
+    pub async fn adopt_peer_tunnel(
+        &self,
+        tag: String,
+        tunnel: Arc<UserspaceWgTunnel>,
+        config: WgEgressConfig,
+    ) -> EgressResult<()> {
+        // Check shutdown state
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EgressError::ShuttingDown);
+        }
+
+        // Check if tunnel already exists
+        {
+            let tunnels = self.tunnels.read();
+            if tunnels.contains_key(&tag) {
+                return Err(EgressError::tunnel_already_exists(&tag));
+            }
+        }
+
+        info!("Adopting peer tunnel '{}' into egress manager", tag);
+
+        // Create managed tunnel wrapper
+        // Note: We create a new ManagedTunnel but reuse the existing tunnel Arc
+        let mut managed = ManagedTunnel {
+            tunnel: tunnel.clone(),
+            config,
+            state: parking_lot::Mutex::new(EgressState::Running),
+            reply_shutdown_tx: None,
+            reply_task: None,
+        };
+
+        // Spawn the reply receiver task
+        let (shutdown_tx, reply_task) = Self::spawn_reply_receiver(
+            tag.clone(),
+            tunnel,
+            self.reply_handler.clone(),
+        );
+        managed.reply_shutdown_tx = Some(shutdown_tx);
+        managed.reply_task = Some(reply_task);
+
+        // Insert into registry
+        {
+            let mut tunnels = self.tunnels.write();
+            if tunnels.contains_key(&tag) {
+                // Race condition - cleanup and return error
+                if let Some(tx) = managed.reply_shutdown_tx.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(handle) = managed.reply_task.take() {
+                    handle.abort();
+                }
+                return Err(EgressError::tunnel_already_exists(&tag));
+            }
+            tunnels.insert(tag.clone(), managed);
+        }
+
+        // Update stats
+        self.stats.tunnels_created.fetch_add(1, Ordering::Relaxed);
+
+        info!("Adopted peer tunnel '{}' successfully", tag);
 
         Ok(())
     }

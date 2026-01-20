@@ -1154,6 +1154,28 @@ impl PeerManager {
         Ok(())
     }
 
+    /// Add a peer configuration directly
+    ///
+    /// This is a public wrapper around `add_peer_internal` that allows external callers
+    /// (such as IPC handlers) to add peers without going through the full pairing flow.
+    /// This is useful for:
+    /// - Restoring peers from database after restart
+    /// - Manual peer configuration for testing
+    /// - Synchronizing peers between nodes
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The peer configuration to add
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The peer tag is invalid
+    /// - A peer with the same tag already exists
+    pub fn add_peer(&self, config: PeerConfig) -> Result<(), PeerError> {
+        self.add_peer_internal(config)
+    }
+
     /// Update peer state
     fn update_peer_state(&self, tag: &str, state: PeerState, error: Option<String>) {
         let mut peers = self.peers.write();
@@ -1202,6 +1224,47 @@ impl PeerManager {
     pub fn get_peer_config(&self, tag: &str) -> Option<PeerConfig> {
         let peers = self.peers.read();
         peers.get(tag).map(|p| p.config.clone())
+    }
+
+    /// Set peer state to connected without creating a tunnel
+    ///
+    /// This method is used when tunnels are managed externally (e.g., by WgEgressManager).
+    /// It validates the peer state transition and updates the state to Connected.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Peer node tag
+    ///
+    /// # Errors
+    ///
+    /// Returns error if peer not found or already connected.
+    pub fn set_connected_external(&self, tag: &str) -> Result<(), PeerError> {
+        let mut peers = self.peers.write();
+        let peer = peers.get_mut(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+
+        if peer.state == PeerState::Connected {
+            return Err(PeerError::AlreadyConnected(tag.to_string()));
+        }
+
+        peer.state = PeerState::Connected;
+        info!(tag = %tag, "Peer marked as connected (external tunnel)");
+
+        Ok(())
+    }
+
+    /// Set peer state to disconnected
+    ///
+    /// This method is used when tunnels are managed externally (e.g., by WgEgressManager).
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Peer node tag
+    pub fn set_disconnected_external(&self, tag: &str) {
+        let mut peers = self.peers.write();
+        if let Some(peer) = peers.get_mut(tag) {
+            peer.state = PeerState::Disconnected;
+            info!(tag = %tag, "Peer marked as disconnected (external tunnel)");
+        }
     }
 
     /// Record a health check result

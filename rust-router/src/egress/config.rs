@@ -359,6 +359,15 @@ pub struct WgEgressConfig {
     #[serde(default = "default_mtu")]
     pub mtu: Option<u16>,
 
+    /// Listen port for incoming connections
+    ///
+    /// For peer tunnels, this specifies the UDP port to listen on for
+    /// incoming WireGuard traffic. If not specified, a random port is used.
+    /// Peer tunnels typically need a fixed port (e.g., 36200) so peers can
+    /// connect to each other.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+
     /// Pre-shared key for additional security (optional, Base64 encoded)
     #[serde(default)]
     pub preshared_key: Option<String>,
@@ -448,6 +457,59 @@ impl WgEgressConfig {
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: default_persistent_keepalive(),
             mtu: default_mtu(),
+            listen_port: None,
+            preshared_key: None,
+            use_batch_io: default_use_batch_io(),
+            batch_size: default_batch_size(),
+        }
+    }
+
+    /// Create a peer tunnel configuration
+    ///
+    /// This helper creates a configuration for inter-node peer tunnels with
+    /// the correct naming convention (`peer-{node_tag}`).
+    ///
+    /// # Arguments
+    ///
+    /// * `node_tag` - The peer node's tag (e.g., "vpn-router")
+    /// * `private_key` - Local WireGuard private key (Base64)
+    /// * `peer_public_key` - Peer's public key (Base64)
+    /// * `peer_endpoint` - Peer's endpoint (IP:port)
+    /// * `local_ip` - Local tunnel IP address (e.g., "10.200.200.2/32")
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = WgEgressConfig::new_peer(
+    ///     "vpn-router",
+    ///     "local_private_key_base64",
+    ///     "peer_public_key_base64",
+    ///     "10.1.1.10:36200",
+    ///     "10.200.200.2/32",
+    /// );
+    /// assert_eq!(config.tag, "peer-vpn-router");
+    /// ```
+    #[must_use]
+    pub fn new_peer(
+        node_tag: impl Into<String>,
+        private_key: impl Into<String>,
+        peer_public_key: impl Into<String>,
+        peer_endpoint: impl Into<String>,
+        local_ip: impl Into<String>,
+    ) -> Self {
+        let node_tag = node_tag.into();
+        let tag = format!("peer-{}", node_tag);
+        Self {
+            tag,
+            tunnel_type: EgressTunnelType::Peer { node_tag },
+            private_key: private_key.into(),
+            peer_public_key: peer_public_key.into(),
+            peer_endpoint: peer_endpoint.into(),
+            local_ip: Some(local_ip.into()),
+            allowed_ips: default_allowed_ips(),
+            persistent_keepalive: default_persistent_keepalive(),
+            mtu: default_mtu(),
+            listen_port: None,
             preshared_key: None,
             use_batch_io: default_use_batch_io(),
             batch_size: default_batch_size(),
@@ -479,6 +541,16 @@ impl WgEgressConfig {
     #[must_use]
     pub fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = Some(mtu);
+        self
+    }
+
+    /// Set the listen port for incoming connections
+    ///
+    /// For peer tunnels, this specifies the UDP port to bind for
+    /// incoming WireGuard traffic. If not set, a random port is used.
+    #[must_use]
+    pub fn with_listen_port(mut self, port: u16) -> Self {
+        self.listen_port = Some(port);
         self
     }
 
@@ -651,6 +723,7 @@ impl Default for WgEgressConfig {
             allowed_ips: default_allowed_ips(),
             persistent_keepalive: default_persistent_keepalive(),
             mtu: default_mtu(),
+            listen_port: None,
             preshared_key: None,
             use_batch_io: default_use_batch_io(),
             batch_size: default_batch_size(),

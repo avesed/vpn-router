@@ -427,6 +427,15 @@ pub enum IpcCommand {
         code: String,
     },
 
+    /// Add a peer node configuration directly
+    ///
+    /// Adds a peer node configuration without going through the full pairing flow.
+    /// This is useful for testing or manual configuration recovery.
+    AddPeer {
+        /// Peer configuration
+        config: PeerConfig,
+    },
+
     /// Connect to a configured peer node
     ///
     /// Initiates connection to a previously configured peer.

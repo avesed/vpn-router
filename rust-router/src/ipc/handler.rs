@@ -15,7 +15,7 @@ use super::protocol::{
     DnsCacheStatsResponse, DnsConfigResponse, DnsQueryLogResponse, DnsQueryResponse,
     DnsStatsResponse, DnsUpstreamInfo, DnsUpstreamStatusResponse, EcmpGroupListResponse,
     EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IngressStatsResponse, IpcCommand, IpcResponse,
-    OutboundInfo, OutboundStatsResponse, PairingResponse, PeerListResponse, PeerState,
+    OutboundInfo, OutboundStatsResponse, PairingResponse, PeerConfig, PeerListResponse, PeerState,
     PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
     ServerCapabilities, ServerStatus, Socks5PoolStats, TunnelType, UdpProcessorInfo,
     UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
@@ -710,6 +710,9 @@ impl IpcHandler {
             }
             IpcCommand::CompleteHandshake { code } => {
                 self.handle_complete_handshake(code).await
+            }
+            IpcCommand::AddPeer { config } => {
+                self.handle_add_peer(config).await
             }
             IpcCommand::ConnectPeer { tag } => {
                 self.handle_connect_peer(&tag).await
@@ -2900,6 +2903,9 @@ impl IpcHandler {
         if let Some(mtu) = config.mtu {
             egress_config = egress_config.with_mtu(mtu);
         }
+        if let Some(port) = config.listen_port {
+            egress_config = egress_config.with_listen_port(port);
+        }
 
         match egress_manager.create_tunnel(egress_config).await {
             Ok(()) => {
@@ -3582,9 +3588,40 @@ impl IpcHandler {
         }
     }
 
+    /// Handle `AddPeer` command
+    ///
+    /// Adds a peer configuration directly to the PeerManager without going through
+    /// the full pairing flow. This is useful for:
+    /// - Restoring peers from database after restart
+    /// - Manual peer configuration for testing
+    /// - Synchronizing peers between nodes
+    async fn handle_add_peer(&self, config: PeerConfig) -> IpcResponse {
+        let Some(peer_manager) = &self.peer_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "Peer manager not available",
+            );
+        };
+
+        let tag = config.tag.clone();
+
+        match peer_manager.add_peer(config) {
+            Ok(()) => {
+                info!("Added peer '{}' via IPC", tag);
+                IpcResponse::success_with_message(format!("Peer '{tag}' added successfully"))
+            }
+            Err(e) => {
+                warn!("Failed to add peer '{}': {}", tag, e);
+                IpcResponse::error(Self::peer_error_to_code(&e), e.to_string())
+            }
+        }
+    }
+
     /// Handle `ConnectPeer` command
     ///
-    /// Connects to a configured peer node.
+    /// Connects to a configured peer node by creating a tunnel in WgEgressManager.
+    /// This ensures peer tunnels are available for chain routing with the correct
+    /// `peer-{tag}` naming convention.
     async fn handle_connect_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
             return IpcResponse::error(
@@ -3593,16 +3630,109 @@ impl IpcHandler {
             );
         };
 
-        match peer_manager.connect(tag).await {
+        let Some(wg_egress_manager) = &self.wg_egress_manager else {
+            return IpcResponse::error(
+                ErrorCode::OperationFailed,
+                "WireGuard egress manager not available",
+            );
+        };
+
+        // Get peer configuration
+        let Some(config) = peer_manager.get_peer_config(tag) else {
+            return IpcResponse::error(
+                ErrorCode::NotFound,
+                format!("Peer '{tag}' not found"),
+            );
+        };
+
+        // Only handle WireGuard peers through WgEgressManager
+        // Xray peers still use PeerManager's internal handling
+        if config.tunnel_type != TunnelType::WireGuard {
+            return match peer_manager.connect(tag).await {
+                Ok(()) => {
+                    info!("Connected to peer '{}' (Xray)", tag);
+                    IpcResponse::success_with_message(format!("Connected to peer '{tag}'"))
+                }
+                Err(e) => {
+                    warn!("Failed to connect to peer '{}': {}", tag, e);
+                    IpcResponse::error(Self::peer_error_to_code(&e), e.to_string())
+                }
+            };
+        }
+
+        // Create peer tunnel tag with correct naming convention
+        let peer_tunnel_tag = format!("peer-{}", tag);
+
+        // Check if tunnel already exists
+        if wg_egress_manager.has_tunnel(&peer_tunnel_tag) {
+            // Just update peer state
+            if let Err(e) = peer_manager.set_connected_external(tag) {
+                warn!("Failed to update peer state: {}", e);
+            }
+            return IpcResponse::success_with_message(format!(
+                "Peer '{tag}' already connected (tunnel '{peer_tunnel_tag}' exists)"
+            ));
+        }
+
+        // Get required WireGuard parameters
+        let private_key = match &config.wg_local_private_key {
+            Some(key) => key.clone(),
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Peer '{tag}' missing WireGuard private key"),
+                );
+            }
+        };
+
+        let peer_public_key = match &config.wg_public_key {
+            Some(key) => key.clone(),
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Peer '{tag}' missing peer public key"),
+                );
+            }
+        };
+
+        let local_ip = config.tunnel_local_ip.clone().unwrap_or_else(|| "10.200.200.1/32".to_string());
+
+        // Create WgEgressConfig for the peer tunnel
+        let egress_config = crate::egress::config::WgEgressConfig::new_peer(
+            tag,
+            private_key,
+            peer_public_key,
+            &config.endpoint,
+            local_ip,
+        )
+        .with_persistent_keepalive(config.persistent_keepalive.unwrap_or(25));
+
+        // Add listen_port if specified (needed for peer tunnels)
+        let egress_config = if let Some(port) = config.tunnel_port {
+            egress_config.with_listen_port(port)
+        } else {
+            egress_config
+        };
+
+        // Create tunnel in WgEgressManager
+        match wg_egress_manager.create_tunnel(egress_config).await {
             Ok(()) => {
-                info!("Connected to peer '{}'", tag);
-                IpcResponse::success_with_message(format!("Connected to peer '{tag}'"))
+                info!("Created peer tunnel '{}' for peer '{}'", peer_tunnel_tag, tag);
+
+                // Update peer state in PeerManager
+                if let Err(e) = peer_manager.set_connected_external(tag) {
+                    warn!("Failed to update peer state after tunnel creation: {}", e);
+                }
+
+                IpcResponse::success_with_message(format!(
+                    "Connected to peer '{tag}' via tunnel '{peer_tunnel_tag}'"
+                ))
             }
             Err(e) => {
-                warn!("Failed to connect to peer '{}': {}", tag, e);
+                warn!("Failed to create peer tunnel '{}': {}", peer_tunnel_tag, e);
                 IpcResponse::error(
-                    Self::peer_error_to_code(&e),
-                    e.to_string(),
+                    ErrorCode::OperationFailed,
+                    format!("Failed to create peer tunnel: {e}"),
                 )
             }
         }
@@ -3610,7 +3740,7 @@ impl IpcHandler {
 
     /// Handle `DisconnectPeer` command
     ///
-    /// Disconnects from a connected peer.
+    /// Disconnects from a connected peer by removing the tunnel from WgEgressManager.
     async fn handle_disconnect_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
             return IpcResponse::error(
@@ -3619,6 +3749,31 @@ impl IpcHandler {
             );
         };
 
+        // Get peer config to check tunnel type
+        let config = peer_manager.get_peer_config(tag);
+
+        // For WireGuard peers, remove from WgEgressManager
+        if let Some(ref cfg) = config {
+            if cfg.tunnel_type == TunnelType::WireGuard {
+                if let Some(wg_egress_manager) = &self.wg_egress_manager {
+                    let peer_tunnel_tag = format!("peer-{}", tag);
+                    if wg_egress_manager.has_tunnel(&peer_tunnel_tag) {
+                        if let Err(e) = wg_egress_manager.remove_tunnel(&peer_tunnel_tag, None).await {
+                            warn!("Failed to remove peer tunnel '{}': {}", peer_tunnel_tag, e);
+                        } else {
+                            info!("Removed peer tunnel '{}'", peer_tunnel_tag);
+                        }
+                    }
+                }
+
+                // Update peer state
+                peer_manager.set_disconnected_external(tag);
+
+                return IpcResponse::success_with_message(format!("Disconnected from peer '{tag}'"));
+            }
+        }
+
+        // For Xray peers, use PeerManager's internal handling
         match peer_manager.disconnect(tag).await {
             Ok(()) => {
                 info!("Disconnected from peer '{}'", tag);

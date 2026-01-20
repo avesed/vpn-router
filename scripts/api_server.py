@@ -2372,6 +2372,69 @@ async def startup_event():
         print(f"[Chain Recovery] 已恢复 {recovered} 条孤立链路（重置为 error 状态）")
     # Sync WG_LISTEN_PORT env var to database
     _sync_wg_listen_port_to_db()
+    # 验证配置，检查潜在的 IP/端口冲突
+    _validate_network_config()
+
+
+def _validate_network_config():
+    """验证网络配置，检查潜在的 IP 子网和端口冲突
+
+    在启动时运行，如果检测到冲突会记录警告日志。
+    """
+    import ipaddress
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return
+
+    warnings = []
+
+    try:
+        db = _get_db()
+
+        # 1. 检查入口子网与 peer tunnel 子网的冲突
+        server = db.get_wireguard_server()
+        if server:
+            ingress_addr = server.get("address", DEFAULT_WG_SUBNET)
+            try:
+                ingress_network = ipaddress.ip_network(ingress_addr, strict=False)
+                peer_tunnel_network = ipaddress.ip_network("10.200.200.0/24")
+                if ingress_network.overlaps(peer_tunnel_network):
+                    warnings.append(
+                        f"⚠️  入口子网 {ingress_addr} 与 peer tunnel 子网 10.200.200.0/24 冲突！"
+                    )
+            except ValueError:
+                pass
+
+            # 2. 检查入口端口是否在 peer tunnel 端口范围内
+            ingress_port = server.get("listen_port", DEFAULT_WG_PORT)
+            TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
+            TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
+            if TUNNEL_PORT_MIN <= ingress_port <= TUNNEL_PORT_MAX:
+                warnings.append(
+                    f"⚠️  入口端口 {ingress_port} 在 peer tunnel 端口范围 ({TUNNEL_PORT_MIN}-{TUNNEL_PORT_MAX}) 内！"
+                )
+
+        # 3. 检查现有 peer nodes 是否有端口冲突
+        peer_nodes = db.get_peer_nodes()
+        for node in peer_nodes:
+            tunnel_port = node.get("tunnel_port")
+            if tunnel_port and server:
+                ingress_port = server.get("listen_port", DEFAULT_WG_PORT)
+                if tunnel_port == ingress_port:
+                    warnings.append(
+                        f"⚠️  Peer 节点 '{node.get('tag')}' 的隧道端口 {tunnel_port} 与入口端口冲突！"
+                    )
+
+        # 输出警告
+        for warning in warnings:
+            logging.warning(f"[Config Validation] {warning}")
+            print(f"[Config Validation] {warning}")
+
+        if not warnings:
+            print("[Config Validation] 网络配置验证通过，无冲突")
+
+    except Exception as e:
+        logging.error(f"[Config Validation] 配置验证失败: {e}")
 
 
 def _sync_wg_listen_port_to_db():
@@ -5831,10 +5894,19 @@ def api_get_ingress_subnet():
     server = db.get_wireguard_server()
     address = server.get("address", DEFAULT_WG_SUBNET) if server else DEFAULT_WG_SUBNET
 
-    # 检查是否与出口地址冲突
+    # 检查是否与保留子网/出口地址冲突
     conflicts = []
     try:
         network = ipaddress.ip_network(address, strict=False)
+
+        # 检查与 peer tunnel 子网 (10.200.200.0/24) 的冲突
+        peer_tunnel_network = ipaddress.ip_network("10.200.200.0/24")
+        if network.overlaps(peer_tunnel_network):
+            conflicts.append({
+                "type": "peer_tunnel_subnet",
+                "tag": "peer_tunnels",
+                "address": "10.200.200.0/24"
+            })
 
         for egress in db.get_custom_egress_list():
             addr = egress.get("address", "")
@@ -5884,10 +5956,16 @@ def api_update_ingress_subnet(payload: SubnetUpdateRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid subnet format: {e}")
 
-    # 2. 检查与出口地址的冲突
+    # 2. 检查与保留子网的冲突
     db = _get_db()
     conflicts = []
 
+    # 2a. 检查与 peer tunnel 子网 (10.200.200.0/24) 的冲突
+    peer_tunnel_network = ipaddress.ip_network("10.200.200.0/24")
+    if network.overlaps(peer_tunnel_network):
+        conflicts.append(f"Peer tunnel subnet uses 10.200.200.0/24")
+
+    # 2b. 检查与出口地址的冲突
     for egress in db.get_custom_egress_list():
         addr = egress.get("address", "")
         if addr:
