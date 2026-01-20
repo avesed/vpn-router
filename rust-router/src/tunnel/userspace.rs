@@ -2507,6 +2507,15 @@ impl WgTunnel for UserspaceWgTunnel {
             self.disconnect().await
         })
     }
+
+    fn send(&self, packet: &[u8]) -> BoxFuture<'_, Result<(), WgTunnelError>> {
+        // We need to clone the packet data since we're moving into the future
+        let packet = packet.to_vec();
+        Box::pin(async move {
+            // Delegate to the inherent async send method
+            UserspaceWgTunnel::send(self, &packet).await
+        })
+    }
 }
 
 // ============================================================================

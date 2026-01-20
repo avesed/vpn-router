@@ -93,9 +93,10 @@ pub use dns_cache::{IpDomainCache, IpDomainCacheStats, IpDomainCacheStatsSnapsho
 pub use error::IngressError;
 pub use forwarder::{
     parse_ip_packet, parse_tcp_details, run_forwarding_loop, run_reply_router_loop,
-    spawn_forwarding_task, spawn_reply_router, tcp_flags, FiveTuple, ForwardingStats,
-    ForwardingStatsSnapshot, IngressReplyStats, IngressReplyStatsSnapshot, IngressSessionTracker,
-    ParsedPacket, PeerSession, ReplyPacket, TcpConnection, TcpConnectionManager,
+    spawn_forwarding_task, spawn_reply_router, spawn_peer_tunnel_processor, tcp_flags,
+    FiveTuple, ForwardingStats, ForwardingStatsSnapshot, IngressReplyStats, IngressReplyStatsSnapshot,
+    IngressSessionTracker, ParsedPacket, PeerSession, PeerTunnelProcessorStats,
+    PeerTunnelProcessorStatsSnapshot, ReplyPacket, TcpConnection, TcpConnectionManager,
     TcpConnectionState, TcpDetails,
 };
 pub use manager::{WgIngressManager, WgIngressStats};

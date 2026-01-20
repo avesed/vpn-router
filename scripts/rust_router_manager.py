@@ -935,8 +935,13 @@ class RustRouterManager:
                             logger.error(error_msg)
 
                     # Remove stale tunnels (in DB but disabled, or not in DB)
+                    # Skip peer tunnels (peer-*) as they are managed separately by PeerManager
                     db_enabled_tags = set(wg_egress.keys())
                     for tag in current_tags:
+                        # Skip peer tunnels - they are managed by ConnectPeer/DisconnectPeer IPC
+                        if tag.startswith("peer-"):
+                            logger.debug(f"Skipping peer tunnel in cleanup: {tag}")
+                            continue
                         if tag not in db_enabled_tags:
                             logger.info(f"Removing stale WG tunnel: {tag}")
                             resp = await client.remove_wg_tunnel(tag)
@@ -1327,10 +1332,56 @@ class RustRouterManager:
                             synced += 1
                             continue
 
-                        # Peer doesn't exist in rust-router - skip creation
-                        # Peer creation is done via the pairing flow, not sync
-                        # We only sync connection state
-                        logger.debug(f"Peer {tag} not found in rust-router (created via pairing flow)")
+                        # Peer doesn't exist in rust-router - add it from database
+                        # This handles restart recovery when peers were created via pairing
+                        if not enabled:
+                            logger.debug(f"Skipping disabled peer {tag}")
+                            continue
+
+                        tunnel_type = (peer.get("tunnel_type") or "wireguard").lower()
+                        endpoint = peer.get("endpoint", "")
+                        if not endpoint:
+                            logger.warning(f"Peer {tag} missing endpoint, skipping")
+                            continue
+
+                        logger.info(f"Adding peer {tag} from database to rust-router")
+
+                        # Build add_peer call with all available fields
+                        # Note: wg_peer_public_key is the remote peer's public key
+                        # wg_public_key is our own public key (derived from wg_private_key)
+                        add_response = await client.add_peer(
+                            tag=tag,
+                            endpoint=endpoint,
+                            tunnel_type=tunnel_type,
+                            description=peer.get("description", ""),
+                            api_port=peer.get("api_port") or 36000,
+                            wg_public_key=peer.get("wg_peer_public_key"),  # Use peer's public key!
+                            wg_local_private_key=peer.get("wg_private_key"),  # DB uses wg_private_key
+                            tunnel_local_ip=peer.get("tunnel_local_ip"),
+                            tunnel_remote_ip=peer.get("tunnel_remote_ip"),
+                            tunnel_port=peer.get("tunnel_port"),
+                            persistent_keepalive=peer.get("persistent_keepalive"),
+                            xray_uuid=peer.get("xray_uuid"),
+                            xray_server_name=peer.get("xray_server_name"),
+                            xray_public_key=peer.get("xray_public_key"),
+                            xray_short_id=peer.get("xray_short_id"),
+                            xray_local_socks_port=peer.get("xray_local_socks_port"),
+                        )
+
+                        if not add_response.success:
+                            logger.warning(f"Failed to add peer {tag}: {add_response.error}")
+                            continue
+
+                        logger.info(f"Added peer {tag} to rust-router")
+                        synced += 1
+
+                        # Connect the peer if auto_connect is enabled
+                        if auto_connect:
+                            connect_response = await client.connect_peer(tag)
+                            if connect_response.success:
+                                logger.info(f"Connected peer {tag}")
+                            else:
+                                logger.warning(f"Failed to connect peer {tag}: {connect_response.error}")
 
                     result.peers_synced = synced
 

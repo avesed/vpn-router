@@ -63,6 +63,7 @@ use crate::chain::dscp::set_dscp;
 use crate::ecmp::{EcmpGroupManager, FiveTuple as EcmpFiveTuple, Protocol as EcmpProtocol};
 use crate::egress::manager::WgEgressManager;
 use crate::outbound::OutboundManager;
+use crate::peer::manager::PeerManager;
 use crate::rules::fwmark::ChainMark;
 
 /// IP protocol numbers
@@ -1674,6 +1675,7 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 /// * `local_ip` - Gateway's local IP for responding to pings to self
 /// * `ecmp_group_manager` - Optional ECMP group manager for load balancing
+/// * `peer_manager` - Optional peer manager for peer tunnel forwarding
 pub async fn run_forwarding_loop(
     mut packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
@@ -1684,6 +1686,7 @@ pub async fn run_forwarding_loop(
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     local_ip: Option<IpAddr>,
     ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
+    peer_manager: Option<Arc<PeerManager>>,
 ) {
     info!("Ingress forwarding loop started");
 
@@ -1744,6 +1747,7 @@ pub async fn run_forwarding_loop(
                     &stats,
                     direct_reply_tx.clone(),
                     ecmp_group_manager.as_ref(),
+                    peer_manager.as_ref(),
                 )
                 .await;
             }
@@ -1762,6 +1766,7 @@ pub async fn run_forwarding_loop(
                         &stats,
                         direct_reply_tx.clone(),
                         ecmp_group_manager.as_ref(),
+                        peer_manager.as_ref(),
                     )
                     .await;
                 } else {
@@ -2052,6 +2057,7 @@ async fn forward_tcp_packet(
     stats: &Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
+    peer_manager: Option<&Arc<PeerManager>>,
 ) {
     let routing_outbound = &processed.routing.outbound;
 
@@ -2098,6 +2104,10 @@ async fn forward_tcp_packet(
     let outbound_tag = &outbound_tag;
 
     // Check if this goes to a WireGuard egress (full IP packet forwarding)
+    // This includes:
+    // - Standard egress: wg-*, pia-*
+    // - Peer tunnels: peer-* (created via ConnectPeer IPC, stored in WgEgressManager)
+    // - Any tunnel registered in WgEgressManager
     let is_wg_egress = outbound_tag.starts_with("wg-")
         || outbound_tag.starts_with("pia-")
         || outbound_tag.starts_with("peer-")
@@ -2632,6 +2642,7 @@ async fn forward_udp_packet(
     stats: &Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
+    peer_manager: Option<&Arc<PeerManager>>,
 ) {
     let routing_outbound = &processed.routing.outbound;
 
@@ -2793,15 +2804,18 @@ async fn forward_udp_packet(
         parsed.total_len as u64,
     );
 
-    // Determine if this is a WireGuard egress tunnel
-    // WireGuard tunnels are tagged with prefixes like "wg-", "pia-", etc.
+    // Determine if this is a WireGuard egress tunnel (managed by WgEgressManager)
+    // This includes:
+    // - Standard egress: wg-*, pia-*
+    // - Peer tunnels: peer-* (created via ConnectPeer IPC, stored in WgEgressManager)
+    // - Any tunnel registered in WgEgressManager
     let is_wg_egress = outbound_tag.starts_with("wg-")
         || outbound_tag.starts_with("pia-")
         || outbound_tag.starts_with("peer-")
         || wg_egress_manager.has_tunnel(outbound_tag);
 
     if is_wg_egress {
-        // Forward through WireGuard egress tunnel
+        // Forward through WireGuard egress tunnel (PIA, custom, WARP, etc.)
         // For WireGuard tunnels, we send the entire IP packet (it gets encapsulated)
         match wg_egress_manager.send(outbound_tag, processed.data.clone()).await {
             Ok(()) => {
@@ -3754,6 +3768,7 @@ pub fn spawn_forwarding_task(
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     local_ip: Option<IpAddr>,
     ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
+    peer_manager: Option<Arc<PeerManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_forwarding_loop(
         packet_rx,
@@ -3765,6 +3780,7 @@ pub fn spawn_forwarding_task(
         direct_reply_tx,
         local_ip,
         ecmp_group_manager,
+        peer_manager,
     ))
 }
 
@@ -3782,6 +3798,178 @@ pub fn spawn_reply_router(
         session_tracker,
         stats,
         dns_cache,
+    ))
+}
+
+/// Statistics for peer tunnel processor
+#[derive(Debug, Default)]
+pub struct PeerTunnelProcessorStats {
+    /// Packets received from peer tunnels
+    pub packets_received: AtomicU64,
+    /// Packets processed successfully
+    pub packets_processed: AtomicU64,
+    /// Packets with parse errors
+    pub parse_errors: AtomicU64,
+    /// Packets with routing errors
+    pub routing_errors: AtomicU64,
+    /// Packets forwarded to WG egress
+    pub wg_egress_forwarded: AtomicU64,
+    /// Packets forwarded to SOCKS/direct
+    pub other_forwarded: AtomicU64,
+}
+
+impl PeerTunnelProcessorStats {
+    pub fn snapshot(&self) -> PeerTunnelProcessorStatsSnapshot {
+        PeerTunnelProcessorStatsSnapshot {
+            packets_received: self.packets_received.load(Ordering::Relaxed),
+            packets_processed: self.packets_processed.load(Ordering::Relaxed),
+            parse_errors: self.parse_errors.load(Ordering::Relaxed),
+            routing_errors: self.routing_errors.load(Ordering::Relaxed),
+            wg_egress_forwarded: self.wg_egress_forwarded.load(Ordering::Relaxed),
+            other_forwarded: self.other_forwarded.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Snapshot of peer tunnel processor stats
+#[derive(Debug, Clone)]
+pub struct PeerTunnelProcessorStatsSnapshot {
+    pub packets_received: u64,
+    pub packets_processed: u64,
+    pub parse_errors: u64,
+    pub routing_errors: u64,
+    pub wg_egress_forwarded: u64,
+    pub other_forwarded: u64,
+}
+
+/// Process packets received from peer tunnels (chain routing)
+///
+/// This function handles packets that arrive on peer tunnels (e.g., `peer-node206`)
+/// and routes them according to the DSCP chain routing rules. On Terminal nodes,
+/// this means forwarding to the exit egress.
+///
+/// # Flow for Terminal nodes
+///
+/// 1. Receive packet from peer tunnel
+/// 2. Use IngressProcessor to extract DSCP and get routing decision
+/// 3. If Terminal role: route to exit_egress and clear DSCP
+/// 4. Forward packet to the appropriate egress
+pub async fn run_peer_tunnel_processor_loop(
+    mut packet_rx: mpsc::Receiver<ReplyPacket>,
+    processor: Arc<super::processor::IngressProcessor>,
+    wg_egress_manager: Arc<WgEgressManager>,
+    stats: Arc<PeerTunnelProcessorStats>,
+) {
+    info!("Peer tunnel processor started");
+
+    while let Some(reply) = packet_rx.recv().await {
+        stats.packets_received.fetch_add(1, Ordering::Relaxed);
+
+        let tunnel_tag = reply.tunnel_tag.clone();
+        let mut packet = reply.packet;
+
+        // Use the tunnel tag as a pseudo "peer" identifier for logging
+        let peer_id = format!("tunnel:{}", tunnel_tag);
+
+        // Get routing decision from ingress processor (handles DSCP/chain routing)
+        let routing = match processor.process(&packet, &peer_id) {
+            Ok(decision) => decision,
+            Err(e) => {
+                stats.routing_errors.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "Peer tunnel processor: failed to get routing decision for packet from {}: {}",
+                    tunnel_tag, e
+                );
+                continue;
+            }
+        };
+
+        // Apply DSCP modification if needed (e.g., clear DSCP for Terminal nodes)
+        if let Some(dscp_mark) = routing.dscp_mark {
+            if let Err(e) = set_dscp(&mut packet, dscp_mark) {
+                warn!(
+                    "Peer tunnel processor: failed to set DSCP {} on packet: {}",
+                    dscp_mark, e
+                );
+            }
+        }
+
+        let outbound_tag = &routing.outbound;
+
+        debug!(
+            "Peer tunnel processor: {} -> outbound '{}' (match: {:?}, dscp: {:?})",
+            tunnel_tag,
+            outbound_tag,
+            routing.match_info,
+            routing.dscp_mark
+        );
+
+        // Handle blocked packets
+        if outbound_tag == "block" || outbound_tag == "adblock" {
+            debug!(
+                "Peer tunnel processor: blocking packet from {} (reason: {})",
+                tunnel_tag,
+                outbound_tag
+            );
+            continue;
+        }
+
+        // Determine if this is a WireGuard egress
+        let is_wg_egress = outbound_tag.starts_with("wg-")
+            || outbound_tag.starts_with("pia-")
+            || outbound_tag.starts_with("peer-")
+            || wg_egress_manager.has_tunnel(outbound_tag);
+
+        if is_wg_egress {
+            // Forward to WireGuard egress tunnel
+            let packet_len = packet.len();
+            match wg_egress_manager.send(outbound_tag, packet).await {
+                Ok(()) => {
+                    stats.wg_egress_forwarded.fetch_add(1, Ordering::Relaxed);
+                    trace!(
+                        "Peer tunnel processor: forwarded {} bytes to WG egress '{}'",
+                        packet_len,
+                        outbound_tag
+                    );
+                }
+                Err(e) => {
+                    stats.routing_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Peer tunnel processor: failed to send to WG egress '{}': {}",
+                        outbound_tag, e
+                    );
+                }
+            }
+        } else {
+            // For non-WG egress (SOCKS, direct), we need more complex handling
+            // For now, log a warning - this would require full TCP/UDP forwarding logic
+            stats.other_forwarded.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "Peer tunnel processor: non-WG egress '{}' not fully supported yet for chain terminal",
+                outbound_tag
+            );
+            // TODO: Implement SOCKS/direct forwarding for Terminal nodes
+            // This would require extracting src/dst IP and ports, creating connections, etc.
+        }
+
+        stats.packets_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    info!("Peer tunnel processor stopped");
+}
+
+/// Spawn the peer tunnel processor loop as a tokio task
+pub fn spawn_peer_tunnel_processor(
+    packet_rx: mpsc::Receiver<ReplyPacket>,
+    processor: Arc<super::processor::IngressProcessor>,
+    wg_egress_manager: Arc<WgEgressManager>,
+    stats: Arc<PeerTunnelProcessorStats>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_peer_tunnel_processor_loop(
+        packet_rx,
+        processor,
+        wg_egress_manager,
+        stats,
     ))
 }
 

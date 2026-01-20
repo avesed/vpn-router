@@ -1124,6 +1124,104 @@ class TunnelAPIClient:
         )
         return result.get("success", False)
 
+    # ============ Phase 12: Chain Sync Propagation ============
+
+    def get_used_dscp_values(self) -> Dict[str, Any]:
+        """Phase 12: 获取远程节点已使用的 DSCP 值列表
+
+        用于在创建链路前检查 DSCP 冲突，确保新链路的 DSCP 值
+        在所有节点上都可用。
+
+        Returns:
+            {"success": True, "used_dscp": [1, 3, 5], "chains": {"chain-a": 1, ...}}
+            或 {"success": False, "error": "..."}
+        """
+        try:
+            result = self._make_request("GET", "/api/chain-sync/used-dscp")
+            success = result.get("success", True)  # 默认 True
+
+            if success:
+                used_dscp = result.get("used_dscp", [])
+                logging.debug(
+                    f"[tunnel-api] 获取 {self.node_tag} 已用 DSCP: {used_dscp}"
+                )
+            else:
+                logging.warning(
+                    f"[tunnel-api] 获取已用 DSCP 失败 ({self.node_tag}): "
+                    f"{result.get('error', 'Unknown')}"
+                )
+
+            return result
+
+        except TunnelAPIError as e:
+            logging.error(f"[tunnel-api] 获取已用 DSCP 异常 ({self.node_tag}): {e}")
+            return {"success": False, "error": str(e)}
+
+    def propagate_chain(
+        self,
+        chain_tag: str,
+        dscp_value: int,
+        full_hops: List[str],
+        exit_egress: str,
+        source_node: str,
+        description: str = "",
+        allow_transitive: bool = False,
+        action: str = "create",
+    ) -> Dict[str, Any]:
+        """Phase 12: 向远程节点同步链路配置
+
+        在创建/更新链路时，将完整的链路配置同步到链路中的所有节点。
+        每个节点收到后会：
+        1. 根据 full_hops 计算自己的角色 (entry/relay/terminal)
+        2. 将链路存储到本地数据库
+        3. 同步到 rust-router
+        4. 继续向下游传播 (如果不是终端节点)
+
+        Args:
+            chain_tag: 链路标识
+            dscp_value: DSCP 值 (1-63)，所有节点统一使用
+            full_hops: 完整跳转列表，所有节点使用相同值
+            exit_egress: 终端出口 (只有 terminal 使用)
+            source_node: 发起同步的节点 (Entry 节点)
+            description: 链路描述
+            allow_transitive: 是否允许传递验证
+            action: 操作类型 ('create', 'update', 'delete')
+
+        Returns:
+            {"success": True, "message": "..."} 或
+            {"success": False, "error": "..."}
+        """
+        try:
+            data = {
+                "chain_tag": chain_tag,
+                "dscp_value": dscp_value,
+                "full_hops": full_hops,
+                "exit_egress": exit_egress,
+                "source_node": source_node,
+                "description": description,
+                "allow_transitive": allow_transitive,
+                "action": action,
+            }
+
+            result = self._make_request("POST", "/api/chain-sync/propagate", data=data)
+            success = result.get("success", False)
+
+            if success:
+                logging.info(
+                    f"[tunnel-api] 链路同步成功: chain={chain_tag}, "
+                    f"dscp={dscp_value}, action={action} @ {self.node_tag}"
+                )
+            else:
+                logging.warning(
+                    f"[tunnel-api] 链路同步失败 ({self.node_tag}): {result.get('error', 'Unknown')}"
+                )
+
+            return result
+
+        except TunnelAPIError as e:
+            logging.error(f"[tunnel-api] 链路同步异常 ({self.node_tag}): {e}")
+            return {"success": False, "error": str(e)}
+
 
 class IpcForwardingTunnelAPIClient:
     """IPC 转发隧道 API 客户端

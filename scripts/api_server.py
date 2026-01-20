@@ -3081,17 +3081,18 @@ def api_health():
 
     返回:
     - status: "healthy" | "degraded" | "unhealthy"
-    - sing_box: sing-box 进程是否运行
+    - rust_router: rust-router 是否运行
     - database: 数据库是否可访问
     - timestamp: 检查时间
     """
     checks = {
-        "sing_box": False,
+        "rust_router": False,
         "database": False,
     }
 
-    # 检查 sing-box 进程
-    checks["sing_box"] = list_processes("sing-box")
+    # 检查 rust-router 进程
+    rust_status = _get_rust_router_status_sync()
+    checks["rust_router"] = rust_status.get("running", False)
 
     # 检查数据库连接
     try:
@@ -3106,7 +3107,7 @@ def api_health():
     # 判断整体状态
     if all(checks.values()):
         status = "healthy"
-    elif checks["sing_box"]:
+    elif checks["rust_router"]:
         status = "degraded"
     else:
         status = "unhealthy"
@@ -5213,11 +5214,12 @@ async def _import_pair_request_via_ipc(
         await client.close()
 
 
-async def _complete_handshake_via_ipc(code: str) -> Tuple[bool, str, Optional[str]]:
+async def _complete_handshake_via_ipc(code: str) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
     """Complete pairing handshake via rust-router IPC (userspace WG mode).
 
     Returns:
-        Tuple of (success, message_or_error, peer_tag)
+        Tuple of (success, message_or_error, peer_tag, response_data)
+        response_data contains wg_local_private_key, tunnel_local_ip, tunnel_port for DB persistence
     """
     from rust_router_client import RustRouterClient
 
@@ -5225,15 +5227,15 @@ async def _complete_handshake_via_ipc(code: str) -> Tuple[bool, str, Optional[st
     try:
         ping_result = await client.ping()
         if not ping_result.success:
-            return False, "rust-router unavailable", None
+            return False, "rust-router unavailable", None, {}
 
         result = await client.complete_handshake(code)
 
         if result.success:
             peer_tag = result.data.get("peer_tag") if result.data else None
-            return True, result.message or "Handshake completed", peer_tag
+            return True, result.message or "Handshake completed", peer_tag, result.data or {}
         else:
-            return False, result.error or "IPC request failed", None
+            return False, result.error or "IPC request failed", None, {}
     finally:
         await client.close()
 
@@ -5360,8 +5362,19 @@ def _sync_userspace_peer_from_codes(
     local_tag: str,
     local_endpoint: Optional[str] = None,
     tunnel_status: str = "connected",
+    ipc_response_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Sync peer_nodes for userspace WG pairing using decoded request/response codes."""
+    """Sync peer_nodes for userspace WG pairing using decoded request/response codes.
+
+    Args:
+        db: Database helper instance
+        request_code: Base64-encoded pairing request code
+        response_code: Base64-encoded pairing response code
+        local_tag: Local node tag
+        local_endpoint: Local endpoint address
+        tunnel_status: Initial tunnel status
+        ipc_response_data: Response data from rust-router IPC containing wg_local_private_key
+    """
     if not HAS_PAIRING:
         return None
 
@@ -5407,7 +5420,19 @@ def _sync_userspace_peer_from_codes(
         tunnel_remote_ip = None
         tunnel_local_ip = None
         tunnel_api_endpoint = None
+        tunnel_port = None
         wg_peer_public_key = None
+        wg_private_key = None  # Local WireGuard private key from IPC
+
+        # Extract WireGuard configuration from IPC response (most accurate source)
+        if ipc_response_data:
+            wg_private_key = ipc_response_data.get("wg_local_private_key")
+            # IPC may also provide tunnel_local_ip and tunnel_port
+            if ipc_response_data.get("tunnel_local_ip"):
+                tunnel_local_ip = ipc_response_data.get("tunnel_local_ip")
+            if ipc_response_data.get("tunnel_port"):
+                tunnel_port = ipc_response_data.get("tunnel_port")
+            logging.debug(f"[pairing] DB sync: extracted from IPC - wg_private_key={'***' if wg_private_key else None}, tunnel_local_ip={tunnel_local_ip}, tunnel_port={tunnel_port}")
 
         if request_data and request_data.get("type") == "pair_request":
             remote_endpoint = request_data.get("endpoint") or remote_endpoint
@@ -5435,19 +5460,24 @@ def _sync_userspace_peer_from_codes(
 
         existing = db.get_peer_node(remote_tag)
         if existing:
-            db.update_peer_node(
-                remote_tag,
-                endpoint=remote_endpoint or existing.get("endpoint"),
-                api_port=remote_api_port or existing.get("api_port"),
-                tunnel_type=tunnel_type,
-                tunnel_status=tunnel_status,
-                tunnel_local_ip=tunnel_local_ip or existing.get("tunnel_local_ip"),
-                tunnel_remote_ip=tunnel_remote_ip or existing.get("tunnel_remote_ip"),
-                tunnel_api_endpoint=tunnel_api_endpoint or existing.get("tunnel_api_endpoint"),
-                wg_peer_public_key=wg_peer_public_key or existing.get("wg_peer_public_key"),
-                bidirectional_status="bidirectional",
-                last_error=None,
-            )
+            update_kwargs = {
+                "endpoint": remote_endpoint or existing.get("endpoint"),
+                "api_port": remote_api_port or existing.get("api_port"),
+                "tunnel_type": tunnel_type,
+                "tunnel_status": tunnel_status,
+                "tunnel_local_ip": tunnel_local_ip or existing.get("tunnel_local_ip"),
+                "tunnel_remote_ip": tunnel_remote_ip or existing.get("tunnel_remote_ip"),
+                "tunnel_api_endpoint": tunnel_api_endpoint or existing.get("tunnel_api_endpoint"),
+                "wg_peer_public_key": wg_peer_public_key or existing.get("wg_peer_public_key"),
+                "bidirectional_status": "bidirectional",
+                "last_error": None,
+            }
+            # Add private key if provided (from IPC)
+            if wg_private_key:
+                update_kwargs["wg_private_key"] = wg_private_key
+            if tunnel_port:
+                update_kwargs["tunnel_port"] = tunnel_port
+            db.update_peer_node(remote_tag, **update_kwargs)
         else:
             db.add_peer_node(
                 tag=remote_tag,
@@ -5459,7 +5489,9 @@ def _sync_userspace_peer_from_codes(
                 tunnel_status=tunnel_status,
                 tunnel_local_ip=tunnel_local_ip,
                 tunnel_remote_ip=tunnel_remote_ip,
+                tunnel_port=tunnel_port,
                 tunnel_api_endpoint=tunnel_api_endpoint,
+                wg_private_key=wg_private_key,  # Local WireGuard private key
                 wg_peer_public_key=wg_peer_public_key,
                 auto_reconnect=False,
                 enabled=True,
@@ -13292,6 +13324,526 @@ def _unregister_chain_from_peers(db, chain: dict) -> dict:
     return results
 
 
+# ============ Phase 12: Chain Sync Propagation ============
+
+def _get_local_node_tag() -> str:
+    """获取本地节点标识"""
+    return (
+        os.environ.get("VPN_ROUTER_NODE_ID")
+        or os.environ.get("RUST_ROUTER_NODE_TAG")
+        or socket.gethostname()
+    )
+
+
+def _collect_used_dscp_from_chain(db, hops: List[str]) -> Dict[str, Any]:
+    """收集链路中所有节点已使用的 DSCP 值
+
+    Phase 12: 在创建链路前，递归查询所有下游节点的 DSCP 使用情况。
+    这确保新分配的 DSCP 值在整个链路中都可用。
+
+    Args:
+        db: 数据库实例
+        hops: 下游节点列表
+
+    Returns:
+        {
+            "success": True,
+            "used_dscp": [1, 2, 3, ...],  # 所有节点的并集
+            "by_node": {"node-b": [1, 2], "node-c": [3], ...}
+        }
+    """
+    from tunnel_api_client import TunnelAPIClient
+
+    all_used = set()
+    by_node = {}
+
+    # 添加本地已使用的 DSCP
+    local_chains = db.get_node_chains()
+    local_used = [c.get("dscp_value") for c in local_chains if c.get("dscp_value")]
+    local_tag = _get_local_node_tag()
+    all_used.update(local_used)
+    by_node[local_tag] = local_used
+
+    # 查询每个下游节点
+    for hop_tag in hops:
+        node = db.get_peer_node(hop_tag)
+        if not node:
+            logging.warning(f"[dscp-check] 节点 '{hop_tag}' 不存在，跳过")
+            continue
+
+        tunnel_api = _get_peer_tunnel_endpoint(node)
+        if not tunnel_api:
+            logging.warning(f"[dscp-check] 节点 '{hop_tag}' 隧道不可用，跳过")
+            continue
+
+        tunnel_type = node.get("tunnel_type", "wireguard")
+        socks_port = node.get("xray_socks_port") if tunnel_type == "xray" else None
+        peer_uuid = node.get("xray_uuid") if tunnel_type == "xray" else None
+
+        try:
+            client = TunnelAPIClient(
+                node_tag=hop_tag,
+                tunnel_endpoint=tunnel_api,
+                tunnel_type=tunnel_type,
+                socks_port=socks_port,
+                peer_uuid=peer_uuid,
+                timeout=10
+            )
+
+            resp = client.get_used_dscp_values()
+            if resp.get("success"):
+                node_used = resp.get("used_dscp", [])
+                all_used.update(node_used)
+                by_node[hop_tag] = node_used
+                logging.debug(f"[dscp-check] 节点 '{hop_tag}' 已用 DSCP: {node_used}")
+            else:
+                logging.warning(
+                    f"[dscp-check] 查询节点 '{hop_tag}' 失败: {resp.get('error')}"
+                )
+
+        except Exception as e:
+            logging.warning(f"[dscp-check] 查询节点 '{hop_tag}' 异常: {e}")
+            # 继续查询其他节点
+
+    return {
+        "success": True,
+        "used_dscp": sorted(list(all_used)),
+        "by_node": by_node,
+    }
+
+
+def _find_available_dscp(used_dscp: List[int], reserved: List[int] = None) -> Optional[int]:
+    """找到一个全局可用的 DSCP 值
+
+    Args:
+        used_dscp: 已使用的 DSCP 值列表
+        reserved: 保留的 DSCP 值（如 EF=46, AF 类等）
+
+    Returns:
+        可用的 DSCP 值，或 None 如果没有可用值
+    """
+    if reserved is None:
+        # 默认保留: 0(默认), 46(EF), AF 类 (10,12,14,18,20,22,26,28,30,34,36,38)
+        reserved = [0, 46, 10, 12, 14, 18, 20, 22, 26, 28, 30, 34, 36, 38]
+
+    used_set = set(used_dscp) | set(reserved)
+
+    # 从 1 到 63 找第一个可用值
+    for dscp in range(1, 64):
+        if dscp not in used_set:
+            return dscp
+
+    return None
+
+
+def _propagate_chain_to_peers(
+    db,
+    chain_tag: str,
+    dscp_value: int,
+    full_hops: List[str],
+    exit_egress: str,
+    description: str = "",
+    allow_transitive: bool = False,
+    action: str = "create",
+) -> Dict[str, Any]:
+    """向链路中的所有下游节点同步链路配置
+
+    Phase 12: 在创建链路时，将完整配置同步到所有节点，确保 DSCP 值一致。
+
+    同步流程：
+    1. Entry 节点向第一个下游节点发送同步请求
+    2. 下游节点存储链路到本地数据库
+    3. 下游节点同步到 rust-router
+    4. 如果不是终端节点，继续向下一跳传播
+
+    Args:
+        db: 数据库实例
+        chain_tag: 链路标识
+        dscp_value: DSCP 值 (1-63)
+        full_hops: 完整跳转列表 (包含本节点)
+        exit_egress: 终端出口
+        description: 链路描述
+        allow_transitive: 是否允许传递验证
+        action: 操作类型 ('create', 'update', 'delete')
+
+    Returns:
+        同步结果 {"success": bool, "results": {node_tag: success_bool, ...}}
+    """
+    from tunnel_api_client import TunnelAPIClient
+
+    local_tag = _get_local_node_tag()
+    source_node = local_tag
+
+    # 找到本节点在 hops 中的位置
+    try:
+        my_index = full_hops.index(local_tag)
+    except ValueError:
+        logging.warning(f"[chain-sync] 本节点 '{local_tag}' 不在链路 hops 中: {full_hops}")
+        return {"success": False, "error": "Local node not in chain hops", "results": {}}
+
+    # 只需向第一个下游节点发送，它会继续传播
+    if my_index >= len(full_hops) - 1:
+        # 已经是终端节点，无需传播
+        logging.debug(f"[chain-sync] 本节点是终端，无需传播")
+        return {"success": True, "results": {}}
+
+    next_hop = full_hops[my_index + 1]
+    results = {}
+
+    # 获取下一跳节点信息
+    next_node = db.get_peer_node(next_hop)
+    if not next_node:
+        logging.warning(f"[chain-sync] 下一跳节点 '{next_hop}' 不存在")
+        return {"success": False, "error": f"Next hop '{next_hop}' not found", "results": {next_hop: False}}
+
+    # 获取隧道端点
+    tunnel_api = _get_peer_tunnel_endpoint(next_node)
+    if not tunnel_api:
+        logging.warning(f"[chain-sync] 节点 '{next_hop}' 隧道不可用")
+        return {"success": False, "error": f"Tunnel to '{next_hop}' unavailable", "results": {next_hop: False}}
+
+    tunnel_type = next_node.get("tunnel_type", "wireguard")
+    socks_port = next_node.get("xray_socks_port") if tunnel_type == "xray" else None
+    peer_uuid = next_node.get("xray_uuid") if tunnel_type == "xray" else None
+
+    try:
+        client = TunnelAPIClient(
+            node_tag=next_hop,
+            tunnel_endpoint=tunnel_api,
+            tunnel_type=tunnel_type,
+            socks_port=socks_port,
+            peer_uuid=peer_uuid,
+            timeout=15
+        )
+
+        logging.info(
+            f"[chain-sync] 向 '{next_hop}' 同步链路 '{chain_tag}': "
+            f"dscp={dscp_value}, action={action}"
+        )
+
+        resp = client.propagate_chain(
+            chain_tag=chain_tag,
+            dscp_value=dscp_value,
+            full_hops=full_hops,
+            exit_egress=exit_egress,
+            source_node=source_node,
+            description=description,
+            allow_transitive=allow_transitive,
+            action=action,
+        )
+
+        if resp.get("success"):
+            logging.info(f"[chain-sync] 节点 '{next_hop}' 同步成功")
+            results[next_hop] = True
+            # 合并下游节点的传播结果
+            downstream_results = resp.get("propagation_results", {})
+            results.update(downstream_results)
+            return {"success": True, "results": results}
+        else:
+            logging.warning(f"[chain-sync] 节点 '{next_hop}' 同步失败: {resp.get('error', 'Unknown')}")
+            results[next_hop] = False
+            return {"success": False, "error": resp.get("error", "Unknown"), "results": results}
+
+    except Exception as e:
+        logging.error(f"[chain-sync] 向 '{next_hop}' 同步失败: {e}")
+        results[next_hop] = False
+        return {"success": False, "error": str(e), "results": results}
+
+
+class ChainSyncPropagateRequest(BaseModel):
+    """链路同步传播请求
+
+    Phase 12: 用于在创建/更新/删除链路时将配置同步到所有节点。
+
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+    """
+    chain_tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]{0,63}$", description="链路标识")
+    dscp_value: int = Field(..., ge=1, le=63, description="DSCP 值 (1-63)")
+    full_hops: List[str] = Field(..., min_length=1, max_length=10, description="完整跳转列表")
+    exit_egress: str = Field(..., description="终端出口")
+    source_node: str = Field(..., pattern=r"^[a-z][a-z0-9-]{0,63}$", description="发起同步的节点")
+    description: str = Field("", description="链路描述")
+    allow_transitive: bool = Field(False, description="是否允许传递验证")
+    action: str = Field("create", pattern=r"^(create|update|delete)$", description="操作类型")
+
+
+@app.get("/api/chain-sync/used-dscp")
+def api_chain_sync_used_dscp(request: Request):
+    """获取本节点已使用的 DSCP 值列表
+
+    Phase 12: 用于在创建链路前检查 DSCP 冲突。
+    Entry 节点在分配 DSCP 值前，先查询所有下游节点已使用的 DSCP 值，
+    确保新分配的值在整个链路中都可用。
+
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+
+    Returns:
+        {
+            "success": true,
+            "used_dscp": [1, 3, 5],
+            "chains": {"chain-a": 1, "chain-b": 3, "chain-c": 5}
+        }
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_api_rate_limit(client_ip):
+        return {"success": False, "error": "Too many requests"}
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return {"success": False, "error": "Database unavailable"}
+
+    db = _get_db()
+
+    # 验证隧道认证
+    node = _verify_tunnel_header(request, db)
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    if not node:
+        logging.warning(f"[chain-sync] used-dscp 认证失败: client_ip={client_ip}")
+        return {"success": False, "error": "Authentication failed"}
+
+    # 获取所有链路的 DSCP 值
+    try:
+        all_chains = db.get_node_chains()
+        used_dscp = []
+        chains_map = {}
+
+        for chain in all_chains:
+            dscp = chain.get("dscp_value")
+            tag = chain.get("tag")
+            if dscp is not None and dscp > 0:
+                if dscp not in used_dscp:
+                    used_dscp.append(dscp)
+                chains_map[tag] = dscp
+
+        logging.debug(f"[chain-sync] 返回已用 DSCP: {used_dscp} (from {node['tag']})")
+
+        return {
+            "success": True,
+            "used_dscp": sorted(used_dscp),
+            "chains": chains_map,
+        }
+
+    except Exception as e:
+        logging.error(f"[chain-sync] 获取已用 DSCP 失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/chain-sync/propagate")
+def api_chain_sync_propagate(request: Request, payload: ChainSyncPropagateRequest):
+    """接收链路同步传播请求
+
+    Phase 12: 当上游节点创建/更新/删除链路时，调用此端点同步配置。
+
+    处理流程：
+    1. 验证请求来自可信节点
+    2. 根据 full_hops 计算本节点角色
+    3. 存储/更新/删除链路到本地数据库
+    4. 同步到 rust-router
+    5. 如果不是终端节点，继续向下游传播
+
+    认证方式: 隧道 IP 认证 (WireGuard) 或 UUID 认证 (Xray)
+    """
+    client_ip = _get_client_ip(request)
+
+    # 速率限制
+    if not _check_api_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return {"success": False, "error": "Database unavailable"}
+
+    db = _get_db()
+
+    # 验证隧道认证
+    node = _verify_tunnel_header(request, db)
+    if not node:
+        node = _verify_peer_endpoint_auth(request, db)
+    if not node:
+        logging.warning(f"[chain-sync] 认证失败: client_ip={client_ip}")
+        return {"success": False, "error": "Authentication failed"}
+
+    local_tag = _get_local_node_tag()
+
+    # 验证本节点在 hops 中
+    if local_tag not in payload.full_hops:
+        logging.warning(
+            f"[chain-sync] 本节点 '{local_tag}' 不在链路 hops 中: {payload.full_hops}"
+        )
+        return {"success": False, "error": f"Local node '{local_tag}' not in chain hops"}
+
+    # 计算本节点角色
+    my_index = payload.full_hops.index(local_tag)
+    last_index = len(payload.full_hops) - 1
+
+    if my_index == 0:
+        role = "entry"
+    elif my_index == last_index:
+        role = "terminal"
+    else:
+        role = "relay"
+
+    logging.info(
+        f"[chain-sync] 收到链路同步: chain={payload.chain_tag}, dscp={payload.dscp_value}, "
+        f"role={role}, action={payload.action}, from={node['tag']}"
+    )
+
+    # 处理不同操作
+    propagation_results = {}
+
+    if payload.action == "delete":
+        # 删除链路
+        existing = db.get_node_chain(payload.chain_tag)
+        if existing:
+            try:
+                db.delete_node_chain(payload.chain_tag)
+                logging.info(f"[chain-sync] 删除链路 '{payload.chain_tag}'")
+            except Exception as e:
+                logging.error(f"[chain-sync] 删除链路失败: {e}")
+                return {"success": False, "error": f"Failed to delete chain: {e}"}
+        else:
+            logging.debug(f"[chain-sync] 链路 '{payload.chain_tag}' 不存在，跳过删除")
+
+    else:
+        # 创建或更新链路
+        # 构建 hops: 从本节点开始的后续跳转
+        downstream_hops = payload.full_hops[my_index + 1:] if my_index < last_index else []
+
+        existing = db.get_node_chain(payload.chain_tag)
+
+        # Phase 12: DSCP 冲突检测
+        # 检查是否有其他链路使用相同的 DSCP 值
+        if not existing or (existing and existing.get("dscp_value") != payload.dscp_value):
+            all_chains = db.get_node_chains()
+            for chain in all_chains:
+                if (
+                    chain.get("tag") != payload.chain_tag
+                    and chain.get("dscp_value") == payload.dscp_value
+                ):
+                    conflict_tag = chain.get("tag")
+                    logging.warning(
+                        f"[chain-sync] DSCP 冲突: 值 {payload.dscp_value} 已被链路 "
+                        f"'{conflict_tag}' 使用"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"DSCP value {payload.dscp_value} already used by chain '{conflict_tag}'",
+                        "conflict_chain": conflict_tag,
+                        "dscp_value": payload.dscp_value,
+                    }
+
+        try:
+            if existing and payload.action == "update":
+                # 更新现有链路
+                db.update_node_chain(
+                    tag=payload.chain_tag,
+                    name=payload.chain_tag,
+                    description=payload.description,
+                    hops=downstream_hops,
+                    exit_egress=payload.exit_egress if role == "terminal" else None,
+                    dscp_value=payload.dscp_value,
+                    allow_transitive=payload.allow_transitive,
+                )
+                logging.info(
+                    f"[chain-sync] 更新链路 '{payload.chain_tag}': "
+                    f"dscp={payload.dscp_value}, role={role}"
+                )
+            elif not existing:
+                # 创建新链路
+                db.add_node_chain(
+                    tag=payload.chain_tag,
+                    name=payload.chain_tag,
+                    description=payload.description,
+                    hops=downstream_hops,
+                    priority=0,
+                    enabled=1,  # 默认启用
+                    exit_egress=payload.exit_egress if role == "terminal" else None,
+                    dscp_value=payload.dscp_value,
+                    chain_mark_type="dscp",
+                    allow_transitive=payload.allow_transitive,
+                )
+                logging.info(
+                    f"[chain-sync] 创建链路 '{payload.chain_tag}': "
+                    f"dscp={payload.dscp_value}, role={role}, hops={downstream_hops}"
+                )
+            else:
+                # 链路已存在且 action=create，检查 DSCP 是否一致
+                if existing.get("dscp_value") != payload.dscp_value:
+                    logging.warning(
+                        f"[chain-sync] 链路 '{payload.chain_tag}' 已存在但 DSCP 不一致: "
+                        f"本地={existing.get('dscp_value')}, 请求={payload.dscp_value}"
+                    )
+                    # 更新为新的 DSCP 值以保持一致性
+                    db.update_node_chain(
+                        tag=payload.chain_tag,
+                        dscp_value=payload.dscp_value,
+                    )
+                    logging.info(f"[chain-sync] 已更新链路 '{payload.chain_tag}' 的 DSCP 值")
+                else:
+                    logging.info(f"[chain-sync] 链路 '{payload.chain_tag}' 已存在且配置一致，跳过")
+
+        except Exception as e:
+            logging.error(f"[chain-sync] 存储链路失败: {e}")
+            return {"success": False, "error": f"Failed to store chain: {e}"}
+
+    # 通知 rust-router 同步链路
+    try:
+        if os.environ.get("USE_RUST_ROUTER", "false").lower() == "true":
+            from rust_router_manager import RustRouterManager
+            manager = RustRouterManager()
+            if manager.is_available():
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    if payload.action == "delete":
+                        loop.run_until_complete(
+                            manager.notify_chain_changed(payload.chain_tag, "deleted")
+                        )
+                    else:
+                        loop.run_until_complete(
+                            manager.notify_chain_changed(payload.chain_tag, payload.action)
+                        )
+                    logging.info(f"[chain-sync] rust-router 同步成功")
+                finally:
+                    loop.close()
+    except Exception as e:
+        logging.warning(f"[chain-sync] rust-router 同步失败: {e}")
+        # 不阻塞传播，继续
+
+    # 如果不是终端节点，继续向下游传播
+    if role != "terminal":
+        prop_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=payload.chain_tag,
+            dscp_value=payload.dscp_value,
+            full_hops=payload.full_hops,
+            exit_egress=payload.exit_egress,
+            description=payload.description,
+            allow_transitive=payload.allow_transitive,
+            action=payload.action,
+        )
+        propagation_results = prop_result.get("results", {})
+
+        if not prop_result.get("success"):
+            logging.warning(f"[chain-sync] 下游传播失败: {prop_result.get('error')}")
+            # 仍然返回成功（本节点已处理），但包含传播错误
+            return {
+                "success": True,
+                "message": f"Local sync succeeded, downstream propagation failed",
+                "role": role,
+                "propagation_results": propagation_results,
+                "propagation_error": prop_result.get("error"),
+            }
+
+    return {
+        "success": True,
+        "message": f"Chain sync completed (role={role})",
+        "role": role,
+        "propagation_results": propagation_results,
+    }
+
+
 # ============ Cascade Notification Endpoints ============
 
 class DownstreamDisconnectedRequest(BaseModel):
@@ -16007,6 +16559,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             local_tag=payload.local_node_tag,
             local_endpoint=ipc_endpoint,
             tunnel_status="connected" if bidirectional else "disconnected",
+            ipc_response_data=response_data,  # Pass IPC response containing wg_local_private_key
         )
 
         if not synced_tag:
@@ -16097,7 +16650,7 @@ def api_complete_pairing(payload: CompletePairingRequest):
 
     if tunnel_type == "wireguard":
         # Use rust-router IPC for completing pairing in userspace WG mode
-        success, message_or_error, peer_tag = _run_async_ipc(
+        success, message_or_error, peer_tag, ipc_response_data = _run_async_ipc(
             _complete_handshake_via_ipc(payload.code)
         )
 
@@ -16109,12 +16662,14 @@ def api_complete_pairing(payload: CompletePairingRequest):
                 created_node_tag=None
             )
 
+        # Pass IPC response data containing wg_local_private_key for DB persistence
         synced_tag = _sync_userspace_peer_from_codes(
             db,
             request_code=payload.pending_request.get("code"),
             response_code=payload.code,
             local_tag=payload.pending_request.get("node_tag", ""),
             tunnel_status="connected",
+            ipc_response_data=ipc_response_data,  # Contains private key, tunnel_ip, port
         )
 
         if not synced_tag:
@@ -16944,13 +17499,43 @@ def api_create_chain(payload: NodeChainCreateRequest):
                        f"Use WireGuard tunnels for multi-hop chains."
             )
 
-    # 自动分配 DSCP 值（如果未提供）
+    # Phase 12: 自动分配全局唯一的 DSCP 值
+    # 查询所有下游节点已使用的 DSCP，确保新值在整个链路中都可用
     dscp_value = payload.dscp_value
+    dscp_check_result = None
+
     if dscp_value is None:
-        dscp_value = db.get_next_available_dscp_value()
+        # 收集本节点和所有下游节点已使用的 DSCP 值
+        dscp_check_result = _collect_used_dscp_from_chain(db, payload.hops)
+        all_used_dscp = dscp_check_result.get("used_dscp", [])
+
+        # 找到全局可用的 DSCP 值
+        dscp_value = _find_available_dscp(all_used_dscp)
         if dscp_value is None:
-            raise HTTPException(status_code=409, detail="无可用的 DSCP 值（已达上限 63）")
-        logging.info(f"[chains] 自动分配 DSCP 值: {dscp_value}")
+            raise HTTPException(
+                status_code=409,
+                detail=f"无全局可用的 DSCP 值。已使用: {all_used_dscp}"
+            )
+        logging.info(
+            f"[chains] 自动分配全局 DSCP 值: {dscp_value} "
+            f"(已用: {all_used_dscp})"
+        )
+    else:
+        # 用户指定了 DSCP 值，检查是否与下游节点冲突
+        dscp_check_result = _collect_used_dscp_from_chain(db, payload.hops)
+        all_used_dscp = dscp_check_result.get("used_dscp", [])
+
+        if dscp_value in all_used_dscp:
+            # 找出哪个节点使用了这个值
+            by_node = dscp_check_result.get("by_node", {})
+            conflict_nodes = [
+                node for node, used in by_node.items()
+                if dscp_value in used
+            ]
+            raise HTTPException(
+                status_code=409,
+                detail=f"DSCP 值 {dscp_value} 已被节点 {conflict_nodes} 使用"
+            )
 
     # Phase 11-Fix.J + Phase 11-Fix.Q: 静态验证终端出口（如已指定）
     # 完整验证在链路激活时通过远程查询终端节点执行
@@ -16988,11 +17573,38 @@ def api_create_chain(payload: NodeChainCreateRequest):
         if chain:
             registration_results = _register_chain_with_peers(db, chain)
 
+    # Phase 12: 同步链路配置到所有下游节点
+    sync_results = {}
+    local_tag = _get_local_node_tag()
+    full_hops = [local_tag] + list(payload.hops)  # 本节点 + 下游节点
+
+    if len(full_hops) > 1:
+        sync_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=payload.tag,
+            dscp_value=dscp_value,
+            full_hops=full_hops,
+            exit_egress=payload.exit_egress or "",
+            description=payload.description or "",
+            allow_transitive=payload.allow_transitive,
+            action="create",
+        )
+        sync_results = sync_result.get("results", {})
+        if sync_result.get("success"):
+            logging.info(f"[chains] 链路 '{payload.tag}' 同步到所有节点成功")
+        else:
+            logging.warning(
+                f"[chains] 链路 '{payload.tag}' 同步失败: {sync_result.get('error')}"
+            )
+
     return {
         "message": f"链路 '{payload.tag}' 创建成功",
         "id": chain_id,
         "tag": payload.tag,
+        "dscp_value": dscp_value,
+        "full_hops": full_hops,
         "registration_results": registration_results,
+        "sync_results": sync_results,
     }
 
 
@@ -17111,10 +17723,35 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
             registration_results = _unregister_chain_from_peers(db, chain)
 
     logging.info(f"[chains] 更新链路 '{tag}'")
+
+    # Phase 12: 同步更新到所有下游节点
+    sync_results = {}
+    hops = _parse_chain_hops(updated_chain, raise_on_error=False)
+    if hops:
+        local_tag = _get_local_node_tag()
+        full_hops = [local_tag] + hops
+
+        sync_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=tag,
+            dscp_value=updated_chain.get("dscp_value", 0),
+            full_hops=full_hops,
+            exit_egress=updated_chain.get("exit_egress") or "",
+            description=updated_chain.get("description") or "",
+            allow_transitive=bool(updated_chain.get("allow_transitive")),
+            action="update",
+        )
+        sync_results = sync_result.get("results", {})
+        if sync_result.get("success"):
+            logging.info(f"[chains] 链路 '{tag}' 更新同步到所有节点成功")
+        else:
+            logging.warning(f"[chains] 链路 '{tag}' 更新同步失败: {sync_result.get('error')}")
+
     return {
         "message": f"链路 '{tag}' 已更新",
         "chain": updated_chain,
         "registration_results": registration_results,
+        "sync_results": sync_results,
     }
 
 
@@ -17151,14 +17788,41 @@ def api_delete_chain(tag: str):
         logging.info(f"[chains] 删除前停用并注销链路 '{tag}' (state={chain_state})")
         unregistration_results = _unregister_chain_from_peers(db, chain)
 
+    # Phase 12: 保存链路信息用于删除同步
+    hops = _parse_chain_hops(chain, raise_on_error=False)
+    dscp_value = chain.get("dscp_value", 0)
+    exit_egress = chain.get("exit_egress") or ""
+
     success = db.delete_node_chain(tag)
     if not success:
         raise HTTPException(status_code=500, detail="删除链路失败")
 
     logging.info(f"[chains] 删除链路 '{tag}'")
+
+    # Phase 12: 同步删除到所有下游节点
+    sync_results = {}
+    if hops:
+        local_tag = _get_local_node_tag()
+        full_hops = [local_tag] + hops
+
+        sync_result = _propagate_chain_to_peers(
+            db=db,
+            chain_tag=tag,
+            dscp_value=dscp_value,
+            full_hops=full_hops,
+            exit_egress=exit_egress,
+            action="delete",
+        )
+        sync_results = sync_result.get("results", {})
+        if sync_result.get("success"):
+            logging.info(f"[chains] 链路 '{tag}' 删除同步到所有节点成功")
+        else:
+            logging.warning(f"[chains] 链路 '{tag}' 删除同步失败: {sync_result.get('error')}")
+
     return {
         "message": f"链路 '{tag}' 已删除",
         "unregistration_results": unregistration_results,
+        "sync_results": sync_results,
     }
 
 

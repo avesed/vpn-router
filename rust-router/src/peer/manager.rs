@@ -150,6 +150,58 @@ pub enum PeerError {
     Internal(String),
 }
 
+/// Result of importing a pairing request
+///
+/// Contains all the information needed to persist the peer configuration
+/// to the database, including the generated WireGuard private key.
+#[derive(Debug, Clone)]
+pub struct ImportPairResult {
+    /// Base64-encoded response code to send back to the requesting node
+    pub response_code: String,
+    /// Remote peer's node tag (this is the peer we just added)
+    pub peer_tag: String,
+    /// Local WireGuard private key (Base64) - must be saved to database
+    pub wg_local_private_key: String,
+    /// Local tunnel IP address
+    pub tunnel_local_ip: String,
+    /// Allocated tunnel port
+    pub tunnel_port: u16,
+}
+
+/// Result from `generate_pair_request`
+///
+/// Contains all the information needed to persist the pending pairing state,
+/// including the generated WireGuard private key which must be saved.
+#[derive(Debug, Clone)]
+pub struct GeneratePairResult {
+    /// Base64-encoded pairing request code to share with the remote node
+    pub code: String,
+    /// Local WireGuard private key (Base64) - must be saved to database
+    pub wg_local_private_key: String,
+    /// Local tunnel IP address
+    pub tunnel_local_ip: String,
+    /// Allocated tunnel port
+    pub tunnel_port: u16,
+}
+
+/// Result from `complete_handshake`
+///
+/// Contains all the information needed to persist the peer configuration
+/// after completing the handshake.
+#[derive(Debug, Clone)]
+pub struct CompleteHandshakeResult {
+    /// Remote peer's node tag
+    pub peer_tag: String,
+    /// Local WireGuard private key (Base64) - must be saved to database
+    pub wg_local_private_key: String,
+    /// Local tunnel IP address
+    pub tunnel_local_ip: String,
+    /// Remote tunnel IP address
+    pub tunnel_remote_ip: Option<String>,
+    /// Allocated tunnel port
+    pub tunnel_port: u16,
+}
+
 /// State for a pending pairing request
 ///
 /// Stores the local keys and configuration while waiting for the peer's response.
@@ -299,8 +351,8 @@ impl PeerManager {
     /// 4. Allocate tunnel port
     /// 5. Create `PairRequest` struct
     /// 6. Store pending request for later completion
-    /// 7. Encode and return the pairing code
-    pub fn generate_pair_request(&self, config: PairRequestConfig) -> Result<String, PeerError> {
+    /// 7. Encode and return the pairing result with private key for persistence
+    pub fn generate_pair_request(&self, config: PairRequestConfig) -> Result<GeneratePairResult, PeerError> {
         // Validate input (no resources allocated yet, safe to return early)
         validate_peer_tag(&config.local_tag)?;
         validate_description(&config.local_description)?;
@@ -400,10 +452,11 @@ impl PeerManager {
         };
 
         // Store pending request (only after successful encoding)
+        // Clone private key since we need it for both pending storage and return value
         let pending = PendingPairRequest {
             local_tag: config.local_tag.clone(),
             remote_tag: String::new(), // Will be filled when we get the response
-            local_private_key,
+            local_private_key: local_private_key.clone(),
             local_public_key,
             remote_private_key,
             remote_public_key,
@@ -449,7 +502,15 @@ impl PeerManager {
             "Pairing request generated"
         );
 
-        Ok(code)
+        // Return result with private key for database persistence
+        Ok(GeneratePairResult {
+            code,
+            wg_local_private_key: local_private_key,
+            tunnel_local_ip: local_tunnel_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            tunnel_port,
+        })
     }
 
     /// Import a pairing request from another node
@@ -470,12 +531,12 @@ impl PeerManager {
     /// 3. Generate local `WireGuard` keys or use pre-generated remote keys
     /// 4. Allocate tunnel IPs
     /// 5. Create peer entry in `peers` `HashMap` with state `Configured`
-    /// 6. Create `PairResponse` and return encoded
+    /// 6. Create `PairResponse` and return encoded along with WireGuard config
     pub async fn import_pair_request(
         &self,
         code: &str,
         local_config: PairRequestConfig,
-    ) -> Result<String, PeerError> {
+    ) -> Result<ImportPairResult, PeerError> {
         // Decode the pairing request
         let request = decode_pair_request(code)?;
 
@@ -644,7 +705,14 @@ impl PeerManager {
             }
         }
 
-        Ok(response_code)
+        // Return the result with all necessary information for database persistence
+        Ok(ImportPairResult {
+            response_code,
+            peer_tag: request.node_tag.clone(),
+            wg_local_private_key: local_private_key,
+            tunnel_local_ip: local_tunnel_ip.to_string(),
+            tunnel_port,
+        })
     }
 
     /// Complete the pairing handshake
@@ -660,7 +728,8 @@ impl PeerManager {
     /// 3. Update peer config with response data
     /// 4. Create peer entry
     /// 5. Remove pending request
-    pub async fn complete_handshake(&self, code: &str) -> Result<(), PeerError> {
+    /// 6. Return result with private key for database persistence
+    pub async fn complete_handshake(&self, code: &str) -> Result<CompleteHandshakeResult, PeerError> {
         // Decode the pairing response
         let response = decode_pair_response(code)?;
 
@@ -719,9 +788,12 @@ impl PeerManager {
             xray_local_socks_port: None,
         };
 
-        // Store bidirectional flag before removing pending request
+        // Store values for result before removing pending request
         let is_bidirectional = pending.bidirectional;
         let peer_tag = response.node_tag.clone();
+        let local_private_key = pending.local_private_key.clone();
+        let local_tunnel_ip = pending.local_tunnel_ip.map(|ip| ip.to_string());
+        let tunnel_port = pending.tunnel_port.unwrap_or(0);
 
         // Add peer to the manager
         self.add_peer_internal(peer_config)?;
@@ -756,7 +828,14 @@ impl PeerManager {
             }
         }
 
-        Ok(())
+        // Return result with private key for database persistence
+        Ok(CompleteHandshakeResult {
+            peer_tag,
+            wg_local_private_key: local_private_key,
+            tunnel_local_ip: local_tunnel_ip.unwrap_or_default(),
+            tunnel_remote_ip: remote_tunnel_ip.map(|ip| ip.to_string()),
+            tunnel_port,
+        })
     }
 
     /// Connect to a configured peer
@@ -845,9 +924,11 @@ impl PeerManager {
             tunnel_config
         };
 
-        // Build tunnel
+        // Build tunnel with peer- prefix for consistency with ChainManager expectations
+        // ChainManager.get_next_hop_tunnel() returns "peer-{node_tag}"
+        let tunnel_tag = format!("peer-{}", tag);
         let tunnel = WgTunnelBuilder::new(tunnel_config)
-            .with_tag(tag)
+            .with_tag(&tunnel_tag)
             .build_userspace()
             .map_err(|e| PeerError::TunnelCreationFailed(e.to_string()))?;
 
@@ -857,13 +938,13 @@ impl PeerManager {
             .await
             .map_err(|e| PeerError::TunnelCreationFailed(format!("Failed to connect tunnel: {e}")))?;
 
-        // Store tunnel
+        // Store tunnel with peer- prefix
         {
             let mut wg_tunnels = self.wg_tunnels.write();
-            wg_tunnels.insert(tag.to_string(), Arc::new(tunnel));
+            wg_tunnels.insert(tunnel_tag.clone(), Arc::new(tunnel));
         }
 
-        debug!(tag = %tag, "WireGuard tunnel created and connected");
+        debug!(tag = %tag, tunnel_tag = %tunnel_tag, "WireGuard tunnel created and connected");
 
         Ok(())
     }
@@ -925,10 +1006,11 @@ impl PeerManager {
 
         match config.tunnel_type {
             TunnelType::WireGuard => {
-                // Remove and shutdown tunnel
+                // Remove and shutdown tunnel (using peer- prefix)
+                let tunnel_tag = format!("peer-{}", tag);
                 let tunnel = {
                     let mut wg_tunnels = self.wg_tunnels.write();
-                    wg_tunnels.remove(tag)
+                    wg_tunnels.remove(&tunnel_tag)
                 };
 
                 if let Some(tunnel) = tunnel {
@@ -968,10 +1050,11 @@ impl PeerManager {
         let peers = self.peers.read();
         let peer = peers.get(tag)?;
 
-        // Get tunnel stats if available
+        // Get tunnel stats if available (tunnels use peer- prefix)
+        let tunnel_tag = format!("peer-{}", tag);
         let (tx_bytes, rx_bytes, last_handshake) = {
             let wg_tunnels = self.wg_tunnels.read();
-            if let Some(tunnel) = wg_tunnels.get(tag) {
+            if let Some(tunnel) = wg_tunnels.get(&tunnel_tag) {
                 let stats = tunnel.stats();
                 (stats.tx_bytes, stats.rx_bytes, stats.last_handshake)
             } else {
@@ -983,6 +1066,7 @@ impl PeerManager {
             tag: tag.to_string(),
             state: peer.state,
             tunnel_type: peer.config.tunnel_type,
+            endpoint: peer.config.endpoint.clone(),
             tunnel_local_ip: peer.config.tunnel_local_ip.clone(),
             tunnel_remote_ip: peer.config.tunnel_remote_ip.clone(),
             api_port: peer.config.api_port,
@@ -1007,7 +1091,9 @@ impl PeerManager {
         peers
             .iter()
             .map(|(tag, peer)| {
-                let (tx_bytes, rx_bytes, last_handshake) = if let Some(tunnel) = wg_tunnels.get(tag)
+                // Tunnels are stored with peer- prefix
+                let tunnel_tag = format!("peer-{}", tag);
+                let (tx_bytes, rx_bytes, last_handshake) = if let Some(tunnel) = wg_tunnels.get(&tunnel_tag)
                 {
                     let stats = tunnel.stats();
                     (stats.tx_bytes, stats.rx_bytes, stats.last_handshake)
@@ -1019,6 +1105,7 @@ impl PeerManager {
                     tag: tag.clone(),
                     state: peer.state,
                     tunnel_type: peer.config.tunnel_type,
+                    endpoint: peer.config.endpoint.clone(),
                     tunnel_local_ip: peer.config.tunnel_local_ip.clone(),
                     tunnel_remote_ip: peer.config.tunnel_remote_ip.clone(),
                     api_port: peer.config.api_port,
@@ -1129,9 +1216,52 @@ impl PeerManager {
     /// Uses a single write lock for the entire check-and-insert operation to prevent
     /// TOCTOU (time-of-check-to-time-of-use) race conditions. Two concurrent calls
     /// with the same tag will now properly return `AlreadyExists` for the second caller.
+    ///
+    /// Also marks tunnel IPs as allocated to prevent conflicts when restoring peers
+    /// from database after restart.
     fn add_peer_internal(&self, config: PeerConfig) -> Result<(), PeerError> {
         // Validate tag before acquiring lock
         validate_peer_tag(&config.tag)?;
+
+        // Mark tunnel IPs and port as allocated (important for database restore)
+        // This prevents new pairings from allocating the same resources
+        if let Some(ref ip_str) = config.tunnel_local_ip {
+            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                // Try to mark as allocated; ignore if already allocated (peer owns it)
+                if let Err(e) = self.tunnel_ip_allocator.allocate_specific(ip) {
+                    debug!(
+                        tag = %config.tag,
+                        ip = %ip,
+                        error = %e,
+                        "Could not mark tunnel_local_ip as allocated (may already be allocated)"
+                    );
+                }
+            }
+        }
+        if let Some(ref ip_str) = config.tunnel_remote_ip {
+            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                // Try to mark as allocated; ignore if already allocated
+                if let Err(e) = self.tunnel_ip_allocator.allocate_specific(ip) {
+                    debug!(
+                        tag = %config.tag,
+                        ip = %ip,
+                        error = %e,
+                        "Could not mark tunnel_remote_ip as allocated (may already be allocated)"
+                    );
+                }
+            }
+        }
+        if let Some(port) = config.tunnel_port {
+            // Try to mark port as allocated; ignore if already allocated
+            if let Err(e) = self.tunnel_port_allocator.allocate_specific(port) {
+                debug!(
+                    tag = %config.tag,
+                    port = port,
+                    error = %e,
+                    "Could not mark tunnel_port as allocated (may already be allocated)"
+                );
+            }
+        }
 
         // Use single write lock to prevent TOCTOU race condition
         // (check if exists + insert must be atomic)

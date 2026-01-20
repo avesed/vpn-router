@@ -63,7 +63,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::chain::allocator::{DscpAllocator, DscpAllocatorError};
 use crate::chain::two_phase::{ChainNetworkClient, NoOpNetworkClient, TwoPhaseCommit, TwoPhaseError};
-use crate::ipc::{ChainConfig, ChainRole, ChainState, ChainStatus, TunnelType};
+use crate::ipc::{ChainConfig, ChainRole, ChainState, ChainStatus, HopStatus, TunnelType};
 use crate::peer::validation::{validate_chain_tag, validate_description};
 
 /// Maximum number of hops allowed in a chain
@@ -1155,12 +1155,27 @@ impl ChainManager {
         let chains = self.chains.read().ok()?;
         let chain = chains.get(tag)?;
 
+        // Convert ChainHop to HopStatus
+        let hop_status: Vec<HopStatus> = chain
+            .config
+            .hops
+            .iter()
+            .map(|hop| HopStatus {
+                node_tag: hop.node_tag.clone(),
+                role: hop.role,
+                tunnel_type: hop.tunnel_type,
+                peer_connected: chain.state == ChainState::Active,
+                prepare_status: None,
+            })
+            .collect();
+
         Some(ChainStatus {
             tag: tag.to_string(),
             state: chain.state,
             dscp_value: chain.allocated_dscp,
             my_role: chain.my_role,
-            hop_status: Vec::new(), // TODO(Phase 6.6.2): Populate from peer status
+            hop_status,
+            exit_egress: chain.config.exit_egress.clone(),
             active_connections: 0,
             last_error: chain.last_error.clone(),
         })
@@ -1231,14 +1246,32 @@ impl ChainManager {
 
         chains
             .iter()
-            .map(|(tag, chain)| ChainStatus {
-                tag: tag.clone(),
-                state: chain.state,
-                dscp_value: chain.allocated_dscp,
-                my_role: chain.my_role,
-                hop_status: Vec::new(),
-                active_connections: 0,
-                last_error: chain.last_error.clone(),
+            .map(|(tag, chain)| {
+                // Convert ChainHop to HopStatus
+                let hop_status: Vec<HopStatus> = chain
+                    .config
+                    .hops
+                    .iter()
+                    .map(|hop| HopStatus {
+                        node_tag: hop.node_tag.clone(),
+                        role: hop.role,
+                        tunnel_type: hop.tunnel_type,
+                        // If chain is active, hops are connected
+                        peer_connected: chain.state == ChainState::Active,
+                        prepare_status: None,
+                    })
+                    .collect();
+
+                ChainStatus {
+                    tag: tag.clone(),
+                    state: chain.state,
+                    dscp_value: chain.allocated_dscp,
+                    my_role: chain.my_role,
+                    hop_status,
+                    exit_egress: chain.config.exit_egress.clone(),
+                    active_connections: 0,
+                    last_error: chain.last_error.clone(),
+                }
             })
             .collect()
     }

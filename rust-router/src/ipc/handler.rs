@@ -3014,15 +3014,23 @@ impl IpcHandler {
         }
 
         // Query PeerManager's WireGuard tunnels (peer connections)
+        // Note: Peer tunnels use "peer-{tag}" naming convention
         if let Some(peer_manager) = &self.peer_manager {
             let peers = peer_manager.list_peers();
             for peer in peers {
                 if peer.tunnel_type == TunnelType::WireGuard {
+                    // Use peer- prefix for consistency with ChainManager expectations
+                    let tunnel_tag = format!("peer-{}", peer.tag);
+                    // Skip if already reported by WgEgressManager
+                    if tunnels.iter().any(|t| t.tag == tunnel_tag) {
+                        continue;
+                    }
                     tunnels.push(WgTunnelStatus {
-                        tag: peer.tag,
+                        tag: tunnel_tag,
                         active: peer.state == PeerState::Connected,
                         local_ip: peer.tunnel_local_ip,
-                        peer_endpoint: peer.tunnel_remote_ip.unwrap_or_else(|| "unknown".to_string()),
+                        // Use actual peer endpoint, not tunnel IP
+                        peer_endpoint: peer.endpoint.clone(),
                         last_handshake: peer.last_handshake,
                         tx_bytes: peer.tx_bytes,
                         rx_bytes: peer.rx_bytes,
@@ -3485,13 +3493,16 @@ impl IpcHandler {
         };
 
         match peer_manager.generate_pair_request(config) {
-            Ok(code) => {
+            Ok(result) => {
                 info!("Generated pairing request code");
                 IpcResponse::Pairing(PairingResponse {
                     success: true,
-                    code: Some(code),
+                    code: Some(result.code),
                     message: Some("Pairing request generated".to_string()),
                     peer_tag: None,
+                    wg_local_private_key: Some(result.wg_local_private_key),
+                    tunnel_local_ip: Some(result.tunnel_local_ip),
+                    tunnel_port: Some(result.tunnel_port),
                 })
             }
             Err(e) => {
@@ -3501,6 +3512,9 @@ impl IpcHandler {
                     code: None,
                     message: Some(e.to_string()),
                     peer_tag: None,
+                    wg_local_private_key: None,
+                    tunnel_local_ip: None,
+                    tunnel_port: None,
                 })
             }
         }
@@ -3534,13 +3548,20 @@ impl IpcHandler {
         };
 
         match peer_manager.import_pair_request(&code, local_config).await {
-            Ok(response_code) => {
-                info!("Imported pairing request, generated response code");
+            Ok(result) => {
+                info!(
+                    peer_tag = %result.peer_tag,
+                    tunnel_port = result.tunnel_port,
+                    "Imported pairing request, generated response code"
+                );
                 IpcResponse::Pairing(PairingResponse {
                     success: true,
-                    code: Some(response_code),
+                    code: Some(result.response_code),
                     message: Some("Pairing request imported".to_string()),
-                    peer_tag: None,
+                    peer_tag: Some(result.peer_tag),
+                    wg_local_private_key: Some(result.wg_local_private_key),
+                    tunnel_local_ip: Some(result.tunnel_local_ip),
+                    tunnel_port: Some(result.tunnel_port),
                 })
             }
             Err(e) => {
@@ -3550,6 +3571,9 @@ impl IpcHandler {
                     code: None,
                     message: Some(e.to_string()),
                     peer_tag: None,
+                    wg_local_private_key: None,
+                    tunnel_local_ip: None,
+                    tunnel_port: None,
                 })
             }
         }
@@ -3567,13 +3591,16 @@ impl IpcHandler {
         };
 
         match peer_manager.complete_handshake(&code).await {
-            Ok(()) => {
-                info!("Completed pairing handshake");
+            Ok(result) => {
+                info!(peer_tag = %result.peer_tag, "Completed pairing handshake");
                 IpcResponse::Pairing(PairingResponse {
                     success: true,
                     code: None,
                     message: Some("Handshake completed".to_string()),
-                    peer_tag: None,
+                    peer_tag: Some(result.peer_tag),
+                    wg_local_private_key: Some(result.wg_local_private_key),
+                    tunnel_local_ip: Some(result.tunnel_local_ip),
+                    tunnel_port: Some(result.tunnel_port),
                 })
             }
             Err(e) => {
@@ -3583,6 +3610,9 @@ impl IpcHandler {
                     code: None,
                     message: Some(e.to_string()),
                     peer_tag: None,
+                    wg_local_private_key: None,
+                    tunnel_local_ip: None,
+                    tunnel_port: None,
                 })
             }
         }

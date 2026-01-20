@@ -511,6 +511,36 @@ pub trait WgTunnel: Send + Sync {
             Ok(())
         })
     }
+
+    // ========================================================================
+    // Data Transmission
+    // ========================================================================
+
+    /// Send a packet through the tunnel
+    ///
+    /// Takes a plaintext IP packet, encrypts it using `WireGuard`, and sends
+    /// it to the peer endpoint over UDP.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - The plaintext IP packet to send
+    ///
+    /// # Errors
+    ///
+    /// - `NotConnected` - The tunnel is not connected
+    /// - `SendFailed` - Failed to send the packet
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `NotSupported` error. Implementations should override this
+    /// with actual sending functionality.
+    fn send(&self, _packet: &[u8]) -> BoxFuture<'_, Result<(), WgTunnelError>> {
+        Box::pin(async {
+            Err(WgTunnelError::NotSupported(
+                "Send not supported by this implementation".into(),
+            ))
+        })
+    }
 }
 
 /// Builder for creating `WireGuard` tunnels

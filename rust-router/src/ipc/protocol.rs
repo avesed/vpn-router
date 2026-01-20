@@ -1787,6 +1787,8 @@ pub struct PeerStatus {
     pub state: PeerState,
     /// Tunnel type
     pub tunnel_type: TunnelType,
+    /// Peer endpoint (host:port)
+    pub endpoint: String,
     /// Local tunnel IP
     pub tunnel_local_ip: Option<String>,
     /// Remote tunnel IP
@@ -1945,6 +1947,9 @@ pub struct ChainStatus {
     pub my_role: Option<ChainRole>,
     /// Status of each hop
     pub hop_status: Vec<HopStatus>,
+    /// Terminal egress outbound tag
+    #[serde(default)]
+    pub exit_egress: String,
     /// Active connections using this chain
     pub active_connections: u64,
     /// Last error message
@@ -2165,6 +2170,16 @@ pub struct PairingResponse {
     /// Peer tag (for import/complete)
     #[serde(default)]
     pub peer_tag: Option<String>,
+    /// Local WireGuard private key (for import - needed for database persistence)
+    /// This is returned so the API can save it to the database for reconnection after restart.
+    #[serde(default)]
+    pub wg_local_private_key: Option<String>,
+    /// Local tunnel IP (for import)
+    #[serde(default)]
+    pub tunnel_local_ip: Option<String>,
+    /// Allocated tunnel port (for import)
+    #[serde(default)]
+    pub tunnel_port: Option<u16>,
 }
 
 /// Response for chain role query
@@ -3576,6 +3591,7 @@ rust_router_connections_total 12345
                     prepare_status: Some(PrepareStatus::Committed),
                 },
             ],
+            exit_egress: "pia-us-west".into(),
             active_connections: 5,
             last_error: None,
         };
@@ -3840,6 +3856,9 @@ rust_router_connections_total 12345
             code: Some("YmFzZTY0Y29kZQ==".into()),
             message: Some("Pairing code generated".into()),
             peer_tag: None,
+            wg_local_private_key: None,
+            tunnel_local_ip: None,
+            tunnel_port: None,
         };
         let ipc_resp = IpcResponse::Pairing(resp);
         let json = serde_json::to_string(&ipc_resp).unwrap();

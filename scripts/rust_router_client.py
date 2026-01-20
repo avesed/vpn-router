@@ -1475,6 +1475,88 @@ class RustRouterClient:
         """
         return await self._send_command({"type": "complete_handshake", "code": code})
 
+    async def add_peer(
+        self,
+        tag: str,
+        endpoint: str,
+        tunnel_type: str = "wireguard",
+        description: str = "",
+        api_port: int = 36000,
+        wg_public_key: Optional[str] = None,
+        wg_local_private_key: Optional[str] = None,
+        tunnel_local_ip: Optional[str] = None,
+        tunnel_remote_ip: Optional[str] = None,
+        tunnel_port: Optional[int] = None,
+        persistent_keepalive: Optional[int] = None,
+        xray_uuid: Optional[str] = None,
+        xray_server_name: Optional[str] = None,
+        xray_public_key: Optional[str] = None,
+        xray_short_id: Optional[str] = None,
+        xray_local_socks_port: Optional[int] = None,
+    ) -> IpcResponse:
+        """Add a peer node configuration.
+
+        Adds a peer configuration to rust-router without going through the full
+        pairing flow. This is useful for syncing peers from the database after
+        rust-router restarts.
+
+        Args:
+            tag: Unique peer tag
+            endpoint: Peer endpoint (IP:port or hostname:port)
+            tunnel_type: Tunnel type ("wireguard" or "xray")
+            description: Human-readable description
+            api_port: Web API port on the peer (default: 36000)
+            wg_public_key: Peer's WireGuard public key (for wireguard type)
+            wg_local_private_key: Local WireGuard private key (for wireguard type)
+            tunnel_local_ip: Local tunnel IP (for wireguard type)
+            tunnel_remote_ip: Remote tunnel IP (for wireguard type)
+            tunnel_port: Tunnel port (for wireguard type)
+            persistent_keepalive: Keepalive interval in seconds
+            xray_uuid: Xray user UUID (for xray type)
+            xray_server_name: Xray server name for TLS (for xray type)
+            xray_public_key: Xray public key for REALITY (for xray type)
+            xray_short_id: Xray short ID (for xray type)
+            xray_local_socks_port: Local SOCKS5 port for Xray (for xray type)
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        config: Dict[str, Any] = {
+            "tag": tag,
+            "description": description,
+            "endpoint": endpoint,
+            "tunnel_type": tunnel_type,
+            "api_port": api_port,
+        }
+
+        # Add optional WireGuard fields
+        if wg_public_key is not None:
+            config["wg_public_key"] = wg_public_key
+        if wg_local_private_key is not None:
+            config["wg_local_private_key"] = wg_local_private_key
+        if tunnel_local_ip is not None:
+            config["tunnel_local_ip"] = tunnel_local_ip
+        if tunnel_remote_ip is not None:
+            config["tunnel_remote_ip"] = tunnel_remote_ip
+        if tunnel_port is not None:
+            config["tunnel_port"] = tunnel_port
+        if persistent_keepalive is not None:
+            config["persistent_keepalive"] = persistent_keepalive
+
+        # Add optional Xray fields
+        if xray_uuid is not None:
+            config["xray_uuid"] = xray_uuid
+        if xray_server_name is not None:
+            config["xray_server_name"] = xray_server_name
+        if xray_public_key is not None:
+            config["xray_public_key"] = xray_public_key
+        if xray_short_id is not None:
+            config["xray_short_id"] = xray_short_id
+        if xray_local_socks_port is not None:
+            config["xray_local_socks_port"] = xray_local_socks_port
+
+        return await self._send_command({"type": "add_peer", "config": config})
+
     async def connect_peer(self, tag: str) -> IpcResponse:
         """Connect to a configured peer node.
 

@@ -474,22 +474,55 @@ async fn main() -> Result<()> {
 
     // Create WireGuard egress manager (always created for IPC support)
     // The reply handler forwards decrypted packets back to the ingress reply router
+    // For peer tunnels (peer-*), packets go to the peer tunnel processor for chain routing
     let reply_router_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
+        Arc::new(parking_lot::RwLock::new(None));
+    let peer_tunnel_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
         Arc::new(parking_lot::RwLock::new(None));
     let reply_stats = Arc::new(rust_router::ingress::IngressReplyStats::default());
     let forwarding_stats = Arc::new(rust_router::ingress::ForwardingStats::default());
+    let peer_tunnel_stats = Arc::new(rust_router::ingress::PeerTunnelProcessorStats::default());
 
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
         let reply_router_tx = Arc::clone(&reply_router_tx);
+        let peer_tunnel_tx = Arc::clone(&peer_tunnel_tx);
         let reply_stats = Arc::clone(&reply_stats);
-        move |packet, tunnel_tag| {
+        let peer_tunnel_stats = Arc::clone(&peer_tunnel_stats);
+        move |packet, tunnel_tag: String| {
+            // Route peer tunnel packets (peer-*) to the peer tunnel processor
+            // for DSCP-based chain routing on Terminal nodes
+            if tunnel_tag.starts_with("peer-") {
+                peer_tunnel_stats
+                    .packets_received
+                    .fetch_add(1, Ordering::Relaxed);
+
+                let maybe_tx = peer_tunnel_tx.read().clone();
+                if let Some(tx) = maybe_tx {
+                    match tx.try_send(rust_router::ingress::ReplyPacket { packet, tunnel_tag: tunnel_tag.clone() }) {
+                        Ok(()) => {
+                            // Peer tunnel packet successfully routed to processor
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            warn!("Peer tunnel processor queue full; dropping packet from '{}'", tunnel_tag);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("Peer tunnel processor unavailable; dropping packet from '{}'", tunnel_tag);
+                        }
+                    }
+                } else {
+                    debug!("Peer tunnel processor not ready; dropping packet from '{}'", tunnel_tag);
+                }
+                return;
+            }
+
+            // Regular egress tunnel replies go to the reply router
             reply_stats
                 .packets_received
                 .fetch_add(1, Ordering::Relaxed);
 
             let maybe_tx = reply_router_tx.read().clone();
             if let Some(tx) = maybe_tx {
-                match tx.try_send(rust_router::ingress::ReplyPacket { packet, tunnel_tag }) {
+                match tx.try_send(rust_router::ingress::ReplyPacket { packet, tunnel_tag: tunnel_tag.clone() }) {
                     Ok(()) => {
                         reply_stats
                             .packets_enqueued
@@ -787,6 +820,7 @@ async fn main() -> Result<()> {
     // Track forwarding task handle for graceful shutdown
     let mut forwarding_task_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut peer_tunnel_task_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     if let Some(ref ingress_mgr) = wg_ingress_manager {
         info!("Starting userspace WireGuard ingress...");
@@ -841,6 +875,19 @@ async fn main() -> Result<()> {
                     Some(dns_cache), // Pass DNS cache to reply router for parsing DNS responses
                 );
 
+                // Spawn peer tunnel processor for chain routing on Terminal nodes
+                // This processes packets from peer-* tunnels through the ingress processor
+                // to handle DSCP-based routing (e.g., route to exit egress on Terminal nodes)
+                let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(8192);
+                *peer_tunnel_tx.write() = Some(peer_tx);
+                let peer_tunnel_handle = rust_router::ingress::spawn_peer_tunnel_processor(
+                    peer_rx,
+                    Arc::clone(ingress_mgr.processor()),
+                    Arc::clone(&wg_egress_manager),
+                    Arc::clone(&peer_tunnel_stats),
+                );
+                info!("Peer tunnel processor started for chain routing");
+
                 let forward_handle = rust_router::ingress::spawn_forwarding_task(
                     packet_rx,
                     Arc::clone(&outbound_manager),
@@ -851,10 +898,12 @@ async fn main() -> Result<()> {
                     Some(direct_reply_tx), // Enable direct UDP reply handling
                     Some(phase6_config.wg_local_ip), // Local IP for responding to pings to gateway
                     Some(Arc::clone(&ecmp_group_manager)), // ECMP group manager for load balancing
+                    Some(Arc::clone(&peer_manager)), // Peer manager for peer WireGuard tunnels
                 );
 
                 info!("Ingress reply router task started");
                 reply_task_handle = Some(reply_handle);
+                peer_tunnel_task_handle = Some(peer_tunnel_handle);
                 info!("Ingress packet forwarding task started");
                 forwarding_task_handle = Some(forward_handle);
                 
@@ -954,6 +1003,18 @@ async fn main() -> Result<()> {
         )
         .await;
         info!("Reply router task shutdown complete");
+    }
+
+    // Shutdown peer tunnel processor task (drop sender to close channel)
+    *peer_tunnel_tx.write() = None;
+    if let Some(handle) = peer_tunnel_task_handle {
+        info!("Waiting for peer tunnel processor task to complete...");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle,
+        )
+        .await;
+        info!("Peer tunnel processor task shutdown complete");
     }
 
     // Shutdown forwarding task (after ingress stops, the channel will close)
