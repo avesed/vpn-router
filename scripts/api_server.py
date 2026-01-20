@@ -13326,14 +13326,6 @@ def _unregister_chain_from_peers(db, chain: dict) -> dict:
 
 # ============ Phase 12: Chain Sync Propagation ============
 
-def _get_local_node_tag() -> str:
-    """获取本地节点标识"""
-    return (
-        os.environ.get("VPN_ROUTER_NODE_ID")
-        or os.environ.get("RUST_ROUTER_NODE_TAG")
-        or socket.gethostname()
-    )
-
 
 def _collect_used_dscp_from_chain(db, hops: List[str]) -> Dict[str, Any]:
     """收集链路中所有节点已使用的 DSCP 值
@@ -13360,7 +13352,7 @@ def _collect_used_dscp_from_chain(db, hops: List[str]) -> Dict[str, Any]:
     # 添加本地已使用的 DSCP
     local_chains = db.get_node_chains()
     local_used = [c.get("dscp_value") for c in local_chains if c.get("dscp_value")]
-    local_tag = _get_local_node_tag()
+    local_tag = _get_local_node_tag(db)
     all_used.update(local_used)
     by_node[local_tag] = local_used
 
@@ -13471,7 +13463,7 @@ def _propagate_chain_to_peers(
     """
     from tunnel_api_client import TunnelAPIClient
 
-    local_tag = _get_local_node_tag()
+    local_tag = _get_local_node_tag(db)
     source_node = local_tag
 
     # 找到本节点在 hops 中的位置
@@ -13664,7 +13656,7 @@ def api_chain_sync_propagate(request: Request, payload: ChainSyncPropagateReques
         logging.warning(f"[chain-sync] 认证失败: client_ip={client_ip}")
         return {"success": False, "error": "Authentication failed"}
 
-    local_tag = _get_local_node_tag()
+    local_tag = _get_local_node_tag(db)
 
     # 验证本节点在 hops 中
     if local_tag not in payload.full_hops:
@@ -14092,11 +14084,13 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
     根据隧道类型使用不同的认证方式：
     - WireGuard 隧道：通过 tunnel_remote_ip 验证（IP 即身份）
     - Xray 隧道：通过 X-Peer-UUID header 验证
+    - SimpleTcpProxy 代理：通过 X-Tunnel-Source-IP header 验证（仅限 localhost）
 
     安全关键（Phase 11-Fix.M）：
     - 必须使用 _get_direct_client_ip() 而非 _get_client_ip()
     - 不能信任 X-Forwarded-For 等可伪造的 HTTP 头
     - 已移除 endpoint IP 回退认证（安全风险）
+    - X-Tunnel-Source-IP 仅在请求来自 localhost 时信任
 
     Args:
         request: FastAPI 请求对象
@@ -14107,6 +14101,51 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
     """
     # Phase 11-Fix.M: 使用直连 IP，防止 X-Forwarded-For 欺骗
     client_ip = _get_direct_client_ip(request)
+
+    # 方式 0: SimpleTcpProxy 代理请求 - 通过 X-Tunnel-Source-IP header 验证
+    # 当请求来自 localhost 且有 X-Tunnel-Source-IP header 时，
+    # 说明请求通过 SimpleTcpProxy 代理，header 值是真实的隧道源 IP
+    # 安全性：X-Tunnel-Source-IP 仅在来自 localhost 时信任，因为：
+    #   1. SimpleTcpProxy 在本地运行，从 WireGuard 解密包中提取源 IP
+    #   2. 外部攻击者无法伪造 localhost 来源
+    if client_ip == "127.0.0.1":
+        tunnel_source_ip = request.headers.get("X-Tunnel-Source-IP")
+        tunnel_peer_tag = request.headers.get("X-Tunnel-Peer-Tag")
+
+        if tunnel_source_ip:
+            logging.info(
+                f"[tunnel-api] 本地代理认证尝试: X-Tunnel-Source-IP={tunnel_source_ip}, "
+                f"X-Tunnel-Peer-Tag={tunnel_peer_tag}"
+            )
+
+            # 使用 tunnel_source_ip 查找 peer
+            node = _find_peer_by_tunnel_ip(db, tunnel_source_ip)
+            if node:
+                # 可选：验证 peer_tag 匹配（额外安全层）
+                if tunnel_peer_tag and node.get("tag") != tunnel_peer_tag:
+                    logging.warning(
+                        f"[tunnel-api] Peer tag 不匹配: header={tunnel_peer_tag}, "
+                        f"db={node.get('tag')}, ip={tunnel_source_ip}"
+                    )
+                    # 仍然允许，但记录警告（tag 不是安全关键，IP 才是）
+
+                if node.get("tunnel_status") == "connected":
+                    logging.info(
+                        f"[tunnel-api] 本地代理认证成功: {node['tag']} "
+                        f"(via X-Tunnel-Source-IP: {tunnel_source_ip})"
+                    )
+                    return node
+                else:
+                    logging.warning(
+                        f"[tunnel-api] 隧道未连接: {node['tag']} "
+                        f"(status={node.get('tunnel_status')})"
+                    )
+                    return None
+            else:
+                logging.warning(
+                    f"[tunnel-api] 本地代理认证失败: 未找到匹配的 peer "
+                    f"(X-Tunnel-Source-IP={tunnel_source_ip})"
+                )
 
     # 方式 1: WireGuard 隧道 - 通过 tunnel_remote_ip 验证
     node = _find_peer_by_tunnel_ip(db, client_ip)
@@ -17575,7 +17614,7 @@ def api_create_chain(payload: NodeChainCreateRequest):
 
     # Phase 12: 同步链路配置到所有下游节点
     sync_results = {}
-    local_tag = _get_local_node_tag()
+    local_tag = _get_local_node_tag(db)
     full_hops = [local_tag] + list(payload.hops)  # 本节点 + 下游节点
 
     if len(full_hops) > 1:
@@ -17728,7 +17767,7 @@ def api_update_chain(tag: str, payload: NodeChainUpdateRequest):
     sync_results = {}
     hops = _parse_chain_hops(updated_chain, raise_on_error=False)
     if hops:
-        local_tag = _get_local_node_tag()
+        local_tag = _get_local_node_tag(db)
         full_hops = [local_tag] + hops
 
         sync_result = _propagate_chain_to_peers(
@@ -17802,7 +17841,7 @@ def api_delete_chain(tag: str):
     # Phase 12: 同步删除到所有下游节点
     sync_results = {}
     if hops:
-        local_tag = _get_local_node_tag()
+        local_tag = _get_local_node_tag(db)
         full_hops = [local_tag] + hops
 
         sync_result = _propagate_chain_to_peers(

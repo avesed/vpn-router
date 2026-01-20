@@ -2516,6 +2516,13 @@ impl WgTunnel for UserspaceWgTunnel {
             UserspaceWgTunnel::send(self, &packet).await
         })
     }
+
+    fn recv(&self) -> BoxFuture<'_, Result<Vec<u8>, WgTunnelError>> {
+        Box::pin(async move {
+            // Delegate to the inherent async recv method
+            UserspaceWgTunnel::recv(self).await
+        })
+    }
 }
 
 // ============================================================================

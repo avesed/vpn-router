@@ -101,6 +101,9 @@ hickory-proto = "0.24"
 # Rate limiting
 governor = "0.6"
 
+# Userspace TCP/IP stack for tunnel HTTP client
+smoltcp = { version = "0.11", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "alloc"] }
+
 # HTTP for DoH (hyper replaces reqwest - reduces binary size)
 hyper = { version = "1.4", features = ["client", "http2"], optional = true }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http2"], optional = true }

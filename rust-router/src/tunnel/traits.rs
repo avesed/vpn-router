@@ -541,6 +541,32 @@ pub trait WgTunnel: Send + Sync {
             ))
         })
     }
+
+    /// Receive a packet from the tunnel
+    ///
+    /// Waits for a decrypted IP packet from the tunnel. This method blocks until
+    /// a packet is received or an error occurs.
+    ///
+    /// # Returns
+    ///
+    /// The decrypted IP packet received from the peer.
+    ///
+    /// # Errors
+    ///
+    /// - `NotConnected` - The tunnel is not connected
+    /// - `ReceiveFailed` - Failed to receive a packet
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `NotSupported` error. Implementations should override this
+    /// with actual receiving functionality.
+    fn recv(&self) -> BoxFuture<'_, Result<Vec<u8>, WgTunnelError>> {
+        Box::pin(async {
+            Err(WgTunnelError::NotSupported(
+                "Recv not supported by this implementation".into(),
+            ))
+        })
+    }
 }
 
 /// Builder for creating `WireGuard` tunnels

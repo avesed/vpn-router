@@ -817,9 +817,13 @@ pub enum IpcCommand {
         /// API port on the peer (default: 36000)
         #[serde(default)]
         api_port: Option<u16>,
-        /// Tunnel IP for Xray peers (optional, for routing through tunnel)
+        /// Tunnel IP for remote peer (where the API server listens, e.g., 10.200.200.1)
         #[serde(default)]
         tunnel_ip: Option<String>,
+        /// Local tunnel IP (our end of the tunnel, e.g., 10.200.200.2)
+        /// Required for WireGuard tunnel forwarding
+        #[serde(default)]
+        tunnel_local_ip: Option<String>,
         /// Custom headers to include in the request (e.g., {"X-Peer-Node-ID": "my-node-tag"})
         #[serde(default)]
         headers: Option<std::collections::HashMap<String, String>>,

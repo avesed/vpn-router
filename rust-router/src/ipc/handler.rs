@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::protocol::{
     BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainDiagnosticsResponse,
@@ -840,8 +840,8 @@ impl IpcHandler {
             // ================================================================
             // Peer API Forwarding Command Handler
             // ================================================================
-            IpcCommand::ForwardPeerRequest { peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, headers } => {
-                self.handle_forward_peer_request(peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, headers).await
+            IpcCommand::ForwardPeerRequest { peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, tunnel_local_ip, headers } => {
+                self.handle_forward_peer_request(peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, tunnel_local_ip, headers).await
             }
         }
     }
@@ -4991,10 +4991,10 @@ impl IpcHandler {
     /// Forwards an HTTP request to a peer node's API. The routing strategy depends
     /// on the peer's tunnel type:
     /// - **Xray peers**: Proxies through the SOCKS5 outbound to the peer's tunnel IP
-    /// - **WireGuard peers**: Makes a direct HTTP request to the peer's public endpoint
+    /// - **WireGuard peers**: Routes through the userspace WireGuard tunnel using smoltcp
     ///
-    /// For WireGuard peers, we cannot easily route TCP traffic through the userspace
-    /// tunnel (which operates at L3), so we use the peer's public API endpoint instead.
+    /// For WireGuard peers with tunnel IPs, we use smoltcp to create a TCP connection
+    /// through the encrypted tunnel, providing end-to-end encrypted API communication.
     async fn handle_forward_peer_request(
         &self,
         peer_tag: String,
@@ -5007,6 +5007,8 @@ impl IpcHandler {
         tunnel_type: Option<String>,
         api_port: Option<u16>,
         tunnel_ip: Option<String>,
+        // Local tunnel IP (our end of the tunnel)
+        tunnel_local_ip: Option<String>,
         // Custom headers to include in the request
         headers: Option<std::collections::HashMap<String, String>>,
     ) -> IpcResponse {
@@ -5048,14 +5050,23 @@ impl IpcHandler {
             });
         }
 
+        // Routing decision structure
+        struct RoutingDecision {
+            target_url: String,
+            use_socks5: bool,
+            use_wg_tunnel: bool,
+            wg_local_ip: Option<std::net::Ipv4Addr>,
+            wg_remote_ip: Option<std::net::Ipv4Addr>,
+        }
+
         // Determine if we should use inline config or PeerManager lookup
         // Inline config takes precedence - this allows Python to pass peer info
         // from its database without requiring peers to be registered in PeerManager
-        let (target_url, use_socks5) = if let Some(ref ep) = endpoint {
+        let routing = if let Some(ref ep) = endpoint {
             // Use inline config
             let ttype = tunnel_type.as_deref().unwrap_or("wireguard");
             let port = api_port.unwrap_or(36000);
-            
+
             // Parse the endpoint host
             let host = match Self::parse_endpoint_host(ep) {
                 Ok(h) => h,
@@ -5068,7 +5079,7 @@ impl IpcHandler {
                     });
                 }
             };
-            
+
             // Build target URL
             // Use tunnel IP when available for both Xray and WireGuard peers
             // This ensures requests come from the tunnel subnet (10.200.200.0/24)
@@ -5080,19 +5091,43 @@ impl IpcHandler {
                 // Fallback to public endpoint
                 format!("http://{}:{}{}", host, port, path)
             };
-            
-            // Only use SOCKS5 for Xray peers when we have tunnel IP
+
+            // Determine routing strategy based on tunnel type and available IPs
             let use_socks = ttype == "xray" && tunnel_ip.is_some();
-            
+
+            // Use WireGuard tunnel if:
+            // - tunnel type is "wireguard"
+            // - we have both local and remote tunnel IPs
+            // - peer manager is available (needed to get the tunnel)
+            let (use_wg, wg_local, wg_remote) = if ttype == "wireguard" && tunnel_ip.is_some() && tunnel_local_ip.is_some() {
+                // Parse the IPs
+                let remote: Option<std::net::Ipv4Addr> = tunnel_ip.as_ref().and_then(|s| s.parse().ok());
+                let local: Option<std::net::Ipv4Addr> = tunnel_local_ip.as_ref().and_then(|s| s.parse().ok());
+                if let (Some(l), Some(r)) = (local, remote) {
+                    (true, Some(l), Some(r))
+                } else {
+                    (false, None, None)
+                }
+            } else {
+                (false, None, None)
+            };
+
             debug!(
                 peer = %peer_tag,
                 tunnel_type = %ttype,
                 url = %url,
                 use_socks5 = use_socks,
+                use_wg_tunnel = use_wg,
                 "Using inline peer config"
             );
-            
-            (url, use_socks)
+
+            RoutingDecision {
+                target_url: url,
+                use_socks5: use_socks,
+                use_wg_tunnel: use_wg,
+                wg_local_ip: wg_local,
+                wg_remote_ip: wg_remote,
+            }
         } else {
             // Fall back to PeerManager lookup (backward compatibility)
             let Some(ref peer_manager) = self.peer_manager else {
@@ -5113,11 +5148,11 @@ impl IpcHandler {
                 });
             };
 
-            // Determine the target URL based on tunnel type
-            let url = match config.tunnel_type {
+            // Determine the target URL and routing based on tunnel type
+            match config.tunnel_type {
                 TunnelType::Xray => {
                     // For Xray peers, use the tunnel IP if available, otherwise public endpoint
-                    if let Some(ref tip) = config.tunnel_remote_ip {
+                    let url = if let Some(ref tip) = config.tunnel_remote_ip {
                         format!("http://{}:{}{}", tip, config.api_port, path)
                     } else {
                         // Fallback to public endpoint (with proper IPv6 handling)
@@ -5133,16 +5168,47 @@ impl IpcHandler {
                             }
                         };
                         format!("http://{}:{}{}", host, config.api_port, path)
+                    };
+                    RoutingDecision {
+                        target_url: url,
+                        use_socks5: true,
+                        use_wg_tunnel: false,
+                        wg_local_ip: None,
+                        wg_remote_ip: None,
                     }
                 }
                 TunnelType::WireGuard => {
                     // For WireGuard peers, prefer tunnel IP when available
-                    // This ensures requests come from the tunnel subnet (10.200.200.0/24)
-                    // which is whitelisted by nginx on the remote node
-                    if let Some(ref tip) = config.tunnel_remote_ip {
-                        format!("http://{}:{}{}", tip, config.api_port, path)
+                    // and route through the WireGuard tunnel using smoltcp
+                    let (url, use_wg, wg_local, wg_remote) = if let (Some(ref local_ip), Some(ref remote_ip)) =
+                        (&config.tunnel_local_ip, &config.tunnel_remote_ip)
+                    {
+                        // Parse IPs for WireGuard tunnel routing
+                        let local: Option<std::net::Ipv4Addr> = local_ip.parse().ok();
+                        let remote: Option<std::net::Ipv4Addr> = remote_ip.parse().ok();
+
+                        if let (Some(l), Some(r)) = (local, remote) {
+                            // Use tunnel IPs and route through WireGuard
+                            let url = format!("http://{}:{}{}", remote_ip, config.api_port, path);
+                            (url, true, Some(l), Some(r))
+                        } else {
+                            // IP parsing failed, fallback to public endpoint
+                            let host = match Self::parse_endpoint_host(&config.endpoint) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                                        success: false,
+                                        status_code: 0,
+                                        body: String::new(),
+                                        error: Some(e),
+                                    });
+                                }
+                            };
+                            let url = format!("http://{}:{}{}", host, config.api_port, path);
+                            (url, false, None, None)
+                        }
                     } else {
-                        // Fallback to public endpoint
+                        // No tunnel IPs configured, fallback to public endpoint
                         let host = match Self::parse_endpoint_host(&config.endpoint) {
                             Ok(h) => h,
                             Err(e) => {
@@ -5154,19 +5220,34 @@ impl IpcHandler {
                                 });
                             }
                         };
-                        format!("http://{}:{}{}", host, config.api_port, path)
+                        let url = format!("http://{}:{}{}", host, config.api_port, path);
+                        (url, false, None, None)
+                    };
+
+                    RoutingDecision {
+                        target_url: url,
+                        use_socks5: false,
+                        use_wg_tunnel: use_wg,
+                        wg_local_ip: wg_local,
+                        wg_remote_ip: wg_remote,
                     }
                 }
-            };
-            
-            let use_socks = matches!(config.tunnel_type, TunnelType::Xray);
-            (url, use_socks)
+            }
         };
 
-        debug!(peer = %peer_tag, url = %target_url, use_socks5 = use_socks5, "Target URL for peer request");
+        debug!(
+            peer = %peer_tag,
+            url = %routing.target_url,
+            use_socks5 = routing.use_socks5,
+            use_wg_tunnel = routing.use_wg_tunnel,
+            "Target URL for peer request"
+        );
 
-        // Route based on tunnel type - SOCKS5 for Xray with tunnel IP, direct for others
-        let result = if use_socks5 {
+        // Route based on tunnel type:
+        // 1. SOCKS5 for Xray peers with tunnel IP
+        // 2. WireGuard tunnel for WireGuard peers with tunnel IPs
+        // 3. Direct HTTP for everything else
+        let result = if routing.use_socks5 {
             // For Xray peers with tunnel IP, route through the SOCKS5 proxy
             let Some(ref peer_manager) = self.peer_manager else {
                 return IpcResponse::PeerRequestResult(PeerRequestResponse {
@@ -5179,16 +5260,42 @@ impl IpcHandler {
             self.forward_via_socks5(
                 peer_manager,
                 &peer_tag,
-                &target_url,
+                &routing.target_url,
                 &method,
                 body.as_deref(),
                 Duration::from_secs(timeout_secs as u64),
             )
             .await
+        } else if routing.use_wg_tunnel {
+            // For WireGuard peers with tunnel IPs, route through the WireGuard tunnel
+            let Some(ref peer_manager) = self.peer_manager else {
+                return IpcResponse::PeerRequestResult(PeerRequestResponse {
+                    success: false,
+                    status_code: 0,
+                    body: String::new(),
+                    error: Some("WireGuard tunnel routing requires peer manager".to_string()),
+                });
+            };
+            // We verified these are Some when we set use_wg_tunnel = true
+            let local_ip = routing.wg_local_ip.unwrap();
+            let remote_ip = routing.wg_remote_ip.unwrap();
+
+            self.forward_via_wg_tunnel(
+                peer_manager,
+                &peer_tag,
+                &routing.target_url,
+                &method,
+                body.as_deref(),
+                Duration::from_secs(timeout_secs as u64),
+                local_ip,
+                remote_ip,
+                headers.as_ref(),
+            )
+            .await
         } else {
             // Direct HTTP request to public endpoint
             self.forward_direct_http(
-                &target_url,
+                &routing.target_url,
                 &method,
                 body.as_deref(),
                 Duration::from_secs(timeout_secs as u64),
@@ -5459,6 +5566,188 @@ impl IpcHandler {
         // Parse HTTP response
         let response_str = String::from_utf8_lossy(&response_buf);
         Self::parse_http_response(&response_str)
+    }
+
+    /// Forward HTTP request through WireGuard tunnel using smoltcp TCP stack
+    ///
+    /// This method creates a TCP connection through the WireGuard tunnel using smoltcp
+    /// to handle the TCP/IP stack at the IP layer. The flow is:
+    ///
+    /// 1. Get the WireGuard tunnel from PeerManager
+    /// 2. Create a SmoltcpBridge with our local tunnel IP
+    /// 3. Spawn a packet pump task to move packets between smoltcp and the tunnel
+    /// 4. Use SmoltcpHttpClient to make the HTTP request
+    /// 5. Clean up resources when done
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_manager` - The peer manager holding the WireGuard tunnel
+    /// * `peer_tag` - Tag of the peer to forward the request through
+    /// * `url` - Full URL to request (e.g., "http://10.200.200.1:36000/api/health")
+    /// * `method` - HTTP method (GET, POST, etc.)
+    /// * `body` - Optional request body
+    /// * `timeout` - Request timeout
+    /// * `tunnel_local_ip` - Our local tunnel IP (e.g., 10.200.200.2)
+    /// * `tunnel_remote_ip` - Remote peer's tunnel IP (e.g., 10.200.200.1)
+    /// * `headers` - Optional custom HTTP headers
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (status_code, response_body) on success
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_via_wg_tunnel(
+        &self,
+        peer_manager: &Arc<PeerManager>,
+        peer_tag: &str,
+        url: &str,
+        method: &str,
+        body: Option<&str>,
+        timeout: Duration,
+        tunnel_local_ip: std::net::Ipv4Addr,
+        tunnel_remote_ip: std::net::Ipv4Addr,
+        headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<(u16, String), String> {
+        use crate::tunnel::{SmoltcpBridge, SmoltcpHttpClient, DEFAULT_WG_MTU};
+        use tokio::sync::mpsc;
+
+        debug!(
+            peer = %peer_tag,
+            url = %url,
+            local_ip = %tunnel_local_ip,
+            remote_ip = %tunnel_remote_ip,
+            "Forwarding request via WireGuard tunnel"
+        );
+
+        // Get the WireGuard tunnel from PeerManager
+        let tunnel = peer_manager
+            .get_wg_tunnel(peer_tag)
+            .ok_or_else(|| format!("WireGuard tunnel for peer '{}' not found or not connected", peer_tag))?;
+
+        // Check tunnel is connected
+        if !tunnel.is_connected() {
+            return Err(format!("WireGuard tunnel for peer '{}' is not connected", peer_tag));
+        }
+
+        // Parse URL to get host, port, and path
+        let uri: hyper::Uri = url
+            .parse()
+            .map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+
+        let port = uri.port_u16().unwrap_or(80);
+        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        // Create channels for packet exchange between smoltcp bridge and tunnel
+        // tx_sender: smoltcp -> tunnel (outgoing IP packets)
+        // rx_sender: tunnel -> smoltcp (incoming IP packets)
+        let (tx_sender, mut tx_receiver) = mpsc::channel::<Vec<u8>>(64);
+        let (rx_sender, mut rx_receiver) = mpsc::channel::<Vec<u8>>(64);
+
+        // Create smoltcp bridge with local tunnel IP
+        let bridge = SmoltcpBridge::new(tunnel_local_ip, DEFAULT_WG_MTU);
+        let mut http_client = SmoltcpHttpClient::new(bridge);
+
+        // Clone tunnel Arc for the pump task
+        let tunnel_for_pump = tunnel.clone();
+        let tx_sender_for_pump = tx_sender.clone();
+
+        // Spawn packet pump task to move packets between smoltcp and WireGuard tunnel
+        // This task runs until the HTTP request completes or errors
+        let pump_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // TX: smoltcp -> tunnel (outgoing IP packets)
+                    Some(packet) = tx_receiver.recv() => {
+                        trace!("Pump: sending {} bytes to tunnel", packet.len());
+                        if let Err(e) = tunnel_for_pump.send(&packet).await {
+                            warn!("Failed to send packet to WireGuard tunnel: {}", e);
+                            break;
+                        }
+                    }
+                    // RX: tunnel -> smoltcp (incoming IP packets)
+                    result = tunnel_for_pump.recv() => {
+                        match result {
+                            Ok(packet) => {
+                                trace!("Pump: received {} bytes from tunnel", packet.len());
+                                if rx_sender.send(packet).await.is_err() {
+                                    // Receiver dropped, client done
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to receive from WireGuard tunnel: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            debug!("Packet pump task exiting");
+        });
+
+        // Build request headers with auto-injected tunnel authentication headers
+        let mut request_headers = headers.cloned().unwrap_or_default();
+
+        // Auto-inject tunnel source IP header (Phase 5 authentication support)
+        request_headers.insert(
+            "X-Tunnel-Source-IP".to_string(),
+            tunnel_local_ip.to_string(),
+        );
+        debug!(source_ip = %tunnel_local_ip, "Added X-Tunnel-Source-IP header");
+
+        // Auto-inject tunnel peer tag header (Phase 5 authentication support)
+        request_headers.insert(
+            "X-Tunnel-Peer-Tag".to_string(),
+            peer_tag.to_string(),
+        );
+        debug!(peer_tag = %peer_tag, "Added X-Tunnel-Peer-Tag header");
+
+        // Make the HTTP request through smoltcp
+        let result = http_client
+            .request(
+                tunnel_remote_ip,
+                port,
+                method,
+                path,
+                Some(request_headers),
+                body,
+                timeout,
+                &tx_sender_for_pump,
+                &mut rx_receiver,
+            )
+            .await;
+
+        // Signal pump to stop by dropping the sender
+        drop(tx_sender_for_pump);
+        drop(tx_sender);
+
+        // Wait briefly for pump to clean up, then abort if needed
+        let mut pump_handle = pump_handle;
+        tokio::select! {
+            _ = &mut pump_handle => {
+                debug!("Packet pump task completed");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                debug!("Packet pump task taking too long, aborting");
+                pump_handle.abort();
+            }
+        }
+
+        // Convert result
+        match result {
+            Ok(response) => {
+                debug!(
+                    peer = %peer_tag,
+                    status = response.status_code,
+                    body_len = response.body.len(),
+                    "WireGuard tunnel request completed"
+                );
+                Ok((response.status_code, response.body))
+            }
+            Err(e) => {
+                warn!(peer = %peer_tag, error = %e, "WireGuard tunnel request failed");
+                Err(format!("WireGuard tunnel request failed: {}", e))
+            }
+        }
     }
 
     /// Parse HTTP response to extract status code and body

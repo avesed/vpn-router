@@ -99,6 +99,10 @@
 
 pub mod config;
 pub mod handshake;
+pub mod simple_tcp_proxy;
+pub mod smoltcp_bridge;
+pub mod smoltcp_device;
+pub mod smoltcp_http_client;
 pub mod traits;
 pub mod userspace;
 
@@ -116,3 +120,14 @@ pub use userspace::{
 // Deprecated re-export for backward compatibility
 #[allow(deprecated)]
 pub use userspace::WG_OVERHEAD;
+
+// smoltcp integration exports
+pub use smoltcp_bridge::SmoltcpBridge;
+pub use smoltcp_device::{TunnelPacketQueue, WgTunnelDevice, DEFAULT_WG_MTU};
+pub use smoltcp_http_client::{HttpClientError, HttpResponse, SmoltcpHttpClient, TunnelAuthHeaders};
+
+// TCP proxy exports
+pub use simple_tcp_proxy::{
+    inject_tunnel_source_header, sanitize_header_value, SimpleTcpProxy, TcpProxyError,
+    TcpProxyStats, DEFAULT_API_PORT,
+};
