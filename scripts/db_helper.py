@@ -2653,11 +2653,17 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    def get_next_peer_tunnel_port(self) -> Optional[int]:
+    def get_next_peer_tunnel_port(self, exclude_ports: set = None) -> Optional[int]:
         """获取下一个可用的对等节点隧道端口
 
         Issue 10/13 Fix: 使用正确的端口范围 (36200-36299) 并正确处理耗尽情况。
         此范围与 CLAUDE.md 和 peer_pairing.py 中的文档保持一致。
+
+        Phase 12-Fix.I: 添加 exclude_ports 参数，用于在导入配对时排除对方节点的端口。
+        例如：A 使用 36200，B 导入时应排除 36200，分配 36201。
+
+        Args:
+            exclude_ports: 额外需要排除的端口集合（如对方节点正在使用的端口）
 
         Returns:
             可用的端口号，如果端口范围已耗尽则返回 None
@@ -2671,6 +2677,10 @@ class UserDatabase:
 
         # 获取需要避免的保留端口（防止与入口端口冲突）
         reserved_ports = self._get_reserved_ports()
+
+        # Phase 12-Fix.I: 合并额外排除的端口
+        if exclude_ports:
+            reserved_ports = reserved_ports | exclude_ports
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
@@ -5023,8 +5033,8 @@ class DatabaseManager:
     def get_connected_peer_nodes(self) -> List[Dict]:
         return self.user.get_connected_peer_nodes()
 
-    def get_next_peer_tunnel_port(self) -> Optional[int]:
-        return self.user.get_next_peer_tunnel_port()
+    def get_next_peer_tunnel_port(self, exclude_ports: set = None) -> Optional[int]:
+        return self.user.get_next_peer_tunnel_port(exclude_ports=exclude_ports)
 
     def get_next_peer_xray_socks_port(self) -> int:
         return self.user.get_next_peer_xray_socks_port()

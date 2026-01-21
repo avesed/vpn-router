@@ -719,6 +719,24 @@ impl WgEgressManager {
         tunnels.contains_key(tag)
     }
 
+    /// Get a tunnel by tag for direct packet operations
+    ///
+    /// This returns a clone of the tunnel Arc, allowing callers to use
+    /// the tunnel's send/recv methods directly (e.g., for smoltcp integration).
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Tag of the tunnel to retrieve
+    ///
+    /// # Returns
+    ///
+    /// `Some(Arc<UserspaceWgTunnel>)` if found, `None` otherwise
+    #[must_use]
+    pub fn get_tunnel(&self, tag: &str) -> Option<Arc<UserspaceWgTunnel>> {
+        let tunnels = self.tunnels.read();
+        tunnels.get(tag).map(|managed| managed.tunnel.clone())
+    }
+
     /// Send a packet through an egress tunnel
     ///
     /// The packet will be encrypted using `WireGuard` and sent to the peer.

@@ -965,6 +965,18 @@ impl UserspaceWgTunnel {
             tunn.encapsulate(&packet_to_send, &mut dst)
         };
 
+        // Phase 12-Fix.P: Log encapsulation result for debugging
+        let result_type = match &result {
+            TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
+            TunnResult::Done => "Done".to_string(),
+            TunnResult::Err(e) => format!("Err({:?})", e),
+            _ => "Other".to_string(),
+        };
+        debug!(
+            "Tunnel {} encapsulate result: {} for {} byte packet",
+            self.tag, result_type, packet_to_send.len()
+        );
+
         // Process result
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
@@ -980,12 +992,12 @@ impl UserspaceWgTunnel {
                     .fetch_add(packet_to_send.len() as u64, Ordering::Relaxed);
                 self.shared.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
 
-                trace!("Sent {} bytes through tunnel", packet_to_send.len());
+                debug!("Sent {} bytes through tunnel {} to {:?}", packet_to_send.len(), self.tag, self.peer_addr_parsed);
                 Ok(())
             }
             TunnResult::Done => {
                 // Packet was queued, may need handshake first
-                debug!("Packet queued, handshake may be in progress");
+                warn!("Tunnel {} packet queued (handshake may be in progress), {} bytes", self.tag, packet_to_send.len());
                 Ok(())
             }
             TunnResult::Err(e) => {
@@ -1042,11 +1054,13 @@ impl UserspaceWgTunnel {
 
         match packet {
             Some(data) => {
-                trace!("Received {} bytes from tunnel", data.len());
+                // Phase 12-Fix.P: Log received packets at debug level
+                debug!("Tunnel {} recv(): got {} bytes from channel", self.tag, data.len());
                 Ok(data)
             }
             None => {
                 // Channel closed, tunnel disconnected
+                debug!("Tunnel {} recv(): channel closed", self.tag);
                 Err(WgTunnelError::NotConnected)
             }
         }
@@ -1140,11 +1154,12 @@ impl UserspaceWgTunnel {
         // Clone Arc for the background task
         let shared = Arc::clone(&self.shared);
         let buffer_pool = Arc::clone(&self.buffer_pool);
+        let tag_for_task = self.tag.clone(); // Phase 12-Fix.P: tag for debug logging
 
         // Spawn combined background task
         // Phase 11-Fix.6C: Pass peer_addr for send_to() calls
         tokio::spawn(async move {
-            run_background_task(socket, shutdown_rx, shared, buffer_pool, peer_addr).await;
+            run_background_task(socket, shutdown_rx, shared, buffer_pool, peer_addr, tag_for_task).await;
         })
     }
 
@@ -1237,6 +1252,7 @@ async fn run_background_task(
     shared: Arc<TunnelShared>,
     buffer_pool: Arc<UdpBufferPool>,
     peer_addr: SocketAddr,  // Phase 11-Fix.6C: peer address for send_to()
+    tunnel_tag_for_task: String, // Phase 12-Fix.P: tag for debug logging
 ) {
     let mut timer_interval = interval(Duration::from_millis(TIMER_TICK_MS));
     // NAT table cleanup interval (Issue: memory leak from stale NAT entries)
@@ -1354,16 +1370,16 @@ async fn run_background_task(
             result = socket.recv_from(&mut recv_buf) => {
                 match result {
                     Ok((len, src_addr)) => {
-                        // Log received UDP packets at trace level
-                        trace!("UDP recv: {} bytes from {} (expecting {})", len, src_addr, peer_addr);
-                        
+                        // Phase 12-Fix.P: Log received UDP packets at debug level for troubleshooting
+                        debug!("Tunnel {} UDP recv: {} bytes from {} (expecting {})", tunnel_tag_for_task, len, src_addr, peer_addr);
+
                         if !shared.connected.load(Ordering::Acquire) {
                             break;
                         }
 
                         // Validate source address matches expected peer
                         if src_addr != peer_addr {
-                            warn!("Ignoring packet from unexpected source: {} (expected {})", src_addr, peer_addr);
+                            warn!("Tunnel {} ignoring packet from unexpected source: {} (expected {})", tunnel_tag_for_task, src_addr, peer_addr);
                             continue;
                         }
 
@@ -1374,7 +1390,7 @@ async fn run_background_task(
                         };
 
                         if let Some(ref result) = process_result {
-                            // Log decapsulate result at trace level
+                            // Phase 12-Fix.P: Log decapsulate result at debug level
                             let result_type = match result {
                                 TunnResult::WriteToTunnelV4(data, _) => format!("WriteToTunnelV4({} bytes)", data.len()),
                                 TunnResult::WriteToTunnelV6(data, _) => format!("WriteToTunnelV6({} bytes)", data.len()),
@@ -1382,7 +1398,7 @@ async fn run_background_task(
                                 TunnResult::Done => "Done".to_string(),
                                 TunnResult::Err(e) => format!("Err({:?})", e),
                             };
-                            trace!("Decapsulate: {} bytes -> {}", len, result_type);
+                            debug!("Tunnel {} decapsulate: {} bytes -> {}", tunnel_tag_for_task, len, result_type);
                         }
 
                         if let Some(result) = process_result {
@@ -2010,12 +2026,21 @@ async fn handle_decapsulate_result(
             // Send to receiver channel
             let recv_tx = shared.recv_tx.read().await;
             if let Some(tx) = recv_tx.as_ref() {
+                // Phase 12-Fix.P: Log channel send for debugging
+                debug!("Sending {} bytes to recv_tx channel", packet_len);
                 if tx.send(packet).await.is_err() {
-                    trace!("Receiver channel closed");
+                    warn!("Receiver channel closed - packet dropped");
+                } else {
+                    debug!("Successfully sent {} bytes to recv_tx channel", packet_len);
                 }
+            } else {
+                warn!("recv_tx is None - packet dropped (tunnel may not be connected)");
             }
 
-            trace!("Decrypted IPv4 packet: {} bytes", packet_len);
+            debug!("Decrypted IPv4 packet: {} bytes (stats: rx_bytes={}, rx_packets={})",
+                packet_len,
+                shared.stats.rx_bytes.load(Ordering::Relaxed),
+                shared.stats.rx_packets.load(Ordering::Relaxed));
         }
 
         TunnResult::WriteToTunnelV6(data, _addr) => {

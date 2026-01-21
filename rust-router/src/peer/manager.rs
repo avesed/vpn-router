@@ -71,8 +71,18 @@ use crate::peer::validation::{
     validate_description, validate_endpoint, validate_peer_tag, validate_wg_key, ValidationError,
 };
 use crate::tunnel::{
-    derive_public_key, generate_private_key, WgTunnel, WgTunnelBuilder, WgTunnelConfig,
+    derive_public_key, generate_private_key, SmoltcpBridge, SimpleTcpProxy, WgTunnel,
+    WgTunnelBuilder, WgTunnelConfig, DEFAULT_WG_MTU,
 };
+use tokio::sync::mpsc;
+
+/// Phase 12-Fix.I: Extract port from endpoint string (e.g., "10.1.1.206:36201" -> Some(36201))
+fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    endpoint
+        .rsplit(':')
+        .next()
+        .and_then(|port_str| port_str.parse::<u16>().ok())
+}
 
 /// Error types for peer operations
 #[derive(Debug, thiserror::Error)]
@@ -275,6 +285,10 @@ pub struct PeerManager {
     tunnel_port_allocator: TunnelPortAllocator,
     /// Health checker with hysteresis
     health_checker: HealthChecker,
+    /// Phase 12-Fix.K: TCP proxy tasks for peer tunnels (receives tunnel traffic, forwards to API)
+    proxy_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Shutdown signal senders for proxy tasks
+    proxy_shutdown_txs: RwLock<HashMap<String, tokio::sync::broadcast::Sender<()>>>,
 }
 
 impl PeerManager {
@@ -299,6 +313,8 @@ impl PeerManager {
             tunnel_ip_allocator: TunnelIpAllocator::new("10.200.200.0/24"),
             tunnel_port_allocator: TunnelPortAllocator::new(36200, 36299),
             health_checker: HealthChecker::new(3), // 3 consecutive failures threshold
+            proxy_tasks: RwLock::new(HashMap::new()),
+            proxy_shutdown_txs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -325,6 +341,8 @@ impl PeerManager {
             tunnel_ip_allocator: TunnelIpAllocator::new(ip_subnet),
             tunnel_port_allocator: TunnelPortAllocator::new(port_min, port_max),
             health_checker: HealthChecker::new(3),
+            proxy_tasks: RwLock::new(HashMap::new()),
+            proxy_shutdown_txs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -588,11 +606,21 @@ impl PeerManager {
                 .map_err(|_| PeerError::IpExhausted)?
         };
 
-        // Allocate tunnel port for our side
-        let tunnel_port = self
-            .tunnel_port_allocator
-            .allocate()
-            .map_err(|_| PeerError::PortExhausted)?;
+        // Phase 12-Fix.I: Use tunnel port from local_endpoint if provided, otherwise allocate
+        // Python API pre-allocates the port to avoid conflicts with remote node's port
+        let tunnel_port = if let Some(port) = extract_port_from_endpoint(&local_config.local_endpoint) {
+            // Use the pre-allocated port from Python API
+            // Try to mark it as allocated in our allocator
+            if let Err(e) = self.tunnel_port_allocator.allocate_specific(port) {
+                warn!("Could not mark tunnel_port {} as allocated: {} (may already be allocated)", port, e);
+            }
+            port
+        } else {
+            // No port in endpoint, allocate one
+            self.tunnel_port_allocator
+                .allocate()
+                .map_err(|_| PeerError::PortExhausted)?
+        };
 
         // Get remote's public key
         let remote_public_key = request.wg_public_key.clone().ok_or(PeerError::MissingWgKey)?;
@@ -939,9 +967,115 @@ impl PeerManager {
             .map_err(|e| PeerError::TunnelCreationFailed(format!("Failed to connect tunnel: {e}")))?;
 
         // Store tunnel with peer- prefix
+        let tunnel_arc: Arc<Box<dyn WgTunnel>> = Arc::new(tunnel);
         {
             let mut wg_tunnels = self.wg_tunnels.write();
-            wg_tunnels.insert(tunnel_tag.clone(), Arc::new(tunnel));
+            wg_tunnels.insert(tunnel_tag.clone(), tunnel_arc.clone());
+        }
+
+        // Phase 12-Fix.K: Start TCP proxy task to handle incoming tunnel traffic
+        // Parse local tunnel IP (strip CIDR suffix like /32)
+        let local_ip_str = config
+            .tunnel_local_ip
+            .clone()
+            .unwrap_or_else(|| "10.200.200.1/32".to_string());
+        let local_ip_only = local_ip_str.split('/').next().unwrap_or("10.200.200.1");
+
+        if let Ok(local_ip) = local_ip_only.parse::<Ipv4Addr>() {
+            // Create shutdown channel
+            let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+            // Store shutdown sender
+            {
+                let mut shutdown_txs = self.proxy_shutdown_txs.write();
+                shutdown_txs.insert(tag.to_string(), shutdown_tx);
+            }
+
+            // Spawn TCP proxy task
+            let tag_clone = tag.to_string();
+            let tunnel_for_proxy = tunnel_arc.clone();
+
+            let proxy_task = tokio::spawn(async move {
+                info!(
+                    tag = %tag_clone,
+                    local_ip = %local_ip,
+                    "Starting TCP proxy task for peer tunnel"
+                );
+
+                // Create channels for packet exchange between smoltcp and tunnel
+                let (tx_sender, mut tx_receiver) = mpsc::channel::<Vec<u8>>(256);
+                let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>(256);
+
+                // Create smoltcp bridge with local tunnel IP
+                let bridge = SmoltcpBridge::new(local_ip, DEFAULT_WG_MTU);
+
+                // Create TCP proxy targeting localhost:36000
+                let proxy = SimpleTcpProxy::new(36000);
+
+                // Clone tunnel for pump task
+                let tunnel_for_pump = tunnel_for_proxy.clone();
+
+                // Spawn packet pump task
+                let mut pump_shutdown_rx = shutdown_rx.resubscribe();
+                let pump_handle = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+
+                            // Check shutdown
+                            _ = pump_shutdown_rx.recv() => {
+                                debug!("Pump task received shutdown signal");
+                                break;
+                            }
+
+                            // TX: smoltcp -> tunnel (outgoing packets)
+                            Some(packet) = tx_receiver.recv() => {
+                                if let Err(e) = tunnel_for_pump.send(&packet).await {
+                                    warn!("Failed to send packet to tunnel: {}", e);
+                                }
+                            }
+
+                            // RX: tunnel -> smoltcp (incoming packets)
+                            result = tunnel_for_pump.recv() => {
+                                match result {
+                                    Ok(packet) => {
+                                        if rx_sender.send(packet).await.is_err() {
+                                            debug!("Proxy receiver dropped");
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to receive from tunnel: {}", e);
+                                        // Don't break on error - tunnel might recover
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    debug!("Pump task exiting");
+                });
+
+                // Run the proxy (this blocks until shutdown or error)
+                if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, shutdown_rx).await {
+                    warn!(tag = %tag_clone, "TCP proxy error: {}", e);
+                }
+
+                // Stop pump task
+                pump_handle.abort();
+
+                info!(tag = %tag_clone, "TCP proxy task stopped");
+            });
+
+            // Store task handle
+            {
+                let mut tasks = self.proxy_tasks.write();
+                tasks.insert(tag.to_string(), proxy_task);
+            }
+
+            debug!(tag = %tag, "TCP proxy task spawned for peer tunnel");
+        } else {
+            warn!(tag = %tag, local_ip = %local_ip_only, "Invalid tunnel local IP, skipping TCP proxy");
         }
 
         debug!(tag = %tag, tunnel_tag = %tunnel_tag, "WireGuard tunnel created and connected");
@@ -1006,6 +1140,30 @@ impl PeerManager {
 
         match config.tunnel_type {
             TunnelType::WireGuard => {
+                // Phase 12-Fix.K: Stop TCP proxy task first
+                // Send shutdown signal
+                {
+                    let shutdown_txs = self.proxy_shutdown_txs.read();
+                    if let Some(tx) = shutdown_txs.get(tag) {
+                        let _ = tx.send(());
+                    }
+                }
+
+                // Remove and abort proxy task
+                {
+                    let mut tasks = self.proxy_tasks.write();
+                    if let Some(task) = tasks.remove(tag) {
+                        task.abort();
+                        debug!(tag = %tag, "Aborted TCP proxy task");
+                    }
+                }
+
+                // Remove shutdown sender
+                {
+                    let mut shutdown_txs = self.proxy_shutdown_txs.write();
+                    shutdown_txs.remove(tag);
+                }
+
                 // Remove and shutdown tunnel (using peer- prefix)
                 let tunnel_tag = format!("peer-{}", tag);
                 let tunnel = {

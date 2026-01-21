@@ -260,11 +260,12 @@ def _validate_not_reserved_port(port: int) -> None:
         )
 
 
-def _allocate_peer_tunnel_port(db) -> int:
+def _allocate_peer_tunnel_port(db, exclude_ports: set = None) -> int:
     """Issue 7/10 Fix: Safely allocate a peer tunnel port.
 
     Args:
         db: Database connection
+        exclude_ports: Phase 12-Fix.I - 额外需要排除的端口（如对方节点的端口）
 
     Returns:
         Allocated port number
@@ -273,7 +274,7 @@ def _allocate_peer_tunnel_port(db) -> int:
         HTTPException: If port allocation fails (exhausted or error)
     """
     try:
-        port = db.get_next_peer_tunnel_port()
+        port = db.get_next_peer_tunnel_port(exclude_ports=exclude_ports)
         if port is None:
             raise HTTPException(
                 status_code=503,
@@ -332,6 +333,57 @@ def _get_local_node_tag(db) -> str:
         normalized = 'node-' + normalized
 
     return normalized[:64]  # 限制长度
+
+
+def _get_peer_forward_params(db, node_tag: str) -> dict:
+    """Phase 12-Fix.J: 统一获取对端节点转发参数
+
+    从数据库读取所有需要的参数，确保 WireGuard 和 Xray 隧道转发正确工作。
+
+    Args:
+        db: 数据库连接
+        node_tag: 对端节点标识
+
+    Returns:
+        dict 包含:
+            - endpoint: 对端公网地址 (IP:port)
+            - tunnel_type: "wireguard" 或 "xray"
+            - api_port: API 端口 (默认 36000)
+            - tunnel_ip: 对端隧道 IP (用于路由目标)
+            - tunnel_local_ip: 本地隧道 IP (WireGuard 隧道转发需要)
+            - node: 完整的节点信息 (供调用方检查 tunnel_status 等)
+    """
+    node = db.get_peer_node(node_tag)
+    if not node:
+        return {
+            "endpoint": None,
+            "tunnel_type": "wireguard",
+            "api_port": 36000,
+            "tunnel_ip": None,
+            "tunnel_local_ip": None,
+            "node": None,
+        }
+
+    tunnel_type = node.get("tunnel_type", "wireguard")
+
+    # tunnel_ip 和 tunnel_local_ip 根据隧道类型设置
+    # WireGuard: 需要两个 IP 才能通过 smoltcp 隧道转发
+    # Xray: 只需要 tunnel_ip 用于 SOCKS5 代理路由
+    if tunnel_type == "wireguard":
+        tunnel_ip = node.get("tunnel_remote_ip")  # 对方的隧道 IP
+        tunnel_local_ip = node.get("tunnel_local_ip")  # 本地的隧道 IP
+    else:  # xray
+        tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
+        tunnel_local_ip = None  # Xray 不需要本地隧道 IP
+
+    return {
+        "endpoint": node.get("endpoint"),
+        "tunnel_type": tunnel_type,
+        "api_port": node.get("api_port", 36000),
+        "tunnel_ip": tunnel_ip,
+        "tunnel_local_ip": tunnel_local_ip,
+        "node": node,
+    }
 
 
 def _get_available_outbounds(db) -> list:
@@ -5454,9 +5506,8 @@ def _sync_userspace_peer_from_codes(
         if not tunnel_api_endpoint and tunnel_remote_ip and remote_api_port:
             tunnel_api_endpoint = f"{tunnel_remote_ip}:{remote_api_port}"
 
-        # Note: For userspace WireGuard (rust-router), we don't set tunnel_port
-        # as the tunnel is managed by rust-router, not kernel WG interfaces.
-        # The tunnel_port field (36200-36299) is only for kernel WG mode.
+        # Phase 12-Fix.H: tunnel_port 在 userspace WireGuard 模式下同样重要
+        # 它指定本节点的监听端口，rust-router 需要用它来创建隧道
 
         existing = db.get_peer_node(remote_tag)
         if existing:
@@ -14608,8 +14659,9 @@ async def _validate_remote_terminal_egress(
         if not client:
             return f"rust-router 不可用，无法验证终端节点 '{terminal_tag}' 的出口"
 
-        # 获取终端节点信息
-        node = db.get_peer_node(terminal_tag)
+        # Phase 12-Fix.J: 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, terminal_tag)
+        node = params["node"]
         if not node:
             return f"Terminal node '{terminal_tag}' not found in database"
 
@@ -14619,24 +14671,17 @@ async def _validate_remote_terminal_egress(
         # 获取本地节点 tag 用于 endpoint IP 认证
         local_node_tag = _get_local_node_tag(db)
 
-        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
-        tunnel_type = node.get("tunnel_type", "wireguard")
-        tunnel_ip = None
-        if tunnel_type == "xray":
-            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
-
         # 通过 IPC 转发请求到终端节点
         result = await client.forward_peer_request(
             peer_tag=terminal_tag,
             method="GET",
             path="/api/peer-info/egress",
             timeout_secs=30,
-            # Inline peer config from database
-            endpoint=node.get("endpoint"),
-            tunnel_type=tunnel_type,
-            api_port=node.get("api_port", 36000),
-            tunnel_ip=tunnel_ip,
-            # Pass local node tag for endpoint IP authentication
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],  # Phase 12-Fix.J
             headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
         )
 
@@ -14715,18 +14760,13 @@ async def _ipc_ping_peer(db, node_tag: str) -> bool:
             logging.warning(f"[ipc-ping] rust-router 不可用")
             return False
 
-        node = db.get_peer_node(node_tag)
-        if not node:
+        # Phase 12-Fix.J: 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, node_tag)
+        if not params["node"]:
             logging.warning(f"[ipc-ping] 节点 '{node_tag}' 不存在")
             return False
 
         local_node_tag = _get_local_node_tag(db)
-
-        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
-        tunnel_type = node.get("tunnel_type", "wireguard")
-        tunnel_ip = None
-        if tunnel_type == "xray":
-            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
 
         # 使用 egress 端点验证可达性
         result = await client.forward_peer_request(
@@ -14734,10 +14774,11 @@ async def _ipc_ping_peer(db, node_tag: str) -> bool:
             method="GET",
             path="/api/peer-info/egress",
             timeout_secs=10,
-            endpoint=node.get("endpoint"),
-            tunnel_type=tunnel_type,
-            api_port=node.get("api_port", 36000),
-            tunnel_ip=tunnel_ip,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],  # Phase 12-Fix.J
             headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
         )
 
@@ -14785,8 +14826,9 @@ async def _ipc_register_chain_route(
         if not client:
             return False, "rust-router 不可用"
 
-        node = db.get_peer_node(node_tag)
-        if not node:
+        # Phase 12-Fix.J: 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, node_tag)
+        if not params["node"]:
             return False, f"节点 '{node_tag}' 不存在"
 
         local_node_tag = _get_local_node_tag(db)
@@ -14803,24 +14845,17 @@ async def _ipc_register_chain_route(
         if target_node:
             data["target_node"] = target_node
 
-        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
-        # 因为 HTTP 请求无法通过 userspace WireGuard 隧道路由
-        # 对于 Xray peers，使用 tunnel_ip 通过 SOCKS5 代理
-        tunnel_type = node.get("tunnel_type", "wireguard")
-        tunnel_ip = None
-        if tunnel_type == "xray":
-            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
-        
         result = await client.forward_peer_request(
             peer_tag=node_tag,
             method="POST",
             path="/api/chain-routing/register",
             body=json.dumps(data),
             timeout_secs=30,
-            endpoint=node.get("endpoint"),
-            tunnel_type=tunnel_type,
-            api_port=node.get("api_port", 36000),
-            tunnel_ip=tunnel_ip,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],  # Phase 12-Fix.J
             headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
         )
 
@@ -14892,8 +14927,9 @@ async def _ipc_unregister_chain_route(
         if not client:
             return False, "rust-router 不可用"
 
-        node = db.get_peer_node(node_tag)
-        if not node:
+        # Phase 12-Fix.J: 使用统一的参数获取函数
+        params = _get_peer_forward_params(db, node_tag)
+        if not params["node"]:
             # 节点不存在时跳过注销（可能已删除）
             logging.warning(f"[ipc-unregister] 节点 '{node_tag}' 不存在，跳过注销")
             return True, None
@@ -14911,22 +14947,17 @@ async def _ipc_unregister_chain_route(
         if target_node:
             data["target_node"] = target_node
 
-        # Userspace WireGuard 模式: 使用公网端点 + X-Peer-Node-ID 认证
-        tunnel_type = node.get("tunnel_type", "wireguard")
-        tunnel_ip = None
-        if tunnel_type == "xray":
-            tunnel_ip = node.get("tunnel_remote_ip") or node.get("tunnel_ip")
-
         result = await client.forward_peer_request(
             peer_tag=node_tag,
             method="POST",
             path="/api/chain-routing/unregister",
             body=json.dumps(data),
             timeout_secs=30,
-            endpoint=node.get("endpoint"),
-            tunnel_type=tunnel_type,
-            api_port=node.get("api_port", 36000),
-            tunnel_ip=tunnel_ip,
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],  # Phase 12-Fix.J
             headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
         )
 
@@ -15300,13 +15331,25 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
                 f"chain={payload.chain_tag}, mark={payload.mark_value} -> {payload.egress_tag} "
                 f"(rust-router synced)"
             )
+            return {"success": True, "message": "Chain route registered"}
         else:
-            logging.warning(
-                f"[tunnel-api] 链路路由注册完成但 rust-router 同步失败: "
+            # Phase 12-Fix.A: rust-router 同步失败时必须返回失败
+            # 否则入口节点以为链路激活成功，但终端节点的 rust-router 不知道如何路由
+            # 导致 DSCP 标记的流量被 processor.rs:320-333 阻断
+            logging.error(
+                f"[tunnel-api] 链路路由注册失败 - rust-router 同步失败: "
                 f"chain={payload.chain_tag}, error={rr_sync_error}"
             )
-        
-        return {"success": True, "message": "Chain route registered"}
+            # 回滚数据库记录
+            try:
+                db.delete_chain_routing(payload.chain_tag, payload.mark_value, payload.mark_type)
+                logging.info(f"[tunnel-api] 已回滚数据库中的链路路由: {payload.chain_tag}")
+            except Exception as rollback_err:
+                logging.warning(f"[tunnel-api] 回滚数据库记录失败: {rollback_err}")
+            return {
+                "success": False,
+                "message": f"rust-router sync failed: {rr_sync_error}"
+            }
 
     except ValueError as e:
         logging.warning(f"[tunnel-api] 链路路由参数错误: {e}")
@@ -15708,7 +15751,8 @@ def _validate_endpoint(endpoint: str) -> tuple:
 def _check_peer_tunnel_status(node: dict) -> str:
     """检查对等节点隧道的实时状态
 
-    Phase 12: WireGuard 隧道状态由数据库管理，无内核接口检查。
+    Phase 12-Fix.B: WireGuard 隧道通过 rust-router IPC 查询真实状态。
+    解决数据库状态与 rust-router 实际状态不同步的问题。
     对于 Xray 隧道：检查 SOCKS 端口是否响应。
 
     Args:
@@ -15719,14 +15763,69 @@ def _check_peer_tunnel_status(node: dict) -> str:
     """
     db_status = node.get("tunnel_status", "disconnected")
     tunnel_type = node.get("tunnel_type", "wireguard")
+    tag = node.get("tag")
 
-    # 如果数据库状态不是已连接，直接返回
-    if db_status != "connected":
+    # Phase 12-Fix.B + C: WireGuard 隧道查询 rust-router 真实状态
+    # 解决配对后数据库状态未同步导致链路激活失败的问题
+    # Phase 12-Fix.C: 只有 WireGuard 握手成功（last_handshake 有值）才视为真正连接
+    if tunnel_type == "wireguard" and tag and HAS_RUST_ROUTER_CLIENT:
+        try:
+            async def _query_rr_peer_status():
+                client = RustRouterClient()
+                try:
+                    # 使用 list_peers 获取完整信息（包括 last_handshake）
+                    peers = await client.list_peers()
+                    for p in peers:
+                        if p.tag == tag:
+                            return p
+                    return None
+                finally:
+                    await client.close()
+
+            peer_info = _run_async_ipc(_query_rr_peer_status())
+            if peer_info:
+                rr_state = (peer_info.state or "").lower()
+                last_handshake = peer_info.last_handshake
+                bytes_rx = peer_info.bytes_rx or 0
+                bytes_tx = peer_info.bytes_tx or 0
+
+                # Phase 12-Fix.C: 真正连接的判断条件
+                # 1. rust-router state == "connected"
+                # 2. last_handshake 有值（WireGuard 握手成功过）
+                # 或者有流量通过（bytes_rx > 0 或 bytes_tx > 0）
+                is_really_connected = (
+                    rr_state == "connected" and
+                    (last_handshake is not None or bytes_rx > 0 or bytes_tx > 0)
+                )
+
+                if is_really_connected:
+                    if db_status != "connected":
+                        logging.info(
+                            f"[peers] 节点 '{tag}' 隧道已连接 (握手成功), "
+                            f"last_handshake={last_handshake}, rx={bytes_rx}, tx={bytes_tx}"
+                        )
+                    return "connected"
+                elif rr_state == "connected":
+                    # state 是 connected 但没有握手成功 - 等待握手中
+                    logging.debug(
+                        f"[peers] 节点 '{tag}' 等待 WireGuard 握手 "
+                        f"(state={rr_state}, last_handshake={last_handshake})"
+                    )
+                    return "connecting"
+                elif rr_state in ("disconnected", "error"):
+                    if db_status == "connected":
+                        logging.info(f"[peers] 节点 '{tag}' rust-router 状态为 {rr_state}")
+                    return "disconnected"
+                elif rr_state == "connecting":
+                    return "connecting"
+        except Exception as e:
+            logging.debug(f"[peers] 查询 rust-router 节点 '{tag}' 状态失败: {e}，回退到数据库状态")
+
+        # rust-router 查询失败时回退到数据库状态
         return db_status
 
-    # Phase 12: WireGuard 隧道在用户空间模式下由 rust-router 管理
-    # 状态信息存储在数据库中，无需检查内核接口
-    if tunnel_type == "wireguard":
+    # 数据库状态不是已连接时直接返回（非 WireGuard 或查询失败）
+    if db_status != "connected":
         return db_status
 
     if tunnel_type == "xray":
@@ -15843,17 +15942,15 @@ def api_list_peers(enabled_only: bool = False):
     nodes = db.get_peer_nodes(enabled_only=enabled_only)
 
     # 实时检测隧道状态并更新
+    # Phase 12-Fix.D: 前端应显示真实隧道状态
     for node in nodes:
-        if node.get("tunnel_status") == "connected":
-            real_status = _check_peer_tunnel_status(node)
-            if real_status == "connecting":
-                # 接口已创建但尚未完成握手，保持 "connected" 状态
-                # 这是刚连接后的正常过渡状态
-                pass
-            elif real_status != "connected":
-                # 真正的断开状态（disconnected 或 stale）
+        real_status = _check_peer_tunnel_status(node)
+        if real_status != node.get("tunnel_status"):
+            # 状态不一致时更新返回值
+            if real_status == "disconnected" and node.get("tunnel_status") == "connected":
+                # 真正断开时同步数据库
                 _update_stale_peer_status(db, node, real_status)
-                node["tunnel_status"] = "disconnected"
+            node["tunnel_status"] = real_status
 
         # 隐藏敏感字段
         node.pop("psk_hash", None)
@@ -15878,14 +15975,12 @@ def api_get_peer(tag: str):
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
     # 实时检测隧道状态并更新
-    if node.get("tunnel_status") == "connected":
-        real_status = _check_peer_tunnel_status(node)
-        if real_status == "connecting":
-            # 接口已创建但尚未完成握手，保持 "connected" 状态
-            pass
-        elif real_status != "connected":
+    # Phase 12-Fix.D: 前端应显示真实隧道状态
+    real_status = _check_peer_tunnel_status(node)
+    if real_status != node.get("tunnel_status"):
+        if real_status == "disconnected" and node.get("tunnel_status") == "connected":
             _update_stale_peer_status(db, node, real_status)
-            node["tunnel_status"] = "disconnected"
+        node["tunnel_status"] = real_status
 
     # 隐藏敏感字段
     node.pop("psk_hash", None)
@@ -16307,10 +16402,12 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
         if payload.tunnel_type == "wireguard":
             # Auto-allocate port if not specified (port == 0)
             ipc_endpoint = endpoint
+            # Phase 12-Fix.H: 记录本地监听端口
+            listen_port = port  # 默认使用用户指定端口
             if port == 0:
-                allocated_port = _allocate_peer_tunnel_port(db)
-                ipc_endpoint = f"{host}:{allocated_port}"
-                logging.info(f"[pairing] IPC 自动分配隧道端口: {allocated_port}")
+                listen_port = _allocate_peer_tunnel_port(db)
+                ipc_endpoint = f"{host}:{listen_port}"
+                logging.info(f"[pairing] IPC 自动分配隧道端口: {listen_port}")
 
             # Use rust-router IPC for pairing
             success, code_or_error, peer_tag, pending_data = _run_async_ipc(
@@ -16328,10 +16425,12 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
                 raise HTTPException(status_code=503, detail=code_or_error)
 
             # Build pending_request for response
+            # Phase 12-Fix.H: 包含本地监听端口供 complete_pairing 使用
             pending_request = {
                 "node_tag": payload.node_tag,
                 "tunnel_type": payload.tunnel_type,
                 "bidirectional": payload.bidirectional,
+                "tunnel_port": listen_port,  # Phase 12-Fix.H: 本地监听端口
             }
             pending_request.update(pending_data)
 
@@ -16454,6 +16553,8 @@ def api_generate_pair_request(payload: GeneratePairRequestRequest):
             "node_tag": payload.node_tag,
             "tunnel_type": payload.tunnel_type,
             "bidirectional": payload.bidirectional,
+            # Phase 12-Fix.F: 保存本地监听端口供 complete_pairing 使用
+            "tunnel_port": listen_port,
         }
 
         # 保存密钥信息
@@ -16561,12 +16662,36 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
     # Phase 11-Fix.AC: WireGuard tunnels use rust-router IPC (userspace mode)
     # Xray tunnels use the kernel code path below
     if request_obj.tunnel_type == "wireguard":
+        # Phase 12-Fix.I: 提取对方节点的端口，分配本地端口时需要排除
+        # 例如：A 使用 36200 发起配对，B 导入时应分配 36201 而非 36200
+        remote_endpoint = request_obj.endpoint  # 对方的 IP:port
+        logging.info(f"[pairing] Phase 12-Fix.I DEBUG: request_obj.endpoint = '{remote_endpoint}', local_listen_port = {local_listen_port}")
+        remote_port = None
+        exclude_ports = set()
+        if remote_endpoint and ":" in remote_endpoint:
+            try:
+                remote_port = int(remote_endpoint.rsplit(":", 1)[1])
+                exclude_ports.add(remote_port)
+                logging.info(f"[pairing] Phase 12-Fix.I: 对方端口 {remote_port}")
+            except (ValueError, IndexError):
+                pass
+
         # Auto-allocate port if not specified (local_listen_port == 0)
+        # Phase 12-Fix.I: 如果用户指定的端口与对方端口相同，也要强制重新分配
+        # Phase 12-Fix.H: 记录本地监听端口
         ipc_endpoint = endpoint
-        if local_listen_port == 0:
-            allocated_port = _allocate_peer_tunnel_port(db)
-            ipc_endpoint = f"{host}:{allocated_port}"
-            logging.info(f"[pairing] IPC 导入自动分配隧道端口: {allocated_port}")
+        listen_port = local_listen_port  # 默认使用用户指定端口
+
+        # Phase 12-Fix.I: 强制检查端口冲突
+        need_allocate = (local_listen_port == 0)
+        if remote_port and local_listen_port == remote_port:
+            logging.warning(f"[pairing] Phase 12-Fix.I: 用户指定端口 {local_listen_port} 与对方端口冲突，强制重新分配")
+            need_allocate = True
+
+        if need_allocate:
+            listen_port = _allocate_peer_tunnel_port(db, exclude_ports=exclude_ports)
+            ipc_endpoint = f"{host}:{listen_port}"
+            logging.info(f"[pairing] IPC 导入自动分配隧道端口: {listen_port}")
 
         # Use rust-router IPC for importing in userspace WG mode
         success, response_code_or_error, remote_tag, response_data = _run_async_ipc(
@@ -16591,6 +16716,13 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
         tunnel_status = response_data.get("tunnel_status")
         bidirectional = response_data.get("bidirectional", request_obj.bidirectional)
 
+        # Phase 12-Fix.H/I: 确保使用本地分配的 tunnel_port，而不是 IPC 返回的（可能是对方的端口）
+        if response_data is None:
+            response_data = {}
+        # Phase 12-Fix.I: 强制使用我们分配的 listen_port，覆盖 IPC 返回的任何值
+        response_data["tunnel_port"] = listen_port
+        logging.info(f"[pairing] Phase 12-Fix.I: 强制设置 tunnel_port = {listen_port}")
+
         synced_tag = _sync_userspace_peer_from_codes(
             db,
             request_code=payload.code,
@@ -16598,7 +16730,7 @@ def api_import_pair_request(payload: ImportPairRequestRequest):
             local_tag=payload.local_node_tag,
             local_endpoint=ipc_endpoint,
             tunnel_status="connected" if bidirectional else "disconnected",
-            ipc_response_data=response_data,  # Pass IPC response containing wg_local_private_key
+            ipc_response_data=response_data,  # Phase 12-Fix.H: 包含 tunnel_port
         )
 
         if not synced_tag:
@@ -16845,17 +16977,20 @@ async def api_get_peer_egress(tag: str):
         raise HTTPException(status_code=503, detail="Database unavailable")
     
     db = _get_db()
-    node = db.get_peer_node(tag)
-    
+
+    # Phase 12-Fix.J: 使用统一的参数获取函数
+    params = _get_peer_forward_params(db, tag)
+    node = params["node"]
+
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
-    
+
     if node.get("tunnel_status") != "connected":
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"节点 '{tag}' 未连接，无法获取出口列表"
         )
-    
+
     try:
         # Phase 11-Fix: 使用 IPC 转发而非直接 HTTP 请求
         # 这解决了 userspace WireGuard 模式下隧道 IP 不可路由的问题
@@ -16865,22 +17000,20 @@ async def api_get_peer_egress(tag: str):
                 status_code=503,
                 detail="rust-router 不可用，无法转发请求"
             )
-        
+
         # 通过 IPC 转发请求到对端节点
-        # 传递 inline config 从数据库，避免需要在 PeerManager 中注册
-        # Phase 11-Fix.B: 传递本地节点 tag 用于 endpoint IP 认证
+        # Phase 12-Fix.J: 使用统一参数确保 WireGuard 隧道转发正确工作
         local_node_tag = _get_local_node_tag(db)
         result = await client.forward_peer_request(
             peer_tag=tag,
             method="GET",
             path="/api/peer-info/egress",
             timeout_secs=30,
-            # Inline peer config from database
-            endpoint=node.get("endpoint"),
-            tunnel_type=node.get("tunnel_type"),
-            api_port=node.get("api_port", 36000),
-            tunnel_ip=node.get("tunnel_ip"),
-            # Pass local node tag for endpoint IP authentication
+            endpoint=params["endpoint"],
+            tunnel_type=params["tunnel_type"],
+            api_port=params["api_port"],
+            tunnel_ip=params["tunnel_ip"],
+            tunnel_local_ip=params["tunnel_local_ip"],  # Phase 12-Fix.J
             headers={"X-Peer-Node-ID": local_node_tag} if local_node_tag else None,
         )
         
@@ -19362,11 +19495,17 @@ async def api_activate_chain(tag: str):
                         detail=f"中继节点 '{relay_tag}' 不存在"
                     )
 
-                if relay_node.get("tunnel_status") != "connected":
+                # Phase 12-Fix.B: 使用 _check_peer_tunnel_status 查询 rust-router 真实状态
+                relay_status = _check_peer_tunnel_status(relay_node)
+                if relay_status != "connected":
                     raise HTTPException(
                         status_code=400,
-                        detail=f"中继节点 '{relay_tag}' 隧道未连接，请先建立连接"
+                        detail=f"中继节点 '{relay_tag}' 隧道未连接 (状态: {relay_status})，请先建立连接"
                     )
+                # 如果 rust-router 报告已连接但数据库状态不一致，同步数据库
+                if relay_node.get("tunnel_status") != "connected" and relay_status == "connected":
+                    db.update_peer_node(relay_tag, tunnel_status="connected")
+                    logging.info(f"[chains] 自动同步中继节点 '{relay_tag}' 状态为 connected")
 
         # Phase 11-Fix.R: 使用本地节点 tag（与 X-Peer-Node-ID header 一致）
         local_node_id = _get_local_node_tag(db)
@@ -19391,11 +19530,17 @@ async def api_activate_chain(tag: str):
                     detail=f"终端节点 '{terminal_tag}' 不存在"
                 )
 
-        if terminal_node.get("tunnel_status") != "connected":
+        # Phase 12-Fix.B: 使用 _check_peer_tunnel_status 查询 rust-router 真实状态
+        terminal_status = _check_peer_tunnel_status(terminal_node)
+        if terminal_status != "connected":
             raise HTTPException(
                 status_code=400,
-                detail=f"终端节点 '{terminal_tag}' 隧道未连接"
+                detail=f"终端节点 '{terminal_tag}' 隧道未连接 (状态: {terminal_status})"
             )
+        # 如果 rust-router 报告已连接但数据库状态不一致，同步数据库
+        if terminal_node.get("tunnel_status") != "connected" and terminal_status == "connected":
+            db.update_peer_node(terminal_tag, tunnel_status="connected")
+            logging.info(f"[chains] 自动同步终端节点 '{terminal_tag}' 状态为 connected")
 
         # Phase 11-Fix.R: 使用 IPC 验证连通性
         logging.info(f"[chains] 验证终端节点 '{terminal_tag}' 连通性 (IPC)...")
@@ -19664,9 +19809,25 @@ async def api_activate_chain(tag: str):
             if rr_success:
                 logging.info(f"[chains] 链路 '{tag}' 已同步到 rust-router")
             else:
-                logging.warning(f"[chains] rust-router 同步失败: {rr_error}")
+                # Phase 12-Fix.A: rust-router 同步失败时必须中止激活
+                # 否则入口节点数据库显示 active，但 rust-router 不知道如何为链路标记 DSCP
+                # 导致流量无法正确路由到终端节点
+                logging.error(f"[chains] rust-router 同步失败，中止激活: {rr_error}")
+                db.update_node_chain(tag, chain_state="error", last_error=f"rust-router sync failed: {rr_error}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"入口节点 rust-router 同步失败: {rr_error}"
+                )
+        except HTTPException:
+            raise  # 重新抛出 HTTPException
         except Exception as e:
-            logging.warning(f"[chains] rust-router 同步异常: {e}")
+            # Phase 12-Fix.A: rust-router 同步异常也必须中止激活
+            logging.error(f"[chains] rust-router 同步异常，中止激活: {e}")
+            db.update_node_chain(tag, chain_state="error", last_error=f"rust-router sync exception: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"入口节点 rust-router 同步异常: {e}"
+            )
 
         # 重新生成 sing-box 配置
         reload_status = "success"

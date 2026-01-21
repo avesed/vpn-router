@@ -1349,6 +1349,8 @@ class RustRouterManager:
                         # Build add_peer call with all available fields
                         # Note: wg_peer_public_key is the remote peer's public key
                         # wg_public_key is our own public key (derived from wg_private_key)
+                        # Phase 12-Fix.F: tunnel_port 是本节点的本地监听端口
+                        # 每个节点在配对时分配不同端口，双向连接需要两个不同端口
                         add_response = await client.add_peer(
                             tag=tag,
                             endpoint=endpoint,
@@ -1359,7 +1361,7 @@ class RustRouterManager:
                             wg_local_private_key=peer.get("wg_private_key"),  # DB uses wg_private_key
                             tunnel_local_ip=peer.get("tunnel_local_ip"),
                             tunnel_remote_ip=peer.get("tunnel_remote_ip"),
-                            tunnel_port=peer.get("tunnel_port"),
+                            tunnel_port=peer.get("tunnel_port"),  # 本地监听端口
                             persistent_keepalive=peer.get("persistent_keepalive"),
                             xray_uuid=peer.get("xray_uuid"),
                             xray_server_name=peer.get("xray_server_name"),

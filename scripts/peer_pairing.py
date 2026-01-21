@@ -435,12 +435,18 @@ class PairingCodeGenerator:
         # PSK 已废弃 - WireGuard 用 IP 认证，Xray 用 UUID 认证
         # 保留空值兼容旧版本
 
+        # Phase 12-Fix.F: 分配本地监听端口，并用它构造 endpoint
+        # 这样响应方才知道连接到哪个端口
+        tunnel_port = self.get_next_tunnel_port()
+        endpoint_ip = endpoint.rsplit(":", 1)[0] if ":" in endpoint else endpoint
+        request_endpoint = f"{endpoint_ip}:{tunnel_port}"
+
         request = PairingRequest(
             type="pair_request",
             version=PAIRING_VERSION,
             node_tag=node_tag,
             node_description=node_description,
-            endpoint=endpoint,
+            endpoint=request_endpoint,  # Phase 12-Fix.F: 使用分配的 tunnel_port
             tunnel_type=tunnel_type,
             api_port=api_port,  # Phase 11-Fix.K
             psk_hash="",  # 已废弃
@@ -449,6 +455,8 @@ class PairingCodeGenerator:
             tunnel_remote_ip=tunnel_remote_ip,
             timestamp=int(time.time()),
         )
+        # Phase 12-Fix.F: 保存 tunnel_port 供 complete_pairing 使用
+        request._tunnel_port = tunnel_port
 
         # 根据隧道类型生成密钥
         if tunnel_type == "wireguard":
@@ -978,13 +986,20 @@ class PairingManager:
         # 生成响应码
         # Phase 11-Fix.K: 使用 api_port 或默认端口
         local_api_port = api_port or DEFAULT_WEB_PORT
+
+        # Phase 12-Fix.F: 响应码的 endpoint 必须使用分配的 tunnel_port
+        # 从 local_endpoint 提取 IP，然后用分配的 tunnel_port 构造新 endpoint
+        # 这样请求方才知道连接到哪个端口
+        endpoint_ip = local_endpoint.rsplit(":", 1)[0] if ":" in local_endpoint else local_endpoint
+        response_endpoint = f"{endpoint_ip}:{tunnel_port}"
+
         response = PairingResponse(
             type="pair_response",
             version=PAIRING_VERSION,
             request_node_tag=request.node_tag,
             node_tag=local_node_tag,
             node_description=local_node_description,
-            endpoint=local_endpoint,
+            endpoint=response_endpoint,  # Phase 12-Fix.F: 使用分配的 tunnel_port
             api_port=api_port,  # Phase 11-Fix.K: 包含 API 端口
             psk_hash="",  # 已废弃
             tunnel_local_ip=remote_ip,  # 分配给请求方的 IP
@@ -1073,6 +1088,8 @@ class PairingManager:
                     tunnel_status="disconnected",
                     tunnel_local_ip=response.tunnel_local_ip,
                     tunnel_remote_ip=response.tunnel_remote_ip,
+                    # Phase 12-Fix.F: 保存本地监听端口
+                    tunnel_port=pending_request.get("tunnel_port"),
                     wg_private_key=pending_request.get("wg_private_key"),
                     wg_public_key=pending_request.get("wg_public_key"),
                     wg_peer_public_key=response.wg_public_key,

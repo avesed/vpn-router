@@ -1155,7 +1155,8 @@ class RustRouterClient:
                     state=item.get("state", "unknown"),
                     local_ip=item.get("local_ip", ""),
                     peer_ip=item.get("peer_ip"),
-                    endpoint=item.get("endpoint"),
+                    # Phase 12-Fix.O: Rust IPC uses peer_endpoint, not endpoint
+                    endpoint=item.get("peer_endpoint"),
                     listen_port=item.get("listen_port"),
                     mtu=item.get("mtu", 1420),
                     bytes_rx=item.get("bytes_rx", 0),
@@ -2354,6 +2355,8 @@ class RustRouterClient:
         tunnel_type: Optional[str] = None,
         api_port: Optional[int] = None,
         tunnel_ip: Optional[str] = None,
+        # Phase 12-Fix.J: Local tunnel IP for WireGuard tunnel routing
+        tunnel_local_ip: Optional[str] = None,
         # Custom headers to include in the request
         headers: Optional[Dict[str, str]] = None,
     ) -> dict:
@@ -2361,7 +2364,8 @@ class RustRouterClient:
 
         This command allows Python to make API calls to peer nodes by forwarding
         HTTP requests through rust-router. For Xray peers, this routes through
-        the SOCKS5 proxy. For WireGuard peers, this uses the peer's public API endpoint.
+        the SOCKS5 proxy. For WireGuard peers with tunnel IPs, this routes through
+        the WireGuard tunnel using smoltcp.
 
         Args:
             peer_tag: The peer node's tag identifier
@@ -2372,7 +2376,8 @@ class RustRouterClient:
             endpoint: Peer endpoint (host:port) - if provided, uses this instead of PeerManager lookup
             tunnel_type: Tunnel type ("wireguard" or "xray") - use with endpoint
             api_port: API port on the peer (default: 36000 if not provided)
-            tunnel_ip: Tunnel IP for Xray peers (optional, for routing through tunnel)
+            tunnel_ip: Remote tunnel IP (e.g., 10.200.200.1) - destination for tunnel routing
+            tunnel_local_ip: Local tunnel IP (e.g., 10.200.200.2) - required for WireGuard tunnel routing
             headers: Custom headers to include in the request (e.g., {"X-Peer-Node-ID": "my-tag"})
 
         Returns:
@@ -2400,6 +2405,9 @@ class RustRouterClient:
             command["api_port"] = api_port
         if tunnel_ip is not None:
             command["tunnel_ip"] = tunnel_ip
+        # Phase 12-Fix.J: Add local tunnel IP for WireGuard routing
+        if tunnel_local_ip is not None:
+            command["tunnel_local_ip"] = tunnel_local_ip
         if headers is not None:
             command["headers"] = headers
 
