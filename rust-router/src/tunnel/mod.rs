@@ -129,5 +129,5 @@ pub use smoltcp_http_client::{HttpClientError, HttpResponse, SmoltcpHttpClient, 
 // TCP proxy exports
 pub use simple_tcp_proxy::{
     inject_tunnel_source_header, sanitize_header_value, SimpleTcpProxy, TcpProxyError,
-    TcpProxyStats, DEFAULT_API_PORT,
+    TcpProxyStats, OutboundHttpRequest, OutboundHttpResponse, DEFAULT_API_PORT,
 };

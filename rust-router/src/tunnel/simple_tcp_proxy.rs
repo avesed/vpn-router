@@ -54,11 +54,11 @@ use std::time::Duration;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::State as TcpState;
-use smoltcp::wire::{IpAddress, Ipv4Packet};
+use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Packet};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, info, trace, warn};
 
@@ -90,6 +90,12 @@ const MAX_HEADER_DETECT_SIZE: usize = 8192;
 
 /// Maximum concurrent connections to prevent DoS resource exhaustion
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// Maximum outbound HTTP response size (1 MB)
+const MAX_OUTBOUND_RESPONSE_SIZE: usize = 1024 * 1024;
+
+/// Default timeout for outbound HTTP requests (30 seconds)
+const DEFAULT_OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Error types for TCP proxy operations
 #[derive(Debug, Error)]
@@ -148,6 +154,69 @@ impl TcpProxyStats {
     }
 }
 
+/// Outbound HTTP request sent through the TCP proxy's channel
+///
+/// This allows external code (e.g., ForwardPeerRequest handler) to send HTTP
+/// requests through the same smoltcp bridge that handles inbound connections,
+/// avoiding the need to compete for tunnel.recv() packets.
+///
+/// # Phase 12-Fix.P
+///
+/// This is part of the permanent fix for the competing pump issue where
+/// SimpleTcpProxy and SmoltcpHttpClient both tried to consume tunnel packets.
+#[derive(Debug)]
+pub struct OutboundHttpRequest {
+    /// HTTP method (GET, POST, etc.)
+    pub method: String,
+    /// Request path (e.g., "/api/health")
+    pub path: String,
+    /// Target host (e.g., "10.200.200.1:36000")
+    pub host: String,
+    /// Target port
+    pub port: u16,
+    /// Optional request body
+    pub body: Option<String>,
+    /// Optional extra headers
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Channel to send the response back
+    pub response_tx: oneshot::Sender<OutboundHttpResponse>,
+}
+
+/// Response from an outbound HTTP request
+#[derive(Debug, Clone)]
+pub struct OutboundHttpResponse {
+    /// Whether the request succeeded
+    pub success: bool,
+    /// HTTP status code (if request succeeded)
+    pub status_code: Option<u16>,
+    /// Response body (if request succeeded)
+    pub body: Option<String>,
+    /// Error message (if request failed)
+    pub error: Option<String>,
+}
+
+impl OutboundHttpResponse {
+    /// Create a successful response
+    pub fn success(status_code: u16, body: String) -> Self {
+        Self {
+            success: true,
+            status_code: Some(status_code),
+            body: Some(body),
+            error: None,
+        }
+    }
+
+    /// Create an error response
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            status_code: None,
+            body: None,
+            error: Some(msg.into()),
+        }
+    }
+}
+
 /// Represents an active proxied connection
 struct ProxiedConnection {
     /// Socket handle in smoltcp
@@ -183,6 +252,43 @@ enum ConnectionState {
     Active,
     /// Closing gracefully
     Closing,
+}
+
+/// State for an outbound HTTP request (Phase 12-Fix.P)
+#[derive(Debug)]
+enum OutboundRequestState {
+    /// Connecting to remote server
+    Connecting,
+    /// Sending HTTP request
+    Sending { sent: usize, total: usize },
+    /// Receiving HTTP response
+    Receiving,
+}
+
+/// An active outbound HTTP request (Phase 12-Fix.P)
+struct OutboundConnection {
+    /// Socket handle in smoltcp
+    handle: SocketHandle,
+    /// Request state
+    state: OutboundRequestState,
+    /// The HTTP request bytes to send
+    request_bytes: Vec<u8>,
+    /// Buffer for received response
+    response_buffer: Vec<u8>,
+    /// Whether headers have been fully received
+    headers_complete: bool,
+    /// Content-Length from headers (if present)
+    content_length: Option<usize>,
+    /// Position where headers end
+    headers_end_pos: usize,
+    /// Channel to send response back
+    response_tx: Option<oneshot::Sender<OutboundHttpResponse>>,
+    /// Remote host (for logging)
+    remote_host: String,
+    /// Creation time (for timeout)
+    created_at: Instant,
+    /// Request timeout duration
+    timeout: Duration,
 }
 
 impl ProxiedConnection {
@@ -300,7 +406,14 @@ impl SimpleTcpProxy {
     /// * `bridge` - The smoltcp bridge for TCP/IP handling
     /// * `tx_sender` - Channel to send packets to the WireGuard tunnel
     /// * `rx_receiver` - Channel to receive packets from the WireGuard tunnel
+    /// * `outbound_rx` - Channel to receive outbound HTTP requests (Phase 12-Fix.P)
     /// * `shutdown_rx` - Broadcast receiver for shutdown signal
+    ///
+    /// # Phase 12-Fix.P: Unified Pump
+    ///
+    /// The `outbound_rx` channel allows external code to send HTTP requests through
+    /// this proxy's smoltcp bridge. This eliminates the competing pump issue where
+    /// both SimpleTcpProxy and SmoltcpHttpClient tried to consume tunnel packets.
     ///
     /// # Errors
     ///
@@ -310,6 +423,7 @@ impl SimpleTcpProxy {
         mut bridge: SmoltcpBridge,
         tx_sender: mpsc::Sender<Vec<u8>>,
         mut rx_receiver: mpsc::Receiver<Vec<u8>>,
+        mut outbound_rx: mpsc::Receiver<OutboundHttpRequest>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> Result<(), TcpProxyError> {
         info!(
@@ -332,8 +446,11 @@ impl SimpleTcpProxy {
 
         info!("TCP proxy listening on port {}", self.listen_port);
 
-        // Active connections
+        // Active inbound connections (proxied to localhost)
         let mut connections: HashMap<SocketHandle, ProxiedConnection> = HashMap::new();
+
+        // Active outbound connections (HTTP requests through tunnel) - Phase 12-Fix.P
+        let mut outbound_connections: HashMap<SocketHandle, OutboundConnection> = HashMap::new();
 
         // Main event loop
         loop {
@@ -346,6 +463,23 @@ impl SimpleTcpProxy {
             // Process incoming packets from the tunnel
             while let Ok(packet) = rx_receiver.try_recv() {
                 bridge.feed_rx_packet(packet);
+            }
+
+            // Phase 12-Fix.P: Accept new outbound HTTP requests
+            while let Ok(req) = outbound_rx.try_recv() {
+                match self.start_outbound_request(&mut bridge, req) {
+                    Ok(outbound_conn) => {
+                        debug!(
+                            "Started outbound request to {} (handle {:?})",
+                            outbound_conn.remote_host, outbound_conn.handle
+                        );
+                        outbound_connections.insert(outbound_conn.handle, outbound_conn);
+                    }
+                    Err((e, response_tx)) => {
+                        warn!("Failed to start outbound request: {}", e);
+                        let _ = response_tx.send(OutboundHttpResponse::error(e.to_string()));
+                    }
+                }
             }
 
             // Poll smoltcp
@@ -453,6 +587,51 @@ impl SimpleTcpProxy {
                 }
             }
 
+            // Phase 12-Fix.P: Process active outbound HTTP requests
+            let mut outbound_to_remove = Vec::new();
+            for (handle, outbound) in &mut outbound_connections {
+                match self.process_outbound_connection(&mut bridge, outbound) {
+                    Ok(Some(response)) => {
+                        // Request completed, send response
+                        debug!(
+                            "Outbound request to {} completed with status {:?}",
+                            outbound.remote_host, response.status_code
+                        );
+                        if let Some(tx) = outbound.response_tx.take() {
+                            let _ = tx.send(response);
+                        }
+                        outbound_to_remove.push(*handle);
+                    }
+                    Ok(None) => {
+                        // Still in progress
+                    }
+                    Err(e) => {
+                        warn!("Outbound request to {} failed: {}", outbound.remote_host, e);
+                        if let Some(tx) = outbound.response_tx.take() {
+                            let _ = tx.send(OutboundHttpResponse::error(e.to_string()));
+                        }
+                        outbound_to_remove.push(*handle);
+                    }
+                }
+            }
+
+            // Remove finished/failed outbound connections and check timeouts
+            for (handle, outbound) in &mut outbound_connections {
+                if !outbound_to_remove.contains(handle) && outbound.created_at.elapsed() > outbound.timeout {
+                    warn!("Outbound request to {} timed out", outbound.remote_host);
+                    if let Some(tx) = outbound.response_tx.take() {
+                        let _ = tx.send(OutboundHttpResponse::error("Request timed out"));
+                    }
+                    outbound_to_remove.push(*handle);
+                }
+            }
+
+            for handle in outbound_to_remove {
+                if let Some(_outbound) = outbound_connections.remove(&handle) {
+                    bridge.remove_socket(handle);
+                }
+            }
+
             // Send any outgoing packets
             for packet in bridge.drain_tx_packets() {
                 if tx_sender.send(packet).await.is_err() {
@@ -476,6 +655,13 @@ impl SimpleTcpProxy {
 
         // Cleanup
         for (handle, _conn) in connections {
+            bridge.remove_socket(handle);
+        }
+        // Phase 12-Fix.P: Cleanup outbound connections and notify callers
+        for (handle, mut outbound) in outbound_connections {
+            if let Some(tx) = outbound.response_tx.take() {
+                let _ = tx.send(OutboundHttpResponse::error("Proxy shutdown"));
+            }
             bridge.remove_socket(handle);
         }
         bridge.remove_socket(listen_handle);
@@ -699,6 +885,371 @@ impl SimpleTcpProxy {
         }
 
         Ok(true)
+    }
+
+    // ========================================================================
+    // Phase 12-Fix.P: Outbound HTTP Request Methods
+    // ========================================================================
+
+    /// Start a new outbound HTTP request
+    ///
+    /// Creates a TCP socket and initiates connection to the remote server.
+    /// Returns the OutboundConnection on success, or error with the response_tx
+    /// so the caller can send an error response.
+    fn start_outbound_request(
+        &self,
+        bridge: &mut SmoltcpBridge,
+        req: OutboundHttpRequest,
+    ) -> Result<OutboundConnection, (TcpProxyError, oneshot::Sender<OutboundHttpResponse>)> {
+        // Parse the host IP
+        let remote_ip: Ipv4Addr = match req.host.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                return Err((
+                    TcpProxyError::AcceptFailed(format!("Invalid host IP: {}", req.host)),
+                    req.response_tx,
+                ));
+            }
+        };
+
+        // Create a TCP socket
+        let handle = match bridge.create_tcp_socket_default() {
+            Some(h) => h,
+            None => {
+                return Err((
+                    TcpProxyError::SocketError("Socket set full".into()),
+                    req.response_tx,
+                ));
+            }
+        };
+
+        // Convert to smoltcp address
+        let remote_addr = IpAddress::Ipv4(Ipv4Address::new(
+            remote_ip.octets()[0],
+            remote_ip.octets()[1],
+            remote_ip.octets()[2],
+            remote_ip.octets()[3],
+        ));
+
+        // Get a local port
+        let local_port = Self::allocate_ephemeral_port();
+
+        // Initiate connection
+        if let Err(e) = bridge.tcp_connect(handle, remote_addr, req.port, local_port) {
+            bridge.remove_socket(handle);
+            return Err((
+                TcpProxyError::AcceptFailed(format!("Failed to connect: {:?}", e)),
+                req.response_tx,
+            ));
+        }
+
+        debug!(
+            "Outbound request: {} {} to {}:{} (handle {:?}, local port {})",
+            req.method, req.path, req.host, req.port, handle, local_port
+        );
+
+        // Build the HTTP request
+        let request_bytes = Self::build_http_request(
+            &req.method,
+            &req.path,
+            &req.host,
+            req.port,
+            req.headers.as_ref(),
+            req.body.as_deref(),
+        );
+
+        Ok(OutboundConnection {
+            handle,
+            state: OutboundRequestState::Connecting,
+            request_bytes,
+            response_buffer: Vec::new(),
+            headers_complete: false,
+            content_length: None,
+            headers_end_pos: 0,
+            response_tx: Some(req.response_tx),
+            remote_host: format!("{}:{}", req.host, req.port),
+            created_at: Instant::now(),
+            timeout: DEFAULT_OUTBOUND_TIMEOUT,
+        })
+    }
+
+    /// Process an outbound connection state machine
+    ///
+    /// Returns:
+    /// - Ok(Some(response)) if the request completed
+    /// - Ok(None) if still in progress
+    /// - Err(e) if an error occurred
+    fn process_outbound_connection(
+        &self,
+        bridge: &mut SmoltcpBridge,
+        outbound: &mut OutboundConnection,
+    ) -> Result<Option<OutboundHttpResponse>, TcpProxyError> {
+        let state = bridge.tcp_socket_state(outbound.handle);
+
+        match &mut outbound.state {
+            OutboundRequestState::Connecting => {
+                match state {
+                    TcpState::Established => {
+                        // Connection established, start sending
+                        trace!("Outbound connection to {} established", outbound.remote_host);
+                        outbound.state = OutboundRequestState::Sending { sent: 0, total: outbound.request_bytes.len() };
+                    }
+                    TcpState::Closed | TcpState::TimeWait => {
+                        return Err(TcpProxyError::AcceptFailed(
+                            "Connection closed during handshake".into(),
+                        ));
+                    }
+                    _ => {
+                        // Still connecting
+                    }
+                }
+            }
+
+            OutboundRequestState::Sending { sent, total } => {
+                // Check if connection is still valid
+                if !matches!(state, TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2) {
+                    return Err(TcpProxyError::TunnelError("Connection closed while sending".into()));
+                }
+
+                // Try to send more data
+                if bridge.tcp_can_send(outbound.handle) && *sent < *total {
+                    let socket = bridge.get_tcp_socket_mut(outbound.handle);
+                    match socket.send_slice(&outbound.request_bytes[*sent..]) {
+                        Ok(n) => {
+                            *sent += n;
+                            trace!("Sent {} bytes ({}/{}) to {}", n, *sent, *total, outbound.remote_host);
+
+                            if *sent >= *total {
+                                // All data sent, start receiving
+                                debug!("Request sent to {}, waiting for response", outbound.remote_host);
+                                outbound.state = OutboundRequestState::Receiving;
+                            }
+                        }
+                        Err(e) => {
+                            return Err(TcpProxyError::SocketError(format!("{:?}", e)));
+                        }
+                    }
+                }
+            }
+
+            OutboundRequestState::Receiving => {
+                // Try to receive data
+                if bridge.tcp_can_recv(outbound.handle) {
+                    let socket = bridge.get_tcp_socket_mut(outbound.handle);
+                    let mut buf = [0u8; 4096];
+                    match socket.recv_slice(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            outbound.response_buffer.extend_from_slice(&buf[..n]);
+                            trace!(
+                                "Received {} bytes from {} (total: {})",
+                                n,
+                                outbound.remote_host,
+                                outbound.response_buffer.len()
+                            );
+
+                            // Check for response size limit
+                            if outbound.response_buffer.len() > MAX_OUTBOUND_RESPONSE_SIZE {
+                                return Err(TcpProxyError::TunnelError(format!(
+                                    "Response too large: {} bytes",
+                                    outbound.response_buffer.len()
+                                )));
+                            }
+
+                            // Check if headers are complete
+                            if !outbound.headers_complete {
+                                if let Some(pos) = Self::find_headers_end(&outbound.response_buffer) {
+                                    outbound.headers_complete = true;
+                                    outbound.headers_end_pos = pos;
+                                    let headers_str = String::from_utf8_lossy(&outbound.response_buffer[..pos]);
+                                    outbound.content_length = Self::extract_content_length(&headers_str);
+                                    trace!(
+                                        "Headers complete for {}, Content-Length: {:?}",
+                                        outbound.remote_host,
+                                        outbound.content_length
+                                    );
+                                }
+                            }
+
+                            // Check if we have the complete response
+                            if outbound.headers_complete {
+                                let body_received = outbound.response_buffer.len() - outbound.headers_end_pos;
+                                if let Some(expected) = outbound.content_length {
+                                    if body_received >= expected {
+                                        return Ok(Some(self.parse_outbound_response(outbound)?));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            // No data available
+                        }
+                        Err(e) => {
+                            return Err(TcpProxyError::SocketError(format!("{:?}", e)));
+                        }
+                    }
+                }
+
+                // Check if connection closed
+                match state {
+                    TcpState::CloseWait | TcpState::Closed | TcpState::TimeWait => {
+                        if outbound.headers_complete {
+                            // Connection closed, but we have a complete response
+                            return Ok(Some(self.parse_outbound_response(outbound)?));
+                        } else if !outbound.response_buffer.is_empty() {
+                            return Err(TcpProxyError::TunnelError(
+                                "Connection closed before headers complete".into(),
+                            ));
+                        } else {
+                            return Err(TcpProxyError::TunnelError("Connection closed by peer".into()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Parse the HTTP response from an outbound connection
+    fn parse_outbound_response(
+        &self,
+        outbound: &OutboundConnection,
+    ) -> Result<OutboundHttpResponse, TcpProxyError> {
+        let response_str = String::from_utf8_lossy(&outbound.response_buffer);
+
+        // Find headers end
+        let headers_end = Self::find_headers_end(&outbound.response_buffer)
+            .ok_or_else(|| TcpProxyError::TunnelError("No headers end found".into()))?;
+
+        let headers_str = &response_str[..headers_end];
+        let body_str = &response_str[headers_end..];
+
+        // Parse status line
+        let status_code = Self::parse_status_code(headers_str)?;
+
+        debug!(
+            "Outbound response from {}: status={}, body_len={}",
+            outbound.remote_host,
+            status_code,
+            body_str.len()
+        );
+
+        Ok(OutboundHttpResponse::success(status_code, body_str.to_string()))
+    }
+
+    /// Allocate an ephemeral port for outbound connections
+    ///
+    /// Uses compare_exchange loop to safely handle wraparound without race conditions.
+    fn allocate_ephemeral_port() -> u16 {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static PORT_COUNTER: AtomicU16 = AtomicU16::new(49152);
+
+        loop {
+            let current = PORT_COUNTER.load(Ordering::Relaxed);
+            // Wrap around before 65535 to avoid overflow issues
+            let next = if current >= 65534 { 49152 } else { current + 1 };
+            if PORT_COUNTER
+                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return current;
+            }
+            // CAS failed, another thread modified the counter - retry
+        }
+    }
+
+    /// Build an HTTP/1.1 request
+    fn build_http_request(
+        method: &str,
+        path: &str,
+        host: &str,
+        port: u16,
+        headers: Option<&std::collections::HashMap<String, String>>,
+        body: Option<&str>,
+    ) -> Vec<u8> {
+        let mut request = String::new();
+
+        // Request line
+        request.push_str(method);
+        request.push(' ');
+        request.push_str(path);
+        request.push_str(" HTTP/1.1\r\n");
+
+        // Host header
+        if port == 80 {
+            request.push_str(&format!("Host: {}\r\n", host));
+        } else {
+            request.push_str(&format!("Host: {}:{}\r\n", host, port));
+        }
+
+        // Default headers
+        request.push_str("Connection: close\r\n");
+        request.push_str("User-Agent: SimpleTcpProxy/1.0\r\n");
+
+        // Custom headers (sanitized)
+        if let Some(hdrs) = headers {
+            for (key, value) in hdrs {
+                let safe_key = sanitize_header_value(key);
+                let safe_value = sanitize_header_value(value);
+                if !safe_key.is_empty() {
+                    request.push_str(&format!("{}: {}\r\n", safe_key, safe_value));
+                }
+            }
+        }
+
+        // Body handling
+        if let Some(body_str) = body {
+            request.push_str(&format!("Content-Length: {}\r\n", body_str.len()));
+            if !headers.map_or(false, |h| h.contains_key("Content-Type")) {
+                request.push_str("Content-Type: application/json\r\n");
+            }
+            request.push_str("\r\n");
+            request.push_str(body_str);
+        } else {
+            request.push_str("\r\n");
+        }
+
+        request.into_bytes()
+    }
+
+    /// Find the end of HTTP headers (double CRLF)
+    fn find_headers_end(data: &[u8]) -> Option<usize> {
+        const CRLF_CRLF: &[u8] = b"\r\n\r\n";
+        data.windows(4)
+            .position(|w| w == CRLF_CRLF)
+            .map(|pos| pos + 4)
+    }
+
+    /// Extract Content-Length from headers
+    fn extract_content_length(headers: &str) -> Option<usize> {
+        for line in headers.lines() {
+            let lower = line.to_lowercase();
+            if lower.starts_with("content-length:") {
+                return line.split(':').nth(1).and_then(|v| v.trim().parse().ok());
+            }
+        }
+        None
+    }
+
+    /// Parse HTTP status code from status line
+    fn parse_status_code(headers: &str) -> Result<u16, TcpProxyError> {
+        let status_line = headers.lines().next().ok_or_else(|| {
+            TcpProxyError::TunnelError("Empty response".into())
+        })?;
+
+        // Format: "HTTP/1.1 200 OK"
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
+            return Err(TcpProxyError::TunnelError(format!(
+                "Invalid status line: {}",
+                status_line
+            )));
+        }
+
+        parts[1].parse().map_err(|_| {
+            TcpProxyError::TunnelError(format!("Invalid status code: {}", parts[1]))
+        })
     }
 }
 

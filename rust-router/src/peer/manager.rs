@@ -72,7 +72,7 @@ use crate::peer::validation::{
 };
 use crate::tunnel::{
     derive_public_key, generate_private_key, SmoltcpBridge, SimpleTcpProxy, WgTunnel,
-    WgTunnelBuilder, WgTunnelConfig, DEFAULT_WG_MTU,
+    WgTunnelBuilder, WgTunnelConfig, OutboundHttpRequest, DEFAULT_WG_MTU,
 };
 use tokio::sync::mpsc;
 
@@ -289,6 +289,9 @@ pub struct PeerManager {
     proxy_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Shutdown signal senders for proxy tasks
     proxy_shutdown_txs: RwLock<HashMap<String, tokio::sync::broadcast::Sender<()>>>,
+    /// Phase 12-Fix.P: Outbound HTTP request senders for each peer's TCP proxy
+    /// This allows ForwardPeerRequest to send HTTP requests through the unified pump
+    outbound_request_txs: RwLock<HashMap<String, mpsc::Sender<OutboundHttpRequest>>>,
 }
 
 impl PeerManager {
@@ -315,6 +318,7 @@ impl PeerManager {
             health_checker: HealthChecker::new(3), // 3 consecutive failures threshold
             proxy_tasks: RwLock::new(HashMap::new()),
             proxy_shutdown_txs: RwLock::new(HashMap::new()),
+            outbound_request_txs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -343,6 +347,7 @@ impl PeerManager {
             health_checker: HealthChecker::new(3),
             proxy_tasks: RwLock::new(HashMap::new()),
             proxy_shutdown_txs: RwLock::new(HashMap::new()),
+            outbound_request_txs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -991,6 +996,15 @@ impl PeerManager {
                 shutdown_txs.insert(tag.to_string(), shutdown_tx);
             }
 
+            // Phase 12-Fix.P: Create outbound HTTP request channel
+            let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundHttpRequest>(16);
+
+            // Store outbound request sender
+            {
+                let mut outbound_txs = self.outbound_request_txs.write();
+                outbound_txs.insert(tag.to_string(), outbound_tx);
+            }
+
             // Spawn TCP proxy task
             let tag_clone = tag.to_string();
             let tunnel_for_proxy = tunnel_arc.clone();
@@ -1057,7 +1071,8 @@ impl PeerManager {
                 });
 
                 // Run the proxy (this blocks until shutdown or error)
-                if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, shutdown_rx).await {
+                // Phase 12-Fix.P: Pass outbound_rx for unified pump
+                if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx).await {
                     warn!(tag = %tag_clone, "TCP proxy error: {}", e);
                 }
 
@@ -1164,6 +1179,12 @@ impl PeerManager {
                     shutdown_txs.remove(tag);
                 }
 
+                // Phase 12-Fix.P: Remove outbound request sender to prevent stale references
+                {
+                    let mut outbound_txs = self.outbound_request_txs.write();
+                    outbound_txs.remove(tag);
+                }
+
                 // Remove and shutdown tunnel (using peer- prefix)
                 let tunnel_tag = format!("peer-{}", tag);
                 let tunnel = {
@@ -1192,6 +1213,170 @@ impl PeerManager {
 
         info!(tag = %tag, "Disconnected from peer");
 
+        Ok(())
+    }
+
+    // NOTE: Phase 12-Fix.S `pause_tcp_proxy()` was removed in Phase 12-Fix.P
+    // The unified pump architecture eliminates the need to pause the TCP proxy
+    // for ForwardPeerRequest. Outbound requests now go through a channel.
+
+    /// Start/restart the TCP proxy for a peer tunnel
+    ///
+    /// This starts or restarts the TCP proxy that handles incoming connections
+    /// through the WireGuard tunnel.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Peer node tag
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if proxy was started successfully
+    pub async fn start_tcp_proxy_for_peer(&self, tag: &str) -> Result<(), PeerError> {
+        // Get peer config
+        let config = {
+            let peers = self.peers.read();
+            let peer = peers.get(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+            peer.config.clone()
+        };
+
+        // Only for WireGuard tunnels
+        if config.tunnel_type != TunnelType::WireGuard {
+            debug!(tag = %tag, "TCP proxy only for WireGuard tunnels");
+            return Ok(());
+        }
+
+        // Get tunnel
+        let tunnel_tag = format!("peer-{}", tag);
+        let tunnel_arc = {
+            let wg_tunnels = self.wg_tunnels.read();
+            wg_tunnels.get(&tunnel_tag).cloned().ok_or_else(|| {
+                PeerError::TunnelCreationFailed(format!("WireGuard tunnel '{}' not found", tunnel_tag))
+            })?
+        };
+
+        // Parse local tunnel IP
+        let local_ip_str = config
+            .tunnel_local_ip
+            .clone()
+            .unwrap_or_else(|| "10.200.200.1/32".to_string());
+        let local_ip_only = local_ip_str.split('/').next().unwrap_or("10.200.200.1");
+
+        let local_ip: std::net::Ipv4Addr = local_ip_only.parse().map_err(|_| {
+            PeerError::TunnelCreationFailed(format!("Invalid tunnel local IP: {}", local_ip_only))
+        })?;
+
+        // Check if already running
+        {
+            let tasks = self.proxy_tasks.read();
+            if tasks.contains_key(tag) {
+                debug!(tag = %tag, "TCP proxy already running");
+                return Ok(());
+            }
+        }
+
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // Store shutdown sender
+        {
+            let mut shutdown_txs = self.proxy_shutdown_txs.write();
+            shutdown_txs.insert(tag.to_string(), shutdown_tx);
+        }
+
+        // Phase 12-Fix.P: Create outbound HTTP request channel
+        let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundHttpRequest>(16);
+
+        // Store outbound request sender
+        {
+            let mut outbound_txs = self.outbound_request_txs.write();
+            outbound_txs.insert(tag.to_string(), outbound_tx);
+        }
+
+        // Spawn TCP proxy task
+        let tag_clone = tag.to_string();
+        let tunnel_for_proxy = tunnel_arc.clone();
+
+        let proxy_task = tokio::spawn(async move {
+            info!(
+                tag = %tag_clone,
+                local_ip = %local_ip,
+                "Starting TCP proxy task for peer tunnel (resumed)"
+            );
+
+            // Create channels for packet exchange between smoltcp and tunnel
+            let (tx_sender, mut tx_receiver) = mpsc::channel::<Vec<u8>>(256);
+            let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>(256);
+
+            // Create smoltcp bridge with local tunnel IP
+            let bridge = SmoltcpBridge::new(local_ip, DEFAULT_WG_MTU);
+
+            // Create TCP proxy targeting localhost:36000
+            let proxy = SimpleTcpProxy::new(36000);
+
+            // Clone tunnel for pump task
+            let tunnel_for_pump = tunnel_for_proxy.clone();
+
+            // Spawn packet pump task
+            let mut pump_shutdown_rx = shutdown_rx.resubscribe();
+            let pump_handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+
+                        // Check shutdown
+                        _ = pump_shutdown_rx.recv() => {
+                            debug!("Pump task received shutdown signal");
+                            break;
+                        }
+
+                        // TX: smoltcp -> tunnel (outgoing packets)
+                        Some(packet) = tx_receiver.recv() => {
+                            if let Err(e) = tunnel_for_pump.send(&packet).await {
+                                warn!("Failed to send packet to tunnel: {}", e);
+                            }
+                        }
+
+                        // RX: tunnel -> smoltcp (incoming packets)
+                        result = tunnel_for_pump.recv() => {
+                            match result {
+                                Ok(packet) => {
+                                    if rx_sender.send(packet).await.is_err() {
+                                        debug!("Proxy receiver dropped");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to receive from tunnel: {}", e);
+                                    // Don't break on error - tunnel might recover
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                debug!("Pump task exiting");
+            });
+
+            // Run the proxy (this blocks until shutdown or error)
+            // Phase 12-Fix.P: Pass outbound_rx for unified pump
+            if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx).await {
+                warn!(tag = %tag_clone, "TCP proxy error: {}", e);
+            }
+
+            // Stop pump task
+            pump_handle.abort();
+
+            info!(tag = %tag_clone, "TCP proxy task stopped");
+        });
+
+        // Store task handle
+        {
+            let mut tasks = self.proxy_tasks.write();
+            tasks.insert(tag.to_string(), proxy_task);
+        }
+
+        info!(tag = %tag, "TCP proxy started for peer tunnel");
         Ok(())
     }
 
@@ -1512,6 +1697,29 @@ impl PeerManager {
     pub fn get_peer_config(&self, tag: &str) -> Option<PeerConfig> {
         let peers = self.peers.read();
         peers.get(tag).map(|p| p.config.clone())
+    }
+
+    /// Get the outbound HTTP request sender for a peer's TCP proxy
+    ///
+    /// This allows external code (e.g., ForwardPeerRequest handler) to send HTTP requests
+    /// through the peer's TCP proxy, which handles them via the unified smoltcp pump.
+    ///
+    /// # Phase 12-Fix.P
+    ///
+    /// This method is part of the permanent fix for the competing pump issue.
+    /// Instead of creating a separate SmoltcpHttpClient (which would compete for tunnel packets),
+    /// callers can send requests through the TCP proxy's unified pump.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Peer node tag
+    ///
+    /// # Returns
+    ///
+    /// The sender channel if the peer has an active TCP proxy, None otherwise
+    pub fn get_outbound_request_sender(&self, tag: &str) -> Option<mpsc::Sender<OutboundHttpRequest>> {
+        let outbound_txs = self.outbound_request_txs.read();
+        outbound_txs.get(tag).cloned()
     }
 
     /// Set peer state to connected without creating a tunnel

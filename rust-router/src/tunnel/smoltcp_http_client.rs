@@ -382,21 +382,40 @@ impl SmoltcpHttpClient {
         );
 
         // Drive the connection until established
+        let mut loop_count = 0;
         loop {
+            loop_count += 1;
+            // Phase 12-Fix.R: Detailed TCP state debugging
+            let state_before = self.bridge.tcp_socket_state(handle);
+
             // Process any incoming packets
             self.process_rx_packets(rx_receiver);
 
             // Poll smoltcp
-            self.bridge.poll();
+            let poll_result = self.bridge.poll();
 
             // Check connection state
             let state = self.bridge.tcp_socket_state(handle);
+
+            // Log state transitions
+            if state != state_before || loop_count <= 3 {
+                debug!(
+                    "TCP connect loop #{}: state {:?} -> {:?}, poll_result={}, rx_queue={}",
+                    loop_count,
+                    state_before,
+                    state,
+                    poll_result,
+                    self.bridge.rx_queue_len()
+                );
+            }
+
             match state {
                 TcpState::Established => {
-                    debug!("TCP connection established");
+                    debug!("TCP connection established after {} loops", loop_count);
                     break;
                 }
                 TcpState::Closed | TcpState::TimeWait => {
+                    debug!("TCP connection failed: state={:?} after {} loops", state, loop_count);
                     return Err(HttpClientError::ConnectionFailed(
                         "Connection closed during handshake".to_string(),
                     ));
@@ -615,8 +634,15 @@ impl SmoltcpHttpClient {
     /// Process incoming packets from the tunnel
     fn process_rx_packets(&mut self, rx_receiver: &mut mpsc::Receiver<Vec<u8>>) {
         // Non-blocking receive of all available packets
+        let mut count = 0;
         while let Ok(packet) = rx_receiver.try_recv() {
+            // Phase 12-Fix.Q: Log packets received from tunnel
+            debug!("HTTP client: received {} byte packet from tunnel", packet.len());
             self.bridge.feed_rx_packet(packet);
+            count += 1;
+        }
+        if count > 0 {
+            debug!("HTTP client: processed {} packets from tunnel", count);
         }
     }
 

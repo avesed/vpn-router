@@ -680,11 +680,26 @@ def _get_direct_client_ip(request: Request) -> str:
     这些端点使用隧道 IP 作为身份证明，因此必须使用实际的 TCP 连接 IP，
     不能信任任何可被伪造的 HTTP 头（X-Forwarded-For, X-Real-IP 等）。
 
+    Phase 12-Fix.P: 修复 nginx keep-alive 连接导致 request.client 为 None 的问题。
+    当 nginx 使用持久连接代理到 uvicorn 时，uvicorn 可能无法获取原始客户端信息。
+    在这种情况下，仅当 X-Real-IP 为 127.0.0.1 时才信任（nginx 由本地设置此头），
+    这确保请求确实来自本地 SimpleTcpProxy。
+
     Returns:
         直接 TCP 连接的客户端 IP 地址
     """
     if request.client and request.client.host:
         return request.client.host
+
+    # Phase 12-Fix.P: 回退处理 - nginx keep-alive 连接导致 request.client 为 None
+    # nginx 设置 X-Real-IP: $remote_addr，仅当其值为 127.0.0.1 时信任
+    # 安全性：外部攻击者可以伪造 X-Real-IP 头，但他们无法伪造为 127.0.0.1
+    # 因为 nginx 会用实际的 $remote_addr 覆盖该头
+    x_real_ip = request.headers.get("X-Real-IP")
+    if x_real_ip == "127.0.0.1":
+        logging.debug("[client-ip] Using X-Real-IP=127.0.0.1 as fallback (nginx proxy)")
+        return "127.0.0.1"
+
     return "unknown"
 
 
@@ -15251,68 +15266,79 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
         rr_sync_error = None
         try:
             import asyncio
-            
+
             async def _sync_chain_to_rust_router():
-                client = await _get_rust_router_client()
-                if not client:
+                # Phase 12-Fix.P: Create fresh client for new event loop context
+                # Using the singleton _get_rust_router_client() doesn't work here because
+                # we're running in a new event loop created by asyncio.new_event_loop(),
+                # but the singleton might be connected in uvicorn's main event loop.
+                if not HAS_RUST_ROUTER_CLIENT:
                     return False, "rust-router not available"
-                
-                local_tag = _get_local_node_tag(db)
-                source_tag = payload.source_node or node["tag"]
-                
-                # Build chain config for terminal node
-                # The chain has: entry (source_node) -> terminal (local_node)
-                chain_config = {
-                    "tag": payload.chain_tag,
-                    "description": f"Chain route from {source_tag}",
-                    "dscp_value": payload.mark_value,
-                    "hops": [
-                        {
-                            "node_tag": source_tag,
-                            "role": "entry",
-                            "tunnel_type": "wireguard",
-                        },
-                        {
-                            "node_tag": local_tag,
-                            "role": "terminal",
-                            "tunnel_type": "wireguard",
-                        },
-                    ],
-                    "rules": [],
-                    "exit_egress": payload.egress_tag,
-                    "allow_transitive": False,
-                }
-                
-                # Check if chain already exists
-                list_response = await client.list_chains()
-                existing_tags = set()
-                if list_response.success and list_response.data:
-                    existing_tags = {c.get("tag") for c in list_response.data if c.get("tag")}
-                
-                if payload.chain_tag in existing_tags:
-                    # Update existing chain - first deactivate if active
-                    status_resp = await client.get_chain_status(payload.chain_tag)
-                    if status_resp.success and status_resp.data:
-                        if status_resp.data.get("chain_state") == "active":
-                            await client.deactivate_chain(payload.chain_tag)
-                    
-                    # Delete and recreate (update may not change hops)
-                    await client.delete_chain(payload.chain_tag)
-                
-                # Create the chain
-                create_resp = await client.create_chain(
-                    tag=payload.chain_tag,
-                    config=chain_config,
-                )
-                if not create_resp.success:
-                    return False, f"Failed to create chain: {create_resp.error}"
-                
-                # Activate the chain
-                activate_resp = await client.activate_chain(payload.chain_tag)
-                if not activate_resp.success:
-                    return False, f"Failed to activate chain: {activate_resp.error}"
-                
-                return True, None
+
+                client = RustRouterClient()
+                try:
+                    # Verify connection
+                    ping_resp = await client.ping()
+                    if not ping_resp.success:
+                        return False, "rust-router not available"
+
+                    local_tag = _get_local_node_tag(db)
+                    source_tag = payload.source_node or node["tag"]
+
+                    # Build chain config for terminal node
+                    # The chain has: entry (source_node) -> terminal (local_node)
+                    chain_config = {
+                        "tag": payload.chain_tag,
+                        "description": f"Chain route from {source_tag}",
+                        "dscp_value": payload.mark_value,
+                        "hops": [
+                            {
+                                "node_tag": source_tag,
+                                "role": "entry",
+                                "tunnel_type": "wireguard",
+                            },
+                            {
+                                "node_tag": local_tag,
+                                "role": "terminal",
+                                "tunnel_type": "wireguard",
+                            },
+                        ],
+                        "rules": [],
+                        "exit_egress": payload.egress_tag,
+                        "allow_transitive": False,
+                    }
+
+                    # Check if chain already exists
+                    # Phase 12-Fix.P: list_chains() returns List[ChainInfo], not a response object
+                    chains_list = await client.list_chains()
+                    existing_tags = {c.tag for c in chains_list if c.tag}
+
+                    if payload.chain_tag in existing_tags:
+                        # Update existing chain - first deactivate if active
+                        status_resp = await client.get_chain_status(payload.chain_tag)
+                        if status_resp.success and status_resp.data:
+                            if status_resp.data.get("chain_state") == "active":
+                                await client.deactivate_chain(payload.chain_tag)
+
+                        # Delete and recreate (update may not change hops)
+                        await client.delete_chain(payload.chain_tag)
+
+                    # Create the chain
+                    create_resp = await client.create_chain(
+                        tag=payload.chain_tag,
+                        config=chain_config,
+                    )
+                    if not create_resp.success:
+                        return False, f"Failed to create chain: {create_resp.error}"
+
+                    # Activate the chain
+                    activate_resp = await client.activate_chain(payload.chain_tag)
+                    if not activate_resp.success:
+                        return False, f"Failed to activate chain: {activate_resp.error}"
+
+                    return True, None
+                finally:
+                    await client.close()
             
             # Run async function
             loop = asyncio.new_event_loop()
@@ -15484,31 +15510,38 @@ def api_chain_routing_unregister(
                 import asyncio
                 
                 async def _remove_chain_from_rust_router():
-                    client = await _get_rust_router_client()
-                    if not client:
+                    # Phase 12-Fix.P: Create fresh client for new event loop context
+                    if not HAS_RUST_ROUTER_CLIENT:
                         return False, "rust-router not available"
-                    
-                    # Check if chain exists
-                    list_response = await client.list_chains()
-                    existing_tags = set()
-                    if list_response.success and list_response.data:
-                        existing_tags = {c.get("tag") for c in list_response.data if c.get("tag")}
-                    
-                    if chain_tag not in existing_tags:
-                        return True, None  # Chain doesn't exist, nothing to do
-                    
-                    # Deactivate if active
-                    status_resp = await client.get_chain_status(chain_tag)
-                    if status_resp.success and status_resp.data:
-                        if status_resp.data.get("chain_state") == "active":
-                            await client.deactivate_chain(chain_tag)
-                    
-                    # Delete the chain
-                    delete_resp = await client.delete_chain(chain_tag)
-                    if not delete_resp.success:
-                        return False, f"Failed to delete chain: {delete_resp.error}"
-                    
-                    return True, None
+
+                    client = RustRouterClient()
+                    try:
+                        ping_resp = await client.ping()
+                        if not ping_resp.success:
+                            return False, "rust-router not available"
+
+                        # Check if chain exists
+                        # Phase 12-Fix.P: list_chains() returns List[ChainInfo], not a response object
+                        chains_list = await client.list_chains()
+                        existing_tags = {c.tag for c in chains_list if c.tag}
+
+                        if chain_tag not in existing_tags:
+                            return True, None  # Chain doesn't exist, nothing to do
+
+                        # Deactivate if active
+                        status_resp = await client.get_chain_status(chain_tag)
+                        if status_resp.success and status_resp.data:
+                            if status_resp.data.get("chain_state") == "active":
+                                await client.deactivate_chain(chain_tag)
+
+                        # Delete the chain
+                        delete_resp = await client.delete_chain(chain_tag)
+                        if not delete_resp.success:
+                            return False, f"Failed to delete chain: {delete_resp.error}"
+
+                        return True, None
+                    finally:
+                        await client.close()
                 
                 loop = asyncio.new_event_loop()
                 try:
@@ -19472,7 +19505,8 @@ async def api_activate_chain(tag: str):
 
         # Phase 11-Fix.Q + R: 远程验证终端节点出口存在且兼容 DSCP 路由
         # 使用 IPC 转发解决 userspace WireGuard 模式下无法直接路由到隧道 IP 的问题
-        allow_transitive = chain.get("allow_transitive", False)
+        # Phase 12-Fix.P: 确保 allow_transitive 是布尔值（数据库存储为 0/1 整数）
+        allow_transitive = bool(chain.get("allow_transitive", False))
         egress_error = await _validate_remote_terminal_egress(db, hops, exit_egress, allow_transitive)
         if egress_error:
             raise HTTPException(
@@ -19745,8 +19779,6 @@ async def api_activate_chain(tag: str):
         # Phase 12-Fix: Sync chain to rust-router with full configuration
         # This ensures rust-router knows about the chain hops, DSCP value, and exit_egress
         try:
-            import asyncio
-            
             async def _sync_chain_to_local_rust_router():
                 client = await _get_rust_router_client()
                 if not client:
@@ -19775,21 +19807,28 @@ async def api_activate_chain(tag: str):
                 }
                 
                 # Check if chain exists
-                list_response = await client.list_chains()
-                existing_tags = set()
-                if list_response.success and list_response.data:
-                    existing_tags = {c.get("tag") for c in list_response.data if c.get("tag")}
-                
+                # Phase 12-Fix.P: list_chains() returns List[ChainInfo], not a response object
+                chains_list = await client.list_chains()
+                existing_tags = {c.tag for c in chains_list if c.tag}
+
+                # DEBUG: Log chain config being sent
+                import json
+                logging.info(f"[chains-debug] Creating chain with config: {json.dumps(chain_config, indent=2)}")
+                logging.info(f"[chains-debug] local_node_id = '{local_node_id}', terminal_tag = '{terminal_tag}'")
+
                 if tag in existing_tags:
                     # Deactivate and delete existing chain
+                    logging.info(f"[chains-debug] Chain '{tag}' already exists, deleting first...")
                     status_resp = await client.get_chain_status(tag)
                     if status_resp.success and status_resp.data:
                         if status_resp.data.get("state") == "active":
                             await client.deactivate_chain(tag)
-                    await client.delete_chain(tag)
-                
+                    delete_resp = await client.delete_chain(tag)
+                    logging.info(f"[chains-debug] Delete response: {delete_resp}")
+
                 # Create with full config
                 create_resp = await client.create_chain(tag=tag, config=chain_config)
+                logging.info(f"[chains-debug] Create response: {create_resp}")
                 if not create_resp.success:
                     return False, f"Failed to create chain: {create_resp.error}"
                 
@@ -19800,11 +19839,9 @@ async def api_activate_chain(tag: str):
                 
                 return True, None
             
-            loop = asyncio.new_event_loop()
-            try:
-                rr_success, rr_error = loop.run_until_complete(_sync_chain_to_local_rust_router())
-            finally:
-                loop.close()
+            # Phase 12-Fix.P: Fix nested event loop bug - just await directly
+            # since api_activate_chain is already async
+            rr_success, rr_error = await _sync_chain_to_local_rust_router()
             
             if rr_success:
                 logging.info(f"[chains] 链路 '{tag}' 已同步到 rust-router")

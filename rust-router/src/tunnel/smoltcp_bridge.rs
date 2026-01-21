@@ -176,8 +176,23 @@ impl SmoltcpBridge {
     ///
     /// `true` if the packet was queued, `false` if the queue is full
     pub fn feed_rx_packet(&self, packet: Vec<u8>) -> bool {
-        trace!("Feeding {} byte packet to RX queue", packet.len());
-        self.queue.push_rx(packet)
+        // Phase 12-Fix.Q: Upgrade to debug for troubleshooting
+        debug!("SmoltcpBridge: feeding {} byte packet to RX queue", packet.len());
+        let result = self.queue.push_rx(packet);
+        if result {
+            debug!("SmoltcpBridge: packet queued for smoltcp processing");
+        } else {
+            warn!("SmoltcpBridge: RX queue full, packet dropped!");
+        }
+        result
+    }
+
+    /// Get the number of packets waiting in the RX queue
+    ///
+    /// Used for debugging to see if packets are being queued but not processed.
+    #[must_use]
+    pub fn rx_queue_len(&self) -> usize {
+        self.queue.rx_queue_len()
     }
 
     /// Drain packets that need to be sent through the WireGuard tunnel
@@ -221,10 +236,12 @@ impl SmoltcpBridge {
     /// `true` if any work was done (packets processed or generated)
     pub fn poll(&mut self) -> bool {
         let timestamp = Self::current_timestamp();
+        // Phase 12-Fix.Q: Log RX queue status before poll
+        let rx_count_before = self.queue.rx_queue_len();
         let result = self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
 
         if result {
-            trace!("smoltcp poll: work done");
+            debug!("smoltcp poll: work done (had {} RX packets)", rx_count_before);
         }
 
         result

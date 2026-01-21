@@ -5234,6 +5234,9 @@ impl IpcHandler {
             let local_ip = routing.wg_local_ip.unwrap();
             let remote_ip = routing.wg_remote_ip.unwrap();
 
+            // Phase 12-Fix.P: No need to pause TCP proxy anymore!
+            // The unified pump architecture sends outbound requests through a channel
+            // instead of creating a competing pump.
             self.forward_via_wg_tunnel(
                 peer_manager,
                 &peer_tag,
@@ -5548,6 +5551,12 @@ impl IpcHandler {
     /// # Returns
     ///
     /// A tuple of (status_code, response_body) on success
+    ///
+    /// # Phase 12-Fix.P: Unified Pump Architecture
+    ///
+    /// This method now uses the Request Channel pattern instead of creating a separate
+    /// packet pump. The outbound HTTP request is sent through the TCP proxy's unified
+    /// pump via a channel, eliminating the competing pump issue.
     #[allow(clippy::too_many_arguments)]
     async fn forward_via_wg_tunnel(
         &self,
@@ -5561,30 +5570,16 @@ impl IpcHandler {
         tunnel_remote_ip: std::net::Ipv4Addr,
         headers: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<(u16, String), String> {
-        use crate::tunnel::{SmoltcpBridge, SmoltcpHttpClient, WgTunnel, DEFAULT_WG_MTU};
-        use tokio::sync::mpsc;
+        use crate::tunnel::OutboundHttpRequest;
+        use tokio::sync::oneshot;
 
         debug!(
             peer = %peer_tag,
             url = %url,
             local_ip = %tunnel_local_ip,
             remote_ip = %tunnel_remote_ip,
-            "Forwarding request via WireGuard tunnel"
+            "Forwarding request via WireGuard tunnel (unified pump)"
         );
-
-        // Get the WireGuard tunnel from PeerManager (where ConnectPeer stores it)
-        // Note: Peer tunnels are stored with "peer-" prefix (e.g., "peer-vpn-router")
-        // PeerManager stores tunnels without reply receiver, enabling smoltcp bidirectional communication
-        let tunnel_tag = format!("peer-{}", peer_tag);
-
-        let tunnel = peer_manager
-            .get_wg_tunnel(&tunnel_tag)
-            .ok_or_else(|| format!("WireGuard tunnel for peer '{}' (tunnel_tag='{}') not found in peer manager", peer_tag, tunnel_tag))?;
-
-        // Check tunnel is connected
-        if !tunnel.is_connected() {
-            return Err(format!("WireGuard tunnel for peer '{}' is not connected", peer_tag));
-        }
 
         // Parse URL to get host, port, and path
         let uri: hyper::Uri = url
@@ -5594,53 +5589,17 @@ impl IpcHandler {
         let port = uri.port_u16().unwrap_or(80);
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        // Create channels for packet exchange between smoltcp bridge and tunnel
-        // tx_sender: smoltcp -> tunnel (outgoing IP packets)
-        // rx_sender: tunnel -> smoltcp (incoming IP packets)
-        let (tx_sender, mut tx_receiver) = mpsc::channel::<Vec<u8>>(64);
-        let (rx_sender, mut rx_receiver) = mpsc::channel::<Vec<u8>>(64);
-
-        // Create smoltcp bridge with local tunnel IP
-        let bridge = SmoltcpBridge::new(tunnel_local_ip, DEFAULT_WG_MTU);
-        let mut http_client = SmoltcpHttpClient::new(bridge);
-
-        // Clone tunnel Arc for the pump task
-        let tunnel_for_pump = tunnel.clone();
-        let tx_sender_for_pump = tx_sender.clone();
-
-        // Spawn packet pump task to move packets between smoltcp and WireGuard tunnel
-        // This task runs until the HTTP request completes or errors
-        let pump_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    // TX: smoltcp -> tunnel (outgoing IP packets)
-                    Some(packet) = tx_receiver.recv() => {
-                        trace!("Pump: sending {} bytes to tunnel", packet.len());
-                        if let Err(e) = tunnel_for_pump.send(&packet).await {
-                            warn!("Failed to send packet to WireGuard tunnel: {}", e);
-                            break;
-                        }
-                    }
-                    // RX: tunnel -> smoltcp (incoming IP packets)
-                    result = tunnel_for_pump.recv() => {
-                        match result {
-                            Ok(packet) => {
-                                trace!("Pump: received {} bytes from tunnel", packet.len());
-                                if rx_sender.send(packet).await.is_err() {
-                                    // Receiver dropped, client done
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to receive from WireGuard tunnel: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            debug!("Packet pump task exiting");
-        });
+        // Phase 12-Fix.P: Get the outbound request sender from PeerManager
+        // This allows us to send the request through the TCP proxy's unified pump
+        // instead of creating a competing pump
+        let request_sender = peer_manager
+            .get_outbound_request_sender(peer_tag)
+            .ok_or_else(|| {
+                format!(
+                    "No outbound request channel for peer '{}' - TCP proxy may not be running",
+                    peer_tag
+                )
+            })?;
 
         // Build request headers with auto-injected tunnel authentication headers
         let mut request_headers = headers.cloned().unwrap_or_default();
@@ -5659,52 +5618,49 @@ impl IpcHandler {
         );
         debug!(peer_tag = %peer_tag, "Added X-Tunnel-Peer-Tag header");
 
-        // Make the HTTP request through smoltcp
-        let result = http_client
-            .request(
-                tunnel_remote_ip,
-                port,
-                method,
-                path,
-                Some(request_headers),
-                body,
-                timeout,
-                &tx_sender_for_pump,
-                &mut rx_receiver,
-            )
-            .await;
+        // Create oneshot channel for the response
+        let (response_tx, response_rx) = oneshot::channel();
 
-        // Signal pump to stop by dropping the sender
-        drop(tx_sender_for_pump);
-        drop(tx_sender);
+        // Build the outbound request
+        let outbound_request = OutboundHttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            host: tunnel_remote_ip.to_string(),
+            port,
+            body: body.map(|s| s.to_string()),
+            headers: Some(request_headers),
+            response_tx,
+        };
 
-        // Wait briefly for pump to clean up, then abort if needed
-        let mut pump_handle = pump_handle;
-        tokio::select! {
-            _ = &mut pump_handle => {
-                debug!("Packet pump task completed");
-            }
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                debug!("Packet pump task taking too long, aborting");
-                pump_handle.abort();
-            }
-        }
+        // Send the request through the unified pump
+        request_sender
+            .send(outbound_request)
+            .await
+            .map_err(|_| format!("Failed to send request to TCP proxy for peer '{}'", peer_tag))?;
 
-        // Convert result
-        match result {
-            Ok(response) => {
-                debug!(
-                    peer = %peer_tag,
-                    status = response.status_code,
-                    body_len = response.body.len(),
-                    "WireGuard tunnel request completed"
-                );
-                Ok((response.status_code, response.body))
-            }
-            Err(e) => {
-                warn!(peer = %peer_tag, error = %e, "WireGuard tunnel request failed");
-                Err(format!("WireGuard tunnel request failed: {}", e))
-            }
+        debug!(peer = %peer_tag, "Request sent to unified pump, waiting for response");
+
+        // Wait for response with timeout
+        let response = tokio::time::timeout(timeout, response_rx)
+            .await
+            .map_err(|_| format!("Request to peer '{}' timed out after {:?}", peer_tag, timeout))?
+            .map_err(|_| format!("Response channel closed for peer '{}'", peer_tag))?;
+
+        // Check response
+        if response.success {
+            let status_code = response.status_code.unwrap_or(200);
+            let body = response.body.unwrap_or_default();
+            debug!(
+                peer = %peer_tag,
+                status = status_code,
+                body_len = body.len(),
+                "WireGuard tunnel request completed via unified pump"
+            );
+            Ok((status_code, body))
+        } else {
+            let error = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            warn!(peer = %peer_tag, error = %error, "WireGuard tunnel request failed");
+            Err(format!("WireGuard tunnel request failed: {}", error))
         }
     }
 
