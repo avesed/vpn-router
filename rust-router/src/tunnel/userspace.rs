@@ -1014,6 +1014,106 @@ impl UserspaceWgTunnel {
         }
     }
 
+    /// Send a packet through the tunnel WITHOUT SNAT
+    ///
+    /// This method sends the packet as-is, preserving the original source IP.
+    /// Used for chain reply packets where we need to preserve the target server's
+    /// source IP so the Entry node can match the session correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - Raw IP packet to send (source IP preserved)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if tunnel is not connected or encapsulation fails.
+    pub async fn send_preserve_src(&self, packet: &[u8]) -> Result<(), WgTunnelError> {
+        if !self.shared.connected.load(Ordering::Acquire) {
+            return Err(WgTunnelError::NotConnected);
+        }
+
+        // Log packet details for debugging (no SNAT applied)
+        if let Some(src_ip) = extract_source_ip(packet) {
+            debug!(
+                "Tunnel {} send_preserve_src: {} bytes, src_ip={} (preserved)",
+                self.tag,
+                packet.len(),
+                src_ip
+            );
+        }
+
+        let socket = self
+            .shared
+            .socket
+            .read()
+            .await
+            .clone()
+            .ok_or(WgTunnelError::NotConnected)?;
+
+        // Allocate buffer for encrypted packet
+        let mut dst = vec![0u8; (packet.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
+
+        // Encapsulate packet
+        let result = {
+            let mut tunn_guard = self.shared.tunn.lock();
+            let tunn = tunn_guard
+                .as_mut()
+                .ok_or(WgTunnelError::NotConnected)?;
+            tunn.encapsulate(packet, &mut dst)
+        };
+
+        // Log encapsulation result
+        let result_type = match &result {
+            TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
+            TunnResult::Done => "Done".to_string(),
+            TunnResult::Err(e) => format!("Err({:?})", e),
+            _ => "Other".to_string(),
+        };
+        debug!(
+            "Tunnel {} send_preserve_src encapsulate: {} for {} byte packet",
+            self.tag, result_type, packet.len()
+        );
+
+        // Process result
+        match result {
+            TunnResult::WriteToNetwork(encrypted) => {
+                socket.send_to(encrypted, self.peer_addr_parsed).await.map_err(|e| {
+                    WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
+                })?;
+
+                // Update stats
+                self.shared
+                    .stats
+                    .tx_bytes
+                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                self.shared.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
+
+                debug!(
+                    "Sent {} bytes (preserved src) through tunnel {} to {:?}",
+                    packet.len(), self.tag, self.peer_addr_parsed
+                );
+                Ok(())
+            }
+            TunnResult::Done => {
+                warn!(
+                    "Tunnel {} packet queued (handshake in progress), {} bytes",
+                    self.tag, packet.len()
+                );
+                Ok(())
+            }
+            TunnResult::Err(e) => {
+                error!("Encapsulation error: {:?}", e);
+                Err(WgTunnelError::Internal(format!(
+                    "Encapsulation failed: {e:?}"
+                )))
+            }
+            _ => {
+                warn!("Unexpected encapsulate result");
+                Ok(())
+            }
+        }
+    }
+
     /// Receive a packet from the tunnel
     ///
     /// Returns the next decrypted IP packet from the peer.
@@ -2539,6 +2639,15 @@ impl WgTunnel for UserspaceWgTunnel {
         Box::pin(async move {
             // Delegate to the inherent async send method
             UserspaceWgTunnel::send(self, &packet).await
+        })
+    }
+
+    fn send_preserve_src(&self, packet: &[u8]) -> BoxFuture<'_, Result<(), WgTunnelError>> {
+        // Clone packet data for the future
+        let packet = packet.to_vec();
+        Box::pin(async move {
+            // Delegate to the inherent async send_preserve_src method (no SNAT)
+            UserspaceWgTunnel::send_preserve_src(self, &packet).await
         })
     }
 

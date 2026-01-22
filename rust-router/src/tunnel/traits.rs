@@ -542,6 +542,33 @@ pub trait WgTunnel: Send + Sync {
         })
     }
 
+    /// Send a packet through the tunnel WITHOUT SNAT (preserve source IP)
+    ///
+    /// This method sends the packet as-is, preserving the original source IP.
+    /// Used for chain reply packets where we need to preserve the target server's
+    /// source IP so the Entry node can match the session correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - Raw IP packet to send (source IP preserved)
+    ///
+    /// # Errors
+    ///
+    /// - `NotConnected` - The tunnel is not connected
+    /// - `SendFailed` - Failed to send the packet
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `NotSupported` error. Implementations should override this
+    /// with actual sending functionality.
+    fn send_preserve_src(&self, _packet: &[u8]) -> BoxFuture<'_, Result<(), WgTunnelError>> {
+        Box::pin(async {
+            Err(WgTunnelError::NotSupported(
+                "send_preserve_src not supported by this implementation".into(),
+            ))
+        })
+    }
+
     /// Receive a packet from the tunnel
     ///
     /// Waits for a decrypted IP packet from the tunnel. This method blocks until

@@ -882,6 +882,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&session_tracker),
                     Arc::clone(&reply_stats),
                     Some(dns_cache), // Pass DNS cache to reply router for parsing DNS responses
+                    Arc::clone(&peer_manager), // Peer manager for Terminal chain reply routing
                 );
 
                 // Spawn peer tunnel processor for chain routing on Terminal nodes
@@ -891,14 +892,18 @@ async fn main() -> Result<()> {
                 *peer_tunnel_tx.write() = Some(peer_tx.clone());
                 // Phase 12-Fix.P3: Get packet sender for forwarding non-WG egress to main loop
                 let forward_tx = ingress_mgr.get_packet_sender();
+                // Phase 3: Pass session_tracker, ingress_manager, and peer_manager for reply routing
                 let peer_tunnel_handle = rust_router::ingress::spawn_peer_tunnel_processor(
                     peer_rx,
                     Arc::clone(ingress_mgr.processor()),
                     Arc::clone(&wg_egress_manager),
                     Arc::clone(&peer_tunnel_stats),
                     forward_tx, // Forward non-WG egress (direct/SOCKS) to main forwarding loop
+                    Arc::clone(&session_tracker), // Session tracker for reply routing
+                    Arc::clone(ingress_mgr),      // Ingress manager for Entry node replies
+                    Arc::clone(&peer_manager),    // Peer manager for Relay node replies
                 );
-                info!("Peer tunnel processor started for chain routing");
+                info!("Peer tunnel processor started for chain routing (with reply path support)");
 
                 // Phase 12-Fix.P2: Set peer_tunnel_tx on PeerManager for chain traffic routing
                 // When peer tunnels receive non-API packets, they forward to peer_tunnel_processor

@@ -1915,6 +1915,88 @@ impl PeerManager {
         wg_tunnels.get(tag).cloned()
     }
 
+    /// Send a packet to a peer tunnel for chain reply routing
+    ///
+    /// This method is used by the peer tunnel processor to route reply packets
+    /// back through the chain. On Relay nodes, when a reply arrives from a downstream
+    /// hop, it needs to be sent back to the upstream hop via the peer tunnel.
+    ///
+    /// # Phase 3 Chain Reply Routing
+    ///
+    /// When a Relay node receives a reply packet, it looks up the session to find
+    /// the source_tunnel_tag (the tunnel the original request came from) and uses
+    /// this method to forward the reply back.
+    ///
+    /// # Arguments
+    ///
+    /// * `tunnel_tag` - Tag of the peer tunnel to send through (e.g., "peer-node123")
+    /// * `packet` - Raw IP packet to send
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the tunnel is not found or send fails.
+    pub async fn send_to_peer_tunnel(&self, tunnel_tag: &str, packet: &[u8]) -> Result<(), PeerError> {
+        let tunnel = {
+            let wg_tunnels = self.wg_tunnels.read();
+            wg_tunnels.get(tunnel_tag).cloned()
+        };
+
+        match tunnel {
+            Some(tunnel) => {
+                tunnel.send(packet).await.map_err(|e| {
+                    PeerError::TunnelCreationFailed(format!("Failed to send to tunnel {}: {}", tunnel_tag, e))
+                })
+            }
+            None => {
+                // The tunnel might be managed by WgEgressManager, not PeerManager
+                // Log a warning but return an error that the caller can handle
+                warn!(
+                    tunnel = %tunnel_tag,
+                    "[PEER-SEND] Tunnel not found in PeerManager (may be in WgEgressManager)"
+                );
+                Err(PeerError::NotFound(tunnel_tag.to_string()))
+            }
+        }
+    }
+
+    /// Send a packet to a peer tunnel WITHOUT SNAT (preserve source IP)
+    ///
+    /// Used for chain reply packets where we need to preserve the target server's
+    /// source IP so the Entry node can match the session correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `tunnel_tag` - The tag of the peer tunnel (e.g., "peer-node-1")
+    /// * `packet` - Raw IP packet to send (source IP preserved)
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the tunnel is not found or send fails.
+    pub async fn send_to_peer_tunnel_preserve_src(&self, tunnel_tag: &str, packet: &[u8]) -> Result<(), PeerError> {
+        let tunnel = {
+            let wg_tunnels = self.wg_tunnels.read();
+            wg_tunnels.get(tunnel_tag).cloned()
+        };
+
+        match tunnel {
+            Some(tunnel) => {
+                tunnel.send_preserve_src(packet).await.map_err(|e| {
+                    PeerError::TunnelCreationFailed(format!(
+                        "Failed to send (preserve_src) to tunnel {}: {}",
+                        tunnel_tag, e
+                    ))
+                })
+            }
+            None => {
+                warn!(
+                    tunnel = %tunnel_tag,
+                    "[PEER-SEND-PRESERVE] Tunnel not found in PeerManager"
+                );
+                Err(PeerError::NotFound(tunnel_tag.to_string()))
+            }
+        }
+    }
+
     /// Get an Xray outbound by tag
     pub fn get_xray_outbound(&self, tag: &str) -> Option<Arc<Socks5Outbound>> {
         let xray_outbounds = self.xray_outbounds.read();

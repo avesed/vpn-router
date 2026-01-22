@@ -62,6 +62,7 @@ use super::processor::RoutingDecision;
 use crate::chain::dscp::set_dscp;
 use crate::ecmp::{EcmpGroupManager, FiveTuple as EcmpFiveTuple, Protocol as EcmpProtocol};
 use crate::egress::manager::WgEgressManager;
+use crate::ipc::ChainRole;
 use crate::outbound::OutboundManager;
 use crate::peer::manager::PeerManager;
 use crate::rules::fwmark::ChainMark;
@@ -658,6 +659,12 @@ pub struct PeerSession {
     pub bytes_sent: u64,
     /// Bytes received in this session (replies)
     pub bytes_received: u64,
+    /// Source tunnel tag for chain traffic (None for wg-ingress Entry traffic)
+    pub source_tunnel_tag: Option<String>,
+    /// Whether this is chain traffic requiring special reply routing
+    pub is_chain_traffic: bool,
+    /// Node role when session was created (Entry/Relay/Terminal)
+    pub node_role: Option<ChainRole>,
 }
 
 impl PeerSession {
@@ -671,6 +678,42 @@ impl PeerSession {
             last_seen: Instant::now(),
             bytes_sent: 0,
             bytes_received: 0,
+            source_tunnel_tag: None,
+            is_chain_traffic: false,
+            node_role: None,
+        }
+    }
+
+    /// Create a new peer session for chain traffic
+    ///
+    /// This constructor is used when traffic arrives via a chain (peer tunnel)
+    /// and requires special reply routing back through the source tunnel.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_public_key` - Peer's WireGuard public key (Base64)
+    /// * `peer_endpoint` - Peer's external endpoint (IP:port)
+    /// * `outbound_tag` - Outbound tag used for this session
+    /// * `source_tunnel_tag` - Tag of the tunnel this traffic arrived from
+    /// * `node_role` - Role of this node in the chain (Entry/Relay/Terminal)
+    #[must_use]
+    pub fn new_chain(
+        peer_public_key: String,
+        peer_endpoint: SocketAddr,
+        outbound_tag: String,
+        source_tunnel_tag: Option<String>,
+        node_role: ChainRole,
+    ) -> Self {
+        Self {
+            peer_public_key,
+            peer_endpoint,
+            outbound_tag,
+            last_seen: Instant::now(),
+            bytes_sent: 0,
+            bytes_received: 0,
+            source_tunnel_tag,
+            is_chain_traffic: true,
+            node_role: Some(node_role),
         }
     }
 
@@ -757,6 +800,59 @@ impl IngressSessionTracker {
             })
             .or_insert_with(|| {
                 let mut session = PeerSession::new(peer_public_key, peer_endpoint, outbound_tag);
+                session.add_bytes_sent(bytes);
+                session
+            });
+    }
+
+    /// Register a chain traffic session with node role information
+    ///
+    /// Chain sessions track the source tunnel so replies can be routed back
+    /// through the chain. For Entry nodes, `source_tunnel_tag` is None.
+    /// For Relay and Terminal nodes, it contains the tunnel tag where
+    /// the packet arrived from.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 5-tuple key for the session
+    /// * `peer_public_key` - For Entry: WG peer key. For Relay/Terminal: tunnel tag as pseudo-key
+    /// * `peer_endpoint` - For Entry: client endpoint. For Relay/Terminal: placeholder (0.0.0.0:0)
+    /// * `outbound_tag` - Where this packet is being forwarded to
+    /// * `bytes` - Bytes being sent
+    /// * `source_tunnel_tag` - For Relay/Terminal: incoming tunnel tag. For Entry: None
+    /// * `node_role` - Entry, Relay, or Terminal
+    pub fn register_chain(
+        &self,
+        key: FiveTuple,
+        peer_public_key: String,
+        peer_endpoint: SocketAddr,
+        outbound_tag: String,
+        bytes: u64,
+        source_tunnel_tag: Option<String>,
+        node_role: ChainRole,
+    ) {
+        self.sessions
+            .entry(key)
+            .and_modify(|session| {
+                session.touch();
+                session.add_bytes_sent(bytes);
+                // Update endpoint in case of roaming (only relevant for Entry nodes)
+                if session.peer_endpoint != peer_endpoint && peer_endpoint.port() != 0 {
+                    tracing::debug!(
+                        "Chain session endpoint updated for {}: {} -> {}",
+                        key, session.peer_endpoint, peer_endpoint
+                    );
+                    session.peer_endpoint = peer_endpoint;
+                }
+            })
+            .or_insert_with(|| {
+                let mut session = PeerSession::new_chain(
+                    peer_public_key,
+                    peer_endpoint,
+                    outbound_tag,
+                    source_tunnel_tag,
+                    node_role,
+                );
                 session.add_bytes_sent(bytes);
                 session
             });
@@ -1854,6 +1950,7 @@ pub async fn run_reply_router_loop(
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<IngressReplyStats>,
     dns_cache: Option<Arc<super::dns_cache::IpDomainCache>>,
+    peer_manager: Arc<PeerManager>,
 ) {
     info!("Ingress reply router started");
 
@@ -1982,6 +2079,53 @@ pub async fn run_reply_router_loop(
             );
             continue;
         };
+
+        // === CHAIN TRAFFIC HANDLING ===
+        // Check if this is Terminal chain traffic that needs to go back through peer tunnel
+        if session.is_chain_traffic {
+            if let Some(ChainRole::Terminal) = session.node_role {
+                let source_tunnel = match &session.source_tunnel_tag {
+                    Some(tag) => tag.clone(),
+                    None => {
+                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "[REPLY-ROUTER-CHAIN] Terminal session missing source_tunnel_tag for {}",
+                            reply_tuple
+                        );
+                        continue;
+                    }
+                };
+
+                debug!(
+                    source_tunnel = %source_tunnel,
+                    five_tuple = %reply_tuple,
+                    "[REPLY-ROUTER-CHAIN] Routing Terminal reply to peer tunnel (preserve_src)"
+                );
+
+                // Use send_preserve_src to keep original target server IP
+                // This allows Entry node to match session by original five-tuple
+                match peer_manager.send_to_peer_tunnel_preserve_src(&source_tunnel, &reply.packet).await {
+                    Ok(()) => {
+                        stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                        session_tracker.update_received(&lookup_key, reply.packet.len() as u64);
+                        debug!(
+                            "[REPLY-ROUTER-CHAIN] Successfully forwarded {} bytes to tunnel {} (src preserved)",
+                            reply.packet.len(),
+                            source_tunnel
+                        );
+                    }
+                    Err(e) => {
+                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "[REPLY-ROUTER-CHAIN] Failed to send chain reply to tunnel {}: {}",
+                            source_tunnel, e
+                        );
+                    }
+                }
+                continue; // Skip normal wg-ingress routing
+            }
+        }
+        // === END CHAIN TRAFFIC HANDLING ===
 
         if reply.tunnel_tag != session.outbound_tag {
             stats.tunnel_mismatch.fetch_add(1, Ordering::Relaxed);
@@ -2114,13 +2258,33 @@ async fn forward_tcp_packet(
         || wg_egress_manager.has_tunnel(outbound_tag);
 
     if is_wg_egress {
-        session_tracker.register(
-            five_tuple,
-            processed.peer_public_key.clone(),
-            processed.src_addr,
-            outbound_tag.clone(),
-            parsed.total_len as u64,
-        );
+        // Phase 12-Fix.Entry: Register chain session when Entry node forwards to peer tunnel
+        if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
+            // Entry node: registering chain session for traffic to peer tunnel
+            session_tracker.register_chain(
+                five_tuple,
+                processed.peer_public_key.clone(),
+                processed.src_addr,
+                outbound_tag.clone(),
+                parsed.total_len as u64,
+                None, // Entry node: no source tunnel (traffic came from wg-ingress)
+                ChainRole::Entry,
+            );
+            debug!(
+                peer = %processed.peer_public_key,
+                outbound = %outbound_tag,
+                "[CHAIN-ENTRY] Registered Entry TCP session for chain traffic"
+            );
+        } else {
+            // Non-chain traffic: use regular registration
+            session_tracker.register(
+                five_tuple,
+                processed.peer_public_key.clone(),
+                processed.src_addr,
+                outbound_tag.clone(),
+                parsed.total_len as u64,
+            );
+        }
 
         // Phase 12-Fix: For peer-* tunnels, first check PeerManager.wg_tunnels
         // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
@@ -2827,15 +2991,6 @@ async fn forward_udp_packet(
     };
     let outbound_tag = &outbound_tag;
 
-    // Register session for reply routing
-    session_tracker.register(
-        five_tuple,
-        processed.peer_public_key.clone(),
-        processed.src_addr,
-        outbound_tag.clone(),
-        parsed.total_len as u64,
-    );
-
     // Determine if this is a WireGuard egress tunnel (managed by WgEgressManager)
     // This includes:
     // - Standard egress: wg-*, pia-*
@@ -2845,6 +3000,34 @@ async fn forward_udp_packet(
         || outbound_tag.starts_with("pia-")
         || outbound_tag.starts_with("peer-")
         || wg_egress_manager.has_tunnel(outbound_tag);
+
+    // Phase 12-Fix.Entry: Register chain session when Entry node forwards to peer tunnel
+    if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
+        // Entry node: registering chain session for traffic to peer tunnel
+        session_tracker.register_chain(
+            five_tuple,
+            processed.peer_public_key.clone(),
+            processed.src_addr,
+            outbound_tag.clone(),
+            parsed.total_len as u64,
+            None, // Entry node: no source tunnel (traffic came from wg-ingress)
+            ChainRole::Entry,
+        );
+        debug!(
+            peer = %processed.peer_public_key,
+            outbound = %outbound_tag,
+            "[CHAIN-ENTRY] Registered Entry UDP session for chain traffic"
+        );
+    } else {
+        // Non-chain traffic: use regular registration
+        session_tracker.register(
+            five_tuple,
+            processed.peer_public_key.clone(),
+            processed.src_addr,
+            outbound_tag.clone(),
+            parsed.total_len as u64,
+        );
+    }
 
     if is_wg_egress {
         // Phase 12-Fix: For peer-* tunnels, first check PeerManager.wg_tunnels
@@ -3848,6 +4031,7 @@ pub fn spawn_reply_router(
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<IngressReplyStats>,
     dns_cache: Option<Arc<super::dns_cache::IpDomainCache>>,
+    peer_manager: Arc<PeerManager>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_reply_router_loop(
         reply_rx,
@@ -3855,6 +4039,7 @@ pub fn spawn_reply_router(
         session_tracker,
         stats,
         dns_cache,
+        peer_manager,
     ))
 }
 
@@ -3873,6 +4058,18 @@ pub struct PeerTunnelProcessorStats {
     pub wg_egress_forwarded: AtomicU64,
     /// Packets forwarded to SOCKS/direct
     pub other_forwarded: AtomicU64,
+    /// Return packets detected (reverse tuple matched)
+    pub return_packets: AtomicU64,
+    /// Entry node replies forwarded to wg-ingress
+    pub entry_replies_forwarded: AtomicU64,
+    /// Relay node replies forwarded to previous peer tunnel
+    pub relay_replies_forwarded: AtomicU64,
+    /// Errors while sending reply packets
+    pub reply_send_errors: AtomicU64,
+    /// Reply packets where destination tunnel was not found
+    pub reply_tunnel_not_found: AtomicU64,
+    /// Chain sessions registered for reply routing
+    pub chain_sessions_registered: AtomicU64,
 }
 
 impl PeerTunnelProcessorStats {
@@ -3884,6 +4081,12 @@ impl PeerTunnelProcessorStats {
             routing_errors: self.routing_errors.load(Ordering::Relaxed),
             wg_egress_forwarded: self.wg_egress_forwarded.load(Ordering::Relaxed),
             other_forwarded: self.other_forwarded.load(Ordering::Relaxed),
+            return_packets: self.return_packets.load(Ordering::Relaxed),
+            entry_replies_forwarded: self.entry_replies_forwarded.load(Ordering::Relaxed),
+            relay_replies_forwarded: self.relay_replies_forwarded.load(Ordering::Relaxed),
+            reply_send_errors: self.reply_send_errors.load(Ordering::Relaxed),
+            reply_tunnel_not_found: self.reply_tunnel_not_found.load(Ordering::Relaxed),
+            chain_sessions_registered: self.chain_sessions_registered.load(Ordering::Relaxed),
         }
     }
 }
@@ -3897,6 +4100,12 @@ pub struct PeerTunnelProcessorStatsSnapshot {
     pub routing_errors: u64,
     pub wg_egress_forwarded: u64,
     pub other_forwarded: u64,
+    pub return_packets: u64,
+    pub entry_replies_forwarded: u64,
+    pub relay_replies_forwarded: u64,
+    pub reply_send_errors: u64,
+    pub reply_tunnel_not_found: u64,
+    pub chain_sessions_registered: u64,
 }
 
 /// Process packets received from peer tunnels (chain routing)
@@ -3917,42 +4126,94 @@ pub struct PeerTunnelProcessorStatsSnapshot {
 /// For non-WireGuard egress (direct, SOCKS), packets are forwarded to the main
 /// forwarding loop via `forward_tx`. This reuses all existing TCP/UDP/SOCKS
 /// forwarding logic instead of duplicating it here.
+///
+/// # Phase 3 Chain Reply Routing
+///
+/// This function also handles reply path detection for chain traffic:
+/// - Entry node: replies go back to wg-ingress client
+/// - Relay node: replies go back to previous peer tunnel
+/// - Terminal node: replies handled by reply_router
 pub async fn run_peer_tunnel_processor_loop(
     mut packet_rx: mpsc::Receiver<ReplyPacket>,
     processor: Arc<super::processor::IngressProcessor>,
     wg_egress_manager: Arc<WgEgressManager>,
     stats: Arc<PeerTunnelProcessorStats>,
     forward_tx: Option<mpsc::Sender<super::manager::ProcessedPacket>>,
+    // Phase 3: New parameters for reply path routing
+    session_tracker: Arc<IngressSessionTracker>,
+    ingress_manager: Arc<WgIngressManager>,
+    peer_manager: Arc<PeerManager>,
 ) {
-    info!("Peer tunnel processor started (forward_tx: {})", forward_tx.is_some());
+    info!("Peer tunnel processor started (forward_tx: {}, reply routing enabled)", forward_tx.is_some());
 
     while let Some(reply) = packet_rx.recv().await {
         stats.packets_received.fetch_add(1, Ordering::Relaxed);
 
         let tunnel_tag = reply.tunnel_tag.clone();
-        let mut packet = reply.packet;
+        let packet = reply.packet;
 
         // Use the tunnel tag as a pseudo "peer" identifier for logging
         let peer_id = format!("tunnel:{}", tunnel_tag);
 
-        // Debug: Extract DSCP and packet info for logging
-        let (src_ip, dst_ip, src_port, dst_port, proto, dscp_in) = if packet.len() >= 24 {
-            let s_ip = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-            let d_ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-            let ihl = ((packet[0] & 0x0F) as usize) * 4;
-            let protocol = packet[9];
-            // Extract DSCP from ToS field (bits 2-7 of byte 1)
-            let dscp = (packet[1] >> 2) & 0x3F;
-            let (sp, dp) = if packet.len() >= ihl + 4 {
-                (u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
-                 u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+        // Parse packet header to extract 5-tuple for session tracking
+        let (src_ip, dst_ip, src_port, dst_port, proto, dscp_in) = if packet.len() >= 20 {
+            let version = (packet[0] >> 4) & 0x0F;
+            if version == 4 && packet.len() >= 20 {
+                // IPv4
+                let s_ip = IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
+                let d_ip = IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
+                let ihl = ((packet[0] & 0x0F) as usize) * 4;
+                let protocol = packet[9];
+                let dscp = (packet[1] >> 2) & 0x3F;
+                let (sp, dp) = if protocol == IPPROTO_ICMP {
+                    // For ICMP, use ID as port for session matching
+                    if packet.len() >= ihl + 8 {
+                        let icmp_id = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]);
+                        (icmp_id, icmp_id)
+                    } else {
+                        (0, 0)
+                    }
+                } else if packet.len() >= ihl + 4 {
+                    (u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                     u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+                } else {
+                    (0, 0)
+                };
+                (s_ip, d_ip, sp, dp, protocol, dscp)
+            } else if version == 6 && packet.len() >= 40 {
+                // IPv6
+                let mut s_bytes = [0u8; 16];
+                let mut d_bytes = [0u8; 16];
+                s_bytes.copy_from_slice(&packet[8..24]);
+                d_bytes.copy_from_slice(&packet[24..40]);
+                let s_ip = IpAddr::V6(Ipv6Addr::from(s_bytes));
+                let d_ip = IpAddr::V6(Ipv6Addr::from(d_bytes));
+                let protocol = packet[6]; // Next header
+                let dscp = ((packet[0] & 0x0F) << 2) | ((packet[1] >> 6) & 0x03);
+                let (sp, dp) = if protocol == IPPROTO_ICMPV6 {
+                    // For ICMPv6, use ID as port
+                    if packet.len() >= 44 {
+                        let icmp_id = u16::from_be_bytes([packet[44], packet[45]]);
+                        (icmp_id, icmp_id)
+                    } else {
+                        (0, 0)
+                    }
+                } else if packet.len() >= 44 {
+                    (u16::from_be_bytes([packet[40], packet[41]]),
+                     u16::from_be_bytes([packet[42], packet[43]]))
+                } else {
+                    (0, 0)
+                };
+                (s_ip, d_ip, sp, dp, protocol, dscp)
             } else {
-                (0, 0)
-            };
-            (s_ip.to_string(), d_ip.to_string(), sp, dp, protocol, dscp)
+                (IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, 0, 0, 0)
+            }
         } else {
-            ("?".to_string(), "?".to_string(), 0, 0, 0, 0)
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, 0, 0, 0)
         };
+
+        // Build 5-tuple for session tracking
+        let five_tuple = FiveTuple::new(src_ip, src_port, dst_ip, dst_port, proto);
 
         debug!(
             tunnel = %tunnel_tag,
@@ -3962,8 +4223,88 @@ pub async fn run_peer_tunnel_processor_loop(
             dst_port = dst_port,
             proto = proto,
             dscp = dscp_in,
-            "[TERMINAL-RX] Received chain packet from peer tunnel"
+            "[PEER-TUNNEL-RX] Received packet from peer tunnel"
         );
+
+        // === REPLY PATH DETECTION ===
+        // Check if this is RETURN traffic by looking up reversed 5-tuple
+        let reversed_tuple = five_tuple.reverse();
+        if let Some(session) = session_tracker.get(&reversed_tuple) {
+            if session.is_chain_traffic {
+                stats.return_packets.fetch_add(1, Ordering::Relaxed);
+
+                match session.node_role {
+                    Some(ChainRole::Entry) => {
+                        // Entry node: Send back to original client via wg-ingress
+                        debug!(
+                            tunnel = %tunnel_tag,
+                            peer = %session.peer_public_key,
+                            "[REPLY-ENTRY] Routing return traffic to wg-ingress client"
+                        );
+
+                        match ingress_manager
+                            .send_to_peer(&session.peer_public_key, session.peer_endpoint, &packet)
+                            .await
+                        {
+                            Ok(()) => {
+                                stats.entry_replies_forwarded.fetch_add(1, Ordering::Relaxed);
+                                session_tracker.update_received(&reversed_tuple, packet.len() as u64);
+                            }
+                            Err(e) => {
+                                stats.reply_send_errors.fetch_add(1, Ordering::Relaxed);
+                                warn!("[REPLY-ENTRY] Failed to send reply to ingress peer: {}", e);
+                            }
+                        }
+                        continue;
+                    }
+
+                    Some(ChainRole::Relay) => {
+                        // Relay node: Send back to previous hop via peer tunnel
+                        let source_tunnel = match &session.source_tunnel_tag {
+                            Some(tag) => tag.clone(),
+                            None => {
+                                warn!("[REPLY-RELAY] Relay session missing source_tunnel_tag");
+                                stats.reply_tunnel_not_found.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
+
+                        debug!(
+                            tunnel = %tunnel_tag,
+                            source_tunnel = %source_tunnel,
+                            "[REPLY-RELAY] Routing return traffic to previous peer tunnel"
+                        );
+
+                        match peer_manager.send_to_peer_tunnel(&source_tunnel, &packet).await {
+                            Ok(()) => {
+                                stats.relay_replies_forwarded.fetch_add(1, Ordering::Relaxed);
+                                session_tracker.update_received(&reversed_tuple, packet.len() as u64);
+                            }
+                            Err(e) => {
+                                stats.reply_send_errors.fetch_add(1, Ordering::Relaxed);
+                                warn!("[REPLY-RELAY] Failed to send reply to tunnel {}: {}", source_tunnel, e);
+                            }
+                        }
+                        continue;
+                    }
+
+                    Some(ChainRole::Terminal) => {
+                        // Terminal replies should go through reply_router, not here
+                        warn!("[REPLY-TERMINAL] Unexpected terminal reply in peer_tunnel_processor");
+                        continue;
+                    }
+
+                    None => {
+                        // Non-chain session found - fall through to normal processing
+                        debug!("Non-chain session found for reversed tuple, processing as forward traffic");
+                    }
+                }
+            }
+        }
+        // === END REPLY PATH DETECTION ===
+
+        // Need mutable packet for DSCP modification
+        let mut packet = packet;
 
         // Get routing decision from ingress processor (handles DSCP/chain routing)
         let routing = match processor.process(&packet, &peer_id) {
@@ -4028,13 +4369,45 @@ pub async fn run_peer_tunnel_processor_loop(
             continue;
         }
 
-        // Determine if this is a WireGuard egress
+        // Determine if this is a WireGuard egress or peer tunnel
+        let is_peer_tunnel = outbound_tag.starts_with("peer-");
         let is_wg_egress = outbound_tag.starts_with("wg-")
             || outbound_tag.starts_with("pia-")
-            || outbound_tag.starts_with("peer-")
+            || is_peer_tunnel
             || wg_egress_manager.has_tunnel(&outbound_tag);
 
         if is_wg_egress {
+            // === CHAIN SESSION REGISTRATION ===
+            // Register session BEFORE forwarding to enable reply routing
+            if is_peer_tunnel {
+                // Relay node: forwarding to next peer tunnel
+                session_tracker.register_chain(
+                    five_tuple,
+                    peer_id.clone(),
+                    SocketAddr::from(([0, 0, 0, 0], 0)),
+                    outbound_tag.clone(),
+                    packet.len() as u64,
+                    Some(tunnel_tag.clone()),
+                    ChainRole::Relay,
+                );
+                stats.chain_sessions_registered.fetch_add(1, Ordering::Relaxed);
+                debug!(tunnel = %tunnel_tag, next_hop = %outbound_tag, "[CHAIN-SESSION] Registered Relay session");
+            } else {
+                // Terminal node: forwarding to exit egress
+                session_tracker.register_chain(
+                    five_tuple,
+                    peer_id.clone(),
+                    SocketAddr::from(([0, 0, 0, 0], 0)),
+                    outbound_tag.clone(),
+                    packet.len() as u64,
+                    Some(tunnel_tag.clone()),
+                    ChainRole::Terminal,
+                );
+                stats.chain_sessions_registered.fetch_add(1, Ordering::Relaxed);
+                debug!(tunnel = %tunnel_tag, egress = %outbound_tag, "[CHAIN-SESSION] Registered Terminal session");
+            }
+            // === END CHAIN SESSION REGISTRATION ===
+
             // Forward to WireGuard egress tunnel
             let packet_len = packet.len();
             match wg_egress_manager.send(&outbound_tag, packet).await {
@@ -4113,12 +4486,18 @@ pub async fn run_peer_tunnel_processor_loop(
 /// * `wg_egress_manager` - Manager for WireGuard egress tunnels
 /// * `stats` - Statistics collector
 /// * `forward_tx` - Optional sender to main forwarding loop for non-WG egress (direct/SOCKS)
+/// * `session_tracker` - Session tracker for reply routing (Phase 3)
+/// * `ingress_manager` - Ingress manager for sending replies to wg-ingress peers (Phase 3)
+/// * `peer_manager` - Peer manager for sending replies to peer tunnels (Phase 3)
 pub fn spawn_peer_tunnel_processor(
     packet_rx: mpsc::Receiver<ReplyPacket>,
     processor: Arc<super::processor::IngressProcessor>,
     wg_egress_manager: Arc<WgEgressManager>,
     stats: Arc<PeerTunnelProcessorStats>,
     forward_tx: Option<mpsc::Sender<super::manager::ProcessedPacket>>,
+    session_tracker: Arc<IngressSessionTracker>,
+    ingress_manager: Arc<WgIngressManager>,
+    peer_manager: Arc<PeerManager>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_peer_tunnel_processor_loop(
         packet_rx,
@@ -4126,6 +4505,9 @@ pub fn spawn_peer_tunnel_processor(
         wg_egress_manager,
         stats,
         forward_tx,
+        session_tracker,
+        ingress_manager,
+        peer_manager,
     ))
 }
 
