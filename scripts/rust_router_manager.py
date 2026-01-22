@@ -1719,6 +1719,14 @@ class RustRouterManager:
                     current_chains = await client.list_chains()
                     current_tags = {c.tag for c in current_chains}
 
+                    # Phase 12-Fix.D: 日志显示数据库和 rust-router 的链路状态对比
+                    db_enabled_tags = {c.get("tag", "") for c in chains if c.get("enabled", False)}
+                    db_all_tags = {c.get("tag", "") for c in chains}
+                    logger.info(
+                        f"[sync_chains] State comparison: "
+                        f"rust-router={current_tags}, db_enabled={db_enabled_tags}, db_all={db_all_tags}"
+                    )
+
                     synced = 0
 
                     for chain in chains:
@@ -1736,11 +1744,18 @@ class RustRouterManager:
                         if not enabled:
                             # If chain is disabled and exists, delete it
                             if tag in current_tags:
+                                # Phase 12-Fix.D: 详细日志记录为什么链路被停用
+                                logger.warning(
+                                    f"[sync_chains] Chain '{tag}' in rust-router but enabled=False in DB, "
+                                    f"will deactivate and delete (chain_state={chain_state})"
+                                )
                                 # First deactivate if active
                                 for cc in current_chains:
                                     if cc.tag == tag and cc.chain_state == "active":
+                                        logger.info(f"[sync_chains] Deactivating chain '{tag}' (rust-router state: active)")
                                         await client.deactivate_chain(tag)
                                         break
+                                logger.info(f"[sync_chains] Deleting chain '{tag}' from rust-router")
                                 await client.delete_chain(tag)
                             continue
 
@@ -1767,15 +1782,99 @@ class RustRouterManager:
                                     if not activate_response.success:
                                         result.errors.append(f"Failed to activate chain {tag}: {activate_response.error}")
 
+                    # Phase 12-Fix.E: 从 chain_routing 表恢复终端节点的链路
+                    # 终端节点的链路由入口节点通过 2PC 创建，保存在 chain_routing 表中
+                    # 重启后需要恢复这些链路到 rust-router
+                    chain_routing_tags = set()
+                    try:
+                        chain_routings = db.get_chain_routing_list()
+                        if chain_routings:
+                            logger.info(f"[sync_chains] Found {len(chain_routings)} entries in chain_routing table (terminal chains)")
+
+                            for cr in chain_routings:
+                                cr_tag = cr.get("chain_tag", "")
+                                cr_dscp = cr.get("mark_value")
+                                cr_egress = cr.get("egress_tag")
+                                cr_source = cr.get("source_node", "")
+
+                                if not cr_tag or not cr_dscp or not cr_egress:
+                                    continue
+
+                                chain_routing_tags.add(cr_tag)
+
+                                # 如果链路不在 rust-router 中，创建它
+                                if cr_tag not in current_tags:
+                                    logger.info(
+                                        f"[sync_chains] Restoring terminal chain '{cr_tag}' from chain_routing "
+                                        f"(DSCP={cr_dscp} -> {cr_egress}, source={cr_source})"
+                                    )
+
+                                    # 构建终端节点的链路配置（只需要 DSCP 和 exit_egress）
+                                    terminal_config = {
+                                        "tag": cr_tag,
+                                        "description": f"Terminal chain from {cr_source}",
+                                        "hops": [],  # 终端节点没有 hops
+                                        "dscp_value": cr_dscp,
+                                        "exit_egress": cr_egress,
+                                        "rules": [],
+                                    }
+
+                                    create_resp = await client.create_chain(
+                                        tag=cr_tag,
+                                        config=terminal_config,
+                                    )
+                                    if create_resp.success:
+                                        # 激活链路
+                                        activate_resp = await client.activate_chain(cr_tag)
+                                        if activate_resp.success:
+                                            logger.info(f"[sync_chains] Terminal chain '{cr_tag}' restored and activated")
+                                            synced += 1
+                                        else:
+                                            logger.warning(f"[sync_chains] Failed to activate restored chain '{cr_tag}': {activate_resp.error}")
+                                    else:
+                                        logger.warning(f"[sync_chains] Failed to restore chain '{cr_tag}': {create_resp.error}")
+                                else:
+                                    # 链路已存在，确保激活
+                                    status_resp = await client.get_chain_status(cr_tag)
+                                    if status_resp.success and status_resp.data:
+                                        rr_state = status_resp.data.get("state", "inactive")
+                                        if rr_state != "active":
+                                            logger.info(f"[sync_chains] Activating existing terminal chain '{cr_tag}'")
+                                            await client.activate_chain(cr_tag)
+                    except Exception as cr_err:
+                        logger.warning(f"[sync_chains] Failed to process chain_routing: {cr_err}")
+
                     # Remove chains that exist in rust-router but not in database
                     db_tags = {c.get("tag", "") for c in chains if c.get("enabled", False)}
+
                     for current_tag in current_tags:
                         if current_tag not in db_tags:
+                            # Phase 12-Fix.E: 检查是否在 chain_routing 表中（终端节点）
+                            if current_tag in chain_routing_tags:
+                                logger.info(
+                                    f"[sync_chains] Chain '{current_tag}' in rust-router but not in node_chains, "
+                                    f"keeping because it exists in chain_routing (terminal node)"
+                                )
+                                continue
+
+                            # Phase 12-Fix.D: 详细日志记录为什么链路被移除
+                            # 确定原因：链路不在数据库中，还是 enabled=False
+                            chain_in_db = any(c.get("tag") == current_tag for c in chains)
+                            if chain_in_db:
+                                reason = "enabled=False in database"
+                            else:
+                                reason = "not found in database"
+                            logger.warning(
+                                f"[sync_chains] Chain '{current_tag}' in rust-router but not in enabled db_tags, "
+                                f"will deactivate and delete (reason: {reason})"
+                            )
                             # Deactivate before deleting
                             for cc in current_chains:
                                 if cc.tag == current_tag and cc.chain_state == "active":
+                                    logger.info(f"[sync_chains] Deactivating orphan chain '{current_tag}' (rust-router state: active)")
                                     await client.deactivate_chain(current_tag)
                                     break
+                            logger.info(f"[sync_chains] Deleting orphan chain '{current_tag}' from rust-router")
                             await client.delete_chain(current_tag)
 
                     result.chains_synced = synced
@@ -1834,6 +1933,11 @@ class RustRouterManager:
 
                 enabled = chain.get("enabled", False)
                 if not enabled:
+                    # Phase 12-Fix.D: 详细日志记录
+                    logger.warning(
+                        f"[notify_chain_changed] Chain '{chain_tag}' enabled=False in DB, "
+                        f"will deactivate and delete (action={action})"
+                    )
                     # Remove disabled chain from rust-router
                     await client.deactivate_chain(chain_tag)
                     response = await client.delete_chain(chain_tag)

@@ -20734,6 +20734,32 @@ def api_deactivate_chain(tag: str):
     # 这里只需清除 enabled 标志和错误信息
     db.update_node_chain(tag, enabled=0, last_error=None)
 
+    # Phase 12-Fix.D: 立即通知 rust-router 停用链路（不等待定期同步）
+    rust_router_deactivate_result = "skipped"
+    if os.environ.get("USE_RUST_ROUTER", "false").lower() == "true" and HAS_RUST_ROUTER_CLIENT:
+        try:
+            from rust_router_client import RustRouterClient
+            import asyncio
+
+            async def _deactivate_chain_ipc():
+                async with RustRouterClient() as client:
+                    return await client.deactivate_chain(tag)
+
+            loop = asyncio.new_event_loop()
+            try:
+                response = loop.run_until_complete(_deactivate_chain_ipc())
+                if response.success:
+                    rust_router_deactivate_result = "success"
+                    logging.info(f"[chains] rust-router 链路 '{tag}' 已停用")
+                else:
+                    rust_router_deactivate_result = f"failed: {response.error}"
+                    logging.warning(f"[chains] rust-router 停用链路 '{tag}' 失败: {response.error}")
+            finally:
+                loop.close()
+        except Exception as e:
+            rust_router_deactivate_result = f"error: {e}"
+            logging.warning(f"[chains] rust-router 停用链路 '{tag}' 异常: {e}")
+
     # 重新生成 sing-box 配置
     reload_status = "success"
     try:
@@ -20763,6 +20789,7 @@ def api_deactivate_chain(tag: str):
         "reload_status": reload_status,
         "cleanup_results": cleanup_results,  # Phase 6 Issue 20: 详细清理结果
         "partial_cleanup": partial_cleanup,  # Phase 6 Issue 20: 是否部分清理
+        "rust_router_deactivate": rust_router_deactivate_result,  # Phase 12-Fix.D: rust-router 停用结果
     }
 
 
