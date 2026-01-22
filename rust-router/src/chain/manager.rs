@@ -175,6 +175,15 @@ pub enum ChainError {
     #[error("COMMIT failed on node {0}: {1}")]
     CommitFailed(String, String),
 
+    /// Partial commit - some nodes committed, some failed (CRITICAL: inconsistent state)
+    #[error("PARTIAL COMMIT FAILURE on chain '{chain_tag}': {committed_nodes:?} committed, {failed_nodes:?} failed. First error: {first_error}")]
+    PartialCommit {
+        chain_tag: String,
+        committed_nodes: Vec<String>,
+        failed_nodes: Vec<String>,
+        first_error: String,
+    },
+
     /// Remote validation failed
     #[error("Remote validation failed: {0}")]
     RemoteValidationFailed(String),
@@ -995,15 +1004,42 @@ impl ChainManager {
 
         if !commit_errors.is_empty() {
             // COMMIT partially failed - serious issue, some nodes may be committed
+            // This is a critical inconsistency: some nodes are active, some are not
+
+            // Collect committed and failed nodes for detailed error reporting
+            let committed_nodes: Vec<String> = coordinator
+                .participants()
+                .filter(|p| p.state == crate::chain::two_phase::TwoPhaseState::Committed)
+                .map(|p| p.node_tag.clone())
+                .collect();
+
+            let failed_nodes: Vec<String> = coordinator
+                .participants()
+                .filter(|p| matches!(p.state, crate::chain::two_phase::TwoPhaseState::Failed(_)))
+                .map(|p| p.node_tag.clone())
+                .collect();
+
             error!(
-                "Chain {} COMMIT partially failed with {} errors",
+                "Chain {} COMMIT partially failed: {} nodes committed, {} nodes failed. \
+                 SYSTEM IS IN INCONSISTENT STATE. Manual intervention may be required.",
                 tag,
-                commit_errors.len()
+                committed_nodes.len(),
+                failed_nodes.len()
             );
+            error!("  Committed nodes: {:?}", committed_nodes);
+            error!("  Failed nodes: {:?}", failed_nodes);
             for err in &commit_errors {
                 error!("  COMMIT error: {}", err);
             }
-            return Err(commit_errors.into_iter().next().unwrap().into());
+
+            // Return error with detailed inconsistency information
+            // The calling code will set chain state to Error with this PartialCommit error
+            return Err(ChainError::PartialCommit {
+                chain_tag: tag.to_string(),
+                committed_nodes,
+                failed_nodes,
+                first_error: commit_errors.into_iter().next().unwrap().to_string(),
+            });
         }
 
         info!("Chain {} 2PC completed successfully", tag);

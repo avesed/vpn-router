@@ -966,7 +966,17 @@ class PeerTunnelManager:
             是否成功
         """
         tag = node["tag"]
-        socks_port = node.get("xray_socks_port") or PEER_XRAY_SOCKS_PORT_START
+        # 必须使用数据库中分配的端口以确保一致性
+        socks_port = node.get("xray_socks_port")
+        if not socks_port:
+            # 基于 tag 计算确定性端口（使用 MD5 而非 hash()）
+            # hash() 在不同 Python 进程间不稳定（hash randomization）
+            # 注意：必须与 xray_manager.py 使用相同的算法
+            tag_hash = int(hashlib.md5(tag.encode()).hexdigest()[:8], 16) % 99
+            socks_port = PEER_XRAY_SOCKS_PORT_START + tag_hash
+            logger.warning(
+                f"[{tag}] 缺少 xray_socks_port，使用基于哈希的端口 {socks_port}"
+            )
         endpoint = node.get("endpoint", "")
         xray_uuid = node.get("xray_uuid")
 
@@ -1143,7 +1153,17 @@ class PeerTunnelManager:
             是否成功
         """
         tag = node["tag"]
-        socks_port = node.get("xray_socks_port") or PEER_XRAY_SOCKS_PORT_START
+        # 必须使用数据库中分配的端口以确保一致性
+        socks_port = node.get("xray_socks_port")
+        if not socks_port:
+            # 基于 tag 计算确定性端口（使用 MD5 而非 hash()）
+            # hash() 在不同 Python 进程间不稳定（hash randomization）
+            # 注意：必须与 xray_manager.py 使用相同的算法
+            tag_hash = int(hashlib.md5(tag.encode()).hexdigest()[:8], 16) % 99
+            socks_port = PEER_XRAY_SOCKS_PORT_START + tag_hash
+            logger.warning(
+                f"[{tag}] 缺少 xray_socks_port，使用基于哈希的端口 {socks_port}"
+            )
         endpoint = node.get("endpoint", "")
 
         # 检查对端是否启用了入站

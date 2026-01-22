@@ -92,9 +92,15 @@ impl HealthChecker {
     /// assert!(checker.record_failure("peer-1"));  // 3rd failure - threshold exceeded
     /// ```
     pub fn record_failure(&self, peer_tag: &str) -> bool {
+        // Recover from poisoned lock - the failure counts are still valid
         let mut failures = match self.peer_failures.write() {
             Ok(guard) => guard,
-            Err(_) => return false,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "HealthChecker lock was poisoned (prior panic), recovering for failure recording"
+                );
+                poisoned.into_inner()
+            }
         };
 
         let count = failures.entry(peer_tag.to_string()).or_insert(0);
@@ -123,9 +129,17 @@ impl HealthChecker {
     /// assert_eq!(checker.get_failure_count("peer-1"), 0);
     /// ```
     pub fn record_success(&self, peer_tag: &str) {
-        if let Ok(mut failures) = self.peer_failures.write() {
-            failures.remove(peer_tag);
-        }
+        // Recover from poisoned lock if necessary
+        let mut failures = match self.peer_failures.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "HealthChecker lock was poisoned (prior panic), recovering for success recording"
+                );
+                poisoned.into_inner()
+            }
+        };
+        failures.remove(peer_tag);
     }
 
     /// Get the current failure count for a peer
@@ -150,11 +164,12 @@ impl HealthChecker {
     /// assert_eq!(checker.get_failure_count("peer-1"), 1);
     /// ```
     pub fn get_failure_count(&self, peer_tag: &str) -> u32 {
-        self.peer_failures
-            .read()
-            .ok()
-            .and_then(|failures| failures.get(peer_tag).copied())
-            .unwrap_or(0)
+        // Recover from poisoned lock if necessary
+        let failures = match self.peer_failures.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        failures.get(peer_tag).copied().unwrap_or(0)
     }
 
     /// Check if a peer has exceeded the failure threshold
@@ -181,24 +196,32 @@ impl HealthChecker {
     ///
     /// * `peer_tag` - The peer's tag identifier
     pub fn clear(&self, peer_tag: &str) {
-        if let Ok(mut failures) = self.peer_failures.write() {
-            failures.remove(peer_tag);
-        }
+        // Recover from poisoned lock if necessary
+        let mut failures = match self.peer_failures.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        failures.remove(peer_tag);
     }
 
     /// Clear all failure counts
     pub fn clear_all(&self) {
-        if let Ok(mut failures) = self.peer_failures.write() {
-            failures.clear();
-        }
+        // Recover from poisoned lock if necessary
+        let mut failures = match self.peer_failures.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        failures.clear();
     }
 
     /// Get the number of peers with recorded failures
     pub fn peers_with_failures(&self) -> usize {
-        self.peer_failures
-            .read()
-            .map(|failures| failures.len())
-            .unwrap_or(0)
+        // Recover from poisoned lock if necessary
+        let failures = match self.peer_failures.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        failures.len()
     }
 
     /// Get all peers currently marked as unhealthy
@@ -207,16 +230,16 @@ impl HealthChecker {
     ///
     /// List of peer tags that have exceeded the failure threshold.
     pub fn unhealthy_peers(&self) -> Vec<String> {
-        self.peer_failures
-            .read()
-            .map(|failures| {
-                failures
-                    .iter()
-                    .filter(|(_, &count)| count >= self.failure_threshold)
-                    .map(|(tag, _)| tag.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        // Recover from poisoned lock if necessary
+        let failures = match self.peer_failures.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        failures
+            .iter()
+            .filter(|(_, &count)| count >= self.failure_threshold)
+            .map(|(tag, _)| tag.clone())
+            .collect()
     }
 }
 

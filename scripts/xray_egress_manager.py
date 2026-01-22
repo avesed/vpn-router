@@ -22,12 +22,14 @@ Xray 出站管理器
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +88,57 @@ def cleanup_stale_pid_file(pid_path: Path) -> None:
             logger.warning(f"清理 PID 文件失败: {e}")
     except Exception as e:
         logger.warning(f"检查 PID 文件时出错: {e}")
+
+
+def write_pid_file_atomic(pid_path: Path, pid: int) -> bool:
+    """
+    原子写入 PID 文件，带文件锁保护
+
+    Args:
+        pid_path: PID 文件路径
+        pid: 进程 ID
+
+    Returns:
+        是否写入成功
+    """
+    try:
+        # 确保目录存在
+        pid_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 使用临时文件实现原子写入
+        fd, tmp_path = tempfile.mkstemp(
+            dir=pid_path.parent,
+            prefix='.pid_',
+            suffix='.tmp'
+        )
+        try:
+            # 设置文件权限 (仅所有者可读写)
+            os.fchmod(fd, 0o600)
+            # 获取排他锁
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # 写入 PID
+            os.write(fd, f"{pid}\n".encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+        # 原子重命名
+        os.rename(tmp_path, pid_path)
+        logger.debug(f"PID 文件已原子写入: {pid_path}")
+        return True
+
+    except BlockingIOError:
+        logger.warning(f"PID 文件被锁定: {pid_path}")
+        return False
+    except Exception as e:
+        logger.error(f"写入 PID 文件失败: {e}")
+        # 清理临时文件
+        try:
+            if 'tmp_path' in locals():
+                os.unlink(tmp_path)
+        except OSError:
+            pass  # 临时文件可能已被删除
+        return False
 
 
 @dataclass
@@ -269,8 +322,8 @@ class XrayEgressManager:
                 if isinstance(alpn, str):
                     try:
                         alpn = json.loads(alpn)
-                    except:
-                        alpn = [alpn]
+                    except (json.JSONDecodeError, TypeError):
+                        alpn = [alpn]  # 作为单个字符串处理
                 tls_settings["alpn"] = alpn
 
             # Allow insecure
@@ -408,11 +461,15 @@ class XrayEgressManager:
         # 生成配置
         try:
             xray_config = self._generate_xray_config(egress_list)
-            if not xray_config["inbounds"]:
-                logger.warning("没有有效的出口配置")
+            # 检查是否有实际的出口 SOCKS 端口（不仅仅是 API 入站）
+            # xray_config["inbounds"] 总是包含 API 入站，所以检查 socks_ports
+            if not self.process.socks_ports:
+                logger.warning("没有有效的出口配置（无 SOCKS 端口）")
                 return True
 
             XRAY_EGRESS_CONFIG_PATH.write_text(json.dumps(xray_config, indent=2))
+            # 设置配置文件权限（仅所有者可读写，包含敏感信息）
+            os.chmod(XRAY_EGRESS_CONFIG_PATH, 0o600)
             self.process.config = xray_config
             logger.info(f"Xray 出站配置已生成: {XRAY_EGRESS_CONFIG_PATH}")
         except Exception as e:
@@ -440,12 +497,8 @@ class XrayEgressManager:
         # 检查进程是否仍在运行
         if self._is_process_alive():
             self.process.status = "running"
-            # 写入 PID 文件
-            try:
-                XRAY_EGRESS_PID_FILE.write_text(str(self.process.pid))
-                logger.debug(f"PID 文件已写入: {XRAY_EGRESS_PID_FILE}")
-            except Exception as e:
-                logger.warning(f"写入 PID 文件失败: {e}")
+            # 原子写入 PID 文件
+            write_pid_file_atomic(XRAY_EGRESS_PID_FILE, self.process.pid)
 
             # 打印 SOCKS 端口信息
             for egress in egress_list:
@@ -463,8 +516,8 @@ class XrayEgressManager:
                     content = error_log.read_text()
                     if content:
                         logger.error(f"Xray 错误日志:\n{content[-1000:]}")
-            except:
-                pass
+            except (OSError, IOError) as e:
+                logger.debug(f"无法读取错误日志: {e}")
             return False
 
     async def stop(self) -> bool:
@@ -493,6 +546,12 @@ class XrayEgressManager:
                         pass
             except ProcessLookupError:
                 pass
+
+            # 收割子进程，避免僵尸进程
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass  # 子进程已被收割或不存在
 
             self.process.pid = None
 
@@ -530,6 +589,8 @@ class XrayEgressManager:
         try:
             xray_config = self._generate_xray_config(egress_list)
             XRAY_EGRESS_CONFIG_PATH.write_text(json.dumps(xray_config, indent=2))
+            # 设置配置文件权限（包含敏感信息如私钥）
+            os.chmod(XRAY_EGRESS_CONFIG_PATH, 0o600)
             self.process.config = xray_config
             self.process.egress_count = len(egress_list)
         except Exception as e:
@@ -593,12 +654,22 @@ class XrayEgressManager:
         }
 
     async def run_daemon(self):
-        """以守护进程模式运行"""
+        """以守护进程模式运行，带指数退避重启策略"""
         self._running = True
+        restart_count = 0
+        last_restart_time = 0
         logger.info("Xray 出站管理器启动（守护模式）")
 
-        # 启动 Xray 出站
-        await self.start()
+        # 初始启动（最多重试 3 次）
+        for attempt in range(3):
+            if await self.start():
+                restart_count = 0
+                break
+            delay = 5 * (attempt + 1)
+            logger.warning(f"初始启动失败，{delay}s 后重试 (第 {attempt + 1}/3 次)")
+            await asyncio.sleep(delay)
+        else:
+            logger.error("Xray 出站初始启动失败，进入监控模式")
 
         # 监控循环
         while self._running:
@@ -606,8 +677,23 @@ class XrayEgressManager:
 
             # 检查进程健康
             if self.process.status == "running" and not self._is_process_alive():
-                logger.warning("Xray 出站进程已退出，尝试重启")
-                await self.start()
+                current_time = time.time()
+
+                # 如果上次重启在 60 秒内成功运行，重置计数
+                if current_time - last_restart_time > 60:
+                    restart_count = 0
+
+                restart_count += 1
+                # 指数退避：10s, 20s, 40s, 80s, ... 最大 300s
+                delay = min(10 * (2 ** (restart_count - 1)), 300)
+                logger.warning(
+                    f"Xray 出站进程已退出，{delay}s 后重启 (第 {restart_count} 次重试)"
+                )
+                await asyncio.sleep(delay)
+
+                if await self.start():
+                    last_restart_time = time.time()
+                    logger.info("Xray 出站重启成功")
 
         # 清理
         await self.stop()
@@ -654,8 +740,22 @@ async def main():
             logger.info("收到停止信号")
             manager.stop_daemon()
 
+        def sigchld_handler():
+            """收割所有僵尸子进程"""
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                    logger.debug(f"已收割子进程: {pid}")
+                except ChildProcessError:
+                    break
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
+
+        # 添加 SIGCHLD 处理器避免僵尸进程
+        loop.add_signal_handler(signal.SIGCHLD, sigchld_handler)
 
         await manager.run_daemon()
 

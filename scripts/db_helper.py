@@ -2508,6 +2508,8 @@ class UserDatabase:
         enabled: bool = True,
         # Phase 11: 双向连接状态
         bidirectional_status: str = "pending",
+        # SOCKS 端口（用于 Xray 隧道类型）
+        xray_socks_port: Optional[int] = None,
     ) -> int:
         """添加对等节点
 
@@ -2543,6 +2545,7 @@ class UserDatabase:
             default_outbound: 默认出口
             auto_reconnect: 自动重连
             enabled: 是否启用
+            xray_socks_port: Xray SOCKS5 端口（未提供时自动分配）
 
         Raises:
             sqlite3.IntegrityError: 如果 tunnel_local_ip 或 tunnel_port 冲突（竞态条件检测）
@@ -2557,6 +2560,10 @@ class UserDatabase:
                     f"tunnel_port {tunnel_port} 超出有效范围 ({TUNNEL_PORT_MIN}-{TUNNEL_PORT_MAX})"
                 )
 
+        # 自动分配 xray_socks_port（如果未提供且隧道类型为 xray）
+        if xray_socks_port is None and tunnel_type == "xray":
+            xray_socks_port = self.get_next_peer_xray_socks_port()
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -2565,20 +2572,20 @@ class UserDatabase:
                     tunnel_type, tunnel_status, tunnel_interface,
                     tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
                     wg_private_key, wg_public_key, wg_peer_public_key,
-                    xray_protocol, xray_uuid,
+                    xray_protocol, xray_uuid, xray_socks_port,
                     xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
                     xray_reality_dest, xray_reality_server_names,
                     xray_peer_reality_public_key, xray_peer_reality_short_id,
                     xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
                     connection_mode, default_outbound, auto_reconnect, enabled,
                     bidirectional_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 tag, name, description, endpoint, api_port, psk_hash, psk_encrypted,
                 tunnel_type, tunnel_status, tunnel_interface,
                 tunnel_local_ip, tunnel_remote_ip, tunnel_port, tunnel_api_endpoint,
                 wg_private_key, wg_public_key, wg_peer_public_key,
-                xray_protocol, xray_uuid,
+                xray_protocol, xray_uuid, xray_socks_port,
                 xray_reality_private_key, xray_reality_public_key, xray_reality_short_id,
                 xray_reality_dest, xray_reality_server_names,
                 xray_peer_reality_public_key, xray_peer_reality_short_id,
@@ -2729,20 +2736,55 @@ class UserDatabase:
     def get_next_peer_xray_socks_port(self) -> int:
         """获取下一个可用的 Xray SOCKS 端口（可通过环境变量配置起始端口）
 
+        端口范围说明:
+        - V2Ray egress SOCKS: 37101-37200 (100 个端口)
+        - Peer node SOCKS: 37201-37299 (99 个端口)
+
         Raises:
-            ValueError: 端口超出 65535 限制
+            ValueError: 端口超出限制或与 V2Ray egress 端口冲突
         """
         # Peer Xray SOCKS port start (configurable via environment)
         PEER_XRAY_SOCKS_PORT_START = int(os.environ.get("PEER_XRAY_SOCKS_PORT_START", "37201"))
+        V2RAY_EGRESS_SOCKS_PORT_START = int(os.environ.get("V2RAY_EGRESS_SOCKS_PORT_START", "37101"))
+        V2RAY_EGRESS_SOCKS_PORT_END = PEER_XRAY_SOCKS_PORT_START - 1  # 37200
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
+
+            # 获取当前最大 peer SOCKS 端口
             row = cursor.execute(
                 "SELECT MAX(xray_socks_port) FROM peer_nodes WHERE xray_socks_port IS NOT NULL"
             ).fetchone()
             max_port = row[0] if row and row[0] else (PEER_XRAY_SOCKS_PORT_START - 1)
             next_port = max(max_port + 1, PEER_XRAY_SOCKS_PORT_START)
+
+            # 获取 V2Ray egress 使用的端口（避免冲突）
+            egress_ports = set()
+            try:
+                rows = cursor.execute(
+                    "SELECT socks_port FROM v2ray_egress WHERE socks_port IS NOT NULL"
+                ).fetchall()
+                egress_ports = {row[0] for row in rows}
+            except Exception:
+                pass  # 表可能不存在
+
+            # 跳过与 V2Ray egress 冲突的端口
+            while next_port in egress_ports:
+                next_port += 1
+
+            # 验证端口范围
             if next_port > 65535:
                 raise ValueError(f"Peer Xray SOCKS port overflow: {next_port} > 65535")
+
+            # 警告如果端口接近 V2Ray egress 范围
+            if V2RAY_EGRESS_SOCKS_PORT_START <= next_port <= V2RAY_EGRESS_SOCKS_PORT_END:
+                import logging
+                logging.warning(
+                    f"Peer SOCKS 端口 {next_port} 与 V2Ray egress 端口范围 "
+                    f"({V2RAY_EGRESS_SOCKS_PORT_START}-{V2RAY_EGRESS_SOCKS_PORT_END}) 重叠。"
+                    "建议调整 PEER_XRAY_SOCKS_PORT_START 环境变量。"
+                )
+
             return next_port
 
     def get_next_peer_inbound_port(self) -> int:
@@ -4082,6 +4124,14 @@ class UserDatabase:
             if mark_value in self.RESERVED_DSCP_VALUES:
                 raise ValueError(f"DSCP value {mark_value} is reserved for QoS")
 
+        # xray_email 类型必须有 source_node（Xray 路由规则需要精确匹配 email）
+        # 参考: https://github.com/XTLS/Xray-core/discussions/4668
+        if mark_type == "xray_email" and not source_node:
+            raise ValueError(
+                "source_node is required for xray_email mark_type "
+                "(Xray routing does not support wildcard matching in user field)"
+            )
+
         with self._get_conn() as conn:
             cursor = conn.cursor()
             existing = cursor.execute(
@@ -4136,6 +4186,14 @@ class UserDatabase:
                 raise ValueError(f"DSCP value must be 1-63, got {mark_value}")
             if mark_value in self.RESERVED_DSCP_VALUES:
                 raise ValueError(f"DSCP value {mark_value} is reserved for QoS")
+
+        # xray_email 类型必须有 source_node（Xray 路由规则需要精确匹配 email）
+        # 参考: https://github.com/XTLS/Xray-core/discussions/4668
+        if mark_type == "xray_email" and not source_node:
+            raise ValueError(
+                "source_node is required for xray_email mark_type "
+                "(Xray routing does not support wildcard matching in user field)"
+            )
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
@@ -5009,6 +5067,8 @@ class DatabaseManager:
         enabled: bool = True,
         # Phase 11: 双向连接状态
         bidirectional_status: str = "pending",
+        # SOCKS 端口（用于 Xray 隧道类型）
+        xray_socks_port: Optional[int] = None,
     ) -> int:
         return self.user.add_peer_node(
             tag, name, endpoint, psk_hash, psk_encrypted, description, api_port,
@@ -5021,7 +5081,7 @@ class DatabaseManager:
             xray_peer_reality_public_key, xray_peer_reality_short_id,
             xray_xhttp_path, xray_xhttp_mode, xray_xhttp_host,
             connection_mode, default_outbound, auto_reconnect, enabled,
-            bidirectional_status
+            bidirectional_status, xray_socks_port
         )
 
     def update_peer_node(self, tag: str, **kwargs) -> bool:

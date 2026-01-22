@@ -21,11 +21,13 @@ import fcntl
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import subprocess
 import sys
 import time
+import uuid as uuid_module
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -58,6 +60,24 @@ USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 # SOCKS5 输出端口基准（入站流量输出到 sing-box）
 # 使用 38601+ 端口范围，避免与其他服务冲突
 PEER_INBOUND_SOCKS_BASE_PORT = 38601
+
+def is_valid_uuid(value: str) -> bool:
+    """验证 UUID 格式是否正确
+
+    Args:
+        value: 待验证的 UUID 字符串
+
+    Returns:
+        True 如果 UUID 格式正确，否则 False
+    """
+    if not value:
+        return False
+    try:
+        # 使用 Python 标准库验证
+        uuid_module.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def write_pid_file_atomic(pid_path: Path, pid: int) -> None:
@@ -284,8 +304,14 @@ class XrayPeerInboundManager:
             logger.error(f"节点未分配入站端口: {tag}")
             return False
 
-        if not node.get("inbound_uuid"):
+        inbound_uuid = node.get("inbound_uuid")
+        if not inbound_uuid:
             logger.error(f"节点未配置入站 UUID: {tag}")
+            return False
+
+        # 验证 UUID 格式
+        if not is_valid_uuid(inbound_uuid):
+            logger.error(f"节点入站 UUID 格式无效: {tag}, uuid={inbound_uuid}")
             return False
 
         # 检查 REALITY 密钥

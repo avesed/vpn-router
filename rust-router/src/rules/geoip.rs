@@ -300,11 +300,15 @@ impl GeoIpMatcher {
         }
 
         // Check if IP is in any of the country's CIDRs
+        // Use into_inner() to recover from poisoned lock - the data is still valid
+        // even if a previous operation panicked while holding the lock
         let cache = match self.country_cidrs.read() {
             Ok(cache) => cache,
-            Err(e) => {
-                tracing::error!("Failed to acquire read lock: {}", e);
-                return false;
+            Err(poisoned) => {
+                tracing::warn!(
+                    "GeoIP cache lock was poisoned (prior panic), recovering data for country lookup"
+                );
+                poisoned.into_inner()
             }
         };
 

@@ -738,9 +738,25 @@ impl EcmpGroup {
             last_accessed: now,
         };
 
-        // Enforce cache size limit
+        // Enforce cache size limit with defensive bounds checking
+        // First cleanup attempt
         if self.session_affinity_cache.len() >= SESSION_AFFINITY_CACHE_MAX_ENTRIES {
             self.cleanup_session_affinity_cache();
+        }
+
+        // Double-check after cleanup: if still at or over limit, force-remove the oldest entry
+        // This handles edge cases where concurrent access or cleanup inefficiency might leave
+        // the cache at capacity. We always ensure room for the new entry.
+        if self.session_affinity_cache.len() >= SESSION_AFFINITY_CACHE_MAX_ENTRIES {
+            // Find and remove the oldest entry by last_accessed time
+            if let Some(oldest_key) = self
+                .session_affinity_cache
+                .iter()
+                .min_by_key(|r| r.value().last_accessed)
+                .map(|r| r.key().clone())
+            {
+                self.session_affinity_cache.remove(&oldest_key);
+            }
         }
 
         self.session_affinity_cache.insert(cache_key, entry);

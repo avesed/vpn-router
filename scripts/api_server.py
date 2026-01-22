@@ -12907,6 +12907,22 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
                 logging.exception(f"[peer-event] 添加墓碑失败 (非致命): {e}")
                 result["actions_taken"].append(f"tombstone failed for {peer_tag}")
 
+            # 清理 Xray peer inbound（如果已启用）
+            if source_peer.get("inbound_enabled"):
+                try:
+                    xray_result = subprocess.run(
+                        ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "stop", peer_tag],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if xray_result.returncode == 0:
+                        result["actions_taken"].append(f"stopped xray inbound for {peer_tag}")
+                    else:
+                        logging.warning(f"[peer-event] 停止 Xray inbound 返回非零: {xray_result.stderr}")
+                        result["actions_taken"].append(f"xray inbound stop attempted for {peer_tag}")
+                except Exception as e:
+                    logging.error(f"[peer-event] 停止 Xray inbound 失败 (非致命): {e}")
+                    result["actions_taken"].append(f"xray inbound stop failed for {peer_tag}")
+
             # 删除本地 peer_node 记录
             db.delete_peer_node(peer_tag)
             result["actions_taken"].append(f"deleted peer_node {peer_tag}")
@@ -16899,10 +16915,10 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
         try:
             from rust_router_client import RustRouterClient
             client = RustRouterClient()
-            
+
             async def _remove_peer_ipc():
                 return await client.remove_peer(tag)
-            
+
             response = _run_async_ipc(_remove_peer_ipc())
             if response.success:
                 logging.info(f"[peers] rust-router peer 已删除: {tag}")
@@ -16915,6 +16931,24 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
             logging.warning(f"[peers] rust-router IPC 超时，继续删除数据库记录: {tag}")
         except Exception as e:
             logging.warning(f"[peers] rust-router IPC 删除失败: {e}")
+
+    # Phase 11-Fix.Xray: 清理 Xray 入站进程（如果启用）
+    # 无论 tunnel_type 是什么，只要 inbound_enabled 就需要停止入站进程
+    if node.get("inbound_enabled"):
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "stop", tag],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                logging.info(f"[peers] Xray 入站进程已停止: {tag}")
+            else:
+                logging.debug(f"[peers] Xray 入站进程停止返回非零 (可能未运行): {result.stderr}")
+        except subprocess.TimeoutExpired:
+            logging.warning(f"[peers] Xray 入站进程停止超时: {tag}")
+        except Exception as e:
+            logging.warning(f"[peers] Xray 入站进程停止失败: {e}")
 
     # 删除数据库记录
     success = db.delete_peer_node(tag)
@@ -18083,19 +18117,24 @@ def api_disable_peer_inbound(tag: str):
     # 更新数据库
     db.update_peer_node(tag, inbound_enabled=0)
 
-    # 合并架构: reload 主 Xray 进程以移除 peer UUID
+    # Phase 11-Fix.Xray: 停止独立的 Xray 入站进程
+    # 使用 xray_peer_inbound_manager 停止专用入站进程，与启用时的逻辑一致
     try:
         import subprocess
         result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
+            ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "stop", tag],
             capture_output=True, text=True, timeout=10
         )
-        if result.returncode != 0:
-            logging.warning(f"[peers] Xray reload 返回非零: {result.stderr}")
+        if result.returncode == 0:
+            logging.info(f"[peers] 节点 '{tag}' 入站进程已停止")
+        else:
+            logging.warning(f"[peers] 入站进程停止可能失败: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        logging.warning(f"[peers] 入站进程停止超时")
     except Exception as e:
-        logging.warning(f"[peers] Xray reload 时出错: {e}")
+        logging.warning(f"[peers] 停止入站进程时出错: {e}")
 
-    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用 (合并架构)")
+    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用 (独立进程模式)")
     return {
         "success": True,
         "message": "入站监听已禁用",

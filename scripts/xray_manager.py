@@ -20,6 +20,7 @@ Xray 进程管理器
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -350,28 +351,49 @@ def build_chain_routing_outbound(egress_info: ChainEgressInfo, chain_tag: str) -
     return None
 
 
-def build_chain_routing_rule(chain_tag: str, source_node: Optional[str] = None) -> Dict:
+def build_chain_routing_rule(chain_tag: str, source_node: Optional[str] = None) -> Optional[Dict]:
     """构建链路路由规则
 
     生成 Xray 路由规则，匹配链路 email 并路由到对应出站。
 
+    IMPORTANT: Xray 的 user 字段不支持通配符匹配，必须精确匹配 email。
+    因此 source_node 是必需的，否则无法正确路由链路流量。
+
     Args:
         chain_tag: 链路标识
-        source_node: 来源节点（可选，用于精确匹配）
+        source_node: 来源节点（必需，用于精确匹配 email）
 
     Returns:
-        Xray 路由规则字典
+        Xray 路由规则字典，如果 source_node 为空则返回 None
     """
+    if not chain_tag:
+        logger.warning("build_chain_routing_rule: chain_tag 为空")
+        return None
+
     safe_chain = re.sub(r'[^a-z0-9\-]', '', chain_tag.lower())[:32]
+    if not safe_chain:
+        logger.warning(f"build_chain_routing_rule: chain_tag '{chain_tag}' 清理后为空")
+        return None
+
     outbound_tag = f"chain-egress-{safe_chain}"
 
     # 构建 user 匹配模式
+    # NOTE: Xray 的 user 字段不支持通配符 (*) 匹配，必须精确匹配
+    # 参考: https://github.com/XTLS/Xray-core/discussions/4668
     if source_node:
         safe_node = re.sub(r'[^a-z0-9\-]', '', source_node.lower())[:32]
+        if not safe_node:
+            logger.warning(f"build_chain_routing_rule: source_node '{source_node}' 清理后为空")
+            return None
         user_pattern = f"chain-{safe_chain}@{safe_node}"
     else:
-        # 使用通配符匹配任意来源节点
-        user_pattern = f"chain-{safe_chain}@*"
+        # source_node 为空时无法创建有效的路由规则
+        # 因为 Xray 不支持 user 字段的通配符匹配
+        logger.warning(
+            f"build_chain_routing_rule: 链路 '{chain_tag}' 缺少 source_node，"
+            "无法创建路由规则（Xray 不支持 user 字段通配符）"
+        )
+        return None
 
     return {
         "type": "field",
@@ -513,6 +535,8 @@ class XrayManager:
         self.process = XrayProcess()
         self.db = get_db(GEODATA_DB_PATH, USER_DB_PATH)
         self._running = False
+        # 并发锁：保护 start/stop 操作不被并发调用
+        self._operation_lock = asyncio.Lock()
         # H6: 清理可能存在的无效 PID 文件
         cleanup_stale_pid_file(XRAY_PID_FILE)
 
@@ -986,6 +1010,15 @@ class XrayManager:
 
         # REALITY 配置（优先于 TLS）
         if config.get("reality_enabled"):
+            # 验证 REALITY 必需字段
+            reality_private_key = config.get("reality_private_key")
+            if not reality_private_key:
+                logger.error(
+                    "REALITY 已启用但缺少私钥 (reality_private_key)。"
+                    "请使用 'xray_manager.py generate-keys' 生成密钥对。"
+                )
+                raise ValueError("REALITY 配置缺少必需的 reality_private_key")
+
             stream_settings["security"] = "reality"
             # 处理可能为 None 的 JSON 字段
             server_names_raw = config.get("reality_server_names")
@@ -995,7 +1028,7 @@ class XrayManager:
             stream_settings["realitySettings"] = {
                 "dest": config.get("reality_dest") or "www.microsoft.com:443",
                 "serverNames": server_names,
-                "privateKey": config.get("reality_private_key") or "",
+                "privateKey": reality_private_key,
                 "shortIds": short_ids
             }
         elif config.get("tls_enabled"):
@@ -1014,6 +1047,8 @@ class XrayManager:
                 key_path = XRAY_RUN_DIR / "server.key"
                 cert_path.write_text(config.get("tls_cert_content"))
                 key_path.write_text(config.get("tls_key_content"))
+                # 设置文件权限：证书可公开读取，私钥仅所有者可读
+                os.chmod(cert_path, 0o644)
                 os.chmod(key_path, 0o600)
                 tls_settings["certificates"] = [{
                     "certificateFile": str(cert_path),
@@ -1084,9 +1119,19 @@ class XrayManager:
             if not peer_tag:
                 continue
 
-            # 分配 SOCKS 端口 (37201, 37202, ...)
-            # 使用数据库中分配的端口，如果没有则按索引分配
-            socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_START + idx)
+            # 分配 SOCKS 端口
+            # 必须使用数据库中分配的端口以确保与 render_singbox.py 一致
+            socks_port = peer.get("xray_socks_port")
+            if not socks_port:
+                # 基于 peer_tag 计算确定性端口（使用 MD5 而非 hash()）
+                # hash() 在不同 Python 进程间不稳定（hash randomization）
+                # MD5 确保跨进程、跨重启的一致性
+                tag_hash = int(hashlib.md5(peer_tag.encode()).hexdigest()[:8], 16) % 99
+                socks_port = PEER_SOCKS_PORT_START + tag_hash
+                logger.warning(
+                    f"Peer {peer_tag} 缺少 xray_socks_port，使用基于哈希的端口 {socks_port}。"
+                    "建议在数据库中显式分配端口以避免潜在冲突。"
+                )
 
             # 解析 endpoint 获取服务器地址和端口
             endpoint = peer.get("endpoint", "")
@@ -1221,6 +1266,11 @@ class XrayManager:
 
             # 生成路由规则
             rule = build_chain_routing_rule(chain_tag, source_node)
+            if not rule:
+                # build_chain_routing_rule 已经记录了警告
+                # 跳过这条链路路由，但保留出站配置（可能被其他规则使用）
+                logger.warning(f"跳过链路 {chain_tag} 的路由规则（无法生成有效规则）")
+                continue
             xray_config["routing"]["rules"].append(rule)
 
             logger.info(
@@ -1444,7 +1494,12 @@ class XrayManager:
             logger.debug(f"删除 TUN 设备时出错: {e}")
 
     async def start(self) -> bool:
-        """启动 Xray"""
+        """启动 Xray（线程安全）"""
+        async with self._operation_lock:
+            return await self._start_impl()
+
+    async def _start_impl(self) -> bool:
+        """启动 Xray 的实际实现"""
         config = self._get_v2ray_inbound_config()
         if not config:
             logger.error("V2Ray 入口配置不存在")
@@ -1458,7 +1513,8 @@ class XrayManager:
         if self._is_process_alive():
             existing_pid = self.process.pid or self._read_pid_from_file()
             logger.info(f"Xray 已在运行 (PID: {existing_pid})，先停止现有进程")
-            await self.stop()
+            # 使用 _stop_impl 而非 stop()，避免在已持有锁的情况下再次加锁导致死锁
+            await self._stop_impl()
 
         users = self._get_v2ray_users()
         if not users:
@@ -1497,6 +1553,8 @@ class XrayManager:
                 chain_routing_entries
             )
             XRAY_CONFIG_PATH.write_text(json.dumps(xray_config, indent=2))
+            # 设置配置文件权限（包含敏感信息）
+            os.chmod(XRAY_CONFIG_PATH, 0o600)
             self.process.config = xray_config
             logger.info(f"Xray 配置已生成: {XRAY_CONFIG_PATH}")
         except Exception as e:
@@ -1539,7 +1597,12 @@ class XrayManager:
             return False
 
     async def stop(self) -> bool:
-        """停止 Xray"""
+        """停止 Xray（线程安全）"""
+        async with self._operation_lock:
+            return await self._stop_impl()
+
+    async def _stop_impl(self) -> bool:
+        """停止 Xray 的实际实现"""
         logger.info("停止 Xray...")
 
         # 获取 PID（优先使用实例变量，否则从文件读取）
@@ -1600,7 +1663,12 @@ class XrayManager:
         return True
 
     async def reload(self) -> bool:
-        """重载配置"""
+        """重载配置（线程安全）"""
+        async with self._operation_lock:
+            return await self._reload_impl()
+
+    async def _reload_impl(self) -> bool:
+        """重载配置的实际实现"""
         logger.info("重载 Xray 配置...")
 
         # 读取新配置
@@ -1608,7 +1676,7 @@ class XrayManager:
         if not config or not config.get("enabled"):
             # 配置已禁用，停止 Xray
             if self._is_process_alive():
-                await self.stop()
+                await self._stop_impl()
             return True
 
         users = self._get_v2ray_users()
@@ -1628,6 +1696,8 @@ class XrayManager:
                 chain_routing_entries
             )
             XRAY_CONFIG_PATH.write_text(json.dumps(xray_config, indent=2))
+            # 设置配置文件权限（包含敏感信息）
+            os.chmod(XRAY_CONFIG_PATH, 0o600)
             self.process.config = xray_config
         except Exception as e:
             logger.error(f"生成 Xray 配置失败: {e}")
@@ -1635,13 +1705,13 @@ class XrayManager:
 
         # 如果进程不在运行，启动它
         if not self._is_process_alive():
-            return await self.start()
+            return await self._start_impl()
 
         # 发送 SIGHUP 重载配置
         # 注意：Xray 可能不支持 SIGHUP 热重载，需要重启
         logger.info("重启 Xray 以应用新配置")
-        await self.stop()
-        return await self.start()
+        await self._stop_impl()
+        return await self._start_impl()
 
     def _read_pid_from_file(self) -> Optional[int]:
         """从 PID 文件读取 PID"""

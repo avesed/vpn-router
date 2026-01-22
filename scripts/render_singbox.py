@@ -8,6 +8,7 @@
 - 应用自定义路由规则（如果有）
 - 支持广告拦截 rule_set（从 ABP/hosts 列表转换）
 """
+import hashlib
 import ipaddress
 import json
 import logging
@@ -1423,7 +1424,19 @@ def ensure_peer_outbounds(config: dict, peer_nodes: List[dict]) -> List[str]:
         peer_tags.append(outbound_tag)
 
         # 获取 SOCKS 端口（与 xray_manager.py 中分配的端口一致）
-        socks_port = peer.get("xray_socks_port") or (PEER_SOCKS_PORT_BASE + idx)
+        # 必须使用数据库中分配的端口以确保一致性
+        socks_port = peer.get("xray_socks_port")
+        if not socks_port:
+            # 基于 peer_tag 计算确定性端口（使用 MD5 而非 hash()）
+            # hash() 在不同 Python 进程间不稳定（hash randomization）
+            # MD5 确保跨进程、跨重启的一致性
+            # 注意：必须与 xray_manager.py 使用相同的算法
+            tag_hash = int(hashlib.md5(tag.encode()).hexdigest()[:8], 16) % 99
+            socks_port = PEER_SOCKS_PORT_BASE + tag_hash
+            print(
+                f"[render] 警告: Peer {tag} 缺少 xray_socks_port，"
+                f"使用基于哈希的端口 {socks_port}"
+            )
 
         socks_outbound = {
             "type": "socks",

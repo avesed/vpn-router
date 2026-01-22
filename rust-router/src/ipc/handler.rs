@@ -3905,6 +3905,7 @@ impl IpcHandler {
             ChainError::NotInChain => ErrorCode::PermissionDenied,
             ChainError::PrepareFailed(_, _)
             | ChainError::CommitFailed(_, _)
+            | ChainError::PartialCommit { .. }
             | ChainError::RemoteValidationFailed(_)
             | ChainError::RuleEngine(_)
             | ChainError::LockError(_)

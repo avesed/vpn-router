@@ -104,14 +104,25 @@ pub fn sniff_tls_sni(data: &[u8]) -> Option<String> {
     // Get record length
     let record_length = u16::from_be_bytes([data[3], data[4]]) as usize;
 
-    // Sanity check on record length
-    if record_length > 16384 || data.len() < TLS_RECORD_HEADER_SIZE + record_length {
+    // Sanity check on record length - RFC 5246 limits TLS record to 16384 bytes
+    // Return None for clearly invalid lengths to prevent parsing corrupted/malformed data
+    if record_length > 16384 {
         trace!(
-            "Invalid record length: {} (data len: {})",
-            record_length,
-            data.len()
+            "Invalid TLS record length exceeds RFC 5246 limit: {} (max: 16384)",
+            record_length
         );
-        // Continue anyway with available data
+        return None;
+    }
+
+    // Check if we have enough data for the full record
+    if data.len() < TLS_RECORD_HEADER_SIZE + record_length {
+        trace!(
+            "Incomplete TLS record: have {} bytes, need {} (header + record)",
+            data.len(),
+            TLS_RECORD_HEADER_SIZE + record_length
+        );
+        // Continue with available data - this allows partial packet analysis
+        // which is useful for TCP stream reassembly scenarios
     }
 
     // Parse handshake message
