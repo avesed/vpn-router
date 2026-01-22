@@ -74,7 +74,9 @@ use crate::tunnel::{
     derive_public_key, generate_private_key, SmoltcpBridge, SimpleTcpProxy, WgTunnel,
     WgTunnelBuilder, WgTunnelConfig, OutboundHttpRequest, DEFAULT_WG_MTU,
 };
+use crate::ingress::ReplyPacket;
 use tokio::sync::mpsc;
+use std::sync::atomic::Ordering;
 
 /// Phase 12-Fix.I: Extract port from endpoint string (e.g., "10.1.1.206:36201" -> Some(36201))
 fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {
@@ -82,6 +84,81 @@ fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {
         .rsplit(':')
         .next()
         .and_then(|port_str| port_str.parse::<u16>().ok())
+}
+
+/// Phase 12-Fix.P2: Check if a packet is API traffic (TCP to/from port 36000)
+///
+/// API traffic includes:
+/// - Requests: TCP packets destined for local_ip:36000
+/// - Responses: TCP packets FROM remote_ip:36000
+///
+/// Everything else (other ports, other IPs, UDP, etc.) is chain traffic.
+///
+/// # Arguments
+/// * `packet` - Raw IP packet bytes
+/// * `local_ip` - The local tunnel IP (e.g., 10.200.200.2)
+/// * `remote_ip` - The remote peer's tunnel IP (e.g., 10.200.200.1)
+///
+/// # Returns
+/// `true` if this is API traffic that should go to smoltcp/SimpleTcpProxy
+fn is_api_packet(packet: &[u8], local_ip: Ipv4Addr, remote_ip: Option<Ipv4Addr>) -> bool {
+    // Need at least IP header (20 bytes)
+    if packet.len() < 20 {
+        return false;
+    }
+
+    // Check IP version (must be IPv4)
+    let version = (packet[0] >> 4) & 0x0F;
+    if version != 4 {
+        return false;
+    }
+
+    // Get header length (in 32-bit words)
+    let ihl = (packet[0] & 0x0F) as usize;
+    let ip_header_len = ihl * 4;
+
+    if packet.len() < ip_header_len {
+        return false;
+    }
+
+    // Get protocol (offset 9)
+    let protocol = packet[9];
+
+    // TCP protocol = 6
+    if protocol != 6 {
+        return false;
+    }
+
+    // Need TCP header (at least 4 bytes for ports)
+    if packet.len() < ip_header_len + 4 {
+        return false;
+    }
+
+    // Get source IP (offset 12-15)
+    let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+
+    // Get destination IP (offset 16-19)
+    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+
+    // Get source port (TCP header offset 0-1)
+    let src_port = u16::from_be_bytes([packet[ip_header_len], packet[ip_header_len + 1]]);
+
+    // Get destination port (TCP header offset 2-3)
+    let dst_port = u16::from_be_bytes([packet[ip_header_len + 2], packet[ip_header_len + 3]]);
+
+    // Check for API request: dst_ip == local_ip AND dst_port == 36000
+    if dst_ip == local_ip && dst_port == 36000 {
+        return true;
+    }
+
+    // Check for API response: src_ip == remote_ip AND src_port == 36000
+    if let Some(remote) = remote_ip {
+        if src_ip == remote && src_port == 36000 {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Error types for peer operations
@@ -292,6 +369,10 @@ pub struct PeerManager {
     /// Phase 12-Fix.P: Outbound HTTP request senders for each peer's TCP proxy
     /// This allows ForwardPeerRequest to send HTTP requests through the unified pump
     outbound_request_txs: RwLock<HashMap<String, mpsc::Sender<OutboundHttpRequest>>>,
+    /// Phase 12-Fix.P2: Peer tunnel processor sender for chain traffic routing
+    /// When a peer tunnel receives packets that are NOT for the local API (port 36000),
+    /// they are forwarded here for DSCP-based chain routing on Terminal nodes
+    peer_tunnel_tx: RwLock<Option<mpsc::Sender<ReplyPacket>>>,
 }
 
 impl PeerManager {
@@ -319,6 +400,7 @@ impl PeerManager {
             proxy_tasks: RwLock::new(HashMap::new()),
             proxy_shutdown_txs: RwLock::new(HashMap::new()),
             outbound_request_txs: RwLock::new(HashMap::new()),
+            peer_tunnel_tx: RwLock::new(None),
         }
     }
 
@@ -348,7 +430,19 @@ impl PeerManager {
             proxy_tasks: RwLock::new(HashMap::new()),
             proxy_shutdown_txs: RwLock::new(HashMap::new()),
             outbound_request_txs: RwLock::new(HashMap::new()),
+            peer_tunnel_tx: RwLock::new(None),
         }
+    }
+
+    /// Phase 12-Fix.P2: Set the peer tunnel processor sender for chain traffic routing
+    ///
+    /// This should be called from main.rs after the peer_tunnel_processor is started.
+    /// When peer tunnels receive packets that are NOT destined for the local API (port 36000),
+    /// they will be forwarded to this channel for DSCP-based chain routing.
+    pub fn set_peer_tunnel_tx(&self, tx: mpsc::Sender<ReplyPacket>) {
+        let mut guard = self.peer_tunnel_tx.write();
+        *guard = Some(tx);
+        debug!("Peer tunnel processor TX set for chain traffic routing");
     }
 
     /// Get the local node tag
@@ -986,6 +1080,12 @@ impl PeerManager {
             .unwrap_or_else(|| "10.200.200.1/32".to_string());
         let local_ip_only = local_ip_str.split('/').next().unwrap_or("10.200.200.1");
 
+        // Parse remote tunnel IP for bidirectional API traffic detection
+        let remote_ip: Option<Ipv4Addr> = config.tunnel_remote_ip.as_ref().and_then(|ip_str| {
+            let ip_only = ip_str.split('/').next().unwrap_or(ip_str);
+            ip_only.parse::<Ipv4Addr>().ok()
+        });
+
         if let Ok(local_ip) = local_ip_only.parse::<Ipv4Addr>() {
             // Create shutdown channel
             let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -1009,6 +1109,10 @@ impl PeerManager {
             let tag_clone = tag.to_string();
             let tunnel_for_proxy = tunnel_arc.clone();
 
+            // Phase 12-Fix.P2: Clone peer_tunnel_tx for chain traffic routing
+            let peer_tunnel_tx_clone = self.peer_tunnel_tx.read().clone();
+            let tunnel_tag_for_pump = format!("peer-{}", tag);
+
             let proxy_task = tokio::spawn(async move {
                 info!(
                     tag = %tag_clone,
@@ -1028,6 +1132,12 @@ impl PeerManager {
 
                 // Clone tunnel for pump task
                 let tunnel_for_pump = tunnel_for_proxy.clone();
+
+                // Phase 12-Fix.P2: Clone values for pump task
+                let local_ip_for_pump = local_ip;
+                let remote_ip_for_pump = remote_ip;
+                let tunnel_tag_pump = tunnel_tag_for_pump.clone();
+                let peer_tx_for_pump = peer_tunnel_tx_clone.clone();
 
                 // Spawn packet pump task
                 let mut pump_shutdown_rx = shutdown_rx.resubscribe();
@@ -1049,13 +1159,74 @@ impl PeerManager {
                                 }
                             }
 
-                            // RX: tunnel -> smoltcp (incoming packets)
+                            // RX: tunnel -> routing decision (API vs chain traffic)
+                            // Phase 12-Fix.P2: Route packets based on destination
+                            // - API traffic (TCP to local_ip:36000) -> smoltcp
+                            // - Chain traffic (everything else) -> peer_tunnel_processor
                             result = tunnel_for_pump.recv() => {
                                 match result {
                                     Ok(packet) => {
-                                        if rx_sender.send(packet).await.is_err() {
-                                            debug!("Proxy receiver dropped");
-                                            break;
+                                        // Parse IP header to determine destination
+                                        // Check both request (dst=local:36000) and response (src=remote:36000)
+                                        let is_api_traffic = is_api_packet(&packet, local_ip_for_pump, remote_ip_for_pump);
+
+                                        // Debug: Extract packet info for logging
+                                        let (src_ip, dst_ip, src_port, dst_port, proto) = if packet.len() >= 24 {
+                                            let s_ip = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                                            let d_ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                                            let ihl = ((packet[0] & 0x0F) as usize) * 4;
+                                            let protocol = packet[9];
+                                            let (sp, dp) = if packet.len() >= ihl + 4 {
+                                                (u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                                                 u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+                                            } else {
+                                                (0, 0)
+                                            };
+                                            (s_ip.to_string(), d_ip.to_string(), sp, dp, protocol)
+                                        } else {
+                                            ("?".to_string(), "?".to_string(), 0, 0, 0)
+                                        };
+
+                                        debug!(
+                                            tunnel = %tunnel_tag_pump,
+                                            src = %src_ip,
+                                            dst = %dst_ip,
+                                            src_port = src_port,
+                                            dst_port = dst_port,
+                                            proto = proto,
+                                            is_api = is_api_traffic,
+                                            local_ip = %local_ip_for_pump,
+                                            "[PUMP-RX] Received packet from peer tunnel"
+                                        );
+
+                                        if is_api_traffic {
+                                            // API traffic: forward to smoltcp for SimpleTcpProxy
+                                            debug!(tunnel = %tunnel_tag_pump, "[PUMP-API] Forwarding to smoltcp (API traffic)");
+                                            if rx_sender.send(packet).await.is_err() {
+                                                debug!("Proxy receiver dropped");
+                                                break;
+                                            }
+                                        } else {
+                                            // Chain traffic: forward to peer_tunnel_processor
+                                            debug!(tunnel = %tunnel_tag_pump, "[PUMP-CHAIN] Forwarding to peer_tunnel_processor");
+                                            if let Some(ref tx) = peer_tx_for_pump {
+                                                let reply = ReplyPacket {
+                                                    packet,
+                                                    tunnel_tag: tunnel_tag_pump.clone(),
+                                                };
+                                                if let Err(e) = tx.try_send(reply) {
+                                                    warn!(
+                                                        tunnel = %tunnel_tag_pump,
+                                                        "[PUMP-CHAIN-ERR] Failed to send chain packet to processor: {:?}",
+                                                        e
+                                                    );
+                                                }
+                                            } else {
+                                                warn!(
+                                                    tunnel = %tunnel_tag_pump,
+                                                    "[PUMP-CHAIN-ERR] Peer tunnel processor not available, dropping chain packet"
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -1266,6 +1437,12 @@ impl PeerManager {
             PeerError::TunnelCreationFailed(format!("Invalid tunnel local IP: {}", local_ip_only))
         })?;
 
+        // Parse remote tunnel IP for bidirectional API traffic detection
+        let remote_ip: Option<Ipv4Addr> = config.tunnel_remote_ip.as_ref().and_then(|ip_str| {
+            let ip_only = ip_str.split('/').next().unwrap_or(ip_str);
+            ip_only.parse::<Ipv4Addr>().ok()
+        });
+
         // Check if already running
         {
             let tasks = self.proxy_tasks.read();
@@ -1297,6 +1474,10 @@ impl PeerManager {
         let tag_clone = tag.to_string();
         let tunnel_for_proxy = tunnel_arc.clone();
 
+        // Phase 12-Fix.P2: Clone peer_tunnel_tx for chain traffic routing
+        let peer_tunnel_tx_clone = self.peer_tunnel_tx.read().clone();
+        let tunnel_tag_for_pump = format!("peer-{}", tag);
+
         let proxy_task = tokio::spawn(async move {
             info!(
                 tag = %tag_clone,
@@ -1316,6 +1497,12 @@ impl PeerManager {
 
             // Clone tunnel for pump task
             let tunnel_for_pump = tunnel_for_proxy.clone();
+
+            // Phase 12-Fix.P2: Clone values for pump task
+            let local_ip_for_pump = local_ip;
+            let remote_ip_for_pump = remote_ip;
+            let tunnel_tag_pump = tunnel_tag_for_pump.clone();
+            let peer_tx_for_pump = peer_tunnel_tx_clone.clone();
 
             // Spawn packet pump task
             let mut pump_shutdown_rx = shutdown_rx.resubscribe();
@@ -1337,13 +1524,72 @@ impl PeerManager {
                             }
                         }
 
-                        // RX: tunnel -> smoltcp (incoming packets)
+                        // RX: tunnel -> routing decision (API vs chain traffic)
+                        // Phase 12-Fix.P2: Route packets based on destination
                         result = tunnel_for_pump.recv() => {
                             match result {
                                 Ok(packet) => {
-                                    if rx_sender.send(packet).await.is_err() {
-                                        debug!("Proxy receiver dropped");
-                                        break;
+                                    // Parse IP header to determine destination
+                                    // Check both request (dst=local:36000) and response (src=remote:36000)
+                                    let is_api_traffic = is_api_packet(&packet, local_ip_for_pump, remote_ip_for_pump);
+
+                                    // Debug: Extract packet info for logging
+                                    let (src_ip, dst_ip, src_port, dst_port, proto) = if packet.len() >= 24 {
+                                        let s_ip = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+                                        let d_ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                                        let ihl = ((packet[0] & 0x0F) as usize) * 4;
+                                        let protocol = packet[9];
+                                        let (sp, dp) = if packet.len() >= ihl + 4 {
+                                            (u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                                             u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+                                        } else {
+                                            (0, 0)
+                                        };
+                                        (s_ip.to_string(), d_ip.to_string(), sp, dp, protocol)
+                                    } else {
+                                        ("?".to_string(), "?".to_string(), 0, 0, 0)
+                                    };
+
+                                    debug!(
+                                        tunnel = %tunnel_tag_pump,
+                                        src = %src_ip,
+                                        dst = %dst_ip,
+                                        src_port = src_port,
+                                        dst_port = dst_port,
+                                        proto = proto,
+                                        is_api = is_api_traffic,
+                                        local_ip = %local_ip_for_pump,
+                                        "[PUMP-RX] Received packet from peer tunnel"
+                                    );
+
+                                    if is_api_traffic {
+                                        // API traffic: forward to smoltcp for SimpleTcpProxy
+                                        debug!(tunnel = %tunnel_tag_pump, "[PUMP-API] Forwarding to smoltcp (API traffic)");
+                                        if rx_sender.send(packet).await.is_err() {
+                                            debug!("Proxy receiver dropped");
+                                            break;
+                                        }
+                                    } else {
+                                        // Chain traffic: forward to peer_tunnel_processor
+                                        debug!(tunnel = %tunnel_tag_pump, "[PUMP-CHAIN] Forwarding to peer_tunnel_processor");
+                                        if let Some(ref tx) = peer_tx_for_pump {
+                                            let reply = ReplyPacket {
+                                                packet,
+                                                tunnel_tag: tunnel_tag_pump.clone(),
+                                            };
+                                            if let Err(e) = tx.try_send(reply) {
+                                                warn!(
+                                                    tunnel = %tunnel_tag_pump,
+                                                    "[PUMP-CHAIN-ERR] Failed to send chain packet to processor: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        } else {
+                                            warn!(
+                                                tunnel = %tunnel_tag_pump,
+                                                "[PUMP-CHAIN-ERR] Peer tunnel processor not available, dropping chain packet"
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {

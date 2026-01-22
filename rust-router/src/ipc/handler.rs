@@ -3660,21 +3660,6 @@ impl IpcHandler {
             );
         };
 
-        let Some(wg_egress_manager) = &self.wg_egress_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "WireGuard egress manager not available",
-            );
-        };
-
-        // Get peer configuration
-        let Some(config) = peer_manager.get_peer_config(tag) else {
-            return IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Peer '{tag}' not found"),
-            );
-        };
-
         // Use PeerManager.connect() for both WireGuard and Xray peers
         // This stores WireGuard tunnels in peer_manager.wg_tunnels (without reply receiver)
         // which is required for smoltcp bidirectional communication in forward_via_wg_tunnel
@@ -3703,7 +3688,8 @@ impl IpcHandler {
 
     /// Handle `DisconnectPeer` command
     ///
-    /// Disconnects from a connected peer by removing the tunnel from WgEgressManager.
+    /// Disconnects from a connected peer by calling PeerManager.disconnect().
+    /// This properly cleans up the WireGuard tunnel and releases the UDP socket.
     async fn handle_disconnect_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
             return IpcResponse::error(
@@ -3712,31 +3698,8 @@ impl IpcHandler {
             );
         };
 
-        // Get peer config to check tunnel type
-        let config = peer_manager.get_peer_config(tag);
-
-        // For WireGuard peers, remove from WgEgressManager
-        if let Some(ref cfg) = config {
-            if cfg.tunnel_type == TunnelType::WireGuard {
-                if let Some(wg_egress_manager) = &self.wg_egress_manager {
-                    let peer_tunnel_tag = format!("peer-{}", tag);
-                    if wg_egress_manager.has_tunnel(&peer_tunnel_tag) {
-                        if let Err(e) = wg_egress_manager.remove_tunnel(&peer_tunnel_tag, None).await {
-                            warn!("Failed to remove peer tunnel '{}': {}", peer_tunnel_tag, e);
-                        } else {
-                            info!("Removed peer tunnel '{}'", peer_tunnel_tag);
-                        }
-                    }
-                }
-
-                // Update peer state
-                peer_manager.set_disconnected_external(tag);
-
-                return IpcResponse::success_with_message(format!("Disconnected from peer '{tag}'"));
-            }
-        }
-
-        // For Xray peers, use PeerManager's internal handling
+        // Use PeerManager's disconnect() for all peer types
+        // This ensures proper cleanup of tunnels and UDP sockets
         match peer_manager.disconnect(tag).await {
             Ok(()) => {
                 info!("Disconnected from peer '{}'", tag);
@@ -3923,7 +3886,8 @@ impl IpcHandler {
             ChainError::AlreadyExists(_) => ErrorCode::AlreadyExists,
             ChainError::AlreadyActivating(_)
             | ChainError::AlreadyActive(_)
-            | ChainError::CannotRemoveActiveChain(_) => ErrorCode::OperationFailed,
+            | ChainError::CannotRemoveActiveChain(_)
+            | ChainError::InvalidState { .. } => ErrorCode::OperationFailed,
             ChainError::InvalidTag(_)
             | ChainError::InvalidDescription(_)
             | ChainError::InvalidDscp(_)
@@ -4889,6 +4853,15 @@ impl IpcHandler {
         // Phase 11-Fix.R: Add chain-routing endpoints for IPC-based chain activation
         "/api/chain-routing/register",
         "/api/chain-routing/unregister",
+        // Phase 12-Fix.P: Add 2PC endpoints for distributed chain activation
+        "/api/chain-routing/prepare",
+        "/api/chain-routing/commit",
+        "/api/chain-routing/abort",
+        // Phase 12-Fix.T: Add diagnostic endpoints for chain troubleshooting
+        "/api/chain-routing/status",
+        "/api/chain-routing",
+        "/api/chains",
+        "/api/egress/list",
     ];
 
     /// Validate that the path is in the allowed list

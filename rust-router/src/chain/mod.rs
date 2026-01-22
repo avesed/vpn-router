@@ -53,6 +53,6 @@ pub use manager::{
     PeerConnectivityCallback,
 };
 pub use two_phase::{
-    ChainNetworkClient, MockNetworkClient, NoOpNetworkClient, ParticipantState, TwoPhaseCommit,
-    TwoPhaseError, TwoPhaseState,
+    ChainNetworkClient, ForwardPeerNetworkClient, MockNetworkClient, NoOpNetworkClient,
+    ParticipantState, TwoPhaseCommit, TwoPhaseError, TwoPhaseState,
 };

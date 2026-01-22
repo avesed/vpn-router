@@ -493,6 +493,10 @@ pub struct WgIngressManager {
     /// Processed packet receiver (for testing/integration)
     packet_rx: tokio::sync::Mutex<Option<mpsc::Receiver<ProcessedPacket>>>,
 
+    /// Processed packet sender (for injecting packets into forwarding loop)
+    /// Phase 12-Fix.P3: Used by peer_tunnel_processor to forward non-WG egress
+    packet_tx: RwLock<Option<mpsc::Sender<ProcessedPacket>>>,
+
     /// Next tunnel index for peer creation
     next_tunnel_index: AtomicU64,
 
@@ -566,6 +570,7 @@ impl WgIngressManager {
             shutdown_tx: RwLock::new(None),
             task_handle: RwLock::new(None),
             packet_rx: tokio::sync::Mutex::new(None),
+            packet_tx: RwLock::new(None),
             next_tunnel_index: AtomicU64::new(1),
             socket_recv_buffer: DEFAULT_SO_RCVBUF,
             socket_send_buffer: DEFAULT_SO_SNDBUF,
@@ -658,6 +663,8 @@ impl WgIngressManager {
         // Create packet channel
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
         *self.packet_rx.lock().await = Some(packet_rx);
+        // Phase 12-Fix.P3: Store sender for peer_tunnel_processor injection
+        *self.packet_tx.write() = Some(packet_tx.clone());
 
         // Share peers reference with the background task (not a copy!)
         let task_peers = Arc::clone(&self.peers);
@@ -922,6 +929,15 @@ impl WgIngressManager {
     /// This can only be called once; subsequent calls return None.
     pub async fn take_packet_receiver(&self) -> Option<mpsc::Receiver<ProcessedPacket>> {
         self.packet_rx.lock().await.take()
+    }
+
+    /// Get a clone of the packet sender for injecting packets into the forwarding loop
+    ///
+    /// Phase 12-Fix.P3: Used by peer_tunnel_processor to forward non-WG egress packets
+    /// (like `direct` egress) back through the main forwarding loop.
+    #[must_use]
+    pub fn get_packet_sender(&self) -> Option<mpsc::Sender<ProcessedPacket>> {
+        self.packet_tx.read().clone()
     }
 
     /// Check whether an IP is allowed for a specific peer

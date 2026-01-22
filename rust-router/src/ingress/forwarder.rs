@@ -2106,7 +2106,7 @@ async fn forward_tcp_packet(
     // Check if this goes to a WireGuard egress (full IP packet forwarding)
     // This includes:
     // - Standard egress: wg-*, pia-*
-    // - Peer tunnels: peer-* (created via ConnectPeer IPC, stored in WgEgressManager)
+    // - Peer tunnels: peer-* (stored in PeerManager.wg_tunnels via ConnectPeer IPC)
     // - Any tunnel registered in WgEgressManager
     let is_wg_egress = outbound_tag.starts_with("wg-")
         || outbound_tag.starts_with("pia-")
@@ -2122,7 +2122,39 @@ async fn forward_tcp_packet(
             parsed.total_len as u64,
         );
 
-        // Forward full IP packet to WireGuard egress
+        // Phase 12-Fix: For peer-* tunnels, first check PeerManager.wg_tunnels
+        // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
+        // not WgEgressManager. This fixes the "Tunnel not found" error for chain routing.
+        if outbound_tag.starts_with("peer-") {
+            if let Some(pm) = peer_manager {
+                if let Some(tunnel) = pm.get_wg_tunnel(outbound_tag) {
+                    match tunnel.send(&processed.data).await {
+                        Ok(()) => {
+                            debug!(
+                                "Forwarded TCP to peer tunnel '{}': {}:{} -> {}:{} (flags={}, {} bytes)",
+                                outbound_tag,
+                                parsed.src_ip,
+                                tcp_details.src_port,
+                                parsed.dst_ip,
+                                tcp_details.dst_port,
+                                tcp_details.flags_string(),
+                                parsed.total_len
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to forward TCP to peer tunnel '{}': {}",
+                                outbound_tag, e
+                            );
+                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Forward full IP packet to WireGuard egress (WgEgressManager)
         match wg_egress_manager
             .send(outbound_tag, processed.data.clone())
             .await
@@ -2807,7 +2839,7 @@ async fn forward_udp_packet(
     // Determine if this is a WireGuard egress tunnel (managed by WgEgressManager)
     // This includes:
     // - Standard egress: wg-*, pia-*
-    // - Peer tunnels: peer-* (created via ConnectPeer IPC, stored in WgEgressManager)
+    // - Peer tunnels: peer-* (stored in PeerManager.wg_tunnels via ConnectPeer IPC)
     // - Any tunnel registered in WgEgressManager
     let is_wg_egress = outbound_tag.starts_with("wg-")
         || outbound_tag.starts_with("pia-")
@@ -2815,8 +2847,33 @@ async fn forward_udp_packet(
         || wg_egress_manager.has_tunnel(outbound_tag);
 
     if is_wg_egress {
-        // Forward through WireGuard egress tunnel (PIA, custom, WARP, etc.)
-        // For WireGuard tunnels, we send the entire IP packet (it gets encapsulated)
+        // Phase 12-Fix: For peer-* tunnels, first check PeerManager.wg_tunnels
+        // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
+        // not WgEgressManager. This fixes the "Tunnel not found" error for chain routing.
+        if outbound_tag.starts_with("peer-") {
+            if let Some(pm) = peer_manager {
+                if let Some(tunnel) = pm.get_wg_tunnel(outbound_tag) {
+                    match tunnel.send(&processed.data).await {
+                        Ok(()) => {
+                            debug!(
+                                "Forwarded UDP to peer tunnel '{}': {} -> {}:{} ({} bytes)",
+                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to forward UDP to peer tunnel '{}': {} -> {}:{}, error: {}",
+                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, e
+                            );
+                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Forward through WireGuard egress tunnel (WgEgressManager)
         match wg_egress_manager.send(outbound_tag, processed.data.clone()).await {
             Ok(()) => {
                 debug!(
@@ -3854,13 +3911,20 @@ pub struct PeerTunnelProcessorStatsSnapshot {
 /// 2. Use IngressProcessor to extract DSCP and get routing decision
 /// 3. If Terminal role: route to exit_egress and clear DSCP
 /// 4. Forward packet to the appropriate egress
+///
+/// # Phase 12-Fix.P3: Non-WG Egress Support
+///
+/// For non-WireGuard egress (direct, SOCKS), packets are forwarded to the main
+/// forwarding loop via `forward_tx`. This reuses all existing TCP/UDP/SOCKS
+/// forwarding logic instead of duplicating it here.
 pub async fn run_peer_tunnel_processor_loop(
     mut packet_rx: mpsc::Receiver<ReplyPacket>,
     processor: Arc<super::processor::IngressProcessor>,
     wg_egress_manager: Arc<WgEgressManager>,
     stats: Arc<PeerTunnelProcessorStats>,
+    forward_tx: Option<mpsc::Sender<super::manager::ProcessedPacket>>,
 ) {
-    info!("Peer tunnel processor started");
+    info!("Peer tunnel processor started (forward_tx: {})", forward_tx.is_some());
 
     while let Some(reply) = packet_rx.recv().await {
         stats.packets_received.fetch_add(1, Ordering::Relaxed);
@@ -3871,14 +3935,57 @@ pub async fn run_peer_tunnel_processor_loop(
         // Use the tunnel tag as a pseudo "peer" identifier for logging
         let peer_id = format!("tunnel:{}", tunnel_tag);
 
+        // Debug: Extract DSCP and packet info for logging
+        let (src_ip, dst_ip, src_port, dst_port, proto, dscp_in) = if packet.len() >= 24 {
+            let s_ip = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let d_ip = std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            let ihl = ((packet[0] & 0x0F) as usize) * 4;
+            let protocol = packet[9];
+            // Extract DSCP from ToS field (bits 2-7 of byte 1)
+            let dscp = (packet[1] >> 2) & 0x3F;
+            let (sp, dp) = if packet.len() >= ihl + 4 {
+                (u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                 u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+            } else {
+                (0, 0)
+            };
+            (s_ip.to_string(), d_ip.to_string(), sp, dp, protocol, dscp)
+        } else {
+            ("?".to_string(), "?".to_string(), 0, 0, 0, 0)
+        };
+
+        debug!(
+            tunnel = %tunnel_tag,
+            src = %src_ip,
+            dst = %dst_ip,
+            src_port = src_port,
+            dst_port = dst_port,
+            proto = proto,
+            dscp = dscp_in,
+            "[TERMINAL-RX] Received chain packet from peer tunnel"
+        );
+
         // Get routing decision from ingress processor (handles DSCP/chain routing)
         let routing = match processor.process(&packet, &peer_id) {
-            Ok(decision) => decision,
+            Ok(decision) => {
+                debug!(
+                    tunnel = %tunnel_tag,
+                    outbound = %decision.outbound,
+                    dscp_mark = ?decision.dscp_mark,
+                    routing_mark = ?decision.routing_mark,
+                    match_info = ?decision.match_info,
+                    is_chain = decision.is_chain_packet,
+                    "[TERMINAL-ROUTE] Got routing decision"
+                );
+                decision
+            },
             Err(e) => {
                 stats.routing_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    "Peer tunnel processor: failed to get routing decision for packet from {}: {}",
-                    tunnel_tag, e
+                    tunnel = %tunnel_tag,
+                    dscp = dscp_in,
+                    "[TERMINAL-ROUTE-ERR] Failed to get routing decision: {}",
+                    e
                 );
                 continue;
             }
@@ -3886,6 +3993,12 @@ pub async fn run_peer_tunnel_processor_loop(
 
         // Apply DSCP modification if needed (e.g., clear DSCP for Terminal nodes)
         if let Some(dscp_mark) = routing.dscp_mark {
+            debug!(
+                tunnel = %tunnel_tag,
+                old_dscp = dscp_in,
+                new_dscp = dscp_mark,
+                "[TERMINAL-DSCP] Setting DSCP value"
+            );
             if let Err(e) = set_dscp(&mut packet, dscp_mark) {
                 warn!(
                     "Peer tunnel processor: failed to set DSCP {} on packet: {}",
@@ -3894,14 +4007,15 @@ pub async fn run_peer_tunnel_processor_loop(
             }
         }
 
-        let outbound_tag = &routing.outbound;
+        // Clone outbound_tag before potential move of routing
+        let outbound_tag = routing.outbound.clone();
 
         debug!(
-            "Peer tunnel processor: {} -> outbound '{}' (match: {:?}, dscp: {:?})",
-            tunnel_tag,
-            outbound_tag,
-            routing.match_info,
-            routing.dscp_mark
+            tunnel = %tunnel_tag,
+            outbound = %outbound_tag,
+            match_info = ?routing.match_info,
+            dscp_mark = ?routing.dscp_mark,
+            "[TERMINAL-FWD] Forwarding to egress"
         );
 
         // Handle blocked packets
@@ -3918,12 +4032,12 @@ pub async fn run_peer_tunnel_processor_loop(
         let is_wg_egress = outbound_tag.starts_with("wg-")
             || outbound_tag.starts_with("pia-")
             || outbound_tag.starts_with("peer-")
-            || wg_egress_manager.has_tunnel(outbound_tag);
+            || wg_egress_manager.has_tunnel(&outbound_tag);
 
         if is_wg_egress {
             // Forward to WireGuard egress tunnel
             let packet_len = packet.len();
-            match wg_egress_manager.send(outbound_tag, packet).await {
+            match wg_egress_manager.send(&outbound_tag, packet).await {
                 Ok(()) => {
                     stats.wg_egress_forwarded.fetch_add(1, Ordering::Relaxed);
                     trace!(
@@ -3940,16 +4054,48 @@ pub async fn run_peer_tunnel_processor_loop(
                     );
                 }
             }
+        } else if let Some(ref tx) = forward_tx {
+            // Phase 12-Fix.P3: Forward non-WG egress to main forwarding loop
+            // This reuses all existing TCP/UDP/SOCKS forwarding logic
+            let processed = super::manager::ProcessedPacket {
+                data: packet,
+                routing,
+                // Use tunnel tag as pseudo peer identifier
+                peer_public_key: tunnel_tag.clone(),
+                // Use a placeholder address - the packet already has real src/dst in IP header
+                src_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+            };
+
+            match tx.try_send(processed) {
+                Ok(()) => {
+                    stats.other_forwarded.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "Peer tunnel processor: forwarded to main loop for egress '{}'",
+                        outbound_tag
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    stats.routing_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Peer tunnel processor: forwarding queue full, dropping packet for '{}'",
+                        outbound_tag
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    stats.routing_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Peer tunnel processor: forwarding channel closed, dropping packet for '{}'",
+                        outbound_tag
+                    );
+                }
+            }
         } else {
-            // For non-WG egress (SOCKS, direct), we need more complex handling
-            // For now, log a warning - this would require full TCP/UDP forwarding logic
-            stats.other_forwarded.fetch_add(1, Ordering::Relaxed);
+            // No forward_tx configured - cannot handle non-WG egress
+            stats.routing_errors.fetch_add(1, Ordering::Relaxed);
             warn!(
-                "Peer tunnel processor: non-WG egress '{}' not fully supported yet for chain terminal",
+                "Peer tunnel processor: non-WG egress '{}' requires forward_tx but none configured",
                 outbound_tag
             );
-            // TODO: Implement SOCKS/direct forwarding for Terminal nodes
-            // This would require extracting src/dst IP and ports, creating connections, etc.
         }
 
         stats.packets_processed.fetch_add(1, Ordering::Relaxed);
@@ -3959,17 +4105,27 @@ pub async fn run_peer_tunnel_processor_loop(
 }
 
 /// Spawn the peer tunnel processor loop as a tokio task
+///
+/// # Arguments
+///
+/// * `packet_rx` - Receiver for packets from peer tunnels
+/// * `processor` - Ingress processor for routing decisions
+/// * `wg_egress_manager` - Manager for WireGuard egress tunnels
+/// * `stats` - Statistics collector
+/// * `forward_tx` - Optional sender to main forwarding loop for non-WG egress (direct/SOCKS)
 pub fn spawn_peer_tunnel_processor(
     packet_rx: mpsc::Receiver<ReplyPacket>,
     processor: Arc<super::processor::IngressProcessor>,
     wg_egress_manager: Arc<WgEgressManager>,
     stats: Arc<PeerTunnelProcessorStats>,
+    forward_tx: Option<mpsc::Sender<super::manager::ProcessedPacket>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_peer_tunnel_processor_loop(
         packet_rx,
         processor,
         wg_egress_manager,
         stats,
+        forward_tx,
     ))
 }
 

@@ -60,13 +60,18 @@
 //! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.6.3
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tracing::{debug, warn};
 
 use crate::ipc::ChainConfig;
+use crate::peer::manager::PeerManager;
+use crate::tunnel::OutboundHttpRequest;
 
 /// Default timeout for 2PC operations in seconds
 pub const DEFAULT_2PC_TIMEOUT_SECS: u64 = 30;
@@ -221,6 +226,225 @@ impl ChainNetworkClient for NoOpNetworkClient {
 
     async fn send_abort(&self, _node: &str, _chain_tag: &str) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// Network client that sends 2PC messages through WireGuard tunnels via ForwardPeerRequest
+///
+/// This implementation uses the existing peer tunnel infrastructure to send
+/// PREPARE, COMMIT, and ABORT messages to remote nodes.
+///
+/// # Phase 12-Fix.P
+///
+/// Uses the unified pump pattern - requests are sent through the TCP proxy's
+/// channel rather than creating a competing packet pump.
+pub struct ForwardPeerNetworkClient {
+    /// Reference to peer manager for getting tunnel info and request senders
+    peer_manager: Arc<PeerManager>,
+    /// Local node tag for source identification
+    local_node_tag: String,
+    /// Request timeout in seconds
+    timeout_secs: u64,
+}
+
+impl ForwardPeerNetworkClient {
+    /// Create a new ForwardPeerNetworkClient
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_manager` - Reference to the peer manager
+    /// * `local_node_tag` - Tag of the local node (used as source_node in requests)
+    pub fn new(peer_manager: Arc<PeerManager>, local_node_tag: String) -> Self {
+        Self {
+            peer_manager,
+            local_node_tag,
+            timeout_secs: DEFAULT_2PC_TIMEOUT_SECS,
+        }
+    }
+
+    /// Set the request timeout
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Send an HTTP request through the peer's WireGuard tunnel
+    ///
+    /// # Arguments
+    ///
+    /// * `node` - Target peer node tag
+    /// * `path` - API endpoint path (e.g., "/api/chain-routing/prepare")
+    /// * `body` - JSON request body
+    ///
+    /// # Returns
+    ///
+    /// The response body on success, or an error message
+    async fn send_request(&self, node: &str, path: &str, body: String) -> Result<String, String> {
+        // Get peer config to find tunnel IPs
+        let peer_config = self
+            .peer_manager
+            .get_peer_config(node)
+            .ok_or_else(|| format!("Peer '{}' not found", node))?;
+
+        // Get tunnel IPs
+        let tunnel_local_ip: Ipv4Addr = peer_config
+            .tunnel_local_ip
+            .as_ref()
+            .ok_or_else(|| format!("Peer '{}' has no tunnel_local_ip configured", node))?
+            .parse()
+            .map_err(|e| format!("Invalid tunnel_local_ip for peer '{}': {}", node, e))?;
+
+        let tunnel_remote_ip: Ipv4Addr = peer_config
+            .tunnel_remote_ip
+            .as_ref()
+            .ok_or_else(|| format!("Peer '{}' has no tunnel_remote_ip configured", node))?
+            .parse()
+            .map_err(|e| format!("Invalid tunnel_remote_ip for peer '{}': {}", node, e))?;
+
+        // Get the outbound request sender
+        let request_sender = self
+            .peer_manager
+            .get_outbound_request_sender(node)
+            .ok_or_else(|| {
+                format!(
+                    "No outbound request channel for peer '{}' - tunnel may not be connected",
+                    node
+                )
+            })?;
+
+        debug!(
+            node = %node,
+            path = %path,
+            local_ip = %tunnel_local_ip,
+            remote_ip = %tunnel_remote_ip,
+            "Sending 2PC request through WireGuard tunnel"
+        );
+
+        // Build request headers
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers.insert("X-Tunnel-Source-IP".to_string(), tunnel_local_ip.to_string());
+        headers.insert("X-Tunnel-Peer-Tag".to_string(), self.local_node_tag.clone());
+
+        // Create oneshot channel for response
+        let (response_tx, response_rx) = oneshot::channel();
+
+        // Build the outbound request
+        let outbound_request = OutboundHttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            host: tunnel_remote_ip.to_string(),
+            port: 36000,
+            body: Some(body),
+            headers: Some(headers),
+            response_tx,
+        };
+
+        // Send the request
+        request_sender
+            .send(outbound_request)
+            .await
+            .map_err(|_| format!("Failed to send request to TCP proxy for peer '{}'", node))?;
+
+        // Wait for response with timeout
+        let timeout_duration = Duration::from_secs(self.timeout_secs);
+        let response = timeout(timeout_duration, response_rx)
+            .await
+            .map_err(|_| format!("Request to peer '{}' timed out after {}s", node, self.timeout_secs))?
+            .map_err(|_| format!("Response channel closed for peer '{}'", node))?;
+
+        // Check response
+        if response.success {
+            let body = response.body.unwrap_or_default();
+            debug!(
+                node = %node,
+                status = ?response.status_code,
+                body_len = body.len(),
+                "2PC request completed successfully"
+            );
+            Ok(body)
+        } else {
+            let error = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            warn!(node = %node, error = %error, "2PC request failed");
+            Err(error)
+        }
+    }
+
+    /// Parse JSON response to check for success
+    fn parse_response(&self, response: &str) -> Result<(), String> {
+        // Parse JSON response to check success field
+        // Expected format: {"success": true, "message": "..."} or {"success": false, "message": "..."}
+        let json: serde_json::Value = serde_json::from_str(response)
+            .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+
+        let success = json
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if success {
+            Ok(())
+        } else {
+            // Check both "message" (API format) and "error" (fallback) fields
+            let error = json
+                .get("message")
+                .or_else(|| json.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            Err(error.to_string())
+        }
+    }
+}
+
+#[async_trait]
+impl ChainNetworkClient for ForwardPeerNetworkClient {
+    async fn send_prepare(&self, node: &str, config: &ChainConfig) -> Result<(), String> {
+        debug!(node = %node, chain = %config.tag, "Sending PREPARE to remote node");
+
+        // Build request body
+        let body = serde_json::json!({
+            "chain_tag": config.tag,
+            "config": config,
+            "source_node": self.local_node_tag
+        });
+
+        let response = self
+            .send_request(node, "/api/chain-routing/prepare", body.to_string())
+            .await?;
+
+        self.parse_response(&response)
+    }
+
+    async fn send_commit(&self, node: &str, chain_tag: &str) -> Result<(), String> {
+        debug!(node = %node, chain = %chain_tag, "Sending COMMIT to remote node");
+
+        // Build request body
+        let body = serde_json::json!({
+            "chain_tag": chain_tag,
+            "source_node": self.local_node_tag
+        });
+
+        let response = self
+            .send_request(node, "/api/chain-routing/commit", body.to_string())
+            .await?;
+
+        self.parse_response(&response)
+    }
+
+    async fn send_abort(&self, node: &str, chain_tag: &str) -> Result<(), String> {
+        debug!(node = %node, chain = %chain_tag, "Sending ABORT to remote node");
+
+        // Build request body
+        let body = serde_json::json!({
+            "chain_tag": chain_tag,
+            "source_node": self.local_node_tag
+        });
+
+        let response = self
+            .send_request(node, "/api/chain-routing/abort", body.to_string())
+            .await?;
+
+        self.parse_response(&response)
     }
 }
 

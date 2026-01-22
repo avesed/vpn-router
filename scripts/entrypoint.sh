@@ -295,6 +295,39 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
+# Phase 12-Fix: Unified node_tag from database
+# All components (rust-router, api_server, rust_router_manager) will use this
+export RUST_ROUTER_NODE_TAG=$(python3 -c "
+from db_helper import get_db
+from key_manager import KeyManager
+import socket
+import re
+import os
+
+key = KeyManager.get_or_create_key()
+geodata_path = os.environ.get('GEODATA_DB_PATH', '/etc/sing-box/geoip-geodata.db')
+user_db_path = os.environ.get('USER_DB_PATH', '/etc/sing-box/user-config.db')
+
+try:
+    db = get_db(geodata_path, user_db_path, key)
+    settings = db.get_all_settings()
+    stored_tag = settings.get('node_tag', '').strip()
+    if stored_tag:
+        print(stored_tag)
+    else:
+        # Fallback to hostname, normalized
+        hostname = socket.gethostname()
+        normalized = re.sub(r'[^a-z0-9-]', '-', hostname.lower())
+        normalized = re.sub(r'-+', '-', normalized).strip('-')
+        if not normalized or not normalized[0].isalpha():
+            normalized = 'node-' + normalized
+        print(normalized[:64])
+except Exception as e:
+    # Ultimate fallback
+    print(socket.gethostname())
+" 2>/dev/null)
+echo "[entrypoint] node_tag: ${RUST_ROUTER_NODE_TAG}"
+
 # Cleanup stale interfaces from previous container run (host network mode)
 cleanup_stale_interfaces
 

@@ -446,6 +446,14 @@ impl IngressProcessor {
             .routing_mark
             .and_then(ChainMark::from_routing_mark)
         {
+            debug!(
+                peer = src_peer,
+                outbound = %result.outbound,
+                routing_mark = chain_mark.routing_mark,
+                dscp_value = chain_mark.dscp_value,
+                "[CHAIN-ENTRY-1] Chain rule matched, attempting to resolve next hop"
+            );
+
             // This is a chain route - resolve chain tag to peer tunnel for entry node
             if let Some(chain_manager) = self.chain_manager.read().clone() {
                 let chain_tag = &result.outbound;
@@ -455,7 +463,10 @@ impl IngressProcessor {
                         chain_tag = chain_tag,
                         next_hop = %next_hop_tunnel,
                         dscp = chain_mark.dscp_value,
-                        "Entry node: routing to chain peer tunnel"
+                        dst_ip = ?conn_info.dest_ip,
+                        dst_port = conn_info.dest_port,
+                        "[CHAIN-ENTRY-2] Entry node: routing to chain peer tunnel, will set DSCP={}",
+                        chain_mark.dscp_value
                     );
                     return Ok(RoutingDecision {
                         outbound: next_hop_tunnel,
@@ -470,7 +481,12 @@ impl IngressProcessor {
                 warn!(
                     peer = src_peer,
                     chain_tag = chain_tag,
-                    "Chain route matched but no next hop tunnel found"
+                    "[CHAIN-ENTRY-ERR] Chain route matched but no next hop tunnel found"
+                );
+            } else {
+                debug!(
+                    peer = src_peer,
+                    "[CHAIN-ENTRY-ERR] Chain rule matched but no ChainManager available"
                 );
             }
         }

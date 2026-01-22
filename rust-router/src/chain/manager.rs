@@ -159,6 +159,14 @@ pub enum ChainError {
     #[error("Cannot remove chain in state '{0}': must be inactive or error")]
     CannotRemoveActiveChain(String),
 
+    /// Invalid state transition
+    #[error("Chain '{chain}' in invalid state: expected {expected}, got {actual}")]
+    InvalidState {
+        chain: String,
+        expected: String,
+        actual: String,
+    },
+
     /// Prepare failed
     #[error("PREPARE failed on node {0}: {1}")]
     PrepareFailed(String, String),
@@ -1618,8 +1626,8 @@ impl ChainManager {
             chain_tag, source_node
         );
 
-        // Step 1: Get chain config and role
-        let (config, my_role) = {
+        // Step 1: Get chain config, role, and state
+        let (config, my_role, current_state) = {
             let chains = self
                 .chains
                 .read()
@@ -1629,13 +1637,52 @@ impl ChainManager {
                 .get(chain_tag)
                 .ok_or_else(|| ChainError::NotFound(chain_tag.to_string()))?;
 
-            // Chain must be in Inactive state (was prepared)
-            if chain.state != ChainState::Inactive {
-                return Err(ChainError::AlreadyActive(chain_tag.to_string()));
+            (chain.config.clone(), chain.my_role, chain.state)
+        };
+
+        // Phase 12-Fix.C: Handle already-active chains gracefully
+        // If chain is already active, ensure routing is set up (idempotent)
+        // This fixes the case where chain was activated but fwmark_router wasn't updated
+        if current_state == ChainState::Active {
+            // Check if routing is already set up
+            let routing_registered = {
+                let callback_guard = self.routing_callback.read()
+                    .map_err(|e| ChainError::LockError(e.to_string()))?;
+                if let Some(callback) = callback_guard.as_ref() {
+                    callback.is_chain_registered(chain_tag)
+                } else {
+                    false
+                }
+            };
+
+            if routing_registered {
+                debug!(
+                    "COMMIT for chain {} - already active and routing registered, success",
+                    chain_tag
+                );
+                return Ok(());
             }
 
-            (chain.config.clone(), chain.my_role)
-        };
+            // Chain is active but routing not set up - fix it
+            debug!(
+                "COMMIT for chain {} - active but routing not registered, setting up routing",
+                chain_tag
+            );
+            self.setup_local_routing(chain_tag, &config, my_role)
+                .map_err(ChainError::RuleEngine)?;
+
+            debug!("COMMIT succeeded for chain {} (routing repaired)", chain_tag);
+            return Ok(());
+        }
+
+        // Normal flow: chain should be Inactive (was prepared)
+        if current_state != ChainState::Inactive {
+            return Err(ChainError::InvalidState {
+                chain: chain_tag.to_string(),
+                expected: "inactive".to_string(),
+                actual: format!("{:?}", current_state),
+            });
+        }
 
         // Step 2: Set up local DSCP routing
         self.setup_local_routing(chain_tag, &config, my_role)

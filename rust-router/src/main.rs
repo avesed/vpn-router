@@ -469,6 +469,15 @@ async fn main() -> Result<()> {
     chain_manager.set_routing_callback(routing_callback);
     debug!("Set RuleEngineRoutingCallback on ChainManager");
 
+    // Phase 12-Fix.P: Wire up the network client for 2PC messages
+    // This allows ChainManager to send PREPARE/COMMIT/ABORT to remote nodes via WG tunnels
+    let network_client = Arc::new(rust_router::chain::ForwardPeerNetworkClient::new(
+        Arc::clone(&peer_manager),
+        phase6_config.node_tag.clone(),
+    ));
+    chain_manager.set_network_client(network_client);
+    debug!("Set ForwardPeerNetworkClient on ChainManager");
+
     // Phase 6-Fix.AI: EcmpGroupManager is now created earlier (before ConnectionManager)
     // so it can be passed to both TCP and UDP handlers for load balancing support
 
@@ -879,14 +888,21 @@ async fn main() -> Result<()> {
                 // This processes packets from peer-* tunnels through the ingress processor
                 // to handle DSCP-based routing (e.g., route to exit egress on Terminal nodes)
                 let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(8192);
-                *peer_tunnel_tx.write() = Some(peer_tx);
+                *peer_tunnel_tx.write() = Some(peer_tx.clone());
+                // Phase 12-Fix.P3: Get packet sender for forwarding non-WG egress to main loop
+                let forward_tx = ingress_mgr.get_packet_sender();
                 let peer_tunnel_handle = rust_router::ingress::spawn_peer_tunnel_processor(
                     peer_rx,
                     Arc::clone(ingress_mgr.processor()),
                     Arc::clone(&wg_egress_manager),
                     Arc::clone(&peer_tunnel_stats),
+                    forward_tx, // Forward non-WG egress (direct/SOCKS) to main forwarding loop
                 );
                 info!("Peer tunnel processor started for chain routing");
+
+                // Phase 12-Fix.P2: Set peer_tunnel_tx on PeerManager for chain traffic routing
+                // When peer tunnels receive non-API packets, they forward to peer_tunnel_processor
+                peer_manager.set_peer_tunnel_tx(peer_tx);
 
                 let forward_handle = rust_router::ingress::spawn_forwarding_task(
                     packet_rx,

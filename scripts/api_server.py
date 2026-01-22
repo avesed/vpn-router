@@ -1705,6 +1705,10 @@ PUBLIC_PATHS = {
     "/api/chain-routing/unregister",
     "/api/chain-routing",
     "/api/chain-routing/status",
+    # Phase 12-Fix.P: 2PC endpoints for distributed chain activation
+    "/api/chain-routing/prepare",
+    "/api/chain-routing/commit",
+    "/api/chain-routing/abort",
     # Phase 11.2: 双向自动连接
     "/api/peer-tunnel/reverse-setup",
     # Phase 11-Tunnel: 隧道优先配对握手（通过隧道调用）
@@ -2290,6 +2294,324 @@ def _update_traffic_stats():
     logging.info("[Traffic] 流量统计后台线程已停止（收到关闭信号）")
 
 
+def _restore_peer_connections():
+    """Phase 12-Fix.Q: 在 API server 启动时恢复 peer 连接
+
+    rust-router 重启后会丢失内存中的 peer 配置，需要从数据库恢复。
+    这个函数会：
+    1. 等待 rust-router 就绪
+    2. 查找数据库中标记为 "connected" 的 peer
+    3. 将它们的配置添加到 rust-router
+    4. 尝试建立连接
+
+    在后台线程中运行，失败不会阻塞 API server 启动。
+    """
+    _STARTUP_DELAY = 5  # 等待 rust-router 启动
+    _RETRY_DELAY = 10   # 重试间隔
+    _MAX_RETRIES = 3    # 最大重试次数
+
+    # 等待系统初始化
+    if _shutdown_event.wait(_STARTUP_DELAY):
+        logging.info("[Peer Restore] 收到关闭信号，取消恢复任务")
+        return
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        logging.debug("[Peer Restore] 数据库不可用，跳过 peer 恢复")
+        return
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        logging.debug("[Peer Restore] rust-router 客户端不可用，跳过 peer 恢复")
+        return
+
+    try:
+        db = _get_db()
+
+        # 获取所有 peer 节点
+        all_peers = db.get_peer_nodes()
+        if not all_peers:
+            logging.debug("[Peer Restore] 没有配置的 peer 节点")
+            return
+
+        # 筛选需要恢复的 peer：数据库状态为 connected 的 WireGuard peer
+        peers_to_restore = []
+        for peer in all_peers:
+            tag = peer.get("tag")
+            db_status = peer.get("tunnel_status", "disconnected")
+            tunnel_type = peer.get("tunnel_type", "wireguard")
+            enabled = peer.get("enabled", 1)
+
+            # 只恢复启用的、数据库标记为 connected 的 WireGuard peer
+            if enabled and db_status == "connected" and tunnel_type == "wireguard":
+                peers_to_restore.append(peer)
+
+        if not peers_to_restore:
+            logging.debug("[Peer Restore] 没有需要恢复的 peer 连接")
+            return
+
+        logging.info(f"[Peer Restore] 发现 {len(peers_to_restore)} 个需要恢复的 peer 连接")
+
+        # 恢复每个 peer
+        for peer in peers_to_restore:
+            if _shutdown_event.is_set():
+                logging.info("[Peer Restore] 收到关闭信号，停止恢复")
+                return
+
+            tag = peer.get("tag")
+
+            for retry in range(_MAX_RETRIES):
+                try:
+                    success = _restore_single_peer(peer)
+                    if success:
+                        logging.info(f"[Peer Restore] 成功恢复 peer '{tag}'")
+                        break
+                    else:
+                        logging.warning(f"[Peer Restore] 恢复 peer '{tag}' 失败 (尝试 {retry + 1}/{_MAX_RETRIES})")
+                except Exception as e:
+                    logging.warning(f"[Peer Restore] 恢复 peer '{tag}' 异常: {e} (尝试 {retry + 1}/{_MAX_RETRIES})")
+
+                if retry < _MAX_RETRIES - 1:
+                    _shutdown_event.wait(_RETRY_DELAY)
+                    if _shutdown_event.is_set():
+                        return
+
+    except Exception as e:
+        logging.exception(f"[Peer Restore] peer 连接恢复失败: {e}")
+
+
+def _restore_single_peer(peer: dict) -> bool:
+    """恢复单个 peer 连接
+
+    Args:
+        peer: peer 节点配置字典
+
+    Returns:
+        True if successful, False otherwise
+    """
+    tag = peer.get("tag")
+
+    async def _do_restore():
+        client = RustRouterClient()
+        try:
+            # 1. 添加 peer 配置到 rust-router
+            add_result = await client.add_peer(
+                tag=tag,
+                endpoint=peer.get("endpoint", ""),
+                tunnel_type="wireguard",
+                description=peer.get("description", ""),
+                api_port=peer.get("api_port", 36000),
+                wg_public_key=peer.get("wg_peer_public_key"),
+                wg_local_private_key=peer.get("wg_private_key"),
+                tunnel_local_ip=peer.get("tunnel_local_ip"),
+                tunnel_remote_ip=peer.get("tunnel_remote_ip"),
+                tunnel_port=peer.get("tunnel_port"),
+                persistent_keepalive=25,
+            )
+
+            if not add_result.success and "already exists" not in (add_result.error or "").lower():
+                logging.warning(f"[Peer Restore] 添加 peer '{tag}' 配置失败: {add_result.error}")
+                return False
+
+            # 2. 连接 peer
+            connect_result = await client.connect_peer(tag)
+            if not connect_result.success and "already connected" not in (connect_result.error or "").lower():
+                logging.warning(f"[Peer Restore] 连接 peer '{tag}' 失败: {connect_result.error}")
+                return False
+
+            return True
+        finally:
+            await client.close()
+
+    return _run_async_ipc(_do_restore())
+
+
+def _restore_chain_routes():
+    """Phase 12-Fix.R: 在 API server 启动时恢复 chain 路由到 rust-router
+
+    rust-router 重启后会丢失内存中的 chain 配置，需要从数据库恢复。
+    这个函数会：
+    1. 等待 rust-router 就绪（在 peer restore 之后）
+    2. 从 chain_routing 表读取所有已注册的 DSCP 路由
+    3. 重新创建并激活 chains 到 rust-router
+
+    注意：此函数仅在 Terminal 节点上执行实际恢复，Entry 节点需要重新激活 chains。
+    """
+    _STARTUP_DELAY = 8  # 等待 peer 恢复完成后再恢复 chains
+    _RETRY_DELAY = 5    # 重试间隔
+    _MAX_RETRIES = 2    # 最大重试次数
+
+    # 等待系统初始化
+    if _shutdown_event.wait(_STARTUP_DELAY):
+        logging.info("[Chain Restore] 收到关闭信号，取消恢复任务")
+        return
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        logging.debug("[Chain Restore] 数据库不可用，跳过 chain 恢复")
+        return
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        logging.debug("[Chain Restore] rust-router 客户端不可用，跳过 chain 恢复")
+        return
+
+    try:
+        db = _get_db()
+
+        # 获取所有 DSCP 类型的 chain_routing 记录
+        routes = db.get_chain_routing_list(mark_type="dscp")
+        if not routes:
+            logging.debug("[Chain Restore] 没有需要恢复的 chain 路由")
+            return
+
+        logging.info(f"[Chain Restore] 发现 {len(routes)} 条需要恢复的 chain 路由")
+
+        # 获取本地节点 tag
+        local_tag = _get_local_node_tag(db)
+
+        # 恢复每个 chain route
+        restored_count = 0
+        for route in routes:
+            if _shutdown_event.is_set():
+                logging.info("[Chain Restore] 收到关闭信号，停止恢复")
+                return
+
+            chain_tag = route.get("chain_tag")
+            dscp_value = route.get("mark_value")
+            egress_tag = route.get("egress_tag")
+            source_node = route.get("source_node", "unknown")
+
+            for retry in range(_MAX_RETRIES):
+                try:
+                    success = _restore_single_chain_route(
+                        chain_tag=chain_tag,
+                        dscp_value=dscp_value,
+                        egress_tag=egress_tag,
+                        local_tag=local_tag,
+                        source_tag=source_node,
+                    )
+                    if success:
+                        logging.info(
+                            f"[Chain Restore] 成功恢复 chain '{chain_tag}' "
+                            f"(DSCP={dscp_value} -> {egress_tag})"
+                        )
+                        restored_count += 1
+                        break
+                    else:
+                        logging.warning(
+                            f"[Chain Restore] 恢复 chain '{chain_tag}' 失败 "
+                            f"(尝试 {retry + 1}/{_MAX_RETRIES})"
+                        )
+                except Exception as e:
+                    logging.warning(
+                        f"[Chain Restore] 恢复 chain '{chain_tag}' 异常: {e} "
+                        f"(尝试 {retry + 1}/{_MAX_RETRIES})"
+                    )
+
+                if retry < _MAX_RETRIES - 1:
+                    _shutdown_event.wait(_RETRY_DELAY)
+                    if _shutdown_event.is_set():
+                        return
+
+        logging.info(f"[Chain Restore] 完成，成功恢复 {restored_count}/{len(routes)} 条 chain 路由")
+
+    except Exception as e:
+        logging.exception(f"[Chain Restore] chain 路由恢复失败: {e}")
+
+
+def _restore_single_chain_route(
+    chain_tag: str,
+    dscp_value: int,
+    egress_tag: str,
+    local_tag: str,
+    source_tag: str,
+) -> bool:
+    """恢复单个 chain 路由到 rust-router
+
+    Args:
+        chain_tag: 链路标识
+        dscp_value: DSCP 值
+        egress_tag: 出口标签
+        local_tag: 本地节点 tag
+        source_tag: 来源节点 tag
+
+    Returns:
+        True if successful, False otherwise
+    """
+    async def _do_restore():
+        client = RustRouterClient()
+        try:
+            # 1. 检查 rust-router 是否可用
+            ping_resp = await client.ping()
+            if not ping_resp.success:
+                logging.warning("[Chain Restore] rust-router 不可用")
+                return False
+
+            # 2. 构建 chain 配置（Terminal 角色）
+            chain_config = {
+                "tag": chain_tag,
+                "description": f"Restored chain route from {source_tag}",
+                "dscp_value": dscp_value,
+                "hops": [
+                    {
+                        "node_tag": source_tag,
+                        "role": "entry",
+                        "tunnel_type": "wireguard",
+                    },
+                    {
+                        "node_tag": local_tag,
+                        "role": "terminal",
+                        "tunnel_type": "wireguard",
+                    },
+                ],
+                "rules": [],
+                "exit_egress": egress_tag,
+                "allow_transitive": False,
+            }
+
+            # 3. 检查 chain 是否已存在
+            chains_list = await client.list_chains()
+            existing_tags = {c.tag for c in chains_list if c.tag}
+
+            if chain_tag in existing_tags:
+                # Chain 已存在，检查状态
+                status_resp = await client.get_chain_status(chain_tag)
+                if status_resp.success and status_resp.data:
+                    state = status_resp.data.get("state", "")
+                    if state == "active":
+                        logging.debug(
+                            f"[Chain Restore] chain '{chain_tag}' 已激活，跳过"
+                        )
+                        return True
+                    # 如果存在但未激活，删除后重建
+                    await client.delete_chain(chain_tag)
+
+            # 4. 创建 chain
+            create_resp = await client.create_chain(
+                tag=chain_tag,
+                config=chain_config,
+            )
+            if not create_resp.success:
+                logging.warning(
+                    f"[Chain Restore] 创建 chain '{chain_tag}' 失败: {create_resp.error}"
+                )
+                return False
+
+            # 5. 激活 chain（Terminal 节点需要立即激活以处理 DSCP 包）
+            activate_resp = await client.activate_chain(chain_tag)
+            if not activate_resp.success:
+                logging.warning(
+                    f"[Chain Restore] 激活 chain '{chain_tag}' 失败: {activate_resp.error}"
+                )
+                # 激活失败，清理创建的 chain
+                await client.delete_chain(chain_tag)
+                return False
+
+            return True
+
+        finally:
+            await client.close()
+
+    return _run_async_ipc(_do_restore())
+
+
 def _bidirectional_status_checker():
     """Phase 11-Fix.B: 后台线程定期检查 peer 双向连接状态
 
@@ -2441,6 +2763,26 @@ async def startup_event():
     _sync_wg_listen_port_to_db()
     # 验证配置，检查潜在的 IP/端口冲突
     _validate_network_config()
+    # Phase 12-Fix.Q: 恢复已连接状态的 peer 节点
+    # 在后台线程中执行，避免阻塞启动
+    peer_restore_thread = threading.Thread(
+        target=_restore_peer_connections,
+        name="peer-restore",
+        daemon=True
+    )
+    peer_restore_thread.start()
+    _background_threads.append(peer_restore_thread)
+    print("[Peer] 启动 peer 连接恢复后台任务")
+    # Phase 12-Fix.R: 恢复 chain 路由到 rust-router
+    # 在后台线程中执行，在 peer 恢复之后启动（有 8 秒延迟）
+    chain_restore_thread = threading.Thread(
+        target=_restore_chain_routes,
+        name="chain-restore",
+        daemon=True
+    )
+    chain_restore_thread.start()
+    _background_threads.append(chain_restore_thread)
+    print("[Chain] 启动 chain 路由恢复后台任务")
 
 
 def _validate_network_config():
@@ -14253,6 +14595,46 @@ def _verify_tunnel_request(request: Request, db) -> Optional[Dict]:
 _verify_tunnel_header = _verify_tunnel_request
 
 
+def _is_tunnel_authenticated(request: Request) -> bool:
+    """简单检查请求是否来自已认证的隧道
+
+    用于 2PC chain routing 端点的快速认证检查。
+    通过 X-Tunnel-Source-IP header 验证请求来自本地 SimpleTcpProxy 代理。
+
+    Args:
+        request: FastAPI 请求对象
+
+    Returns:
+        True 如果请求来自已认证的隧道，False 否则
+    """
+    client_ip = _get_direct_client_ip(request)
+
+    # 只接受来自 localhost 的请求（SimpleTcpProxy 代理）
+    if client_ip != "127.0.0.1":
+        logging.debug(f"[tunnel-auth] 拒绝非本地请求: client_ip={client_ip}")
+        return False
+
+    # 检查必须的 tunnel headers
+    tunnel_source_ip = request.headers.get("X-Tunnel-Source-IP")
+    if not tunnel_source_ip:
+        logging.debug("[tunnel-auth] 缺少 X-Tunnel-Source-IP header")
+        return False
+
+    # 验证 tunnel_source_ip 是有效的 peer
+    try:
+        db = _get_db()
+        node = _find_peer_by_tunnel_ip(db, tunnel_source_ip)
+        if node and node.get("tunnel_status") == "connected":
+            logging.debug(f"[tunnel-auth] 认证成功: peer={node.get('tag')}, ip={tunnel_source_ip}")
+            return True
+        else:
+            logging.warning(f"[tunnel-auth] 未找到已连接的 peer: ip={tunnel_source_ip}")
+            return False
+    except Exception as e:
+        logging.error(f"[tunnel-auth] 认证检查失败: {e}")
+        return False
+
+
 def _verify_peer_request_flexible(
     request: Request,
     db,
@@ -14680,7 +15062,9 @@ async def _validate_remote_terminal_egress(
         if not node:
             return f"Terminal node '{terminal_tag}' not found in database"
 
-        if node.get("tunnel_status") != "connected":
+        # Phase 12-Fix.R3: 使用实时状态检查，而非数据库中可能过时的值
+        real_status = _check_peer_tunnel_status(node)
+        if real_status != "connected":
             return f"Terminal node '{terminal_tag}' is not connected"
 
         # 获取本地节点 tag 用于 endpoint IP 认证
@@ -15139,6 +15523,198 @@ class ChainRoutingRegisterRequest(BaseModel):
     )
 
 
+# Phase 12-Fix.P: 2PC (Two-Phase Commit) 请求模型
+class ChainRouting2PCPrepareRequest(BaseModel):
+    """2PC PREPARE 请求 - 验证链路配置"""
+    chain_tag: str = Field(..., pattern=TAG_PATTERN, description="链路标识")
+    config: dict = Field(..., description="完整链路配置")
+    source_node: str = Field(..., pattern=TAG_PATTERN, description="发起节点")
+
+
+class ChainRouting2PCCommitRequest(BaseModel):
+    """2PC COMMIT 请求 - 应用已验证的配置"""
+    chain_tag: str = Field(..., pattern=TAG_PATTERN, description="链路标识")
+    source_node: str = Field(..., pattern=TAG_PATTERN, description="发起节点")
+
+
+class ChainRouting2PCAbortRequest(BaseModel):
+    """2PC ABORT 请求 - 回滚预验证状态"""
+    chain_tag: str = Field(..., pattern=TAG_PATTERN, description="链路标识")
+    source_node: str = Field(..., pattern=TAG_PATTERN, description="发起节点")
+
+
+# Phase 12-Fix.R: 2PC 配置缓存（用于在 COMMIT 时持久化到数据库）
+# key: chain_tag, value: {"config": {...}, "source_node": "...", "prepared_at": timestamp}
+_2pc_config_cache: Dict[str, dict] = {}
+_2pc_cache_lock = threading.Lock()
+
+
+@app.post("/api/chain-routing/prepare")
+async def api_chain_routing_prepare(request: Request, payload: ChainRouting2PCPrepareRequest):
+    """2PC PREPARE: 验证链路路由配置
+
+    Phase 12-Fix.P: 接收来自入口节点的 2PC PREPARE 请求。
+    调用 rust-router IPC prepare_chain_route 验证配置。
+
+    认证方式: 隧道 IP/UUID
+    """
+    client_ip = _get_client_ip(request)
+
+    # 隧道认证
+    if not _is_tunnel_authenticated(request):
+        raise HTTPException(status_code=401, detail="Tunnel authentication required")
+
+    logging.info(f"[2PC-PREPARE] chain={payload.chain_tag} from={payload.source_node} client={client_ip}")
+
+    try:
+        # 调用 rust-router IPC
+        async with RustRouterClient() as client:
+            response = await client.prepare_chain_route(
+                chain_tag=payload.chain_tag,
+                config=payload.config,
+                source_node=payload.source_node,
+            )
+            if response.success:
+                # Phase 12-Fix.R: 缓存配置用于 COMMIT 时持久化
+                import time
+                with _2pc_cache_lock:
+                    _2pc_config_cache[payload.chain_tag] = {
+                        "config": payload.config,
+                        "source_node": payload.source_node,
+                        "prepared_at": time.time(),
+                    }
+                logging.info(f"[2PC-PREPARE] chain={payload.chain_tag} PREPARED (config cached)")
+                return {"success": True, "message": "Chain route prepared"}
+            else:
+                logging.warning(f"[2PC-PREPARE] chain={payload.chain_tag} FAILED: {response.error}")
+                return {"success": False, "message": response.error or "Prepare failed"}
+    except Exception as e:
+        logging.error(f"[2PC-PREPARE] chain={payload.chain_tag} ERROR: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/chain-routing/commit")
+async def api_chain_routing_commit(request: Request, payload: ChainRouting2PCCommitRequest):
+    """2PC COMMIT: 应用已验证的链路路由
+
+    Phase 12-Fix.P: 接收来自入口节点的 2PC COMMIT 请求。
+    调用 rust-router IPC commit_chain_route 应用配置。
+
+    认证方式: 隧道 IP/UUID
+    """
+    client_ip = _get_client_ip(request)
+
+    # 隧道认证
+    if not _is_tunnel_authenticated(request):
+        raise HTTPException(status_code=401, detail="Tunnel authentication required")
+
+    logging.info(f"[2PC-COMMIT] chain={payload.chain_tag} from={payload.source_node} client={client_ip}")
+
+    try:
+        # 调用 rust-router IPC
+        async with RustRouterClient() as client:
+            response = await client.commit_chain_route(
+                chain_tag=payload.chain_tag,
+                source_node=payload.source_node,
+            )
+            if response.success:
+                # Phase 12-Fix.R: 持久化 chain 配置到数据库
+                db_persist_success = False
+                try:
+                    with _2pc_cache_lock:
+                        cached = _2pc_config_cache.pop(payload.chain_tag, None)
+
+                    if cached and HAS_DATABASE and USER_DB_PATH.exists():
+                        config = cached.get("config", {})
+                        dscp_value = config.get("dscp_value")
+                        exit_egress = config.get("exit_egress")
+                        source_node = cached.get("source_node", payload.source_node)
+
+                        if dscp_value and exit_egress:
+                            db = _get_db()
+                            db.add_or_update_chain_routing(
+                                chain_tag=payload.chain_tag,
+                                mark_value=dscp_value,
+                                egress_tag=exit_egress,
+                                mark_type="dscp",
+                                source_node=source_node,
+                            )
+                            db_persist_success = True
+                            logging.info(
+                                f"[2PC-COMMIT] chain={payload.chain_tag} persisted to DB "
+                                f"(DSCP={dscp_value} -> {exit_egress})"
+                            )
+                        else:
+                            logging.warning(
+                                f"[2PC-COMMIT] chain={payload.chain_tag} missing dscp_value or exit_egress, "
+                                f"skipping DB persist"
+                            )
+                    elif not cached:
+                        logging.warning(
+                            f"[2PC-COMMIT] chain={payload.chain_tag} config not found in cache, "
+                            f"skipping DB persist"
+                        )
+                except Exception as db_err:
+                    logging.error(f"[2PC-COMMIT] DB persist error: {db_err}")
+
+                logging.info(
+                    f"[2PC-COMMIT] chain={payload.chain_tag} COMMITTED "
+                    f"(db_persist={'ok' if db_persist_success else 'skipped'})"
+                )
+                return {"success": True, "message": "Chain route committed"}
+            else:
+                # 清理缓存
+                with _2pc_cache_lock:
+                    _2pc_config_cache.pop(payload.chain_tag, None)
+                logging.warning(f"[2PC-COMMIT] chain={payload.chain_tag} FAILED: {response.error}")
+                return {"success": False, "message": response.error or "Commit failed"}
+    except Exception as e:
+        # 清理缓存
+        with _2pc_cache_lock:
+            _2pc_config_cache.pop(payload.chain_tag, None)
+        logging.error(f"[2PC-COMMIT] chain={payload.chain_tag} ERROR: {e}")
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/chain-routing/abort")
+async def api_chain_routing_abort(request: Request, payload: ChainRouting2PCAbortRequest):
+    """2PC ABORT: 回滚链路路由预验证
+
+    Phase 12-Fix.P: 接收来自入口节点的 2PC ABORT 请求。
+    调用 rust-router IPC abort_chain_route 回滚状态。
+
+    认证方式: 隧道 IP/UUID
+    """
+    client_ip = _get_client_ip(request)
+
+    # 隧道认证
+    if not _is_tunnel_authenticated(request):
+        raise HTTPException(status_code=401, detail="Tunnel authentication required")
+
+    logging.info(f"[2PC-ABORT] chain={payload.chain_tag} from={payload.source_node} client={client_ip}")
+
+    try:
+        # Phase 12-Fix.R: 清理缓存
+        with _2pc_cache_lock:
+            _2pc_config_cache.pop(payload.chain_tag, None)
+
+        # 调用 rust-router IPC
+        async with RustRouterClient() as client:
+            response = await client.abort_chain_route(
+                chain_tag=payload.chain_tag,
+                source_node=payload.source_node,
+            )
+            if response.success:
+                logging.info(f"[2PC-ABORT] chain={payload.chain_tag} ABORTED")
+                return {"success": True, "message": "Chain route aborted"}
+            else:
+                logging.warning(f"[2PC-ABORT] chain={payload.chain_tag} FAILED: {response.error}")
+                return {"success": False, "message": response.error or "Abort failed"}
+    except Exception as e:
+        logging.error(f"[2PC-ABORT] chain={payload.chain_tag} ERROR: {e}")
+        return {"success": False, "message": str(e)}
+
+
 @app.post("/api/chain-routing/register")
 def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRequest):
     """注册链路路由
@@ -15317,13 +15893,16 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
                         # Update existing chain - first deactivate if active
                         status_resp = await client.get_chain_status(payload.chain_tag)
                         if status_resp.success and status_resp.data:
-                            if status_resp.data.get("chain_state") == "active":
+                            # Phase 12-Fix.R2: rust-router returns "state", not "chain_state"
+                            if status_resp.data.get("state") == "active":
                                 await client.deactivate_chain(payload.chain_tag)
 
                         # Delete and recreate (update may not change hops)
                         await client.delete_chain(payload.chain_tag)
 
-                    # Create the chain
+                    # Create the chain (in Inactive state)
+                    # NOTE: Do NOT activate here - the entry node's 2PC COMMIT will activate
+                    # This fixes the "Chain is already active" error during 2PC
                     create_resp = await client.create_chain(
                         tag=payload.chain_tag,
                         config=chain_config,
@@ -15331,10 +15910,9 @@ def api_chain_routing_register(request: Request, payload: ChainRoutingRegisterRe
                     if not create_resp.success:
                         return False, f"Failed to create chain: {create_resp.error}"
 
-                    # Activate the chain
-                    activate_resp = await client.activate_chain(payload.chain_tag)
-                    if not activate_resp.success:
-                        return False, f"Failed to activate chain: {activate_resp.error}"
+                    # Phase 12-Fix.R: Chain will be activated by 2PC COMMIT from entry node
+                    # Activating here would cause "Chain is already active" error when
+                    # the entry node sends 2PC PREPARE/COMMIT
 
                     return True, None
                 finally:
@@ -15531,7 +16109,8 @@ def api_chain_routing_unregister(
                         # Deactivate if active
                         status_resp = await client.get_chain_status(chain_tag)
                         if status_resp.success and status_resp.data:
-                            if status_resp.data.get("chain_state") == "active":
+                            # Phase 12-Fix.R2: rust-router returns "state", not "chain_state"
+                            if status_resp.data.get("state") == "active":
                                 await client.deactivate_chain(chain_tag)
 
                         # Delete the chain
@@ -15851,11 +16430,20 @@ def _check_peer_tunnel_status(node: dict) -> str:
                     return "disconnected"
                 elif rr_state == "connecting":
                     return "connecting"
+            else:
+                # Phase 12-Fix.Q: peer 不在 rust-router 中时返回 disconnected
+                # 而不是回退到数据库状态（可能是旧的 "connected"）
+                # 这解决了 rust-router 重启后前端仍显示"已连接"的问题
+                if db_status == "connected":
+                    logging.info(
+                        f"[peers] 节点 '{tag}' 不在 rust-router 中，"
+                        f"数据库状态为 {db_status}，返回 disconnected"
+                    )
+                return "disconnected"
         except Exception as e:
             logging.debug(f"[peers] 查询 rust-router 节点 '{tag}' 状态失败: {e}，回退到数据库状态")
-
-        # rust-router 查询失败时回退到数据库状态
-        return db_status
+            # rust-router 查询失败（如连接错误）时回退到数据库状态
+            return db_status
 
     # 数据库状态不是已连接时直接返回（非 WireGuard 或查询失败）
     if db_status != "connected":
@@ -15976,13 +16564,13 @@ def api_list_peers(enabled_only: bool = False):
 
     # 实时检测隧道状态并更新
     # Phase 12-Fix.D: 前端应显示真实隧道状态
+    # Phase 12-Fix.R4: 双向同步 - 连接和断开都要更新数据库
     for node in nodes:
         real_status = _check_peer_tunnel_status(node)
         if real_status != node.get("tunnel_status"):
-            # 状态不一致时更新返回值
-            if real_status == "disconnected" and node.get("tunnel_status") == "connected":
-                # 真正断开时同步数据库
-                _update_stale_peer_status(db, node, real_status)
+            # 状态不一致时同步数据库（双向）
+            db.update_peer_node(node.get("tag"), tunnel_status=real_status)
+            logging.debug(f"[peers] 自动同步节点 '{node.get('tag')}' 状态: {node.get('tunnel_status')} -> {real_status}")
             node["tunnel_status"] = real_status
 
         # 隐藏敏感字段
@@ -17018,7 +17606,10 @@ async def api_get_peer_egress(tag: str):
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
-    if node.get("tunnel_status") != "connected":
+    # Phase 12-Fix.R3: 使用实时状态检查，而非数据库中可能过时的值
+    # 与 /api/peers 保持一致，确保真实连接状态
+    real_status = _check_peer_tunnel_status(node)
+    if real_status != "connected":
         raise HTTPException(
             status_code=400,
             detail=f"节点 '{tag}' 未连接，无法获取出口列表"

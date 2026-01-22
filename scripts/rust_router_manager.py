@@ -354,8 +354,31 @@ class RustRouterManager:
         return self._db
 
     def _get_local_node_tag(self) -> str:
-        """Match rust-router's local node tag resolution."""
-        return os.environ.get("RUST_ROUTER_NODE_TAG") or socket.gethostname()
+        """Phase 12-Fix: Unified node_tag resolution matching api_server.py.
+
+        Priority:
+        1. Database settings.node_tag (single source of truth)
+        2. RUST_ROUTER_NODE_TAG environment variable (set by entrypoint.sh)
+        3. Hostname as fallback
+        """
+        # Try database first (matches api_server._get_local_node_tag)
+        try:
+            db = self._get_db()
+            if db:
+                settings = db.get_all_settings()
+                stored_tag = settings.get("node_tag", "").strip()
+                if stored_tag:
+                    return stored_tag
+        except Exception:
+            pass
+
+        # Fallback to environment variable (set by entrypoint.sh from database)
+        env_tag = os.environ.get("RUST_ROUTER_NODE_TAG")
+        if env_tag:
+            return env_tag
+
+        # Ultimate fallback to hostname
+        return socket.gethostname()
 
     def _parse_chain_hops(self, hops: Any) -> List[str]:
         """Parse hops from DB (list or JSON string)."""
