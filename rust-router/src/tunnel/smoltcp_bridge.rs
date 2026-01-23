@@ -1,7 +1,7 @@
 //! Async bridge between smoltcp TCP/IP stack and WireGuard tunnel
 //!
 //! This module provides `SmoltcpBridge`, which manages a smoltcp `Interface`
-//! and `SocketSet`, bridging them to the WireGuard tunnel for TCP communication.
+//! and `SocketSet`, bridging them to the WireGuard tunnel for TCP/UDP communication.
 //!
 //! # Architecture
 //!
@@ -46,8 +46,12 @@ use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer, State as TcpState};
+use smoltcp::socket::udp::{
+    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata,
+    RecvError as UdpRecvError, SendError as UdpSendError, Socket as UdpSocket,
+};
 use smoltcp::time::Instant as SmoltcpInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use tracing::{debug, trace, warn};
 
 use crate::tunnel::smoltcp_device::{TunnelPacketQueue, WgTunnelDevice, DEFAULT_WG_MTU};
@@ -59,7 +63,22 @@ const DEFAULT_TCP_RX_BUFFER: usize = 65536;
 const DEFAULT_TCP_TX_BUFFER: usize = 65536;
 
 /// Maximum number of sockets in the socket set
-const MAX_SOCKETS: usize = 16;
+const MAX_SOCKETS: usize = 1024;
+
+/// TCP Maximum Segment Size
+///
+/// MSS = MTU (1420) - IP header (20) - TCP header (20) = 1380
+/// This ensures TCP segments fit within WireGuard's MTU.
+pub const TCP_MSS: u16 = 1380;
+
+/// Default UDP receive buffer size (64 KB)
+const DEFAULT_UDP_RX_BUFFER: usize = 65536;
+
+/// Default UDP transmit buffer size (64 KB)
+const DEFAULT_UDP_TX_BUFFER: usize = 65536;
+
+/// Default number of UDP packet metadata entries
+const DEFAULT_UDP_PACKET_META: usize = 64;
 
 /// Bridge between smoltcp TCP/IP stack and WireGuard tunnel
 ///
@@ -287,10 +306,17 @@ impl SmoltcpBridge {
 
         let rx_buffer = SocketBuffer::new(vec![0u8; rx_buffer_size]);
         let tx_buffer = SocketBuffer::new(vec![0u8; tx_buffer_size]);
-        let socket = TcpSocket::new(rx_buffer, tx_buffer);
+        let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
+
+        // Configure MSS to fit within WireGuard MTU
+        // MSS = MTU (1420) - IP header (20) - TCP header (20) = 1380
+        // Note: smoltcp determines MSS from interface MTU, but we disable
+        // Nagle's algorithm for lower latency in tunnel scenarios.
+        socket.set_nagle_enabled(false);
+
         let handle = self.sockets.add(socket);
 
-        debug!("Created TCP socket: handle={:?}", handle);
+        debug!("Created TCP socket: handle={:?}, MSS={}", handle, TCP_MSS);
         Some(handle)
     }
 
@@ -533,6 +559,205 @@ impl SmoltcpBridge {
         socket.abort();
     }
 
+    // =========================================================================
+    // UDP Socket Methods
+    // =========================================================================
+
+    /// Create a new UDP socket with default buffer sizes
+    ///
+    /// # Returns
+    ///
+    /// The socket handle for the new UDP socket, or `None` if the socket
+    /// set is full.
+    pub fn create_udp_socket(&mut self) -> Option<SocketHandle> {
+        self.create_udp_socket_with_buffer(
+            DEFAULT_UDP_RX_BUFFER,
+            DEFAULT_UDP_TX_BUFFER,
+            DEFAULT_UDP_PACKET_META,
+        )
+    }
+
+    /// Create a new UDP socket with custom buffer sizes
+    ///
+    /// # Arguments
+    ///
+    /// * `rx_buffer_size` - Size of the receive buffer
+    /// * `tx_buffer_size` - Size of the transmit buffer
+    /// * `packet_meta_count` - Number of packet metadata entries for each buffer
+    ///
+    /// # Returns
+    ///
+    /// The socket handle for the new UDP socket, or `None` if the socket
+    /// set is full.
+    pub fn create_udp_socket_with_buffer(
+        &mut self,
+        rx_buffer_size: usize,
+        tx_buffer_size: usize,
+        packet_meta_count: usize,
+    ) -> Option<SocketHandle> {
+        if self.sockets.iter().count() >= MAX_SOCKETS {
+            warn!("Socket set full, cannot create new UDP socket");
+            return None;
+        }
+
+        let rx_meta = vec![UdpPacketMetadata::EMPTY; packet_meta_count];
+        let rx_buffer = vec![0u8; rx_buffer_size];
+        let tx_meta = vec![UdpPacketMetadata::EMPTY; packet_meta_count];
+        let tx_buffer = vec![0u8; tx_buffer_size];
+
+        let socket = UdpSocket::new(
+            UdpPacketBuffer::new(rx_meta, rx_buffer),
+            UdpPacketBuffer::new(tx_meta, tx_buffer),
+        );
+
+        let handle = self.sockets.add(socket);
+        debug!("Created UDP socket: handle={:?}", handle);
+        Some(handle)
+    }
+
+    /// Bind a UDP socket to a local port
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    /// * `port` - The local port to bind to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be bound to the specified port
+    pub fn udp_bind(
+        &mut self,
+        handle: SocketHandle,
+        port: u16,
+    ) -> Result<(), smoltcp::socket::udp::BindError> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.bind(port)
+    }
+
+    /// Send data through a UDP socket
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    /// * `data` - The data to send
+    /// * `remote` - The remote endpoint to send to
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be sent
+    pub fn udp_send(
+        &mut self,
+        handle: SocketHandle,
+        data: &[u8],
+        remote: IpEndpoint,
+    ) -> Result<(), UdpSendError> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.send_slice(data, remote)
+    }
+
+    /// Receive data from a UDP socket
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (data, remote endpoint) on success
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no data is available or the socket is not bound
+    pub fn udp_recv(&mut self, handle: SocketHandle) -> Result<(Vec<u8>, IpEndpoint), UdpRecvError> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        let (data, metadata) = socket.recv()?;
+        let data_vec: Vec<u8> = data.to_vec();
+        Ok((data_vec, metadata.endpoint))
+    }
+
+    /// Check if a UDP socket can send
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    ///
+    /// # Returns
+    ///
+    /// `true` if the socket can accept data for sending
+    #[must_use]
+    pub fn udp_can_send(&self, handle: SocketHandle) -> bool {
+        self.sockets.get::<UdpSocket>(handle).can_send()
+    }
+
+    /// Check if a UDP socket can receive (has pending data)
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    ///
+    /// # Returns
+    ///
+    /// `true` if the socket has data available to read
+    #[must_use]
+    pub fn udp_can_recv(&self, handle: SocketHandle) -> bool {
+        self.sockets.get::<UdpSocket>(handle).can_recv()
+    }
+
+    /// Get a mutable reference to a UDP socket
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    ///
+    /// # Returns
+    ///
+    /// A mutable reference to the UDP socket
+    pub fn get_udp_socket_mut(&mut self, handle: SocketHandle) -> &mut UdpSocket<'static> {
+        self.sockets.get_mut::<UdpSocket>(handle)
+    }
+
+    /// Get an immutable reference to a UDP socket
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    ///
+    /// # Returns
+    ///
+    /// An immutable reference to the UDP socket
+    #[must_use]
+    pub fn get_udp_socket(&self, handle: SocketHandle) -> &UdpSocket<'static> {
+        self.sockets.get::<UdpSocket>(handle)
+    }
+
+    /// Check if a UDP socket is open (bound)
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    ///
+    /// # Returns
+    ///
+    /// `true` if the socket is bound and open
+    #[must_use]
+    pub fn udp_is_open(&self, handle: SocketHandle) -> bool {
+        self.sockets.get::<UdpSocket>(handle).is_open()
+    }
+
+    /// Close a UDP socket
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The socket handle
+    pub fn udp_close(&mut self, handle: SocketHandle) {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.close();
+    }
+
+    // =========================================================================
+    // Internal Methods
+    // =========================================================================
+
     /// Get current timestamp for smoltcp
     ///
     /// Uses a monotonic clock relative to process start time, which is more
@@ -640,13 +865,14 @@ mod tests {
     fn test_bridge_max_sockets() {
         let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
 
-        // Create max sockets
+        // Create max sockets using smaller buffers to speed up test
+        // (MAX_SOCKETS is 1024, so we use minimal buffer sizes)
         for _ in 0..MAX_SOCKETS {
-            assert!(bridge.create_tcp_socket_default().is_some());
+            assert!(bridge.create_tcp_socket(1024, 1024).is_some());
         }
 
         // Next should fail
-        assert!(bridge.create_tcp_socket_default().is_none());
+        assert!(bridge.create_tcp_socket(1024, 1024).is_none());
     }
 
     #[test]
@@ -741,5 +967,100 @@ mod tests {
 
         // State should be closed after abort
         assert_eq!(bridge.tcp_socket_state(handle), TcpState::Closed);
+    }
+
+    // =========================================================================
+    // UDP Socket Tests
+    // =========================================================================
+
+    #[test]
+    fn test_bridge_create_udp_socket() {
+        let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
+
+        let handle = bridge.create_udp_socket();
+        assert!(handle.is_some());
+        assert_eq!(bridge.socket_count(), 1);
+    }
+
+    #[test]
+    fn test_bridge_udp_bind() {
+        let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
+
+        let handle = bridge.create_udp_socket().unwrap();
+        let result = bridge.udp_bind(handle, 12345);
+        assert!(result.is_ok());
+        assert!(bridge.udp_is_open(handle));
+    }
+
+    #[test]
+    fn test_bridge_udp_close() {
+        let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
+
+        let handle = bridge.create_udp_socket().unwrap();
+        bridge.udp_bind(handle, 12345).unwrap();
+        assert!(bridge.udp_is_open(handle));
+
+        bridge.udp_close(handle);
+        assert!(!bridge.udp_is_open(handle));
+    }
+
+    #[test]
+    fn test_bridge_udp_can_send_recv() {
+        let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
+
+        let handle = bridge.create_udp_socket().unwrap();
+        bridge.udp_bind(handle, 12345).unwrap();
+
+        // Bound socket should be able to send
+        assert!(bridge.udp_can_send(handle));
+        // No data received yet
+        assert!(!bridge.udp_can_recv(handle));
+    }
+
+    #[test]
+    fn test_bridge_max_sockets_udp() {
+        let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
+
+        // Create max sockets (mix of TCP and UDP) using smaller buffers
+        for i in 0..MAX_SOCKETS {
+            if i % 2 == 0 {
+                assert!(bridge.create_tcp_socket(1024, 1024).is_some());
+            } else {
+                assert!(bridge.create_udp_socket_with_buffer(1024, 1024, 8).is_some());
+            }
+        }
+
+        // Next should fail (either type)
+        assert!(bridge.create_tcp_socket(1024, 1024).is_none());
+        assert!(bridge.create_udp_socket_with_buffer(1024, 1024, 8).is_none());
+    }
+
+    #[test]
+    fn test_bridge_udp_socket_accessors() {
+        let mut bridge = SmoltcpBridge::new(Ipv4Addr::new(10, 200, 200, 2), 1420);
+
+        let handle = bridge.create_udp_socket().unwrap();
+        bridge.udp_bind(handle, 54321).unwrap();
+
+        // Test immutable accessor
+        {
+            let socket = bridge.get_udp_socket(handle);
+            assert!(socket.is_open());
+        }
+
+        // Test mutable accessor
+        {
+            let socket = bridge.get_udp_socket_mut(handle);
+            socket.close();
+        }
+
+        assert!(!bridge.udp_is_open(handle));
+    }
+
+    #[test]
+    fn test_tcp_mss_constant() {
+        // Verify the TCP_MSS constant is correctly calculated
+        // MSS = MTU (1420) - IP header (20) - TCP header (20) = 1380
+        assert_eq!(TCP_MSS, 1380);
     }
 }

@@ -89,6 +89,7 @@ pub mod tunnel;
 pub mod vision;
 pub mod vless;
 pub mod vless_inbound;
+pub mod vless_wg_bridge;
 pub mod warp;
 
 // Re-export commonly used types at the crate root
@@ -170,6 +171,11 @@ pub use vless_inbound::{
     AuthenticatedUser, InboundTlsConfig, VlessConnection, VlessConnectionHandler,
     VlessDestination, VlessInboundConfig, VlessInboundError, VlessInboundListener,
     VlessInboundResult, VlessInboundStats, VlessUser,
+};
+pub use vless_wg_bridge::{
+    BridgeError, BridgeStats, BridgeStatsSnapshot, PortAllocator, PortAllocatorConfig, PortGuard,
+    SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig,
+    UdpSession as BridgeUdpSession, VlessConnectionId, VlessWgBridge, WgReplyPacket,
 };
 
 /// Crate version
