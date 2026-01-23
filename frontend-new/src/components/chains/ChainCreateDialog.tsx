@@ -18,7 +18,7 @@ import { Loader2 } from "lucide-react";
 
 const formSchema = z.object({
   tag: z.string().min(1, "Tag is required").regex(/^[a-z][a-z0-9-]*$/, "Must start with lowercase letter, only lowercase letters, numbers and hyphens"),
-  name: z.string().optional(),  // Phase 11-Fix.B: 名称可选，默认使用 tag
+  name: z.string().optional(),  // Optional, defaults to tag
   description: z.string().optional(),
   hops: z.array(z.string()).min(1, "At least 1 hop required"),
   exit_egress: z.string().optional(),

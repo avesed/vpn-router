@@ -1,16 +1,7 @@
-//! ECMP group management for Phase 6
+//! ECMP group management
 //!
 //! This module implements ECMP group management with health-aware
 //! member selection and routing mark assignment.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.7 ECMP group structure
-//! - [x] 6.7 Member management
-//! - [x] 6.7 Health integration
-//! - [x] 6.7 Routing mark allocation
-//! - [x] 6.7 `EcmpGroupManager`
-//! - [x] 6.7 Connection-based selection
 //!
 //! # Example
 //!

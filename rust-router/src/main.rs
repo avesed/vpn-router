@@ -14,7 +14,7 @@
 //! # Run with environment overrides
 //! RUST_ROUTER_LOG_LEVEL=debug sudo ./rust-router
 //!
-//! # Run with userspace WireGuard (Phase 6)
+//! # Run with userspace WireGuard
 //! RUST_ROUTER_USERSPACE_WG=true sudo ./rust-router
 //! ```
 
@@ -132,7 +132,7 @@ ENVIRONMENT:
     RUST_ROUTER_MAX_CONNECTIONS  Override maximum connections
     RUST_ROUTER_IPC_SOCKET       Override IPC socket path
 
-    Phase 6 (Userspace WireGuard):
+    Userspace WireGuard:
     RUST_ROUTER_USERSPACE_WG     Enable userspace WireGuard mode (true/false)
     RUST_ROUTER_WG_LISTEN_PORT   WireGuard listen port (default: 36100)
     RUST_ROUTER_WG_PRIVATE_KEY   WireGuard private key (Base64)
@@ -154,7 +154,7 @@ EXAMPLE:
     # Run the router
     sudo rust-router -c /etc/rust-router/config.json
 
-    # Run with userspace WireGuard (Phase 6)
+    # Run with userspace WireGuard
     RUST_ROUTER_USERSPACE_WG=true \
     RUST_ROUTER_WG_PRIVATE_KEY=<base64_key> \
     sudo rust-router -c /etc/rust-router/config.json
@@ -236,9 +236,9 @@ fn build_outbound_manager(config: &Config) -> Arc<OutboundManager> {
     Arc::new(manager)
 }
 
-/// Phase 6 configuration from environment variables
+/// Userspace WireGuard configuration from environment variables
 #[derive(Debug)]
-struct Phase6Config {
+struct UserspaceWgConfig {
     /// Enable userspace WireGuard mode
     userspace_wg: bool,
     /// WireGuard listen port
@@ -259,8 +259,8 @@ struct Phase6Config {
     socks5_inbound_port: u16,
 }
 
-impl Phase6Config {
-    /// Load Phase 6 configuration from environment variables
+impl UserspaceWgConfig {
+    /// Load configuration from environment variables
     fn from_env() -> Self {
         let userspace_wg = std::env::var("RUST_ROUTER_USERSPACE_WG")
             .map(|v| v == "true")
@@ -366,7 +366,7 @@ async fn main() -> Result<()> {
         .expect("Failed to create default routing snapshot");
     let rule_engine = Arc::new(RuleEngine::new(routing_snapshot));
 
-    // Phase 6-Fix.AI: Create EcmpGroupManager early so we can pass it to ConnectionManager
+    // Create EcmpGroupManager early so we can pass it to ConnectionManager
     // This is needed for ECMP load balancing group support in routing
     let ecmp_group_manager = Arc::new(EcmpGroupManager::new());
     debug!("Created EcmpGroupManager for load balancing");
@@ -391,8 +391,7 @@ async fn main() -> Result<()> {
         // The actual session tracking happens inside UdpPacketProcessor's handle_cache
         let session_manager = Arc::new(UdpSessionManager::new(UdpSessionConfig::default()));
 
-        // Create UDP packet processor with ECMP group manager
-        // Phase 6-Fix.AI: Set ECMP manager for load balancing support
+        // Create UDP packet processor with ECMP group manager for load balancing support
         let processor_config = UdpProcessorConfig::default();
         let mut processor = UdpPacketProcessor::new(processor_config);
         processor.set_ecmp_group_manager(Arc::clone(&ecmp_group_manager));
@@ -445,40 +444,40 @@ async fn main() -> Result<()> {
     );
 
     // ========================================================================
-    // Phase 6: Load Phase 6 configuration and create managers
+    // Load userspace WireGuard configuration and create managers
     // ========================================================================
-    let phase6_config = Phase6Config::from_env();
+    let userspace_wg_config = UserspaceWgConfig::from_env();
 
     info!(
-        "Phase 6 config: userspace_wg={}, node_tag={}, wg_port={}",
-        phase6_config.userspace_wg,
-        phase6_config.node_tag,
-        phase6_config.wg_listen_port
+        "Userspace WG config: enabled={}, node_tag={}, wg_port={}",
+        userspace_wg_config.userspace_wg,
+        userspace_wg_config.node_tag,
+        userspace_wg_config.wg_listen_port
     );
 
     // Create PeerManager (always created for IPC support)
-    let peer_manager = Arc::new(PeerManager::new(phase6_config.node_tag.clone()));
-    debug!("Created PeerManager with node tag: {}", phase6_config.node_tag);
+    let peer_manager = Arc::new(PeerManager::new(userspace_wg_config.node_tag.clone()));
+    debug!("Created PeerManager with node tag: {}", userspace_wg_config.node_tag);
 
     // Create ChainManager (always created for IPC support)
-    let chain_manager = Arc::new(ChainManager::new(phase6_config.node_tag.clone()));
-    debug!("Created ChainManager with node tag: {}", phase6_config.node_tag);
+    let chain_manager = Arc::new(ChainManager::new(userspace_wg_config.node_tag.clone()));
+    debug!("Created ChainManager with node tag: {}", userspace_wg_config.node_tag);
 
     // Wire up the routing callback so chains register with FwmarkRouter
     let routing_callback = Arc::new(RuleEngineRoutingCallback::new(Arc::clone(&rule_engine)));
     chain_manager.set_routing_callback(routing_callback);
     debug!("Set RuleEngineRoutingCallback on ChainManager");
 
-    // Phase 12-Fix.P: Wire up the network client for 2PC messages
+    // Wire up the network client for 2PC messages
     // This allows ChainManager to send PREPARE/COMMIT/ABORT to remote nodes via WG tunnels
     let network_client = Arc::new(rust_router::chain::ForwardPeerNetworkClient::new(
         Arc::clone(&peer_manager),
-        phase6_config.node_tag.clone(),
+        userspace_wg_config.node_tag.clone(),
     ));
     chain_manager.set_network_client(network_client);
     debug!("Set ForwardPeerNetworkClient on ChainManager");
 
-    // Phase 6-Fix.AI: EcmpGroupManager is now created earlier (before ConnectionManager)
+    // EcmpGroupManager is created earlier (before ConnectionManager)
     // so it can be passed to both TCP and UDP handlers for load balancing support
 
     // Create WireGuard egress manager (always created for IPC support)
@@ -569,28 +568,28 @@ async fn main() -> Result<()> {
     debug!("Created WgEgressManager");
 
     // Create WireGuard ingress manager (only if userspace mode is enabled and configured)
-    let wg_ingress_manager: Option<Arc<WgIngressManager>> = if phase6_config.can_enable_userspace_wg() {
-        let private_key = phase6_config.wg_private_key.as_ref().unwrap();
+    let wg_ingress_manager: Option<Arc<WgIngressManager>> = if userspace_wg_config.can_enable_userspace_wg() {
+        let private_key = userspace_wg_config.wg_private_key.as_ref().unwrap();
         let listen_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            phase6_config.wg_listen_port,
+            userspace_wg_config.wg_listen_port,
         );
-        let allowed_subnet: ipnet::IpNet = phase6_config.wg_subnet.parse()
-            .map_err(|e| anyhow::anyhow!("Invalid WG subnet '{}': {}", phase6_config.wg_subnet, e))?;
+        let allowed_subnet: ipnet::IpNet = userspace_wg_config.wg_subnet.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid WG subnet '{}': {}", userspace_wg_config.wg_subnet, e))?;
 
         let wg_ingress_config = WgIngressConfig::builder()
             .private_key(private_key)
             .listen_addr(listen_addr)
-            .local_ip(phase6_config.wg_local_ip)
+            .local_ip(userspace_wg_config.wg_local_ip)
             .allowed_subnet(allowed_subnet)
-            .use_batch_io(phase6_config.wg_batch_io)
+            .use_batch_io(userspace_wg_config.wg_batch_io)
             .build();
 
         match WgIngressManager::new(wg_ingress_config, Arc::clone(&rule_engine)) {
             Ok(manager) => {
                 info!(
                     "Created WgIngressManager (userspace WireGuard on port {})",
-                    phase6_config.wg_listen_port
+                    userspace_wg_config.wg_listen_port
                 );
                 manager.set_chain_manager(Arc::clone(&chain_manager));
                 Some(Arc::new(manager))
@@ -602,7 +601,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        if phase6_config.userspace_wg {
+        if userspace_wg_config.userspace_wg {
             warn!(
                 "Userspace WireGuard requested but RUST_ROUTER_WG_PRIVATE_KEY not set"
             );
@@ -630,10 +629,10 @@ async fn main() -> Result<()> {
         )
     };
 
-    // Wire up Phase 6 managers to IPC handler
+    // Wire up managers to IPC handler
     let mut ipc_handler = ipc_handler
         .with_peer_manager(Arc::clone(&peer_manager))
-        .with_chain_manager(Arc::clone(&chain_manager), phase6_config.node_tag.clone())
+        .with_chain_manager(Arc::clone(&chain_manager), userspace_wg_config.node_tag.clone())
         .with_ecmp_group_manager(Arc::clone(&ecmp_group_manager))
         .with_wg_egress_manager(Arc::clone(&wg_egress_manager));
 
@@ -647,7 +646,7 @@ async fn main() -> Result<()> {
     }
 
     // ========================================================================
-    // Phase 7: DNS Engine Initialization
+    // DNS Engine Initialization
     // ========================================================================
 
     // Create DNS configuration from environment variables with default upstream servers
@@ -708,7 +707,7 @@ async fn main() -> Result<()> {
     let ipc_handler = Arc::new(ipc_handler);
 
     info!(
-        "IPC handler configured with Phase 6 managers (peer={}, chain={}, ecmp={}, wg_ingress={}, wg_egress={}) and DNS engine",
+        "IPC handler configured with managers (peer={}, chain={}, ecmp={}, wg_ingress={}, wg_egress={}) and DNS engine",
         true, true, true,
         wg_ingress_manager.is_some(),
         true
@@ -725,7 +724,7 @@ async fn main() -> Result<()> {
     });
 
     // ========================================================================
-    // Phase 7: Start DNS Servers (UDP + TCP on 127.0.0.1:7853)
+    // Start DNS Servers (UDP + TCP on 127.0.0.1:7853)
     // ========================================================================
 
     // Create rate limiter and handler for DNS servers
@@ -792,11 +791,11 @@ async fn main() -> Result<()> {
     // ========================================================================
     // SOCKS5 Inbound Server (for Xray integration)
     // ========================================================================
-    let socks5_server_handle: Option<tokio::task::JoinHandle<()>> = if phase6_config.socks5_inbound_enabled {
+    let socks5_server_handle: Option<tokio::task::JoinHandle<()>> = if userspace_wg_config.socks5_inbound_enabled {
         use rust_router::ingress::{Socks5Server, Socks5ServerConfig};
 
         let socks5_config = Socks5ServerConfig {
-            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), phase6_config.socks5_inbound_port),
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), userspace_wg_config.socks5_inbound_port),
             ..Default::default()
         };
 
@@ -808,7 +807,7 @@ async fn main() -> Result<()> {
 
         info!(
             "SOCKS5 inbound server starting on 127.0.0.1:{}",
-            phase6_config.socks5_inbound_port
+            userspace_wg_config.socks5_inbound_port
         );
 
         let handle = tokio::spawn(async move {
@@ -824,7 +823,7 @@ async fn main() -> Result<()> {
     };
 
     // ========================================================================
-    // Phase 6: Start userspace WireGuard ingress if enabled
+    // Start userspace WireGuard ingress if enabled
     // ========================================================================
     // Track forwarding task handle for graceful shutdown
     let mut forwarding_task_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -890,9 +889,9 @@ async fn main() -> Result<()> {
                 // to handle DSCP-based routing (e.g., route to exit egress on Terminal nodes)
                 let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(8192);
                 *peer_tunnel_tx.write() = Some(peer_tx.clone());
-                // Phase 12-Fix.P3: Get packet sender for forwarding non-WG egress to main loop
+                // Get packet sender for forwarding non-WG egress to main loop
                 let forward_tx = ingress_mgr.get_packet_sender();
-                // Phase 3: Pass session_tracker, ingress_manager, and peer_manager for reply routing
+                // Pass session_tracker, ingress_manager, and peer_manager for reply routing
                 let peer_tunnel_handle = rust_router::ingress::spawn_peer_tunnel_processor(
                     peer_rx,
                     Arc::clone(ingress_mgr.processor()),
@@ -905,7 +904,7 @@ async fn main() -> Result<()> {
                 );
                 info!("Peer tunnel processor started for chain routing (with reply path support)");
 
-                // Phase 12-Fix.P2: Set peer_tunnel_tx on PeerManager for chain traffic routing
+                // Set peer_tunnel_tx on PeerManager for chain traffic routing
                 // When peer tunnels receive non-API packets, they forward to peer_tunnel_processor
                 peer_manager.set_peer_tunnel_tx(peer_tx);
 
@@ -917,12 +916,12 @@ async fn main() -> Result<()> {
                     session_tracker,
                     Arc::clone(&fwd_stats),
                     Some(direct_reply_tx), // Enable direct UDP reply handling
-                    Some(phase6_config.wg_local_ip), // Local IP for responding to pings to gateway
+                    Some(userspace_wg_config.wg_local_ip), // Local IP for responding to pings to gateway
                     Some(Arc::clone(&ecmp_group_manager)), // ECMP group manager for load balancing
                     Some(Arc::clone(&peer_manager)), // Peer manager for peer WireGuard tunnels
                 );
 
-                info!("Ingress reply router task started");
+                info!("Ingress reply router started");
                 reply_task_handle = Some(reply_handle);
                 peer_tunnel_task_handle = Some(peer_tunnel_handle);
                 info!("Ingress packet forwarding task started");
@@ -972,7 +971,7 @@ async fn main() -> Result<()> {
     ).await;
 
     // ========================================================================
-    // Phase 7: Shutdown DNS servers
+    // Shutdown DNS servers
     // ========================================================================
     info!("Shutting down DNS servers...");
 
@@ -1002,7 +1001,7 @@ async fn main() -> Result<()> {
     }
 
     // ========================================================================
-    // Phase 6: Shutdown WireGuard ingress if running
+    // Shutdown WireGuard ingress if running
     // ========================================================================
     if let Some(ref ingress_mgr) = wg_ingress_manager {
         if ingress_mgr.is_running() {

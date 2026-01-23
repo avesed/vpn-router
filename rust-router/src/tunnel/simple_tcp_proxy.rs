@@ -160,9 +160,7 @@ impl TcpProxyStats {
 /// requests through the same smoltcp bridge that handles inbound connections,
 /// avoiding the need to compete for tunnel.recv() packets.
 ///
-/// # Phase 12-Fix.P
-///
-/// This is part of the permanent fix for the competing pump issue where
+/// This is part of the fix for the competing pump issue where
 /// SimpleTcpProxy and SmoltcpHttpClient both tried to consume tunnel packets.
 #[derive(Debug)]
 pub struct OutboundHttpRequest {
@@ -225,7 +223,7 @@ struct ProxiedConnection {
     local_stream: TcpStream,
     /// Source IP from the tunnel (for header injection)
     source_ip: Ipv4Addr,
-    /// Peer tag for logging and future authentication headers (Phase 5)
+    /// Peer tag for logging and future authentication headers
     /// Currently unused but will be used for X-Tunnel-Peer-Tag and HMAC auth headers
     #[allow(dead_code)]
     peer_tag: Option<String>,
@@ -254,7 +252,7 @@ enum ConnectionState {
     Closing,
 }
 
-/// State for an outbound HTTP request (Phase 12-Fix.P)
+/// State for an outbound HTTP request
 #[derive(Debug)]
 enum OutboundRequestState {
     /// Connecting to remote server
@@ -265,7 +263,7 @@ enum OutboundRequestState {
     Receiving,
 }
 
-/// An active outbound HTTP request (Phase 12-Fix.P)
+/// An active outbound HTTP request
 struct OutboundConnection {
     /// Socket handle in smoltcp
     handle: SocketHandle,
@@ -310,7 +308,7 @@ impl ProxiedConnection {
     }
 
     /// Create a new proxied connection with peer tag
-    /// Reserved for Phase 5 authentication header injection
+    /// Reserved for authentication header injection
     #[allow(dead_code)]
     fn with_peer_tag(
         handle: SocketHandle,
@@ -406,10 +404,10 @@ impl SimpleTcpProxy {
     /// * `bridge` - The smoltcp bridge for TCP/IP handling
     /// * `tx_sender` - Channel to send packets to the WireGuard tunnel
     /// * `rx_receiver` - Channel to receive packets from the WireGuard tunnel
-    /// * `outbound_rx` - Channel to receive outbound HTTP requests (Phase 12-Fix.P)
+    /// * `outbound_rx` - Channel to receive outbound HTTP requests
     /// * `shutdown_rx` - Broadcast receiver for shutdown signal
     ///
-    /// # Phase 12-Fix.P: Unified Pump
+    /// # Unified Pump
     ///
     /// The `outbound_rx` channel allows external code to send HTTP requests through
     /// this proxy's smoltcp bridge. This eliminates the competing pump issue where
@@ -449,7 +447,7 @@ impl SimpleTcpProxy {
         // Active inbound connections (proxied to localhost)
         let mut connections: HashMap<SocketHandle, ProxiedConnection> = HashMap::new();
 
-        // Active outbound connections (HTTP requests through tunnel) - Phase 12-Fix.P
+        // Active outbound connections (HTTP requests through tunnel)
         let mut outbound_connections: HashMap<SocketHandle, OutboundConnection> = HashMap::new();
 
         // Main event loop
@@ -465,7 +463,7 @@ impl SimpleTcpProxy {
                 bridge.feed_rx_packet(packet);
             }
 
-            // Phase 12-Fix.P: Accept new outbound HTTP requests
+            // Accept new outbound HTTP requests
             while let Ok(req) = outbound_rx.try_recv() {
                 match self.start_outbound_request(&mut bridge, req) {
                     Ok(outbound_conn) => {
@@ -587,7 +585,7 @@ impl SimpleTcpProxy {
                 }
             }
 
-            // Phase 12-Fix.P: Process active outbound HTTP requests
+            // Process active outbound HTTP requests
             let mut outbound_to_remove = Vec::new();
             for (handle, outbound) in &mut outbound_connections {
                 match self.process_outbound_connection(&mut bridge, outbound) {
@@ -657,7 +655,7 @@ impl SimpleTcpProxy {
         for (handle, _conn) in connections {
             bridge.remove_socket(handle);
         }
-        // Phase 12-Fix.P: Cleanup outbound connections and notify callers
+        // Cleanup outbound connections and notify callers
         for (handle, mut outbound) in outbound_connections {
             if let Some(tx) = outbound.response_tx.take() {
                 let _ = tx.send(OutboundHttpResponse::error("Proxy shutdown"));
@@ -888,7 +886,7 @@ impl SimpleTcpProxy {
     }
 
     // ========================================================================
-    // Phase 12-Fix.P: Outbound HTTP Request Methods
+    // Outbound HTTP Request Methods
     // ========================================================================
 
     /// Start a new outbound HTTP request

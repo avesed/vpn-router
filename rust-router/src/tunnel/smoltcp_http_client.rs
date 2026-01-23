@@ -385,7 +385,7 @@ impl SmoltcpHttpClient {
         let mut loop_count = 0;
         loop {
             loop_count += 1;
-            // Phase 12-Fix.R: Detailed TCP state debugging
+            // Detailed TCP state debugging
             let state_before = self.bridge.tcp_socket_state(handle);
 
             // Process any incoming packets
@@ -636,7 +636,7 @@ impl SmoltcpHttpClient {
         // Non-blocking receive of all available packets
         let mut count = 0;
         while let Ok(packet) = rx_receiver.try_recv() {
-            // Phase 12-Fix.Q: Log packets received from tunnel
+            // Log packets received from tunnel
             debug!("HTTP client: received {} byte packet from tunnel", packet.len());
             self.bridge.feed_rx_packet(packet);
             count += 1;
@@ -1067,9 +1067,10 @@ mod tests {
 
         let request_str = String::from_utf8_lossy(&request);
 
-        // The injected header should NOT appear as a separate header
-        assert!(!request_str.contains("X-Injected: malicious\r\n"));
-        // The sanitized value should be present (without CR/LF)
+        // The injected header should NOT appear as a separate header line
+        // (it would appear as "\r\nX-Injected:" if injection succeeded)
+        assert!(!request_str.contains("\r\nX-Injected:"));
+        // The sanitized value should be present (without CR/LF in the middle)
         assert!(request_str.contains("X-Custom: valueX-Injected: malicious\r\n"));
     }
 }

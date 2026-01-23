@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """链路路由管理器
 
-.. deprecated:: Phase 12
+.. deprecated::
     此模块已弃用。rust-router 现在在用户空间处理链路路由，无需内核 iptables 规则。
-    
+
     - 链路路由映射存储在数据库的 chain_routing 表中
     - rust-router 的 ChainManager 在用户空间执行 DSCP 到出口的路由
     - 参见 rust-router/src/ingress/processor.rs
-    
+
     保留此文件仅用于向后兼容和参考。所有 add_route/remove_route 函数的内核
     iptables 部分已移除，仅保留数据库操作。
 
@@ -145,7 +145,7 @@ class ChainRouteManager:
                 from db_helper import get_egress_interface_name
                 return get_egress_interface_name(egress_tag, is_pia=False)
 
-        # WARP egress (Phase 3: 所有 WARP 现在都是 WireGuard)
+        # WARP egress (WireGuard only)
         warp_list = self.db.get_warp_egress_list(enabled_only=True)
         for e in warp_list:
             if e["tag"] == egress_tag:
@@ -221,7 +221,7 @@ class ChainRouteManager:
                 self._logger.error(f"Cannot find interface for egress: {egress_tag}")
                 return False
 
-            # Phase 3: 验证接口在系统中实际存在
+            # 验证接口在系统中实际存在
             if not self._interface_exists(interface):
                 self._logger.error(f"Interface '{interface}' does not exist in system")
                 return False

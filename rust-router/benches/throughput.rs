@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo bench --bench throughput`
 //!
-//! Performance targets (Phase 4 - 1C1G VPS):
+//! Performance targets (1C1G VPS):
 //! - Memory: 60MB idle, 150MB under load
 //! - Latency: <1ms overhead per connection
 //! - Throughput: >= sing-box baseline

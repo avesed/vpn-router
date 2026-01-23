@@ -37,7 +37,7 @@ PAIRING_VERSION = 1
 PAIRING_CODE_TTL = 7 * 24 * 60 * 60
 
 # ============================================
-# 安全验证常量（修复 Phase 2 审查发现的问题）
+# 安全验证常量
 # ============================================
 
 # 配对码最大长度（16KB）- 防止内存/CPU 耗尽攻击
@@ -61,7 +61,7 @@ MAX_TIMESTAMP_FUTURE_OFFSET = 300
 # 隧道 IP 基础网段
 TUNNEL_IP_BASE = "10.200.200"
 
-# Phase 6: 隧道端口范围（支持环境变量配置）
+# 隧道端口范围（支持环境变量配置）
 TUNNEL_PORT_BASE = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
 TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
 
@@ -105,7 +105,7 @@ class PairingRequest:
     endpoint: str  # IP:port 格式 (WireGuard 端口)
     tunnel_type: str  # "wireguard" 或 "xray"
 
-    # Phase 11-Fix.K: API 端口（用于通过外部 IP 访问 API）
+    # API 端口（用于通过外部 IP 访问 API）
     # endpoint 包含 WireGuard 端口，api_port 是 Web API 端口（默认 36000）
     api_port: Optional[int] = None
 
@@ -119,14 +119,14 @@ class PairingRequest:
     xray_reality_public_key: Optional[str] = None
     xray_reality_short_id: Optional[str] = None
 
-    # Phase 11.2: 双向自动连接参数
+    # 双向自动连接参数
     # 预生成的密钥对，用于远程节点直接使用（无需密钥交换）
     # 注意：request code 包含私钥，必须保密处理！
     remote_wg_private_key: Optional[str] = None  # 为远程节点预生成的私钥
     remote_wg_public_key: Optional[str] = None  # 对应的公钥
     bidirectional: bool = True  # 是否启用双向连接
 
-    # Phase 11-Tunnel: 隧道 IP 信息（用于隧道优先配对）
+    # 隧道 IP 信息（用于隧道优先配对）
     # 在配对码中包含 IP，确保双方使用一致的地址
     tunnel_local_ip: Optional[str] = None  # 生成方的隧道 IP
     tunnel_remote_ip: Optional[str] = None  # 为远程节点预分配的 IP
@@ -153,17 +153,17 @@ class PairingRequest:
             d["xray_reality_public_key"] = self.xray_reality_public_key
         if self.xray_reality_short_id:
             d["xray_reality_short_id"] = self.xray_reality_short_id
-        # Phase 11.2: 双向自动连接密钥（需保密！）
+        # 双向自动连接密钥（需保密！）
         if self.remote_wg_private_key:
             d["remote_wg_private_key"] = self.remote_wg_private_key
         if self.remote_wg_public_key:
             d["remote_wg_public_key"] = self.remote_wg_public_key
-        # Phase 11-Tunnel: 隧道 IP
+        # 隧道 IP
         if self.tunnel_local_ip:
             d["tunnel_local_ip"] = self.tunnel_local_ip
         if self.tunnel_remote_ip:
             d["tunnel_remote_ip"] = self.tunnel_remote_ip
-        # Phase 11-Fix.K: API 端口
+        # API 端口
         if self.api_port:
             d["api_port"] = self.api_port
         return d
@@ -178,8 +178,7 @@ class PairingRequest:
             node_description=d.get("node_description", ""),
             endpoint=d["endpoint"],
             tunnel_type=d["tunnel_type"],
-            api_port=d.get("api_port"),  # Phase 11-Fix.K
-            psk_hash=d.get("psk_hash", ""),  # 已废弃，兼容旧配对码
+            api_port=d.get("api_port"),            psk_hash=d.get("psk_hash", ""),  # 已废弃，兼容旧配对码
             wg_public_key=d.get("wg_public_key"),
             xray_reality_public_key=d.get("xray_reality_public_key"),
             xray_reality_short_id=d.get("xray_reality_short_id"),
@@ -206,7 +205,7 @@ class PairingResponse:
     tunnel_local_ip: str  # 分配给请求方的 IP
     tunnel_remote_ip: str  # 本节点的隧道 IP
 
-    # Phase 11-Fix.K: API 端口（用于通过外部 IP 访问 API）
+    # API 端口（用于通过外部 IP 访问 API）
     api_port: Optional[int] = None
 
     # PSK 认证（已废弃 - WireGuard 用 IP 认证，Xray 用 UUID 认证）
@@ -218,7 +217,7 @@ class PairingResponse:
     # Xray REALITY 参数
     xray_reality_public_key: Optional[str] = None
     xray_reality_short_id: Optional[str] = None
-    xray_uuid: Optional[str] = None  # Phase 11-Fix.Xray: UUID for inbound authentication
+    xray_uuid: Optional[str] = None  # UUID for inbound authentication
 
     # 隧道 API 端点
     tunnel_api_endpoint: Optional[str] = None
@@ -250,7 +249,7 @@ class PairingResponse:
             d["xray_uuid"] = self.xray_uuid
         if self.tunnel_api_endpoint:
             d["tunnel_api_endpoint"] = self.tunnel_api_endpoint
-        # Phase 11-Fix.K: API 端口
+        # API 端口
         if self.api_port:
             d["api_port"] = self.api_port
         return d
@@ -265,14 +264,14 @@ class PairingResponse:
             node_tag=d["node_tag"],
             node_description=d.get("node_description", ""),
             endpoint=d["endpoint"],
-            api_port=d.get("api_port"),  # Phase 11-Fix.K
+            api_port=d.get("api_port"),
             psk_hash=d.get("psk_hash", ""),  # 已废弃，兼容旧配对码
             tunnel_local_ip=d["tunnel_local_ip"],
             tunnel_remote_ip=d["tunnel_remote_ip"],
             wg_public_key=d.get("wg_public_key"),
             xray_reality_public_key=d.get("xray_reality_public_key"),
             xray_reality_short_id=d.get("xray_reality_short_id"),
-            xray_uuid=d.get("xray_uuid"),  # Phase 11-Fix.Xray: UUID for inbound auth
+            xray_uuid=d.get("xray_uuid"),  # UUID for inbound auth
             tunnel_api_endpoint=d.get("tunnel_api_endpoint"),
             timestamp=d.get("timestamp", 0),
         )
@@ -412,9 +411,7 @@ class PairingCodeGenerator:
         tunnel_type: str = "wireguard",
         psk: Optional[str] = None,  # 已废弃，保留兼容
         bidirectional: bool = True,
-        tunnel_local_ip: Optional[str] = None,  # Phase 11-Tunnel
-        tunnel_remote_ip: Optional[str] = None,  # Phase 11-Tunnel
-        api_port: Optional[int] = None,  # Phase 11-Fix.K: API 端口
+        tunnel_local_ip: Optional[str] = None,        tunnel_remote_ip: Optional[str] = None,        api_port: Optional[int] = None,  # API 端口
     ) -> Tuple[str, str, "PairingRequest"]:
         """生成配对请求码
 
@@ -424,18 +421,14 @@ class PairingCodeGenerator:
             endpoint: 隧道端点 (IP:port)
             tunnel_type: 隧道类型 ("wireguard" 或 "xray")
             psk: [已废弃] 不再使用，保留参数兼容
-            bidirectional: 是否启用双向自动连接 (Phase 11.2)
-            tunnel_local_ip: 本节点隧道 IP (Phase 11-Tunnel)
-            tunnel_remote_ip: 为远程节点预分配的隧道 IP (Phase 11-Tunnel)
-            api_port: 本节点 API 端口 (Phase 11-Fix.K)
-
+            bidirectional: 是否启用双向自动连接             tunnel_local_ip: 本节点隧道 IP             tunnel_remote_ip: 为远程节点预分配的隧道 IP             api_port: 本节点 API 端口 
         Returns:
             (pairing_code, "", request) - 配对码、空字符串（兼容）和请求对象
         """
         # PSK 已废弃 - WireGuard 用 IP 认证，Xray 用 UUID 认证
         # 保留空值兼容旧版本
 
-        # Phase 12-Fix.F: 分配本地监听端口，并用它构造 endpoint
+        # 分配本地监听端口，并用它构造 endpoint
         # 这样响应方才知道连接到哪个端口
         tunnel_port = self.get_next_tunnel_port()
         endpoint_ip = endpoint.rsplit(":", 1)[0] if ":" in endpoint else endpoint
@@ -446,16 +439,15 @@ class PairingCodeGenerator:
             version=PAIRING_VERSION,
             node_tag=node_tag,
             node_description=node_description,
-            endpoint=request_endpoint,  # Phase 12-Fix.F: 使用分配的 tunnel_port
+            endpoint=request_endpoint,  # 使用分配的 tunnel_port
             tunnel_type=tunnel_type,
-            api_port=api_port,  # Phase 11-Fix.K
-            psk_hash="",  # 已废弃
+            api_port=api_port,            psk_hash="",  # 已废弃
             bidirectional=bidirectional,
             tunnel_local_ip=tunnel_local_ip,
             tunnel_remote_ip=tunnel_remote_ip,
             timestamp=int(time.time()),
         )
-        # Phase 12-Fix.F: 保存 tunnel_port 供 complete_pairing 使用
+        # 保存 tunnel_port 供 complete_pairing 使用
         request._tunnel_port = tunnel_port
 
         # 根据隧道类型生成密钥
@@ -465,7 +457,7 @@ class PairingCodeGenerator:
             # 保存私钥到临时存储（调用者需要处理）
             request._private_key = private_key
 
-            # Phase 11.2: 为远程节点预生成密钥对（双向自动连接）
+            # 为远程节点预生成密钥对（双向自动连接）
             # 注意：密钥对会包含在 request code 中，必须保密处理！
             if bidirectional:
                 remote_private, remote_public = self.generate_wireguard_keypair()
@@ -483,7 +475,7 @@ class PairingCodeGenerator:
     def validate_pair_request(self, code: str) -> Tuple[bool, str, Optional[PairingRequest]]:
         """验证配对请求码
 
-        包含完整的安全验证（修复 Phase 2 审查发现的问题）：
+        包含完整的安全验证：
         - node_tag 格式验证（防止注入和 WireGuard 接口名问题）
         - endpoint 格式验证（防止 SSRF 和无效地址）
         - WireGuard/Xray 密钥格式验证
@@ -566,8 +558,7 @@ class PairingCodeGenerator:
                 return False, "Invalid WireGuard public key format", None
 
             # ========================================
-            # CRITICAL-1 修复：预生成密钥格式验证 (Phase 11.2)
-            # ========================================
+            # CRITICAL-1 修复：预生成密钥格式验证             # ========================================
             remote_wg_private_key = data.get("remote_wg_private_key", "")
             remote_wg_public_key = data.get("remote_wg_public_key", "")
             if remote_wg_private_key:
@@ -668,7 +659,7 @@ class PairingCodeGenerator:
     def validate_pair_response(self, code: str) -> Tuple[bool, str, Optional[PairingResponse]]:
         """验证配对响应码
 
-        包含完整的安全验证（修复 Phase 2 审查发现的问题）：
+        包含完整的安全验证：
         - node_tag 格式验证
         - endpoint 格式验证
         - 隧道 IP 格式验证
@@ -862,7 +853,7 @@ class PairingManager:
         local_node_description: str,
         local_endpoint: str,
         psk: str = "",  # 已废弃，保留参数兼容
-        api_port: Optional[int] = None,  # Phase 11-Fix.K: 本节点 API 端口
+        api_port: Optional[int] = None,  # 本节点 API 端口
     ) -> Tuple[bool, str, Optional[str]]:
         """导入配对请求码
 
@@ -877,8 +868,7 @@ class PairingManager:
             local_node_description: 本节点描述
             local_endpoint: 本节点端点
             psk: [已废弃] 不再使用，保留参数兼容
-            api_port: 本节点 API 端口 (Phase 11-Fix.K)
-
+            api_port: 本节点 API 端口 
         Returns:
             (success, message, response_code)
         """
@@ -905,7 +895,7 @@ class PairingManager:
         try:
             # 生成本节点密钥
             if request.tunnel_type == "wireguard":
-                # Phase 11.2: 使用预生成的密钥对（如果请求中包含）
+                # 使用预生成的密钥对（如果请求中包含）
                 # 这允许请求方无需密钥交换即可知道本节点的公钥
                 if request.remote_wg_private_key and request.remote_wg_public_key:
                     # 使用请求方预生成的密钥对
@@ -918,14 +908,14 @@ class PairingManager:
                     private_key, public_key = self.generator.generate_wireguard_keypair()
                     bidirectional_status = None
 
-                # Phase 11-Fix.K: 保存 api_port 并正确设置 tunnel_api_endpoint
+                # 保存 api_port 并正确设置 tunnel_api_endpoint
                 remote_api_port = request.api_port or DEFAULT_WEB_PORT
                 self.db.add_peer_node(
                     tag=request.node_tag,
                     name=request.node_tag,
                     description=request.node_description or f"Paired from {request.endpoint}",
                     endpoint=request.endpoint,
-                    api_port=request.api_port,  # Phase 11-Fix.K: 保存 API 端口
+                    api_port=request.api_port,  # 保存 API 端口
                     # psk_hash/psk_encrypted 已废弃
                     tunnel_type="wireguard",
                     tunnel_status="disconnected",
@@ -938,7 +928,7 @@ class PairingManager:
                     tunnel_api_endpoint=f"{remote_ip}:{remote_api_port}",
                 )
 
-                # Phase 11.2: 设置双向连接状态
+                # 设置双向连接状态
                 if bidirectional_status:
                     self.db.update_peer_node(
                         request.node_tag,
@@ -948,19 +938,19 @@ class PairingManager:
                 private_key, public_key = self.generator.generate_xray_reality_keypair()
                 short_id = self.generator.generate_short_id()
 
-                # Phase 6 Issue 21: 为 Xray peer 生成 xray_uuid
+                # 为 Xray peer 生成 xray_uuid
                 # 这个 UUID 用于隧道 API 认证
                 import uuid
                 xray_uuid = str(uuid.uuid4())
 
-                # Phase 11-Fix.K: 保存 api_port 并正确设置 tunnel_api_endpoint
+                # 保存 api_port 并正确设置 tunnel_api_endpoint
                 remote_api_port = request.api_port or DEFAULT_WEB_PORT
                 self.db.add_peer_node(
                     tag=request.node_tag,
                     name=request.node_tag,
                     description=request.node_description or f"Paired from {request.endpoint}",
                     endpoint=request.endpoint,
-                    api_port=request.api_port,  # Phase 11-Fix.K: 保存 API 端口
+                    api_port=request.api_port,  # 保存 API 端口
                     # psk_hash/psk_encrypted 已废弃
                     tunnel_type="xray",
                     tunnel_status="disconnected",
@@ -972,7 +962,7 @@ class PairingManager:
                     xray_reality_short_id=short_id,
                     xray_peer_reality_public_key=request.xray_reality_public_key,
                     xray_peer_reality_short_id=request.xray_reality_short_id,
-                    xray_uuid=xray_uuid,  # Phase 6 Issue 21: 存储 xray_uuid
+                    xray_uuid=xray_uuid,  # 存储 xray_uuid
                     tunnel_api_endpoint=f"{remote_ip}:{remote_api_port}",
                 )
         except sqlite3.IntegrityError as e:
@@ -984,10 +974,10 @@ class PairingManager:
             return False, "Failed to create peer node", None
 
         # 生成响应码
-        # Phase 11-Fix.K: 使用 api_port 或默认端口
+        # 使用 api_port 或默认端口
         local_api_port = api_port or DEFAULT_WEB_PORT
 
-        # Phase 12-Fix.F: 响应码的 endpoint 必须使用分配的 tunnel_port
+        # 响应码的 endpoint 必须使用分配的 tunnel_port
         # 从 local_endpoint 提取 IP，然后用分配的 tunnel_port 构造新 endpoint
         # 这样请求方才知道连接到哪个端口
         endpoint_ip = local_endpoint.rsplit(":", 1)[0] if ":" in local_endpoint else local_endpoint
@@ -999,13 +989,13 @@ class PairingManager:
             request_node_tag=request.node_tag,
             node_tag=local_node_tag,
             node_description=local_node_description,
-            endpoint=response_endpoint,  # Phase 12-Fix.F: 使用分配的 tunnel_port
-            api_port=api_port,  # Phase 11-Fix.K: 包含 API 端口
+            endpoint=response_endpoint,  # 使用分配的 tunnel_port
+            api_port=api_port,  # 包含 API 端口
             psk_hash="",  # 已废弃
             tunnel_local_ip=remote_ip,  # 分配给请求方的 IP
             tunnel_remote_ip=local_ip,  # 本节点的 IP
             timestamp=int(time.time()),
-            tunnel_api_endpoint=f"{local_ip}:{local_api_port}",  # Phase 11-Fix.K: 使用实际端口
+            tunnel_api_endpoint=f"{local_ip}:{local_api_port}",  # 使用实际端口
         )
 
         if request.tunnel_type == "wireguard":
@@ -1013,7 +1003,7 @@ class PairingManager:
         elif request.tunnel_type == "xray":
             response.xray_reality_public_key = public_key
             response.xray_reality_short_id = short_id
-            response.xray_uuid = xray_uuid  # Phase 11-Fix.Xray: Include UUID for inbound auth
+            response.xray_uuid = xray_uuid  # Include UUID for inbound auth
 
         response_code = self.generator.encode_pairing_code(response.to_dict())
 
@@ -1082,20 +1072,20 @@ class PairingManager:
                     name=response.node_tag,
                     description=response.node_description or f"Paired from {response.endpoint}",
                     endpoint=response.endpoint,
-                    api_port=response.api_port,  # Phase 11-Fix.K: 保存 API 端口
+                    api_port=response.api_port,  # 保存 API 端口
                     # psk_hash/psk_encrypted 已废弃
                     tunnel_type="wireguard",
                     tunnel_status="disconnected",
                     tunnel_local_ip=response.tunnel_local_ip,
                     tunnel_remote_ip=response.tunnel_remote_ip,
-                    # Phase 12-Fix.F: 保存本地监听端口
+                    # 保存本地监听端口
                     tunnel_port=pending_request.get("tunnel_port"),
                     wg_private_key=pending_request.get("wg_private_key"),
                     wg_public_key=pending_request.get("wg_public_key"),
                     wg_peer_public_key=response.wg_public_key,
                     tunnel_api_endpoint=tunnel_api_endpoint,  # Issue 14: 使用计算后的值
                 )
-                # Phase 11.2: 保存双向连接参数
+                # 保存双向连接参数
                 if pending_request.get("bidirectional"):
                     self.db.update_peer_node(
                         response.node_tag,
@@ -1104,8 +1094,8 @@ class PairingManager:
                         bidirectional_status="pending",
                     )
             elif tunnel_type == "xray":
-                # Phase 11.3: Xray 双向自动连接
-                # Phase 11-Fix.Xray: Use xray_uuid from response for inbound authentication
+                # Xray 双向自动连接
+                # Use xray_uuid from response for inbound authentication
                 # The response contains the peer's UUID that they will use when connecting to us
                 import uuid
                 xray_uuid = response.xray_uuid if hasattr(response, 'xray_uuid') and response.xray_uuid else str(uuid.uuid4())
@@ -1115,7 +1105,7 @@ class PairingManager:
                     name=response.node_tag,
                     description=response.node_description or f"Paired from {response.endpoint}",
                     endpoint=response.endpoint,
-                    api_port=response.api_port,  # Phase 11-Fix.K: 保存 API 端口
+                    api_port=response.api_port,  # 保存 API 端口
                     # psk_hash/psk_encrypted 已废弃
                     tunnel_type="xray",
                     tunnel_status="disconnected",
@@ -1126,9 +1116,9 @@ class PairingManager:
                     xray_reality_short_id=pending_request.get("xray_short_id"),
                     xray_peer_reality_public_key=response.xray_reality_public_key,
                     xray_peer_reality_short_id=response.xray_reality_short_id,
-                    xray_uuid=xray_uuid,  # Phase 11-Fix.Xray: Use peer's UUID for inbound auth
+                    xray_uuid=xray_uuid,  # Use peer's UUID for inbound auth
                     tunnel_api_endpoint=tunnel_api_endpoint,  # Issue 14: 使用计算后的值
-                    bidirectional_status="pending",  # Phase 11.3: 标记待双向连接
+                    bidirectional_status="pending",  # 标记待双向连接
                 )
         except Exception as e:
             logging.error(f"[pairing] 完成配对失败: {e}")

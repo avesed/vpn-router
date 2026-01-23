@@ -22,6 +22,8 @@ interface V2RayShareDialogProps {
 export function V2RayShareDialog({ user, open, onOpenChange }: V2RayShareDialogProps) {
   const [qrCodeUrl, setQrCodeUrl] = useState<string | null>(null);
   const [shareUri, setShareUri] = useState<string | null>(null);
+  const [qrError, setQrError] = useState<string | null>(null);
+  const [uriError, setUriError] = useState<string | null>(null);
   const { mutate: getQrCode, isPending: isLoadingQr } = useGetV2RayUserQrCode();
   const { mutate: getUri, isPending: isLoadingUri } = useGetV2RayUserUri();
 
@@ -29,13 +31,17 @@ export function V2RayShareDialog({ user, open, onOpenChange }: V2RayShareDialogP
     if (open && user) {
       setQrCodeUrl(null);
       setShareUri(null);
-      
+      setQrError(null);
+      setUriError(null);
+
       getQrCode(user.id, {
         onSuccess: (url) => setQrCodeUrl(url),
+        onError: (error: Error) => setQrError(error.message),
       });
-      
+
       getUri(user.id, {
         onSuccess: (data) => setShareUri(data.uri),
+        onError: (error: Error) => setUriError(error.message),
       });
     }
 
@@ -75,22 +81,28 @@ export function V2RayShareDialog({ user, open, onOpenChange }: V2RayShareDialogP
             ) : qrCodeUrl ? (
               <img src={qrCodeUrl} alt="V2Ray QR Code" className="h-64 w-64 border rounded-lg" />
             ) : (
-              <p className="text-muted-foreground">Failed to load QR code</p>
+              <p className="text-destructive text-center">{qrError || "Failed to load QR code"}</p>
             )}
-            <p className="text-sm text-muted-foreground mt-4 text-center">
-              Scan this code with a V2Ray/Xray compatible client
-            </p>
+            {qrCodeUrl && (
+              <p className="text-sm text-muted-foreground mt-4 text-center">
+                Scan this code with a V2Ray/Xray compatible client
+              </p>
+            )}
           </TabsContent>
-          
+
           <TabsContent value="uri" className="space-y-4">
             <div className="relative">
               {isLoadingUri ? (
                 <div className="flex justify-center p-8">
                   <Loader2 className="h-8 w-8 animate-spin" />
                 </div>
-              ) : (
+              ) : shareUri ? (
                 <div className="p-4 rounded-lg bg-muted break-all text-xs font-mono border">
-                  {shareUri || "Failed to load share URI"}
+                  {shareUri}
+                </div>
+              ) : (
+                <div className="p-4 rounded-lg bg-destructive/10 text-destructive text-sm border border-destructive/20">
+                  {uriError || "Failed to load share URI"}
                 </div>
               )}
             </div>

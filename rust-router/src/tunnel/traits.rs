@@ -1,16 +1,8 @@
-//! `WireGuard` tunnel abstraction trait for Phase 6
+//! `WireGuard` tunnel abstraction trait
 //!
 //! This module defines the trait interface for `WireGuard` tunnels,
 //! allowing different implementations (userspace, kernel) to be
 //! used interchangeably.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.2 `WgTunnel` trait definition
-//! - [x] 6.2 Async read/write operations
-//! - [x] 6.2 Statistics collection
-//! - [x] 6.2 Peer management (Ingress mode)
-//! - [x] 6.2 Encryption/decryption operations
 //!
 //! # Trait Design
 //!
@@ -220,7 +212,7 @@ pub trait WgTunnel: Send + Sync {
     /// should use `get_peer()` to get individual peer endpoints.
     fn peer_endpoint(&self) -> Option<SocketAddr>;
 
-    /// Get the UDP socket for batch I/O operations (Phase 6.8)
+    /// Get the UDP socket for batch I/O operations
     ///
     /// Returns an Arc-wrapped `UdpSocket` if the tunnel is connected.
     /// This allows batch send/receive operations using `sendmmsg`/`recvmmsg`.

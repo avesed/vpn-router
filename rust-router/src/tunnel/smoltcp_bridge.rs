@@ -176,7 +176,6 @@ impl SmoltcpBridge {
     ///
     /// `true` if the packet was queued, `false` if the queue is full
     pub fn feed_rx_packet(&self, packet: Vec<u8>) -> bool {
-        // Phase 12-Fix.Q: Upgrade to debug for troubleshooting
         debug!("SmoltcpBridge: feeding {} byte packet to RX queue", packet.len());
         let result = self.queue.push_rx(packet);
         if result {
@@ -236,7 +235,7 @@ impl SmoltcpBridge {
     /// `true` if any work was done (packets processed or generated)
     pub fn poll(&mut self) -> bool {
         let timestamp = Self::current_timestamp();
-        // Phase 12-Fix.Q: Log RX queue status before poll
+        // Log RX queue status before poll
         let rx_count_before = self.queue.rx_queue_len();
         let result = self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
 

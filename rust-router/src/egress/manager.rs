@@ -1,4 +1,4 @@
-//! `WireGuard` Egress Manager for Phase 6.4
+//! `WireGuard` Egress Manager
 //!
 //! This module provides the main `WgEgressManager` struct that manages
 //! multiple `WireGuard` egress tunnels, including creation, removal, and
@@ -82,7 +82,7 @@ use crate::tunnel::config::WgTunnelConfig;
 use crate::tunnel::traits::{WgTunnel, WgTunnelError, WgTunnelStats};
 use crate::tunnel::userspace::UserspaceWgTunnel;
 
-// Phase 6.8: Batch I/O imports (Linux only)
+// Batch I/O imports (Linux only)
 #[cfg(target_os = "linux")]
 use crate::io::BatchSender;
 
@@ -1089,7 +1089,7 @@ impl WgEgressManager {
         };
         // Lock is now released
 
-        // Phase 6.8: Use batch I/O on Linux when enabled
+        // Use batch I/O on Linux when enabled
         #[cfg(target_os = "linux")]
         {
             if use_batch_io {

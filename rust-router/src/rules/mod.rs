@@ -2,10 +2,10 @@
 //!
 //! This module provides:
 //! - Rule type definitions
-//! - Domain matching (Phase 2.2)
-//! - `GeoIP` matching (Phase 2.3)
-//! - fwmark/DSCP routing (Phase 2.4)
-//! - Hot-reloadable rule engine (Phase 2.5)
+//! - Domain matching
+//! - `GeoIP` matching
+//! - fwmark/DSCP routing
+//! - Hot-reloadable rule engine
 //!
 //! # Architecture
 //!
@@ -30,7 +30,7 @@
 //! assert_eq!(ruleset.default_outbound(), "direct");
 //! ```
 //!
-//! # Domain Matching (Phase 2.2)
+//! # Domain Matching
 //!
 //! High-performance domain matching using Aho-Corasick algorithm:
 //!
@@ -49,7 +49,7 @@
 //! assert_eq!(matcher.match_domain("ads.example.org"), Some("block"));
 //! ```
 //!
-//! # `GeoIP` Matching (Phase 2.3)
+//! # `GeoIP` Matching
 //!
 //! IP-based routing with CIDR and country code matching:
 //!
@@ -72,7 +72,7 @@
 //! assert_eq!(matcher.match_ip(ip), None);
 //! ```
 //!
-//! # fwmark/DSCP Chain Routing (Phase 2.4)
+//! # fwmark/DSCP Chain Routing
 //!
 //! DSCP-based multi-hop chain routing:
 //!
@@ -93,7 +93,7 @@
 //! assert!(!router.is_chain("direct"));
 //! ```
 //!
-//! # Hot-Reloadable Rule Engine (Phase 2.5)
+//! # Hot-Reloadable Rule Engine
 //!
 //! Lock-free routing configuration with atomic hot-reload:
 //!

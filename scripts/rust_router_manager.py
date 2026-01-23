@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rust Router Manager (Phase 3.4)
+Rust Router Manager
 
 Manager class that syncs database configuration to rust-router.
 Handles outbound lifecycle, routing rule sync, and configuration updates.
@@ -46,7 +46,6 @@ from rust_router_client import (
     IpcResponse,
     UpdateRoutingResult,
     is_available,
-    # Phase 6 types
     PeerInfo,
     EcmpGroupInfo,
     EcmpMemberInfo,
@@ -80,21 +79,20 @@ class SyncResult:
     outbounds_removed: int = 0
     outbounds_updated: int = 0
     rules_synced: int = 0
-    # Phase 6 fields
     peers_synced: int = 0
     ecmp_groups_synced: int = 0
     chains_synced: int = 0
-    wg_tunnels_synced: int = 0  # Phase 11-Fix.AB
-    wg_tunnels_removed: int = 0  # Phase 11-Fix.AB
-    wg_ingress_peers_synced: int = 0  # Phase 11-Fix.AD: WireGuard ingress client peers
-    dns_blocklist_synced: bool = False  # Phase 3-Fix: DNS adblock rules
+    wg_tunnels_synced: int = 0
+    wg_tunnels_removed: int = 0
+    wg_ingress_peers_synced: int = 0  # WireGuard ingress client peers
+    dns_blocklist_synced: bool = False  # DNS adblock rules
     errors: List[str] = field(default_factory=list)
 
 
 def _get_db():
     """Lazy import and get database instance.
 
-    Phase 11-Fix.AB: Ensures SQLCIPHER_KEY is available from multiple sources:
+     Ensures SQLCIPHER_KEY is available from multiple sources:
     1. Environment variable (preferred)
     2. Key file (/etc/sing-box/encryption.key or .db-key)
     3. KeyManager fallback
@@ -164,7 +162,7 @@ def _is_ip_address(host: str) -> bool:
 def _parse_wg_config_file(config_path: str) -> Optional[Dict[str, str]]:
     """Parse a WireGuard config file and extract key fields.
 
-    Phase 6-Fix.AG: WARP WireGuard config is stored in wg.conf format.
+     WARP WireGuard config is stored in wg.conf format.
     This helper extracts the fields needed for rust-router's CreateWgTunnel.
 
     Args:
@@ -247,7 +245,7 @@ async def _resolve_hostname_async(
 ) -> Optional[str]:
     """Resolve hostname to IP address asynchronously.
 
-    Phase 11-Fix.AC: Async DNS resolution for WireGuard egress endpoints.
+     Async DNS resolution for WireGuard egress endpoints.
     Hostnames in Custom WG or WARP egress are resolved to IP addresses
     since rust-router's WgEgressConfig requires IP:port format.
 
@@ -270,7 +268,7 @@ async def _resolve_hostname_async(
         return dns_cache[hostname]
 
     # Resolve hostname using getaddrinfo in executor (non-blocking)
-    # Phase 11-Fix.AC: Use get_running_loop() for Python 3.10+ compatibility
+    #  Use get_running_loop() for Python 3.10+ compatibility
     loop = asyncio.get_running_loop()
     try:
         # Use run_in_executor to avoid blocking the event loop
@@ -354,7 +352,7 @@ class RustRouterManager:
         return self._db
 
     def _get_local_node_tag(self) -> str:
-        """Phase 12-Fix: Unified node_tag resolution matching api_server.py.
+        """ Unified node_tag resolution matching api_server.py.
 
         Priority:
         1. Database settings.node_tag (single source of truth)
@@ -789,13 +787,12 @@ class RustRouterManager:
             )
 
     # =========================================================================
-    # Userspace WireGuard Egress Sync (Phase 11-Fix.AB)
-    # =========================================================================
+    # Userspace WireGuard Egress Sync     # =========================================================================
 
     async def sync_wg_egress_tunnels(self) -> SyncResult:
         """Sync WireGuard egress tunnels for userspace WG mode.
 
-        Phase 11-Fix.AB: In userspace WG mode, WireGuard egress types
+         In userspace WG mode, WireGuard egress types
         (PIA, Custom, WARP WG) use rust-router's CreateWgTunnel command
         instead of kernel WireGuard interfaces.
 
@@ -809,7 +806,7 @@ class RustRouterManager:
             try:
                 db = self._get_db()
 
-                # Phase 11-Fix.AC: DNS resolution cache for this sync cycle
+                #  DNS resolution cache for this sync cycle
                 dns_cache: Dict[str, str] = {}
 
                 # Collect WG-based egress from database
@@ -843,7 +840,7 @@ class RustRouterManager:
                     address = egress.get("address")
 
                     if tag and private_key and peer_public_key and server:
-                        # Phase 11-Fix.AC: Resolve hostname to IP if needed
+                        #  Resolve hostname to IP if needed
                         resolved_server = await _resolve_hostname_async(server, port, dns_cache)
                         if resolved_server is None:
                             logger.warning(
@@ -860,14 +857,14 @@ class RustRouterManager:
                         }
 
                 # WARP WireGuard egress (not MASQUE)
-                # Phase 3-Fix.B: Read WireGuard config from database (preferred)
+                #  Read WireGuard config from database (preferred)
                 # Fall back to wg.conf file for backward compatibility
                 for egress in db.get_warp_egress_list(enabled_only=True):
                     tag = egress.get("tag", "")
                     if not tag:
                         continue
 
-                    # Phase 3-Fix.B: Read WireGuard config from database fields first
+                    #  Read WireGuard config from database fields first
                     private_key = egress.get("private_key")
                     peer_public_key = egress.get("peer_public_key")
                     endpoint = egress.get("endpoint")
@@ -982,13 +979,12 @@ class RustRouterManager:
         return result
 
     # =========================================================================
-    # WireGuard Ingress Peer Sync (Phase 11-Fix.AD)
-    # =========================================================================
+    # WireGuard Ingress Peer Sync     # =========================================================================
 
     async def sync_wg_ingress_peers(self) -> SyncResult:
         """Sync WireGuard ingress client peers from database to rust-router.
 
-        Phase 11-Fix.AD: This method syncs WireGuard client peers (from the
+         This method syncs WireGuard client peers (from the
         wireguard_peers table) to rust-router's ingress WireGuard interface.
 
         This method:
@@ -1100,7 +1096,7 @@ class RustRouterManager:
     async def sync_dns_blocklist(self) -> SyncResult:
         """Sync DNS adblock rules to rust-router.
 
-        Phase 3-Fix: This method triggers rust-router to reload the DNS blocklist
+         This method triggers rust-router to reload the DNS blocklist
         from /etc/sing-box/rulesets/__adblock_combined__.json.
 
         The blocklist file is generated by api_server.py from the adblock_rulesets
@@ -1146,8 +1142,7 @@ class RustRouterManager:
 
         This method:
         1. Gets all enabled routing rules from database
-        2. Validates outbounds and skips invalid rules (Phase 11-Fix)
-        3. Converts them to RuleConfig format
+        2. Validates outbounds and skips invalid rules         3. Converts them to RuleConfig format
         4. Sends UpdateRouting command to rust-router
 
         Returns:
@@ -1161,10 +1156,10 @@ class RustRouterManager:
                 rules = db.get_routing_rules(enabled_only=True)
 
                 # Get default outbound from settings or use "direct"
-                # Phase 11-Fix.Z: 使用正确的方法名 get_setting() (不是 get_settings())
+                #  使用正确的方法名 get_setting() (不是 get_settings())
                 default_outbound = db.get_setting("default_outbound", "direct") or "direct"
 
-                # Phase 11-Fix: Get valid outbounds from rust-router to pre-validate rules
+                #  Get valid outbounds from rust-router to pre-validate rules
                 # This prevents the entire sync from failing due to one invalid rule
                 valid_outbounds: Set[str] = {"block", "adblock", "direct"}
                 async with await self._get_client() as client:
@@ -1216,7 +1211,7 @@ class RustRouterManager:
                     if not rule_type or not target:
                         continue
 
-                    # Phase 11-Fix: Skip rules with invalid outbounds
+                    #  Skip rules with invalid outbounds
                     # Allow WireGuard-prefixed tags as they may be added later
                     is_wg_prefixed = (
                         outbound.startswith("wg-") or
@@ -1231,11 +1226,11 @@ class RustRouterManager:
                         )
                         continue
 
-                    # Phase 11-Fix.AF: Use domain_suffix for domain rules to match all subdomains
+                    #  Use domain_suffix for domain rules to match all subdomains
                     # e.g., "example.com" matches "www.example.com", "api.example.com", etc.
                     if rule_type == "domain":
                         rule_type = "domain_suffix"
-                    # Phase 11-Fix.AG: Map 'ip' to 'ip_cidr' for rust-router compatibility
+                    #  Map 'ip' to 'ip_cidr' for rust-router compatibility
                     elif rule_type == "ip":
                         rule_type = "ip_cidr"
 
@@ -1278,8 +1273,7 @@ class RustRouterManager:
         return result
 
     # =========================================================================
-    # Peer Node Sync (Phase 6)
-    # =========================================================================
+    # Peer Node Sync     # =========================================================================
 
     async def sync_peers(self) -> SyncResult:
         """Sync peer nodes from database to rust-router.
@@ -1372,7 +1366,7 @@ class RustRouterManager:
                         # Build add_peer call with all available fields
                         # Note: wg_peer_public_key is the remote peer's public key
                         # wg_public_key is our own public key (derived from wg_private_key)
-                        # Phase 12-Fix.F: tunnel_port 是本节点的本地监听端口
+                        #  tunnel_port 是本节点的本地监听端口
                         # 每个节点在配对时分配不同端口，双向连接需要两个不同端口
                         add_response = await client.add_peer(
                             tag=tag,
@@ -1514,8 +1508,7 @@ class RustRouterManager:
             return False
 
     # =========================================================================
-    # ECMP Group Sync (Phase 6)
-    # =========================================================================
+    # ECMP Group Sync     # =========================================================================
 
     async def sync_ecmp_groups(self) -> SyncResult:
         """Sync ECMP groups from database to rust-router.
@@ -1569,7 +1562,7 @@ class RustRouterManager:
                         weights_dict = group.get("weights") or {}
 
                         # Build member dicts
-                        # Phase 6-Fix.AI: Use 'outbound' key to match Rust EcmpMemberConfig struct
+                        #  Use 'outbound' key to match Rust EcmpMemberConfig struct
                         # Weights is a dict: {"member-tag": weight, ...}
                         members = []
                         for member_tag in members_list:
@@ -1687,8 +1680,7 @@ class RustRouterManager:
             return False
 
     # =========================================================================
-    # Chain Sync (Phase 6)
-    # =========================================================================
+    # Chain Sync     # =========================================================================
 
     async def sync_chains(self) -> SyncResult:
         """Sync multi-hop chains from database to rust-router.
@@ -1719,7 +1711,7 @@ class RustRouterManager:
                     current_chains = await client.list_chains()
                     current_tags = {c.tag for c in current_chains}
 
-                    # Phase 12-Fix.D: 日志显示数据库和 rust-router 的链路状态对比
+                    #  日志显示数据库和 rust-router 的链路状态对比
                     db_enabled_tags = {c.get("tag", "") for c in chains if c.get("enabled", False)}
                     db_all_tags = {c.get("tag", "") for c in chains}
                     logger.info(
@@ -1744,7 +1736,7 @@ class RustRouterManager:
                         if not enabled:
                             # If chain is disabled and exists, delete it
                             if tag in current_tags:
-                                # Phase 12-Fix.D: 详细日志记录为什么链路被停用
+                                #  详细日志记录为什么链路被停用
                                 logger.warning(
                                     f"[sync_chains] Chain '{tag}' in rust-router but enabled=False in DB, "
                                     f"will deactivate and delete (chain_state={chain_state})"
@@ -1782,7 +1774,7 @@ class RustRouterManager:
                                     if not activate_response.success:
                                         result.errors.append(f"Failed to activate chain {tag}: {activate_response.error}")
 
-                    # Phase 12-Fix.E: 从 chain_routing 表恢复终端节点的链路
+                    #  从 chain_routing 表恢复终端节点的链路
                     # 终端节点的链路由入口节点通过 2PC 创建，保存在 chain_routing 表中
                     # 重启后需要恢复这些链路到 rust-router
                     chain_routing_tags = set()
@@ -1849,7 +1841,7 @@ class RustRouterManager:
 
                     for current_tag in current_tags:
                         if current_tag not in db_tags:
-                            # Phase 12-Fix.E: 检查是否在 chain_routing 表中（终端节点）
+                            #  检查是否在 chain_routing 表中（终端节点）
                             if current_tag in chain_routing_tags:
                                 logger.info(
                                     f"[sync_chains] Chain '{current_tag}' in rust-router but not in node_chains, "
@@ -1857,7 +1849,7 @@ class RustRouterManager:
                                 )
                                 continue
 
-                            # Phase 12-Fix.D: 详细日志记录为什么链路被移除
+                            #  详细日志记录为什么链路被移除
                             # 确定原因：链路不在数据库中，还是 enabled=False
                             chain_in_db = any(c.get("tag") == current_tag for c in chains)
                             if chain_in_db:
@@ -1933,7 +1925,7 @@ class RustRouterManager:
 
                 enabled = chain.get("enabled", False)
                 if not enabled:
-                    # Phase 12-Fix.D: 详细日志记录
+                    #  详细日志记录
                     logger.warning(
                         f"[notify_chain_changed] Chain '{chain_tag}' enabled=False in DB, "
                         f"will deactivate and delete (action={action})"
@@ -2030,19 +2022,17 @@ class RustRouterManager:
         result.wg_tunnels_removed = wg_tunnel_result.wg_tunnels_removed
         result.errors.extend(wg_tunnel_result.errors)
 
-        # Sync ECMP groups BEFORE routing rules (Phase 6)
-        # Default outbound may be an ECMP group tag, so it must exist first
+        # Sync ECMP groups BEFORE routing rules         # Default outbound may be an ECMP group tag, so it must exist first
         ecmp_result = await self.sync_ecmp_groups()
         result.ecmp_groups_synced = ecmp_result.ecmp_groups_synced
         result.errors.extend(ecmp_result.errors)
 
-        # Sync peers (Phase 6) - before chains since chains may reference peer tunnels
+        # Sync peers - before chains since chains may reference peer tunnels
         peers_result = await self.sync_peers()
         result.peers_synced = peers_result.peers_synced
         result.errors.extend(peers_result.errors)
 
-        # Sync chains BEFORE routing rules (Phase 11-Fix)
-        # Routing rules may reference chain tags as outbounds, so chains must exist first
+        # Sync chains BEFORE routing rules         # Routing rules may reference chain tags as outbounds, so chains must exist first
         chains_result = await self.sync_chains()
         result.chains_synced = chains_result.chains_synced
         result.errors.extend(chains_result.errors)
@@ -2052,12 +2042,12 @@ class RustRouterManager:
         result.rules_synced = rules_result.rules_synced
         result.errors.extend(rules_result.errors)
 
-        # Phase 11-Fix.AD: Sync WireGuard ingress client peers
+        #  Sync WireGuard ingress client peers
         wg_ingress_result = await self.sync_wg_ingress_peers()
         result.wg_ingress_peers_synced = wg_ingress_result.wg_ingress_peers_synced
         result.errors.extend(wg_ingress_result.errors)
 
-        # Phase 3-Fix: Sync DNS adblock rules
+        #  Sync DNS adblock rules
         dns_blocklist_result = await self.sync_dns_blocklist()
         result.dns_blocklist_synced = dns_blocklist_result.dns_blocklist_synced
         result.errors.extend(dns_blocklist_result.errors)
@@ -2410,17 +2400,17 @@ if __name__ == "__main__":
             self.assertIsInstance(result.errors, list)
 
     class TestSyncResultPhase6(unittest.TestCase):
-        """Test SyncResult Phase 6 fields"""
+        """Test SyncResult extended fields"""
 
         def test_phase6_default_values(self):
-            """Test Phase 6 default values"""
+            """Test default values"""
             result = SyncResult(success=True)
             self.assertEqual(result.peers_synced, 0)
             self.assertEqual(result.ecmp_groups_synced, 0)
             self.assertEqual(result.chains_synced, 0)
 
         def test_phase6_with_values(self):
-            """Test Phase 6 with custom values"""
+            """Test custom values"""
             result = SyncResult(
                 success=True,
                 peers_synced=3,
@@ -2899,7 +2889,7 @@ if __name__ == "__main__":
             self.assertIsNone(config)
 
     class TestPeerSync(unittest.IsolatedAsyncioTestCase):
-        """Test peer sync methods (Phase 6)"""
+        """Test peer sync methods"""
 
         def setUp(self):
             self.manager = RustRouterManager()
@@ -2988,7 +2978,7 @@ if __name__ == "__main__":
                     mock_client.connect_peer.assert_called_once_with("node-a")
 
     class TestEcmpGroupSync(unittest.IsolatedAsyncioTestCase):
-        """Test ECMP group sync methods (Phase 6)"""
+        """Test ECMP group sync methods"""
 
         def setUp(self):
             self.manager = RustRouterManager()
@@ -3086,7 +3076,7 @@ if __name__ == "__main__":
                     mock_client.create_ecmp_group.assert_called_once()
 
     class TestChainSync(unittest.IsolatedAsyncioTestCase):
-        """Test chain sync methods (Phase 6)"""
+        """Test chain sync methods"""
 
         def setUp(self):
             self.manager = RustRouterManager()
@@ -3248,17 +3238,14 @@ if __name__ == "__main__":
 
     # CLI entry point
     parser = argparse.ArgumentParser(
-        description="Rust Router Manager (Phase 6)",
+        description="Rust Router Manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s sync           # Full sync (outbounds + rules + peers + ecmp + chains)
   %(prog)s outbounds      # Sync outbounds only
   %(prog)s rules          # Sync routing rules only
-  %(prog)s peers          # Sync peer nodes only (Phase 6)
-  %(prog)s ecmp           # Sync ECMP groups only (Phase 6)
-  %(prog)s chains         # Sync chains only (Phase 6)
-  %(prog)s health         # Get outbound health status
+  %(prog)s peers          # Sync peer nodes only   %(prog)s ecmp           # Sync ECMP groups only   %(prog)s chains         # Sync chains only   %(prog)s health         # Get outbound health status
   %(prog)s status         # Get rust-router status
   %(prog)s test           # Run comprehensive unit tests
         """
@@ -3291,7 +3278,7 @@ Examples:
         suite.addTests(loader.loadTestsFromTestCase(TestManagerNotifications))
         suite.addTests(loader.loadTestsFromTestCase(TestManagerHealth))
         suite.addTests(loader.loadTestsFromTestCase(TestGetEgressConfig))
-        # Phase 6 test classes
+        # Additional test classes
         suite.addTests(loader.loadTestsFromTestCase(TestPeerSync))
         suite.addTests(loader.loadTestsFromTestCase(TestEcmpGroupSync))
         suite.addTests(loader.loadTestsFromTestCase(TestChainSync))

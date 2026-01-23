@@ -1,14 +1,7 @@
-//! `ChainManager` - Multi-hop chain routing management for Phase 6
+//! `ChainManager` - Multi-hop chain routing management
 //!
 //! This module implements chain lifecycle management with Two-Phase
 //! Commit (2PC) protocol for distributed activation across nodes.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.6.1 `ChainManager` structure
-//! - [x] 6.6.1 Chain validation
-//! - [ ] 6.6.1 Remote egress validation
-//! - [ ] 6.6.1 2PC integration
 //!
 //! # Architecture
 //!
@@ -980,7 +973,7 @@ impl ChainManager {
         coordinator: &mut TwoPhaseCommit,
         tag: &str,
     ) -> Result<(), ChainError> {
-        // Phase 1: PREPARE all participants
+        // PREPARE all participants
         info!("Chain {} starting PREPARE phase", tag);
         let prepare_errors = coordinator.prepare_all().await;
 
@@ -998,7 +991,7 @@ impl ChainManager {
             return Err(prepare_errors.into_iter().next().unwrap().into());
         }
 
-        // Phase 2: COMMIT all participants
+        // COMMIT all participants
         info!("Chain {} starting COMMIT phase", tag);
         let commit_errors = coordinator.commit_all().await;
 
@@ -1256,7 +1249,7 @@ impl ChainManager {
             .unwrap_or(false)
     }
 
-    /// Check if a chain exists and is active (Phase 11-Fix)
+    /// Check if a chain exists and is active
     ///
     /// Only active chains are registered in the FwmarkRouter and can
     /// properly route traffic. This method should be used for validating
@@ -1383,7 +1376,7 @@ impl ChainManager {
     /// # Errors
     ///
     /// Returns `NotFound` if chain does not exist.
-    #[allow(dead_code)] // Used in Phase 6.6.2: 2PC integration
+    #[allow(dead_code)] // Used for 2PC integration
     pub(crate) fn update_chain_state(
         &self,
         tag: &str,
@@ -1676,7 +1669,7 @@ impl ChainManager {
             (chain.config.clone(), chain.my_role, chain.state)
         };
 
-        // Phase 12-Fix.C: Handle already-active chains gracefully
+        // Handle already-active chains gracefully
         // If chain is already active, ensure routing is set up (idempotent)
         // This fixes the case where chain was activated but fwmark_router wasn't updated
         if current_state == ChainState::Active {

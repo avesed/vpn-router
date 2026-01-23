@@ -34,7 +34,7 @@ pub struct ConnectionManager {
     /// Outbound manager
     outbound_manager: Arc<OutboundManager>,
 
-    /// Phase 6-Fix.AI: ECMP group manager for load balancing
+    /// ECMP group manager for load balancing
     ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
     /// Default outbound tag
@@ -85,7 +85,7 @@ impl ConnectionManager {
         }
     }
 
-    /// Phase 6-Fix.AI: Set ECMP group manager for load balancing
+    /// Set ECMP group manager for load balancing
     pub fn set_ecmp_group_manager(&mut self, ecmp_manager: Arc<EcmpGroupManager>) {
         self.ecmp_group_manager = Some(ecmp_manager);
     }
@@ -132,7 +132,7 @@ impl ConnectionManager {
         );
 
         // Create connection context
-        // Phase 6-Fix.AI: Include ECMP group manager for load balancing support
+        // Include ECMP group manager for load balancing support
         let ctx = TcpConnectionContext {
             conn,
             outbound_manager: Arc::clone(&self.outbound_manager),

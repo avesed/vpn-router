@@ -466,7 +466,7 @@ impl BlockFilter {
         // Increment total queries
         self.total_queries.fetch_add(1, Ordering::Relaxed);
 
-        // Phase 3-Fix: Strip trailing dot from FQDN format (e.g., "ads.google.com." -> "ads.google.com")
+        // Strip trailing dot from FQDN format (e.g., "ads.google.com." -> "ads.google.com")
         // DNS QNAME from hickory_proto includes a trailing dot for FQDN, but blocklist rules don't.
         let domain = domain.trim_end_matches('.');
 
@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_is_blocked_trailing_dot() {
-        // Phase 3-Fix: Test that trailing dot (FQDN format) is handled correctly
+        // Test that trailing dot (FQDN format) is handled correctly
         // DNS QNAME from hickory_proto includes a trailing dot, e.g., "ads.google.com."
         let filter = BlockFilter::new(BlockingConfig::default());
         let domains = vec!["ads.google.com".to_string(), "googleadservices.com".to_string()];

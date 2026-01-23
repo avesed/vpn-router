@@ -6,10 +6,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 import { Button } from "../ui/button";
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "../ui/form";
 import { Input } from "../ui/input";
-// Phase 3: Select component removed (protocol selector no longer needed)
 import { toast } from "sonner";
 
-// Phase 3: protocol field removed - WireGuard only
+// WireGuard protocol only
 const formSchema = z.object({
   tag: z.string().min(1, "Tag is required"),
   description: z.string().optional(),
@@ -32,7 +31,6 @@ export function AddWarpDialog({ open, onOpenChange }: AddWarpDialogProps) {
       tag: "warp-1",
       description: "",
       license_key: "",
-      // Phase 3: protocol removed - WireGuard only
     },
   });
 
@@ -102,7 +100,6 @@ export function AddWarpDialog({ open, onOpenChange }: AddWarpDialogProps) {
                 </FormItem>
               )}
             />
-            {/* Phase 3: Protocol selector removed - WireGuard only */}
             <DialogFooter>
               <Button type="submit" disabled={registerWarp.isPending}>
                 Register WARP

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Rust Router IPC Client (v4.1 - Phase 7.7)
+Rust Router IPC Client (v4.1)
 
 Async client for communicating with rust-router via Unix socket.
 Used by api_server.py and RustRouterManager for configuration sync.
 
-Protocol v4.1 Features (Phase 7.7):
+Protocol v4.1 Features:
 - Length-prefixed JSON framing (4 bytes BE + JSON) - matches Rust IPC protocol
 - WireGuard outbound management (AddWireguardOutbound)
 - SOCKS5 outbound management (AddSocks5Outbound)
@@ -17,14 +17,14 @@ Protocol v4.1 Features (Phase 7.7):
 - Connection retry with exponential backoff
 - Graceful degradation when rust-router unavailable
 
-Phase 6 v3.2 Commands:
+v3.2 Commands:
 - Userspace WireGuard tunnel management (CreateWgTunnel, RemoveWgTunnel, etc.)
 - ECMP group management (CreateEcmpGroup, RemoveEcmpGroup, etc.)
 - Peer node management (GeneratePairRequest, ImportPairRequest, ConnectPeer, etc.)
 - Chain management (CreateChain, ActivateChain, DeactivateChain, etc.)
 - Two-Phase Commit for distributed chain activation
 
-Phase 7.7 DNS Commands:
+DNS Commands:
 - DNS statistics (GetDnsStats, GetDnsCacheStats, GetDnsBlockStats)
 - Cache management (FlushDnsCache)
 - Upstream management (AddDnsUpstream, RemoveDnsUpstream, GetDnsUpstreamStatus)
@@ -56,7 +56,7 @@ LENGTH_PREFIX_SIZE = 4
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 
 # Protocol version
-PROTOCOL_VERSION = 5  # Phase 7.7: DNS engine commands
+PROTOCOL_VERSION = 5  # DNS engine commands
 
 # Default timeouts
 DEFAULT_CONNECT_TIMEOUT = 5.0  # seconds
@@ -144,7 +144,7 @@ class PrometheusMetricsResponse:
 
 
 # =============================================================================
-# Phase 6 v3.2: New dataclasses
+# v3.2: New dataclasses
 # =============================================================================
 
 
@@ -257,7 +257,7 @@ class RuleConfig:
 
 
 # =============================================================================
-# Phase 7.7: DNS dataclasses
+# DNS dataclasses
 # =============================================================================
 
 
@@ -760,7 +760,7 @@ class RustRouterClient:
         return await self._send_command({"type": "disable_outbound", "tag": tag})
 
     # =========================================================================
-    # Phase 3.3/3.4: WireGuard and SOCKS5 Outbound Management
+    # WireGuard and SOCKS5 Outbound Management
     # =========================================================================
 
     async def add_wireguard_outbound(
@@ -1056,7 +1056,7 @@ class RustRouterClient:
         })
 
     # =========================================================================
-    # Phase 6: WireGuard Tunnel Management (Userspace)
+    # WireGuard Tunnel Management (Userspace)
     # =========================================================================
 
     async def create_wg_tunnel(
@@ -1090,7 +1090,7 @@ class RustRouterClient:
         config = {
             "private_key": private_key,
             "peer_public_key": peer_public_key,
-            # Phase 11-Fix.Z: 修复字段名不匹配 - Rust IPC 协议使用 peer_endpoint
+            # 修复字段名不匹配 - Rust IPC 协议使用 peer_endpoint
             "peer_endpoint": endpoint,
             "local_ip": local_ip,
             "mtu": mtu,
@@ -1155,7 +1155,7 @@ class RustRouterClient:
                     state=item.get("state", "unknown"),
                     local_ip=item.get("local_ip", ""),
                     peer_ip=item.get("peer_ip"),
-                    # Phase 12-Fix.O: Rust IPC uses peer_endpoint, not endpoint
+                    # Rust IPC uses peer_endpoint, not endpoint
                     endpoint=item.get("peer_endpoint"),
                     listen_port=item.get("listen_port"),
                     mtu=item.get("mtu", 1420),
@@ -1167,7 +1167,7 @@ class RustRouterClient:
         return result
 
     # =========================================================================
-    # Phase 11-Fix.AA: Ingress Peer Management
+    # Ingress Peer Management
     # =========================================================================
 
     async def add_ingress_peer(
@@ -1227,7 +1227,7 @@ class RustRouterClient:
         return []
 
     # =========================================================================
-    # Phase 6: ECMP Group Management
+    # ECMP Group Management
     # =========================================================================
 
     @staticmethod
@@ -1393,7 +1393,7 @@ class RustRouterClient:
         })
 
     # =========================================================================
-    # Phase 6: Peer Node Management
+    # Peer Node Management
     # =========================================================================
 
     async def generate_pair_request(
@@ -1660,7 +1660,7 @@ class RustRouterClient:
         return await self._send_command({"type": "remove_peer", "tag": tag})
 
     # =========================================================================
-    # Phase 6: Chain Management
+    # Chain Management
     # =========================================================================
 
     async def create_chain(
@@ -1840,7 +1840,7 @@ class RustRouterClient:
         )
 
     # =========================================================================
-    # Phase 6: Two-Phase Commit (2PC) Protocol
+    # Two-Phase Commit (2PC) Protocol
     # =========================================================================
 
     async def prepare_chain_route(
@@ -1915,7 +1915,7 @@ class RustRouterClient:
         })
 
     # =========================================================================
-    # Phase 7.7: DNS Commands
+    # DNS Commands
     # =========================================================================
 
     async def get_dns_stats(self) -> Optional[DnsStats]:
@@ -2355,7 +2355,7 @@ class RustRouterClient:
         tunnel_type: Optional[str] = None,
         api_port: Optional[int] = None,
         tunnel_ip: Optional[str] = None,
-        # Phase 12-Fix.J: Local tunnel IP for WireGuard tunnel routing
+        # Local tunnel IP for WireGuard tunnel routing
         tunnel_local_ip: Optional[str] = None,
         # Custom headers to include in the request
         headers: Optional[Dict[str, str]] = None,
@@ -2405,7 +2405,7 @@ class RustRouterClient:
             command["api_port"] = api_port
         if tunnel_ip is not None:
             command["tunnel_ip"] = tunnel_ip
-        # Phase 12-Fix.J: Add local tunnel IP for WireGuard routing
+        # Add local tunnel IP for WireGuard routing
         if tunnel_local_ip is not None:
             command["tunnel_local_ip"] = tunnel_local_ip
         if headers is not None:
@@ -3068,7 +3068,7 @@ if __name__ == "__main__":
             self.assertIsNone(result)
 
     class TestPhase6Dataclasses(unittest.TestCase):
-        """Test Phase 6 v3.2 dataclasses"""
+        """Test v3.2 dataclasses"""
 
         def test_wg_tunnel_info_defaults(self):
             """Test WgTunnelInfo with defaults"""
@@ -3167,7 +3167,7 @@ if __name__ == "__main__":
             self.assertEqual(info.dscp_value, 10)
 
     class TestPhase6Commands(unittest.IsolatedAsyncioTestCase):
-        """Test Phase 6 v3.2 client command methods"""
+        """Test v3.2 client command methods"""
 
         async def asyncSetUp(self):
             self.client = RustRouterClient()
@@ -3506,7 +3506,7 @@ if __name__ == "__main__":
 
     # CLI entry point
     parser = argparse.ArgumentParser(
-        description="Rust Router IPC Client (v4.0 - Phase 6 v3.2)",
+        description="Rust Router IPC Client (v4.1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -3521,7 +3521,7 @@ Examples:
   %(prog)s shutdown                    # Request graceful shutdown
   %(prog)s test                        # Run comprehensive unit tests
 
-Phase 6 v3.2 Features:
+v3.2 Features:
   - Userspace WireGuard tunnel management (boringtun)
   - ECMP load balancing groups (5 algorithms)
   - Peer node management with offline pairing

@@ -975,7 +975,7 @@ impl Outbound for Socks5Outbound {
         })
     }
 
-    // === UDP Methods (Phase 5.2) ===
+    // === UDP Methods ===
 
     async fn connect_udp(
         &self,

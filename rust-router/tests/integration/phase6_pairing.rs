@@ -151,12 +151,12 @@ fn test_pairing_request_generation() {
     }).expect("Should generate pairing code");
 
     // Verify code is valid Base64
-    assert!(!code.is_empty());
-    assert!(code.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    assert!(!code.code.is_empty());
+    assert!(code.code.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
 
     // Decode and verify content
     use rust_router::peer::decode_pair_request;
-    let request = decode_pair_request(&code).expect("Should decode pairing code");
+    let request = decode_pair_request(&code.code).expect("Should decode pairing code");
     assert_eq!(request.node_tag, "local-node");
     assert_eq!(request.api_port, 36000);
     assert!(!request.bidirectional);
@@ -178,8 +178,8 @@ async fn test_pairing_bidirectional() {
     }).expect("Should generate pairing request");
 
     // Step 2: Node B imports request and generates response
-    let response_code = manager_b.import_pair_request(
-        &request_code,
+    let response_result = manager_b.import_pair_request(
+        &request_code.code,
         PairRequestConfig {
             local_tag: "node-b".to_string(),
             local_description: "Node B".to_string(),
@@ -194,7 +194,7 @@ async fn test_pairing_bidirectional() {
     assert!(manager_b.peer_exists("node-a"));
 
     // Step 3: Node A completes handshake
-    manager_a.complete_handshake(&response_code)
+    manager_a.complete_handshake(&response_result.response_code)
         .await
         .expect("Should complete handshake");
 
@@ -336,10 +336,10 @@ fn test_xray_pairing_request_generation() {
     }).expect("Should generate Xray pairing code");
 
     // Verify code is valid Base64
-    assert!(!code.is_empty());
+    assert!(!code.code.is_empty());
 
     // Decode and verify content
-    let request = decode_pair_request(&code).expect("Should decode pairing code");
+    let request = decode_pair_request(&code.code).expect("Should decode pairing code");
     assert_eq!(request.node_tag, "xray-node");
     assert_eq!(request.tunnel_type, TunnelType::Xray);
     // Xray requests still include WG public key for hybrid scenarios
@@ -491,7 +491,7 @@ async fn test_pairing_import_truncated_code() {
     }).expect("Should generate code");
 
     // Truncate the code
-    let truncated = &valid_code[..valid_code.len() / 2];
+    let truncated = &valid_code.code[..valid_code.code.len() / 2];
 
     let result = manager.import_pair_request(
         truncated,

@@ -59,7 +59,7 @@ def _safe_int_env(name: str, default: int) -> int:
         return default
 
 
-# Phase 11-Fix.V.5: 可配置的超时时间（秒）
+# 可配置的超时时间（秒）
 # 通过环境变量可调整，适应不同网络环境
 DEFAULT_TIMEOUT = _safe_int_env("TUNNEL_API_TIMEOUT", 15)  # 从 10s 增加到 15s
 DEFAULT_CONNECT_TIMEOUT = _safe_int_env("TUNNEL_API_CONNECT_TIMEOUT", 8)  # 从 5s 增加到 8s
@@ -76,7 +76,7 @@ class EgressInfo:
     type: str  # "pia", "custom", "direct", "warp", "v2ray", "openvpn"
     enabled: bool
     description: Optional[str] = None
-    protocol: Optional[str] = None  # Phase 11-Fix.Q: WARP protocol (wireguard/masque)
+    protocol: Optional[str] = None  # WARP protocol (wireguard/masque)
 
 
 @dataclass
@@ -302,7 +302,7 @@ class TunnelAPIClient:
                     )
 
             # 解析 JSON 响应
-            # Phase 11-Fix.U: 确保 message 字段始终存在，避免调用方出现 None
+            # 确保 message 字段始终存在，避免调用方出现 None
             if response.text:
                 result = response.json()
                 if 'message' not in result:
@@ -352,7 +352,7 @@ class TunnelAPIClient:
     ) -> Dict[str, Any]:
         """发送 GET 请求
 
-        Phase 2: 通用 GET 方法，用于隧道优先通信。
+        通用 GET 方法，用于隧道优先通信。
 
         Args:
             path: API 路径 (如 /api/peer-info/egress)
@@ -374,7 +374,7 @@ class TunnelAPIClient:
     ) -> Dict[str, Any]:
         """发送 POST 请求
 
-        Phase 2: 通用 POST 方法，用于隧道优先通信。
+        通用 POST 方法，用于隧道优先通信。
 
         Args:
             path: API 路径 (如 /api/peer-notify/connected)
@@ -397,7 +397,7 @@ class TunnelAPIClient:
     ) -> Dict[str, Any]:
         """发送 DELETE 请求
 
-        Phase 2: 通用 DELETE 方法，用于隧道优先通信。
+        通用 DELETE 方法，用于隧道优先通信。
 
         Args:
             path: API 路径 (如 /api/peer-chain/unregister)
@@ -429,8 +429,7 @@ class TunnelAPIClient:
                     type=item.get("type", "unknown"),
                     enabled=item.get("enabled", True),
                     description=item.get("description"),
-                    protocol=item.get("protocol"),  # Phase 11-Fix.Q
-                ))
+                    protocol=item.get("protocol"),                ))
 
             logging.info(f"[tunnel-api] 获取 {self.node_tag} 出口列表: {len(egress_list)} 个")
             return egress_list
@@ -440,7 +439,7 @@ class TunnelAPIClient:
             raise
 
     def get_forwarded_egress_list(self, target_tag: str) -> List[EgressInfo]:
-        """Phase 4: 通过当前节点转发获取目标节点的出口列表
+        """通过当前节点转发获取目标节点的出口列表
 
         用于传递模式：当本节点是中继时，转发查询到终端节点。
 
@@ -471,8 +470,7 @@ class TunnelAPIClient:
                     type=e.get("type", "unknown"),
                     enabled=e.get("enabled", False),
                     description=e.get("description"),
-                    protocol=e.get("protocol"),  # Phase 11-Fix.Q
-                )
+                    protocol=e.get("protocol"),                )
                 for e in egress_data
             ]
 
@@ -496,7 +494,7 @@ class TunnelAPIClient:
         egress_tag: str,
         mark_type: str = "dscp",
         source_node: Optional[str] = None,
-        target_node: Optional[str] = None,  # Phase 11-Fix.E: 支持转发注册
+        target_node: Optional[str] = None, 支持转发注册
     ) -> bool:
         """在终端节点注册链路路由
 
@@ -523,7 +521,7 @@ class TunnelAPIClient:
             }
             if source_node:
                 data["source_node"] = source_node
-            # Phase 11-Fix.E: 如果指定了 target_node，接收节点将转发注册
+           如果指定了 target_node，接收节点将转发注册
             if target_node:
                 data["target_node"] = target_node
 
@@ -551,8 +549,8 @@ class TunnelAPIClient:
         chain_tag: str,
         mark_value: int,
         mark_type: str = "dscp",
-        target_node: Optional[str] = None,  # Phase 11-Fix.E: 支持转发注销
-        source_node: Optional[str] = None,  # Phase 11-Fix.V.3: 入口节点标识
+        target_node: Optional[str] = None, 支持转发注销
+        source_node: Optional[str] = None, 入口节点标识
     ) -> bool:
         """在终端节点注销链路路由
 
@@ -574,10 +572,10 @@ class TunnelAPIClient:
                 "mark_value": mark_value,
                 "mark_type": mark_type,
             }
-            # Phase 11-Fix.E: 传递模式下，通过中继转发注销请求
+           传递模式下，通过中继转发注销请求
             if target_node:
                 params["target_node"] = target_node
-            # Phase 11-Fix.V.3: 传递入口节点标识
+           传递入口节点标识
             if source_node:
                 params["source_node"] = source_node
 
@@ -623,7 +621,7 @@ class TunnelAPIClient:
             raise
 
     def get_peers(self) -> List[Dict[str, Any]]:
-        """Phase 11-Fix.C: 获取远程节点的 peer 列表
+        """ 获取远程节点的 peer 列表
 
         用于验证多跳链路中的后续跳点是否存在于中间节点。
 
@@ -644,7 +642,7 @@ class TunnelAPIClient:
         hops: List[str],
         allow_transitive: bool = False,
     ) -> Dict[str, Any]:
-        """Phase 11-Fix.C: 在远程节点验证链路跳点
+        """ 在远程节点验证链路跳点
 
         用于递归验证多跳链路中后续跳点的有效性。
         例如 A→B→C 链路，A 调用 B 的此方法验证 [C] 是否有效。
@@ -717,7 +715,7 @@ class TunnelAPIClient:
         wg_public_key: str,
         tunnel_local_ip: str,
     ) -> bool:
-        """Phase 11.3: 请求远程节点建立反向连接
+        """ 请求远程节点建立反向连接
 
         在配对完成后，通过隧道调用远程节点的 reverse-setup API，
         请求远程节点也建立到本节点的隧道连接，实现双向通信。
@@ -763,7 +761,7 @@ class TunnelAPIClient:
         dscp_value: int,
         mark_type: str = "dscp",
     ) -> Dict[str, Any]:
-        """Phase 11-Fix.T: 2PC 准备阶段 - 验证中继路由可注册性
+        """ 2PC 准备阶段 - 验证中继路由可注册性
 
         在实际注册前调用，验证所有条件但不应用 iptables 规则。
 
@@ -813,7 +811,7 @@ class TunnelAPIClient:
         dscp_value: int,
         mark_type: str = "dscp",
     ) -> bool:
-        """Phase 11.4: 在远程节点注册中继转发规则
+        """ 在远程节点注册中继转发规则
 
         用于多跳链路激活：请求中间节点配置 DSCP 匹配 + 策略路由。
 
@@ -854,9 +852,9 @@ class TunnelAPIClient:
     def unregister_relay_route(
         self,
         chain_tag: str,
-        source_node: Optional[str] = None,  # Phase 11-Fix.V.3: 入口节点标识
+        source_node: Optional[str] = None, 入口节点标识
     ) -> bool:
-        """Phase 11.4: 在远程节点注销中继转发规则
+        """ 在远程节点注销中继转发规则
 
         用于多跳链路停用：请求中间节点清理转发规则。
 
@@ -873,7 +871,7 @@ class TunnelAPIClient:
             data = {
                 "chain_tag": chain_tag,
             }
-            # Phase 11-Fix.V.3: 传递入口节点标识
+           传递入口节点标识
             if source_node:
                 data["source_node"] = source_node
             result = self._make_request("POST", "/api/relay-routing/unregister", data=data)
@@ -898,9 +896,8 @@ class TunnelAPIClient:
         local_endpoint: str,
         local_tunnel_ip: str,
         wg_public_key: str,
-        api_port: Optional[int] = None,  # Phase 11-Fix.K
-    ) -> dict:
-        """Phase 11-Tunnel: 请求完成配对握手
+        api_port: Optional[int] = None,    ) -> dict:
+        """ 请求完成配对握手
 
         通过已建立的隧道调用远程节点的 complete-handshake API，
         通知远程节点完成配对流程。
@@ -912,7 +909,7 @@ class TunnelAPIClient:
             local_endpoint: 本节点端点（对方可连接的地址）
             local_tunnel_ip: 本节点隧道 IP
             wg_public_key: 本节点 WireGuard 公钥
-            api_port: 本节点 API 端口（Phase 11-Fix.K，默认 36000）
+            api_port: 本节点 API 端口（默认 36000）
 
         Returns:
             API 响应字典，包含 success 和 message 字段
@@ -925,7 +922,7 @@ class TunnelAPIClient:
                 "endpoint": local_endpoint,
                 "tunnel_ip": local_tunnel_ip,
                 "wg_public_key": wg_public_key,
-                "api_port": api_port,  # Phase 11-Fix.K: 传递 API 端口
+                "api_port": api_port,  # 传递 API 端口
             }
 
             result = self._make_request("POST", "/api/peer-tunnel/complete-handshake", data=data)
@@ -942,7 +939,7 @@ class TunnelAPIClient:
             logging.error(f"[tunnel-api] 完成握手失败 ({self.node_tag}): {e}")
             return {"success": False, "message": str(e)}
 
-    # ============ Phase 11-Cascade: 对等节点事件通知 ============
+    # ============ 对等节点事件通知 ============
 
     def send_peer_event(
         self,
@@ -954,7 +951,7 @@ class TunnelAPIClient:
         reason: str = "",
         details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Phase 11-Cascade: 发送对等节点事件通知
+        """ 发送对等节点事件通知
 
         通用方法，用于发送 delete/disconnect/broadcast 事件。
 
@@ -1010,7 +1007,7 @@ class TunnelAPIClient:
         reason: str = "deleted",
         ttl: int = 3,
     ) -> bool:
-        """Phase 11-Cascade: 发送删除通知
+        """ 发送删除通知
 
         通知远程节点：我们已删除它，它应该清理与我们的连接。
 
@@ -1038,7 +1035,7 @@ class TunnelAPIClient:
         source_node: str,
         reason: str = "disconnected",
     ) -> bool:
-        """Phase 11-Cascade: 发送断开通知
+        """ 发送断开通知
 
         通知远程节点：我们临时断开隧道（可能会重连）。
 
@@ -1067,7 +1064,7 @@ class TunnelAPIClient:
         reason: str = "node_unavailable",
         ttl: int = 2,
     ) -> bool:
-        """Phase 11-Cascade: 发送广播通知
+        """ 发送广播通知
 
         通知远程节点：某个节点已不可用（级联通知）。
 
@@ -1124,10 +1121,10 @@ class TunnelAPIClient:
         )
         return result.get("success", False)
 
-    # ============ Phase 12: Chain Sync Propagation ============
+    # ============ Chain Sync Propagation ============
 
     def get_used_dscp_values(self) -> Dict[str, Any]:
-        """Phase 12: 获取远程节点已使用的 DSCP 值列表
+        """ 获取远程节点已使用的 DSCP 值列表
 
         用于在创建链路前检查 DSCP 冲突，确保新链路的 DSCP 值
         在所有节点上都可用。
@@ -1168,7 +1165,7 @@ class TunnelAPIClient:
         allow_transitive: bool = False,
         action: str = "create",
     ) -> Dict[str, Any]:
-        """Phase 12: 向远程节点同步链路配置
+        """ 向远程节点同步链路配置
 
         在创建/更新链路时，将完整的链路配置同步到链路中的所有节点。
         每个节点收到后会：
@@ -1443,7 +1440,7 @@ class TunnelAPIClientManager:
         如果客户端不存在，会从数据库加载节点信息并创建。
         使用 LRU 策略管理缓存：访问时移到末尾，新增时检查大小限制。
 
-        Phase 10.2: 根据隧道类型选择连接方式：
+        根据隧道类型选择连接方式：
         - WireGuard 隧道：直接 HTTP 连接到隧道 IP
         - Xray 隧道：通过 SOCKS5 代理连接
 
@@ -1562,7 +1559,7 @@ class TunnelAPIClientManager:
             logging.error(f"[tunnel-api-mgr] 获取终端出口列表失败: {e}")
             return []
 
-    # ============ Phase 11-Cascade: 广播事件到所有连接的 peer ============
+    # ============ 广播事件到所有连接的 peer ============
 
     def broadcast_delete_event(
         self,
@@ -1572,7 +1569,7 @@ class TunnelAPIClientManager:
         ttl: int = 3,
         exclude_nodes: Optional[List[str]] = None,
     ) -> Dict[str, bool]:
-        """Phase 11-Cascade: 向所有连接的 peer 广播删除事件
+        """ 向所有连接的 peer 广播删除事件
 
         当删除一个节点时，通知所有其他连接的节点该节点已不可用。
 
@@ -1644,7 +1641,7 @@ class TunnelAPIClientManager:
         source_node: str,
         reason: str = "deleted",
     ) -> bool:
-        """Phase 11-Cascade: 通知单个 peer 删除事件
+        """ 通知单个 peer 删除事件
 
         在删除节点前通过隧道通知对方，让对方清理连接。
 

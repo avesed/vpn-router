@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Router Watchdog - Phase 3.5
+Router Watchdog
 
 Monitors rust-router and sing-box health, manages failover between routers.
 Handles TPROXY port switching for seamless traffic failover.
@@ -1104,7 +1104,7 @@ if __name__ == "__main__":
             self.assertEqual(HealthStatus.UNKNOWN.value, "unknown")
 
     # CLI handling
-    parser = argparse.ArgumentParser(description="Router Watchdog - Phase 3.5")
+    parser = argparse.ArgumentParser(description="Router Watchdog")
     parser.add_argument("--daemon", "-d", action="store_true", help="Run as daemon")
     parser.add_argument("--test", "-t", action="store_true", help="Run unit tests")
     parser.add_argument("--status", "-s", action="store_true", help="Print current status and exit")

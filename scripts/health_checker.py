@@ -218,7 +218,7 @@ def _check_wg_tunnel_status(tag: str, timeout: int) -> Tuple[bool, int, str]:
         resp_type = response.get("type", "")
 
         if resp_type == "wg_tunnel_status":
-            # Phase 6-Fix: rust-router IPC 返回 active: bool 而不是 state: str
+            # rust-router IPC returns active: bool instead of state: str
             is_active = response.get("active", False)
             last_handshake = response.get("last_handshake", 0)
             error = response.get("error")

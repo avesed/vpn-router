@@ -240,7 +240,7 @@ impl DirectOutbound {
         }
     }
 
-    // === UDP Support (Phase 5.1) ===
+    // === UDP Support ===
 
     /// Create a UDP socket with the configured options.
     ///
@@ -454,7 +454,7 @@ impl Outbound for DirectOutbound {
         "direct"
     }
 
-    // === UDP Methods (Phase 5.1) ===
+    // === UDP Methods ===
 
     async fn connect_udp(
         &self,

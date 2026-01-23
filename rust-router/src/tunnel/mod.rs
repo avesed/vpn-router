@@ -1,4 +1,4 @@
-//! `WireGuard` tunnel module for Phase 6
+//! `WireGuard` tunnel module
 //!
 //! This module provides userspace `WireGuard` tunnel implementations
 //! using boringtun for full Rust-native `WireGuard` support.
@@ -45,19 +45,6 @@
 //! - [`userspace`]: Userspace `WireGuard` via boringtun
 //! - [`config`]: Tunnel configuration types
 //!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.1 boringtun integration
-//! - [x] 6.1 Key generation (`generate_private_key`, `derive_public_key`)
-//! - [x] 6.1 Handshake handling
-//! - [x] 6.1 Packet encryption/decryption
-//! - [x] 6.1 Timer task (keepalive, rekey)
-//! - [x] 6.2 Tunnel abstraction trait (extended)
-//! - [x] 6.2 Configuration types and validation
-//! - [x] 6.2 Peer management (single-peer egress mode)
-//! - [ ] 6.3 `WireGuard` ingress
-//! - [ ] 6.4 `WireGuard` egress
-//!
 //! # Architecture
 //!
 //! ```text
@@ -95,7 +82,6 @@
 //!
 //! - boringtun: <https://github.com/cloudflare/boringtun>
 //! - `WireGuard` Protocol: <https://www.wireguard.com/protocol/>
-//! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Sections 6.1-6.4
 
 pub mod config;
 pub mod handshake;

@@ -1,17 +1,8 @@
-//! `WireGuard` Ingress module for Phase 6.3
+//! `WireGuard` Ingress module
 //!
 //! This module provides `WireGuard` ingress functionality, allowing the rust-router
 //! to accept incoming `WireGuard` connections from clients and route their traffic
 //! based on DSCP values and rule matching.
-//!
-//! # Phase 6.3 Implementation Status
-//!
-//! - [x] `WgIngressConfig` configuration type
-//! - [x] `IngressError` error types
-//! - [x] `IngressProcessor` for packet processing
-//! - [x] `WgIngressManager` for tunnel management
-//! - [x] DSCP extraction and rule matching
-//! - [x] Multi-peer support
 //!
 //! # Architecture
 //!

@@ -16,7 +16,7 @@
 //!       |
 //!       +---> UDP packets ---> WgEgressManager.send() / OutboundManager
 //!       |
-//!       +---> TCP packets ---> (Phase 3: TCP state machine)
+//!       +---> TCP packets ---> TCP state machine
 //! ```
 //!
 //! # Session Tracking
@@ -117,7 +117,7 @@ impl UdpSessionEntry {
 }
 
 // ============================================================================
-// TCP Connection Tracking (Phase 3)
+// TCP Connection Tracking
 // ============================================================================
 
 /// TCP flag bits
@@ -2214,7 +2214,7 @@ async fn forward_tcp_packet(
         IPPROTO_TCP,
     );
 
-    // Phase 6-Fix.AI: Resolve ECMP group to member using five-tuple hash
+    // Resolve ECMP group to member using five-tuple hash
     let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
         if let Some(group) = ecmp_mgr.get_group(routing_outbound) {
             // Create ECMP five-tuple for consistent hashing
@@ -2258,7 +2258,7 @@ async fn forward_tcp_packet(
         || wg_egress_manager.has_tunnel(outbound_tag);
 
     if is_wg_egress {
-        // Phase 12-Fix.Entry: Register chain session when Entry node forwards to peer tunnel
+        // Register chain session when Entry node forwards to peer tunnel
         if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
             // Entry node: registering chain session for traffic to peer tunnel
             session_tracker.register_chain(
@@ -2286,7 +2286,7 @@ async fn forward_tcp_packet(
             );
         }
 
-        // Phase 12-Fix: For peer-* tunnels, first check PeerManager.wg_tunnels
+        // For peer-* tunnels, first check PeerManager.wg_tunnels
         // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
         // not WgEgressManager. This fixes the "Tunnel not found" error for chain routing.
         if outbound_tag.starts_with("peer-") {
@@ -2958,7 +2958,7 @@ async fn forward_udp_packet(
     // Create 5-tuple for session tracking
     let five_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP);
 
-    // Phase 6-Fix.AI: Resolve ECMP group to member using five-tuple hash
+    // Resolve ECMP group to member using five-tuple hash
     let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
         if let Some(group) = ecmp_mgr.get_group(routing_outbound) {
             // Create ECMP five-tuple for consistent hashing
@@ -3001,7 +3001,7 @@ async fn forward_udp_packet(
         || outbound_tag.starts_with("peer-")
         || wg_egress_manager.has_tunnel(outbound_tag);
 
-    // Phase 12-Fix.Entry: Register chain session when Entry node forwards to peer tunnel
+    // Register chain session when Entry node forwards to peer tunnel
     if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
         // Entry node: registering chain session for traffic to peer tunnel
         session_tracker.register_chain(
@@ -3030,7 +3030,7 @@ async fn forward_udp_packet(
     }
 
     if is_wg_egress {
-        // Phase 12-Fix: For peer-* tunnels, first check PeerManager.wg_tunnels
+        // For peer-* tunnels, first check PeerManager.wg_tunnels
         // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
         // not WgEgressManager. This fixes the "Tunnel not found" error for chain routing.
         if outbound_tag.starts_with("peer-") {
@@ -4121,13 +4121,13 @@ pub struct PeerTunnelProcessorStatsSnapshot {
 /// 3. If Terminal role: route to exit_egress and clear DSCP
 /// 4. Forward packet to the appropriate egress
 ///
-/// # Phase 12-Fix.P3: Non-WG Egress Support
+/// # Non-WG Egress Support
 ///
 /// For non-WireGuard egress (direct, SOCKS), packets are forwarded to the main
 /// forwarding loop via `forward_tx`. This reuses all existing TCP/UDP/SOCKS
 /// forwarding logic instead of duplicating it here.
 ///
-/// # Phase 3 Chain Reply Routing
+/// # Chain Reply Routing
 ///
 /// This function also handles reply path detection for chain traffic:
 /// - Entry node: replies go back to wg-ingress client
@@ -4139,7 +4139,7 @@ pub async fn run_peer_tunnel_processor_loop(
     wg_egress_manager: Arc<WgEgressManager>,
     stats: Arc<PeerTunnelProcessorStats>,
     forward_tx: Option<mpsc::Sender<super::manager::ProcessedPacket>>,
-    // Phase 3: New parameters for reply path routing
+    // Parameters for reply path routing
     session_tracker: Arc<IngressSessionTracker>,
     ingress_manager: Arc<WgIngressManager>,
     peer_manager: Arc<PeerManager>,
@@ -4428,7 +4428,7 @@ pub async fn run_peer_tunnel_processor_loop(
                 }
             }
         } else if let Some(ref tx) = forward_tx {
-            // Phase 12-Fix.P3: Forward non-WG egress to main forwarding loop
+            // Forward non-WG egress to main forwarding loop
             // This reuses all existing TCP/UDP/SOCKS forwarding logic
             let processed = super::manager::ProcessedPacket {
                 data: packet,
@@ -4486,9 +4486,9 @@ pub async fn run_peer_tunnel_processor_loop(
 /// * `wg_egress_manager` - Manager for WireGuard egress tunnels
 /// * `stats` - Statistics collector
 /// * `forward_tx` - Optional sender to main forwarding loop for non-WG egress (direct/SOCKS)
-/// * `session_tracker` - Session tracker for reply routing (Phase 3)
-/// * `ingress_manager` - Ingress manager for sending replies to wg-ingress peers (Phase 3)
-/// * `peer_manager` - Peer manager for sending replies to peer tunnels (Phase 3)
+/// * `session_tracker` - Session tracker for reply routing
+/// * `ingress_manager` - Ingress manager for sending replies to wg-ingress peers
+/// * `peer_manager` - Peer manager for sending replies to peer tunnels
 pub fn spawn_peer_tunnel_processor(
     packet_rx: mpsc::Receiver<ReplyPacket>,
     processor: Arc<super::processor::IngressProcessor>,
@@ -4548,11 +4548,16 @@ mod tests {
         Arc::new(WgIngressManager::new(config, create_test_engine()).unwrap())
     }
 
+    fn create_test_peer_manager() -> Arc<PeerManager> {
+        Arc::new(PeerManager::new("test-node".to_string()))
+    }
+
     async fn run_reply_router_once(
         reply: ReplyPacket,
         ingress_manager: Arc<WgIngressManager>,
         session_tracker: Arc<IngressSessionTracker>,
         stats: Arc<IngressReplyStats>,
+        peer_manager: Arc<PeerManager>,
     ) {
         let (tx, rx) = mpsc::channel(1);
         let handle = tokio::spawn(run_reply_router_loop(
@@ -4561,6 +4566,7 @@ mod tests {
             session_tracker,
             stats,
             None, // No DNS cache for tests
+            peer_manager,
         ));
 
         tx.send(reply).await.unwrap();
@@ -4815,6 +4821,7 @@ mod tests {
             ingress_manager,
             session_tracker,
             Arc::clone(&stats),
+            create_test_peer_manager(),
         )
         .await;
 
@@ -4857,6 +4864,7 @@ mod tests {
             ingress_manager,
             session_tracker,
             Arc::clone(&stats),
+            create_test_peer_manager(),
         )
         .await;
 
@@ -4899,6 +4907,7 @@ mod tests {
             ingress_manager,
             session_tracker,
             Arc::clone(&stats),
+            create_test_peer_manager(),
         )
         .await;
 
@@ -4946,6 +4955,7 @@ mod tests {
             ingress_manager,
             session_tracker,
             Arc::clone(&stats),
+            create_test_peer_manager(),
         )
         .await;
 
@@ -4970,6 +4980,7 @@ mod tests {
             ingress_manager,
             session_tracker,
             Arc::clone(&stats),
+            create_test_peer_manager(),
         )
         .await;
 
@@ -5448,7 +5459,7 @@ mod tests {
     }
 
     // ========================================================================
-    // UDP Forwarding Tests (Phase 2)
+    // UDP Forwarding Tests
     // ========================================================================
 
     #[tokio::test]
@@ -5679,7 +5690,7 @@ mod tests {
     }
 
     // ========================================================================
-    // TCP Connection State Tests (Phase 3)
+    // TCP Connection State Tests
     // ========================================================================
 
     #[test]

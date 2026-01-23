@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """中继节点配置管理器
 
-.. deprecated:: Phase 12
+.. deprecated::
     此模块已弃用。rust-router 现在在用户空间处理多跳中继路由。
-    
+
     - 在 userspace WireGuard 模式下，rust-router 直接处理多跳转发
     - 无需 iptables DSCP 标记规则
     - 参见 rust-router/src/tunnel/ 目录
-    
+
     保留此文件仅用于向后兼容和参考。
 
 原始功能说明（已废弃）：
-Phase 11.4: 对于 WireGuard 多跳链路，中间节点需要 iptables 规则来转发流量。
+对于 WireGuard 多跳链路，中间节点需要 iptables 规则来转发流量。
 
 架构（已迁移到 rust-router 用户空间）：
     入口(A) -> wg-peer-B [DSCP 标记] -> 中继(B) -> wg-peer-C -> 终端(C)
@@ -219,7 +219,7 @@ class RelayConfigManager:
                     logger.warning(f"[relay] 链路 '{chain_tag}' 的节点不存在")
                     continue
 
-                # Phase 11-Fix.P: 验证节点使用 WireGuard 隧道（非 Xray）
+                # 验证节点使用 WireGuard 隧道（非 Xray）
                 source_tunnel_type = source_node.get("tunnel_type", "wireguard")
                 target_tunnel_type = target_node.get("tunnel_type", "wireguard")
                 if source_tunnel_type == "xray" or target_tunnel_type == "xray":
@@ -300,7 +300,7 @@ class RelayConfigManager:
     def _setup_dscp_relay(self, rule: RelayRule) -> bool:
         """设置 DSCP 匹配的中继转发
 
-        Phase 12: rust-router 在用户空间处理 DSCP 路由，无需内核 iptables 规则。
+        rust-router 在用户空间处理 DSCP 路由，无需内核 iptables 规则。
         此函数保留用于日志记录和兼容性。
         """
         logger.info(
@@ -312,13 +312,13 @@ class RelayConfigManager:
     def _cleanup_dscp_relay(self, rule: RelayRule) -> bool:
         """清理 DSCP 中继规则
 
-        Phase 12: rust-router 在用户空间处理 DSCP 路由，无需清理内核规则。
+        rust-router 在用户空间处理 DSCP 路由，无需清理内核规则。
         """
         logger.debug(f"[relay] DSCP cleanup (no-op in userspace mode): chain={rule.chain_tag}")
         return True
 
     def _setup_xray_relay(self, rule: RelayRule) -> bool:
-        """Xray 中继路由不支持 (Phase 11-Fix.P)
+        """Xray 中继路由不支持
 
         设计决策：多跳链路应使用 WireGuard 隧道，而非 Xray。
         Xray 隧道用于入口/出口，不用于中继。
@@ -338,7 +338,7 @@ class RelayConfigManager:
         return False
 
     def _cleanup_xray_relay(self, rule: RelayRule) -> bool:
-        """清理 Xray 中继规则 (Phase 11-Fix.P)
+        """清理 Xray 中继规则
 
         由于 Xray 中继不支持，此方法仅记录日志。
         """

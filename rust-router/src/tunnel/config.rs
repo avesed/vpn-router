@@ -1,13 +1,7 @@
-//! Tunnel configuration types for Phase 6
+//! Tunnel configuration types
 //!
 //! This module defines configuration types for `WireGuard` tunnels,
 //! including both userspace and kernel-based implementations.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.2 Configuration types
-//! - [x] 6.2 Validation
-//! - [x] 6.2 Serialization/deserialization
 //!
 //! # References
 //!

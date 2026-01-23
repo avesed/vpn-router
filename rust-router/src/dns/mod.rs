@@ -63,75 +63,14 @@
 //! config.validate().expect("Invalid DNS config");
 //! ```
 //!
-//! # Phase 7.0 Deliverables
+//! # Modules
 //!
-//! This is the foundation phase establishing:
-//!
-//! - Module skeleton and public interface
-//! - Error types with 12 variants
-//! - Configuration types with serde support
-//! - hickory-proto integration and performance validation
-//!
-//! # Phase 7.1 Deliverables
-//!
-//! This phase adds the DNS server module:
-//!
-//! - [`server::DnsRateLimiter`]: Per-client rate limiting with token bucket
-//! - [`server::UdpDnsServer`]: UDP DNS listener with batch I/O support
-//! - [`server::TcpDnsServer`]: TCP DNS listener with connection limits
-//! - [`server::DnsHandler`]: Core query processing and validation
-//!
-//! # Phase 7.2 Deliverables
-//!
-//! This phase adds the DNS cache module:
-//!
-//! - [`cache::DnsCache`]: High-performance LRU cache with moka backend
-//! - [`cache::CacheKey`]: Case-insensitive domain key with qtype/qclass
-//! - [`cache::CacheEntry`]: Cached response with TTL management
-//! - [`cache::CacheStats`]: Atomic cache statistics (hits, misses, etc.)
-//! - Negative caching support for NXDOMAIN/NODATA per RFC 2308
-//!
-//! # Phase 7.3 Deliverables
-//!
-//! This phase adds the DNS client module:
-//!
-//! - [`client::DnsUpstream`]: Core trait for all upstream clients
-//! - [`client::UdpClient`]: UDP DNS client with retry logic
-//! - [`client::TcpClient`]: TCP DNS client with deadpool connection pooling
-//! - [`client::DohClient`]: DNS-over-HTTPS client (RFC 8484) - requires `dns-doh`
-//! - [`client::DotClient`]: DNS-over-TLS client (RFC 7858) - requires `dns-dot`
-//! - [`client::HealthChecker`]: Health state machine with configurable thresholds
-//! - [`client::UpstreamPool`]: Multi-upstream pool with failover and selection strategies
-//!
-//! # Phase 7.4 Deliverables
-//!
-//! This phase adds the DNS blocking/filtering module:
-//!
-//! - [`filter::BlockFilter`]: High-performance domain blocker with `ArcSwap` hot-reload
-//! - [`filter::CnameDetector`]: CNAME chain detection for bypass prevention
-//! - [`filter::BlockedResponseBuilder`]: Response generator for blocked queries
-//!
-//! # Phase 7.5 Deliverables
-//!
-//! This phase adds the DNS splitting module:
-//!
-//! - [`split::DnsRouter`]: Per-domain upstream routing with `ArcSwap` hot-reload
-//! - [`split::DomainMatchType`]: Match types (Exact, Suffix, Keyword, Regex)
-//! - [`split::RouteInfo`]: Route configuration information
-//! - [`split::DnsRouterStats`]: Routing statistics with atomic counters
-//!
-//! # Phase 7.6 Deliverables
-//!
-//! This phase adds the DNS query logging module:
-//!
-//! - [`log::QueryLogger`]: Async non-blocking query logger with batch writes
-//! - [`log::QueryLogEntry`]: DNS query log entry with serialization support
-//! - [`log::LogRotator`]: Time-based log rotation with configurable retention
-//! - [`log::LogStats`]: Atomic logging statistics (entries, drops, bytes)
-//! - [`log::RotationStats`]: Rotation statistics (rotations, deletions)
-//!
-//! Future phases will add:
-//! - Phase 7.7: Integration and testing
+//! - **Server**: [`server::DnsRateLimiter`], [`server::UdpDnsServer`], [`server::TcpDnsServer`], [`server::DnsHandler`]
+//! - **Cache**: [`cache::DnsCache`], [`cache::CacheKey`], [`cache::CacheEntry`], [`cache::CacheStats`]
+//! - **Client**: [`client::DnsUpstream`], [`client::UdpClient`], [`client::TcpClient`], [`client::DohClient`], [`client::DotClient`]
+//! - **Filter**: [`filter::BlockFilter`], [`filter::CnameDetector`], [`filter::BlockedResponseBuilder`]
+//! - **Split**: [`split::DnsRouter`], [`split::DomainMatchType`], [`split::RouteInfo`]
+//! - **Logging**: [`log::QueryLogger`], [`log::QueryLogEntry`], [`log::LogRotator`]
 
 pub mod cache;
 pub mod client;
@@ -255,7 +194,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 7.2: Cache Module Tests
+    // Cache Module Tests
     // ========================================================================
 
     #[test]
@@ -359,7 +298,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 7.4: Filter Module Tests
+    // Filter Module Tests
     // ========================================================================
 
     #[test]
@@ -426,7 +365,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 7.5: Split Module Tests
+    // Split Module Tests
     // ========================================================================
 
     #[test]
@@ -480,7 +419,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 7.6: Log Module Tests
+    // Log Module Tests
     // ========================================================================
 
     #[test]

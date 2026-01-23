@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared Routing Config Generator - Phase 3.5
+Shared Routing Config Generator
 
 Generates routing configuration for both rust-router and sing-box from the
 central database. This ensures both routers have consistent configuration
@@ -98,7 +98,7 @@ class EgressType(Enum):
     PIA = "pia"
     CUSTOM = "custom"
     WARP_WG = "warp_wg"
-    # Phase 3: WARP_MASQUE removed - WireGuard only
+    # WARP_MASQUE removed - WireGuard only
     V2RAY = "v2ray"
     OPENVPN = "openvpn"
     DIRECT = "direct"
@@ -135,7 +135,7 @@ class OutboundConfig:
     routing_mark: Optional[int] = None
     routing_table: Optional[int] = None
 
-    # For SOCKS5-based outbounds (V2Ray only, Phase 3: WARP MASQUE removed)
+    # For SOCKS5-based outbounds (V2Ray only, WARP MASQUE removed)
     socks_addr: Optional[str] = None
     socks_port: Optional[int] = None
     username: Optional[str] = None
@@ -408,7 +408,7 @@ class DatabaseLoader:
         return outbounds
 
     def load_warp_egress(self) -> List[OutboundConfig]:
-        """Load WARP egress (Phase 3: WireGuard only, MASQUE removed)"""
+        """Load WARP egress (WireGuard only, MASQUE removed)"""
         db = self._get_db()
         if not db:
             logger.warning("Database not available for WARP egress loading")
@@ -423,7 +423,7 @@ class DatabaseLoader:
                 if not tag:
                     continue
 
-                # Phase 3: Only WireGuard protocol supported
+                # Only WireGuard protocol supported
                 interface = get_egress_interface_name_fallback(tag, EgressType.WARP_WG)
                 outbounds.append(OutboundConfig(
                     tag=tag,
@@ -630,29 +630,29 @@ class RustRouterConfigGenerator:
                 outbounds.append(outbound_dict)
                 valid_outbound_tags.add(outbound_dict["tag"])
             elif ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER):
-                # Phase 11-Fix.AE: WireGuard outbounds are valid even though managed via IPC
+                # WireGuard outbounds are valid even though managed via IPC
                 # Rules referencing them should NOT be remapped to default
                 valid_outbound_tags.add(ob.tag)
                 logger.debug(f"Marked WireGuard outbound '{ob.tag}' as valid (managed via IPC)")
             elif ob.egress_type == EgressType.V2RAY:
-                # Phase 11-Fix.AE: SOCKS5 outbounds are also managed via IPC
-                # Phase 3: WARP_MASQUE removed
+                # SOCKS5 outbounds are also managed via IPC
+                # WARP_MASQUE removed
                 valid_outbound_tags.add(ob.tag)
                 logger.debug(f"Marked SOCKS5 outbound '{ob.tag}' as valid (managed via IPC)")
 
-        # Phase 6-Fix.AI: Add ECMP group tags to valid outbounds
+        # Add ECMP group tags to valid outbounds
         # Groups are managed via IPC (CreateEcmpGroup command) but rules can reference them
         for group in config.ecmp_groups:
             valid_outbound_tags.add(group.tag)
             logger.debug(f"Marked ECMP group '{group.tag}' as valid (managed via IPC)")
 
-        # Phase 6-Fix.AF: Check if default outbound is IPC-managed (SOCKS5/WireGuard)
+        # Check if default outbound is IPC-managed (SOCKS5/WireGuard)
         # These outbounds are added dynamically via IPC, not in static config.
         # Set static default to "direct", then Python manager sets real default via IPC.
         default_outbound = config.default_outbound
 
         # Build set of outbound tags that are IPC-managed (not in static config)
-        # Phase 3: WARP_MASQUE removed
+        # WARP_MASQUE removed
         ipc_managed_tags = set()
         for ob in config.outbounds:
             if ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER,
@@ -672,7 +672,7 @@ class RustRouterConfigGenerator:
 
         # Filter rules to only include those with valid outbounds
         # For rules referencing skipped outbounds (e.g., SOCKS5), use default outbound
-        # Phase 12-Fix: IPC-managed rules are SKIPPED from static config entirely.
+        # IPC-managed rules are SKIPPED from static config entirely.
         # This avoids the race condition where traffic goes to "direct" before IPC sync.
         # The default_outbound will be used for unmatched traffic until IPC pushes correct rules.
         # Python manager will sync ALL rules (including IPC-managed) via IPC after startup.
@@ -682,7 +682,7 @@ class RustRouterConfigGenerator:
         for rule in config.rules:
             outbound = rule.outbound
             if outbound in ipc_managed_tags:
-                # Phase 12-Fix: Skip IPC-managed rules in static config
+                # Skip IPC-managed rules in static config
                 # These will fall through to default_outbound until IPC sync completes
                 # This is better than mapping to "direct" which could be wrong
                 ipc_skipped_count += 1
@@ -726,7 +726,7 @@ class RustRouterConfigGenerator:
             # Outbounds - required
             "outbounds": outbounds,
             # Default outbound - required (top-level, not in routing)
-            # Phase 11-Fix.AB: Use validated default_outbound (may have been remapped)
+            # Use validated default_outbound (may have been remapped)
             "default_outbound": default_outbound,
             # IpcConfig - required
             "ipc": {
@@ -758,7 +758,7 @@ class RustRouterConfigGenerator:
 
         Note: rust-router currently only supports Direct and Block outbound types
         in config. WireGuard-based outbounds use Direct with bind_interface.
-        SOCKS5 outbounds (V2Ray only, Phase 3: WARP MASQUE removed) are not yet supported and will be skipped.
+        SOCKS5 outbounds (V2Ray only, WARP MASQUE removed) are not yet supported and will be skipped.
 
         WireGuard outbounds are managed via IPC by rust_router_manager.py (userspace mode).
         """
@@ -789,7 +789,7 @@ class RustRouterConfigGenerator:
             return None
 
         elif ob.egress_type == EgressType.V2RAY:
-            # Phase 3: WARP_MASQUE removed - only V2Ray SOCKS5 remains
+            # WARP_MASQUE removed - only V2Ray SOCKS5 remains
             # SOCKS5-based outbounds are not yet supported in rust-router config
             # These will need to be added via IPC when that's implemented
             logger.warning(f"SOCKS5 outbound '{ob.tag}' not yet supported in rust-router, skipping")
@@ -946,7 +946,7 @@ class SingBoxConfigGenerator:
             }
 
         elif ob.egress_type == EgressType.V2RAY:
-            # Phase 3: WARP_MASQUE removed - only V2Ray SOCKS5 remains
+            # WARP_MASQUE removed - only V2Ray SOCKS5 remains
             # SOCKS5 outbound
             return {
                 "type": "socks",
@@ -1149,7 +1149,7 @@ def run_tests() -> int:
         """Test EgressType enum"""
 
         def test_all_types(self):
-            # Phase 3: WARP_MASQUE removed - 8 types total
+            # WARP_MASQUE removed - 8 types total
             types = [EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG,
                      EgressType.V2RAY, EgressType.OPENVPN,
                      EgressType.DIRECT, EgressType.BLOCK, EgressType.PEER]
@@ -1446,13 +1446,13 @@ def run_tests() -> int:
             self.assertEqual(outbounds[0].socks_port, 37101)
 
         def test_database_loader_get_warp_egress(self):
-            """Test loading WARP egress from mock DB (Phase 3: WireGuard only)"""
+            """Test loading WARP egress from mock DB (WireGuard only)"""
             from unittest.mock import MagicMock, patch
 
             mock_db = MagicMock()
             mock_db.get_warp_egress_list.return_value = [
                 {"tag": "warp-wg", "protocol": "wireguard", "enabled": True},
-                # Phase 3: MASQUE support removed
+                # MASQUE support removed
             ]
 
             loader = DatabaseLoader("/test/geoip.db", "/test/user.db")
@@ -1636,7 +1636,7 @@ def run_tests() -> int:
             self.assertEqual(len(outbounds), 1)
             self.assertEqual(outbounds[0].tag, "valid")
 
-        # Phase 3: test_warp_masque_loader_rejects_invalid_port removed (MASQUE deprecated)
+        # test_warp_masque_loader_rejects_invalid_port removed (MASQUE deprecated)
 
     # Run tests
     print("Running render_routing_config unit tests...")

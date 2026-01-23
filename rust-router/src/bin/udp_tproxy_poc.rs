@@ -1,6 +1,6 @@
 //! TPROXY UDP Proof of Concept
 //!
-//! Phase 0 Day 2: Validates that Rust can correctly handle TPROXY UDP traffic.
+//! Validates that Rust can correctly handle TPROXY UDP traffic.
 //!
 //! Key differences from TCP:
 //! - UDP uses recvmsg with IP_RECVORIGDSTADDR control message to get original destination

@@ -84,7 +84,7 @@ fn generate_response_with_records() -> Vec<u8> {
 ///
 /// This function generates a realistic DNS response with multiple A records,
 /// NS records, and additional records to reach the 512-byte target specified
-/// in the Phase 7.0 plan for benchmark compliance.
+/// for benchmark compliance.
 fn generate_512_byte_response() -> Vec<u8> {
     let mut message = Message::new();
     message.set_id(0x512b);
@@ -538,7 +538,7 @@ fn bench_name_operations(c: &mut Criterion) {
 /// This test validates that our performance targets are achievable.
 /// It is run as a benchmark but also serves as documentation.
 ///
-/// Performance targets (from Phase 7.0 plan):
+/// Performance targets:
 /// - A query parsing (~30 bytes): <1 microsecond
 /// - Response parsing (~512 bytes): <2 microseconds
 fn bench_validate_targets(c: &mut Criterion) {

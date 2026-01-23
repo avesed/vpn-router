@@ -1,14 +1,14 @@
-//! Two-Phase Commit (2PC) protocol for Phase 6
+//! Two-Phase Commit (2PC) protocol for distributed chain activation
 //!
 //! This module implements the Two-Phase Commit protocol for distributed
 //! chain activation across multiple nodes.
 //!
-//! # Phase 6 Implementation Status
+//! # Features
 //!
-//! - [x] 6.6.3 PREPARE phase implementation
-//! - [x] 6.6.3 COMMIT phase implementation
-//! - [x] 6.6.3 ABORT/rollback implementation
-//! - [x] 6.6.3 Timeout handling
+//! - PREPARE phase implementation
+//! - COMMIT phase implementation
+//! - ABORT/rollback implementation
+//! - Timeout handling
 //!
 //! # Protocol Overview
 //!
@@ -54,10 +54,6 @@
 //! - **PREPARE failure**: Abort entire transaction
 //! - **COMMIT failure**: Best-effort, some nodes may be active
 //! - **Network partition**: Timeout-based abort
-//!
-//! # References
-//!
-//! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.6.3
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -233,8 +229,6 @@ impl ChainNetworkClient for NoOpNetworkClient {
 ///
 /// This implementation uses the existing peer tunnel infrastructure to send
 /// PREPARE, COMMIT, and ABORT messages to remote nodes.
-///
-/// # Phase 12-Fix.P
 ///
 /// Uses the unified pump pattern - requests are sent through the TCP proxy's
 /// channel rather than creating a competing packet pump.

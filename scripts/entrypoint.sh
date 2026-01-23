@@ -8,7 +8,7 @@ set -euo pipefail
 # Utility Functions
 # ============================================================================
 
-# Phase 11-Fix.Y: Unified iptables backend selection
+# Unified iptables backend selection
 select_iptables_backend() {
   local nft_pkts legacy_pkts
   nft_pkts=$(iptables-nft -t mangle -L -v -n 2>/dev/null | grep -E "^[[:space:]]*[0-9]+" | awk '{sum+=$1} END {print sum+0}')
@@ -295,7 +295,7 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-# Phase 12-Fix: Unified node_tag from database
+# Unified node_tag from database
 # All components (rust-router, api_server, rust_router_manager) will use this
 export RUST_ROUTER_NODE_TAG=$(python3 -c "
 from db_helper import get_db
@@ -359,14 +359,14 @@ sync_ecmp_routes() {
 }
 
 sync_chain_routes() {
-  # Phase 12: No-op - rust-router handles DSCP routing in userspace
+  # No-op - rust-router handles DSCP routing in userspace
   # Chain routes are managed by rust-router's ChainManager
   # See rust-router/src/ingress/processor.rs for DSCP routing logic
   echo "[entrypoint] chain routes managed by rust-router (userspace DSCP routing)"
 }
 
 restore_dscp_rules() {
-  # Phase 12: No-op - rust-router handles DSCP routing in userspace
+  # No-op - rust-router handles DSCP routing in userspace
   # No kernel iptables/policy routing rules needed
   echo "[entrypoint] DSCP rules managed by rust-router (userspace mode)"
 }
@@ -477,7 +477,7 @@ print(len(egress_list))
   fi
 }
 
-# Phase 3: start_warp_manager() removed - MASQUE deprecated, WireGuard managed via rust-router IPC
+# start_warp_manager() removed - MASQUE deprecated, WireGuard managed via rust-router IPC
 
 start_health_checker() {
   local group_count
@@ -500,7 +500,7 @@ print(len(groups))
 }
 
 start_peer_tunnel_manager() {
-  # Phase 12: peer_tunnel_manager.py uses kernel WireGuard (wg set/show).
+  # peer_tunnel_manager.py uses kernel WireGuard (wg set/show).
   # In userspace mode, peer tunnels are managed by rust-router via IPC.
   # Skip this legacy manager.
   echo "[entrypoint] peer tunnels managed by rust-router (userspace mode)"
@@ -686,7 +686,7 @@ fi
 start_health_checker
 start_peer_tunnel_manager
 
-# Phase 3: WARP manager removed - WARP tunnels managed via rust-router IPC
+# WARP manager removed - WARP tunnels managed via rust-router IPC
 
 # NOTE: Peer tunnel subnet routing removed - userspace WireGuard mode
 # routes HTTP traffic through rust-router's internal WireGuard implementation
@@ -763,7 +763,7 @@ while true; do
     start_xray_egress_manager
   fi
 
-  # Phase 3: WARP manager check removed (deprecated)
+  # WARP manager check removed (deprecated)
 
   # Check health checker
   if [ -n "${HEALTH_CHECKER_PID}" ] && ! kill -0 "${HEALTH_CHECKER_PID}" 2>/dev/null; then

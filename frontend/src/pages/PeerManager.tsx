@@ -490,7 +490,7 @@ export default function PeerManager() {
     );
   };
 
-  // Render bidirectional status badge (Phase 11.2)
+  // Render bidirectional status badge
   const renderBidirectionalBadge = (status?: "pending" | "outbound_only" | "bidirectional") => {
     if (!status) return null;
 
@@ -685,7 +685,7 @@ export default function PeerManager() {
                   <span className="text-slate-500">{t("peers.endpoint")}:</span>
                   <span className="text-slate-300 font-mono">{node.endpoint}</span>
                 </div>
-                {/* Phase D: 显示 API 端口 */}
+                {/* 显示 API 端口 */}
                 <div className="flex items-center gap-2 text-sm">
                   <span className="text-slate-500">{t("peers.apiPort")}:</span>
                   <span className="text-slate-300 font-mono">{node.api_port || 36000}</span>

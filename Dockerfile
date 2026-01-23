@@ -6,7 +6,7 @@ FROM golang:1.23-bookworm AS ca-certs
 # ==========================================
 # Stage 1: Build xray-lite from source
 # ==========================================
-# [Phase XL] Build minimized Xray supporting only VLESS + XHTTP + REALITY
+# Build minimized Xray supporting only VLESS + XHTTP + REALITY
 # This reduces binary from ~21MB to ~5.7MB (with UPX --best --lzma)
 # See xray-lite/README.md for details on removed protocols
 FROM golang:1.25-bookworm AS xray-builder
@@ -193,14 +193,14 @@ RUN set -eux; \
 # NOTE: sing-box removed - replaced by rust-router for all routing/WireGuard
 
 # Copy xray-lite binary (minimized Xray: VLESS + XHTTP + REALITY only)
-# [Phase XL] ~5.7MB vs ~25MB official Xray binary (77% size reduction)
+# ~5.7MB vs ~25MB official Xray binary (77% size reduction)
 COPY --from=xray-builder /xray /usr/local/bin/xray
 RUN chmod +x /usr/local/bin/xray
 
-# Phase 3: Removed usque binary (MASQUE deprecated, WireGuard-only via rust-router)
+# Removed usque binary (MASQUE deprecated, WireGuard-only via rust-router)
 
 # Copy rust-router binary (primary data plane)
-# [Phase 4] Binary size: ~3.1 MB, LTO optimized, stripped
+# Binary size: ~3.1 MB, LTO optimized, stripped
 COPY --from=rust-router-builder /build/target/release/rust-router /usr/local/bin/rust-router
 RUN chmod +x /usr/local/bin/rust-router && \
     mkdir -p /etc/rust-router /var/log
@@ -239,7 +239,7 @@ COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
 COPY scripts/xray_manager.py /usr/local/bin/xray_manager.py
 COPY scripts/xray_egress_manager.py /usr/local/bin/xray_egress_manager.py
 COPY scripts/xray_peer_inbound_manager.py /usr/local/bin/xray_peer_inbound_manager.py
-# Phase 3: warp_manager.py removed - WARP via rust-router IPC
+# warp_manager.py removed - WARP via rust-router IPC
 COPY scripts/warp_endpoint_optimizer.py /usr/local/bin/warp_endpoint_optimizer.py
 COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
 COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
@@ -249,13 +249,13 @@ COPY scripts/key_manager.py /usr/local/bin/key_manager.py
 # NOTE: ecmp_manager.py removed - rust-router handles ECMP internally
 COPY scripts/health_checker.py /usr/local/bin/health_checker.py
 COPY scripts/peer_tunnel_manager.py /usr/local/bin/peer_tunnel_manager.py
-# Phase 11: Multi-node peering scripts
+# Multi-node peering scripts
 COPY scripts/dscp_manager.py /usr/local/bin/dscp_manager.py
 COPY scripts/relay_config_manager.py /usr/local/bin/relay_config_manager.py
 COPY scripts/peer_pairing.py /usr/local/bin/peer_pairing.py
 COPY scripts/tunnel_api_client.py /usr/local/bin/tunnel_api_client.py
 COPY scripts/chain_route_manager.py /usr/local/bin/chain_route_manager.py
-# Phase 5: rust-router integration scripts
+# rust-router integration scripts
 COPY scripts/rust_router_client.py /usr/local/bin/rust_router_client.py
 COPY scripts/rust_router_manager.py /usr/local/bin/rust_router_manager.py
 COPY scripts/render_routing_config.py /usr/local/bin/render_routing_config.py

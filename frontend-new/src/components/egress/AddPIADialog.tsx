@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -102,10 +102,15 @@ export function AddPIADialog({ open, onOpenChange, editProfile }: AddPIADialogPr
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            {isEditing 
+            {isEditing
               ? t("egress.pia.editTitle", { defaultValue: "Edit PIA Profile" })
               : t("egress.pia.addTitle", { defaultValue: "Add PIA Profile" })}
           </DialogTitle>
+          <DialogDescription>
+            {isEditing
+              ? t("egress.pia.editDescription", { defaultValue: "Update PIA VPN profile settings" })
+              : t("egress.pia.addDescription", { defaultValue: "Add a new Private Internet Access VPN profile" })}
+          </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">
@@ -284,6 +289,9 @@ export function PIALoginDialog({ open, onOpenChange, onSuccess }: PIALoginDialog
           <DialogTitle>
             {t("egress.pia.loginTitle", { defaultValue: "PIA Login" })}
           </DialogTitle>
+          <DialogDescription>
+            {t("egress.pia.loginDescription", { defaultValue: "Enter your Private Internet Access credentials" })}
+          </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4 py-4">

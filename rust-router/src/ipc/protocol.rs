@@ -145,7 +145,7 @@ pub enum IpcCommand {
     },
 
     // ========================================================================
-    // Phase 3.3: IPC Protocol v2.1 Commands
+    // IPC Protocol v2.1 Commands
     // ========================================================================
 
     /// Add a `WireGuard` outbound using `DirectOutbound` with `bind_interface`
@@ -220,7 +220,7 @@ pub enum IpcCommand {
     GetPrometheusMetrics,
 
     // ========================================================================
-    // Phase 5.5: UDP IPC Commands
+    // UDP IPC Commands
     // ========================================================================
 
     /// Get UDP statistics (sessions, packets, worker pool stats).
@@ -261,12 +261,12 @@ pub enum IpcCommand {
     GetBufferPoolStats,
 
     // ========================================================================
-    // Phase 6.0: IPC Protocol v3.0 - WireGuard Tunnel Management
+    // IPC Protocol v3.0 - WireGuard Tunnel Management
     // ========================================================================
 
     /// Create a userspace `WireGuard` tunnel
     ///
-    /// Creates a new `WireGuard` tunnel using boringtun (Phase 6).
+    /// Creates a new `WireGuard` tunnel using boringtun.
     CreateWgTunnel {
         /// Unique tag for this tunnel
         tag: String,
@@ -299,7 +299,7 @@ pub enum IpcCommand {
     ListWgTunnels,
 
     // ========================================================================
-    // Phase 11-Fix.AA: Ingress Peer Management
+    // Ingress Peer Management
     // ========================================================================
 
     /// Add a peer to `WireGuard` ingress
@@ -335,7 +335,7 @@ pub enum IpcCommand {
     GetIngressStats,
 
     // ========================================================================
-    // Phase 6.0: IPC Protocol v3.0 - ECMP Group Management
+    // IPC Protocol v3.0 - ECMP Group Management
     // ========================================================================
 
     /// Create an ECMP (Equal-Cost Multi-Path) load balancing group
@@ -380,7 +380,7 @@ pub enum IpcCommand {
     },
 
     // ========================================================================
-    // Phase 6.0: IPC Protocol v3.2 - Peer Management
+    // IPC Protocol v3.2 - Peer Management
     // ========================================================================
 
     /// Generate offline pairing request code
@@ -482,7 +482,7 @@ pub enum IpcCommand {
     },
 
     // ========================================================================
-    // Phase 6.0: IPC Protocol v3.2 - Chain Management
+    // IPC Protocol v3.2 - Chain Management
     // ========================================================================
 
     /// Create a multi-node routing chain
@@ -589,10 +589,10 @@ pub enum IpcCommand {
     },
 
     // ========================================================================
-    // Phase 6.0: IPC Protocol v3.2 - Two-Phase Commit Commands
+    // IPC Protocol v3.2 - Two-Phase Commit Commands
     // ========================================================================
 
-    /// Phase 1: Prepare chain route (validate only, no apply)
+    /// Prepare chain route (validate only, no apply)
     ///
     /// Validates chain configuration on this node without applying rules.
     /// Part of the Two-Phase Commit protocol for distributed chain activation.
@@ -605,7 +605,7 @@ pub enum IpcCommand {
         source_node: String,
     },
 
-    /// Phase 2a: Commit chain route (apply rules)
+    /// Commit chain route (apply rules)
     ///
     /// Applies chain routing rules after successful PREPARE on all nodes.
     CommitChainRoute {
@@ -615,7 +615,7 @@ pub enum IpcCommand {
         source_node: String,
     },
 
-    /// Phase 2b: Abort chain route (rollback any state)
+    /// Abort chain route (rollback any state)
     ///
     /// Rolls back any prepared state after a PREPARE failure.
     AbortChainRoute {
@@ -626,7 +626,7 @@ pub enum IpcCommand {
     },
 
     // ========================================================================
-    // Phase 7.7: IPC Protocol v3.3 - DNS Commands
+    // IPC Protocol v3.3 - DNS Commands
     // ========================================================================
 
     /// Get overall DNS statistics
@@ -723,9 +723,9 @@ pub enum IpcCommand {
     ///
     /// # Status: PARTIAL IMPLEMENTATION
     ///
-    /// Currently returns an empty list with metadata. The `QueryLogger` (Phase 7.6)
-    /// is write-only by design. A log reader implementation is planned for a
-    /// future phase to enable reading logs from disk.
+    /// Currently returns an empty list with metadata. The `QueryLogger`
+    /// is write-only by design. A log reader implementation is planned for
+    /// future work to enable reading logs from disk.
     GetDnsQueryLog {
         /// Maximum number of entries to return (default: 100)
         #[serde(default = "default_dns_query_limit")]
@@ -946,7 +946,7 @@ pub enum IpcResponse {
     PoolStats(PoolStatsResponse),
 
     // ========================================================================
-    // Phase 3.3: IPC Protocol v2.1 Response Types
+    // IPC Protocol v2.1 Response Types
     // ========================================================================
 
     /// Outbound health status response
@@ -962,7 +962,7 @@ pub enum IpcResponse {
     PrometheusMetrics(PrometheusMetricsResponse),
 
     // ========================================================================
-    // Phase 5.5: UDP IPC Response Types
+    // UDP IPC Response Types
     // ========================================================================
 
     /// UDP statistics response
@@ -981,7 +981,7 @@ pub enum IpcResponse {
     BufferPoolStats(BufferPoolStatsResponse),
 
     // ========================================================================
-    // Phase 6.0: IPC Protocol v3.2 Response Types
+    // IPC Protocol v3.2 Response Types
     // ========================================================================
 
     /// `WireGuard` tunnel status response
@@ -990,7 +990,7 @@ pub enum IpcResponse {
     /// `WireGuard` tunnel list response
     WgTunnelList(WgTunnelListResponse),
 
-    /// Phase 11-Fix.AA: Ingress peer list response
+    /// Ingress peer list response
     IngressPeerList(IngressPeerListResponse),
 
     /// Userspace `WireGuard` ingress statistics response
@@ -1027,7 +1027,7 @@ pub enum IpcResponse {
     PrepareResult(PrepareResponse),
 
     // ========================================================================
-    // Phase 7.7: IPC Protocol v3.3 - DNS Response Types
+    // IPC Protocol v3.3 - DNS Response Types
     // ========================================================================
 
     /// DNS overall statistics response
@@ -1141,13 +1141,13 @@ impl Default for ServerCapabilities {
                 "direct".into(),
                 "block".into(),
                 "socks5".into(),
-                "wireguard".into(), // Phase 3.3: WireGuard via DirectOutbound
+                "wireguard".into(), // WireGuard via DirectOutbound
             ],
             hot_reload: true,
             tls_sniffing: true,
-            udp_support: false, // Phase 1: TCP only
+            udp_support: false, // TCP only
             max_connections: 65536,
-            protocol_version: 4, // Phase 5: IPC ingress stats
+            protocol_version: 4, // IPC ingress stats
         }
     }
 }
@@ -1251,7 +1251,7 @@ pub struct PoolStatsResponse {
 }
 
 // ============================================================================
-// Phase 3.3: IPC Protocol v2.1 Response Structs
+// IPC Protocol v2.1 Response Structs
 // ============================================================================
 
 /// Health status for a single outbound
@@ -1320,7 +1320,7 @@ pub struct PrometheusMetricsResponse {
 }
 
 // ============================================================================
-// Phase 5.5: UDP IPC Response Structs
+// UDP IPC Response Structs
 // ============================================================================
 
 /// Comprehensive UDP statistics response
@@ -1486,13 +1486,13 @@ pub struct BufferPoolStatsResponse {
 }
 
 // ============================================================================
-// Phase 6.0: IPC Protocol v3.2 Types
+// IPC Protocol v3.2 Types
 // ============================================================================
 
 /// Tunnel type for peer connections
 ///
 /// Defines the type of tunnel used for peer-to-peer connections.
-/// Phase 11-Fix.AC: Use explicit renames for API compatibility with Python REST API.
+/// Use explicit renames for API compatibility with Python REST API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum TunnelType {
@@ -1692,7 +1692,7 @@ pub struct EcmpMemberStatus {
 }
 
 // ============================================================================
-// Phase 6.0: Peer Management Types
+// Peer Management Types
 // ============================================================================
 
 /// Peer node configuration
@@ -1814,7 +1814,7 @@ pub struct PeerStatus {
 }
 
 // ============================================================================
-// Phase 6.0: Chain Management Types
+// Chain Management Types
 // ============================================================================
 
 /// Chain node role
@@ -1961,7 +1961,7 @@ pub struct ChainStatus {
 }
 
 // ============================================================================
-// Phase 6.0: Pairing Types
+// Pairing Types
 // ============================================================================
 
 /// Default value for `pair_request` message type
@@ -2081,7 +2081,7 @@ pub struct PairResponse {
 }
 
 // ============================================================================
-// Phase 6.0: IPC Response Types
+// IPC Response Types
 // ============================================================================
 
 /// Response containing a `WireGuard` tunnel list
@@ -2092,7 +2092,7 @@ pub struct WgTunnelListResponse {
 }
 
 // ============================================================================
-// Phase 11-Fix.AA: Ingress Peer Types
+// Ingress Peer Types
 // ============================================================================
 
 /// Information about an ingress peer
@@ -2251,7 +2251,7 @@ pub struct PrepareResponse {
 }
 
 // ============================================================================
-// Phase 7.7: IPC Protocol v3.3 - DNS Types
+// IPC Protocol v3.3 - DNS Types
 // ============================================================================
 
 /// DNS upstream configuration for IPC
@@ -2648,7 +2648,7 @@ mod tests {
         let caps = ServerCapabilities::default();
         assert!(caps.outbound_types.contains(&"direct".to_string()));
         assert!(caps.hot_reload);
-        assert!(!caps.udp_support); // Phase 1: TCP only
+        assert!(!caps.udp_support); // TCP only
     }
 
     #[test]
@@ -2774,7 +2774,7 @@ mod tests {
     }
 
     // =========================================================================
-    // P0 Serialization Tests - Phase 3.3 IPC Protocol v2.1
+    // P0 Serialization Tests - IPC Protocol v2.1
     // =========================================================================
 
     #[test]
@@ -2971,7 +2971,7 @@ rust_router_connections_total 12345
     }
 
     // =========================================================================
-    // Phase 5.5: UDP IPC Protocol Tests
+    // UDP IPC Protocol Tests
     // =========================================================================
 
     #[test]
@@ -3276,12 +3276,12 @@ rust_router_connections_total 12345
     }
 
     // =========================================================================
-    // Phase 6.0 Serialization Tests - IPC Protocol v3.2
+    // Serialization Tests - IPC Protocol v3.2
     // =========================================================================
 
     #[test]
     fn test_tunnel_type_serialization() {
-        // Phase 11-Fix.AC: TunnelType uses "wireguard" (not "wire_guard") for REST API compatibility
+        // TunnelType uses "wireguard" (not "wire_guard") for REST API compatibility
         let wg = TunnelType::WireGuard;
         let json = serde_json::to_string(&wg).unwrap();
         assert_eq!(json, "\"wireguard\"");
@@ -3622,6 +3622,7 @@ rust_router_connections_total 12345
             tag: "peer-1".into(),
             state: PeerState::Connected,
             tunnel_type: TunnelType::WireGuard,
+            endpoint: "192.168.1.100:36200".into(),
             tunnel_local_ip: Some("10.200.200.1".into()),
             tunnel_remote_ip: Some("10.200.200.2".into()),
             api_port: 36000,
@@ -3923,7 +3924,7 @@ rust_router_connections_total 12345
     }
 
     // =========================================================================
-    // Phase 7.7: DNS IPC Protocol Tests
+    // DNS IPC Protocol Tests
     // =========================================================================
 
     #[test]

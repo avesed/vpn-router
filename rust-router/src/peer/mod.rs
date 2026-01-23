@@ -1,4 +1,4 @@
-//! Peer management module for Phase 6
+//! Peer management module
 //!
 //! This module provides types and utilities for managing peer nodes
 //! in a multi-node VPN routing setup.
@@ -15,18 +15,11 @@
 //! # Submodules
 //!
 //! - [`validation`]: Input validation utilities for peer operations
-//! - [`manager`]: `PeerManager` for lifecycle management (Phase 6.5)
-//! - [`pairing`]: Offline pairing protocol (Phase 6.5)
-//! - [`port_allocator`]: Tunnel port allocation (Phase 6.5)
-//! - [`ip_allocator`]: Tunnel IP allocation (Phase 6.5)
-//! - [`health`]: Health checker with hysteresis (Phase 6.5)
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.5.1 Input validation
-//! - [ ] 6.5.2 `PeerManager` structure
-//! - [ ] 6.5.3 Port/IP allocators
-//! - [ ] 6.5.4 Health checker
+//! - [`manager`]: `PeerManager` for lifecycle management
+//! - [`pairing`]: Offline pairing protocol
+//! - [`port_allocator`]: Tunnel port allocation
+//! - [`ip_allocator`]: Tunnel IP allocation
+//! - [`health`]: Health checker with hysteresis
 
 pub mod health;
 pub mod ip_allocator;

@@ -14,9 +14,13 @@ export function useUpdateV2RayIngressConfig() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: V2RayInboundUpdateRequest) => api.updateV2RayInbound(data),
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["v2ray-ingress", "config"] });
-      toast.success("V2Ray ingress configuration updated");
+      if (data.auto_generated_short_id) {
+        toast.success(`V2Ray ingress updated. Auto-generated Short ID: ${data.auto_generated_short_id}`);
+      } else {
+        toast.success("V2Ray ingress configuration updated");
+      }
     },
     onError: (error: Error) => {
       toast.error(`Failed to update V2Ray ingress: ${error.message}`);

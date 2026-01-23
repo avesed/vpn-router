@@ -614,7 +614,7 @@ export const api = {
   // ============ V2Ray Inbound Management ============
   getV2RayInbound: () => request<V2RayInboundResponse>("/ingress/v2ray"),
   updateV2RayInbound: (data: V2RayInboundUpdateRequest) =>
-    request<{ message: string }>("/ingress/v2ray", {
+    request<{ message: string; auto_generated_short_id?: string }>("/ingress/v2ray", {
       method: "PUT",
       body: data
     }),
@@ -824,7 +824,7 @@ export const api = {
       { method: "POST", timeout: 60000 }
     ),
 
-  // Get terminal node's available egress list (with cache support - Phase 11.5)
+  // Get terminal node's available egress list (with cache support)
   getTerminalEgress: (tag: string, refresh?: boolean) =>
     request<{ egress_list: Array<{ tag: string; type: string; description?: string; enabled: boolean }>; node_tag: string; cached?: boolean; cached_at?: string }>(
       `/chains/${encodeURIComponent(tag)}/terminal-egress${refresh ? '?refresh=true' : ''}`,
@@ -845,7 +845,7 @@ export const api = {
       { method: "POST", timeout: 30000 }
     ),
 
-  // Pairing API (Phase 11 Xray)
+  // Pairing API (Xray peer nodes)
   generatePairRequest: (data: GeneratePairRequestRequest) =>
     request<GeneratePairRequestResponse>("/peer/generate-pair-request", {
       method: "POST",

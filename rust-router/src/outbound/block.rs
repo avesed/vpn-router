@@ -104,7 +104,7 @@ impl Outbound for BlockOutbound {
         "block"
     }
 
-    // === UDP Methods (Phase 5.1) ===
+    // === UDP Methods ===
 
     async fn connect_udp(
         &self,

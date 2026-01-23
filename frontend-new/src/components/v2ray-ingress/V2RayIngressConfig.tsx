@@ -35,6 +35,7 @@ const configSchema = z.object({
   reality_public_key: z.string().optional(),
   reality_dest: z.string().optional(),
   reality_server_names: z.string().optional(),
+  reality_short_ids: z.string().optional(),
 });
 
 type ConfigFormValues = z.infer<typeof configSchema>;
@@ -83,6 +84,10 @@ export function V2RayIngressConfig() {
         "reality_server_names",
         config.config.reality_server_names?.join(", ") || ""
       );
+      setValue(
+        "reality_short_ids",
+        config.config.reality_short_ids?.join(", ") || ""
+      );
     }
   }, [config, setValue]);
 
@@ -99,6 +104,9 @@ export function V2RayIngressConfig() {
       reality_dest: data.reality_dest,
       reality_server_names: data.reality_server_names
         ? data.reality_server_names.split(",").map((s) => s.trim()).filter(Boolean)
+        : [],
+      reality_short_ids: data.reality_short_ids
+        ? data.reality_short_ids.split(",").map((s) => s.trim()).filter(Boolean)
         : [],
     });
   };
@@ -261,6 +269,18 @@ export function V2RayIngressConfig() {
                       placeholder="www.microsoft.com, microsoft.com"
                       {...register("reality_server_names")}
                     />
+                  </div>
+
+                  <div className="grid gap-2">
+                    <Label htmlFor="reality_short_ids">Short IDs (comma separated)</Label>
+                    <Input
+                      id="reality_short_ids"
+                      placeholder="e.g. abcd1234, 5678efgh"
+                      {...register("reality_short_ids")}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Hex strings (0-16 chars each). Leave empty to auto-generate.
+                    </p>
                   </div>
                 </div>
               )}

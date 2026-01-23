@@ -84,7 +84,7 @@ pub struct OutboundConnection {
 pub enum UdpOutboundHandle {
     /// Direct UDP socket handle
     Direct(DirectUdpHandle),
-    /// Placeholder for SOCKS5 UDP ASSOCIATE (Phase 5.2)
+    /// SOCKS5 UDP ASSOCIATE handle
     Socks5(Socks5UdpHandle),
 }
 
@@ -452,7 +452,7 @@ pub trait Outbound: Send + Sync {
         None
     }
 
-    // === UDP Methods (Phase 5.1) ===
+    // === UDP Methods ===
 
     /// Connect for UDP through this outbound.
     ///

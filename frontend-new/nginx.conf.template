@@ -51,7 +51,7 @@ server {
         proxy_send_timeout 30s;
     }
 
-    # Peer tunnel endpoints - SECURITY CRITICAL (H-2, Phase 11-Fix.P)
+    # Peer tunnel endpoints - SECURITY CRITICAL
     # These endpoints use tunnel IP as identity proof, only allow from:
     # - WireGuard peer tunnel subnet (10.200.200.0/24) - 64 subnets x 4 IPs = 256 addresses
     # - Localhost for internal testing (127.0.0.1)

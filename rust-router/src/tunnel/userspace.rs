@@ -1,25 +1,22 @@
-//! Userspace `WireGuard` tunnel via boringtun for Phase 6
+//! Userspace `WireGuard` tunnel via boringtun
 //!
 //! This module implements userspace `WireGuard` tunnels using the
 //! boringtun library for Rust-native `WireGuard` support.
 //!
-//! # Phase 6.1 Implementation
+//! # Features
 //!
-//! - [x] boringtun integration
-//! - [x] Key generation
-//! - [x] Handshake handling
-//! - [x] Packet encryption/decryption
-//! - [x] Buffer pooling integration
-//! - [x] Allowed IPs validation
-//! - [x] Handshake completion signal
-//! - [x] Background task monitoring
-//!
-//! # Phase 6.2 Implementation
-//!
-//! - [x] `WgTunnel` trait encrypt/decrypt methods
-//! - [x] Peer management (single-peer egress mode)
-//! - [x] `trigger_handshake/shutdown` trait methods
-//! - [x] `get_peer/list_peers` for single peer
+//! - boringtun integration
+//! - Key generation
+//! - Handshake handling
+//! - Packet encryption/decryption
+//! - Buffer pooling integration
+//! - Allowed IPs validation
+//! - Handshake completion signal
+//! - Background task monitoring
+//! - `WgTunnel` trait encrypt/decrypt methods
+//! - Peer management (single-peer egress mode)
+//! - `trigger_handshake/shutdown` trait methods
+//! - `get_peer/list_peers` for single peer
 //!
 //! # Architecture
 //!
@@ -68,7 +65,6 @@
 //! # References
 //!
 //! - boringtun: <https://github.com/cloudflare/boringtun>
-//! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.1
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -191,13 +187,13 @@ const DEFAULT_TUNNEL_TAG: &str = "unnamed";
 /// 3. `shared.recv_tx` (`RwLock`)
 /// 4. `shared.local_ip` (`RwLock`)
 /// 5. `shared.allowed_ips` (`RwLock`)
-/// 6. `shared.peer_state` (`RwLock`) - Phase 6.2
+/// 6. `shared.peer_state` (`RwLock`)
 ///
 /// # Peer Mode
 ///
 /// This implementation operates in **single-peer (egress) mode**. Each tunnel
 /// has exactly one peer (the configured peer). For multi-peer (ingress) mode,
-/// use `MultiPeerWgTunnel` (Phase 6.3).
+/// use `MultiPeerWgTunnel`.
 pub struct UserspaceWgTunnel {
     /// Tunnel tag identifier
     tag: String,
@@ -240,7 +236,7 @@ pub struct UserspaceWgTunnel {
 /// 3. `recv_tx` (`RwLock`)
 /// 4. `local_ip` (`RwLock`)
 /// 5. `allowed_ips` (`RwLock`)
-/// 6. `peer_state` (`RwLock`) - Phase 6.2
+/// 6. `peer_state` (`RwLock`)
 ///
 /// The `handshake_tx` is a watch channel and does not require ordering.
 struct TunnelShared {
@@ -268,7 +264,7 @@ struct TunnelShared {
     /// Handshake completion signal sender (H3 fix)
     handshake_tx: watch::Sender<bool>,
 
-    /// Single peer state tracking (Phase 6.2)
+    /// Single peer state tracking
     /// This is initialized on tunnel creation and updated during operation.
     peer_state: RwLock<Option<Arc<PeerStateInner>>>,
 
@@ -516,7 +512,7 @@ impl UserspaceWgTunnel {
         // Create handshake completion channel (H3 fix)
         let (handshake_tx, handshake_rx) = watch::channel(false);
 
-        // Initialize peer state for single-peer mode (Phase 6.2)
+        // Initialize peer state for single-peer mode
         let peer_state = PeerStateInner {
             public_key: config.peer_public_key.clone(),
             endpoint: Some(peer_addr),
@@ -637,7 +633,7 @@ impl UserspaceWgTunnel {
             .unwrap_or(listen_port);
         debug!("Bound UDP socket to port {}", actual_port);
 
-        // Phase 11-Fix.6C: Do NOT call socket.connect()
+        // Do NOT call socket.connect()
         // Using connected UDP sockets causes problems with ICMP errors:
         // - When peer is not ready, we get ICMP "Port Unreachable"
         // - This error is cached on the connected socket
@@ -965,7 +961,7 @@ impl UserspaceWgTunnel {
             tunn.encapsulate(&packet_to_send, &mut dst)
         };
 
-        // Phase 12-Fix.P: Log encapsulation result for debugging
+        // Log encapsulation result for debugging
         let result_type = match &result {
             TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
             TunnResult::Done => "Done".to_string(),
@@ -980,7 +976,7 @@ impl UserspaceWgTunnel {
         // Process result
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
-                // Phase 11-Fix.6C: Use send_to() instead of send() for unconnected socket
+                // Use send_to() instead of send() for unconnected socket
                 socket.send_to(encrypted, self.peer_addr_parsed).await.map_err(|e| {
                     WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
                 })?;
@@ -1154,7 +1150,7 @@ impl UserspaceWgTunnel {
 
         match packet {
             Some(data) => {
-                // Phase 12-Fix.P: Log received packets at debug level
+                // Log received packets at debug level
                 debug!("Tunnel {} recv(): got {} bytes from channel", self.tag, data.len());
                 Ok(data)
             }
@@ -1220,7 +1216,7 @@ impl UserspaceWgTunnel {
 
         match result {
             TunnResult::WriteToNetwork(handshake) => {
-                // Phase 11-Fix.6C: Use send_to() instead of send()
+                // Use send_to() for unconnected socket
                 socket.send_to(handshake, self.peer_addr_parsed).await.map_err(|e| {
                     WgTunnelError::IoError(format!("Failed to send handshake: {e}"))
                 })?;
@@ -1254,10 +1250,9 @@ impl UserspaceWgTunnel {
         // Clone Arc for the background task
         let shared = Arc::clone(&self.shared);
         let buffer_pool = Arc::clone(&self.buffer_pool);
-        let tag_for_task = self.tag.clone(); // Phase 12-Fix.P: tag for debug logging
+        let tag_for_task = self.tag.clone(); // tag for debug logging
 
-        // Spawn combined background task
-        // Phase 11-Fix.6C: Pass peer_addr for send_to() calls
+        // Spawn combined background task (pass peer_addr for send_to() calls)
         tokio::spawn(async move {
             run_background_task(socket, shutdown_rx, shared, buffer_pool, peer_addr, tag_for_task).await;
         })
@@ -1351,8 +1346,8 @@ async fn run_background_task(
     mut shutdown_rx: oneshot::Receiver<()>,
     shared: Arc<TunnelShared>,
     buffer_pool: Arc<UdpBufferPool>,
-    peer_addr: SocketAddr,  // Phase 11-Fix.6C: peer address for send_to()
-    tunnel_tag_for_task: String, // Phase 12-Fix.P: tag for debug logging
+    peer_addr: SocketAddr,  // peer address for send_to()
+    tunnel_tag_for_task: String, // tag for debug logging
 ) {
     let mut timer_interval = interval(Duration::from_millis(TIMER_TICK_MS));
     // NAT table cleanup interval (Issue: memory leak from stale NAT entries)
@@ -1417,7 +1412,7 @@ async fn run_background_task(
                                 if shared.handshake_tracker.can_initiate() {
                                     match shared.handshake_tracker.on_initiate() {
                                         Ok(attempt) => {
-                                            // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                                            // Use send_to() for unconnected socket
                                             if let Err(e) = socket.send_to(data, peer_addr).await {
                                                 warn!("Failed to send handshake attempt {}: {}", attempt, e);
                                                 shared.handshake_tracker.on_network_error();
@@ -1442,7 +1437,7 @@ async fn run_background_task(
                                 }
                             } else {
                                 // Not a handshake init (keepalive, data, etc.) - send immediately
-                                // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                                // Use send_to() for unconnected socket
                                 if let Err(e) = socket.send_to(data, peer_addr).await {
                                     warn!("Failed to send timer packet: {}", e);
                                 } else {
@@ -1454,7 +1449,7 @@ async fn run_background_task(
                         // Without handshake_retry feature, send all packets immediately
                         #[cfg(not(feature = "handshake_retry"))]
                         {
-                            // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                            // Use send_to() for unconnected socket
                             if let Err(e) = socket.send_to(data, peer_addr).await {
                                 warn!("Failed to send timer packet: {}", e);
                             } else {
@@ -1465,12 +1460,11 @@ async fn run_background_task(
                 }
             }
 
-            // Receive incoming packets
-            // Phase 11-Fix.6C: Use recv_from() for unconnected socket
+            // Receive incoming packets (use recv_from() for unconnected socket)
             result = socket.recv_from(&mut recv_buf) => {
                 match result {
                     Ok((len, src_addr)) => {
-                        // Phase 12-Fix.P: Log received UDP packets at debug level for troubleshooting
+                        // Log received UDP packets at debug level for troubleshooting
                         debug!("Tunnel {} UDP recv: {} bytes from {} (expecting {})", tunnel_tag_for_task, len, src_addr, peer_addr);
 
                         if !shared.connected.load(Ordering::Acquire) {
@@ -1490,7 +1484,7 @@ async fn run_background_task(
                         };
 
                         if let Some(ref result) = process_result {
-                            // Phase 12-Fix.P: Log decapsulate result at debug level
+                            // Log decapsulate result at debug level
                             let result_type = match result {
                                 TunnResult::WriteToTunnelV4(data, _) => format!("WriteToTunnelV4({} bytes)", data.len()),
                                 TunnResult::WriteToTunnelV6(data, _) => format!("WriteToTunnelV6({} bytes)", data.len()),
@@ -1506,7 +1500,7 @@ async fn run_background_task(
                                 result,
                                 &socket,
                                 &shared,
-                                peer_addr,  // Phase 11-Fix.6C
+                                peer_addr,
                             ).await;
                         }
                     }
@@ -2058,7 +2052,7 @@ async fn handle_decapsulate_result(
     result: TunnResult<'_>,
     socket: &Arc<UdpSocket>,
     shared: &Arc<TunnelShared>,
-    peer_addr: SocketAddr,  // Phase 11-Fix.6C: peer address for send_to()
+    peer_addr: SocketAddr,  // peer address for send_to()
 ) {
     match result {
         TunnResult::WriteToTunnelV4(data, _addr) => {
@@ -2126,7 +2120,7 @@ async fn handle_decapsulate_result(
             // Send to receiver channel
             let recv_tx = shared.recv_tx.read().await;
             if let Some(tx) = recv_tx.as_ref() {
-                // Phase 12-Fix.P: Log channel send for debugging
+                // Log channel send for debugging
                 debug!("Sending {} bytes to recv_tx channel", packet_len);
                 if tx.send(packet).await.is_err() {
                     warn!("Receiver channel closed - packet dropped");
@@ -2212,7 +2206,7 @@ async fn handle_decapsulate_result(
 
         TunnResult::WriteToNetwork(response) => {
             // Need to send response (handshake response, keepalive, etc.)
-            // Phase 11-Fix.6C: Use send_to() for unconnected socket
+            // Use send_to() for unconnected socket
             if let Err(e) = socket.send_to(response, peer_addr).await {
                 warn!("Failed to send response: {}", e);
             } else {
@@ -2284,7 +2278,7 @@ async fn handle_decapsulate_result(
                         }
                     }
                     Some(TunnResult::WriteToNetwork(data)) => {
-                        // Phase 11-Fix.6C: Use send_to() for unconnected socket
+                        // Use send_to() for unconnected socket
                         let _ = socket.send_to(data, peer_addr).await;
                     }
                     _ => {
@@ -2370,7 +2364,7 @@ impl WgTunnel for UserspaceWgTunnel {
         Some(self.peer_addr_parsed)
     }
 
-    /// Get the UDP socket for batch I/O operations (Phase 6.8)
+    /// Get the UDP socket for batch I/O operations
     ///
     /// Returns an Arc-wrapped `UdpSocket` if the tunnel is connected.
     /// This allows batch send/receive operations using `sendmmsg`/`recvmmsg`.
@@ -2392,7 +2386,7 @@ impl WgTunnel for UserspaceWgTunnel {
     }
 
     // ========================================================================
-    // Phase 6.2: Peer Management (Single-Peer Mode)
+    // Peer Management (Single-Peer Mode)
     // ========================================================================
 
     fn add_peer(&self, _peer: WgPeerConfig) -> BoxFuture<'_, Result<(), WgTunnelError>> {
@@ -2479,7 +2473,7 @@ impl WgTunnel for UserspaceWgTunnel {
     }
 
     // ========================================================================
-    // Phase 6.2: Encryption/Decryption Operations
+    // Encryption/Decryption Operations
     // ========================================================================
 
     fn decrypt(&self, encrypted: &[u8]) -> Result<DecryptResult, WgTunnelError> {
@@ -2583,7 +2577,7 @@ impl WgTunnel for UserspaceWgTunnel {
     }
 
     // ========================================================================
-    // Phase 6.2: Tunnel Control
+    // Tunnel Control
     // ========================================================================
 
     fn connect(&self) -> BoxFuture<'_, Result<(), WgTunnelError>> {
@@ -3255,7 +3249,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Tag Tests (Phase 6.2)
+    // Tag Tests
     // ========================================================================
 
     #[test]
@@ -3300,7 +3294,7 @@ mod tests {
     }
 
     // ========================================================================
-    // is_healthy Tests (Phase 6.2)
+    // is_healthy Tests
     // ========================================================================
 
     #[test]
@@ -3313,7 +3307,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: Peer Management Tests
+    // Peer Management Tests
     // ========================================================================
 
     #[test]
@@ -3440,7 +3434,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: Encryption/Decryption Tests
+    // Encryption/Decryption Tests
     // ========================================================================
 
     #[test]
@@ -3482,7 +3476,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: Tunnel Control Tests
+    // Tunnel Control Tests
     // ========================================================================
 
     #[tokio::test]
@@ -3517,7 +3511,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: Additional Encryption Tests
+    // Additional Encryption Tests
     // ========================================================================
 
     #[test]
@@ -3632,7 +3626,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: Additional Decryption Tests
+    // Additional Decryption Tests
     // ========================================================================
 
     #[test]
@@ -3709,7 +3703,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: DecryptResult Type Tests
+    // DecryptResult Type Tests
     // ========================================================================
 
     #[test]
@@ -3742,7 +3736,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: WG_TRANSPORT_OVERHEAD Constant Tests
+    // WG_TRANSPORT_OVERHEAD Constant Tests
     // ========================================================================
 
     #[test]
@@ -3773,7 +3767,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.2: PeerStateInner Tests
+    // PeerStateInner Tests
     // ========================================================================
 
     #[test]

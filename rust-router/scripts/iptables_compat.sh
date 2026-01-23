@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Phase 0 Day 3: iptables Compatibility Test
+# iptables Compatibility Test
 #
 # This script tests that the Rust router's TPROXY rules can coexist with:
 # 1. DIVERT chain for established connections
@@ -349,7 +349,7 @@ cleanup() {
 print_summary() {
     echo ""
     echo "=============================================="
-    echo "           Phase 0 Day 3 Summary"
+    echo "           Summary"
     echo "=============================================="
     echo ""
     echo "Routing Table Allocation (Verified No Overlap):"
@@ -405,7 +405,7 @@ main() {
 
     echo ""
     echo "=============================================="
-    echo "   Phase 0 Day 3: iptables Compatibility Test"
+    echo "   iptables Compatibility Test"
     echo "=============================================="
     echo ""
 

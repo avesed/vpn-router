@@ -1,14 +1,8 @@
-//! Tunnel IP allocator for Phase 6
+//! Tunnel IP allocator
 //!
 //! This module implements IP address allocation for peer tunnels,
 //! ensuring each tunnel endpoint gets a unique IP within the
 //! designated subnet.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [ ] 6.5.3 IP allocation from subnet
-//! - [ ] 6.5.3 IP release
-//! - [ ] 6.5.3 IP pair allocation for bidirectional tunnels
 //!
 //! # Subnet Configuration
 //!
@@ -21,10 +15,6 @@
 //! The allocator uses `RwLock` for thread-safe allocation and release
 //! of IP addresses across concurrent operations.
 //!
-//! # References
-//!
-//! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.5.3
-
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::sync::RwLock;

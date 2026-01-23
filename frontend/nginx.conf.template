@@ -51,7 +51,7 @@ server {
         proxy_send_timeout 30s;
     }
 
-    # Peer tunnel endpoints - SECURITY CRITICAL (H-2, Phase 11-Fix.P)
+    # Peer tunnel endpoints - SECURITY CRITICAL
     # These endpoints use tunnel IP as identity proof, only allow from:
     # - WireGuard peer tunnel subnet (10.200.200.0/24) - 64 subnets x 4 IPs = 256 addresses
     # - Localhost for internal testing (127.0.0.1)
@@ -67,7 +67,7 @@ server {
     # - /api/peer/forward-egress/* : Forwarded egress queries
     # - /api/chains/validate-hops : Chain hop validation (exact match, no trailing path)
     #
-    # Note: /api/peer-info/* moved to public access (Phase 11-Fix.B) - uses X-Peer-Node-ID auth
+    # Note: /api/peer-info/* moved to public access - uses X-Peer-Node-ID auth
     #
     # Regex note: (/.*)?$ makes trailing path optional to cover both /api/chain-routing and /api/chain-routing/register
     location ~ ^/api/(peer-tunnel|peer-notify|peer-chain|peer-relay|chain-routing|relay-routing|peer/forward-egress|chains/validate-hops)(/.*)?$ {

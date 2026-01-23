@@ -262,14 +262,14 @@ CREATE INDEX IF NOT EXISTS idx_v2ray_egress_protocol ON v2ray_egress(protocol);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
 
 -- WARP 出口表（Cloudflare WARP via WireGuard）
--- Phase 3: Simplified schema - WireGuard only (MASQUE removed)
--- Phase 3-Fix.B: Added WireGuard config fields for persistence
+-- Simplified schema - WireGuard only (MASQUE removed)
+-- Added WireGuard config fields for persistence
 CREATE TABLE IF NOT EXISTS warp_egress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag TEXT NOT NULL UNIQUE,                 -- 出口标识，如 "warp-main"
     description TEXT DEFAULT '',               -- 描述
 
-    -- WireGuard 配置（Phase 3-Fix.B: 必需字段）
+    -- WireGuard 配置（必需字段）
     private_key TEXT,                          -- WireGuard 私钥 (base64)
     peer_public_key TEXT,                      -- WARP 服务器公钥 (base64)
     endpoint TEXT,                             -- 默认 endpoint (如 engage.cloudflareclient.com:2408)
@@ -499,8 +499,7 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
     -- outbound: 连接到对端的主隧道端点（默认）
     -- inbound: 连接到对端的入站监听器（需要 peer_inbound_enabled=1）
 
-    -- 双向连接状态 (Phase 11.1)
-    bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
+    -- 双向连接状态     bidirectional_status TEXT DEFAULT 'pending' CHECK(bidirectional_status IN ('pending', 'outbound_only', 'bidirectional')),
     -- pending: 等待双向连接
     -- outbound_only: 仅出站连接
     -- bidirectional: 双向连接已建立
@@ -523,8 +522,7 @@ CREATE TABLE IF NOT EXISTS peer_nodes (
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_tag ON peer_nodes(tag);
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_enabled ON peer_nodes(enabled);
 CREATE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_status ON peer_nodes(tunnel_status);
--- 注: idx_peer_nodes_enabled_bidirectional 索引在迁移函数中创建（Phase 11.1）
--- 避免现有数据库缺少 bidirectional_status 列时出错
+-- 注: idx_peer_nodes_enabled_bidirectional 索引在迁移函数中创建-- 避免现有数据库缺少 bidirectional_status 列时出错
 -- 唯一索引防止资源分配竞态条件
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_local_ip ON peer_nodes(tunnel_local_ip) WHERE tunnel_local_ip IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_peer_nodes_tunnel_port ON peer_nodes(tunnel_port) WHERE tunnel_port IS NOT NULL;
@@ -577,8 +575,8 @@ CREATE TABLE IF NOT EXISTS node_chains (
     dscp_value INTEGER,                    -- DSCP 标记值 (1-63)，用于 WireGuard 链路流量识别
     chain_mark_type TEXT DEFAULT 'dscp' CHECK(chain_mark_type IN ('dscp', 'xray_email')),
     chain_state TEXT DEFAULT 'inactive' CHECK(chain_state IN ('inactive', 'activating', 'active', 'error')),
-    allow_transitive INTEGER DEFAULT 0,    -- Phase 11-Fix.Q: 传递模式验证（只验证第一跳）
-    last_error TEXT,                       -- Phase 5: 最后错误信息
+    allow_transitive INTEGER DEFAULT 0,    -- 传递模式验证（只验证第一跳）
+    last_error TEXT,                       -- 最后错误信息
 
     -- 健康状态
     health_status TEXT DEFAULT 'unknown' CHECK(health_status IN ('unknown', 'healthy', 'degraded', 'unhealthy')),
@@ -645,8 +643,7 @@ CREATE INDEX IF NOT EXISTS idx_chain_routing_chain_tag ON chain_routing(chain_ta
 CREATE INDEX IF NOT EXISTS idx_chain_routing_egress ON chain_routing(egress_tag);
 CREATE INDEX IF NOT EXISTS idx_chain_routing_source_node ON chain_routing(source_node);
 
--- 终端出口缓存表 (Phase 11.1)
--- 入口节点缓存终端节点的出口列表，避免每次都通过隧道查询
+-- 终端出口缓存表 -- 入口节点缓存终端节点的出口列表，避免每次都通过隧道查询
 CREATE TABLE IF NOT EXISTS terminal_egress_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chain_tag TEXT NOT NULL UNIQUE,          -- 链路标识（与 node_chains.tag 对应）
@@ -658,7 +655,7 @@ CREATE TABLE IF NOT EXISTS terminal_egress_cache (
 -- 注: chain_tag 上的 UNIQUE 约束已自动创建隐式索引，无需额外索引
 CREATE INDEX IF NOT EXISTS idx_terminal_egress_cache_expires ON terminal_egress_cache(expires_at);
 
--- ============ Phase 11-Cascade: 级联删除通知支持 ============
+-- ============ 级联删除通知支持 ============
 
 -- 对等节点事件审计日志
 -- 记录所有节点生命周期事件（删除、断开、广播等）
@@ -889,19 +886,19 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
     else:
         print("⊘ warp_egress.protocol 字段已存在，跳过迁移")
 
-    # Phase 2: 添加 account_id 字段（用于 rust-router WARP 注册）
+    # 添加 account_id 字段（用于 rust-router WARP 注册）
     if "account_id" not in columns:
         cursor.execute("ALTER TABLE warp_egress ADD COLUMN account_id TEXT")
         conn.commit()
-        print("✓ 添加 warp_egress.account_id 字段（Phase 2: WARP Integration）")
+        print("✓ 添加 warp_egress.account_id 字段（WARP Integration）")
     else:
         print("⊘ warp_egress.account_id 字段已存在，跳过迁移")
 
-    # Phase 3: 移除 MASQUE 专用字段（mode, socks_port）
+    # 移除 MASQUE 专用字段（mode, socks_port）
     # 这是一个破坏性迁移，需要重建表
-    # Phase 3-Fix.B: 只检查 mode/socks_port，不检查 protocol（避免重复迁移）
+    # 只检查 mode/socks_port，不检查 protocol（避免重复迁移）
     if "mode" in columns or "socks_port" in columns:
-        print("Phase 3: 检测到旧表结构（包含 MASQUE 字段），开始迁移...")
+        print(" 检测到旧表结构（包含 MASQUE 字段），开始迁移...")
 
         # 禁用所有 MASQUE 条目
         cursor.execute("SELECT COUNT(*) FROM warp_egress WHERE protocol='masque'")
@@ -952,9 +949,9 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_warp_egress_enabled ON warp_egress(enabled)")
 
         conn.commit()
-        print("✓ Phase 3 迁移完成：移除 MASQUE 字段，表结构已简化")
+        print("✓ 迁移完成：移除 MASQUE 字段，表结构已简化")
     else:
-        print("⊘ warp_egress 表已是 Phase 3 结构，跳过迁移")
+        print("⊘ warp_egress 表已是简化结构，跳过迁移")
 
 
 def migrate_outbound_groups(conn: sqlite3.Connection):
@@ -1195,7 +1192,7 @@ def migrate_peer_nodes_tables(conn: sqlite3.Connection):
         if "disconnected_node" not in columns:
             cursor.execute("ALTER TABLE node_chains ADD COLUMN disconnected_node TEXT")
             print("✓ 添加 node_chains.disconnected_node 列")
-        # Phase 5: last_error 列
+        # last_error 列
         if "last_error" not in columns:
             cursor.execute("ALTER TABLE node_chains ADD COLUMN last_error TEXT")
             print("✓ 添加 node_chains.last_error 列")
@@ -1499,8 +1496,8 @@ def migrate_node_chains_chain_fields(conn: sqlite3.Connection):
         ("dscp_value", "INTEGER"),
         ("chain_mark_type", "TEXT DEFAULT 'dscp'"),
         ("chain_state", "TEXT DEFAULT 'inactive'"),
-        ("allow_transitive", "INTEGER DEFAULT 0"),  # Phase 11-Fix.Q: 传递模式验证
-        ("last_error", "TEXT"),  # Phase 5: 错误原因记录
+        ("allow_transitive", "INTEGER DEFAULT 0"),  # 传递模式验证
+        ("last_error", "TEXT"),  # 错误原因记录
     ]
 
     for field_name, field_type in chain_fields:
@@ -1604,8 +1601,7 @@ def migrate_chain_routing_table(conn: sqlite3.Connection):
 
 
 def migrate_peer_nodes_bidirectional_fields(conn: sqlite3.Connection):
-    """为 peer_nodes 表添加双向连接字段 (Phase 11.1)
-
+    """为 peer_nodes 表添加双向连接字段 
     支持离线配对后自动双向连接:
     - bidirectional_status: 双向连接状态 (pending/outbound_only/bidirectional)
     - remote_wg_private_key: 为远程节点预生成的 WireGuard 私钥
@@ -1659,8 +1655,7 @@ def migrate_peer_nodes_bidirectional_fields(conn: sqlite3.Connection):
 
 
 def migrate_terminal_egress_cache_table(conn: sqlite3.Connection):
-    """为现有数据库添加 terminal_egress_cache 表 (Phase 11.1)
-
+    """为现有数据库添加 terminal_egress_cache 表 
     用于缓存终端节点的出口列表，避免每次都通过隧道查询远程 API
     - 缓存命中时直接返回本地数据
     - 缓存过期（默认 5 分钟）后重新获取
@@ -1732,7 +1727,7 @@ def migrate_pending_pairings_table(conn: sqlite3.Connection):
 
 
 def migrate_cascade_delete_tables(conn: sqlite3.Connection):
-    """Phase 11-Cascade: 添加级联删除通知支持表
+    """ 添加级联删除通知支持表
 
     添加三个表:
     - peer_event_log: 审计日志，记录节点生命周期事件
@@ -1802,7 +1797,7 @@ def migrate_cascade_delete_tables(conn: sqlite3.Connection):
 
 
 def migrate_warp_egress_wireguard_fields(conn: sqlite3.Connection):
-    """Phase 3-Fix.B: 添加 WireGuard 配置字段到 warp_egress 表
+    """ 添加 WireGuard 配置字段到 warp_egress 表
 
     修复 WARP 出口在容器重启后消失的问题。
     之前 WireGuard 配置只传给 rust-router，没有持久化到数据库。
@@ -1847,7 +1842,7 @@ def migrate_warp_egress_wireguard_fields(conn: sqlite3.Connection):
 
     if fields_added > 0:
         conn.commit()
-        print(f"✓ Phase 3-Fix.B: 添加了 {fields_added} 个 WireGuard 配置字段")
+        print(f"✓  添加了 {fields_added} 个 WireGuard 配置字段")
     else:
         print("⊘ warp_egress WireGuard 字段已存在，跳过迁移")
 
@@ -2084,17 +2079,17 @@ def main():
     migrate_node_chains_chain_fields(conn)
     migrate_chain_routing_table(conn)
 
-    # Phase 11.1: 双向连接和终端出口缓存
+    # 双向连接和终端出口缓存
     migrate_peer_nodes_bidirectional_fields(conn)
     migrate_terminal_egress_cache_table(conn)
 
-    # Phase 11-Tunnel: 待处理配对表（用于隧道优先的配对流程）
+    # 待处理配对表（用于隧道优先的配对流程）
     migrate_pending_pairings_table(conn)
 
-    # Phase 11-Cascade: 级联删除通知支持表
+    # 级联删除通知支持表
     migrate_cascade_delete_tables(conn)
 
-    # Phase 3-Fix.B: WARP WireGuard 配置持久化
+    # WARP WireGuard 配置持久化
     migrate_warp_egress_wireguard_fields(conn)
 
     # 添加默认数据

@@ -760,11 +760,11 @@ class XrayManager:
     def _ensure_xray_wg_peer(self, xray_public_key: str) -> bool:
         """确保 wg-ingress 中存在 Xray 的 peer，并配置路由
 
-        .. deprecated:: Phase 12
+        .. deprecated::
             此函数使用内核 WireGuard (wg set)，在 userspace 模式下已废弃。
             Xray WireGuard peer 现在通过数据库管理，rust-router 会自动同步。
         """
-        # Phase 12: 仅更新数据库，跳过内核 WireGuard 配置
+        # 仅更新数据库，跳过内核 WireGuard 配置
         # rust-router 会在 IPC 同步时处理 ingress peers
         try:
             existing = self.db.get_wireguard_peer_by_name(XRAY_WG_PEER_NAME)
@@ -795,22 +795,22 @@ class XrayManager:
     def _setup_xray_wg_routes(self) -> bool:
         """设置 Xray WireGuard 子网的路由和 iptables 规则
 
-        .. deprecated:: Phase 12
+        .. deprecated::
             此函数使用内核 WireGuard 路由，在 userspace 模式下已废弃。
             rust-router 在用户空间处理路由。
         """
-        # Phase 12: No-op - rust-router 处理路由
+        # No-op - rust-router 处理路由
         logger.debug("Xray WG routes: no-op in userspace mode")
         return True
 
     def _fix_local_routes_for_xray_wg(self) -> bool:
         """删除 Xray WireGuard 接口的 local 路由
 
-        .. deprecated:: Phase 12
+        .. deprecated::
             此函数操作内核路由表，在 userspace 模式下已废弃。
             rust-router 在用户空间处理所有路由。
         """
-        # Phase 12: No-op - rust-router 处理路由
+        # No-op - rust-router 处理路由
         logger.debug("Fix local routes: no-op in userspace mode")
         return True
 
@@ -1759,7 +1759,7 @@ class XrayManager:
     async def run_daemon(self):
         """以守护进程模式运行 - 带重试和指数退避
 
-        Phase 10.5: 实现健康检查循环和指数退避重启策略
+        实现健康检查循环和指数退避重启策略：
         - 初始启动最多重试 3 次（5s, 10s, 15s 间隔）
         - 运行时崩溃使用指数退避重启（最大 5 分钟）
         - 成功启动后重置重启计数
@@ -1812,7 +1812,7 @@ class XrayManager:
 def should_xray_run(db) -> bool:
     """判断是否需要运行 Xray 进程
 
-    Phase 10.5: Xray 应该在以下情况运行：
+    Xray 应该在以下情况运行：
     1. 有启用的 V2Ray 用户（V2Ray Ingress 功能）
     2. 有启用了 inbound 的 peer 节点（Peer Inbound 功能）
 
@@ -1874,7 +1874,7 @@ def is_xray_running() -> bool:
 async def ensure_xray_state(db) -> bool:
     """确保 Xray 进程状态正确
 
-    Phase 10.5: 根据当前配置自动启停 Xray：
+    根据当前配置自动启停 Xray：
     - 如果需要运行但未运行 → 启动
     - 如果不需要运行但在运行 → 停止
 

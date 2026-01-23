@@ -12,7 +12,7 @@
 //! The `UdpBufferPool` provides lock-free buffer reuse for UDP packet
 //! processing to reduce allocation overhead.
 //!
-//! # Batch I/O (Phase 6.8)
+//! # Batch I/O
 //!
 //! The `batch_io` module provides high-performance batch UDP send/receive
 //! using Linux-specific `sendmmsg` and `recvmmsg` syscalls. This provides
@@ -38,7 +38,7 @@ pub use buffer_pool::{
 };
 pub use copy::{bidirectional_copy, bidirectional_copy_with_buffer, CopyResult};
 
-// Phase 6.8: Batch I/O exports (Linux only)
+// Batch I/O exports (Linux only)
 #[cfg(target_os = "linux")]
 pub use batch_io::{
     BatchConfig, BatchReceiver, BatchSender, BatchStats, OutgoingPacket, ReceivedPacket,

@@ -1,6 +1,6 @@
 //! TPROXY TCP Proof of Concept
 //!
-//! Phase 0 Day 1: Validates that Rust can correctly handle TPROXY TCP traffic.
+//! Validates that Rust can correctly handle TPROXY TCP traffic.
 //!
 //! Key system calls:
 //! - IP_TRANSPARENT: Allows binding to non-local addresses

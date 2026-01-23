@@ -440,9 +440,6 @@ impl<'de> Deserialize<'de> for PortRange {
 ///
 /// Rules are sorted by priority during compilation for efficient matching.
 /// The `CompiledRuleSet` is immutable after creation.
-///
-/// Note: Full matching logic (domain, IP) will be implemented in Phase 2.2/2.3.
-/// Currently only provides priority-based iteration.
 #[derive(Clone)]
 pub struct CompiledRuleSet {
     /// Rules sorted by priority (ascending = higher priority first)
@@ -572,14 +569,10 @@ impl CompiledRuleSet {
             .chain(std::iter::once(self.default_outbound.as_str()))
     }
 
-    /// Simple priority-based matching (Phase 2.1 implementation)
+    /// Simple priority-based matching
     ///
     /// Returns the outbound tag for the first matching rule, or the default
     /// outbound if no rules match.
-    ///
-    /// Note: This is a basic implementation that only checks rule types.
-    /// Full matching (domain suffix, regex, `GeoIP` lookup) will be implemented
-    /// in Phase 2.2/2.3.
     ///
     /// # Arguments
     ///
@@ -617,7 +610,7 @@ impl CompiledRuleSet {
         &self.default_outbound
     }
 
-    /// Match a connection using `ConnectionInfo` (Phase 2.5).
+    /// Match a connection using `ConnectionInfo`.
     ///
     /// This method is designed for use with the rule engine and returns
     /// both the rule ID and outbound for tracking which rule matched.
@@ -698,13 +691,10 @@ impl CompiledRuleSet {
 
     /// Check if a single rule matches the connection
     ///
-    /// Phase 2.1 implements basic matching for:
+    /// Implements basic matching for:
     /// - Port/PortRange matching
-    /// - Protocol matching (always true in Phase 2.1, TCP-only)
+    /// - Protocol matching
     /// - Exact domain matching
-    ///
-    /// Domain suffix, keyword, regex, `GeoIP`, `GeoSite`, and IP CIDR matching
-    /// will be implemented in Phase 2.2/2.3.
     fn matches_rule(
         rule: &Rule,
         domain: Option<&str>,
@@ -721,7 +711,7 @@ impl CompiledRuleSet {
                 }
             }
             RuleType::Protocol => {
-                // Phase 2.1: TCP-only, so "tcp" always matches
+                // TCP-only in basic matching, so "tcp" always matches
                 rule.target.to_lowercase() == "tcp"
             }
             RuleType::Domain => {
@@ -732,7 +722,7 @@ impl CompiledRuleSet {
                     false
                 }
             }
-            // These will be implemented in Phase 2.2/2.3
+            // These are handled by dedicated matchers in the rule engine
             RuleType::DomainSuffix
             | RuleType::DomainKeyword
             | RuleType::DomainRegex
@@ -1130,7 +1120,7 @@ mod tests {
         let ruleset = CompiledRuleSet::new(rules, "direct".into()).unwrap();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
 
-        // TCP matches in Phase 2.1
+        // TCP protocol matches
         assert_eq!(ruleset.match_by_priority(None, ip, 80), "tcp-handler");
     }
 

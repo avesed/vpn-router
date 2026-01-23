@@ -1,14 +1,7 @@
-//! DSCP value allocator for Phase 6
+//! DSCP value allocator
 //!
 //! This module implements DSCP value allocation for chain routing,
 //! ensuring each chain gets a unique DSCP value with conflict detection.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [ ] 6.6.4 DSCP allocation
-//! - [ ] 6.6.4 DSCP reservation
-//! - [ ] 6.6.4 Conflict detection
-//! - [ ] 6.6.4 Reserved `QoS` value protection
 //!
 //! # DSCP Value Range
 //!

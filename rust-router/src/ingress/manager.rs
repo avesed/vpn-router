@@ -1,4 +1,4 @@
-//! `WireGuard` Ingress Manager for Phase 6.3
+//! `WireGuard` Ingress Manager
 //!
 //! This module provides the main `WgIngressManager` struct that manages
 //! the `WireGuard` ingress tunnel, including peer management, packet
@@ -91,7 +91,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
-// Phase 6.8: Batch I/O imports (Linux only)
+// Batch I/O imports (Linux only)
 #[cfg(target_os = "linux")]
 use crate::io::{BatchConfig, BatchReceiver};
 
@@ -150,7 +150,7 @@ impl std::fmt::Display for IngressState {
     }
 }
 
-/// Phase 11-Fix.AA: Information about an ingress peer for listing
+/// Information about an ingress peer for listing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngressPeerListItem {
     /// Peer public key (Base64)
@@ -494,7 +494,7 @@ pub struct WgIngressManager {
     packet_rx: tokio::sync::Mutex<Option<mpsc::Receiver<ProcessedPacket>>>,
 
     /// Processed packet sender (for injecting packets into forwarding loop)
-    /// Phase 12-Fix.P3: Used by peer_tunnel_processor to forward non-WG egress
+    /// Used by peer_tunnel_processor to forward non-WG egress
     packet_tx: RwLock<Option<mpsc::Sender<ProcessedPacket>>>,
 
     /// Next tunnel index for peer creation
@@ -663,7 +663,7 @@ impl WgIngressManager {
         // Create packet channel
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
         *self.packet_rx.lock().await = Some(packet_rx);
-        // Phase 12-Fix.P3: Store sender for peer_tunnel_processor injection
+        // Store sender for peer_tunnel_processor injection
         *self.packet_tx.write() = Some(packet_tx.clone());
 
         // Share peers reference with the background task (not a copy!)
@@ -896,7 +896,7 @@ impl WgIngressManager {
         self.peers.read().contains_key(public_key)
     }
 
-    /// Phase 11-Fix.AA: List all registered peers
+    /// List all registered peers
     ///
     /// Returns information about all peers registered with the ingress.
     #[must_use]
@@ -933,7 +933,7 @@ impl WgIngressManager {
 
     /// Get a clone of the packet sender for injecting packets into the forwarding loop
     ///
-    /// Phase 12-Fix.P3: Used by peer_tunnel_processor to forward non-WG egress packets
+    /// Used by peer_tunnel_processor to forward non-WG egress packets
     /// (like `direct` egress) back through the main forwarding loop.
     #[must_use]
     pub fn get_packet_sender(&self) -> Option<mpsc::Sender<ProcessedPacket>> {
@@ -1017,7 +1017,7 @@ impl WgIngressManager {
     /// 4. Processes the decrypted packet through the rule engine
     /// 5. Sends handshake responses back to the client if needed
     ///
-    /// # Phase 6.8: Batch I/O
+    /// # Batch I/O
     ///
     /// On Linux, when `use_batch_io` is enabled, uses `recvmmsg` to receive
     /// multiple packets per syscall for improved throughput.
@@ -1030,7 +1030,7 @@ impl WgIngressManager {
         packet_tx: mpsc::Sender<ProcessedPacket>,
         shutdown_rx: oneshot::Receiver<()>,
     ) {
-        // Phase 6.8: Use batch I/O on Linux when enabled
+        // Use batch I/O on Linux when enabled
         #[cfg(target_os = "linux")]
         {
             if config.use_batch_io {
@@ -2156,7 +2156,7 @@ mod tests {
     }
 
     // ========================================================================
-    // DSCP Integration Tests (Phase 6.3)
+    // DSCP Integration Tests
     // ========================================================================
 
     #[test]
@@ -2322,7 +2322,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Rule Matching Tests (Phase 6.3)
+    // Rule Matching Tests
     // ========================================================================
 
     #[test]

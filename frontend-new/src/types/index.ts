@@ -128,7 +128,7 @@ export const PROTOCOL_OPTIONS = [
 
 // Network type options
 export const NETWORK_OPTIONS = [
-  { value: "", label: "Any", description: "Match all network types" },
+  { value: "any", label: "Any", description: "Match all network types" },
   { value: "tcp", label: "TCP", description: "TCP traffic only" },
   { value: "udp", label: "UDP", description: "UDP traffic only" },
 ] as const;
@@ -646,7 +646,7 @@ export interface SpeedTestResponse {
 }
 
 // ============ V2Ray Egress Types ============
-// [Phase XL] Only VLESS is supported for new configs
+// Only VLESS is supported for new configs
 // VMess/Trojan kept in type for backwards compat (reading existing data)
 
 export type V2RayProtocol = "vmess" | "vless" | "trojan";
@@ -906,7 +906,7 @@ export interface RealityKeyPair {
 }
 
 // V2Ray protocol options for UI
-// [Phase XL] Only VLESS is supported - VMess/Trojan removed from xray-lite
+// Only VLESS is supported - VMess/Trojan removed from xray-lite
 export const V2RAY_PROTOCOLS = [
   { value: "vless", label: "VLESS", description: "VLESS protocol with REALITY/XTLS-Vision" },
 ] as const;
@@ -933,7 +933,7 @@ export const V2RAY_SECURITY_OPTIONS = [
 ] as const;
 
 export const V2RAY_TLS_FINGERPRINTS = [
-  { value: "", label: "Default", description: "Default" },
+  { value: "default", label: "Default", description: "Default" },
   { value: "chrome", label: "Chrome", description: "Chrome browser" },
   { value: "firefox", label: "Firefox", description: "Firefox browser" },
   { value: "safari", label: "Safari", description: "Safari browser" },
@@ -951,7 +951,7 @@ export const V2RAY_MULTIPLEX_PROTOCOLS = [
 ] as const;
 
 export const VLESS_FLOW_OPTIONS = [
-  { value: "", label: "None", description: "No flow control" },
+  { value: "none", label: "None", description: "No flow control" },
   { value: "xtls-rprx-vision", label: "xtls-rprx-vision", description: "XTLS Vision flow control" },
 ] as const;
 
@@ -1157,7 +1157,7 @@ export interface PeerNode {
   name: string;
   description?: string;
   endpoint: string;
-  api_port?: number;  // Phase D: API 端口 (默认 36000)
+  api_port?: number;  // API port (default 36000)
   tunnel_type: PeerTunnelType;
   tunnel_status: PeerTunnelStatus;
   tunnel_interface?: string;
@@ -1191,7 +1191,7 @@ export interface PeerNode {
   created_at?: string;
   updated_at?: string;
 
-  // 双向连接状态 (Phase 11.2)
+  // Bidirectional connection status
   bidirectional_status?: "pending" | "outbound_only" | "bidirectional";
 }
 
@@ -1312,7 +1312,7 @@ export interface NodeChain {
 
 export interface NodeChainCreateRequest {
   tag: string;
-  name?: string;  // Phase 11-Fix.B: 可选，默认使用 tag
+  name?: string;  // Optional, defaults to tag
   description?: string;
   hops: string[];
   hop_protocols?: Record<string, string>;
@@ -1349,7 +1349,7 @@ export interface TerminalEgressInfo {
   enabled: boolean;
 }
 
-// Terminal egress list response (with cache support - Phase 11.5)
+// Terminal egress list response (with cache support)
 export interface TerminalEgressListResponse {
   egress_list: TerminalEgressInfo[];
   node_tag: string;

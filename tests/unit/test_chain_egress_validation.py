@@ -168,22 +168,22 @@ class TestValidateEdgeCases:
 
         ISSUE #1: Currently this passes (returns None), should it fail?
         """
-        # Document current behavior, can be fixed in Phase 2
+        # Document current behavior
         result = _validate_chain_terminal_egress(None, for_tunnel_api=False)
         # Current behavior: returns None (passes)
         # Note: This is a bug, should raise HTTPException
-        # TODO: Fix in Phase 2
+        # TODO: Fix this
 
     def test_empty_string_user_api(self):
         """Test validation with empty string in user API mode
 
         ISSUE #1: Currently this passes (returns None), should it fail?
         """
-        # Document current behavior, can be fixed in Phase 2
+        # Document current behavior
         result = _validate_chain_terminal_egress("", for_tunnel_api=False)
         # Current behavior: returns None (passes)
         # Note: This is a bug, should raise HTTPException
-        # TODO: Fix in Phase 2
+        # TODO: Fix this
 
     def test_whitespace_only(self):
         """Test validation with whitespace-only input"""

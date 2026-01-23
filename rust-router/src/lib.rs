@@ -56,8 +56,8 @@
 //! - [`outbound`]: Outbound implementations
 //! - [`sniff`]: Protocol sniffing (TLS SNI, QUIC SNI)
 //! - [`tproxy`]: TPROXY socket and listener
-//! - [`ingress`]: `WireGuard` ingress management (Phase 6.3)
-//! - [`egress`]: `WireGuard` egress management (Phase 6.4)
+//! - [`ingress`]: `WireGuard` ingress management
+//! - [`egress`]: `WireGuard` egress management
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]

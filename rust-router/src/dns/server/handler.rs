@@ -200,8 +200,6 @@ impl HandlerStatsSnapshot {
 
 /// DNS query handler
 ///
-/// Phase 11-Fix.AA: Now connected to all DNS components for real query processing.
-///
 /// Processes incoming DNS queries through the full pipeline:
 /// 1. Rate limiting
 /// 2. Query validation
@@ -264,7 +262,7 @@ impl DnsHandler {
         Self::new(Arc::new(DnsRateLimiter::disabled()))
     }
 
-    /// Phase 11-Fix.AA: Create a fully configured DNS handler
+    /// Create a fully configured DNS handler
     ///
     /// This constructor connects the handler to all DNS components for
     /// real query processing.
@@ -300,7 +298,7 @@ impl DnsHandler {
 
     /// Handle an incoming DNS query
     ///
-    /// Phase 11-Fix.AA: Now implements full query processing pipeline:
+    /// Implements full query processing pipeline:
     /// 1. Rate limiting
     /// 2. Query validation
     /// 3. Block filter check
@@ -345,7 +343,7 @@ impl DnsHandler {
         // Validate the query
         let context = self.validate_query(client, &query)?;
 
-        // Phase 11-Fix.AA: Real query processing with components
+        // Process query through components
         let response = self.process_query(&query, &context).await?;
 
         self.stats.queries_processed.fetch_add(1, Ordering::Relaxed);
@@ -353,7 +351,7 @@ impl DnsHandler {
         self.serialize_response(&response)
     }
 
-    /// Phase 11-Fix.AA: Process a validated DNS query through the full pipeline
+    /// Process a validated DNS query through the full pipeline
     async fn process_query(&self, query: &Message, context: &QueryContext) -> DnsResult<Message> {
         let qname = &context.qname;
 

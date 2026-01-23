@@ -797,7 +797,7 @@ export const api = {
       { method: "POST", timeout: 60000 }
     ),
 
-  // Get terminal node's available egress list (with cache support - Phase 11.5)
+  // Get terminal node's available egress list (with cache support)
   getTerminalEgress: (tag: string, refresh?: boolean) =>
     request<{ egress_list: Array<{ tag: string; type: string; description?: string; enabled: boolean }>; node_tag: string; cached?: boolean; cached_at?: string }>(
       `/chains/${encodeURIComponent(tag)}/terminal-egress${refresh ? '?refresh=true' : ''}`,

@@ -1,13 +1,7 @@
-//! DSCP packet modification for Phase 6
+//! DSCP packet modification
 //!
 //! This module implements DSCP (Differentiated Services Code Point) packet
 //! modification for chain routing, including IPv4 header checksum recalculation.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [ ] 6.6.2 IPv4 DSCP modification with checksum
-//! - [ ] 6.6.2 IPv6 DSCP modification
-//! - [ ] 6.6.2 DSCP extraction
 //!
 //! # DSCP in IP Headers
 //!

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Phase 0 Day 4: Kernel Configuration Check
+# Kernel Configuration Check
 #
 # This script verifies that all required kernel parameters and modules
 # are available for TPROXY operation.
@@ -502,7 +502,7 @@ main() {
 
     echo ""
     echo "=============================================="
-    echo "   Phase 0 Day 4: Kernel Configuration Check"
+    echo "   Kernel Configuration Check"
     echo "=============================================="
 
     check_capabilities

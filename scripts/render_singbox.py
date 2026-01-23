@@ -158,7 +158,7 @@ def create_tproxy_inbound(wg_config: dict) -> dict:
     # TPROXY 入口配置
     # 监听 TCP 和 UDP 流量
     #
-    # Phase 11-Fix.Y: 必须使用 0.0.0.0 而不是 127.0.0.1
+    # 必须使用 0.0.0.0 而不是 127.0.0.1
     # 在 macvlan/bridge 模式下，sing-box 监听 127.0.0.1 会导致黑洞，
     # 即使 iptables TPROXY --on-ip 127.0.0.1 规则正确设置。
     # 使用 0.0.0.0 可以同时兼容 host 模式和 macvlan 模式。
@@ -871,7 +871,7 @@ def ensure_outbound_selector(config: dict, all_egress_tags: List[str], default_o
     existing_outbound_tags = {ob.get("tag") for ob in outbounds if ob.get("tag")}
 
     # 收集所有可用出口（只包含实际存在的 outbounds）
-    # Phase 6-Fix: 在 userspace WireGuard 模式下，某些出口（如 WARP）由 rust-router 管理，
+    # 在 userspace WireGuard 模式下，某些出口（如 WARP）由 rust-router 管理，
     # 不会在 sing-box config 中创建对应的 outbound。需要过滤掉这些不存在的 tags。
     available = ["direct"] + [tag for tag in all_egress_tags if tag in existing_outbound_tags]
 
@@ -1484,7 +1484,7 @@ def ensure_peer_dns_servers(config: dict, peer_tags: List[str]) -> None:
 
 
 # ============ WARP Egress 支持 ============
-# Phase 3: Cloudflare WARP 通过 WireGuard 提供出口
+# Cloudflare WARP 通过 WireGuard 提供出口
 # - MASQUE 协议已弃用，仅支持 WireGuard
 # - sing-box 通过 direct outbound + bind_interface 连接
 
@@ -1505,11 +1505,11 @@ def load_warp_egress() -> List[dict]:
 def ensure_warp_egress_outbounds(config: dict, warp_egress: List[dict]) -> List[str]:
     """确保每个 WARP 出口都有对应的 outbound
 
-    Phase 3: WARP 仅支持 WireGuard 协议
+    WARP 仅支持 WireGuard 协议：
     - WireGuard: 通过内核 WireGuard 接口 (sing-box direct outbound + bind_interface)
     - MASQUE 协议已弃用
 
-    Phase 6-Fix: 在 userspace WireGuard 模式下，WARP 隧道由 rust-router 管理，
+    在 userspace WireGuard 模式下，WARP 隧道由 rust-router 管理，
     不需要在 sing-box 中创建 outbound。只返回 tags 供 all_egress_tags 使用。
 
     Args:
@@ -2647,7 +2647,7 @@ def main() -> None:
         ensure_v2ray_dns_servers(config, v2ray_tags)
         all_egress_tags.extend(v2ray_tags)
 
-    # 加载并处理 WARP 出口（Phase 3: WireGuard only, MASQUE deprecated）
+    # 加载并处理 WARP 出口（WireGuard only, MASQUE deprecated）
     # sing-box 通过 direct outbound + bind_interface 连接 WireGuard 接口
     warp_egress = load_warp_egress()
     if warp_egress:

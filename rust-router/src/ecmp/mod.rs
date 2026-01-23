@@ -1,4 +1,4 @@
-//! ECMP (Equal-Cost Multi-Path) load balancing module for Phase 6
+//! ECMP (Equal-Cost Multi-Path) load balancing module
 //!
 //! This module implements ECMP load balancing for distributing traffic
 //! across multiple outbounds with health-aware failover.
@@ -14,17 +14,8 @@
 //!
 //! # Submodules
 //!
-//! - [`group`]: ECMP group management (Phase 6.7)
-//! - [`lb`]: Load balancing algorithms (Phase 6.7)
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.7 ECMP group structure
-//! - [x] 6.7 Load balancer algorithms (`FiveTupleHash`, `RoundRobin`, Weighted, `LeastConnections`, Random)
-//! - [x] 6.7 Health integration
-//! - [x] 6.7 Routing mark management
-//! - [x] 6.7 Connection affinity (five-tuple hash)
-//! - [x] 6.7 `EcmpGroupManager`
+//! - [`group`]: ECMP group management
+//! - [`lb`]: Load balancing algorithms
 //!
 //! # Architecture
 //!

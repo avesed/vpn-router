@@ -115,7 +115,7 @@ export function AddV2RayUserDialog({ open, onOpenChange }: AddV2RayUserDialogPro
           <div className="grid gap-2">
             <Label htmlFor="flow">Flow (XTLS Vision)</Label>
             <Select
-              onValueChange={(value) => setValue("flow", value)}
+              onValueChange={(value) => setValue("flow", value === "none" ? "" : value)}
             >
               <SelectTrigger>
                 <SelectValue placeholder="Select flow..." />

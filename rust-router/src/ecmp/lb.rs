@@ -1,19 +1,9 @@
-//! Load balancing algorithms for Phase 6
+//! Load balancing algorithms
 //!
 //! This module implements various load balancing algorithms for ECMP
 //! groups, including round-robin, weighted, least-connections, random,
 //! five-tuple hash for connection affinity, and destination hash for
 //! session affinity (video streaming).
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.7 Round-robin algorithm
-//! - [x] 6.7 Weighted round-robin
-//! - [x] 6.7 Least connections
-//! - [x] 6.7 Random selection
-//! - [x] 6.7 Five-tuple hash (connection affinity)
-//! - [x] 6.7 Destination hash (session affinity for video streaming)
-//! - [x] 6.7 Destination hash with least-load (session affinity + smart LB)
 //!
 //! # Algorithms
 //!

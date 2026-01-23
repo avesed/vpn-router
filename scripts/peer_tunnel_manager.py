@@ -2,7 +2,7 @@
 """
 对等节点隧道管理器
 
-.. deprecated:: Phase 12
+.. deprecated::
     此模块已弃用。rust-router 现在在用户空间管理对等节点隧道。
     
     - 在 userspace WireGuard 模式下，此管理器不再启动
@@ -89,7 +89,7 @@ SQLCIPHER_KEY = os.environ.get("SQLCIPHER_KEY")
 # 隧道 IP 子网
 PEER_TUNNEL_SUBNET = "10.200.200"
 
-# ============ Phase 11-Fix.D: 端口分配说明 ============
+# ============ 端口分配说明 ============
 #
 # 端口用途表（可通过环境变量配置）:
 #   WEB_PORT (36000)              Web UI + API（nginx）
@@ -106,19 +106,19 @@ PEER_TUNNEL_SUBNET = "10.200.200"
 #
 # ============================================
 
-# Phase 6 Fix: Peer tunnel port range (must match db_helper.py and CLAUDE.md)
+# Peer tunnel port range (must match db_helper.py and CLAUDE.md)
 # Valid range: 36200-36299 (100 ports for peer tunnels)
 PEER_TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
 PEER_TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
 PEER_XRAY_SOCKS_PORT_START = int(os.environ.get("PEER_XRAY_SOCKS_PORT_START", "37201"))
 
-# Phase 8 Fix: Peer tunnel routing table range (500-599)
+# Peer tunnel routing table range (500-599)
 # Derived from port: table = PEER_TABLE_BASE + (port - PEER_TUNNEL_PORT_MIN)
 PEER_TABLE_BASE = 500
 
 
 def get_peer_routing_table(tunnel_port: int) -> int:
-    """Phase 8 Fix: 从隧道端口计算路由表号（确定性，无冲突）
+    """ 从隧道端口计算路由表号（确定性，无冲突）
 
     端口 36200-36299 映射到路由表 500-599。
     每个 peer 有唯一端口，因此路由表号也唯一。
@@ -147,14 +147,14 @@ RECONNECT_INTERVAL = 30  # 快速重连间隔（秒）
 HEALTH_CHECK_INTERVAL = 60  # 健康检查间隔（秒）
 MAX_FAST_RECONNECT_ATTEMPTS = 5  # 快速重连最大尝试次数
 SLOW_RECONNECT_INTERVAL = 600  # 慢速重连间隔（秒）= 10 分钟
-# Phase 11-Fix.T: 抖动配置（防止 thundering herd）
+# 抖动配置（防止 thundering herd）
 JITTER_FACTOR = 0.25  # 抖动因子：±25% 随机偏移
 EXPONENTIAL_BACKOFF_BASE = 2  # 指数退避基数
 MAX_BACKOFF_INTERVAL = 1800  # 最大退避间隔（30 分钟）
 
 
 def calculate_jittered_backoff(attempt: int, base_interval: float) -> float:
-    """Phase 11-Fix.T: 计算带抖动的指数退避间隔
+    """ 计算带抖动的指数退避间隔
 
     防止多个节点同时重连导致的 "thundering herd" 问题。
 
@@ -510,7 +510,7 @@ def create_wireguard_tunnel_with_endpoint(
     peer_public_key: str,
     remote_endpoint: str,
 ) -> tuple:
-    """Phase 11-Tunnel: 创建 WireGuard 隧道并连接到远程端点
+    """ 创建 WireGuard 隧道并连接到远程端点
 
     用于导入配对请求时，Node B 创建隧道并连接到 Node A。
 
@@ -595,7 +595,7 @@ def create_wireguard_tunnel_with_endpoint(
         )
 
         # 设置策略路由
-        # Phase 8 Fix: 使用端口派生的确定性路由表号（替代 hash() 的非确定性行为）
+        # 使用端口派生的确定性路由表号（替代 hash() 的非确定性行为）
         table_num = get_peer_routing_table(listen_port)
         subprocess.run(
             ["ip", "route", "add", "default", "via", remote_ip, "dev", interface_name, "table", str(table_num)],
@@ -751,7 +751,7 @@ class PeerTunnelManager:
         local_ip = node["tunnel_local_ip"]
         remote_ip = node.get("tunnel_remote_ip", f"{PEER_TUNNEL_SUBNET}.2")
         endpoint = node["endpoint"]
-        # Phase 8 Fix: tunnel_port 必须在创建节点时分配，缺失则报错
+        # tunnel_port 必须在创建节点时分配，缺失则报错
         port = node.get("tunnel_port")
         if not port:
             logger.error(f"[{tag}] tunnel_port 未分配，请检查节点创建流程")
@@ -827,7 +827,7 @@ class PeerTunnelManager:
 
             # 设置策略路由: 从本地隧道 IP 发出的流量通过对端转发
             # 这允许 sing-box 使用 bind_interface 时流量正确路由
-            # Phase 8 Fix: 使用端口派生的确定性路由表号
+            # 使用端口派生的确定性路由表号
             # 路由表分配：ECMP 200-299, DSCP 300-363, 中继 400-463, 对等 500-599
             table_num = get_peer_routing_table(port)
 
@@ -881,7 +881,7 @@ class PeerTunnelManager:
 
             # 清理策略路由规则
             if local_ip and node:
-                # Phase 8 Fix: 使用端口派生的确定性路由表号
+                # 使用端口派生的确定性路由表号
                 tunnel_port = node.get("tunnel_port")
                 if tunnel_port:
                     table_num = get_peer_routing_table(tunnel_port)
@@ -1898,7 +1898,7 @@ class PeerTunnelManager:
         now = time.time()
         for tag, tunnel in list(self.tunnels.items()):
             if tunnel.status != "connected":
-                # Phase 11-Fix.T: 使用抖动退避计算重连间隔
+                # 使用抖动退避计算重连间隔
                 required_interval = calculate_jittered_backoff(
                     tunnel.reconnect_attempts,
                     RECONNECT_INTERVAL

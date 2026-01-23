@@ -1,4 +1,4 @@
-//! Batch I/O benchmarks for Phase 6.8
+//! Batch I/O benchmarks
 //!
 //! Run with: `cargo bench --bench batch_io`
 //!

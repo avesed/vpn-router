@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -44,12 +44,12 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
   const [password, setPassword] = useState("");
   const [security, setSecurity] = useState("auto");
   const [alterId, setAlterId] = useState(0);
-  const [flow, setFlow] = useState("");
-  
+  const [flow, setFlow] = useState("none");
+
   // TLS
   const [tlsEnabled, setTlsEnabled] = useState(true);
   const [tlsSni, setTlsSni] = useState("");
-  const [tlsFingerprint, setTlsFingerprint] = useState("");
+  const [tlsFingerprint, setTlsFingerprint] = useState("default");
   const [tlsAllowInsecure, setTlsAllowInsecure] = useState(false);
   
   // REALITY
@@ -74,10 +74,10 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
     setPassword("");
     setSecurity("auto");
     setAlterId(0);
-    setFlow("");
+    setFlow("none");
     setTlsEnabled(true);
     setTlsSni("");
-    setTlsFingerprint("");
+    setTlsFingerprint("default");
     setTlsAllowInsecure(false);
     setRealityEnabled(false);
     setRealityPublicKey("");
@@ -104,10 +104,10 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
         setPassword(""); // Password is hidden by API
         setSecurity(editEgress.security || "auto");
         setAlterId(editEgress.alter_id || 0);
-        setFlow(editEgress.flow || "");
+        setFlow(editEgress.flow || "none");
         setTlsEnabled(editEgress.tls_enabled === 1);
         setTlsSni(editEgress.tls_sni || "");
-        setTlsFingerprint(editEgress.tls_fingerprint || "");
+        setTlsFingerprint(editEgress.tls_fingerprint || "default");
         setTlsAllowInsecure(editEgress.tls_allow_insecure === 1);
         setRealityEnabled(editEgress.reality_enabled === 1);
         setRealityPublicKey(editEgress.reality_public_key || "");
@@ -152,10 +152,10 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
       if (result.password) setPassword(result.password);
       if (result.security) setSecurity(result.security);
       if (result.alter_id !== undefined) setAlterId(result.alter_id);
-      if (result.flow) setFlow(result.flow);
+      if (result.flow) setFlow(result.flow); else setFlow("none");
       if (result.tls_enabled !== undefined) setTlsEnabled(result.tls_enabled);
       if (result.tls_sni) setTlsSni(result.tls_sni);
-      if (result.tls_fingerprint) setTlsFingerprint(result.tls_fingerprint);
+      if (result.tls_fingerprint) setTlsFingerprint(result.tls_fingerprint); else setTlsFingerprint("default");
       if (result.tls_allow_insecure !== undefined) setTlsAllowInsecure(result.tls_allow_insecure);
       if (result.reality_enabled !== undefined) setRealityEnabled(result.reality_enabled);
       if (result.reality_public_key) setRealityPublicKey(result.reality_public_key);
@@ -192,6 +192,10 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
       if (transportHost) transportConfig.host = transportHost;
       if (transportServiceName) transportConfig.service_name = transportServiceName;
 
+      // Convert special values back to API format (empty string or undefined)
+      const flowValue = flow === "none" ? undefined : flow || undefined;
+      const fingerprintValue = tlsFingerprint === "default" ? undefined : tlsFingerprint || undefined;
+
       if (isEditing) {
         await updateMutation.mutateAsync({
           tag: editEgress.tag,
@@ -204,10 +208,10 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
             password: password || undefined,
             security,
             alter_id: alterId,
-            flow: flow || undefined,
+            flow: flowValue,
             tls_enabled: tlsEnabled,
             tls_sni: tlsSni || undefined,
-            tls_fingerprint: tlsFingerprint || undefined,
+            tls_fingerprint: fingerprintValue,
             tls_allow_insecure: tlsAllowInsecure,
             reality_enabled: realityEnabled,
             reality_public_key: realityPublicKey || undefined,
@@ -227,10 +231,10 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
           password: password || undefined,
           security,
           alter_id: alterId,
-          flow: flow || undefined,
+          flow: flowValue,
           tls_enabled: tlsEnabled,
           tls_sni: tlsSni || undefined,
-          tls_fingerprint: tlsFingerprint || undefined,
+          tls_fingerprint: fingerprintValue,
           tls_allow_insecure: tlsAllowInsecure,
           reality_enabled: realityEnabled,
           reality_public_key: realityPublicKey || undefined,
@@ -263,6 +267,11 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
               ? t("egress.v2ray.editTitle", { defaultValue: "Edit V2Ray Egress" })
               : t("egress.v2ray.addTitle", { defaultValue: "Add V2Ray Egress" })}
           </DialogTitle>
+          <DialogDescription>
+            {isEditing
+              ? t("egress.v2ray.editDescription", { defaultValue: "Update V2Ray/Xray outbound configuration" })
+              : t("egress.v2ray.addDescription", { defaultValue: "Add a new V2Ray/Xray outbound proxy" })}
+          </DialogDescription>
         </DialogHeader>
 
         <Tabs value={importMethod} onValueChange={(v) => setImportMethod(v as typeof importMethod)}>

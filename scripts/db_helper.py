@@ -1847,14 +1847,14 @@ class UserDatabase:
         endpoint_v6: Optional[str] = None,
         enabled: bool = True,
         account_id: Optional[str] = None,
-        # Phase 3-Fix.B: WireGuard config fields for persistence
+        # WireGuard config fields for persistence
         private_key: Optional[str] = None,
         peer_public_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         local_ip: Optional[str] = None,
         local_ipv6: Optional[str] = None
     ) -> int:
-        """添加 WARP 出口 (Phase 3: WireGuard only, Phase 3-Fix.B: with WG config)"""
+        """添加 WARP 出口 (WireGuard only with config)"""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -1874,11 +1874,11 @@ class UserDatabase:
             return cursor.lastrowid
 
     def update_warp_egress(self, tag: str, **kwargs) -> bool:
-        """更新 WARP 出口 (Phase 3: WireGuard only, Phase 3-Fix.B: with WG config)"""
+        """更新 WARP 出口 (WireGuard only with config)"""
         allowed_fields = {
             "description", "config_path", "license_key", "account_type",
             "endpoint_v4", "endpoint_v6", "enabled", "account_id",
-            # Phase 3-Fix.B: WireGuard config fields
+            # WireGuard config fields
             "private_key", "peer_public_key", "endpoint", "local_ip", "local_ipv6"
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
@@ -1968,7 +1968,7 @@ class UserDatabase:
     def get_next_routing_table(self) -> Optional[int]:
         """获取下一个可用的 ECMP 路由表号（200-299 范围）
 
-        Phase 8 Fix: 添加上限验证，防止表号超出 ECMP 范围并与 DSCP/Relay/Peer 表冲突。
+         添加上限验证，防止表号超出 ECMP 范围并与 DSCP/Relay/Peer 表冲突。
 
         Returns:
             可用的表号 (200-299)，如果范围已耗尽则返回 None
@@ -1995,7 +1995,7 @@ class UserDatabase:
                 if table not in used_tables:
                     return table
 
-            # Phase 8: 范围耗尽，返回 None
+            # 范围耗尽，返回 None
             return None
 
     def get_all_egress_tags(self) -> set:
@@ -2151,7 +2151,7 @@ class UserDatabase:
         # 自动分配路由表号
         routing_table = self.get_next_routing_table()
 
-        # Phase 8 Fix: 检查表号分配是否成功
+        #  检查表号分配是否成功
         if routing_table is None:
             raise ValueError(
                 "无法分配路由表号：ECMP 表范围 (200-299) 已耗尽。"
@@ -2474,9 +2474,8 @@ class UserDatabase:
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
-        # 隧道状态和 IP 参数（Phase 2 配对系统需要）
-        tunnel_status: str = "disconnected",
-        tunnel_interface: Optional[str] = None,  # Phase 11-Tunnel: WireGuard 接口名
+        # 隧道状态和 IP 参数        tunnel_status: str = "disconnected",
+        tunnel_interface: Optional[str] = None,  # WireGuard 接口名
         tunnel_local_ip: Optional[str] = None,
         tunnel_remote_ip: Optional[str] = None,
         tunnel_port: Optional[int] = None,
@@ -2506,7 +2505,7 @@ class UserDatabase:
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
         enabled: bool = True,
-        # Phase 11: 双向连接状态
+        # 双向连接状态
         bidirectional_status: str = "pending",
         # SOCKS 端口（用于 Xray 隧道类型）
         xray_socks_port: Optional[int] = None,
@@ -2551,7 +2550,7 @@ class UserDatabase:
             sqlite3.IntegrityError: 如果 tunnel_local_ip 或 tunnel_port 冲突（竞态条件检测）
             ValueError: 如果 tunnel_port 超出有效范围 (36200-36299)
         """
-        # Phase 6 Fix: 验证 tunnel_port 在有效范围内（支持环境变量配置）
+        # 验证 tunnel_port 在有效范围内（支持环境变量配置）
         TUNNEL_PORT_MIN = int(os.environ.get("PEER_TUNNEL_PORT_MIN", "36200"))
         TUNNEL_PORT_MAX = int(os.environ.get("PEER_TUNNEL_PORT_MAX", "36299"))
         if tunnel_port is not None:
@@ -2617,7 +2616,7 @@ class UserDatabase:
             # 对方入站信息（用于连接到对方的入站）
             "peer_inbound_enabled", "peer_inbound_port", "peer_inbound_uuid",
             "peer_inbound_reality_public_key", "peer_inbound_reality_short_id",
-            # Phase 11.1: 双向自动连接参数
+            # 双向自动连接参数
             "bidirectional_status", "remote_wg_private_key", "remote_wg_public_key",
             # 连接模式
             "connection_mode",  # 'outbound' or 'inbound'
@@ -2666,7 +2665,7 @@ class UserDatabase:
         Issue 10/13 Fix: 使用正确的端口范围 (36200-36299) 并正确处理耗尽情况。
         此范围与 CLAUDE.md 和 peer_pairing.py 中的文档保持一致。
 
-        Phase 12-Fix.I: 添加 exclude_ports 参数，用于在导入配对时排除对方节点的端口。
+         添加 exclude_ports 参数，用于在导入配对时排除对方节点的端口。
         例如：A 使用 36200，B 导入时应排除 36200，分配 36201。
 
         Args:
@@ -2685,7 +2684,7 @@ class UserDatabase:
         # 获取需要避免的保留端口（防止与入口端口冲突）
         reserved_ports = self._get_reserved_ports()
 
-        # Phase 12-Fix.I: 合并额外排除的端口
+        #  合并额外排除的端口
         if exclude_ports:
             reserved_ports = reserved_ports | exclude_ports
 
@@ -2816,7 +2815,7 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    # ============ 双向连接管理 (Phase 11.1) ============
+    # ============ 双向连接管理 ============
 
     def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
         """更新对等节点的双向连接状态
@@ -2869,8 +2868,7 @@ class UserDatabase:
         Returns:
             符合条件的节点列表
         """
-        # 输入验证 (Phase 11.1)
-        valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
+        # 输入验证         valid_statuses = {'pending', 'outbound_only', 'bidirectional'}
         if status not in valid_statuses:
             logger.warning(f"Invalid bidirectional_status query: {status}")
             return []
@@ -2886,7 +2884,7 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    # ============ Pending Pairings 管理 (Phase 11-Tunnel) ============
+    # ============ Pending Pairings 管理 ============
 
     def add_pending_pairing(
         self,
@@ -3038,7 +3036,7 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
-    # ============ Phase 11-Cascade: 级联删除通知支持 ============
+    # ============ 级联删除通知支持 ============
 
     # 有效的事件类型 (必须与数据库 CHECK 约束保持一致)
     # Phase B: 添加 port_change 事件类型支持端口变更通知
@@ -3566,7 +3564,7 @@ class UserDatabase:
         dscp_value: Optional[int] = None,
         chain_mark_type: str = "dscp",
         chain_state: str = "inactive",
-        allow_transitive: bool = False  # Phase 11-Fix.Q: 传递模式验证
+        allow_transitive: bool = False  # 传递模式验证
     ) -> int:
         """添加多跳链路
 
@@ -3617,8 +3615,8 @@ class UserDatabase:
             "downstream_status", "disconnected_node",  # 级联通知字段
             # 多跳链路架构 v2 字段
             "exit_egress", "dscp_value", "chain_mark_type", "chain_state",
-            "allow_transitive",  # Phase 11-Fix.Q: 传递模式验证
-            "last_error"  # Phase 5: 错误原因记录
+            "allow_transitive",  # 传递模式验证
+            "last_error"  # 错误原因记录
         }
         updates = []
         values = []
@@ -3650,13 +3648,12 @@ class UserDatabase:
         timeout_ms: int = 30000,
         last_error: Optional[str] = None
     ) -> tuple:
-        """Phase 11-Fix.T/U: 原子性链路状态转换
+        """ 原子性链路状态转换
 
         使用 BEGIN EXCLUSIVE 事务确保并发安全。解决两个并发请求同时
         读取 'inactive' 状态然后都尝试写入 'activating' 的竞态条件。
 
-        Phase 11-Fix.U 修改:
-        - 使用专用连接避免 TLS 连接池隐式事务状态冲突
+                - 使用专用连接避免 TLS 连接池隐式事务状态冲突
         - 添加 last_error 参数支持在同一事务中设置错误消息
 
         Args:
@@ -3673,7 +3670,7 @@ class UserDatabase:
             - (False, "Expected state 'X', found 'Y'"): 状态不匹配
             - (False, "Database error: ..."): 数据库错误
         """
-        # Phase 11-Fix.U: 使用专用连接避免 TLS 连接池冲突
+        # 使用专用连接避免 TLS 连接池冲突
         # TLS 缓存连接可能有待处理的隐式事务，导致 BEGIN EXCLUSIVE 或 COMMIT 失败
         conn = sqlite3.connect(
             str(self.db_path),
@@ -3700,18 +3697,18 @@ class UserDatabase:
             row = cursor.fetchone()
 
             if not row:
-                # Phase 11-Fix.V.2: 使用 conn.rollback() 统一事务管理
+                # 使用 conn.rollback() 统一事务管理
                 conn.rollback()
                 return False, f"Chain '{tag}' not found"
 
             current_state = row[0] or "inactive"
 
             if current_state != expected_state:
-                # Phase 11-Fix.V.2: 使用 conn.rollback() 统一事务管理
+                # 使用 conn.rollback() 统一事务管理
                 conn.rollback()
                 return False, f"Expected state '{expected_state}', found '{current_state}'"
 
-            # Phase 11-Fix.U: 原子更新状态和 last_error（如果提供）
+            # 原子更新状态和 last_error（如果提供）
             if last_error is not None:
                 cursor.execute(
                     """UPDATE node_chains
@@ -3726,7 +3723,7 @@ class UserDatabase:
                        WHERE tag = ?""",
                     (new_state, tag)
                 )
-            # Phase 11-Fix.V.2: 使用 conn.commit() 统一事务管理
+            # 使用 conn.commit() 统一事务管理
             conn.commit()
 
             logger.info(
@@ -3740,12 +3737,12 @@ class UserDatabase:
             try:
                 conn.rollback()
             except Exception as rollback_err:
-                # Phase 11-Fix.V.2: 记录 rollback 失败（连接将在 finally 中关闭）
+                # 记录 rollback 失败（连接将在 finally 中关闭）
                 logger.warning(f"[db] Rollback failed during error recovery: {rollback_err}")
             logger.error(f"[db] atomic_chain_state_transition failed: {e}")
             return False, f"Database error: {str(e)}"
         finally:
-            # Phase 11-Fix.U: 专用连接在使用后关闭，不污染 TLS 连接池
+            # 专用连接在使用后关闭，不污染 TLS 连接池
             try:
                 conn.close()
             except Exception:
@@ -3773,7 +3770,7 @@ class UserDatabase:
             return cursor.rowcount > 0
 
     def validate_chain_hops(self, hops: List[str], allow_transitive: bool = False) -> tuple:
-        """Phase 11-Fix.C: 验证链路的跳点节点，支持传递模式
+        """ 验证链路的跳点节点，支持传递模式
 
         验证内容：
         1. hops 不能为空
@@ -4325,7 +4322,7 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount
 
-    # ============ 终端出口缓存 (Phase 11.1) ============
+    # ============ 终端出口缓存 ============
 
     def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
         """获取终端出口缓存
@@ -4368,7 +4365,7 @@ class UserDatabase:
         Returns:
             是否成功
         """
-        # TTL 边界验证 (Phase 11.1)
+        # TTL 边界验证
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0 or ttl_seconds > 86400:
             logger.warning(f"Invalid ttl_seconds: {ttl_seconds}, using default 300")
             ttl_seconds = 300
@@ -4866,14 +4863,14 @@ class DatabaseManager:
         endpoint_v6: Optional[str] = None,
         enabled: bool = True,
         account_id: Optional[str] = None,
-        # Phase 3-Fix.B: WireGuard config fields
+        # WireGuard config fields
         private_key: Optional[str] = None,
         peer_public_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         local_ip: Optional[str] = None,
         local_ipv6: Optional[str] = None
     ) -> int:
-        """Phase 3: WireGuard only, Phase 3-Fix.B: with WG config"""
+        """WireGuard only with WG config"""
         return self.user.add_warp_egress(
             tag, description, config_path, license_key, account_type,
             endpoint_v4, endpoint_v6, enabled, account_id,
@@ -5033,9 +5030,8 @@ class DatabaseManager:
         description: str = "",
         api_port: Optional[int] = None,
         tunnel_type: str = "wireguard",
-        # 隧道状态和 IP 参数（Phase 2 配对系统需要）
-        tunnel_status: str = "disconnected",
-        tunnel_interface: Optional[str] = None,  # Phase 11-Tunnel: WireGuard 接口名
+        # 隧道状态和 IP 参数        tunnel_status: str = "disconnected",
+        tunnel_interface: Optional[str] = None,  # WireGuard 接口名
         tunnel_local_ip: Optional[str] = None,
         tunnel_remote_ip: Optional[str] = None,
         tunnel_port: Optional[int] = None,
@@ -5065,7 +5061,7 @@ class DatabaseManager:
         default_outbound: Optional[str] = None,
         auto_reconnect: bool = True,
         enabled: bool = True,
-        # Phase 11: 双向连接状态
+        # 双向连接状态
         bidirectional_status: str = "pending",
         # SOCKS 端口（用于 Xray 隧道类型）
         xray_socks_port: Optional[int] = None,
@@ -5105,8 +5101,7 @@ class DatabaseManager:
     def get_peer_nodes_with_inbound(self) -> List[Dict]:
         return self.user.get_peer_nodes_with_inbound()
 
-    # 双向连接管理 (Phase 11.1)
-    def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
+    # 双向连接管理     def update_peer_bidirectional_status(self, tag: str, status: str) -> bool:
         return self.user.update_peer_bidirectional_status(tag, status)
 
     def get_peers_pending_bidirectional(self) -> List[Dict]:
@@ -5115,7 +5110,7 @@ class DatabaseManager:
     def get_peers_by_bidirectional_status(self, status: str) -> List[Dict]:
         return self.user.get_peers_by_bidirectional_status(status)
 
-    # Pending Pairings (待处理配对管理, Phase 11-Tunnel)
+    # Pending Pairings (待处理配对管理)
     def add_pending_pairing(
         self,
         pairing_id: str,
@@ -5155,7 +5150,7 @@ class DatabaseManager:
     def get_all_pending_pairings(self) -> List[Dict]:
         return self.user.get_all_pending_pairings()
 
-    # Phase 11-Cascade: 级联删除通知支持
+    # 级联删除通知支持
     def log_peer_event(
         self,
         event_type: str,
@@ -5269,7 +5264,7 @@ class DatabaseManager:
         dscp_value: Optional[int] = None,
         chain_mark_type: str = "dscp",
         chain_state: str = "inactive",
-        allow_transitive: bool = False  # Phase 11-Fix.Q: 传递模式验证
+        allow_transitive: bool = False  # 传递模式验证
     ) -> int:
         return self.user.add_node_chain(
             tag, name, hops, description, hop_protocols,
@@ -5292,7 +5287,7 @@ class DatabaseManager:
         timeout_ms: int = 30000,
         last_error: Optional[str] = None
     ) -> tuple:
-        """Phase 11-Fix.T/U: 原子性链路状态转换（代理方法）"""
+        """ 原子性链路状态转换（代理方法）"""
         return self.user.atomic_chain_state_transition(
             tag, expected_state, new_state, timeout_ms, last_error
         )
@@ -5396,8 +5391,7 @@ class DatabaseManager:
     def update_peer_node_tunnel_api_endpoint(self, tag: str, tunnel_api_endpoint: Optional[str]) -> bool:
         return self.user.update_peer_node_tunnel_api_endpoint(tag, tunnel_api_endpoint)
 
-    # 终端出口缓存 (Phase 11.1)
-    def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
+    # 终端出口缓存     def get_terminal_egress_cache(self, chain_tag: str) -> Optional[Dict]:
         return self.user.get_terminal_egress_cache(chain_tag)
 
     def update_terminal_egress_cache(

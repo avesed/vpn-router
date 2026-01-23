@@ -150,7 +150,7 @@ pub struct IpcHandler {
     last_reload_timestamp: AtomicU64,
 
     // ========================================================================
-    // Phase 5.5: UDP Components (Optional)
+    // UDP Components (Optional)
     // ========================================================================
 
     /// Whether UDP is enabled
@@ -166,46 +166,46 @@ pub struct IpcHandler {
     udp_buffer_pool: Option<Arc<UdpBufferPool>>,
 
     // ========================================================================
-    // Phase 6.6: Chain Management Components
+    // Chain Management Components
     // ========================================================================
 
-    /// Chain manager for multi-hop routing (Phase 6.6)
+    /// Chain manager for multi-hop routing
     chain_manager: Option<Arc<ChainManager>>,
 
     /// Local node tag for chain identification
     local_node_tag: String,
 
     // ========================================================================
-    // Phase 6.9: Additional Manager Components
+    // Additional Manager Components
     // ========================================================================
 
-    /// Peer manager for multi-node connections (Phase 6.5)
+    /// Peer manager for multi-node connections
     peer_manager: Option<Arc<PeerManager>>,
 
-    /// ECMP group manager for load balancing (Phase 6.7)
+    /// ECMP group manager for load balancing
     ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
-    /// `WireGuard` ingress manager (Phase 6.3)
+    /// `WireGuard` ingress manager
     wg_ingress_manager: Option<Arc<WgIngressManager>>,
 
-    /// `WireGuard` ingress forwarding stats (Phase 6.3)
+    /// `WireGuard` ingress forwarding stats
     ingress_forwarding_stats: Option<Arc<ForwardingStats>>,
 
-    /// `WireGuard` ingress reply stats (Phase 6.3)
+    /// `WireGuard` ingress reply stats
     ingress_reply_stats: Option<Arc<IngressReplyStats>>,
 
     /// `WireGuard` ingress session tracker for active connection count
     /// Uses RwLock to allow setting after handler is created (Arc wrapped)
     ingress_session_tracker: RwLock<Option<Arc<IngressSessionTracker>>>,
 
-    /// `WireGuard` egress manager (Phase 6.4)
+    /// `WireGuard` egress manager
     wg_egress_manager: Option<Arc<WgEgressManager>>,
 
     // ========================================================================
-    // Phase 7.7: DNS Engine Components
+    // DNS Engine Components
     // ========================================================================
 
-    /// DNS engine for DNS query handling (Phase 7.7)
+    /// DNS engine for DNS query handling
     dns_engine: Option<Arc<DnsEngine>>,
 }
 
@@ -280,7 +280,7 @@ impl IpcHandler {
 
     /// Create a new IPC handler with chain manager
     ///
-    /// This enables chain management commands (Phase 6.6).
+    /// This enables chain management commands.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_chain_manager(
         connection_manager: Arc<ConnectionManager>,
@@ -463,7 +463,7 @@ impl IpcHandler {
     /// Check if an outbound tag is valid (exists in outbound_manager or wg_egress_manager,
     /// or is a WireGuard-prefixed tag that will be added via IPC).
     ///
-    /// Phase 11-Fix.AE: This fixes the routing validation bug where WireGuard outbounds
+    /// This fixes the routing validation bug where WireGuard outbounds
     /// in wg_egress_manager were not recognized, causing all traffic to fall back to "direct".
     fn is_valid_outbound_tag(&self, tag: &str) -> bool {
         // Check outbound_manager first (Direct/SOCKS5 outbounds)
@@ -478,14 +478,14 @@ impl IpcHandler {
             }
         }
 
-        // Phase 6-Fix.AI: Check ecmp_group_manager for ECMP groups
+        // Check ecmp_group_manager for ECMP groups
         if let Some(ref ecmp_mgr) = self.ecmp_group_manager {
             if ecmp_mgr.has_group(tag) {
                 return true;
             }
         }
 
-        // Phase 11-Fix: Check chain_manager for multi-hop chains
+        // Check chain_manager for multi-hop chains
         // Only ACTIVE chains can be used as outbounds (they're registered in FwmarkRouter)
         // Inactive chains exist but can't route traffic properly
         if let Some(ref chain_mgr) = self.chain_manager {
@@ -580,7 +580,7 @@ impl IpcHandler {
             IpcCommand::GetPoolStats { tag } => self.handle_get_pool_stats(tag),
 
             // ================================================================
-            // Phase 3.3: IPC Protocol v2.1 Command Handlers
+            // IPC Protocol v2.1 Command Handlers
             // ================================================================
             IpcCommand::AddWireguardOutbound {
                 tag,
@@ -611,7 +611,7 @@ impl IpcHandler {
             IpcCommand::GetPrometheusMetrics => self.handle_get_prometheus_metrics(),
 
             // ================================================================
-            // Phase 5.5: UDP IPC Command Handlers
+            // UDP IPC Command Handlers
             // ================================================================
             IpcCommand::GetUdpStats => self.handle_get_udp_stats(),
 
@@ -627,10 +627,10 @@ impl IpcHandler {
             IpcCommand::GetBufferPoolStats => self.handle_get_buffer_pool_stats(),
 
             // ================================================================
-            // Phase 6.9: IPC Protocol v3.2 Command Handlers
+            // IPC Protocol v3.2 Command Handlers
             // ================================================================
 
-            // WireGuard Tunnel Management (Phase 6 - userspace WireGuard)
+            // WireGuard Tunnel Management (userspace WireGuard)
             IpcCommand::CreateWgTunnel { tag, config } => {
                 self.handle_create_wg_tunnel(tag, config).await
             }
@@ -644,7 +644,7 @@ impl IpcHandler {
                 self.handle_list_wg_tunnels()
             }
 
-            // Phase 11-Fix.AA: Ingress Peer Management
+            // Ingress Peer Management
             IpcCommand::AddIngressPeer { public_key, allowed_ips, name, preshared_key } => {
                 self.handle_add_ingress_peer(public_key, allowed_ips, name, preshared_key).await
             }
@@ -734,7 +734,7 @@ impl IpcHandler {
             }
 
             // ================================================================
-            // Phase 6.6.5: Chain Management Command Handlers
+            // Chain Management Command Handlers
             // ================================================================
             IpcCommand::CreateChain { tag, config } => {
                 self.handle_create_chain(tag, config).await
@@ -768,7 +768,7 @@ impl IpcHandler {
             }
 
             // ================================================================
-            // Phase 6.6.5: Two-Phase Commit Command Handlers
+            // Two-Phase Commit Command Handlers
             // ================================================================
             IpcCommand::PrepareChainRoute { chain_tag, config, source_node } => {
                 self.handle_prepare_chain_route(&chain_tag, config, &source_node).await
@@ -781,7 +781,7 @@ impl IpcHandler {
             }
 
             // ================================================================
-            // Phase 7.7: DNS Command Handlers
+            // DNS Command Handlers
             // ================================================================
             IpcCommand::GetDnsStats => {
                 self.handle_get_dns_stats()
@@ -1021,7 +1021,7 @@ impl IpcHandler {
 
     /// Handle list outbounds command
     ///
-    /// Phase 11-Fix.AA: Now includes `WgEgressManager` tunnels in addition to
+    /// Now includes `WgEgressManager` tunnels in addition to
     /// `OutboundManager` outbounds.
     fn handle_list_outbounds(&self) -> IpcResponse {
         let mut outbounds: Vec<OutboundInfo> = self
@@ -1043,7 +1043,7 @@ impl IpcHandler {
             })
             .collect();
 
-        // Phase 11-Fix.AA: Include userspace WireGuard egress tunnels
+        // Include userspace WireGuard egress tunnels
         if let Some(egress_manager) = &self.wg_egress_manager {
             let tunnel_tags = egress_manager.list_tunnels();
             for tag in tunnel_tags {
@@ -1339,7 +1339,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 3.3: IPC Protocol v2.1 Handler Implementations
+    // IPC Protocol v2.1 Handler Implementations
     // ========================================================================
 
     /// Handle add `WireGuard` outbound command
@@ -1479,7 +1479,7 @@ impl IpcHandler {
     ///
     /// Atomically updates routing rules via `ArcSwap`.
     ///
-    /// Phase 11-Fix.Z: Properly rebuild `domain_matcher` and `geoip_matcher`
+    /// Properly rebuilds `domain_matcher` and `geoip_matcher`
     /// using `RoutingSnapshotBuilder` instead of just cloning existing matchers.
     /// This ensures domain/geoip rules are actually matched by the high-performance
     /// Aho-Corasick and CIDR matchers.
@@ -1491,7 +1491,7 @@ impl IpcHandler {
         use super::protocol::UpdateRoutingResponse;
         use crate::rules::RuleType;
 
-        // Validate default outbound exists (Phase 11-Fix.AE: check both managers + WG prefixes)
+        // Validate default outbound exists (check both managers + WG prefixes)
         if !self.is_valid_outbound_tag(&default_outbound) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
@@ -1506,7 +1506,7 @@ impl IpcHandler {
         let current = self.rule_engine.load();
 
         // Use RoutingSnapshotBuilder to properly build domain_matcher and geoip_matcher
-        // Phase 11-Fix.Z: This is the key fix - we must use the builder to add rules
+        // This is the key fix - we must use the builder to add rules
         // to their respective matchers, not just compile them into CompiledRuleSet
         let mut builder = RoutingSnapshotBuilder::new()
             .default_outbound(&default_outbound)
@@ -1520,7 +1520,7 @@ impl IpcHandler {
                 continue;
             }
 
-            // Validate outbound exists (Phase 11-Fix.AE: check both managers + WG prefixes)
+            // Validate outbound exists (check both managers + WG prefixes)
             if !self.is_valid_outbound_tag(&rule_cfg.outbound) {
                 return IpcResponse::error(
                     ErrorCode::NotFound,
@@ -1546,7 +1546,7 @@ impl IpcHandler {
                 }
             };
 
-            // Phase 11-Fix.Z: Route rules to appropriate builders based on type
+            // Route rules to appropriate builders based on type
             // This ensures domain rules go to domain_matcher (Aho-Corasick),
             // geoip rules go to geoip_matcher (CIDR), etc.
             let result = match rule_type {
@@ -1637,7 +1637,7 @@ impl IpcHandler {
     fn handle_set_default_outbound(&self, tag: String) -> IpcResponse {
         use crate::rules::RoutingSnapshot;
 
-        // Validate outbound exists (Phase 11-Fix.AE: check both managers + WG prefixes)
+        // Validate outbound exists (check both managers + WG prefixes)
         if !self.is_valid_outbound_tag(&tag) {
             return IpcResponse::error(
                 ErrorCode::NotFound,
@@ -2073,7 +2073,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 5.5: UDP IPC Handler Implementations
+    // UDP IPC Handler Implementations
     // ========================================================================
 
     /// Handle `GetUdpStats` command
@@ -2133,7 +2133,7 @@ impl IpcHandler {
             }
         });
 
-        // Get processor stats from worker pool (Phase 5.5 fix)
+        // Get processor stats from worker pool
         let processor_stats = self.udp_worker_pool.as_ref().map(|pool| {
             let stats = pool.processor_stats();
             UdpProcessorInfo {
@@ -2317,7 +2317,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 6.6.5: Chain Management Handler Implementations
+    // Chain Management Handler Implementations
     // ========================================================================
 
     /// Handle `CreateChain` command
@@ -2741,10 +2741,10 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 6.6.5: Two-Phase Commit Handler Implementations
+    // Two-Phase Commit Handler Implementations
     // ========================================================================
 
-    /// Handle `PrepareChainRoute` command (2PC Phase 1)
+    /// Handle `PrepareChainRoute` command (2PC prepare phase)
     ///
     /// Validates chain configuration without applying routing rules.
     /// Called by the coordinator to prepare remote nodes.
@@ -2788,7 +2788,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle `CommitChainRoute` command (2PC Phase 2a)
+    /// Handle `CommitChainRoute` command (2PC commit phase)
     ///
     /// Applies routing rules after all nodes have been prepared.
     /// Called by the coordinator to commit remote nodes.
@@ -2825,7 +2825,7 @@ impl IpcHandler {
         }
     }
 
-    /// Handle `AbortChainRoute` command (2PC Phase 2b)
+    /// Handle `AbortChainRoute` command (2PC abort phase)
     ///
     /// Rolls back prepared state when 2PC fails.
     /// Called by the coordinator to abort remote nodes.
@@ -2864,7 +2864,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 6.9: WireGuard Tunnel Handler Implementations
+    // WireGuard Tunnel Handler Implementations
     // ========================================================================
 
     /// Handle `CreateWgTunnel` command
@@ -3045,7 +3045,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 11-Fix.AA: Ingress Peer Handler Implementations
+    // Ingress Peer Handler Implementations
     // ========================================================================
 
     /// Handle `AddIngressPeer` command
@@ -3194,7 +3194,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 6.9: ECMP Group Handler Implementations
+    // ECMP Group Handler Implementations
     // ========================================================================
 
     /// Handle `CreateEcmpGroup` command
@@ -3461,7 +3461,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 6.9: Peer Management Handler Implementations
+    // Peer Management Handler Implementations
     // ========================================================================
 
     /// Handle `GeneratePairRequest` command
@@ -3776,7 +3776,7 @@ impl IpcHandler {
     ///
     /// Removes a peer configuration.
     ///
-    /// Phase 12-Fix.G: Also removes the egress tunnel to release bound UDP ports.
+    /// Also removes the egress tunnel to release bound UDP ports.
     async fn handle_remove_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
             return IpcResponse::error(
@@ -3785,10 +3785,10 @@ impl IpcHandler {
             );
         };
 
-        // Phase 12-Fix.G: Get peer config to check tunnel type before removal
+        // Get peer config to check tunnel type before removal
         let config = peer_manager.get_peer_config(tag);
 
-        // Phase 12-Fix.G: For WireGuard peers, remove egress tunnel first to release UDP port
+        // For WireGuard peers, remove egress tunnel first to release UDP port
         if let Some(ref cfg) = config {
             if cfg.tunnel_type == TunnelType::WireGuard {
                 if let Some(wg_egress_manager) = &self.wg_egress_manager {
@@ -3914,7 +3914,7 @@ impl IpcHandler {
     }
 
     // ========================================================================
-    // Phase 7.7: DNS Command Handler Implementations
+    // DNS Command Handler Implementations
     // ========================================================================
 
     /// Handle `GetDnsStats` command
@@ -4851,14 +4851,12 @@ impl IpcHandler {
         "/api/peer-chain/register",
         "/api/peer-chain/unregister",
         "/api/peer-event",
-        // Phase 11-Fix.R: Add chain-routing endpoints for IPC-based chain activation
+        // Chain routing endpoints
         "/api/chain-routing/register",
         "/api/chain-routing/unregister",
-        // Phase 12-Fix.P: Add 2PC endpoints for distributed chain activation
         "/api/chain-routing/prepare",
         "/api/chain-routing/commit",
         "/api/chain-routing/abort",
-        // Phase 12-Fix.T: Add diagnostic endpoints for chain troubleshooting
         "/api/chain-routing/status",
         "/api/chain-routing",
         "/api/chains",
@@ -5208,7 +5206,6 @@ impl IpcHandler {
             let local_ip = routing.wg_local_ip.unwrap();
             let remote_ip = routing.wg_remote_ip.unwrap();
 
-            // Phase 12-Fix.P: No need to pause TCP proxy anymore!
             // The unified pump architecture sends outbound requests through a channel
             // instead of creating a competing pump.
             self.forward_via_wg_tunnel(
@@ -5526,9 +5523,9 @@ impl IpcHandler {
     ///
     /// A tuple of (status_code, response_body) on success
     ///
-    /// # Phase 12-Fix.P: Unified Pump Architecture
+    /// # Unified Pump Architecture
     ///
-    /// This method now uses the Request Channel pattern instead of creating a separate
+    /// This method uses the Request Channel pattern instead of creating a separate
     /// packet pump. The outbound HTTP request is sent through the TCP proxy's unified
     /// pump via a channel, eliminating the competing pump issue.
     #[allow(clippy::too_many_arguments)]
@@ -5563,9 +5560,8 @@ impl IpcHandler {
         let port = uri.port_u16().unwrap_or(80);
         let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        // Phase 12-Fix.P: Get the outbound request sender from PeerManager
+        // Get the outbound request sender from PeerManager
         // This allows us to send the request through the TCP proxy's unified pump
-        // instead of creating a competing pump
         let request_sender = peer_manager
             .get_outbound_request_sender(peer_tag)
             .ok_or_else(|| {
@@ -5578,14 +5574,14 @@ impl IpcHandler {
         // Build request headers with auto-injected tunnel authentication headers
         let mut request_headers = headers.cloned().unwrap_or_default();
 
-        // Auto-inject tunnel source IP header (Phase 5 authentication support)
+        // Auto-inject tunnel source IP header for authentication
         request_headers.insert(
             "X-Tunnel-Source-IP".to_string(),
             tunnel_local_ip.to_string(),
         );
         debug!(source_ip = %tunnel_local_ip, "Added X-Tunnel-Source-IP header");
 
-        // Auto-inject tunnel peer tag header (Phase 5 authentication support)
+        // Auto-inject tunnel peer tag header for authentication
         request_headers.insert(
             "X-Tunnel-Peer-Tag".to_string(),
             peer_tag.to_string(),
@@ -6186,7 +6182,7 @@ mod tests {
     }
 
     // =========================================================================
-    // P1 Handler Tests - Phase 3.3 IPC Protocol v2.1
+    // IPC Protocol v2.1 Handler Tests
     // =========================================================================
 
     #[tokio::test]
@@ -6579,7 +6575,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_routing_with_chain_outbound() {
-        // Phase 11-Fix: Test that ACTIVE chain tags are accepted as valid outbounds
+        // Test that ACTIVE chain tags are accepted as valid outbounds
         let handler = create_test_handler_with_chain_manager();
 
         // First create a chain
@@ -6646,7 +6642,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_default_outbound_to_chain() {
-        // Phase 11-Fix: Test that ACTIVE chain tags can be used as default outbound
+        // Test that ACTIVE chain tags can be used as default outbound
         let handler = create_test_handler_with_chain_manager();
 
         // First create a chain
@@ -6686,7 +6682,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_routing_with_chain_as_default() {
-        // Phase 11-Fix: Test that ACTIVE chain tags can be used as default_outbound in UpdateRouting
+        // Test that ACTIVE chain tags can be used as default_outbound in UpdateRouting
         let handler = create_test_handler_with_chain_manager();
 
         // First create a chain
@@ -6971,7 +6967,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase 5.5: UDP IPC Handler Tests
+    // UDP IPC Handler Tests
     // =========================================================================
 
     #[tokio::test]
@@ -7143,7 +7139,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.6.5: Chain Management Tests
+    // Chain Management Tests
     // ========================================================================
 
     use crate::chain::ChainManager;
@@ -7492,7 +7488,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.6.5: Two-Phase Commit Tests
+    // Two-Phase Commit Tests
     // ========================================================================
 
     #[tokio::test]
@@ -7741,7 +7737,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.9: New Handler Tests
+    // Additional Handler Tests
     // ========================================================================
 
     #[tokio::test]
@@ -8105,7 +8101,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 6.9: UpdateChain and UpdateEcmpGroupMembers Tests
+    // UpdateChain and UpdateEcmpGroupMembers Tests
     // ========================================================================
 
     #[tokio::test]

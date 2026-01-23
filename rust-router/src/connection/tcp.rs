@@ -25,7 +25,7 @@ pub struct TcpConnectionContext {
     /// Outbound manager
     pub outbound_manager: Arc<OutboundManager>,
 
-    /// Phase 6-Fix.AI: ECMP group manager for load balancing
+    /// ECMP group manager for load balancing
     pub ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
     /// Sniff timeout
@@ -107,7 +107,7 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
     // For now, use default outbound
     let outbound_tag = &ctx.default_outbound;
 
-    // Phase 6-Fix.AI: Get the outbound with ECMP group resolution
+    // Get the outbound with ECMP group resolution
     // This supports both direct outbounds and ECMP load balancing groups
     // Pass SNI for DestHash algorithm (video streaming session affinity)
     let (outbound, actual_outbound_tag) = match resolve_outbound_with_ecmp(
@@ -215,7 +215,7 @@ fn is_tls_port(port: u16) -> bool {
     )
 }
 
-/// Phase 6-Fix.AI: Resolve outbound tag to actual outbound, with ECMP group support.
+/// Resolve outbound tag to actual outbound, with ECMP group support.
 ///
 /// If the tag refers to an ECMP group, this function selects a member using
 /// the configured load balancing algorithm:

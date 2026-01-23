@@ -19,7 +19,7 @@
 //! client endpoints and outbound handles. Outbound handles are cached in
 //! a moka LRU cache with configurable TTL.
 //!
-//! # QUIC SNI Integration (Phase 5.3)
+//! # QUIC SNI Integration
 //!
 //! The processor supports QUIC Initial packet SNI extraction for rule-based routing:
 //! - Detects QUIC Initial packets using `QuicSniffer::is_initial()`
@@ -329,7 +329,7 @@ pub struct UdpPacketProcessor {
     decrement_counter: AtomicU64,
     /// SEC-2 FIX: Last cleanup timestamp, protected by Mutex for thread-safe updates
     last_cleanup: Mutex<Instant>,
-    /// Phase 6-Fix.AI: ECMP group manager for load balancing
+    /// ECMP group manager for load balancing
     ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 }
 
@@ -382,18 +382,18 @@ impl UdpPacketProcessor {
         Self::new(UdpProcessorConfig::default())
     }
 
-    /// Phase 6-Fix.AI: Set ECMP group manager for load balancing
+    /// Set ECMP group manager for load balancing
     pub fn with_ecmp_group_manager(mut self, ecmp_manager: Arc<EcmpGroupManager>) -> Self {
         self.ecmp_group_manager = Some(ecmp_manager);
         self
     }
 
-    /// Phase 6-Fix.AI: Set ECMP group manager (mutable reference version)
+    /// Set ECMP group manager (mutable reference version)
     pub fn set_ecmp_group_manager(&mut self, ecmp_manager: Arc<EcmpGroupManager>) {
         self.ecmp_group_manager = Some(ecmp_manager);
     }
 
-    /// Phase 6-Fix.AI: Resolve an outbound tag, checking ECMP groups if needed.
+    /// Resolve an outbound tag, checking ECMP groups if needed.
     ///
     /// This method first tries to find the tag in `outbound_manager`. If not found
     /// and an ECMP group manager is configured, it checks if the tag is an ECMP
@@ -817,7 +817,7 @@ impl UdpPacketProcessor {
             !match_result.is_default()
         );
 
-        // Phase 6-Fix.AI: Get outbound from manager with ECMP group resolution
+        // Get outbound from manager with ECMP group resolution
         // This supports both direct outbounds and ECMP load balancing groups
         // Pass domain for DestHash algorithm (video streaming session affinity)
         let (outbound, actual_outbound_tag) = if let Some(resolved) =
@@ -852,7 +852,7 @@ impl UdpPacketProcessor {
 
         // Create routing info - move sniffed_domain instead of cloning
         // since it's not used after this point
-        // Phase 6-Fix.AI: Use actual_outbound_tag which reflects ECMP member selection
+        // Use actual_outbound_tag which reflects ECMP member selection
         let routing_info = UdpRoutingInfo {
             domain: sniffed_domain,
             outbound: actual_outbound_tag,

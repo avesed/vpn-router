@@ -1,13 +1,7 @@
-//! Health checker with hysteresis for Phase 6
+//! Health checker with hysteresis
 //!
 //! This module implements health checking for peer tunnels with
 //! hysteresis to prevent rapid state flapping.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [ ] 6.5.4 Health check recording
-//! - [ ] 6.5.4 Consecutive failure tracking
-//! - [ ] 6.5.4 Hysteresis threshold
 //!
 //! # Hysteresis Mechanism
 //!

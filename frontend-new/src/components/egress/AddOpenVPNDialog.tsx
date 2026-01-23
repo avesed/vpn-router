@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -28,7 +28,7 @@ const AUTH_OPTIONS = [
 ];
 
 const COMPRESS_OPTIONS = [
-  { value: "", label: "None" },
+  { value: "none", label: "None" },
   { value: "lzo", label: "LZO" },
   { value: "lz4", label: "LZ4" },
   { value: "lz4-v2", label: "LZ4-v2" },
@@ -68,7 +68,7 @@ export function AddOpenVPNDialog({ open, onOpenChange, editEgress }: AddOpenVPND
   const [authPass, setAuthPass] = useState("");
   const [cipher, setCipher] = useState("AES-256-GCM");
   const [auth, setAuth] = useState("SHA256");
-  const [compress, setCompress] = useState("");
+  const [compress, setCompress] = useState("none");
   const [extraOptions, setExtraOptions] = useState("");
 
   // Reset form
@@ -88,7 +88,7 @@ export function AddOpenVPNDialog({ open, onOpenChange, editEgress }: AddOpenVPND
     setAuthPass("");
     setCipher("AES-256-GCM");
     setAuth("SHA256");
-    setCompress("");
+    setCompress("none");
     setExtraOptions("");
     setPasteContent("");
     setParseError(null);
@@ -116,7 +116,7 @@ export function AddOpenVPNDialog({ open, onOpenChange, editEgress }: AddOpenVPND
         setAuthPass(""); // Password is hidden by API
         setCipher(editEgress.cipher);
         setAuth(editEgress.auth);
-        setCompress(editEgress.compress || "");
+        setCompress(editEgress.compress || "none");
         setExtraOptions(editEgress.extra_options || "");
         setImportMethod("manual");
       } else {
@@ -161,7 +161,7 @@ export function AddOpenVPNDialog({ open, onOpenChange, editEgress }: AddOpenVPND
       if (result.crl_verify) setCrlVerify(result.crl_verify);
       if (result.cipher) setCipher(result.cipher.toUpperCase());
       if (result.auth) setAuth(result.auth.toUpperCase());
-      if (result.compress) setCompress(result.compress);
+      if (result.compress) setCompress(result.compress); else setCompress("none");
       
       setShowAuthHint(!!result.requires_auth);
       setImportMethod("manual");
@@ -215,7 +215,7 @@ export function AddOpenVPNDialog({ open, onOpenChange, editEgress }: AddOpenVPND
             auth_pass: authPass || undefined,
             cipher,
             auth,
-            compress: compress || undefined,
+            compress: compress === "none" ? undefined : compress || undefined,
             extra_options: extraOptions || undefined,
           }
         });
@@ -257,6 +257,11 @@ export function AddOpenVPNDialog({ open, onOpenChange, editEgress }: AddOpenVPND
               ? t("egress.openvpn.editTitle", { defaultValue: "Edit OpenVPN Egress" })
               : t("egress.openvpn.addTitle", { defaultValue: "Add OpenVPN Egress" })}
           </DialogTitle>
+          <DialogDescription>
+            {isEditing
+              ? t("egress.openvpn.editDescription", { defaultValue: "Update OpenVPN outbound configuration" })
+              : t("egress.openvpn.addDescription", { defaultValue: "Add a new OpenVPN outbound connection" })}
+          </DialogDescription>
         </DialogHeader>
 
         <Tabs value={importMethod} onValueChange={(v) => setImportMethod(v as typeof importMethod)}>

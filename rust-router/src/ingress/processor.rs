@@ -1,4 +1,4 @@
-//! Ingress packet processor for Phase 6.3
+//! Ingress packet processor
 //!
 //! This module handles packet processing for `WireGuard` ingress traffic,
 //! including DSCP extraction, rule matching, and routing decisions.

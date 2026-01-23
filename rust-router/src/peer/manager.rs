@@ -1,15 +1,7 @@
-//! `PeerManager` - Multi-node peer management for Phase 6
+//! `PeerManager` - Multi-node peer management
 //!
 //! This module implements peer discovery, pairing, and tunnel management
 //! for multi-node VPN routing.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [x] 6.5.1 Input Validation (see validation.rs)
-//! - [x] 6.5.2 `PeerManager` Structure
-//! - [x] 6.5.3 Port Allocator
-//! - [x] 6.5.4 Health Checker
-//! - [x] 6.5.5 Pairing Flow
 //!
 //! # Architecture
 //!
@@ -46,10 +38,6 @@
 //! })?;
 //! ```
 //!
-//! # References
-//!
-//! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.5.2
-
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -78,7 +66,7 @@ use crate::ingress::ReplyPacket;
 use tokio::sync::mpsc;
 use std::sync::atomic::Ordering;
 
-/// Phase 12-Fix.I: Extract port from endpoint string (e.g., "10.1.1.206:36201" -> Some(36201))
+/// Extract port from endpoint string (e.g., "10.1.1.206:36201" -> Some(36201))
 fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {
     endpoint
         .rsplit(':')
@@ -86,7 +74,7 @@ fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {
         .and_then(|port_str| port_str.parse::<u16>().ok())
 }
 
-/// Phase 12-Fix.P2: Check if a packet is API traffic (TCP to/from port 36000)
+/// Check if a packet is API traffic (TCP to/from port 36000)
 ///
 /// API traffic includes:
 /// - Requests: TCP packets destined for local_ip:36000
@@ -362,14 +350,14 @@ pub struct PeerManager {
     tunnel_port_allocator: TunnelPortAllocator,
     /// Health checker with hysteresis
     health_checker: HealthChecker,
-    /// Phase 12-Fix.K: TCP proxy tasks for peer tunnels (receives tunnel traffic, forwards to API)
+    /// TCP proxy tasks for peer tunnels (receives tunnel traffic, forwards to API)
     proxy_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Shutdown signal senders for proxy tasks
     proxy_shutdown_txs: RwLock<HashMap<String, tokio::sync::broadcast::Sender<()>>>,
-    /// Phase 12-Fix.P: Outbound HTTP request senders for each peer's TCP proxy
+    /// Outbound HTTP request senders for each peer's TCP proxy
     /// This allows ForwardPeerRequest to send HTTP requests through the unified pump
     outbound_request_txs: RwLock<HashMap<String, mpsc::Sender<OutboundHttpRequest>>>,
-    /// Phase 12-Fix.P2: Peer tunnel processor sender for chain traffic routing
+    /// Peer tunnel processor sender for chain traffic routing
     /// When a peer tunnel receives packets that are NOT for the local API (port 36000),
     /// they are forwarded here for DSCP-based chain routing on Terminal nodes
     peer_tunnel_tx: RwLock<Option<mpsc::Sender<ReplyPacket>>>,
@@ -434,7 +422,7 @@ impl PeerManager {
         }
     }
 
-    /// Phase 12-Fix.P2: Set the peer tunnel processor sender for chain traffic routing
+    /// Set the peer tunnel processor sender for chain traffic routing
     ///
     /// This should be called from main.rs after the peer_tunnel_processor is started.
     /// When peer tunnels receive packets that are NOT destined for the local API (port 36000),
@@ -590,7 +578,7 @@ impl PeerManager {
         {
             let mut pending_requests = self.pending_requests.write();
 
-            // Phase 11-Fix.AA: Release resources from any existing pending request with same tag
+            // Release resources from any existing pending request with same tag
             // This prevents resource leaks when generate_pair_request is called multiple times
             if let Some(old_pending) = pending_requests.remove(&config.local_tag) {
                 warn!(
@@ -705,7 +693,7 @@ impl PeerManager {
                 .map_err(|_| PeerError::IpExhausted)?
         };
 
-        // Phase 12-Fix.I: Use tunnel port from local_endpoint if provided, otherwise allocate
+        // Use tunnel port from local_endpoint if provided, otherwise allocate
         // Python API pre-allocates the port to avoid conflicts with remote node's port
         let tunnel_port = if let Some(port) = extract_port_from_endpoint(&local_config.local_endpoint) {
             // Use the pre-allocated port from Python API
@@ -759,7 +747,7 @@ impl PeerManager {
         // Add peer to the manager
         self.add_peer_internal(peer_config)?;
 
-        // Phase 11-Fix.AA: Construct response endpoint with allocated tunnel_port
+        // Construct response endpoint with allocated tunnel_port
         // The user-provided endpoint may have a wrong/reserved port (e.g., 36100)
         // We need to replace it with the dynamically allocated tunnel_port
         let response_endpoint = {
@@ -802,7 +790,7 @@ impl PeerManager {
             "Pairing response generated"
         );
 
-        // Phase 11-Fix.6A: For bidirectional pairing, connect to establish our listening socket
+        // For bidirectional pairing, connect to establish our listening socket
         // but expect initial handshake to fail (peer hasn't completed handshake yet).
         //
         // Why we still connect here:
@@ -1072,7 +1060,7 @@ impl PeerManager {
             wg_tunnels.insert(tunnel_tag.clone(), tunnel_arc.clone());
         }
 
-        // Phase 12-Fix.K: Start TCP proxy task to handle incoming tunnel traffic
+        // Start TCP proxy task to handle incoming tunnel traffic
         // Parse local tunnel IP (strip CIDR suffix like /32)
         let local_ip_str = config
             .tunnel_local_ip
@@ -1096,7 +1084,7 @@ impl PeerManager {
                 shutdown_txs.insert(tag.to_string(), shutdown_tx);
             }
 
-            // Phase 12-Fix.P: Create outbound HTTP request channel
+            // Create outbound HTTP request channel
             let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundHttpRequest>(16);
 
             // Store outbound request sender
@@ -1109,7 +1097,7 @@ impl PeerManager {
             let tag_clone = tag.to_string();
             let tunnel_for_proxy = tunnel_arc.clone();
 
-            // Phase 12-Fix.P2: Clone peer_tunnel_tx for chain traffic routing
+            // Clone peer_tunnel_tx for chain traffic routing
             let peer_tunnel_tx_clone = self.peer_tunnel_tx.read().clone();
             let tunnel_tag_for_pump = format!("peer-{}", tag);
 
@@ -1133,7 +1121,7 @@ impl PeerManager {
                 // Clone tunnel for pump task
                 let tunnel_for_pump = tunnel_for_proxy.clone();
 
-                // Phase 12-Fix.P2: Clone values for pump task
+                // Clone values for pump task
                 let local_ip_for_pump = local_ip;
                 let remote_ip_for_pump = remote_ip;
                 let tunnel_tag_pump = tunnel_tag_for_pump.clone();
@@ -1160,7 +1148,7 @@ impl PeerManager {
                             }
 
                             // RX: tunnel -> routing decision (API vs chain traffic)
-                            // Phase 12-Fix.P2: Route packets based on destination
+                            // Route packets based on destination:
                             // - API traffic (TCP to local_ip:36000) -> smoltcp
                             // - Chain traffic (everything else) -> peer_tunnel_processor
                             result = tunnel_for_pump.recv() => {
@@ -1242,7 +1230,7 @@ impl PeerManager {
                 });
 
                 // Run the proxy (this blocks until shutdown or error)
-                // Phase 12-Fix.P: Pass outbound_rx for unified pump
+                // Pass outbound_rx for unified pump
                 if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx).await {
                     warn!(tag = %tag_clone, "TCP proxy error: {}", e);
                 }
@@ -1326,7 +1314,7 @@ impl PeerManager {
 
         match config.tunnel_type {
             TunnelType::WireGuard => {
-                // Phase 12-Fix.K: Stop TCP proxy task first
+                // Stop TCP proxy task first
                 // Send shutdown signal
                 {
                     let shutdown_txs = self.proxy_shutdown_txs.read();
@@ -1350,7 +1338,7 @@ impl PeerManager {
                     shutdown_txs.remove(tag);
                 }
 
-                // Phase 12-Fix.P: Remove outbound request sender to prevent stale references
+                // Remove outbound request sender to prevent stale references
                 {
                     let mut outbound_txs = self.outbound_request_txs.write();
                     outbound_txs.remove(tag);
@@ -1387,8 +1375,7 @@ impl PeerManager {
         Ok(())
     }
 
-    // NOTE: Phase 12-Fix.S `pause_tcp_proxy()` was removed in Phase 12-Fix.P
-    // The unified pump architecture eliminates the need to pause the TCP proxy
+    // NOTE: The unified pump architecture eliminates the need to pause the TCP proxy
     // for ForwardPeerRequest. Outbound requests now go through a channel.
 
     /// Start/restart the TCP proxy for a peer tunnel
@@ -1461,7 +1448,7 @@ impl PeerManager {
             shutdown_txs.insert(tag.to_string(), shutdown_tx);
         }
 
-        // Phase 12-Fix.P: Create outbound HTTP request channel
+        // Create outbound HTTP request channel
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundHttpRequest>(16);
 
         // Store outbound request sender
@@ -1474,7 +1461,7 @@ impl PeerManager {
         let tag_clone = tag.to_string();
         let tunnel_for_proxy = tunnel_arc.clone();
 
-        // Phase 12-Fix.P2: Clone peer_tunnel_tx for chain traffic routing
+        // Clone peer_tunnel_tx for chain traffic routing
         let peer_tunnel_tx_clone = self.peer_tunnel_tx.read().clone();
         let tunnel_tag_for_pump = format!("peer-{}", tag);
 
@@ -1498,7 +1485,7 @@ impl PeerManager {
             // Clone tunnel for pump task
             let tunnel_for_pump = tunnel_for_proxy.clone();
 
-            // Phase 12-Fix.P2: Clone values for pump task
+            // Clone values for pump task
             let local_ip_for_pump = local_ip;
             let remote_ip_for_pump = remote_ip;
             let tunnel_tag_pump = tunnel_tag_for_pump.clone();
@@ -1525,7 +1512,7 @@ impl PeerManager {
                         }
 
                         // RX: tunnel -> routing decision (API vs chain traffic)
-                        // Phase 12-Fix.P2: Route packets based on destination
+                        // Route packets based on destination
                         result = tunnel_for_pump.recv() => {
                             match result {
                                 Ok(packet) => {
@@ -1605,7 +1592,7 @@ impl PeerManager {
             });
 
             // Run the proxy (this blocks until shutdown or error)
-            // Phase 12-Fix.P: Pass outbound_rx for unified pump
+            // Pass outbound_rx for unified pump
             if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx).await {
                 warn!(tag = %tag_clone, "TCP proxy error: {}", e);
             }
@@ -1921,7 +1908,7 @@ impl PeerManager {
     /// back through the chain. On Relay nodes, when a reply arrives from a downstream
     /// hop, it needs to be sent back to the upstream hop via the peer tunnel.
     ///
-    /// # Phase 3 Chain Reply Routing
+    /// # Chain Reply Routing
     ///
     /// When a Relay node receives a reply packet, it looks up the session to find
     /// the source_tunnel_tag (the tunnel the original request came from) and uses
@@ -2032,9 +2019,7 @@ impl PeerManager {
     /// This allows external code (e.g., ForwardPeerRequest handler) to send HTTP requests
     /// through the peer's TCP proxy, which handles them via the unified smoltcp pump.
     ///
-    /// # Phase 12-Fix.P
-    ///
-    /// This method is part of the permanent fix for the competing pump issue.
+    /// This method is part of the solution for the competing pump issue.
     /// Instead of creating a separate SmoltcpHttpClient (which would compete for tunnel packets),
     /// callers can send requests through the TCP proxy's unified pump.
     ///
@@ -2183,11 +2168,11 @@ mod tests {
             tunnel_type: TunnelType::WireGuard,
         };
 
-        let code = manager.generate_pair_request(config).expect("Should generate request");
+        let result = manager.generate_pair_request(config).expect("Should generate request");
 
         // Verify it's valid Base64
-        assert!(!code.is_empty());
-        assert!(code.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+        assert!(!result.code.is_empty());
+        assert!(result.code.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
 
         // Verify pending request was stored
         let pending = manager.pending_requests.read();
@@ -2207,8 +2192,8 @@ mod tests {
             tunnel_type: TunnelType::WireGuard,
         };
 
-        let code = manager.generate_pair_request(config).expect("Should generate request");
-        assert!(!code.is_empty());
+        let result = manager.generate_pair_request(config).expect("Should generate request");
+        assert!(!result.code.is_empty());
 
         // Verify pending request has remote keys
         let pending = manager.pending_requests.read();
@@ -2280,13 +2265,13 @@ mod tests {
             bidirectional: false,
             tunnel_type: TunnelType::WireGuard,
         };
-        let response_code = node_b.import_pair_request(&request_code, local_config).await.unwrap();
+        let response_result = node_b.import_pair_request(&request_code.code, local_config).await.unwrap();
 
         // Node B should now have node-a as a peer
         assert!(node_b.peer_exists("node-a"));
 
         // Node A completes handshake
-        node_a.complete_handshake(&response_code).await.unwrap();
+        node_a.complete_handshake(&response_result.response_code).await.unwrap();
 
         // Node A should now have node-b as a peer
         assert!(node_a.peer_exists("node-b"));
@@ -2320,10 +2305,10 @@ mod tests {
             bidirectional: true,
             tunnel_type: TunnelType::WireGuard,
         };
-        let response_code = node_b.import_pair_request(&request_code, local_config).await.unwrap();
+        let response_result = node_b.import_pair_request(&request_code.code, local_config).await.unwrap();
 
         // Node A completes handshake
-        node_a.complete_handshake(&response_code).await.unwrap();
+        node_a.complete_handshake(&response_result.response_code).await.unwrap();
 
         // Both should have each other as peers
         assert!(node_a.peer_exists("node-b"));
@@ -2864,10 +2849,10 @@ mod tests {
             bidirectional: false,
             tunnel_type: TunnelType::WireGuard,
         };
-        let response_code = node_b.import_pair_request(&request_code, local_config).await.unwrap();
+        let response_result = node_b.import_pair_request(&request_code.code, local_config).await.unwrap();
 
         // Different manager (no pending request) tries to complete
-        let result = manager.complete_handshake(&response_code).await;
+        let result = manager.complete_handshake(&response_result.response_code).await;
         assert!(matches!(result, Err(PeerError::PendingRequestNotFound(_))));
     }
 
@@ -3176,8 +3161,8 @@ mod tests {
         };
 
         // Should still generate (Xray uses different fields but request is similar)
-        let code = manager.generate_pair_request(config).expect("Should generate request");
-        assert!(!code.is_empty());
+        let result = manager.generate_pair_request(config).expect("Should generate request");
+        assert!(!result.code.is_empty());
     }
 
     #[test]
@@ -3321,7 +3306,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Additional Tests (Phase 6.5 Review Recommendations)
+    // Additional Tests
     // =========================================================================
 
     #[tokio::test]
@@ -3380,7 +3365,7 @@ mod tests {
         let initial_ips = manager.available_ips();
 
         // Generate a pairing request (allocates resources)
-        let code = manager.generate_pair_request(PairRequestConfig {
+        let result = manager.generate_pair_request(PairRequestConfig {
             local_tag: "test-node".to_string(),
             local_description: "Test Node".to_string(),
             local_endpoint: "192.168.1.1:36200".to_string(),
@@ -3406,7 +3391,7 @@ mod tests {
         assert!(has_pending, "Should have pending request");
 
         // Verify the code is not empty
-        assert!(!code.is_empty());
+        assert!(!result.code.is_empty());
     }
 
     #[test]

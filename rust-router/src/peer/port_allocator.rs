@@ -1,13 +1,7 @@
-//! Tunnel port allocator for Phase 6
+//! Tunnel port allocator
 //!
 //! This module implements port allocation for peer tunnels, ensuring
 //! that each tunnel gets a unique port within the designated range.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [ ] 6.5.3 Port allocation
-//! - [ ] 6.5.3 Port release
-//! - [ ] 6.5.3 Conflict detection
 //!
 //! # Port Range
 //!
@@ -20,10 +14,6 @@
 //! The allocator uses `RwLock` for thread-safe allocation and release
 //! of ports across concurrent operations.
 //!
-//! # References
-//!
-//! - Implementation Plan: `docs/PHASE6_IMPLEMENTATION_PLAN_v3.2.md` Section 6.5.3
-
 use std::collections::HashSet;
 use std::sync::RwLock;
 

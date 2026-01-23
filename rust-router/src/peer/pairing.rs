@@ -1,15 +1,8 @@
-//! Offline pairing protocol for Phase 6
+//! Offline pairing protocol
 //!
 //! This module implements the offline pairing protocol for establishing
 //! peer connections between nodes without requiring network connectivity
 //! for the initial setup.
-//!
-//! # Phase 6 Implementation Status
-//!
-//! - [ ] 6.5.2 Pairing code generation
-//! - [ ] 6.5.2 Pairing code import
-//! - [ ] 6.5.2 Bidirectional key pre-generation
-//! - [ ] 6.5.2 Handshake completion
 //!
 //! # Protocol Overview
 //!
