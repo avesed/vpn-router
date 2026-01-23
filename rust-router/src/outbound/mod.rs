@@ -42,6 +42,7 @@ pub mod socks5;
 pub mod socks5_common;
 pub mod socks5_udp;
 mod traits;
+pub mod vless;
 pub mod wireguard;
 
 pub use block::BlockOutbound;
@@ -49,9 +50,12 @@ pub use direct::DirectOutbound;
 pub use manager::{OutboundManager, OutboundManagerBuilder};
 pub use socks5::{PoolStats, Socks5Config, Socks5Error, Socks5Outbound};
 pub use socks5_udp::{Socks5Auth, Socks5UdpAssociation, Socks5UdpError};
+pub use vless::{
+    TlsSettings, UuidInput, VlessConfig, VlessOutbound, VlessOutboundError, VlessTransportConfig,
+};
 pub use traits::{
-    DirectUdpHandle, HealthStatus, Outbound, OutboundConnection, OutboundExt, PoolStatsInfo,
-    ProxyServerInfo, Socks5UdpHandle, UdpOutboundHandle,
+    DirectUdpHandle, HealthStatus, Outbound, OutboundConnection, OutboundExt, OutboundStream,
+    PoolStatsInfo, ProxyServerInfo, Socks5UdpHandle, UdpOutboundHandle,
 };
 pub use wireguard::{
     get_egress_interface_name, get_egress_type, get_interface_info, get_peer_routing_table,

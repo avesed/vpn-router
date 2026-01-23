@@ -20,6 +20,7 @@ use super::protocol::{
     ServerCapabilities, ServerStatus, Socks5PoolStats, TunnelType, UdpProcessorInfo,
     UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
     UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
+    VlessOutboundInfoResponse, VlessInboundStatusResponse, VlessUserInfo, VlessUserConfig,
 };
 use crate::chain::ChainManager;
 use crate::dns::cache::DnsCache;
@@ -40,6 +41,9 @@ use crate::peer::manager::PeerManager;
 use crate::peer::pairing::PairRequestConfig;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
 use crate::tproxy::UdpWorkerPool;
+use crate::outbound::vless::{VlessConfig, VlessOutbound, VlessTransportConfig, TlsSettings};
+use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessUser as VlessInboundUser};
+use crate::vless::{VlessAccount, VlessAccountManager};
 
 /// DNS engine component holder
 ///
@@ -207,6 +211,23 @@ pub struct IpcHandler {
 
     /// DNS engine for DNS query handling
     dns_engine: Option<Arc<DnsEngine>>,
+
+    // ========================================================================
+    // VLESS Components
+    // ========================================================================
+
+    /// VLESS inbound listener (wrapped in RwLock for dynamic updates)
+    vless_inbound: RwLock<Option<Arc<VlessInboundListener>>>,
+
+    /// VLESS account manager for dynamic user management
+    vless_accounts: RwLock<VlessAccountManager>,
+
+    /// VLESS user configurations (for flow validation)
+    vless_user_configs: RwLock<Vec<VlessInboundUser>>,
+
+    /// VLESS inbound statistics
+    vless_total_connections: AtomicU64,
+    vless_active_connections: AtomicU64,
 }
 
 impl IpcHandler {
@@ -238,6 +259,11 @@ impl IpcHandler {
             ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
+            vless_inbound: RwLock::new(None),
+            vless_accounts: RwLock::new(VlessAccountManager::new()),
+            vless_user_configs: RwLock::new(Vec::new()),
+            vless_total_connections: AtomicU64::new(0),
+            vless_active_connections: AtomicU64::new(0),
         }
     }
 
@@ -275,6 +301,11 @@ impl IpcHandler {
             ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
+            vless_inbound: RwLock::new(None),
+            vless_accounts: RwLock::new(VlessAccountManager::new()),
+            vless_user_configs: RwLock::new(Vec::new()),
+            vless_total_connections: AtomicU64::new(0),
+            vless_active_connections: AtomicU64::new(0),
         }
     }
 
@@ -311,6 +342,11 @@ impl IpcHandler {
             ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
+            vless_inbound: RwLock::new(None),
+            vless_accounts: RwLock::new(VlessAccountManager::new()),
+            vless_user_configs: RwLock::new(Vec::new()),
+            vless_total_connections: AtomicU64::new(0),
+            vless_active_connections: AtomicU64::new(0),
         }
     }
 
@@ -350,6 +386,11 @@ impl IpcHandler {
             ingress_session_tracker: RwLock::new(None),
             wg_egress_manager: None,
             dns_engine: None,
+            vless_inbound: RwLock::new(None),
+            vless_accounts: RwLock::new(VlessAccountManager::new()),
+            vless_user_configs: RwLock::new(Vec::new()),
+            vless_total_connections: AtomicU64::new(0),
+            vless_active_connections: AtomicU64::new(0),
         }
     }
 
@@ -842,6 +883,62 @@ impl IpcHandler {
             // ================================================================
             IpcCommand::ForwardPeerRequest { peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, tunnel_local_ip, headers } => {
                 self.handle_forward_peer_request(peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, tunnel_local_ip, headers).await
+            }
+
+            // ================================================================
+            // VLESS Protocol Command Handlers (v3.3)
+            // ================================================================
+            IpcCommand::AddVlessOutbound {
+                tag,
+                server_address,
+                server_port,
+                uuid,
+                flow,
+                transport,
+                tls_server_name,
+                tls_skip_verify,
+                ws_path,
+                ws_host,
+            } => {
+                self.handle_add_vless_outbound(
+                    tag,
+                    server_address,
+                    server_port,
+                    uuid,
+                    flow,
+                    transport,
+                    tls_server_name,
+                    tls_skip_verify,
+                    ws_path,
+                    ws_host,
+                ).await
+            }
+            IpcCommand::RemoveVlessOutbound { tag } => {
+                self.handle_remove_vless_outbound(&tag)
+            }
+            IpcCommand::ListVlessOutbounds => {
+                self.handle_list_vless_outbounds()
+            }
+            IpcCommand::GetVlessOutbound { tag } => {
+                self.handle_get_vless_outbound(&tag)
+            }
+            IpcCommand::ConfigureVlessInbound { listen, users, tls_cert_path, tls_key_path, fallback } => {
+                self.handle_configure_vless_inbound(listen, users, tls_cert_path, tls_key_path, fallback).await
+            }
+            IpcCommand::AddVlessUser { uuid, email, flow } => {
+                self.handle_add_vless_user(uuid, email, flow)
+            }
+            IpcCommand::RemoveVlessUser { uuid } => {
+                self.handle_remove_vless_user(&uuid)
+            }
+            IpcCommand::ListVlessUsers => {
+                self.handle_list_vless_users()
+            }
+            IpcCommand::GetVlessInboundStatus => {
+                self.handle_get_vless_inbound_status()
+            }
+            IpcCommand::StopVlessInbound => {
+                self.handle_stop_vless_inbound()
             }
         }
     }
@@ -5661,6 +5758,517 @@ impl IpcHandler {
             .map_err(|_| format!("Invalid status code: '{}'", parts[1]))?;
 
         Ok((status_code, body.to_string()))
+    }
+
+    // ========================================================================
+    // VLESS Protocol Handlers (v3.3)
+    // ========================================================================
+
+    /// Handle AddVlessOutbound command
+    ///
+    /// Creates a new VLESS outbound and adds it to the outbound manager.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_add_vless_outbound(
+        &self,
+        tag: String,
+        server_address: String,
+        server_port: u16,
+        uuid: String,
+        flow: String,
+        transport: String,
+        tls_server_name: Option<String>,
+        tls_skip_verify: bool,
+        ws_path: Option<String>,
+        ws_host: Option<String>,
+    ) -> IpcResponse {
+        // Check if outbound already exists
+        if self.outbound_manager.contains(&tag) {
+            return IpcResponse::error(
+                ErrorCode::AlreadyExists,
+                format!("Outbound '{tag}' already exists"),
+            );
+        }
+
+        // Validate UUID format
+        if uuid::Uuid::parse_str(&uuid).is_err() {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!("Invalid UUID format: '{uuid}'"),
+            );
+        }
+
+        // Build transport configuration based on transport type
+        let transport_config = match transport.as_str() {
+            "tcp" => VlessTransportConfig::Tcp,
+            "tls" => VlessTransportConfig::Tls {
+                server_name: tls_server_name.clone().unwrap_or_else(|| server_address.clone()),
+                alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                skip_verify: tls_skip_verify,
+            },
+            "websocket" => VlessTransportConfig::WebSocket {
+                path: ws_path.clone().unwrap_or_else(|| "/".to_string()),
+                host: ws_host.clone(),
+                headers: vec![],
+                tls: None,
+            },
+            "websocket_tls" => VlessTransportConfig::WebSocket {
+                path: ws_path.clone().unwrap_or_else(|| "/".to_string()),
+                host: ws_host.clone(),
+                headers: vec![],
+                tls: Some(TlsSettings {
+                    server_name: tls_server_name.clone().unwrap_or_else(|| server_address.clone()),
+                    alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                    skip_verify: tls_skip_verify,
+                }),
+            },
+            _ => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid transport type: '{}'. Valid options: tcp, tls, websocket, websocket_tls", transport),
+                );
+            }
+        };
+
+        // Build VLESS config
+        let config = VlessConfig {
+            tag: tag.clone(),
+            server_address: server_address.clone(),
+            server_port,
+            uuid: uuid.clone(),
+            flow: flow.clone(),
+            transport: transport_config,
+        };
+
+        // Create VLESS outbound
+        let outbound = match VlessOutbound::new(config).await {
+            Ok(o) => o,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to create VLESS outbound: {e}"),
+                );
+            }
+        };
+
+        // Add to outbound manager
+        self.outbound_manager.add(Box::new(outbound));
+
+        info!(
+            "Added VLESS outbound '{}' -> {}:{}",
+            tag, server_address, server_port
+        );
+        IpcResponse::success_with_message(format!("VLESS outbound '{tag}' added"))
+    }
+
+    /// Handle RemoveVlessOutbound command
+    fn handle_remove_vless_outbound(&self, tag: &str) -> IpcResponse {
+        // Check if the outbound exists
+        let outbound = match self.outbound_manager.get(tag) {
+            Some(o) => o,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Outbound '{tag}' not found"),
+                );
+            }
+        };
+
+        // Verify it's a VLESS outbound
+        if outbound.outbound_type() != "vless" {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!("Outbound '{tag}' is not a VLESS outbound (type: {})", outbound.outbound_type()),
+            );
+        }
+
+        // Remove the outbound
+        if self.outbound_manager.remove(tag).is_some() {
+            info!("Removed VLESS outbound '{}'", tag);
+            IpcResponse::success_with_message(format!("VLESS outbound '{tag}' removed"))
+        } else {
+            IpcResponse::error(
+                ErrorCode::OperationFailed,
+                format!("Failed to remove VLESS outbound '{tag}'"),
+            )
+        }
+    }
+
+    /// Handle ListVlessOutbounds command
+    fn handle_list_vless_outbounds(&self) -> IpcResponse {
+        let mut outbounds = Vec::new();
+
+        for outbound in self.outbound_manager.all() {
+            if outbound.outbound_type() == "vless" {
+                // Get server info (address contains host:port)
+                let server_info = outbound.proxy_server_info();
+                let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+
+                // Parse address into host and port
+                let (server_address, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
+                    let host = address_str[..colon_pos].to_string();
+                    let port = address_str[colon_pos + 1..].parse().unwrap_or(0);
+                    (host, port)
+                } else {
+                    (address_str, 0u16)
+                };
+
+                outbounds.push(VlessOutboundInfoResponse {
+                    tag: outbound.tag().to_string(),
+                    server_address,
+                    server_port,
+                    uuid: "***".to_string(), // Hidden for security in list view
+                    flow: String::new(), // Not available through trait
+                    transport: "unknown".to_string(), // Not available through trait
+                    enabled: outbound.is_enabled(),
+                    health_status: outbound.health_status().to_string(),
+                    active_connections: outbound.active_connections(),
+                });
+            }
+        }
+
+        IpcResponse::VlessOutboundList { outbounds }
+    }
+
+    /// Handle GetVlessOutbound command
+    fn handle_get_vless_outbound(&self, tag: &str) -> IpcResponse {
+        let outbound = match self.outbound_manager.get(tag) {
+            Some(o) => o,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Outbound '{tag}' not found"),
+                );
+            }
+        };
+
+        // Verify it's a VLESS outbound
+        if outbound.outbound_type() != "vless" {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!("Outbound '{tag}' is not a VLESS outbound (type: {})", outbound.outbound_type()),
+            );
+        }
+
+        // Get server info (address contains host:port)
+        let server_info = outbound.proxy_server_info();
+        let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+
+        // Parse address into host and port
+        let (server_address, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
+            let host = address_str[..colon_pos].to_string();
+            let port = address_str[colon_pos + 1..].parse().unwrap_or(0);
+            (host, port)
+        } else {
+            (address_str, 0u16)
+        };
+
+        let info = VlessOutboundInfoResponse {
+            tag: outbound.tag().to_string(),
+            server_address,
+            server_port,
+            uuid: "***".to_string(), // Hidden for security
+            flow: String::new(), // Not available through trait
+            transport: "unknown".to_string(), // Not available through trait
+            enabled: outbound.is_enabled(),
+            health_status: outbound.health_status().to_string(),
+            active_connections: outbound.active_connections(),
+        };
+
+        IpcResponse::VlessOutboundInfo(info)
+    }
+
+    /// Handle ConfigureVlessInbound command
+    ///
+    /// Creates and starts a VLESS inbound listener.
+    async fn handle_configure_vless_inbound(
+        &self,
+        listen: String,
+        users: Vec<VlessUserConfig>,
+        tls_cert_path: Option<String>,
+        tls_key_path: Option<String>,
+        fallback: Option<String>,
+    ) -> IpcResponse {
+        use std::net::SocketAddr;
+
+        // Check if already running
+        {
+            let inbound_guard = self.vless_inbound.read();
+            if inbound_guard.is_some() {
+                return IpcResponse::error(
+                    ErrorCode::AlreadyExists,
+                    "VLESS inbound is already running. Stop it first with StopVlessInbound.",
+                );
+            }
+        }
+
+        // Parse listen address
+        let listen_addr: SocketAddr = match listen.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid listen address '{}': {}", listen, e),
+                );
+            }
+        };
+
+        // Validate that we have at least one user
+        if users.is_empty() {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                "At least one user must be configured",
+            );
+        }
+
+        // Convert VlessUserConfig to VlessInboundUser
+        let mut inbound_users = Vec::with_capacity(users.len());
+        for user in &users {
+            // Validate UUID
+            if uuid::Uuid::parse_str(&user.uuid).is_err() {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid UUID format: '{}'", user.uuid),
+                );
+            }
+
+            let mut vless_user = VlessInboundUser::new(&user.uuid, user.email.as_ref());
+            if let Some(ref flow) = user.flow {
+                vless_user = vless_user.with_flow(flow);
+            }
+            inbound_users.push(vless_user);
+        }
+
+        // Build configuration
+        let mut config = VlessInboundConfig::new(listen_addr)
+            .with_users(inbound_users.clone());
+
+        // Add TLS if configured
+        if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
+            use crate::vless_inbound::InboundTlsConfig;
+            config = config.with_tls(
+                InboundTlsConfig::new(&cert_path, &key_path)
+                    .with_alpn(vec!["h2", "http/1.1"]),
+            );
+        }
+
+        // Add fallback if configured
+        if let Some(fallback_addr) = fallback {
+            match fallback_addr.parse::<SocketAddr>() {
+                Ok(addr) => {
+                    config = config.with_fallback(addr);
+                }
+                Err(e) => {
+                    return IpcResponse::error(
+                        ErrorCode::InvalidParameters,
+                        format!("Invalid fallback address '{}': {}", fallback_addr, e),
+                    );
+                }
+            }
+        }
+
+        // Create the listener
+        let listener = match VlessInboundListener::new(config).await {
+            Ok(l) => Arc::new(l),
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to create VLESS inbound listener: {}", e),
+                );
+            }
+        };
+
+        // Update internal state
+        {
+            let mut accounts = self.vless_accounts.write();
+            accounts.clear();
+            for user in &users {
+                if let Ok(account) = VlessAccount::from_uuid_str(&user.uuid, user.email.clone()) {
+                    accounts.add_account(account);
+                }
+            }
+        }
+
+        {
+            let mut configs = self.vless_user_configs.write();
+            *configs = inbound_users;
+        }
+
+        // Store the listener
+        {
+            let mut inbound_guard = self.vless_inbound.write();
+            *inbound_guard = Some(listener);
+        }
+
+        info!("VLESS inbound listener started on {}", listen);
+        IpcResponse::success_with_message(format!("VLESS inbound started on {}", listen))
+    }
+
+    /// Handle AddVlessUser command
+    fn handle_add_vless_user(
+        &self,
+        uuid: String,
+        email: Option<String>,
+        flow: Option<String>,
+    ) -> IpcResponse {
+        // Validate UUID
+        if uuid::Uuid::parse_str(&uuid).is_err() {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!("Invalid UUID format: '{}'", uuid),
+            );
+        }
+
+        // Check if user already exists
+        let uuid_bytes = match uuid::Uuid::parse_str(&uuid) {
+            Ok(u) => *u.as_bytes(),
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Failed to parse UUID: {}", e),
+                );
+            }
+        };
+
+        {
+            let accounts = self.vless_accounts.read();
+            if accounts.contains_bytes(&uuid_bytes) {
+                return IpcResponse::error(
+                    ErrorCode::AlreadyExists,
+                    format!("User with UUID '{}' already exists", uuid),
+                );
+            }
+        }
+
+        // Create and add account
+        let account = match VlessAccount::from_uuid_str(&uuid, email.clone()) {
+            Ok(a) => a,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to create account: {}", e),
+                );
+            }
+        };
+
+        {
+            let mut accounts = self.vless_accounts.write();
+            accounts.add_account(account);
+        }
+
+        // Add to user configs
+        {
+            let mut configs = self.vless_user_configs.write();
+            let mut user = VlessInboundUser::new(&uuid, email.as_ref());
+            if let Some(ref flow_value) = flow {
+                user = user.with_flow(flow_value);
+            }
+            configs.push(user);
+        }
+
+        info!("Added VLESS user: {}", uuid);
+        IpcResponse::success_with_message(format!("VLESS user '{}' added", uuid))
+    }
+
+    /// Handle RemoveVlessUser command
+    fn handle_remove_vless_user(&self, uuid: &str) -> IpcResponse {
+        // Validate and parse UUID
+        let uuid_parsed = match uuid::Uuid::parse_str(uuid) {
+            Ok(u) => u,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid UUID format: {}", e),
+                );
+            }
+        };
+
+        // Check if user exists
+        let uuid_bytes = *uuid_parsed.as_bytes();
+        {
+            let accounts = self.vless_accounts.read();
+            if !accounts.contains_bytes(&uuid_bytes) {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("User with UUID '{}' not found", uuid),
+                );
+            }
+        }
+
+        // Remove from accounts
+        {
+            let mut accounts = self.vless_accounts.write();
+            accounts.remove_account(&uuid_parsed);
+        }
+
+        // Remove from user configs
+        {
+            let mut configs = self.vless_user_configs.write();
+            configs.retain(|u| u.uuid != uuid);
+        }
+
+        info!("Removed VLESS user: {}", uuid);
+        IpcResponse::success_with_message(format!("VLESS user '{}' removed", uuid))
+    }
+
+    /// Handle ListVlessUsers command
+    fn handle_list_vless_users(&self) -> IpcResponse {
+        let configs = self.vless_user_configs.read();
+
+        let users: Vec<VlessUserInfo> = configs
+            .iter()
+            .map(|u| VlessUserInfo {
+                uuid: u.uuid.clone(),
+                email: u.email.clone(),
+                flow: u.flow.clone(),
+            })
+            .collect();
+
+        IpcResponse::VlessUserList { users }
+    }
+
+    /// Handle GetVlessInboundStatus command
+    fn handle_get_vless_inbound_status(&self) -> IpcResponse {
+        let inbound_guard = self.vless_inbound.read();
+
+        let status = if let Some(ref listener) = *inbound_guard {
+            VlessInboundStatusResponse {
+                running: listener.is_active(),
+                listen_address: listener.local_addr().ok().map(|a| a.to_string()),
+                user_count: listener.user_count(),
+                tls_enabled: listener.has_tls(),
+                total_connections: self.vless_total_connections.load(Ordering::Relaxed),
+                active_connections: self.vless_active_connections.load(Ordering::Relaxed),
+            }
+        } else {
+            VlessInboundStatusResponse {
+                running: false,
+                listen_address: None,
+                user_count: 0,
+                tls_enabled: false,
+                total_connections: 0,
+                active_connections: 0,
+            }
+        };
+
+        IpcResponse::VlessInboundStatus(status)
+    }
+
+    /// Handle StopVlessInbound command
+    fn handle_stop_vless_inbound(&self) -> IpcResponse {
+        let mut inbound_guard = self.vless_inbound.write();
+
+        if let Some(listener) = inbound_guard.take() {
+            // Signal shutdown
+            listener.shutdown();
+
+            info!("VLESS inbound listener stopped");
+            IpcResponse::success_with_message("VLESS inbound stopped")
+        } else {
+            IpcResponse::error(
+                ErrorCode::NotFound,
+                "VLESS inbound is not running",
+            )
+        }
     }
 }
 

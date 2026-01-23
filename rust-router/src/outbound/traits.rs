@@ -2,16 +2,30 @@
 //!
 //! This module defines the core `Outbound` trait that all outbound types must implement.
 //! Supports both TCP and UDP protocols.
+//!
+//! # Stream Types
+//!
+//! The module supports multiple stream types through `OutboundStream`:
+//! - **TCP**: Direct TCP connections
+//! - **Transport**: TLS, WebSocket, and other transport layer streams
+//!
+//! This abstraction allows outbound implementations like VLESS to work
+//! over different transport layers while maintaining a unified interface.
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
+use crate::transport::TransportStream;
 
 /// Connection pool statistics (for pooled outbound types like SOCKS5)
 #[derive(Debug, Clone, Copy, Default)]
@@ -65,10 +79,170 @@ impl std::fmt::Display for HealthStatus {
     }
 }
 
+// ============================================================================
+// Stream Types
+// ============================================================================
+
+/// Unified stream type for outbound connections
+///
+/// This enum allows outbound connections to use different transport types
+/// (TCP, TLS, WebSocket) while maintaining a unified interface for data transfer.
+///
+/// # Example
+///
+/// ```ignore
+/// use rust_router::outbound::OutboundStream;
+///
+/// // TCP stream
+/// let stream = OutboundStream::Tcp(tcp_stream);
+///
+/// // Transport stream (TLS/WebSocket)
+/// let stream = OutboundStream::Transport(transport_stream);
+/// ```
+pub enum OutboundStream {
+    /// Plain TCP stream
+    Tcp(TcpStream),
+    /// Transport layer stream (TLS, WebSocket, etc.)
+    Transport(TransportStream),
+}
+
+impl OutboundStream {
+    /// Create from a TCP stream
+    #[must_use]
+    pub fn tcp(stream: TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+
+    /// Create from a transport stream
+    #[must_use]
+    pub fn transport(stream: TransportStream) -> Self {
+        Self::Transport(stream)
+    }
+
+    /// Check if this is a TCP stream
+    #[must_use]
+    pub const fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
+
+    /// Check if this is a transport stream
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+
+    /// Try to get the underlying TCP stream
+    ///
+    /// Returns `None` if this is not a TCP stream.
+    #[must_use]
+    pub fn as_tcp(&self) -> Option<&TcpStream> {
+        match self {
+            Self::Tcp(s) => Some(s),
+            Self::Transport(_) => None,
+        }
+    }
+
+    /// Try to get a mutable reference to the underlying TCP stream
+    ///
+    /// Returns `None` if this is not a TCP stream.
+    pub fn as_tcp_mut(&mut self) -> Option<&mut TcpStream> {
+        match self {
+            Self::Tcp(s) => Some(s),
+            Self::Transport(_) => None,
+        }
+    }
+
+    /// Try to convert into a TCP stream
+    ///
+    /// Returns `Err(self)` if this is not a TCP stream.
+    pub fn try_into_tcp(self) -> Result<TcpStream, Self> {
+        match self {
+            Self::Tcp(s) => Ok(s),
+            other => Err(other),
+        }
+    }
+
+    /// Get the local address if available
+    #[must_use]
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Tcp(s) => s.local_addr().ok(),
+            Self::Transport(TransportStream::Tcp(s)) => s.local_addr().ok(),
+            #[cfg(feature = "transport-tls")]
+            Self::Transport(TransportStream::Tls(s)) => {
+                // TLS stream wraps TCP, get address from inner stream
+                s.get_ref().0.local_addr().ok()
+            }
+            #[cfg(feature = "transport-ws")]
+            Self::Transport(TransportStream::WebSocket(_)) => None, // WebSocket doesn't expose local addr
+        }
+    }
+}
+
+impl std::fmt::Debug for OutboundStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(s) => f
+                .debug_struct("OutboundStream::Tcp")
+                .field("local_addr", &s.local_addr().ok())
+                .field("peer_addr", &s.peer_addr().ok())
+                .finish(),
+            Self::Transport(t) => f
+                .debug_struct("OutboundStream::Transport")
+                .field("inner", &t)
+                .finish(),
+        }
+    }
+}
+
+impl AsyncRead for OutboundStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Transport(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for OutboundStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Transport(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Self::Transport(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Transport(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Represents an established outbound connection
+///
+/// This struct wraps an `OutboundStream` which can be either a plain TCP stream
+/// or a transport stream (TLS, WebSocket). The unified interface allows consumers
+/// to work with different stream types transparently.
 pub struct OutboundConnection {
-    /// The underlying TCP stream
-    stream: TcpStream,
+    /// The underlying stream (TCP or transport)
+    stream: OutboundStream,
     /// Local address of the connection
     local_addr: Option<SocketAddr>,
     /// Remote address
@@ -356,9 +530,39 @@ impl Socks5UdpHandle {
 }
 
 impl OutboundConnection {
-    /// Create a new outbound connection
+    /// Create a new outbound connection from a TCP stream
+    ///
+    /// This is the traditional constructor for TCP-based outbounds.
     pub fn new(stream: TcpStream, remote_addr: SocketAddr) -> Self {
         let local_addr = stream.local_addr().ok();
+        Self {
+            stream: OutboundStream::Tcp(stream),
+            local_addr,
+            remote_addr,
+        }
+    }
+
+    /// Create a new outbound connection from a transport stream
+    ///
+    /// Use this constructor for TLS, WebSocket, or other transport-based streams.
+    pub fn from_transport(stream: TransportStream, remote_addr: SocketAddr) -> Self {
+        let local_addr = match &stream {
+            TransportStream::Tcp(s) => s.local_addr().ok(),
+            #[cfg(feature = "transport-tls")]
+            TransportStream::Tls(s) => s.get_ref().0.local_addr().ok(),
+            #[cfg(feature = "transport-ws")]
+            TransportStream::WebSocket(_) => None,
+        };
+        Self {
+            stream: OutboundStream::Transport(stream),
+            local_addr,
+            remote_addr,
+        }
+    }
+
+    /// Create a new outbound connection from an OutboundStream
+    pub fn from_stream(stream: OutboundStream, remote_addr: SocketAddr) -> Self {
+        let local_addr = stream.local_addr();
         Self {
             stream,
             local_addr,
@@ -366,21 +570,119 @@ impl OutboundConnection {
         }
     }
 
-    /// Get the underlying stream
+    /// Get the underlying stream reference (generic)
+    ///
+    /// This returns the `OutboundStream` enum which can be matched to get
+    /// the specific stream type.
     #[must_use]
-    pub fn stream(&self) -> &TcpStream {
+    pub fn outbound_stream(&self) -> &OutboundStream {
         &self.stream
     }
 
-    /// Get mutable reference to the stream
-    pub fn stream_mut(&mut self) -> &mut TcpStream {
+    /// Get a mutable reference to the underlying stream (generic)
+    pub fn outbound_stream_mut(&mut self) -> &mut OutboundStream {
         &mut self.stream
     }
 
-    /// Consume and return the underlying stream
+    /// Consume and return the underlying OutboundStream
+    ///
+    /// Use this when you need to work with either TCP or transport streams.
+    #[must_use]
+    pub fn into_outbound_stream(self) -> OutboundStream {
+        self.stream
+    }
+
+    /// Get the underlying TCP stream if this is a TCP connection
+    ///
+    /// Returns `None` if the connection uses a transport stream.
+    #[must_use]
+    pub fn stream(&self) -> Option<&TcpStream> {
+        self.stream.as_tcp()
+    }
+
+    /// Get mutable reference to the TCP stream if this is a TCP connection
+    ///
+    /// Returns `None` if the connection uses a transport stream.
+    pub fn stream_mut(&mut self) -> Option<&mut TcpStream> {
+        self.stream.as_tcp_mut()
+    }
+
+    /// Consume and return the underlying TCP stream
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection uses a transport stream instead of TCP.
+    /// Use `try_into_stream()` for a non-panicking alternative.
     #[must_use]
     pub fn into_stream(self) -> TcpStream {
-        self.stream
+        match self.stream {
+            OutboundStream::Tcp(s) => s,
+            OutboundStream::Transport(TransportStream::Tcp(s)) => s,
+            #[cfg(feature = "transport-tls")]
+            OutboundStream::Transport(TransportStream::Tls(_)) => {
+                panic!("Cannot convert TLS stream to TcpStream; use into_outbound_stream() instead")
+            }
+            #[cfg(feature = "transport-ws")]
+            OutboundStream::Transport(TransportStream::WebSocket(_)) => {
+                panic!("Cannot convert WebSocket stream to TcpStream; use into_outbound_stream() instead")
+            }
+        }
+    }
+
+    /// Try to consume and return the underlying TCP stream
+    ///
+    /// Returns `Err(self)` if the connection uses a non-TCP transport stream.
+    pub fn try_into_stream(self) -> Result<TcpStream, Self> {
+        match self.stream {
+            OutboundStream::Tcp(s) => Ok(s),
+            OutboundStream::Transport(TransportStream::Tcp(s)) => Ok(s),
+            stream => Err(Self {
+                stream,
+                local_addr: self.local_addr,
+                remote_addr: self.remote_addr,
+            }),
+        }
+    }
+
+    /// Check if this connection uses a plain TCP stream
+    #[must_use]
+    pub fn is_tcp(&self) -> bool {
+        matches!(
+            &self.stream,
+            OutboundStream::Tcp(_) | OutboundStream::Transport(TransportStream::Tcp(_))
+        )
+    }
+
+    /// Check if this connection uses TLS
+    #[must_use]
+    pub fn is_tls(&self) -> bool {
+        #[cfg(feature = "transport-tls")]
+        {
+            matches!(
+                &self.stream,
+                OutboundStream::Transport(TransportStream::Tls(_))
+            )
+        }
+        #[cfg(not(feature = "transport-tls"))]
+        {
+            false
+        }
+    }
+
+    /// Check if this connection uses WebSocket
+    #[must_use]
+    pub fn is_websocket(&self) -> bool {
+        #[cfg(feature = "transport-ws")]
+        {
+            matches!(
+                &self.stream,
+                OutboundStream::Transport(TransportStream::WebSocket(_))
+            )
+        }
+        #[cfg(not(feature = "transport-ws"))]
+        {
+            false
+        }
     }
 
     /// Get the local address

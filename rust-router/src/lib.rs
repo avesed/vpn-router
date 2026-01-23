@@ -58,6 +58,11 @@
 //! - [`tproxy`]: TPROXY socket and listener
 //! - [`ingress`]: `WireGuard` ingress management
 //! - [`egress`]: `WireGuard` egress management
+//! - [`vless`]: VLESS protocol implementation
+//! - [`vless_inbound`]: VLESS inbound listener (server mode)
+//! - [`vision`]: XTLS-Vision TLS detection and zero-copy passthrough
+//! - [`reality`]: REALITY protocol configuration (TLS 1.3 camouflage)
+//! - [`transport`]: Transport layer abstraction (TCP, TLS, WebSocket)
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -75,10 +80,15 @@ pub mod io;
 pub mod ipc;
 pub mod outbound;
 pub mod peer;
+pub mod reality;
 pub mod rules;
 pub mod sniff;
 pub mod tproxy;
+pub mod transport;
 pub mod tunnel;
+pub mod vision;
+pub mod vless;
+pub mod vless_inbound;
 pub mod warp;
 
 // Re-export commonly used types at the crate root
@@ -137,6 +147,29 @@ pub use dns::{
     CacheKey, CacheStats, CacheStatsSnapshot, DnsCache, DnsConfig, DnsError, DnsResult, LogFormat,
     LoggingConfig, NegativeAnalysis, NegativeCacheConfig, NegativeResponseType, RateLimitConfig,
     TcpServerConfig, UpstreamConfig, UpstreamProtocol,
+};
+pub use vless::{
+    VlessAccount, VlessAccountManager, VlessAddons, VlessAddress, VlessCommand, VlessError,
+    VlessRequestHeader, VlessResponseHeader, VLESS_VERSION, XTLS_VISION_FLOW,
+};
+pub use reality::{RealityConfig, RealityError, RealityResult};
+pub use vision::{
+    is_application_data, is_client_hello, is_server_hello, is_tls_traffic, is_valid_tls_version,
+    parse_tls_record_header, VisionError, VisionResult, VisionState, HANDSHAKE_CLIENT_HELLO,
+    HANDSHAKE_SERVER_HELLO, TLS_APPLICATION_DATA, TLS_HANDSHAKE, TLS_RECORD_HEADER_SIZE,
+};
+pub use transport::{
+    connect, TcpTransport, TlsConfig, Transport, TransportConfig, TransportError, TransportStream,
+    WebSocketConfig,
+};
+#[cfg(feature = "transport-tls")]
+pub use transport::TlsTransport;
+#[cfg(feature = "transport-ws")]
+pub use transport::WebSocketTransport;
+pub use vless_inbound::{
+    AuthenticatedUser, InboundTlsConfig, VlessConnection, VlessConnectionHandler,
+    VlessDestination, VlessInboundConfig, VlessInboundError, VlessInboundListener,
+    VlessInboundResult, VlessInboundStats, VlessUser,
 };
 
 /// Crate version

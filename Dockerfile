@@ -4,72 +4,7 @@
 FROM golang:1.23-bookworm AS ca-certs
 
 # ==========================================
-# Stage 1: Build xray-lite from source
-# ==========================================
-# Build minimized Xray supporting only VLESS + XHTTP + REALITY
-# This reduces binary from ~21MB to ~5.7MB (with UPX --best --lzma)
-# See xray-lite/README.md for details on removed protocols
-FROM golang:1.25-bookworm AS xray-builder
-
-ARG TARGETARCH
-
-RUN set -eux; \
-    for file in /etc/apt/sources.list \
-        /etc/apt/sources.list.d/debian.sources; do \
-        if [ -f "$file" ]; then \
-            sed -i 's|http://|https://|g' "$file"; \
-        fi; \
-    done
-
-# Download UPX for binary compression (~70% size reduction)
-# UPX not available in Debian bookworm repos, downloading from GitHub
-# SHA256 checksums verified from official UPX releases (supply chain security)
-RUN UPX_VERSION="4.2.4" && \
-    UPX_ARCH="amd64" && \
-    UPX_SHA256="75cab4e57ab72fb4585ee45ff36388d280c7afd72aa03e8d4b9c3cbddb474193" && \
-    if [ "$TARGETARCH" = "arm64" ]; then \
-        UPX_ARCH="arm64"; \
-        UPX_SHA256="6bfeae6714e34a82e63245289888719c41fd6af29f749a44ae3d3d166ba6a1c9"; \
-    fi && \
-    apt-get update && apt-get install -y --no-install-recommends curl xz-utils && \
-    curl -fsSL -o /tmp/upx.tar.xz "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-${UPX_ARCH}_linux.tar.xz" && \
-    echo "${UPX_SHA256}  /tmp/upx.tar.xz" | sha256sum -c - && \
-    tar -xJf /tmp/upx.tar.xz -C /tmp && \
-    mv /tmp/upx-${UPX_VERSION}-${UPX_ARCH}_linux/upx /usr/local/bin/upx && \
-    chmod +x /usr/local/bin/upx && \
-    rm -rf /tmp/upx* && \
-    apt-get remove -y curl xz-utils && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# Copy xray-lite source code (minimized Xray fork)
-COPY xray-lite/ .
-
-# Build release binary with optimizations:
-# - CGO_ENABLED=0: Static binary, no libc dependency
-# - netgo: Pure Go DNS resolver (no cgo)
-# - -s -w: Strip symbols and DWARF debug info
-# - -trimpath: Remove local paths from binary
-# - -buildid=: Empty build ID for reproducibility
-RUN BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && \
-    LDFLAGS="-s -w -buildid= -X github.com/xtls/xray-core/core.build=${BUILD_DATE}" && \
-    echo "Building xray-lite for ${TARGETARCH}..." && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
-        -tags="netgo" \
-        -ldflags="${LDFLAGS}" \
-        -trimpath \
-        -o /xray \
-        ./main && \
-    echo "Build complete, size before UPX:" && \
-    ls -lh /xray && \
-    echo "Applying UPX compression (--best --lzma)..." && \
-    upx --best --lzma /xray && \
-    echo "Final size after UPX:" && \
-    ls -lh /xray
-
-# ==========================================
-# Stage 2: Build rust-router
+# Stage 1: Build rust-router
 # ==========================================
 # High-performance Rust data plane for TPROXY transparent proxying
 # - p99 latency: 2.775μs (360x better than target)
@@ -190,14 +125,8 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /etc/openvpn/configs /run/openvpn /var/log/openvpn
 
-# NOTE: sing-box removed - replaced by rust-router for all routing/WireGuard
-
-# Copy xray-lite binary (minimized Xray: VLESS + XHTTP + REALITY only)
-# ~5.7MB vs ~25MB official Xray binary (77% size reduction)
-COPY --from=xray-builder /xray /usr/local/bin/xray
-RUN chmod +x /usr/local/bin/xray
-
-# Removed usque binary (MASQUE deprecated, WireGuard-only via rust-router)
+# NOTE: sing-box and xray-lite removed - replaced by rust-router for all routing
+# VLESS/REALITY support now native in rust-router (Rust implementation)
 
 # Copy rust-router binary (primary data plane)
 # Binary size: ~3.1 MB, LTO optimized, stripped
@@ -236,10 +165,7 @@ COPY scripts/db_helper.py /usr/local/bin/db_helper.py
 COPY scripts/init_user_db.py /usr/local/bin/init_user_db.py
 COPY scripts/convert_adblock.py /usr/local/bin/convert_adblock.py
 COPY scripts/openvpn_manager.py /usr/local/bin/openvpn_manager.py
-COPY scripts/xray_manager.py /usr/local/bin/xray_manager.py
-COPY scripts/xray_egress_manager.py /usr/local/bin/xray_egress_manager.py
-COPY scripts/xray_peer_inbound_manager.py /usr/local/bin/xray_peer_inbound_manager.py
-# warp_manager.py removed - WARP via rust-router IPC
+# NOTE: xray_*.py managers removed - VLESS via rust-router IPC
 COPY scripts/warp_endpoint_optimizer.py /usr/local/bin/warp_endpoint_optimizer.py
 COPY scripts/v2ray_stats_pb2.py /usr/local/bin/v2ray_stats_pb2.py
 COPY scripts/v2ray_stats_pb2_grpc.py /usr/local/bin/v2ray_stats_pb2_grpc.py
@@ -267,8 +193,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/pia_provision.py \
     /usr/local/bin/api_server.py /usr/local/bin/init_user_db.py \
     /usr/local/bin/convert_adblock.py /usr/local/bin/openvpn_manager.py \
-    /usr/local/bin/xray_manager.py \
-    /usr/local/bin/xray_egress_manager.py /usr/local/bin/xray_peer_inbound_manager.py \
     /usr/local/bin/warp_endpoint_optimizer.py \
     /usr/local/bin/health_checker.py /usr/local/bin/peer_tunnel_manager.py \
     /usr/local/bin/dscp_manager.py /usr/local/bin/relay_config_manager.py \

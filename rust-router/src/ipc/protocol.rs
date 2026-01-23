@@ -828,6 +828,104 @@ pub enum IpcCommand {
         #[serde(default)]
         headers: Option<std::collections::HashMap<String, String>>,
     },
+
+    // ========================================================================
+    // VLESS Protocol Commands (v3.3)
+    // ========================================================================
+
+    /// Add a VLESS outbound
+    ///
+    /// Creates a new VLESS outbound with the specified configuration.
+    /// Supports TCP, TLS, and WebSocket transports.
+    AddVlessOutbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// VLESS server address (host or IP)
+        server_address: String,
+        /// VLESS server port
+        server_port: u16,
+        /// User UUID for authentication
+        uuid: String,
+        /// Flow control (e.g., "xtls-rprx-vision", empty for none)
+        #[serde(default)]
+        flow: String,
+        /// Transport type: "tcp", "tls", "websocket", or "websocket_tls"
+        #[serde(default = "default_vless_transport")]
+        transport: String,
+        /// TLS server name (for TLS/WebSocket+TLS)
+        #[serde(default)]
+        tls_server_name: Option<String>,
+        /// Skip TLS certificate verification (for testing)
+        #[serde(default)]
+        tls_skip_verify: bool,
+        /// WebSocket path (for WebSocket transport)
+        #[serde(default)]
+        ws_path: Option<String>,
+        /// WebSocket host header (for WebSocket transport)
+        #[serde(default)]
+        ws_host: Option<String>,
+    },
+
+    /// Remove a VLESS outbound
+    RemoveVlessOutbound {
+        /// Outbound tag to remove
+        tag: String,
+    },
+
+    /// List all VLESS outbounds
+    ListVlessOutbounds,
+
+    /// Get VLESS outbound info
+    GetVlessOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    /// Configure VLESS inbound listener
+    ///
+    /// Sets up a VLESS inbound listener that accepts connections from VLESS clients.
+    ConfigureVlessInbound {
+        /// Listen address (e.g., "0.0.0.0:443")
+        listen: String,
+        /// Allowed users
+        users: Vec<VlessUserConfig>,
+        /// TLS certificate path (optional, for VLESS over TLS)
+        #[serde(default)]
+        tls_cert_path: Option<String>,
+        /// TLS private key path
+        #[serde(default)]
+        tls_key_path: Option<String>,
+        /// Fallback address for non-VLESS connections
+        #[serde(default)]
+        fallback: Option<String>,
+    },
+
+    /// Add a user to VLESS inbound
+    AddVlessUser {
+        /// User UUID
+        uuid: String,
+        /// User email (optional, for logging)
+        #[serde(default)]
+        email: Option<String>,
+        /// Flow control type
+        #[serde(default)]
+        flow: Option<String>,
+    },
+
+    /// Remove a user from VLESS inbound
+    RemoveVlessUser {
+        /// User UUID to remove
+        uuid: String,
+    },
+
+    /// List all VLESS inbound users
+    ListVlessUsers,
+
+    /// Get VLESS inbound status
+    GetVlessInboundStatus,
+
+    /// Stop VLESS inbound listener
+    StopVlessInbound,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -873,6 +971,11 @@ fn default_speed_test_timeout() -> u64 {
 /// Default peer request timeout (30 seconds)
 fn default_peer_request_timeout() -> u32 {
     30
+}
+
+/// Default VLESS transport type (TCP)
+fn default_vless_transport() -> String {
+    "tcp".to_string()
 }
 
 /// Egress action type for `NotifyEgressChange`
@@ -1059,6 +1162,26 @@ pub enum IpcResponse {
 
     /// Peer API request result response
     PeerRequestResult(PeerRequestResponse),
+
+    // ========================================================================
+    // VLESS Protocol Response Types (v3.3)
+    // ========================================================================
+
+    /// VLESS outbound info response
+    VlessOutboundInfo(VlessOutboundInfoResponse),
+
+    /// VLESS outbound list response
+    VlessOutboundList {
+        outbounds: Vec<VlessOutboundInfoResponse>,
+    },
+
+    /// VLESS inbound status response
+    VlessInboundStatus(VlessInboundStatusResponse),
+
+    /// VLESS user list response
+    VlessUserList {
+        users: Vec<VlessUserInfo>,
+    },
 
     /// Success response (for commands that don't return data)
     Success {
@@ -2531,6 +2654,74 @@ pub struct PeerRequestResponse {
     pub body: String,
     /// Error message if failed
     pub error: Option<String>,
+}
+
+// ============================================================================
+// VLESS Protocol Types (v3.3)
+// ============================================================================
+
+/// VLESS user configuration for IPC
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessUserConfig {
+    /// User UUID for authentication
+    pub uuid: String,
+    /// User email (optional, for logging)
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Flow control type (e.g., "xtls-rprx-vision")
+    #[serde(default)]
+    pub flow: Option<String>,
+}
+
+/// VLESS outbound info response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessOutboundInfoResponse {
+    /// Outbound tag
+    pub tag: String,
+    /// VLESS server address
+    pub server_address: String,
+    /// VLESS server port
+    pub server_port: u16,
+    /// User UUID (partially masked for security)
+    pub uuid: String,
+    /// Flow control setting
+    pub flow: String,
+    /// Transport type (tcp, tls, websocket, websocket_tls)
+    pub transport: String,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Health status (healthy, unhealthy, unknown)
+    pub health_status: String,
+    /// Number of active connections
+    pub active_connections: u64,
+}
+
+/// VLESS inbound status response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessInboundStatusResponse {
+    /// Whether the inbound listener is running
+    pub running: bool,
+    /// Listen address (e.g., "0.0.0.0:443")
+    pub listen_address: Option<String>,
+    /// Number of configured users
+    pub user_count: usize,
+    /// Whether TLS is enabled
+    pub tls_enabled: bool,
+    /// Total connections since start
+    pub total_connections: u64,
+    /// Currently active connections
+    pub active_connections: u64,
+}
+
+/// VLESS user info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlessUserInfo {
+    /// User UUID
+    pub uuid: String,
+    /// User email (optional)
+    pub email: Option<String>,
+    /// Flow control type
+    pub flow: Option<String>,
 }
 
 /// IPC error
@@ -4453,5 +4644,311 @@ rust_router_connections_total 12345
         assert_eq!(parsed.protocol, "udp");
         assert!(parsed.bootstrap.is_empty());
         assert!(parsed.timeout_secs.is_none());
+    }
+
+    // =========================================================================
+    // VLESS Protocol Serialization Tests (v3.3)
+    // =========================================================================
+
+    #[test]
+    fn test_add_vless_outbound_command_serialization() {
+        // Full config
+        let cmd = IpcCommand::AddVlessOutbound {
+            tag: "vless-jp".into(),
+            server_address: "jp.example.com".into(),
+            server_port: 443,
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            flow: "xtls-rprx-vision".into(),
+            transport: "websocket_tls".into(),
+            tls_server_name: Some("jp.example.com".into()),
+            tls_skip_verify: false,
+            ws_path: Some("/ws".into()),
+            ws_host: Some("jp.example.com".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_vless_outbound\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+        assert!(json.contains("\"server_address\":\"jp.example.com\""));
+        assert!(json.contains("\"server_port\":443"));
+        assert!(json.contains("\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\""));
+        assert!(json.contains("\"flow\":\"xtls-rprx-vision\""));
+        assert!(json.contains("\"transport\":\"websocket_tls\""));
+        assert!(json.contains("\"ws_path\":\"/ws\""));
+
+        // Deserialize back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::AddVlessOutbound { tag, server_address, server_port, uuid, flow, transport, .. } => {
+                assert_eq!(tag, "vless-jp");
+                assert_eq!(server_address, "jp.example.com");
+                assert_eq!(server_port, 443);
+                assert_eq!(uuid, "550e8400-e29b-41d4-a716-446655440000");
+                assert_eq!(flow, "xtls-rprx-vision");
+                assert_eq!(transport, "websocket_tls");
+            }
+            _ => panic!("Expected AddVlessOutbound command"),
+        }
+    }
+
+    #[test]
+    fn test_add_vless_outbound_minimal_config() {
+        // Minimal config with defaults
+        let json = r#"{"type":"add_vless_outbound","tag":"vless-test","server_address":"test.com","server_port":443,"uuid":"test-uuid"}"#;
+        let parsed: IpcCommand = serde_json::from_str(json).unwrap();
+        match parsed {
+            IpcCommand::AddVlessOutbound { tag, transport, flow, tls_skip_verify, .. } => {
+                assert_eq!(tag, "vless-test");
+                assert_eq!(transport, "tcp"); // default
+                assert_eq!(flow, ""); // default empty
+                assert!(!tls_skip_verify); // default false
+            }
+            _ => panic!("Expected AddVlessOutbound command"),
+        }
+    }
+
+    #[test]
+    fn test_remove_vless_outbound_command_serialization() {
+        let cmd = IpcCommand::RemoveVlessOutbound {
+            tag: "vless-jp".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"remove_vless_outbound\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::RemoveVlessOutbound { tag } => {
+                assert_eq!(tag, "vless-jp");
+            }
+            _ => panic!("Expected RemoveVlessOutbound command"),
+        }
+    }
+
+    #[test]
+    fn test_list_vless_outbounds_command_serialization() {
+        let cmd = IpcCommand::ListVlessOutbounds;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"list_vless_outbounds\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, IpcCommand::ListVlessOutbounds));
+    }
+
+    #[test]
+    fn test_configure_vless_inbound_command_serialization() {
+        let cmd = IpcCommand::ConfigureVlessInbound {
+            listen: "0.0.0.0:443".into(),
+            users: vec![
+                VlessUserConfig {
+                    uuid: "uuid-1".into(),
+                    email: Some("user1@example.com".into()),
+                    flow: Some("xtls-rprx-vision".into()),
+                },
+                VlessUserConfig {
+                    uuid: "uuid-2".into(),
+                    email: None,
+                    flow: None,
+                },
+            ],
+            tls_cert_path: Some("/etc/ssl/cert.pem".into()),
+            tls_key_path: Some("/etc/ssl/key.pem".into()),
+            fallback: Some("127.0.0.1:80".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"configure_vless_inbound\""));
+        assert!(json.contains("\"listen\":\"0.0.0.0:443\""));
+        assert!(json.contains("\"uuid\":\"uuid-1\""));
+        assert!(json.contains("\"email\":\"user1@example.com\""));
+        assert!(json.contains("\"flow\":\"xtls-rprx-vision\""));
+        assert!(json.contains("\"fallback\":\"127.0.0.1:80\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::ConfigureVlessInbound { listen, users, tls_cert_path, fallback, .. } => {
+                assert_eq!(listen, "0.0.0.0:443");
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].uuid, "uuid-1");
+                assert_eq!(users[0].email, Some("user1@example.com".into()));
+                assert!(tls_cert_path.is_some());
+                assert_eq!(fallback, Some("127.0.0.1:80".into()));
+            }
+            _ => panic!("Expected ConfigureVlessInbound command"),
+        }
+    }
+
+    #[test]
+    fn test_add_vless_user_command_serialization() {
+        let cmd = IpcCommand::AddVlessUser {
+            uuid: "test-uuid".into(),
+            email: Some("test@example.com".into()),
+            flow: Some("xtls-rprx-vision".into()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"add_vless_user\""));
+        assert!(json.contains("\"uuid\":\"test-uuid\""));
+        assert!(json.contains("\"email\":\"test@example.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::AddVlessUser { uuid, email, flow } => {
+                assert_eq!(uuid, "test-uuid");
+                assert_eq!(email, Some("test@example.com".into()));
+                assert_eq!(flow, Some("xtls-rprx-vision".into()));
+            }
+            _ => panic!("Expected AddVlessUser command"),
+        }
+    }
+
+    #[test]
+    fn test_vless_outbound_info_response_serialization() {
+        let info = VlessOutboundInfoResponse {
+            tag: "vless-jp".into(),
+            server_address: "jp.example.com".into(),
+            server_port: 443,
+            uuid: "550e****0000".into(), // Masked
+            flow: "xtls-rprx-vision".into(),
+            transport: "websocket_tls".into(),
+            enabled: true,
+            health_status: "healthy".into(),
+            active_connections: 5,
+        };
+        let resp = IpcResponse::VlessOutboundInfo(info);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_outbound_info\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+        assert!(json.contains("\"server_address\":\"jp.example.com\""));
+        assert!(json.contains("\"health_status\":\"healthy\""));
+        assert!(json.contains("\"active_connections\":5"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessOutboundInfo(info) = parsed {
+            assert_eq!(info.tag, "vless-jp");
+            assert!(info.enabled);
+            assert_eq!(info.active_connections, 5);
+        } else {
+            panic!("Expected VlessOutboundInfo response");
+        }
+    }
+
+    #[test]
+    fn test_vless_outbound_list_response_serialization() {
+        let outbounds = vec![
+            VlessOutboundInfoResponse {
+                tag: "vless-jp".into(),
+                server_address: "jp.example.com".into(),
+                server_port: 443,
+                uuid: "uuid1".into(),
+                flow: "".into(),
+                transport: "tcp".into(),
+                enabled: true,
+                health_status: "healthy".into(),
+                active_connections: 2,
+            },
+            VlessOutboundInfoResponse {
+                tag: "vless-us".into(),
+                server_address: "us.example.com".into(),
+                server_port: 443,
+                uuid: "uuid2".into(),
+                flow: "".into(),
+                transport: "tls".into(),
+                enabled: false,
+                health_status: "unhealthy".into(),
+                active_connections: 0,
+            },
+        ];
+        let resp = IpcResponse::VlessOutboundList { outbounds };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_outbound_list\""));
+        assert!(json.contains("\"tag\":\"vless-jp\""));
+        assert!(json.contains("\"tag\":\"vless-us\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessOutboundList { outbounds } = parsed {
+            assert_eq!(outbounds.len(), 2);
+            assert_eq!(outbounds[0].tag, "vless-jp");
+            assert_eq!(outbounds[1].tag, "vless-us");
+        } else {
+            panic!("Expected VlessOutboundList response");
+        }
+    }
+
+    #[test]
+    fn test_vless_inbound_status_response_serialization() {
+        let status = VlessInboundStatusResponse {
+            running: true,
+            listen_address: Some("0.0.0.0:443".into()),
+            user_count: 10,
+            tls_enabled: true,
+            total_connections: 1000,
+            active_connections: 25,
+        };
+        let resp = IpcResponse::VlessInboundStatus(status);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_inbound_status\""));
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"user_count\":10"));
+        assert!(json.contains("\"tls_enabled\":true"));
+        assert!(json.contains("\"active_connections\":25"));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessInboundStatus(s) = parsed {
+            assert!(s.running);
+            assert_eq!(s.user_count, 10);
+            assert!(s.tls_enabled);
+        } else {
+            panic!("Expected VlessInboundStatus response");
+        }
+    }
+
+    #[test]
+    fn test_vless_user_list_response_serialization() {
+        let users = vec![
+            VlessUserInfo {
+                uuid: "uuid-1".into(),
+                email: Some("user1@example.com".into()),
+                flow: Some("xtls-rprx-vision".into()),
+            },
+            VlessUserInfo {
+                uuid: "uuid-2".into(),
+                email: None,
+                flow: None,
+            },
+        ];
+        let resp = IpcResponse::VlessUserList { users };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"vless_user_list\""));
+        assert!(json.contains("\"uuid\":\"uuid-1\""));
+        assert!(json.contains("\"email\":\"user1@example.com\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessUserList { users } = parsed {
+            assert_eq!(users.len(), 2);
+            assert_eq!(users[0].uuid, "uuid-1");
+            assert_eq!(users[0].email, Some("user1@example.com".into()));
+            assert!(users[1].email.is_none());
+        } else {
+            panic!("Expected VlessUserList response");
+        }
+    }
+
+    #[test]
+    fn test_vless_user_config_serialization() {
+        // Full config
+        let config = VlessUserConfig {
+            uuid: "test-uuid".into(),
+            email: Some("test@example.com".into()),
+            flow: Some("xtls-rprx-vision".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"uuid\":\"test-uuid\""));
+        assert!(json.contains("\"email\":\"test@example.com\""));
+        assert!(json.contains("\"flow\":\"xtls-rprx-vision\""));
+
+        // Minimal config with defaults
+        let json_minimal = r#"{"uuid":"minimal-uuid"}"#;
+        let parsed: VlessUserConfig = serde_json::from_str(json_minimal).unwrap();
+        assert_eq!(parsed.uuid, "minimal-uuid");
+        assert!(parsed.email.is_none());
+        assert!(parsed.flow.is_none());
     }
 }

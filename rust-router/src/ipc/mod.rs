@@ -50,5 +50,7 @@ pub use protocol::{
     DnsUpstreamConfig, DnsStatsResponse, DnsCacheStatsResponse, DnsBlockStatsResponse,
     DnsUpstreamStatusResponse, DnsUpstreamInfo, DnsQueryLogResponse, DnsQueryLogEntry,
     DnsQueryResponse, DnsConfigResponse, IngressStatsResponse,
+    // VLESS IPC types (v3.3)
+    VlessUserConfig, VlessOutboundInfoResponse, VlessInboundStatusResponse, VlessUserInfo,
 };
 pub use server::{IpcClient, IpcServer};
