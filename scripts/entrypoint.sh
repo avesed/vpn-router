@@ -438,6 +438,8 @@ print(len(db.get_openvpn_egress_list(enabled_only=True)))
 }
 
 start_xray_manager() {
+  # VLESS inbound is now handled natively by rust-router
+  # Configure via IPC instead of old xray_manager.py
   local enabled
   enabled=$(python3 -c "
 import sys
@@ -449,11 +451,68 @@ print('1' if config and config.get('enabled') else '0')
 " 2>/dev/null || echo "0")
 
   if [ "${enabled}" = "1" ]; then
-    echo "[entrypoint] starting Xray manager for V2Ray ingress"
-    python3 /usr/local/bin/xray_manager.py daemon >/var/log/xray-manager.log 2>&1 &
-    XRAY_MGR_PID=$!
+    echo "[entrypoint] configuring VLESS inbound via rust-router IPC"
+    # Configure VLESS inbound through rust-router native implementation
+    python3 -c "
+import sys
+import os
+import asyncio
+from pathlib import Path
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+from rust_router_client import RustRouterClient
+
+async def configure_vless():
+    # Get encryption key from environment or fallback to file
+    encryption_key = os.environ.get('SQLCIPHER_KEY')
+    if not encryption_key:
+        key_file = Path('/etc/sing-box/encryption.key')
+        if key_file.exists():
+            encryption_key = key_file.read_text().strip()
+
+    db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db', encryption_key)
+    config = db.get_v2ray_inbound_config()
+    if not config or not config.get('enabled'):
+        return
+
+    # Get users
+    users = db.get_v2ray_users(enabled_only=True)
+    user_configs = []
+    for user in users:
+        user_configs.append({
+            'uuid': user.get('uuid'),
+            'email': user.get('email'),
+            'flow': user.get('flow', 'xtls-rprx-vision'),
+        })
+
+    if not user_configs:
+        print('[vless] No users configured')
+        return
+
+    listen = f\"0.0.0.0:{config.get('listen_port', 443)}\"
+    tls_cert = config.get('tls_cert_path')
+    tls_key = config.get('tls_key_path')
+    fallback = config.get('fallback_server')
+
+    async with RustRouterClient() as client:
+        resp = await client.configure_vless_inbound(
+            listen=listen,
+            users=user_configs,
+            tls_cert_path=tls_cert,
+            tls_key_path=tls_key,
+            fallback=fallback,
+        )
+        if resp.success:
+            print(f'[vless] Inbound configured on {listen} with {len(user_configs)} users')
+        else:
+            print(f'[vless] Failed to configure: {resp.error}')
+
+asyncio.run(configure_vless())
+" 2>&1 || echo "[entrypoint] VLESS inbound configuration failed"
+    # No daemon PID needed - rust-router handles the listener
+    XRAY_MGR_PID=""
   else
-    echo "[entrypoint] V2Ray ingress not enabled, skipping Xray manager"
+    echo "[entrypoint] V2Ray ingress not enabled, skipping VLESS inbound"
   fi
 }
 
@@ -669,10 +728,8 @@ echo "[entrypoint] rust-router config generated: ${RUST_ROUTER_CONFIG}"
 start_api_server
 start_nginx
 start_openvpn_manager
-start_xray_manager
-start_xray_egress_manager
 
-# Start rust-router first (health_checker needs IPC socket)
+# Start rust-router first (health_checker, VLESS inbound need IPC socket)
 echo "[entrypoint] starting rust-router (userspace WireGuard mode)"
 if start_rust_router; then
   echo "[entrypoint] rust-router started successfully"
@@ -681,6 +738,10 @@ else
   echo "[entrypoint] FATAL: rust-router failed to start" >&2
   exit 1
 fi
+
+# Configure VLESS inbound AFTER rust-router is ready (needs IPC socket)
+start_xray_manager
+start_xray_egress_manager
 
 # Start health checker AFTER rust-router (needs IPC socket)
 start_health_checker
@@ -751,7 +812,9 @@ while true; do
     start_openvpn_manager
   fi
 
-  # Check Xray manager
+  # Check Xray manager (legacy - now VLESS inbound is handled by rust-router)
+  # XRAY_MGR_PID is always empty since VLESS is native to rust-router
+  # This check is kept for backward compatibility but will never trigger
   if [ -n "${XRAY_MGR_PID}" ] && ! kill -0 "${XRAY_MGR_PID}" 2>/dev/null; then
     echo "[entrypoint] WARNING: Xray manager died, restarting..." >&2
     start_xray_manager

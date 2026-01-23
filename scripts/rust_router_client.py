@@ -2429,6 +2429,209 @@ class RustRouterClient:
             }
 
     # =========================================================================
+    # VLESS Inbound/Outbound Commands
+    # =========================================================================
+
+    async def configure_vless_inbound(
+        self,
+        listen: str,
+        users: List[Dict[str, Any]],
+        tls_cert_path: Optional[str] = None,
+        tls_key_path: Optional[str] = None,
+        fallback: Optional[str] = None,
+    ) -> IpcResponse:
+        """Configure VLESS inbound listener
+
+        Args:
+            listen: Listen address (e.g., "0.0.0.0:443")
+            users: List of user configs, each with:
+                - uuid: User UUID (required)
+                - email: Optional email
+                - flow: Optional flow control (e.g., "xtls-rprx-vision")
+            tls_cert_path: Path to TLS certificate file
+            tls_key_path: Path to TLS private key file
+            fallback: Fallback address for non-VLESS connections
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        command: Dict[str, Any] = {
+            "type": "configure_vless_inbound",
+            "listen": listen,
+            "users": users,
+        }
+        if tls_cert_path:
+            command["tls_cert_path"] = tls_cert_path
+        if tls_key_path:
+            command["tls_key_path"] = tls_key_path
+        if fallback:
+            command["fallback"] = fallback
+        return await self._send_command(command)
+
+    async def stop_vless_inbound(self) -> IpcResponse:
+        """Stop VLESS inbound listener
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "stop_vless_inbound"})
+
+    async def get_vless_inbound_status(self) -> IpcResponse:
+        """Get VLESS inbound status
+
+        Returns:
+            IpcResponse with inbound status info
+        """
+        return await self._send_command({"type": "get_vless_inbound_status"})
+
+    async def add_vless_user(
+        self,
+        uuid: str,
+        email: Optional[str] = None,
+        flow: Optional[str] = None,
+    ) -> IpcResponse:
+        """Add a user to VLESS inbound
+
+        Args:
+            uuid: User UUID
+            email: Optional email identifier
+            flow: Optional flow control (e.g., "xtls-rprx-vision")
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        command: Dict[str, Any] = {
+            "type": "add_vless_user",
+            "uuid": uuid,
+        }
+        if email:
+            command["email"] = email
+        if flow:
+            command["flow"] = flow
+        return await self._send_command(command)
+
+    async def remove_vless_user(self, uuid: str) -> IpcResponse:
+        """Remove a user from VLESS inbound
+
+        Args:
+            uuid: User UUID to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "remove_vless_user",
+            "uuid": uuid,
+        })
+
+    async def list_vless_users(self) -> IpcResponse:
+        """List all VLESS inbound users
+
+        Returns:
+            IpcResponse with list of users
+        """
+        return await self._send_command({"type": "list_vless_users"})
+
+    async def add_vless_outbound(
+        self,
+        tag: str,
+        server_address: str,
+        server_port: int,
+        uuid: str,
+        flow: Optional[str] = None,
+        transport: str = "tcp",
+        tls_enabled: bool = False,
+        tls_sni: Optional[str] = None,
+        tls_skip_verify: bool = False,
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        ws_path: Optional[str] = None,
+        ws_host: Optional[str] = None,
+    ) -> IpcResponse:
+        """Add a VLESS outbound
+
+        Args:
+            tag: Outbound tag
+            server_address: Server hostname or IP
+            server_port: Server port
+            uuid: User UUID
+            flow: Flow control (e.g., "xtls-rprx-vision")
+            transport: Transport type (tcp, ws, grpc)
+            tls_enabled: Enable TLS
+            tls_sni: TLS SNI
+            tls_skip_verify: Skip TLS verification
+            reality_enabled: Enable REALITY
+            reality_public_key: REALITY public key
+            reality_short_id: REALITY short ID
+            ws_path: WebSocket path
+            ws_host: WebSocket host header
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        command: Dict[str, Any] = {
+            "type": "add_vless_outbound",
+            "tag": tag,
+            "server_address": server_address,
+            "server_port": server_port,
+            "uuid": uuid,
+            "transport": transport,
+            "tls_enabled": tls_enabled,
+            "tls_skip_verify": tls_skip_verify,
+            "reality_enabled": reality_enabled,
+        }
+        if flow:
+            command["flow"] = flow
+        if tls_sni:
+            command["tls_sni"] = tls_sni
+        if reality_public_key:
+            command["reality_public_key"] = reality_public_key
+        if reality_short_id:
+            command["reality_short_id"] = reality_short_id
+        if ws_path:
+            command["ws_path"] = ws_path
+        if ws_host:
+            command["ws_host"] = ws_host
+        return await self._send_command(command)
+
+    async def remove_vless_outbound(self, tag: str) -> IpcResponse:
+        """Remove a VLESS outbound
+
+        Args:
+            tag: Outbound tag to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "remove_vless_outbound",
+            "tag": tag,
+        })
+
+    async def list_vless_outbounds(self) -> IpcResponse:
+        """List all VLESS outbounds
+
+        Returns:
+            IpcResponse with list of VLESS outbounds
+        """
+        return await self._send_command({"type": "list_vless_outbounds"})
+
+    async def get_vless_outbound(self, tag: str) -> IpcResponse:
+        """Get info about a specific VLESS outbound
+
+        Args:
+            tag: Outbound tag
+
+        Returns:
+            IpcResponse with outbound info
+        """
+        return await self._send_command({
+            "type": "get_vless_outbound",
+            "tag": tag,
+        })
+
+    # =========================================================================
     # Lifecycle Commands
     # =========================================================================
 

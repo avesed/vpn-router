@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 
-use tracing::{debug, info, trace, warn};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, trace, warn};
 
 use super::protocol::{
     BufferPoolInfo, BufferPoolStatsResponse, ChainConfig, ChainDiagnosticsResponse,
@@ -44,6 +45,7 @@ use crate::tproxy::UdpWorkerPool;
 use crate::outbound::vless::{VlessConfig, VlessOutbound, VlessTransportConfig, TlsSettings};
 use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessUser as VlessInboundUser};
 use crate::vless::{VlessAccount, VlessAccountManager};
+use crate::io::bidirectional_copy;
 
 /// DNS engine component holder
 ///
@@ -228,6 +230,9 @@ pub struct IpcHandler {
     /// VLESS inbound statistics
     vless_total_connections: AtomicU64,
     vless_active_connections: AtomicU64,
+
+    /// VLESS inbound accept task handle
+    vless_inbound_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl IpcHandler {
@@ -264,6 +269,7 @@ impl IpcHandler {
             vless_user_configs: RwLock::new(Vec::new()),
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
+            vless_inbound_task: RwLock::new(None),
         }
     }
 
@@ -306,6 +312,7 @@ impl IpcHandler {
             vless_user_configs: RwLock::new(Vec::new()),
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
+            vless_inbound_task: RwLock::new(None),
         }
     }
 
@@ -347,6 +354,7 @@ impl IpcHandler {
             vless_user_configs: RwLock::new(Vec::new()),
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
+            vless_inbound_task: RwLock::new(None),
         }
     }
 
@@ -391,6 +399,7 @@ impl IpcHandler {
             vless_user_configs: RwLock::new(Vec::new()),
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
+            vless_inbound_task: RwLock::new(None),
         }
     }
 
@@ -6096,7 +6105,277 @@ impl IpcHandler {
         // Store the listener
         {
             let mut inbound_guard = self.vless_inbound.write();
-            *inbound_guard = Some(listener);
+            *inbound_guard = Some(Arc::clone(&listener));
+        }
+
+        // Clone references needed for the accept task
+        let outbound_manager = Arc::clone(&self.outbound_manager);
+        let rule_engine = Arc::clone(&self.rule_engine);
+        let ecmp_group_manager = self.ecmp_group_manager.clone();
+        let total_connections = Arc::new(AtomicU64::new(0));
+        let active_connections = Arc::new(AtomicU64::new(0));
+
+        // Store references for statistics updates
+        let total_conn_stat = Arc::clone(&total_connections);
+        let active_conn_stat = Arc::clone(&active_connections);
+
+        // Copy the stats pointers for the handler to access
+        // Note: Using Arc here to share between the spawned task and the handler
+        let _stats_total = self.vless_total_connections.load(Ordering::SeqCst);
+        let _stats_active = self.vless_active_connections.load(Ordering::SeqCst);
+
+        // Spawn the accept loop task
+        let accept_task = tokio::spawn(async move {
+            info!("VLESS inbound accept loop started");
+
+            loop {
+                // Accept next connection
+                let conn = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        if e.is_recoverable() {
+                            warn!("VLESS accept recoverable error: {}", e);
+                            continue;
+                        } else {
+                            error!("VLESS accept fatal error: {}", e);
+                            break;
+                        }
+                    }
+                };
+
+                // Update statistics
+                total_conn_stat.fetch_add(1, Ordering::Relaxed);
+                active_conn_stat.fetch_add(1, Ordering::Relaxed);
+
+                // Get connection details
+                let client_addr = conn.client_addr();
+                let destination = conn.destination().clone();
+
+                info!(
+                    "VLESS connection from {} to {}",
+                    client_addr,
+                    destination
+                );
+
+                // Clone references for the connection handler
+                let outbound_manager = Arc::clone(&outbound_manager);
+                let rule_engine = Arc::clone(&rule_engine);
+                let ecmp_mgr = ecmp_group_manager.clone();
+                let active_conn = Arc::clone(&active_conn_stat);
+
+                // Spawn a task to handle this connection
+                tokio::spawn(async move {
+                    // Extract destination info
+                    let dest_port = destination.port;
+                    let (dest_ip, domain) = match &destination.address {
+                        crate::vless::VlessAddress::Ipv4(ip) => {
+                            (Some(std::net::IpAddr::V4(*ip)), None)
+                        }
+                        crate::vless::VlessAddress::Ipv6(ip) => {
+                            (Some(std::net::IpAddr::V6(*ip)), None)
+                        }
+                        crate::vless::VlessAddress::Domain(d) => {
+                            (None, Some(d.clone()))
+                        }
+                    };
+
+                    // Route the connection using the rule engine
+                    let conn_info = ConnectionInfo {
+                        domain: domain.clone(),
+                        dest_ip,
+                        dest_port,
+                        source_ip: Some(client_addr.ip()),
+                        protocol: "tcp",
+                        sniffed_protocol: None,  // VLESS doesn't do protocol sniffing
+                    };
+
+                    // Match against rules to determine outbound
+                    let match_result = rule_engine.match_connection(&conn_info);
+                    let outbound_tag = match_result.outbound.clone();
+
+                    debug!(
+                        "VLESS connection {} -> {} routed to outbound '{}'",
+                        client_addr, destination, outbound_tag
+                    );
+
+                    // Resolve destination address (handle domain if needed)
+                    let dest_addr: std::net::SocketAddr = if let Some(ip) = dest_ip {
+                        std::net::SocketAddr::new(ip, dest_port)
+                    } else if let Some(ref d) = domain {
+                        // Resolve domain to IP address
+                        match tokio::net::lookup_host(format!("{}:{}", d, dest_port)).await {
+                            Ok(mut addrs) => {
+                                match addrs.next() {
+                                    Some(addr) => addr,
+                                    None => {
+                                        warn!("No addresses found for domain {}", d);
+                                        active_conn.fetch_sub(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to resolve domain {}: {}", d, e);
+                                active_conn.fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    } else {
+                        error!("No destination IP or domain available");
+                        active_conn.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    };
+
+                    // Get the outbound (handling both direct outbounds and ECMP groups)
+                    let (outbound, actual_outbound_tag) = {
+                        // Try direct lookup first
+                        if let Some(o) = outbound_manager.get(&outbound_tag) {
+                            (o, outbound_tag.clone())
+                        } else if let Some(ref ecmp_manager) = ecmp_mgr {
+                            // Check if it's an ECMP group
+                            if ecmp_manager.has_group(&outbound_tag) {
+                                if let Some(group) = ecmp_manager.get_group(&outbound_tag) {
+                                    // Use default five-tuple hash for connection affinity
+                                    use crate::ecmp::{FiveTuple, Protocol as EcmpProtocol};
+                                    let five_tuple = FiveTuple::new(
+                                        client_addr.ip(),
+                                        dest_addr.ip(),
+                                        client_addr.port(),
+                                        dest_addr.port(),
+                                        EcmpProtocol::Tcp,
+                                    );
+                                    match group.select_by_connection(&five_tuple) {
+                                        Ok(member_tag) => {
+                                            debug!(
+                                                "ECMP group '{}' selected member '{}' for VLESS {} -> {}",
+                                                outbound_tag, member_tag, client_addr, destination
+                                            );
+                                            if let Some(o) = outbound_manager.get(&member_tag) {
+                                                (o, member_tag)
+                                            } else {
+                                                warn!(
+                                                    "ECMP member '{}' not found, using direct",
+                                                    member_tag
+                                                );
+                                                match outbound_manager.get("direct") {
+                                                    Some(o) => (o, "direct".to_string()),
+                                                    None => {
+                                                        error!("No 'direct' outbound available");
+                                                        active_conn.fetch_sub(1, Ordering::Relaxed);
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("ECMP group '{}' selection failed: {}, using direct", outbound_tag, e);
+                                            match outbound_manager.get("direct") {
+                                                Some(o) => (o, "direct".to_string()),
+                                                None => {
+                                                    error!("No 'direct' outbound available");
+                                                    active_conn.fetch_sub(1, Ordering::Relaxed);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    warn!(
+                                        "Outbound '{}' not found for VLESS connection {} -> {}, using direct",
+                                        outbound_tag, client_addr, destination
+                                    );
+                                    match outbound_manager.get("direct") {
+                                        Some(o) => (o, "direct".to_string()),
+                                        None => {
+                                            error!("No 'direct' outbound available");
+                                            active_conn.fetch_sub(1, Ordering::Relaxed);
+                                            return;
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Outbound '{}' not found for VLESS connection {} -> {}, using direct",
+                                    outbound_tag, client_addr, destination
+                                );
+                                match outbound_manager.get("direct") {
+                                    Some(o) => (o, "direct".to_string()),
+                                    None => {
+                                        error!("No 'direct' outbound available");
+                                        active_conn.fetch_sub(1, Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!(
+                                "Outbound '{}' not found for VLESS connection {} -> {}, using direct",
+                                outbound_tag, client_addr, destination
+                            );
+                            match outbound_manager.get("direct") {
+                                Some(o) => (o, "direct".to_string()),
+                                None => {
+                                    error!("No 'direct' outbound available");
+                                    active_conn.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    // Connect to upstream via outbound
+                    let upstream = match outbound.connect(dest_addr, Duration::from_secs(30)).await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            warn!(
+                                "Failed to connect to {} via {}: {}",
+                                destination, actual_outbound_tag, e
+                            );
+                            active_conn.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                    };
+
+                    info!(
+                        "VLESS proxying {} -> {} via {}",
+                        client_addr, destination, actual_outbound_tag
+                    );
+
+                    // Get mutable streams for bidirectional copy
+                    let mut client_stream = conn.into_stream();
+                    let mut upstream_stream = upstream.into_stream();
+
+                    // Relay traffic bidirectionally
+                    match bidirectional_copy(&mut client_stream, &mut upstream_stream).await {
+                        Ok(result) => {
+                            info!(
+                                "VLESS connection closed: {} -> {}, {} up / {} down bytes",
+                                client_addr,
+                                destination,
+                                result.client_to_upstream,
+                                result.upstream_to_client
+                            );
+                        }
+                        Err(e) => {
+                            debug!(
+                                "VLESS connection error: {} -> {}: {}",
+                                client_addr, destination, e
+                            );
+                        }
+                    }
+
+                    // Decrease active connection count
+                    active_conn.fetch_sub(1, Ordering::Relaxed);
+                });
+            }
+
+            info!("VLESS inbound accept loop ended");
+        });
+
+        // Store the task handle for cleanup
+        {
+            let mut task_guard = self.vless_inbound_task.write();
+            *task_guard = Some(accept_task);
         }
 
         info!("VLESS inbound listener started on {}", listen);
@@ -6255,6 +6534,16 @@ impl IpcHandler {
 
     /// Handle StopVlessInbound command
     fn handle_stop_vless_inbound(&self) -> IpcResponse {
+        // First abort the accept task
+        {
+            let mut task_guard = self.vless_inbound_task.write();
+            if let Some(task) = task_guard.take() {
+                task.abort();
+                info!("VLESS inbound accept task aborted");
+            }
+        }
+
+        // Then shutdown the listener
         let mut inbound_guard = self.vless_inbound.write();
 
         if let Some(listener) = inbound_guard.take() {
