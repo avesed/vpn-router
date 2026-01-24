@@ -4,11 +4,12 @@
 //! as required by the REALITY protocol.
 
 use crate::reality::common::{
-    CONTENT_TYPE_HANDSHAKE, HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED,
-    HANDSHAKE_TYPE_SERVER_HELLO, TLS_RECORD_HEADER_SIZE, VERSION_TLS_1_2_MAJOR,
-    VERSION_TLS_1_2_MINOR,
+    CONTENT_TYPE_HANDSHAKE, HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
+    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, HANDSHAKE_TYPE_SERVER_HELLO,
+    TLS_RECORD_HEADER_SIZE, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
 use crate::reality::error::{RealityError, RealityResult};
+use ed25519_dalek::{Signer, SigningKey};
 
 /// Default ALPN protocols for REALITY client (matches browser fingerprints)
 pub const DEFAULT_ALPN_PROTOCOLS: &[&str] = &["h2", "http/1.1"];
@@ -255,6 +256,130 @@ pub fn construct_encrypted_extensions() -> RealityResult<Vec<u8>> {
     encrypted_extensions.extend_from_slice(&extensions_length.to_be_bytes());
 
     Ok(encrypted_extensions)
+}
+
+/// Construct Certificate message with DER-encoded certificate
+///
+/// # Arguments
+/// * `cert_der` - DER-encoded X.509 certificate bytes
+///
+/// # Returns
+/// Certificate handshake message bytes
+///
+/// # Certificate Structure (TLS 1.3)
+/// ```text
+/// struct {
+///     opaque certificate_request_context<0..2^8-1>;  // empty for server
+///     CertificateEntry certificate_list<0..2^24-1>;
+/// } Certificate;
+///
+/// struct {
+///     opaque cert_data<1..2^24-1>;  // DER-encoded certificate
+///     Extension extensions<0..2^16-1>;  // empty for simplicity
+/// } CertificateEntry;
+/// ```
+pub fn construct_certificate(cert_der: &[u8]) -> RealityResult<Vec<u8>> {
+    // Pre-calculate sizes to allocate exact capacity
+    // cert_list = 3 (cert_data len) + cert_der.len() + 2 (extensions len)
+    let cert_entry_len = 3 + cert_der.len() + 2;
+    // payload = 1 (context len) + 3 (list len) + cert_entry_len
+    let payload_len = 1 + 3 + cert_entry_len;
+    // total = 1 (type) + 3 (payload len) + payload_len
+    let total_len = 1 + 3 + payload_len;
+
+    let mut certificate = Vec::with_capacity(total_len);
+
+    // Handshake type: Certificate (0x0B = 11)
+    certificate.push(HANDSHAKE_TYPE_CERTIFICATE);
+
+    // Payload length (3 bytes, big-endian)
+    certificate.extend_from_slice(&[
+        ((payload_len >> 16) & 0xff) as u8,
+        ((payload_len >> 8) & 0xff) as u8,
+        (payload_len & 0xff) as u8,
+    ]);
+
+    // Certificate request context (empty for server certificates)
+    certificate.push(0x00);
+
+    // Certificate list length (3 bytes)
+    certificate.extend_from_slice(&[
+        ((cert_entry_len >> 16) & 0xff) as u8,
+        ((cert_entry_len >> 8) & 0xff) as u8,
+        (cert_entry_len & 0xff) as u8,
+    ]);
+
+    // Certificate entry - cert data length (3 bytes)
+    certificate.extend_from_slice(&[
+        ((cert_der.len() >> 16) & 0xff) as u8,
+        ((cert_der.len() >> 8) & 0xff) as u8,
+        (cert_der.len() & 0xff) as u8,
+    ]);
+
+    // Certificate DER data
+    certificate.extend_from_slice(cert_der);
+
+    // Extensions (empty)
+    certificate.extend_from_slice(&[0x00, 0x00]);
+
+    Ok(certificate)
+}
+
+/// Construct CertificateVerify message
+///
+/// Signs the handshake transcript with the server's private key.
+///
+/// # Arguments
+/// * `signing_key` - Ed25519 signing key
+/// * `handshake_hash` - Hash of all handshake messages up to this point
+///
+/// # Returns
+/// CertificateVerify handshake message bytes
+///
+/// # TLS 1.3 CertificateVerify Context
+/// The signed content is constructed as:
+/// - 64 spaces (0x20)
+/// - "TLS 1.3, server CertificateVerify"
+/// - 0x00 (separator)
+/// - handshake_hash
+pub fn construct_certificate_verify(
+    signing_key: &SigningKey,
+    handshake_hash: &[u8],
+) -> RealityResult<Vec<u8>> {
+    // Construct the signed content per TLS 1.3 spec (RFC 8446)
+    let mut signed_content = Vec::with_capacity(64 + 34 + 1 + handshake_hash.len());
+    signed_content.extend_from_slice(&[0x20u8; 64]); // 64 spaces
+    signed_content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed_content.push(0x00); // separator
+    signed_content.extend_from_slice(handshake_hash);
+
+    // Sign with Ed25519
+    let signature = signing_key.sign(&signed_content);
+    let signature_bytes = signature.to_bytes();
+
+    let mut payload = Vec::new();
+
+    // Signature algorithm: Ed25519 (0x0807)
+    payload.extend_from_slice(&[0x08, 0x07]);
+
+    // Signature length (2 bytes) and data
+    payload.extend_from_slice(&(signature_bytes.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&signature_bytes);
+
+    let mut certificate_verify = Vec::with_capacity(1 + 3 + payload.len());
+
+    // Handshake type: CertificateVerify (0x0F = 15)
+    certificate_verify.push(HANDSHAKE_TYPE_CERTIFICATE_VERIFY);
+
+    // Payload length (3 bytes)
+    certificate_verify.extend_from_slice(&[
+        ((payload.len() >> 16) & 0xff) as u8,
+        ((payload.len() >> 8) & 0xff) as u8,
+        (payload.len() & 0xff) as u8,
+    ]);
+    certificate_verify.extend_from_slice(&payload);
+
+    Ok(certificate_verify)
 }
 
 /// Construct Finished message

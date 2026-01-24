@@ -65,9 +65,13 @@
 //! # }
 //! ```
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, trace, warn};
@@ -75,7 +79,9 @@ use tracing::{debug, error, info, trace, warn};
 use super::config::VlessInboundConfig;
 use super::error::{VlessInboundError, VlessInboundResult};
 use super::handler::{VlessConnection, VlessConnectionHandler};
-use crate::reality::{RealityAcceptResult, RealityServer};
+use crate::reality::{
+    RealityAcceptResult, RealityHandshakeResult, RealityServer, RealityServerStream,
+};
 
 #[cfg(feature = "transport-tls")]
 use {
@@ -87,6 +93,66 @@ use {
     std::sync::OnceLock,
     tokio_rustls::TlsAcceptor,
 };
+
+/// Unified stream type for VLESS inbound connections
+///
+/// This enum allows `accept_auto()` to return a single type regardless of
+/// whether the connection uses plain TCP or REALITY-encrypted transport.
+pub enum VlessInboundStream {
+    /// Plain TCP stream
+    Tcp(TcpStream),
+    /// REALITY-encrypted stream (TLS 1.3 with REALITY authentication)
+    Reality(RealityServerStream<TcpStream>),
+}
+
+impl AsyncRead for VlessInboundStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            VlessInboundStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            VlessInboundStream::Reality(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for VlessInboundStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            VlessInboundStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            VlessInboundStream::Reality(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            VlessInboundStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            VlessInboundStream::Reality(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            VlessInboundStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            VlessInboundStream::Reality(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl std::fmt::Debug for VlessInboundStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VlessInboundStream::Tcp(_) => write!(f, "VlessInboundStream::Tcp"),
+            VlessInboundStream::Reality(_) => write!(f, "VlessInboundStream::Reality"),
+        }
+    }
+}
 
 /// VLESS inbound listener
 ///
@@ -483,7 +549,7 @@ impl VlessInboundListener {
     /// ```
     pub async fn accept_reality(
         &self,
-    ) -> VlessInboundResult<Option<VlessConnection<TcpStream>>> {
+    ) -> VlessInboundResult<Option<VlessConnection<RealityServerStream<TcpStream>>>> {
         if !self.active {
             return Err(VlessInboundError::NotActive);
         }
@@ -503,16 +569,16 @@ impl VlessInboundListener {
 
             trace!(client = %client_addr, "Accepted TCP connection (REALITY mode)");
 
-            // Perform REALITY validation
-            match reality_server.accept(tcp_stream).await {
-                Ok(RealityAcceptResult::Authenticated { stream, short_id, .. }) => {
+            // Perform REALITY validation with complete TLS 1.3 handshake
+            match reality_server.accept_with_handshake(tcp_stream).await {
+                Ok(RealityHandshakeResult::Authenticated { stream, short_id }) => {
                     debug!(
                         client = %client_addr,
                         short_id = ?short_id,
-                        "REALITY authentication successful"
+                        "REALITY authentication and TLS handshake successful"
                     );
 
-                    // Now handle VLESS authentication on the authenticated stream
+                    // Now handle VLESS authentication on the encrypted stream
                     match self.handler.handle(stream, client_addr).await {
                         Ok(conn) => return Ok(Some(conn)),
                         Err(e) => {
@@ -528,7 +594,7 @@ impl VlessInboundListener {
                         }
                     }
                 }
-                Ok(RealityAcceptResult::Fallback) => {
+                Ok(RealityHandshakeResult::Fallback) => {
                     // Connection was proxied to fallback
                     debug!(
                         client = %client_addr,
@@ -541,7 +607,7 @@ impl VlessInboundListener {
                     warn!(
                         client = %client_addr,
                         error = %e,
-                        "REALITY accept error"
+                        "REALITY accept/handshake error"
                     );
                     // Continue accepting new connections
                     continue;
@@ -554,7 +620,7 @@ impl VlessInboundListener {
     ///
     /// This method automatically selects the appropriate accept method based on
     /// the configuration:
-    /// - REALITY mode: Uses REALITY protocol validation
+    /// - REALITY mode: Uses REALITY protocol validation with TLS 1.3 handshake
     /// - TLS mode: Uses standard TLS handshake
     /// - Plain mode: Direct VLESS protocol
     ///
@@ -562,11 +628,86 @@ impl VlessInboundListener {
     ///
     /// Returns `Some(VlessConnection)` for authenticated clients, or `None` if
     /// the connection was handled (e.g., proxied to fallback in REALITY mode).
-    pub async fn accept_auto(&self) -> VlessInboundResult<Option<VlessConnection<TcpStream>>> {
-        if self.reality_server.is_some() {
-            self.accept_reality().await
+    ///
+    /// The returned stream is a unified `VlessInboundStream` that can be either
+    /// plain TCP or REALITY-encrypted, allowing callers to handle both cases uniformly.
+    pub async fn accept_auto(&self) -> VlessInboundResult<Option<VlessConnection<VlessInboundStream>>> {
+        if !self.active {
+            return Err(VlessInboundError::NotActive);
+        }
+
+        if let Some(reality_server) = &self.reality_server {
+            // REALITY mode: Complete TLS 1.3 handshake then VLESS auth
+            loop {
+                // Accept TCP connection
+                let (tcp_stream, client_addr) = self
+                    .tcp_listener
+                    .accept()
+                    .await
+                    .map_err(|e| VlessInboundError::accept(e.to_string()))?;
+
+                trace!(client = %client_addr, "Accepted TCP connection (REALITY mode)");
+
+                // Perform REALITY validation with complete TLS 1.3 handshake
+                match reality_server.accept_with_handshake(tcp_stream).await {
+                    Ok(RealityHandshakeResult::Authenticated { stream, short_id }) => {
+                        debug!(
+                            client = %client_addr,
+                            short_id = ?short_id,
+                            "REALITY authentication and TLS handshake successful"
+                        );
+
+                        // Wrap in unified stream type
+                        let unified_stream = VlessInboundStream::Reality(stream);
+
+                        // Handle VLESS authentication on the encrypted stream
+                        match self.handler.handle(unified_stream, client_addr).await {
+                            Ok(conn) => return Ok(Some(conn)),
+                            Err(e) => {
+                                if e.is_recoverable() {
+                                    warn!(
+                                        client = %client_addr,
+                                        error = %e,
+                                        "Recoverable VLESS error after REALITY, continuing"
+                                    );
+                                    continue;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Ok(RealityHandshakeResult::Fallback) => {
+                        debug!(
+                            client = %client_addr,
+                            "REALITY authentication failed, proxied to fallback"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            client = %client_addr,
+                            error = %e,
+                            "REALITY accept/handshake error"
+                        );
+                        continue;
+                    }
+                }
+            }
         } else {
-            self.accept().await.map(Some)
+            // Plain TCP mode
+            let (tcp_stream, client_addr) = self
+                .tcp_listener
+                .accept()
+                .await
+                .map_err(|e| VlessInboundError::accept(e.to_string()))?;
+
+            trace!(client = %client_addr, "Accepted TCP connection");
+
+            // Wrap in unified stream type
+            let unified_stream = VlessInboundStream::Tcp(tcp_stream);
+
+            // Handle VLESS authentication
+            self.handler.handle(unified_stream, client_addr).await.map(Some)
         }
     }
 

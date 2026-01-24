@@ -494,16 +494,49 @@ async def configure_vless():
     tls_key = config.get('tls_key_path')
     fallback = config.get('fallback_server')
 
+    # REALITY parameters
+    reality_enabled = config.get('reality_enabled')
+    reality_private_key = config.get('reality_private_key')
+    reality_short_ids_raw = config.get('reality_short_ids')
+    reality_dest = config.get('reality_dest')
+    reality_server_names_raw = config.get('reality_server_names')
+
+    # Parse REALITY short_ids and server_names (may be JSON array or comma-separated)
+    import json
+    reality_short_ids = None
+    reality_server_names = None
+    if reality_short_ids_raw:
+        try:
+            reality_short_ids = json.loads(reality_short_ids_raw) if isinstance(reality_short_ids_raw, str) and reality_short_ids_raw.startswith('[') else [s.strip() for s in str(reality_short_ids_raw).split(',')]
+        except:
+            reality_short_ids = [str(reality_short_ids_raw).strip()]
+    if reality_server_names_raw:
+        try:
+            reality_server_names = json.loads(reality_server_names_raw) if isinstance(reality_server_names_raw, str) and reality_server_names_raw.startswith('[') else [s.strip() for s in str(reality_server_names_raw).split(',')]
+        except:
+            reality_server_names = [str(reality_server_names_raw).strip()]
+
     async with RustRouterClient() as client:
-        resp = await client.configure_vless_inbound(
-            listen=listen,
-            users=user_configs,
-            tls_cert_path=tls_cert,
-            tls_key_path=tls_key,
-            fallback=fallback,
-        )
+        kwargs = {
+            'listen': listen,
+            'users': user_configs,
+            'tls_cert_path': tls_cert,
+            'tls_key_path': tls_key,
+            'fallback': fallback,
+        }
+        # Add REALITY parameters if enabled
+        if reality_enabled and reality_private_key:
+            kwargs['reality_private_key'] = reality_private_key
+            kwargs['reality_short_ids'] = reality_short_ids
+            kwargs['reality_dest'] = reality_dest
+            kwargs['reality_server_names'] = reality_server_names
+            kwargs['reality_max_time_diff_ms'] = 120000  # 2 minutes
+            print(f'[vless] REALITY enabled with dest={reality_dest}')
+
+        resp = await client.configure_vless_inbound(**kwargs)
         if resp.success:
-            print(f'[vless] Inbound configured on {listen} with {len(user_configs)} users')
+            mode = 'REALITY' if reality_enabled and reality_private_key else ('TLS' if tls_cert else 'TCP')
+            print(f'[vless] Inbound configured on {listen} with {len(user_configs)} users ({mode} mode)')
         else:
             print(f'[vless] Failed to configure: {resp.error}')
 

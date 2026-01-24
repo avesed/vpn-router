@@ -20,8 +20,16 @@
 //!    - Validate short_id is in allowed list
 //!    - Validate timestamp is within acceptable range
 //!
-//! 4. **Handle Result**:
-//!    - If valid: Complete TLS handshake and proceed with VLESS
+//! 4. **Complete TLS 1.3 Handshake**:
+//!    - Generate server ephemeral X25519 keypair
+//!    - Send ServerHello with server's ephemeral public key
+//!    - Derive handshake keys using shared secret
+//!    - Send encrypted EncryptedExtensions + Finished
+//!    - Receive and verify client's Finished
+//!    - Derive application traffic keys
+//!
+//! 5. **Handle Result**:
+//!    - If valid: Return encrypted stream for VLESS protocol
 //!    - If invalid: Transparently proxy to fallback destination
 //!
 //! # Example
@@ -47,8 +55,8 @@
 //!     let server = server.clone();
 //!
 //!     tokio::spawn(async move {
-//!         match server.accept(stream).await {
-//!             Ok(RealityAcceptResult::Authenticated { stream, short_id }) => {
+//!         match server.accept_with_handshake(stream).await {
+//!             Ok(RealityAcceptResult::Authenticated { stream, short_id, .. }) => {
 //!                 // Valid REALITY client - proceed with VLESS
 //!                 println!("Authenticated with short_id: {:?}", short_id);
 //!             }
@@ -65,19 +73,34 @@
 //! # }
 //! ```
 
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use sha2::{Digest, Sha256, Sha384};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, trace, warn};
 
-use crate::reality::auth::{decode_short_id, validate_auth};
+use crate::reality::auth::{decode_short_id, derive_auth_key, validate_auth};
+use crate::reality::certificate::generate_hmac_certificate;
 use crate::reality::common::{
-    CONTENT_TYPE_HANDSHAKE, REALITY_DEFAULT_MAX_TIME_DIFF_MS, REALITY_SESSION_ID_SIZE,
-    REALITY_SHORT_ID_SIZE, TLS_RECORD_HEADER_SIZE,
+    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
+    HANDSHAKE_TYPE_FINISHED, REALITY_AUTH_INFO, REALITY_DEFAULT_MAX_TIME_DIFF_MS,
+    REALITY_SESSION_ID_SIZE, REALITY_SHORT_ID_SIZE, TLS_RECORD_HEADER_SIZE,
+};
+use crate::reality::crypto::{
+    compute_finished_verify_data, decrypt_handshake_message, derive_application_secrets,
+    derive_handshake_keys, derive_traffic_keys, generate_keypair, perform_ecdh, AeadKey,
+    CipherSuite, HashAlgorithm, DEFAULT_CIPHER_SUITES,
 };
 use crate::reality::error::{RealityError, RealityResult};
-use crate::reality::tls::{extract_client_public_key, extract_client_random, extract_session_id};
+use crate::reality::tls::{
+    construct_certificate, construct_certificate_verify, construct_encrypted_extensions,
+    construct_finished, construct_server_hello, extract_client_public_key, extract_client_random,
+    extract_session_id, write_record_header, RecordDecryptor, RecordEncryptor,
+};
 
 /// Maximum size of ClientHello we'll accept (reasonable limit)
 const MAX_CLIENT_HELLO_SIZE: usize = 16384;
@@ -213,12 +236,16 @@ impl Default for RealityServerConfig {
     }
 }
 
-/// Connection result after REALITY validation
+/// Connection result after REALITY validation (without TLS handshake)
+///
+/// **Deprecated**: Use `RealityHandshakeResult` from `accept_with_handshake()` instead.
+/// This result returns the raw TCP stream after REALITY auth validation,
+/// but the TLS 1.3 handshake is NOT completed.
 #[derive(Debug)]
 pub enum RealityAcceptResult<S> {
     /// Valid REALITY auth - proceed with VLESS
     Authenticated {
-        /// The authenticated stream
+        /// The authenticated stream (RAW - TLS handshake NOT complete)
         stream: S,
         /// The matched short ID
         short_id: Vec<u8>,
@@ -227,6 +254,262 @@ pub enum RealityAcceptResult<S> {
     },
     /// Invalid auth - connection proxied to fallback
     Fallback,
+}
+
+/// Connection result after complete REALITY + TLS 1.3 handshake
+pub enum RealityHandshakeResult<S: AsyncRead + AsyncWrite + Unpin> {
+    /// Valid REALITY auth with completed TLS 1.3 handshake
+    Authenticated {
+        /// Encrypted stream ready for application data
+        stream: RealityServerStream<S>,
+        /// The matched short ID
+        short_id: Vec<u8>,
+    },
+    /// Invalid auth - connection proxied to fallback
+    Fallback,
+}
+
+/// Default cipher suite for REALITY server
+const DEFAULT_SERVER_CIPHER_SUITE: CipherSuite = CipherSuite::AES_128_GCM_SHA256;
+
+/// Encrypted stream wrapper for REALITY server connections
+///
+/// Provides AsyncRead/AsyncWrite over the encrypted TLS 1.3 channel.
+pub struct RealityServerStream<T> {
+    inner: T,
+    cipher_suite: CipherSuite,
+    /// Server's application traffic key bytes (for encrypting outbound data)
+    server_app_key_bytes: Vec<u8>,
+    server_app_iv: Vec<u8>,
+    /// Client's application traffic key bytes (for decrypting inbound data)
+    client_app_key_bytes: Vec<u8>,
+    client_app_iv: Vec<u8>,
+    /// Sequence numbers
+    write_seq: u64,
+    read_seq: u64,
+    /// Read buffer for decrypted data
+    read_buffer: Vec<u8>,
+    read_offset: usize,
+    /// Input buffer for accumulating TLS records
+    input_buffer: Vec<u8>,
+}
+
+impl<T> RealityServerStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Create a new server stream with established keys
+    fn new(
+        inner: T,
+        cipher_suite: CipherSuite,
+        server_app_key_bytes: Vec<u8>,
+        server_app_iv: Vec<u8>,
+        client_app_key_bytes: Vec<u8>,
+        client_app_iv: Vec<u8>,
+    ) -> Self {
+        Self {
+            inner,
+            cipher_suite,
+            server_app_key_bytes,
+            server_app_iv,
+            client_app_key_bytes,
+            client_app_iv,
+            write_seq: 0,
+            read_seq: 0,
+            read_buffer: Vec::new(),
+            read_offset: 0,
+            input_buffer: Vec::new(),
+        }
+    }
+
+    /// Get a reference to the underlying transport
+    pub fn get_ref(&self) -> &T {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the underlying transport
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+
+    /// Consume the stream and return the underlying transport
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T> AsyncRead for RealityServerStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Return buffered data first
+        if self.read_offset < self.read_buffer.len() {
+            let available = &self.read_buffer[self.read_offset..];
+            let to_copy = available.len().min(buf.remaining());
+            buf.put_slice(&available[..to_copy]);
+            self.read_offset += to_copy;
+
+            if self.read_offset >= self.read_buffer.len() {
+                self.read_buffer.clear();
+                self.read_offset = 0;
+            }
+
+            return Poll::Ready(Ok(()));
+        }
+
+        // Read from underlying transport into input_buffer
+        let mut read_buf = vec![0u8; 16384];
+        let mut tmp_buf = ReadBuf::new(&mut read_buf);
+
+        match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = tmp_buf.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Ok(())); // EOF
+                }
+
+                self.input_buffer.extend_from_slice(&read_buf[..n]);
+
+                // Try to decrypt a complete record
+                if self.input_buffer.len() < TLS_RECORD_HEADER_SIZE {
+                    // Need more data - wake up again
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+
+                let record_len =
+                    u16::from_be_bytes([self.input_buffer[3], self.input_buffer[4]]) as usize;
+                let total_len = TLS_RECORD_HEADER_SIZE + record_len;
+
+                if self.input_buffer.len() < total_len {
+                    // Need more data
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+
+                // Extract and decrypt record
+                let mut ciphertext: Vec<u8> = self
+                    .input_buffer
+                    .drain(..total_len)
+                    .skip(TLS_RECORD_HEADER_SIZE)
+                    .collect();
+
+                // Extract values to avoid borrow conflicts
+                let cipher_suite = self.cipher_suite;
+                let client_key_bytes = self.client_app_key_bytes.clone();
+                let client_iv = self.client_app_iv.clone();
+
+                let client_key = match AeadKey::new(cipher_suite, &client_key_bytes) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Failed to create decryption key: {}", e),
+                        )));
+                    }
+                };
+
+                let mut decryptor = RecordDecryptor::new(
+                    &client_key,
+                    &client_iv,
+                    &mut self.read_seq,
+                );
+
+                match decryptor.decrypt_record_in_place(&mut ciphertext, record_len as u16) {
+                    Ok((content_type, plaintext)) => {
+                        if content_type == CONTENT_TYPE_APPLICATION_DATA {
+                            let to_copy = plaintext.len().min(buf.remaining());
+                            buf.put_slice(&plaintext[..to_copy]);
+
+                            if to_copy < plaintext.len() {
+                                self.read_buffer.extend_from_slice(&plaintext[to_copy..]);
+                                self.read_offset = 0;
+                            }
+                        }
+                        // Ignore alerts and other content types for now
+
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Decryption failed: {}", e),
+                    ))),
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<T> AsyncWrite for RealityServerStream<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Encrypt the data
+        let mut plaintext_buf = buf.to_vec();
+        let mut ciphertext_buf = Vec::new();
+
+        // Extract values to avoid borrow conflicts
+        let cipher_suite = self.cipher_suite;
+        let server_key_bytes = self.server_app_key_bytes.clone();
+        let server_iv = self.server_app_iv.clone();
+
+        let server_key = match AeadKey::new(cipher_suite, &server_key_bytes) {
+            Ok(k) => k,
+            Err(e) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to create encryption key: {}", e),
+                )));
+            }
+        };
+
+        {
+            let mut encryptor = RecordEncryptor::new(
+                &server_key,
+                &server_iv,
+                &mut self.write_seq,
+            );
+            if let Err(e) = encryptor.encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Encryption failed: {}", e),
+                )));
+            }
+        }
+
+        // Write encrypted data
+        match Pin::new(&mut self.inner).poll_write(cx, &ciphertext_buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    Poll::Ready(Ok(buf.len()))
+                } else {
+                    Poll::Ready(Ok(0))
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// REALITY server for accepting and validating connections
@@ -251,6 +534,17 @@ impl RealityServer {
     #[must_use]
     pub fn config(&self) -> &RealityServerConfig {
         &self.config
+    }
+
+    /// Extract hostname from the destination config (strips port)
+    ///
+    /// For example, "www.google.com:443" returns "www.google.com"
+    fn dest_hostname(&self) -> String {
+        // Strip port from dest (e.g., "www.google.com:443" -> "www.google.com")
+        self.config.dest
+            .rsplit_once(':')
+            .map(|(host, _port)| host.to_string())
+            .unwrap_or_else(|| self.config.dest.clone())
     }
 
     /// Accept and validate a REALITY connection
@@ -324,6 +618,406 @@ impl RealityServer {
                 Ok(RealityAcceptResult::Fallback)
             }
         }
+    }
+
+    /// Accept a REALITY connection with complete TLS 1.3 handshake
+    ///
+    /// This method:
+    /// 1. Reads and validates the ClientHello
+    /// 2. Validates REALITY authentication
+    /// 3. Completes the TLS 1.3 handshake (ServerHello, EncryptedExtensions, Finished)
+    /// 4. Returns an encrypted stream ready for application data
+    ///
+    /// # Arguments
+    /// * `stream` - Incoming TCP stream
+    ///
+    /// # Returns
+    /// * `Authenticated` - Valid REALITY client with encrypted stream
+    /// * `Fallback` - Invalid auth, connection was proxied to fallback
+    ///
+    /// # Errors
+    /// Returns error on I/O failure, handshake failure, or if fallback fails
+    pub async fn accept_with_handshake<S>(
+        &self,
+        mut stream: S,
+    ) -> RealityResult<RealityHandshakeResult<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Read ClientHello
+        let (client_hello, record_data) = self.read_client_hello(&mut stream).await?;
+
+        trace!(
+            client_hello_len = client_hello.len(),
+            "Received ClientHello for handshake"
+        );
+
+        // Parse ClientHello
+        let parsed = match self.parse_client_hello(&client_hello) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "Failed to parse ClientHello - proxying to fallback");
+                self.proxy_to_fallback(stream, &record_data).await?;
+                return Ok(RealityHandshakeResult::Fallback);
+            }
+        };
+
+        // Validate SNI
+        if !self.validate_sni(&parsed.sni) {
+            debug!(sni = %parsed.sni, "Invalid SNI - proxying to fallback");
+            self.proxy_to_fallback(stream, &record_data).await?;
+            return Ok(RealityHandshakeResult::Fallback);
+        }
+
+        // Validate REALITY authentication
+        let normalized_short_ids = self.config.normalized_short_ids();
+        let client_hello_aad =
+            self.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+
+        let session_id = match validate_auth(
+            &parsed.client_random,
+            &parsed.encrypted_session_id,
+            &self.config.private_key,
+            &parsed.client_public_key,
+            &normalized_short_ids,
+            self.config.max_time_diff_ms,
+            &client_hello_aad,
+        ) {
+            Ok(sid) => sid,
+            Err(e) => {
+                debug!(error = %e, "REALITY authentication failed - proxying to fallback");
+                self.proxy_to_fallback(stream, &record_data).await?;
+                return Ok(RealityHandshakeResult::Fallback);
+            }
+        };
+
+        debug!(
+            short_id = ?session_id.short_id,
+            "REALITY authentication successful, completing TLS handshake"
+        );
+
+        // === Complete TLS 1.3 Handshake ===
+
+        // 1. Generate server ephemeral key pair
+        let server_keypair = generate_keypair();
+        let server_ephemeral_public = server_keypair.public_key_bytes();
+
+        // 2. Compute ECDH shared secret for TLS key derivation
+        let tls_shared_secret =
+            perform_ecdh(&server_keypair.private_key_bytes(), &parsed.client_public_key)?;
+
+        // 3. Use default cipher suite (AES_128_GCM_SHA256)
+        let cipher_suite = DEFAULT_SERVER_CIPHER_SUITE;
+        let hash_len = cipher_suite.hash_len();
+
+        // 3.5. Derive auth_key for HMAC certificate (same derivation as client)
+        let shared_secret_for_auth =
+            perform_ecdh(&self.config.private_key, &parsed.client_public_key)?;
+        let auth_key = derive_auth_key(
+            &shared_secret_for_auth,
+            &parsed.client_random[0..20],
+            REALITY_AUTH_INFO,
+        )?;
+
+        // 3.6. Generate HMAC certificate for REALITY authentication
+        let dest_hostname = self.dest_hostname();
+        let hmac_cert = generate_hmac_certificate(&auth_key, &dest_hostname)?;
+
+        trace!(
+            cert_len = hmac_cert.der.len(),
+            hostname = %dest_hostname,
+            "Generated HMAC certificate"
+        );
+
+        // 4. Build ServerHello
+        let server_random: [u8; 32] = crate::reality::crypto::x25519::random_bytes();
+        let session_id_echo = parsed.encrypted_session_id.to_vec(); // Echo back client's session ID
+
+        let server_hello =
+            construct_server_hello(&server_random, &session_id_echo, cipher_suite.id(), &server_ephemeral_public)?;
+
+        // 5. Compute transcript hash (ClientHello || ServerHello)
+        let server_hello_hash = match cipher_suite.hash_algorithm() {
+            HashAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(&client_hello);
+                hasher.update(&server_hello);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha384 => {
+                let mut hasher = Sha384::new();
+                hasher.update(&client_hello);
+                hasher.update(&server_hello);
+                hasher.finalize().to_vec()
+            }
+        };
+
+        // 6. Derive handshake keys
+        let hs_keys = derive_handshake_keys(cipher_suite, &tls_shared_secret, &[], &server_hello_hash)?;
+
+        // 7. Derive server handshake traffic keys
+        let (server_hs_key_bytes, server_hs_iv) =
+            derive_traffic_keys(&hs_keys.server_handshake_traffic_secret, cipher_suite)?;
+        let server_hs_key = AeadKey::new(cipher_suite, &server_hs_key_bytes)?;
+
+        // 8. Derive client handshake traffic keys (for receiving client Finished)
+        let (client_hs_key_bytes, client_hs_iv) =
+            derive_traffic_keys(&hs_keys.client_handshake_traffic_secret, cipher_suite)?;
+        let client_hs_key = AeadKey::new(cipher_suite, &client_hs_key_bytes)?;
+
+        // 9. Build encrypted handshake messages: EncryptedExtensions + Certificate + CertificateVerify + Finished
+        let encrypted_extensions = construct_encrypted_extensions()?;
+        let certificate = construct_certificate(&hmac_cert.der)?;
+
+        // Build transcript up to Certificate for CertificateVerify signature
+        let mut transcript_for_cert_verify = client_hello.clone();
+        transcript_for_cert_verify.extend_from_slice(&server_hello);
+        transcript_for_cert_verify.extend_from_slice(&encrypted_extensions);
+        transcript_for_cert_verify.extend_from_slice(&certificate);
+
+        let cert_verify_hash = match cipher_suite.hash_algorithm() {
+            HashAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(&transcript_for_cert_verify);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha384 => {
+                let mut hasher = Sha384::new();
+                hasher.update(&transcript_for_cert_verify);
+                hasher.finalize().to_vec()
+            }
+        };
+
+        let certificate_verify = construct_certificate_verify(&hmac_cert.signing_key, &cert_verify_hash)?;
+
+        // Build transcript including CertificateVerify for Finished verify_data
+        let mut transcript_for_finished = transcript_for_cert_verify;
+        transcript_for_finished.extend_from_slice(&certificate_verify);
+
+        let handshake_hash_for_finished = match cipher_suite.hash_algorithm() {
+            HashAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(&transcript_for_finished);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha384 => {
+                let mut hasher = Sha384::new();
+                hasher.update(&transcript_for_finished);
+                hasher.finalize().to_vec()
+            }
+        };
+
+        let server_verify_data = compute_finished_verify_data(
+            cipher_suite,
+            &hs_keys.server_handshake_traffic_secret,
+            &handshake_hash_for_finished,
+        )?;
+        let server_finished = construct_finished(&server_verify_data)?;
+
+        // 10. Send ServerHello (unencrypted, as TLS record)
+        let mut server_hello_record =
+            write_record_header(CONTENT_TYPE_HANDSHAKE, server_hello.len() as u16);
+        server_hello_record.extend_from_slice(&server_hello);
+        stream.write_all(&server_hello_record).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to send ServerHello: {}", e),
+            ))
+        })?;
+
+        trace!("Sent ServerHello");
+
+        // 11. Send ChangeCipherSpec (for compatibility with middleboxes)
+        let ccs_record = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]; // ChangeCipherSpec
+        stream.write_all(&ccs_record).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to send ChangeCipherSpec: {}", e),
+            ))
+        })?;
+
+        trace!("Sent ChangeCipherSpec");
+
+        // 12. Encrypt and send EncryptedExtensions + Certificate + CertificateVerify + Finished
+        let mut server_hs_seq = 0u64;
+        let mut encrypted_output = Vec::new();
+
+        {
+            let mut encryptor =
+                RecordEncryptor::new(&server_hs_key, &server_hs_iv, &mut server_hs_seq);
+            encryptor.encrypt_handshake(&encrypted_extensions, &mut encrypted_output)?;
+            encryptor.encrypt_handshake(&certificate, &mut encrypted_output)?;
+            encryptor.encrypt_handshake(&certificate_verify, &mut encrypted_output)?;
+            encryptor.encrypt_handshake(&server_finished, &mut encrypted_output)?;
+        }
+
+        stream.write_all(&encrypted_output).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to send encrypted handshake: {}", e),
+            ))
+        })?;
+
+        trace!(
+            encrypted_len = encrypted_output.len(),
+            "Sent encrypted EncryptedExtensions + Certificate + CertificateVerify + Finished"
+        );
+
+        // 13. Receive client's encrypted Finished
+        // First, skip any ChangeCipherSpec from client
+        let mut client_hs_seq = 0u64;
+
+        loop {
+            let mut header = [0u8; TLS_RECORD_HEADER_SIZE];
+            stream.read_exact(&mut header).await.map_err(|e| {
+                RealityError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read client response header: {}", e),
+                ))
+            })?;
+
+            let record_type = header[0];
+            let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+            let mut record_payload = vec![0u8; record_len];
+            stream.read_exact(&mut record_payload).await.map_err(|e| {
+                RealityError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read client response: {}", e),
+                ))
+            })?;
+
+            // Skip ChangeCipherSpec
+            if record_type == CONTENT_TYPE_CHANGE_CIPHER_SPEC {
+                trace!("Skipping client ChangeCipherSpec");
+                continue;
+            }
+
+            // Expect encrypted handshake (ApplicationData type in TLS 1.3)
+            if record_type != CONTENT_TYPE_APPLICATION_DATA {
+                return Err(RealityError::protocol(format!(
+                    "Expected ApplicationData (client Finished), got 0x{:02x}",
+                    record_type
+                )));
+            }
+
+            // Decrypt client Finished
+            let plaintext = decrypt_handshake_message(
+                cipher_suite,
+                &client_hs_key_bytes,
+                &client_hs_iv,
+                client_hs_seq,
+                &record_payload,
+                record_len as u16,
+            )?;
+
+            client_hs_seq += 1;
+
+            // Verify it's a Finished message
+            if plaintext.is_empty() || plaintext[0] != HANDSHAKE_TYPE_FINISHED {
+                return Err(RealityError::protocol(format!(
+                    "Expected Finished message, got type 0x{:02x}",
+                    plaintext.get(0).copied().unwrap_or(0)
+                )));
+            }
+
+            // Extract verify_data from Finished message
+            if plaintext.len() < 4 {
+                return Err(RealityError::protocol("Finished message too short"));
+            }
+
+            let finished_len = u32::from_be_bytes([0, plaintext[1], plaintext[2], plaintext[3]]) as usize;
+            if plaintext.len() < 4 + finished_len {
+                return Err(RealityError::protocol("Finished message truncated"));
+            }
+
+            let client_verify_data = &plaintext[4..4 + finished_len];
+
+            // Compute expected client verify_data
+            // Transcript includes everything up to server Finished (including Cert and CertVerify)
+            let mut transcript_for_client_finished = client_hello.clone();
+            transcript_for_client_finished.extend_from_slice(&server_hello);
+            transcript_for_client_finished.extend_from_slice(&encrypted_extensions);
+            transcript_for_client_finished.extend_from_slice(&certificate);
+            transcript_for_client_finished.extend_from_slice(&certificate_verify);
+            transcript_for_client_finished.extend_from_slice(&server_finished);
+
+            let hash_for_client_finished = match cipher_suite.hash_algorithm() {
+                HashAlgorithm::Sha256 => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&transcript_for_client_finished);
+                    hasher.finalize().to_vec()
+                }
+                HashAlgorithm::Sha384 => {
+                    let mut hasher = Sha384::new();
+                    hasher.update(&transcript_for_client_finished);
+                    hasher.finalize().to_vec()
+                }
+            };
+
+            let expected_client_verify_data = compute_finished_verify_data(
+                cipher_suite,
+                &hs_keys.client_handshake_traffic_secret,
+                &hash_for_client_finished,
+            )?;
+
+            if client_verify_data != expected_client_verify_data.as_slice() {
+                return Err(RealityError::handshake(
+                    "Client Finished verify_data mismatch",
+                ));
+            }
+
+            trace!("Client Finished verified successfully");
+            break;
+        }
+
+        // 14. Derive application traffic secrets
+        // Full transcript hash up to server Finished (including Cert and CertVerify)
+        // Note: client Finished is NOT included per RFC 8446 Section 4.4.4
+        let mut full_transcript = client_hello.clone();
+        full_transcript.extend_from_slice(&server_hello);
+        full_transcript.extend_from_slice(&encrypted_extensions);
+        full_transcript.extend_from_slice(&certificate);
+        full_transcript.extend_from_slice(&certificate_verify);
+        full_transcript.extend_from_slice(&server_finished);
+
+        let handshake_hash = match cipher_suite.hash_algorithm() {
+            HashAlgorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(&full_transcript);
+                hasher.finalize().to_vec()
+            }
+            HashAlgorithm::Sha384 => {
+                let mut hasher = Sha384::new();
+                hasher.update(&full_transcript);
+                hasher.finalize().to_vec()
+            }
+        };
+
+        let (client_app_secret, server_app_secret) =
+            derive_application_secrets(cipher_suite, &hs_keys.master_secret, &handshake_hash)?;
+
+        let (client_app_key_bytes, client_app_iv) =
+            derive_traffic_keys(&client_app_secret, cipher_suite)?;
+        let (server_app_key_bytes, server_app_iv) =
+            derive_traffic_keys(&server_app_secret, cipher_suite)?;
+
+        debug!("TLS 1.3 handshake complete, derived application keys");
+
+        // 15. Create encrypted stream
+        let reality_stream = RealityServerStream::new(
+            stream,
+            cipher_suite,
+            server_app_key_bytes,
+            server_app_iv,
+            client_app_key_bytes,
+            client_app_iv,
+        );
+
+        Ok(RealityHandshakeResult::Authenticated {
+            stream: reality_stream,
+            short_id: session_id.short_id.to_vec(),
+        })
     }
 
     /// Read and validate the ClientHello from the stream

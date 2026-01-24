@@ -276,7 +276,7 @@ impl RegisteredPeer {
             config.persistent_keepalive,
             tunnel_index,
             None, // No rate limiter
-        ).map_err(|e| IngressError::internal(format!("Failed to create tunnel for peer: {e}")))?;
+        );
 
         // Parse allowed IPs
         let allowed_ips_parsed: Vec<IpNet> = config.allowed_ips

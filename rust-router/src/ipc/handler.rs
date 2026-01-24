@@ -44,7 +44,7 @@ use crate::peer::pairing::PairRequestConfig;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
 use crate::tproxy::UdpWorkerPool;
 use crate::outbound::vless::{VlessConfig, VlessOutbound, VlessTransportConfig, TlsSettings};
-use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessUser as VlessInboundUser};
+use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessInboundStream, VlessUser as VlessInboundUser};
 use crate::vless::{VlessAccount, VlessAccountManager};
 use crate::io::bidirectional_copy;
 
@@ -6292,12 +6292,19 @@ impl IpcHandler {
 
         // Spawn the accept loop task
         let accept_task = tokio::spawn(async move {
-            info!("VLESS inbound accept loop started");
+            info!(
+                has_reality = listener.has_reality(),
+                "VLESS inbound accept loop started"
+            );
 
             loop {
-                // Accept next connection
-                let conn = match listener.accept().await {
-                    Ok(conn) => conn,
+                // Accept next connection - use accept_auto() which handles REALITY vs plain TCP
+                let conn = match listener.accept_auto().await {
+                    Ok(Some(conn)) => conn,
+                    Ok(None) => {
+                        // Connection was forwarded to fallback (REALITY proxy mode)
+                        continue;
+                    }
                     Err(e) => {
                         if e.is_recoverable() {
                             warn!("VLESS accept recoverable error: {}", e);

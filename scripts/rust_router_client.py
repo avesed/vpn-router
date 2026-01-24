@@ -2440,6 +2440,12 @@ class RustRouterClient:
         tls_key_path: Optional[str] = None,
         fallback: Optional[str] = None,
         udp_enabled: bool = True,
+        # REALITY parameters
+        reality_private_key: Optional[str] = None,
+        reality_short_ids: Optional[List[str]] = None,
+        reality_dest: Optional[str] = None,
+        reality_server_names: Optional[List[str]] = None,
+        reality_max_time_diff_ms: Optional[int] = None,
     ) -> IpcResponse:
         """Configure VLESS inbound listener
 
@@ -2453,6 +2459,11 @@ class RustRouterClient:
             tls_key_path: Path to TLS private key file
             fallback: Fallback address for non-VLESS connections
             udp_enabled: Enable UDP support (VLESS command 0x02), default True
+            reality_private_key: REALITY private key (base64)
+            reality_short_ids: List of REALITY short IDs (hex strings)
+            reality_dest: REALITY destination server (e.g., "www.apple.com:443")
+            reality_server_names: List of allowed SNI server names
+            reality_max_time_diff_ms: Maximum time difference for REALITY (ms)
 
         Returns:
             IpcResponse indicating success or failure
@@ -2469,6 +2480,17 @@ class RustRouterClient:
             command["tls_key_path"] = tls_key_path
         if fallback:
             command["fallback"] = fallback
+        # REALITY parameters
+        if reality_private_key:
+            command["reality_private_key"] = reality_private_key
+        if reality_short_ids:
+            command["reality_short_ids"] = reality_short_ids
+        if reality_dest:
+            command["reality_dest"] = reality_dest
+        if reality_server_names:
+            command["reality_server_names"] = reality_server_names
+        if reality_max_time_diff_ms is not None:
+            command["reality_max_time_diff_ms"] = reality_max_time_diff_ms
         return await self._send_command(command)
 
     async def stop_vless_inbound(self) -> IpcResponse:

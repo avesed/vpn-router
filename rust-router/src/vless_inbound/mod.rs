@@ -145,7 +145,7 @@ pub mod listener;
 pub use config::{InboundRealityConfig, InboundTlsConfig, VlessInboundConfig, VlessUser};
 pub use error::{VlessInboundError, VlessInboundResult};
 pub use handler::{AuthenticatedUser, VlessConnection, VlessConnectionHandler, VlessDestination};
-pub use listener::{VlessInboundListener, VlessInboundStats};
+pub use listener::{VlessInboundListener, VlessInboundStats, VlessInboundStream};
 
 #[cfg(test)]
 mod tests {

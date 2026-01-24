@@ -609,8 +609,7 @@ impl UserspaceWgTunnel {
             self.config.persistent_keepalive,
             index,
             None, // No rate limiter
-        )
-        .map_err(|e| WgTunnelError::Internal(format!("Failed to create tunnel: {e}")))?;
+        );
 
         // Store tunnel instance
         {

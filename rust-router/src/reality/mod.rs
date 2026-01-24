@@ -96,6 +96,7 @@ pub mod tls;
 
 // Protocol implementation
 mod auth;
+pub mod certificate;
 mod client;
 pub mod server;
 mod stream;
@@ -125,10 +126,14 @@ pub use crypto::{
 
 // TLS message handling
 pub use tls::{
-    construct_client_hello, construct_encrypted_extensions, construct_finished,
-    construct_server_hello, extract_server_cipher_suite, extract_server_public_key,
-    write_record_header, RecordDecryptor, RecordEncryptor, DEFAULT_ALPN_PROTOCOLS,
+    construct_certificate, construct_certificate_verify, construct_client_hello,
+    construct_encrypted_extensions, construct_finished, construct_server_hello,
+    extract_server_cipher_suite, extract_server_public_key, write_record_header,
+    RecordDecryptor, RecordEncryptor, DEFAULT_ALPN_PROTOCOLS,
 };
+
+// HMAC certificate generation
+pub use certificate::{generate_hmac_certificate, HmacCertificate};
 
 // Authentication
 pub use auth::{
@@ -140,7 +145,10 @@ pub use auth::{
 pub use client::{FeedResult, RealityClientConfig, RealityClientConnection};
 
 // Server connection
-pub use server::{extract_client_sni, RealityAcceptResult, RealityServer, RealityServerConfig};
+pub use server::{
+    extract_client_sni, RealityAcceptResult, RealityHandshakeResult, RealityServer,
+    RealityServerConfig, RealityServerStream,
+};
 
 // Async stream wrappers
 pub use stream::{RealityConnector, RealityStream};

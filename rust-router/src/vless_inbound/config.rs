@@ -24,11 +24,23 @@
 
 use std::net::SocketAddr;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use super::error::{VlessInboundError, VlessInboundResult};
 use crate::reality::server::RealityServerConfig;
 use crate::vless::{VlessAccount, VlessAccountManager};
+
+/// Decode Base64 supporting both standard and URL-safe encoding
+///
+/// Xray typically uses URL-safe Base64 (with `-` and `_`) for X25519 keys,
+/// while some tools use standard Base64 (with `+` and `/`). This function
+/// tries both encodings for compatibility.
+fn decode_base64_flexible(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+}
 
 /// Configuration for VLESS inbound listener
 ///
@@ -184,11 +196,7 @@ impl InboundRealityConfig {
             return Err(VlessInboundError::invalid_config("REALITY private_key is empty"));
         }
 
-        let key_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &self.private_key,
-        )
-        .map_err(|e| {
+        let key_bytes = decode_base64_flexible(&self.private_key).map_err(|e| {
             VlessInboundError::invalid_config(format!("Invalid REALITY private_key Base64: {}", e))
         })?;
 
@@ -254,11 +262,7 @@ impl InboundRealityConfig {
         self.validate()?;
 
         // Decode private key
-        let key_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &self.private_key,
-        )
-        .map_err(|e| {
+        let key_bytes = decode_base64_flexible(&self.private_key).map_err(|e| {
             VlessInboundError::invalid_config(format!("Invalid REALITY private_key: {}", e))
         })?;
 
@@ -295,11 +299,7 @@ impl InboundRealityConfig {
     ///
     /// Returns error if private key is invalid.
     pub fn public_key(&self) -> VlessInboundResult<String> {
-        let key_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &self.private_key,
-        )
-        .map_err(|e| {
+        let key_bytes = decode_base64_flexible(&self.private_key).map_err(|e| {
             VlessInboundError::invalid_config(format!("Invalid REALITY private_key: {}", e))
         })?;
 
