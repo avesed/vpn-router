@@ -45,5 +45,7 @@
 mod config;
 mod error;
 
-pub use config::{ShadowsocksMethod, ShadowsocksOutboundConfig, ShadowsocksOutboundInfo};
+pub use config::{
+    ShadowsocksMethod, ShadowsocksOutboundConfig, ShadowsocksOutboundInfo, ShadowsocksTransport,
+};
 pub use error::ShadowsocksError;

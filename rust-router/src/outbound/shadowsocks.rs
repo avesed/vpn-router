@@ -4,12 +4,25 @@
 //! Shadowsocks is a secure proxy protocol with AEAD encryption, commonly used for
 //! bypassing network restrictions.
 //!
+//! # Transport Types
+//!
+//! Shadowsocks supports multiple transport types:
+//!
+//! - **TCP** (default): Standard TCP connection
+//! - **QUIC** (optional, `transport-quic` feature): QUIC transport for better performance
+//!
 //! # Protocol Overview
 //!
 //! ## TCP Connection Flow
 //! 1. Establish TCP connection to the Shadowsocks server
 //! 2. Send encrypted target address header
 //! 3. Bidirectional encrypted data relay
+//!
+//! ## QUIC Connection Flow
+//! 1. Establish QUIC connection to the Shadowsocks server
+//! 2. Open bidirectional stream
+//! 3. Send encrypted target address header
+//! 4. Bidirectional encrypted data relay
 //!
 //! ## UDP Relay Flow
 //! 1. Create UDP socket connected to the Shadowsocks server
@@ -26,21 +39,21 @@
 //! use std::time::Duration;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = ShadowsocksOutboundConfig::new("ss.example.com", 8388, "password")
-//!     .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm)
-//!     .with_udp(true); // Enable UDP relay
+//! // TCP transport (default)
+//! let tcp_config = ShadowsocksOutboundConfig::new("ss.example.com", 8388, "password")
+//!     .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
 //!
-//! let outbound = ShadowsocksOutbound::new("my-ss", config)?;
+//! let tcp_outbound = ShadowsocksOutbound::new("my-ss-tcp", tcp_config)?;
 //!
-//! // TCP connection
-//! let conn = outbound.connect("8.8.8.8:443".parse()?, Duration::from_secs(10)).await?;
+//! // QUIC transport
+//! let quic_config = ShadowsocksOutboundConfig::new("ss.example.com", 8388, "password")
+//!     .with_quic()
+//!     .with_quic_sni("ss.example.com");
 //!
-//! // UDP relay (when UDP is enabled)
-//! if outbound.supports_udp() {
-//!     let udp_handle = outbound.connect_udp("8.8.8.8:53".parse()?, Duration::from_secs(5)).await?;
-//!     // Send DNS query
-//!     udp_handle.send(b"DNS query data").await?;
-//! }
+//! let quic_outbound = ShadowsocksOutbound::new("my-ss-quic", quic_config)?;
+//!
+//! // Connect
+//! let conn = tcp_outbound.connect("8.8.8.8:443".parse()?, Duration::from_secs(10)).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -64,7 +77,9 @@ use super::traits::{
 };
 use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
-use crate::shadowsocks::{ShadowsocksError, ShadowsocksMethod, ShadowsocksOutboundConfig};
+use crate::shadowsocks::{
+    ShadowsocksError, ShadowsocksMethod, ShadowsocksOutboundConfig, ShadowsocksTransport,
+};
 
 #[cfg(feature = "shadowsocks")]
 use shadowsocks::{
@@ -79,23 +94,76 @@ use shadowsocks::{
     ServerAddr,
 };
 
+#[cfg(all(feature = "shadowsocks", feature = "transport-quic"))]
+use crate::transport::{QuicClientConfig, QuicEndpointPool, QuicStream};
+
 // ============================================================================
 // Shadowsocks Stream Wrapper
 // ============================================================================
 
+/// Inner stream type for Shadowsocks connections
+///
+/// This enum allows Shadowsocks to work over different transports while
+/// maintaining a unified interface.
+#[cfg(feature = "shadowsocks")]
+enum ShadowsocksStreamInner {
+    /// TCP-based Shadowsocks stream
+    Tcp(ProxyClientStream<SsTcpStream>),
+
+    /// QUIC-based Shadowsocks stream
+    #[cfg(feature = "transport-quic")]
+    Quic(ProxyClientStream<QuicStream>),
+}
+
 /// Wrapper around `ProxyClientStream` that implements `AsyncRead` and `AsyncWrite`
 ///
 /// This wrapper is needed because `ProxyClientStream` has a generic parameter
-/// and we need a concrete type for `OutboundStream`.
+/// and we need a concrete type for `OutboundStream`. It supports both TCP and
+/// QUIC transport types.
+///
+/// # Transport Types
+///
+/// - **TCP**: Standard TCP connection (default)
+/// - **QUIC**: QUIC transport for better performance over lossy networks
 #[cfg(feature = "shadowsocks")]
 pub struct ShadowsocksStream {
-    inner: ProxyClientStream<SsTcpStream>,
+    inner: ShadowsocksStreamInner,
 }
 
 #[cfg(feature = "shadowsocks")]
 impl ShadowsocksStream {
-    fn new(inner: ProxyClientStream<SsTcpStream>) -> Self {
-        Self { inner }
+    /// Create a new Shadowsocks stream from a TCP-based ProxyClientStream
+    fn from_tcp(inner: ProxyClientStream<SsTcpStream>) -> Self {
+        Self {
+            inner: ShadowsocksStreamInner::Tcp(inner),
+        }
+    }
+
+    /// Create a new Shadowsocks stream from a QUIC-based ProxyClientStream
+    #[cfg(feature = "transport-quic")]
+    fn from_quic(inner: ProxyClientStream<QuicStream>) -> Self {
+        Self {
+            inner: ShadowsocksStreamInner::Quic(inner),
+        }
+    }
+
+    /// Check if this stream uses QUIC transport
+    #[allow(dead_code)]
+    pub fn is_quic(&self) -> bool {
+        #[cfg(feature = "transport-quic")]
+        {
+            matches!(self.inner, ShadowsocksStreamInner::Quic(_))
+        }
+        #[cfg(not(feature = "transport-quic"))]
+        {
+            false
+        }
+    }
+
+    /// Check if this stream uses TCP transport
+    #[allow(dead_code)]
+    pub fn is_tcp(&self) -> bool {
+        matches!(self.inner, ShadowsocksStreamInner::Tcp(_))
     }
 }
 
@@ -106,7 +174,11 @@ impl AsyncRead for ShadowsocksStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        match &mut self.inner {
+            ShadowsocksStreamInner::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksStreamInner::Quic(s) => Pin::new(s).poll_read(cx, buf),
+        }
     }
 }
 
@@ -117,22 +189,44 @@ impl AsyncWrite for ShadowsocksStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        match &mut self.inner {
+            ShadowsocksStreamInner::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksStreamInner::Quic(s) => Pin::new(s).poll_write(cx, buf),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match &mut self.inner {
+            ShadowsocksStreamInner::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksStreamInner::Quic(s) => Pin::new(s).poll_flush(cx),
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        match &mut self.inner {
+            ShadowsocksStreamInner::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksStreamInner::Quic(s) => Pin::new(s).poll_shutdown(cx),
+        }
     }
 }
 
 #[cfg(feature = "shadowsocks")]
 impl fmt::Debug for ShadowsocksStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ShadowsocksStream").finish_non_exhaustive()
+        match &self.inner {
+            ShadowsocksStreamInner::Tcp(_) => f
+                .debug_struct("ShadowsocksStream")
+                .field("transport", &"tcp")
+                .finish_non_exhaustive(),
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksStreamInner::Quic(_) => f
+                .debug_struct("ShadowsocksStream")
+                .field("transport", &"quic")
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -398,6 +492,205 @@ impl ShadowsocksOutbound {
     fn socket_addr_to_ss_address(addr: SocketAddr) -> SsAddress {
         SsAddress::SocketAddress(addr)
     }
+
+    /// Get the transport type string for logging
+    fn transport_type(&self) -> &'static str {
+        match &self.config.transport {
+            ShadowsocksTransport::Tcp => "tcp",
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksTransport::Quic { .. } => "quic",
+        }
+    }
+
+    /// Connect to a destination via TCP transport
+    async fn connect_tcp(
+        &self,
+        addr: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<OutboundConnection, OutboundError> {
+        debug!(
+            "Shadowsocks (TCP) connecting to {} via {} (server: {})",
+            addr,
+            self.tag,
+            self.config.server_string()
+        );
+
+        // Convert destination to Shadowsocks Address
+        let ss_addr = Self::socket_addr_to_ss_address(addr);
+
+        // Connect via Shadowsocks proxy with timeout
+        let connect_result = timeout(
+            connect_timeout,
+            ProxyClientStream::connect(self.ss_context.clone(), &self.ss_config, ss_addr),
+        )
+        .await;
+
+        match connect_result {
+            Ok(Ok(proxy_stream)) => {
+                self.update_health(true);
+                debug!(
+                    "Shadowsocks (TCP) connection to {} via {} successful",
+                    addr, self.tag
+                );
+
+                // Wrap the ProxyClientStream in our wrapper
+                let ss_stream = ShadowsocksStream::from_tcp(proxy_stream);
+                Ok(OutboundConnection::from_shadowsocks(ss_stream, addr))
+            }
+            Ok(Err(e)) => {
+                self.update_health(false);
+                self.stats.record_error();
+                warn!(
+                    "Shadowsocks (TCP) connection to {} via {} failed: {}",
+                    addr, self.tag, e
+                );
+                Err(OutboundError::connection_failed(
+                    addr,
+                    format!("Shadowsocks TCP connection failed: {e}"),
+                ))
+            }
+            Err(_) => {
+                self.update_health(false);
+                self.stats.record_error();
+                warn!(
+                    "Shadowsocks (TCP) connection to {} via {} timed out",
+                    addr, self.tag
+                );
+                Err(OutboundError::Timeout {
+                    addr,
+                    timeout_secs: connect_timeout.as_secs(),
+                })
+            }
+        }
+    }
+
+    /// Connect to a destination via QUIC transport
+    #[cfg(feature = "transport-quic")]
+    async fn connect_quic(
+        &self,
+        addr: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<OutboundConnection, OutboundError> {
+        use std::net::ToSocketAddrs;
+
+        debug!(
+            "Shadowsocks (QUIC) connecting to {} via {} (server: {})",
+            addr,
+            self.tag,
+            self.config.server_string()
+        );
+
+        // Extract QUIC configuration
+        let (sni, alpn, skip_verify, idle_timeout_secs, keep_alive_secs) =
+            match &self.config.transport {
+                ShadowsocksTransport::Quic {
+                    sni,
+                    alpn,
+                    skip_verify,
+                    idle_timeout_secs,
+                    keep_alive_secs,
+                } => (
+                    sni.clone(),
+                    alpn.clone(),
+                    *skip_verify,
+                    *idle_timeout_secs,
+                    *keep_alive_secs,
+                ),
+                _ => unreachable!("connect_quic called with non-QUIC transport"),
+            };
+
+        // Use SNI or fall back to server address
+        let server_name = sni.unwrap_or_else(|| self.config.server.clone());
+
+        // Resolve server address
+        let server_addr_str = self.config.server_string();
+        let server_socket_addr = server_addr_str
+            .to_socket_addrs()
+            .map_err(|e| {
+                OutboundError::connection_failed(
+                    addr,
+                    format!("Failed to resolve server address {}: {}", server_addr_str, e),
+                )
+            })?
+            .next()
+            .ok_or_else(|| {
+                OutboundError::connection_failed(
+                    addr,
+                    format!("No addresses found for {}", server_addr_str),
+                )
+            })?;
+
+        // Create QUIC client configuration
+        let mut quic_config = QuicClientConfig::new(&server_name)
+            .with_idle_timeout(idle_timeout_secs)
+            .with_keep_alive_interval(keep_alive_secs)
+            .with_num_endpoints(1); // Use single endpoint per connection
+
+        if !alpn.is_empty() {
+            quic_config = quic_config.with_alpn(alpn);
+        }
+
+        if skip_verify {
+            quic_config = quic_config.insecure_skip_verify();
+        }
+
+        // Connect via QUIC with timeout
+        let connect_result = timeout(connect_timeout, async {
+            // Create endpoint pool (single endpoint)
+            let pool = QuicEndpointPool::new(&quic_config).await?;
+
+            // Connect to the Shadowsocks server via QUIC
+            let quic_stream = pool.connect(server_socket_addr, &server_name).await?;
+
+            // Convert destination to Shadowsocks Address
+            let ss_addr = Self::socket_addr_to_ss_address(addr);
+
+            // Create ProxyClientStream over the QUIC stream
+            let proxy_stream =
+                ProxyClientStream::from_stream(self.ss_context.clone(), quic_stream, &self.ss_config, ss_addr);
+
+            Ok::<_, crate::transport::TransportError>(proxy_stream)
+        })
+        .await;
+
+        match connect_result {
+            Ok(Ok(proxy_stream)) => {
+                self.update_health(true);
+                debug!(
+                    "Shadowsocks (QUIC) connection to {} via {} successful",
+                    addr, self.tag
+                );
+
+                // Wrap the ProxyClientStream in our wrapper
+                let ss_stream = ShadowsocksStream::from_quic(proxy_stream);
+                Ok(OutboundConnection::from_shadowsocks(ss_stream, addr))
+            }
+            Ok(Err(e)) => {
+                self.update_health(false);
+                self.stats.record_error();
+                warn!(
+                    "Shadowsocks (QUIC) connection to {} via {} failed: {}",
+                    addr, self.tag, e
+                );
+                Err(OutboundError::connection_failed(
+                    addr,
+                    format!("Shadowsocks QUIC connection failed: {e}"),
+                ))
+            }
+            Err(_) => {
+                self.update_health(false);
+                self.stats.record_error();
+                warn!(
+                    "Shadowsocks (QUIC) connection to {} via {} timed out",
+                    addr, self.tag
+                );
+                Err(OutboundError::Timeout {
+                    addr,
+                    timeout_secs: connect_timeout.as_secs(),
+                })
+            }
+        }
+    }
 }
 
 #[cfg(feature = "shadowsocks")]
@@ -417,73 +710,11 @@ impl Outbound for ShadowsocksOutbound {
 
         self.stats.record_connection();
 
-        debug!(
-            "Shadowsocks connecting to {} via {} (server: {})",
-            addr,
-            self.tag,
-            self.config.server_string()
-        );
-
-        // Convert destination to Shadowsocks Address
-        let ss_addr = Self::socket_addr_to_ss_address(addr);
-
-        // Connect via Shadowsocks proxy with timeout
-        let connect_result = timeout(
-            connect_timeout,
-            ProxyClientStream::connect(
-                self.ss_context.clone(),
-                &self.ss_config,
-                ss_addr,
-            ),
-        )
-        .await;
-
-        match connect_result {
-            Ok(Ok(proxy_stream)) => {
-                self.update_health(true);
-                debug!(
-                    "Shadowsocks connection to {} via {} successful",
-                    addr, self.tag
-                );
-
-                // Wrap the ProxyClientStream in our wrapper
-                let ss_stream = ShadowsocksStream::new(proxy_stream);
-
-                // Create OutboundConnection
-                // We need to wrap ShadowsocksStream in a type that OutboundStream can hold
-                // For now, use a Box<dyn AsyncRead + AsyncWrite + Send + Unpin>
-                // Since OutboundStream doesn't have a Shadowsocks variant, we'll use Transport
-                // Actually, we need to add support for this in traits.rs
-                // For now, let's create a workaround using TcpStream pattern
-
-                // Note: This is a limitation - we'd need to add OutboundStream::Shadowsocks
-                // For now, we'll create a custom connection that holds the stream directly
-                Ok(OutboundConnection::from_shadowsocks(ss_stream, addr))
-            }
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                warn!(
-                    "Shadowsocks connection to {} via {} failed: {}",
-                    addr, self.tag, e
-                );
-                Err(OutboundError::connection_failed(
-                    addr,
-                    format!("Shadowsocks connection failed: {e}"),
-                ))
-            }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                warn!(
-                    "Shadowsocks connection to {} via {} timed out",
-                    addr, self.tag
-                );
-                Err(OutboundError::Timeout {
-                    addr,
-                    timeout_secs: connect_timeout.as_secs(),
-                })
-            }
+        // Dispatch based on transport type
+        match &self.config.transport {
+            ShadowsocksTransport::Tcp => self.connect_tcp(addr, connect_timeout).await,
+            #[cfg(feature = "transport-quic")]
+            ShadowsocksTransport::Quic { .. } => self.connect_quic(addr, connect_timeout).await,
         }
     }
 
@@ -609,6 +840,7 @@ impl fmt::Debug for ShadowsocksOutbound {
             .field("tag", &self.tag)
             .field("server", &self.config.server_string())
             .field("method", &self.config.method)
+            .field("transport", &self.transport_type())
             .field("enabled", &self.is_enabled())
             .field("health", &self.health_status())
             .finish_non_exhaustive()

@@ -83,6 +83,8 @@ pub mod outbound;
 pub mod peer;
 pub mod reality;
 pub mod rules;
+#[cfg(feature = "transport-quic")]
+pub mod quic_inbound;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
 pub mod sniff;
@@ -195,6 +197,16 @@ pub use ss_inbound::{
     ShadowsocksInboundConfig, ShadowsocksInboundError, ShadowsocksInboundListener,
     ShadowsocksInboundResult, ShadowsocksInboundStats, ShadowsocksInboundStatsSnapshot,
     ShadowsocksInboundStatus,
+};
+#[cfg(feature = "transport-quic")]
+pub use quic_inbound::{
+    ConnectionGuard as QuicConnectionGuardWrapper, QuicInboundConfig, QuicInboundConnection,
+    QuicInboundError, QuicInboundListener, QuicInboundResult, QuicInboundStatus,
+};
+#[cfg(feature = "transport-quic")]
+pub use transport::{
+    QuicConnection, QuicConnectionGuard, QuicInboundStats, QuicInboundStatsSnapshot,
+    QuicServerConfig, build_server_config, load_certs_from_pem, load_key_from_pem,
 };
 
 /// Crate version

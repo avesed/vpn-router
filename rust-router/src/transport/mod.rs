@@ -84,7 +84,15 @@ pub use tls::TlsTransport;
 pub use websocket::WebSocketTransport;
 
 #[cfg(feature = "transport-quic")]
-pub use quic::{QuicClientConfig, QuicEndpointPool, QuicStream};
+pub use quic::{
+    // Client types
+    QuicClientConfig, QuicEndpointPool, QuicStream,
+    // Server types
+    QuicServerConfig, QuicInboundListener, QuicConnection, QuicConnectionGuard,
+    QuicInboundStats, QuicInboundStatsSnapshot,
+    // Helper functions
+    build_server_config, load_certs_from_pem, load_key_from_pem,
+};
 
 use std::io;
 use std::pin::Pin;

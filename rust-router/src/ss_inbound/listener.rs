@@ -748,4 +748,80 @@ mod tests {
         assert!(debug_str.contains("ShadowsocksInboundListener"));
         assert!(debug_str.contains("127.0.0.1"));
     }
+
+    #[test]
+    fn test_connection_guard_increment_on_create() {
+        let stats = Arc::new(ShadowsocksInboundStats::new());
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+
+        let _guard = ConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_connection_guard_decrement_on_drop() {
+        let stats = Arc::new(ShadowsocksInboundStats::new());
+
+        {
+            let _guard = ConnectionGuard::new(Arc::clone(&stats));
+            assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+        }
+
+        // After guard is dropped, count should be decremented
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_connection_guard_multiple() {
+        let stats = Arc::new(ShadowsocksInboundStats::new());
+
+        let guard1 = ConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        let guard2 = ConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 2);
+
+        drop(guard1);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(guard2);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_connection_guard_clone() {
+        let stats = Arc::new(ShadowsocksInboundStats::new());
+
+        let guard1 = ConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        let guard2 = guard1.clone();
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 2);
+
+        drop(guard1);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(guard2);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_connection_guard_stats_access() {
+        let stats = Arc::new(ShadowsocksInboundStats::new());
+        stats.connections_accepted.fetch_add(10, Ordering::Relaxed);
+
+        let guard = ConnectionGuard::new(Arc::clone(&stats));
+
+        assert_eq!(guard.stats().connections_accepted.load(Ordering::Relaxed), 10);
+        assert_eq!(guard.stats().active_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_connection_guard_debug() {
+        let stats = Arc::new(ShadowsocksInboundStats::new());
+        let guard = ConnectionGuard::new(stats);
+
+        let debug_str = format!("{:?}", guard);
+        assert!(debug_str.contains("ConnectionGuard"));
+    }
 }

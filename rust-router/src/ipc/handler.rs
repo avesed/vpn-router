@@ -237,6 +237,22 @@ pub struct IpcHandler {
 
     /// VLESS reply registry for routing WG replies back to VLESS sessions
     vless_reply_registry: Option<Arc<crate::vless_wg_bridge::VlessReplyRegistry>>,
+
+    // ========================================================================
+    // Shadowsocks Components
+    // ========================================================================
+
+    /// Shadowsocks inbound listener (wrapped in RwLock for dynamic updates)
+    #[cfg(feature = "shadowsocks")]
+    ss_inbound: RwLock<Option<Arc<crate::ss_inbound::ShadowsocksInboundListener>>>,
+
+    /// Shadowsocks inbound configuration (stored for status queries)
+    #[cfg(feature = "shadowsocks")]
+    ss_inbound_config: RwLock<Option<crate::ss_inbound::ShadowsocksInboundConfig>>,
+
+    /// Shadowsocks inbound accept task handle
+    #[cfg(feature = "shadowsocks")]
+    ss_inbound_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl IpcHandler {
@@ -275,6 +291,12 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_config: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_task: RwLock::new(None),
         }
     }
 
@@ -319,6 +341,12 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_config: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_task: RwLock::new(None),
         }
     }
 
@@ -362,6 +390,12 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_config: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_task: RwLock::new(None),
         }
     }
 
@@ -408,6 +442,12 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_config: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_inbound_task: RwLock::new(None),
         }
     }
 
@@ -1016,7 +1056,7 @@ impl IpcHandler {
                 password,
                 udp_enabled,
             } => {
-                self.handle_configure_shadowsocks_inbound(&listen, &method, &password, udp_enabled)
+                self.handle_configure_shadowsocks_inbound(&listen, &method, &password, udp_enabled).await
             }
             #[cfg(feature = "shadowsocks")]
             IpcCommand::GetShadowsocksInboundStatus => {
@@ -6971,10 +7011,10 @@ impl IpcHandler {
 
     /// Handle ConfigureShadowsocksInbound command
     ///
-    /// Note: This is a placeholder implementation. The actual listener management
-    /// will be done in main.rs similar to VlessInboundListener.
+    /// Creates and starts a Shadowsocks inbound listener.
+    /// Supports AEAD 2022 and legacy AEAD ciphers.
     #[cfg(feature = "shadowsocks")]
-    fn handle_configure_shadowsocks_inbound(
+    async fn handle_configure_shadowsocks_inbound(
         &self,
         listen: &str,
         method: &str,
@@ -6983,6 +7023,18 @@ impl IpcHandler {
     ) -> IpcResponse {
         use crate::ipc::protocol::ShadowsocksInboundStatusResponse;
         use crate::shadowsocks::ShadowsocksMethod;
+        use crate::ss_inbound::{ShadowsocksInboundConfig, ShadowsocksInboundListener};
+
+        // Check if already running
+        {
+            let inbound_guard = self.ss_inbound.read();
+            if inbound_guard.is_some() {
+                return IpcResponse::error(
+                    ErrorCode::AlreadyExists,
+                    "Shadowsocks inbound listener is already running. Stop it first.",
+                );
+            }
+        }
 
         // Parse listen address
         let listen_addr: std::net::SocketAddr = match listen.parse() {
@@ -7014,61 +7066,209 @@ impl IpcHandler {
             );
         }
 
-        // Log the configuration (actual listener will be started by main.rs)
         info!(
             listen = %listen_addr,
             method = %ss_method,
             udp = udp_enabled,
-            "Shadowsocks inbound configuration received"
+            "Configuring Shadowsocks inbound listener"
         );
 
-        // Return success with initial status
-        // Note: The actual listener lifecycle is managed externally
+        // Build configuration
+        let config = ShadowsocksInboundConfig::new(listen_addr, password)
+            .with_method(ss_method)
+            .with_udp(udp_enabled);
+
+        // Validate configuration
+        if let Err(e) = config.validate() {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!("Invalid configuration: {}", e),
+            );
+        }
+
+        // Create the listener
+        let listener = match ShadowsocksInboundListener::new(config.clone()).await {
+            Ok(l) => Arc::new(l),
+            Err(e) => {
+                error!(error = %e, "Failed to create Shadowsocks inbound listener");
+                return IpcResponse::error(
+                    ErrorCode::InternalError,
+                    format!("Failed to create listener: {}", e),
+                );
+            }
+        };
+
+        // Store the configuration for status queries
+        {
+            let mut config_guard = self.ss_inbound_config.write();
+            *config_guard = Some(config);
+        }
+
+        // Store the listener
+        {
+            let mut inbound_guard = self.ss_inbound.write();
+            *inbound_guard = Some(Arc::clone(&listener));
+        }
+
+        // Start the accept loop in a background task
+        // Note: This is a simplified version. In production, you'd integrate with
+        // the RuleEngine and outbound routing similar to VLESS.
+        let listener_clone = Arc::clone(&listener);
+        let accept_task = tokio::spawn(async move {
+            info!("Shadowsocks inbound accept loop started");
+
+            loop {
+                match listener_clone.accept_with_guard().await {
+                    Ok((conn, _guard)) => {
+                        debug!(
+                            client = %conn.client_addr(),
+                            destination = %conn.destination(),
+                            "Accepted Shadowsocks connection"
+                        );
+                        // Note: Actual connection handling would be done here
+                        // with routing through RuleEngine and forwarding to outbounds.
+                        // For now, we just log and the connection will be dropped.
+                    }
+                    Err(e) => {
+                        if !listener_clone.is_active() {
+                            info!("Shadowsocks inbound listener shutting down");
+                            break;
+                        }
+                        if e.is_recoverable() {
+                            warn!(error = %e, "Recoverable error in Shadowsocks accept loop");
+                        } else {
+                            error!(error = %e, "Fatal error in Shadowsocks accept loop");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Store the task handle for cleanup
+        {
+            let mut task_guard = self.ss_inbound_task.write();
+            *task_guard = Some(accept_task);
+        }
+
+        info!(
+            listen = %listen_addr,
+            method = %ss_method,
+            "Shadowsocks inbound listener started"
+        );
+
+        // Return success status
+        let stats = listener.stats_snapshot();
         IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
-            active: false, // Will be updated once listener starts
+            active: listener.is_active(),
             listen: listen_addr.to_string(),
             method: ss_method.to_string(),
             udp_enabled,
-            connections_accepted: 0,
-            active_connections: 0,
-            protocol_errors: 0,
-            bytes_received: 0,
-            bytes_sent: 0,
+            connections_accepted: stats.connections_accepted,
+            active_connections: stats.active_connections,
+            protocol_errors: stats.protocol_errors,
+            bytes_received: stats.bytes_received,
+            bytes_sent: stats.bytes_sent,
         })
     }
 
     /// Handle GetShadowsocksInboundStatus command
     ///
-    /// Note: This is a placeholder implementation. The actual status
-    /// will be retrieved from the listener managed by main.rs.
+    /// Returns the current status of the Shadowsocks inbound listener.
     #[cfg(feature = "shadowsocks")]
     fn handle_get_shadowsocks_inbound_status(&self) -> IpcResponse {
         use crate::ipc::protocol::ShadowsocksInboundStatusResponse;
 
-        // Return status indicating no listener is running
-        // In production, this would query the actual listener state
-        IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
-            active: false,
-            listen: "0.0.0.0:8388".to_string(),
-            method: "2022-blake3-aes-256-gcm".to_string(),
-            udp_enabled: false,
-            connections_accepted: 0,
-            active_connections: 0,
-            protocol_errors: 0,
-            bytes_received: 0,
-            bytes_sent: 0,
-        })
+        let inbound_guard = self.ss_inbound.read();
+        let config_guard = self.ss_inbound_config.read();
+
+        match (inbound_guard.as_ref(), config_guard.as_ref()) {
+            (Some(listener), Some(config)) => {
+                let stats = listener.stats_snapshot();
+                IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
+                    active: listener.is_active(),
+                    listen: config.listen.to_string(),
+                    method: config.method.to_string(),
+                    udp_enabled: config.udp_enabled,
+                    connections_accepted: stats.connections_accepted,
+                    active_connections: stats.active_connections,
+                    protocol_errors: stats.protocol_errors,
+                    bytes_received: stats.bytes_received,
+                    bytes_sent: stats.bytes_sent,
+                })
+            }
+            (Some(listener), None) => {
+                // Listener exists but no config (shouldn't happen normally)
+                let stats = listener.stats_snapshot();
+                IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
+                    active: listener.is_active(),
+                    listen: listener.listen_addr().to_string(),
+                    method: "unknown".to_string(),
+                    udp_enabled: listener.is_udp_enabled(),
+                    connections_accepted: stats.connections_accepted,
+                    active_connections: stats.active_connections,
+                    protocol_errors: stats.protocol_errors,
+                    bytes_received: stats.bytes_received,
+                    bytes_sent: stats.bytes_sent,
+                })
+            }
+            _ => {
+                // No listener running
+                IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
+                    active: false,
+                    listen: "0.0.0.0:8388".to_string(),
+                    method: "2022-blake3-aes-256-gcm".to_string(),
+                    udp_enabled: false,
+                    connections_accepted: 0,
+                    active_connections: 0,
+                    protocol_errors: 0,
+                    bytes_received: 0,
+                    bytes_sent: 0,
+                })
+            }
+        }
     }
 
     /// Handle StopShadowsocksInbound command
     ///
-    /// Note: This is a placeholder implementation. The actual shutdown
-    /// will be handled by main.rs.
+    /// Stops the Shadowsocks inbound listener and cleans up resources.
     #[cfg(feature = "shadowsocks")]
     fn handle_stop_shadowsocks_inbound(&self) -> IpcResponse {
         info!("Shadowsocks inbound stop requested");
-        // In production, this would signal the listener to shut down
-        IpcResponse::success_with_message("Shadowsocks inbound stop signal sent")
+
+        // First abort the accept task
+        {
+            let mut task_guard = self.ss_inbound_task.write();
+            if let Some(task) = task_guard.take() {
+                task.abort();
+                info!("Shadowsocks inbound accept task aborted");
+            }
+        }
+
+        // Then shutdown the listener
+        let mut inbound_guard = self.ss_inbound.write();
+
+        if let Some(listener) = inbound_guard.take() {
+            // Signal shutdown
+            listener.shutdown();
+            info!(
+                listen = %listener.listen_addr(),
+                "Shadowsocks inbound listener stopped"
+            );
+
+            // Clear the config
+            {
+                let mut config_guard = self.ss_inbound_config.write();
+                *config_guard = None;
+            }
+
+            IpcResponse::success_with_message("Shadowsocks inbound listener stopped")
+        } else {
+            IpcResponse::error(
+                ErrorCode::NotFound,
+                "Shadowsocks inbound listener is not running",
+            )
+        }
     }
 }
 

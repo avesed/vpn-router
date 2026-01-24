@@ -751,6 +751,813 @@ impl ServerCertVerifier for InsecureServerCertVerifier {
     }
 }
 
+// ============================================================================
+// QUIC Server (Inbound) Support
+// ============================================================================
+
+/// Default maximum concurrent bidirectional streams per connection
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// Default server idle timeout in seconds
+const DEFAULT_SERVER_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// QUIC server configuration
+///
+/// This struct holds all configuration options for QUIC server endpoints,
+/// including TLS certificates, ALPN protocols, and connection limits.
+///
+/// # Example
+///
+/// ```no_run
+/// use rust_router::transport::quic::QuicServerConfig;
+/// use std::net::SocketAddr;
+///
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = QuicServerConfig::new("0.0.0.0:443".parse()?)
+///     .with_cert_pem(include_bytes!("cert.pem").to_vec())
+///     .with_key_pem(include_bytes!("key.pem").to_vec())
+///     .with_alpn(vec!["h3"]);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct QuicServerConfig {
+    /// Address to listen on
+    pub listen_addr: SocketAddr,
+
+    /// TLS certificate chain (PEM bytes)
+    pub tls_cert_pem: Vec<u8>,
+
+    /// TLS private key (PEM bytes)
+    pub tls_key_pem: Vec<u8>,
+
+    /// ALPN protocols (e.g., ["h3"])
+    pub alpn_protocols: Vec<String>,
+
+    /// Idle timeout in seconds
+    pub idle_timeout_secs: u64,
+
+    /// Maximum concurrent bidirectional streams per connection
+    pub max_concurrent_streams: u32,
+}
+
+impl QuicServerConfig {
+    /// Create a new QUIC server configuration with listen address
+    ///
+    /// # Arguments
+    ///
+    /// * `listen_addr` - Address to bind the server to
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::transport::quic::QuicServerConfig;
+    /// use std::net::SocketAddr;
+    ///
+    /// let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+    /// let config = QuicServerConfig::new(addr);
+    /// assert_eq!(config.listen_addr, addr);
+    /// ```
+    #[must_use]
+    pub fn new(listen_addr: SocketAddr) -> Self {
+        Self {
+            listen_addr,
+            tls_cert_pem: Vec::new(),
+            tls_key_pem: Vec::new(),
+            alpn_protocols: Vec::new(),
+            idle_timeout_secs: DEFAULT_SERVER_IDLE_TIMEOUT_SECS,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+        }
+    }
+
+    /// Set the certificate from PEM data
+    ///
+    /// # Arguments
+    ///
+    /// * `pem` - PEM-encoded certificate data
+    #[must_use]
+    pub fn with_cert_pem(mut self, pem: Vec<u8>) -> Self {
+        self.tls_cert_pem = pem;
+        self
+    }
+
+    /// Set the private key from PEM data
+    ///
+    /// # Arguments
+    ///
+    /// * `pem` - PEM-encoded private key data
+    #[must_use]
+    pub fn with_key_pem(mut self, pem: Vec<u8>) -> Self {
+        self.tls_key_pem = pem;
+        self
+    }
+
+    /// Load certificate from file path
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to PEM certificate file
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if file reading fails
+    pub fn with_cert_file(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, TransportError> {
+        let pem = std::fs::read(path.as_ref()).map_err(|e| {
+            TransportError::TlsConfigError(format!("failed to read certificate file: {e}"))
+        })?;
+        self.tls_cert_pem = pem;
+        Ok(self)
+    }
+
+    /// Load private key from file path
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to PEM private key file
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if file reading fails
+    pub fn with_key_file(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, TransportError> {
+        let pem = std::fs::read(path.as_ref()).map_err(|e| {
+            TransportError::TlsConfigError(format!("failed to read key file: {e}"))
+        })?;
+        self.tls_key_pem = pem;
+        Ok(self)
+    }
+
+    /// Set ALPN protocols
+    ///
+    /// # Arguments
+    ///
+    /// * `protocols` - List of ALPN protocol names (e.g., ["h3"])
+    #[must_use]
+    pub fn with_alpn<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.alpn_protocols = protocols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set idle timeout in seconds
+    ///
+    /// # Arguments
+    ///
+    /// * `secs` - Idle timeout in seconds
+    #[must_use]
+    pub fn with_idle_timeout(mut self, secs: u64) -> Self {
+        self.idle_timeout_secs = secs;
+        self
+    }
+
+    /// Set maximum concurrent bidirectional streams per connection
+    ///
+    /// # Arguments
+    ///
+    /// * `max` - Maximum number of concurrent streams
+    #[must_use]
+    pub fn with_max_concurrent_streams(mut self, max: u32) -> Self {
+        self.max_concurrent_streams = max;
+        self
+    }
+
+    /// Validate the configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if:
+    /// - No certificate is provided
+    /// - No private key is provided
+    pub fn validate(&self) -> Result<(), TransportError> {
+        if self.tls_cert_pem.is_empty() {
+            return Err(TransportError::TlsConfigError(
+                "no TLS certificate provided".to_string(),
+            ));
+        }
+        if self.tls_key_pem.is_empty() {
+            return Err(TransportError::TlsConfigError(
+                "no TLS private key provided".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for QuicServerConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0:443".parse().unwrap(),
+            tls_cert_pem: Vec::new(),
+            tls_key_pem: Vec::new(),
+            alpn_protocols: Vec::new(),
+            idle_timeout_secs: DEFAULT_SERVER_IDLE_TIMEOUT_SECS,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+        }
+    }
+}
+
+/// Load certificates from PEM data
+///
+/// # Arguments
+///
+/// * `pem` - PEM-encoded certificate data
+///
+/// # Errors
+///
+/// Returns `TransportError` if parsing fails or no certificates found
+pub fn load_certs_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TransportError> {
+    use rustls_pemfile::certs;
+    use std::io::BufReader;
+
+    let mut reader = BufReader::new(pem);
+    let certs: Vec<CertificateDer<'static>> = certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TransportError::TlsConfigError(format!("failed to parse PEM certificates: {e}")))?;
+
+    if certs.is_empty() {
+        return Err(TransportError::TlsConfigError(
+            "no certificates found in PEM data".to_string(),
+        ));
+    }
+
+    Ok(certs)
+}
+
+/// Load a private key from PEM data
+///
+/// Supports PKCS#8, RSA, and EC private key formats.
+///
+/// # Arguments
+///
+/// * `pem` - PEM-encoded private key data
+///
+/// # Errors
+///
+/// Returns `TransportError` if parsing fails or no key found
+pub fn load_key_from_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TransportError> {
+    use rustls_pemfile::{pkcs8_private_keys, rsa_private_keys, ec_private_keys};
+    use std::io::BufReader;
+
+    let mut reader = BufReader::new(pem);
+
+    // Try PKCS#8 format first
+    let keys: Vec<_> = pkcs8_private_keys(&mut reader)
+        .filter_map(Result::ok)
+        .collect();
+    if !keys.is_empty() {
+        return Ok(PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap()));
+    }
+
+    // Try RSA format
+    reader = BufReader::new(pem);
+    let keys: Vec<_> = rsa_private_keys(&mut reader)
+        .filter_map(Result::ok)
+        .collect();
+    if !keys.is_empty() {
+        return Ok(PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap()));
+    }
+
+    // Try EC format
+    reader = BufReader::new(pem);
+    let keys: Vec<_> = ec_private_keys(&mut reader)
+        .filter_map(Result::ok)
+        .collect();
+    if !keys.is_empty() {
+        return Ok(PrivateKeyDer::Sec1(keys.into_iter().next().unwrap()));
+    }
+
+    Err(TransportError::TlsConfigError(
+        "no private key found in PEM data (tried PKCS#8, RSA, and EC formats)".to_string(),
+    ))
+}
+
+/// Build QUIC server configuration from our config struct
+///
+/// # Arguments
+///
+/// * `config` - QUIC server configuration
+///
+/// # Errors
+///
+/// Returns `TransportError` if TLS configuration fails
+pub fn build_server_config(config: &QuicServerConfig) -> Result<quinn::ServerConfig, TransportError> {
+    config.validate()?;
+
+    // Parse certificates and key from PEM
+    let certs = load_certs_from_pem(&config.tls_cert_pem)?;
+    let key = load_key_from_pem(&config.tls_key_pem)?;
+
+    // Build rustls server config
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| TransportError::TlsConfigError(format!("failed to create TLS config: {e}")))?;
+
+    // Set ALPN protocols if specified
+    if !config.alpn_protocols.is_empty() {
+        tls_config.alpn_protocols = config
+            .alpn_protocols
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+    }
+
+    // Create quinn crypto config from rustls config
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).map_err(|e| {
+        TransportError::TlsConfigError(format!("failed to create QUIC crypto config: {e}"))
+    })?;
+
+    // Configure transport settings
+    let mut transport = quinn::TransportConfig::default();
+
+    // Set idle timeout
+    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
+    transport.max_idle_timeout(Some(
+        idle_timeout
+            .try_into()
+            .map_err(|_| TransportError::TlsConfigError("invalid idle timeout".to_string()))?,
+    ));
+
+    // Set max concurrent bidirectional streams
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(config.max_concurrent_streams));
+
+    // Create final server config
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(Arc::new(transport));
+
+    Ok(server_config)
+}
+
+/// QUIC inbound listener for accepting QUIC connections
+///
+/// This listener binds to a UDP socket and accepts incoming QUIC connections.
+/// Each connection can have multiple bidirectional streams.
+///
+/// # Example
+///
+/// ```no_run
+/// use rust_router::transport::quic::{QuicServerConfig, QuicInboundListener};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = QuicServerConfig::new("0.0.0.0:443".parse()?)
+///     .with_cert_file("cert.pem")?
+///     .with_key_file("key.pem")?
+///     .with_alpn(vec!["h3"]);
+///
+/// let listener = QuicInboundListener::bind(&config).await?;
+///
+/// loop {
+///     if let Some(stream) = listener.accept().await {
+///         // Handle stream
+///         println!("Accepted stream from {}", stream.remote_address());
+///     }
+/// }
+/// # }
+/// ```
+pub struct QuicInboundListener {
+    /// Quinn endpoint
+    endpoint: Endpoint,
+
+    /// Server configuration
+    config: QuicServerConfig,
+
+    /// Statistics
+    stats: Arc<QuicInboundStats>,
+
+    /// Shutdown flag
+    shutdown: AtomicBool,
+}
+
+impl QuicInboundListener {
+    /// Bind to the configured address and start listening
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - QUIC server configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError` if:
+    /// - Configuration validation fails
+    /// - UDP socket binding fails
+    /// - Endpoint creation fails
+    pub async fn bind(config: &QuicServerConfig) -> Result<Self, TransportError> {
+        // Build server configuration
+        let server_config = build_server_config(config)?;
+
+        // Bind UDP socket
+        let socket = std::net::UdpSocket::bind(config.listen_addr).map_err(|e| {
+            TransportError::connection_failed(
+                config.listen_addr.to_string(),
+                format!("failed to bind UDP socket: {e}"),
+            )
+        })?;
+
+        socket.set_nonblocking(true).map_err(|e| {
+            TransportError::socket_option("UDP_NONBLOCK", format!("failed to set non-blocking: {e}"))
+        })?;
+
+        // Create quinn endpoint with server config
+        let runtime = Arc::new(quinn::TokioRuntime);
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .map_err(|e| {
+            TransportError::quic_endpoint(format!("failed to create QUIC endpoint: {e}"))
+        })?;
+
+        tracing::info!(
+            listen = %config.listen_addr,
+            alpn = ?config.alpn_protocols,
+            "QUIC inbound listener started"
+        );
+
+        Ok(Self {
+            endpoint,
+            config: config.clone(),
+            stats: Arc::new(QuicInboundStats::new()),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
+    /// Accept a new QUIC stream from any connection
+    ///
+    /// This method waits for a new incoming connection, accepts it,
+    /// and opens a bidirectional stream.
+    ///
+    /// Returns `None` if the listener has been shut down.
+    pub async fn accept(&self) -> Option<QuicStream> {
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return None;
+            }
+
+            // Accept incoming connection
+            let incoming = self.endpoint.accept().await?;
+
+            self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+            self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+
+            let remote = incoming.remote_address();
+
+            tracing::debug!(
+                remote = %remote,
+                "Accepting QUIC connection"
+            );
+
+            // Complete the handshake
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        remote = %remote,
+                        error = %e,
+                        "QUIC handshake failed"
+                    );
+                    continue; // Try next connection
+                }
+            };
+
+            let conn = Arc::new(conn);
+
+            // Accept a bidirectional stream
+            match conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    self.stats.streams_accepted.fetch_add(1, Ordering::Relaxed);
+
+                    tracing::debug!(
+                        remote = %remote,
+                        stable_id = conn.stable_id(),
+                        "QUIC stream accepted"
+                    );
+
+                    return Some(QuicStream::new(send, recv, conn));
+                }
+                Err(e) => {
+                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats.stream_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        remote = %remote,
+                        error = %e,
+                        "Failed to accept QUIC stream"
+                    );
+                    continue; // Try next connection
+                }
+            }
+        }
+    }
+
+    /// Accept a new QUIC connection (returning the connection itself)
+    ///
+    /// Use this when you need to handle multiple streams per connection.
+    ///
+    /// Returns `None` if the listener has been shut down.
+    pub async fn accept_connection(&self) -> Option<QuicConnection> {
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return None;
+            }
+
+            let incoming = self.endpoint.accept().await?;
+
+            self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+            self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+
+            let remote = incoming.remote_address();
+
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        remote = %remote,
+                        error = %e,
+                        "QUIC handshake failed"
+                    );
+                    continue; // Try next connection
+                }
+            };
+
+            return Some(QuicConnection {
+                connection: Arc::new(conn),
+                stats: Arc::clone(&self.stats),
+            });
+        }
+    }
+
+    /// Get the local address the listener is bound to
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    /// Get the configured listen address
+    #[must_use]
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.config.listen_addr
+    }
+
+    /// Get listener statistics
+    #[must_use]
+    pub fn stats(&self) -> &QuicInboundStats {
+        &self.stats
+    }
+
+    /// Get a snapshot of statistics
+    #[must_use]
+    pub fn stats_snapshot(&self) -> QuicInboundStatsSnapshot {
+        self.stats.snapshot()
+    }
+
+    /// Check if the listener is active
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Graceful shutdown
+    ///
+    /// This stops accepting new connections and closes existing ones.
+    pub fn shutdown(&self) {
+        tracing::info!(listen = %self.config.listen_addr, "Shutting down QUIC listener");
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.endpoint.close(VarInt::from_u32(0), b"shutdown");
+    }
+
+    /// Wait for all connections to close
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+}
+
+impl std::fmt::Debug for QuicInboundListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicInboundListener")
+            .field("listen_addr", &self.config.listen_addr)
+            .field("alpn", &self.config.alpn_protocols)
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+/// QUIC connection wrapper for multi-stream handling
+///
+/// This struct wraps a QUIC connection and provides methods for
+/// accepting multiple bidirectional streams from a single connection.
+pub struct QuicConnection {
+    /// The underlying QUIC connection
+    connection: Arc<Connection>,
+
+    /// Reference to listener stats
+    stats: Arc<QuicInboundStats>,
+}
+
+impl QuicConnection {
+    /// Get the remote address of the connection
+    #[must_use]
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
+    /// Get the connection's stable ID
+    #[must_use]
+    pub fn stable_id(&self) -> usize {
+        self.connection.stable_id()
+    }
+
+    /// Check if the connection is still open
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+
+    /// Accept a bidirectional stream from this connection
+    ///
+    /// Returns `None` if the connection is closed.
+    pub async fn accept_bi(&self) -> Option<QuicStream> {
+        match self.connection.accept_bi().await {
+            Ok((send, recv)) => {
+                self.stats.streams_accepted.fetch_add(1, Ordering::Relaxed);
+                Some(QuicStream::new(send, recv, Arc::clone(&self.connection)))
+            }
+            Err(e) => {
+                self.stats.stream_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    stable_id = self.stable_id(),
+                    error = %e,
+                    "Failed to accept bidirectional stream"
+                );
+                None
+            }
+        }
+    }
+
+    /// Open a bidirectional stream on this connection
+    pub async fn open_bi(&self) -> Result<QuicStream, TransportError> {
+        let (send, recv) = self.connection.open_bi().await.map_err(|e| {
+            TransportError::QuicStreamError(format!("failed to open bidirectional stream: {e}"))
+        })?;
+        Ok(QuicStream::new(send, recv, Arc::clone(&self.connection)))
+    }
+
+    /// Close the connection gracefully
+    pub fn close(&self, error_code: VarInt, reason: &[u8]) {
+        self.connection.close(error_code, reason);
+        self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Get connection statistics
+    #[must_use]
+    pub fn conn_stats(&self) -> quinn::ConnectionStats {
+        self.connection.stats()
+    }
+}
+
+impl Drop for QuicConnection {
+    fn drop(&mut self) {
+        // Decrement active connections if the connection is being dropped
+        // without explicit close
+        if self.connection.close_reason().is_none() {
+            self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl std::fmt::Debug for QuicConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicConnection")
+            .field("remote_address", &self.remote_address())
+            .field("stable_id", &self.stable_id())
+            .field("is_closed", &self.is_closed())
+            .finish()
+    }
+}
+
+/// Statistics for the QUIC inbound listener
+#[derive(Debug)]
+pub struct QuicInboundStats {
+    /// Total connections accepted
+    pub connections_accepted: AtomicU64,
+
+    /// Currently active connections
+    pub active_connections: AtomicU64,
+
+    /// Total streams accepted
+    pub streams_accepted: AtomicU64,
+
+    /// Handshake errors
+    pub handshake_errors: AtomicU64,
+
+    /// Stream errors
+    pub stream_errors: AtomicU64,
+}
+
+impl QuicInboundStats {
+    /// Create new empty stats
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            connections_accepted: AtomicU64::new(0),
+            active_connections: AtomicU64::new(0),
+            streams_accepted: AtomicU64::new(0),
+            handshake_errors: AtomicU64::new(0),
+            stream_errors: AtomicU64::new(0),
+        }
+    }
+
+    /// Get a snapshot of the statistics
+    #[must_use]
+    pub fn snapshot(&self) -> QuicInboundStatsSnapshot {
+        QuicInboundStatsSnapshot {
+            connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
+            active_connections: self.active_connections.load(Ordering::Relaxed),
+            streams_accepted: self.streams_accepted.load(Ordering::Relaxed),
+            handshake_errors: self.handshake_errors.load(Ordering::Relaxed),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for QuicInboundStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Snapshot of QUIC inbound statistics
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct QuicInboundStatsSnapshot {
+    /// Total connections accepted
+    pub connections_accepted: u64,
+
+    /// Currently active connections
+    pub active_connections: u64,
+
+    /// Total streams accepted
+    pub streams_accepted: u64,
+
+    /// Handshake errors
+    pub handshake_errors: u64,
+
+    /// Stream errors
+    pub stream_errors: u64,
+}
+
+/// RAII guard for tracking active QUIC connections
+///
+/// When this guard is dropped, it automatically decrements the active connection
+/// counter in the associated stats.
+#[derive(Debug)]
+pub struct QuicConnectionGuard {
+    stats: Arc<QuicInboundStats>,
+}
+
+impl QuicConnectionGuard {
+    /// Create a new connection guard
+    ///
+    /// This increments the active connection counter.
+    #[must_use]
+    pub fn new(stats: Arc<QuicInboundStats>) -> Self {
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { stats }
+    }
+
+    /// Get a reference to the associated stats
+    #[must_use]
+    pub fn stats(&self) -> &QuicInboundStats {
+        &self.stats
+    }
+}
+
+impl Drop for QuicConnectionGuard {
+    fn drop(&mut self) {
+        self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Clone for QuicConnectionGuard {
+    fn clone(&self) -> Self {
+        self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self {
+            stats: Arc::clone(&self.stats),
+        }
+    }
+}
+
+// ============================================================================
+// Helper imports for server functionality
+// ============================================================================
+
+use rustls::pki_types::PrivateKeyDer;
+use std::sync::atomic::AtomicBool;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,5 +1735,311 @@ mod tests {
         assert!(!schemes.is_empty());
         assert!(schemes.contains(&SignatureScheme::ED25519));
         assert!(schemes.contains(&SignatureScheme::ECDSA_NISTP256_SHA256));
+    }
+
+    // ========================================================================
+    // QUIC Server Tests
+    // ========================================================================
+
+    #[test]
+    fn test_quic_server_config_new() {
+        let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let config = QuicServerConfig::new(addr);
+        assert_eq!(config.listen_addr, addr);
+        assert!(config.tls_cert_pem.is_empty());
+        assert!(config.tls_key_pem.is_empty());
+        assert!(config.alpn_protocols.is_empty());
+        assert_eq!(config.idle_timeout_secs, DEFAULT_SERVER_IDLE_TIMEOUT_SECS);
+        assert_eq!(config.max_concurrent_streams, DEFAULT_MAX_CONCURRENT_STREAMS);
+    }
+
+    #[test]
+    fn test_quic_server_config_default() {
+        let config = QuicServerConfig::default();
+        assert_eq!(config.listen_addr.port(), 443);
+        assert!(config.tls_cert_pem.is_empty());
+        assert!(config.tls_key_pem.is_empty());
+    }
+
+    #[test]
+    fn test_quic_server_config_builder() {
+        let addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        let config = QuicServerConfig::new(addr)
+            .with_alpn(vec!["h3", "h3-29"])
+            .with_idle_timeout(120)
+            .with_max_concurrent_streams(50);
+
+        assert_eq!(config.listen_addr, addr);
+        assert_eq!(config.alpn_protocols, vec!["h3", "h3-29"]);
+        assert_eq!(config.idle_timeout_secs, 120);
+        assert_eq!(config.max_concurrent_streams, 50);
+    }
+
+    #[test]
+    fn test_quic_server_config_validate_no_cert() {
+        let config = QuicServerConfig::default();
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("certificate"));
+    }
+
+    #[test]
+    fn test_quic_server_config_validate_no_key() {
+        init_crypto_provider();
+        // Create a self-signed cert for testing
+        let cert_pem = generate_test_cert_pem();
+        let config = QuicServerConfig::default()
+            .with_cert_pem(cert_pem);
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("key"));
+    }
+
+    #[test]
+    fn test_load_certs_from_pem_empty() {
+        let result = load_certs_from_pem(b"");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no certificates"));
+    }
+
+    #[test]
+    fn test_load_key_from_pem_empty() {
+        let result = load_key_from_pem(b"");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no private key"));
+    }
+
+    #[test]
+    fn test_load_certs_from_pem_valid() {
+        let pem = generate_test_cert_pem();
+        let result = load_certs_from_pem(&pem);
+        assert!(result.is_ok());
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_load_key_from_pem_valid() {
+        let pem = generate_test_key_pem();
+        let result = load_key_from_pem(&pem);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_quic_inbound_stats_new() {
+        let stats = QuicInboundStats::new();
+        assert_eq!(stats.connections_accepted.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.streams_accepted.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.handshake_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.stream_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_quic_inbound_stats_snapshot() {
+        let stats = QuicInboundStats::new();
+        stats.connections_accepted.fetch_add(10, Ordering::Relaxed);
+        stats.active_connections.fetch_add(5, Ordering::Relaxed);
+        stats.streams_accepted.fetch_add(20, Ordering::Relaxed);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.connections_accepted, 10);
+        assert_eq!(snapshot.active_connections, 5);
+        assert_eq!(snapshot.streams_accepted, 20);
+    }
+
+    #[test]
+    fn test_quic_inbound_stats_snapshot_serialization() {
+        let snapshot = QuicInboundStatsSnapshot {
+            connections_accepted: 100,
+            active_connections: 5,
+            streams_accepted: 200,
+            handshake_errors: 2,
+            stream_errors: 3,
+        };
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("100"));
+        assert!(json.contains("200"));
+
+        let deserialized: QuicInboundStatsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.connections_accepted, 100);
+        assert_eq!(deserialized.streams_accepted, 200);
+    }
+
+    #[test]
+    fn test_quic_connection_guard_increment_on_create() {
+        let stats = Arc::new(QuicInboundStats::new());
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+
+        let _guard = QuicConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_quic_connection_guard_decrement_on_drop() {
+        let stats = Arc::new(QuicInboundStats::new());
+
+        {
+            let _guard = QuicConnectionGuard::new(Arc::clone(&stats));
+            assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+        }
+
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_quic_connection_guard_multiple() {
+        let stats = Arc::new(QuicInboundStats::new());
+
+        let guard1 = QuicConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        let guard2 = QuicConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 2);
+
+        drop(guard1);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(guard2);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_quic_connection_guard_clone() {
+        let stats = Arc::new(QuicInboundStats::new());
+
+        let guard1 = QuicConnectionGuard::new(Arc::clone(&stats));
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        let guard2 = guard1.clone();
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 2);
+
+        drop(guard1);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(guard2);
+        assert_eq!(stats.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_quic_connection_guard_stats_access() {
+        let stats = Arc::new(QuicInboundStats::new());
+        stats.connections_accepted.fetch_add(10, Ordering::Relaxed);
+
+        let guard = QuicConnectionGuard::new(Arc::clone(&stats));
+
+        assert_eq!(guard.stats().connections_accepted.load(Ordering::Relaxed), 10);
+        assert_eq!(guard.stats().active_connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_quic_server_bind_with_valid_config() {
+        init_crypto_provider();
+
+        let cert_pem = generate_test_cert_pem();
+        let key_pem = generate_test_key_pem();
+
+        let config = QuicServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_cert_pem(cert_pem)
+            .with_key_pem(key_pem)
+            .with_alpn(vec!["h3"]);
+
+        let listener = QuicInboundListener::bind(&config).await;
+        assert!(listener.is_ok());
+
+        let listener = listener.unwrap();
+        assert!(listener.is_active());
+
+        let local_addr = listener.local_addr().unwrap();
+        assert!(local_addr.port() > 0);
+
+        listener.shutdown();
+        assert!(!listener.is_active());
+    }
+
+    #[tokio::test]
+    async fn test_quic_server_debug() {
+        init_crypto_provider();
+
+        let cert_pem = generate_test_cert_pem();
+        let key_pem = generate_test_key_pem();
+
+        let config = QuicServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_cert_pem(cert_pem)
+            .with_key_pem(key_pem)
+            .with_alpn(vec!["test-proto"]);
+
+        let listener = QuicInboundListener::bind(&config).await.unwrap();
+        let debug_str = format!("{:?}", listener);
+        assert!(debug_str.contains("QuicInboundListener"));
+        assert!(debug_str.contains("127.0.0.1"));
+        assert!(debug_str.contains("test-proto"));
+    }
+
+    #[tokio::test]
+    async fn test_quic_server_stats_snapshot() {
+        init_crypto_provider();
+
+        let cert_pem = generate_test_cert_pem();
+        let key_pem = generate_test_key_pem();
+
+        let config = QuicServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_cert_pem(cert_pem)
+            .with_key_pem(key_pem);
+
+        let listener = QuicInboundListener::bind(&config).await.unwrap();
+        let stats = listener.stats_snapshot();
+
+        assert_eq!(stats.connections_accepted, 0);
+        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.streams_accepted, 0);
+    }
+
+    #[test]
+    fn test_build_server_config_with_valid_config() {
+        init_crypto_provider();
+
+        let cert_pem = generate_test_cert_pem();
+        let key_pem = generate_test_key_pem();
+
+        let config = QuicServerConfig::new("127.0.0.1:443".parse().unwrap())
+            .with_cert_pem(cert_pem)
+            .with_key_pem(key_pem)
+            .with_alpn(vec!["h3"])
+            .with_idle_timeout(60)
+            .with_max_concurrent_streams(100);
+
+        let result = build_server_config(&config);
+        assert!(result.is_ok());
+    }
+
+    // Helper function to generate a self-signed certificate PEM for testing
+    // This uses a valid EC P-256 key pair that rustls supports
+    fn generate_test_cert_pem() -> Vec<u8> {
+        // Valid self-signed certificate with EC P-256 key
+        // Generated with: openssl ecparam -genkey -name prime256v1 -noout -out key.pem
+        //                 openssl req -new -x509 -key key.pem -out cert.pem -days 3650 -subj "/CN=test"
+        b"-----BEGIN CERTIFICATE-----
+MIIBdDCCARmgAwIBAgIUD03a2Olf9h4dAKq4JZ0wvvdyVy8wCgYIKoZIzj0EAwIw
+DzENMAsGA1UEAwwEdGVzdDAeFw0yNjAxMjQwMzU2MTJaFw0zNjAxMjIwMzU2MTJa
+MA8xDTALBgNVBAMMBHRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARqAX7m
+glRxBt1WVkeu6Xv1DZgQ6auVD6DXsPR4mV5qERVBux0V17EH8+u2f8G7/g5q+kjt
+zegGuc0ES6Am/yh1o1MwUTAdBgNVHQ4EFgQUHSw86X0pO16Fimg2rwu9TbSKuE0w
+HwYDVR0jBBgwFoAUHSw86X0pO16Fimg2rwu9TbSKuE0wDwYDVR0TAQH/BAUwAwEB
+/zAKBggqhkjOPQQDAgNJADBGAiEAlBG5Mg/0+lwJG6NXRBaYyAwPrXmfsdn4Xu4M
+DlV6WPACIQDfEQFhvHY+GwxJtD4VwLr9wLomdF8bx8nyE69ttA3QVg==
+-----END CERTIFICATE-----
+".to_vec()
+    }
+
+    // Helper function to generate a private key PEM for testing
+    fn generate_test_key_pem() -> Vec<u8> {
+        // EC P-256 private key matching the certificate above
+        b"-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEINqlpC+I/zCwt3mMtoL76ZRT/gjmCAQ2K0RoeR0RpTJmoAoGCCqGSM49
+AwEHoUQDQgAEagF+5oJUcQbdVlZHrul79Q2YEOmrlQ+g17D0eJleahEVQbsdFdex
+B/Prtn/Bu/4OavpI7c3oBrnNBEugJv8odQ==
+-----END EC PRIVATE KEY-----
+".to_vec()
     }
 }
