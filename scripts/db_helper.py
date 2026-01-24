@@ -2423,6 +2423,66 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ Shadowsocks Inbound 配置 ============
+
+    def get_shadowsocks_inbound_config(self) -> Optional[Dict]:
+        """获取 Shadowsocks 入口配置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM shadowsocks_inbound_config WHERE id = 1"
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def set_shadowsocks_inbound_config(
+        self,
+        listen_address: str = "0.0.0.0",
+        listen_port: int = 8388,
+        method: str = "2022-blake3-aes-256-gcm",
+        password: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = False,
+        default_outbound: Optional[str] = None,
+    ) -> bool:
+        """设置 Shadowsocks 入口配置"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO shadowsocks_inbound_config
+                (id, listen_address, listen_port, method, password,
+                 udp_enabled, enabled, default_outbound, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (listen_address, listen_port, method, password,
+                  1 if udp_enabled else 0, 1 if enabled else 0, default_outbound))
+            conn.commit()
+            return True
+
+    def update_shadowsocks_inbound_config(self, **kwargs) -> bool:
+        """更新 Shadowsocks 入口配置的特定字段"""
+        allowed_fields = {
+            "listen_address", "listen_port", "method", "password",
+            "udp_enabled", "enabled", "default_outbound"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE shadowsocks_inbound_config SET {", ".join(updates)} WHERE id = 1
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
     # ============ Peer Nodes 管理 ============
 
     def get_peer_nodes(self, enabled_only: bool = False) -> List[Dict]:
@@ -5009,6 +5069,28 @@ class DatabaseManager:
 
     def delete_v2ray_user(self, user_id: int) -> bool:
         return self.user.delete_v2ray_user(user_id)
+
+    # Shadowsocks Inbound 配置
+    def get_shadowsocks_inbound_config(self) -> Optional[Dict]:
+        return self.user.get_shadowsocks_inbound_config()
+
+    def set_shadowsocks_inbound_config(
+        self,
+        listen_address: str = "0.0.0.0",
+        listen_port: int = 8388,
+        method: str = "2022-blake3-aes-256-gcm",
+        password: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = False,
+        default_outbound: Optional[str] = None,
+    ) -> bool:
+        return self.user.set_shadowsocks_inbound_config(
+            listen_address, listen_port, method, password,
+            udp_enabled, enabled, default_outbound
+        )
+
+    def update_shadowsocks_inbound_config(self, **kwargs) -> bool:
+        return self.user.update_shadowsocks_inbound_config(**kwargs)
 
     # Peer Nodes (对等节点管理)
     def get_peer_nodes(self, enabled_only: bool = False) -> List[Dict]:

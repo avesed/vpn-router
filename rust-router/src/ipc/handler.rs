@@ -253,6 +253,18 @@ pub struct IpcHandler {
     /// Shadowsocks inbound accept task handle
     #[cfg(feature = "shadowsocks")]
     ss_inbound_task: RwLock<Option<JoinHandle<()>>>,
+
+    /// Shadowsocks UDP relay inbound
+    #[cfg(feature = "shadowsocks")]
+    ss_udp_relay: RwLock<Option<Arc<crate::ss_inbound::SsUdpRelayInbound>>>,
+
+    /// Shadowsocks UDP relay task handle
+    #[cfg(feature = "shadowsocks")]
+    ss_udp_task: RwLock<Option<JoinHandle<()>>>,
+
+    /// Shadowsocks UDP reply polling task handle
+    #[cfg(feature = "shadowsocks")]
+    ss_udp_reply_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl IpcHandler {
@@ -297,6 +309,12 @@ impl IpcHandler {
             ss_inbound_config: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_relay: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_reply_task: RwLock::new(None),
         }
     }
 
@@ -347,6 +365,12 @@ impl IpcHandler {
             ss_inbound_config: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_relay: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_reply_task: RwLock::new(None),
         }
     }
 
@@ -396,6 +420,12 @@ impl IpcHandler {
             ss_inbound_config: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_relay: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_reply_task: RwLock::new(None),
         }
     }
 
@@ -448,6 +478,12 @@ impl IpcHandler {
             ss_inbound_config: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_relay: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_task: RwLock::new(None),
+            #[cfg(feature = "shadowsocks")]
+            ss_udp_reply_task: RwLock::new(None),
         }
     }
 
@@ -7105,6 +7141,9 @@ impl IpcHandler {
             }
         };
 
+        // Clone config for UDP relay before storing
+        let udp_config = if udp_enabled { Some(config.clone()) } else { None };
+
         // Store the configuration for status queries
         {
             let mut config_guard = self.ss_inbound_config.write();
@@ -7117,24 +7156,251 @@ impl IpcHandler {
             *inbound_guard = Some(Arc::clone(&listener));
         }
 
-        // Start the accept loop in a background task
-        // Note: This is a simplified version. In production, you'd integrate with
-        // the RuleEngine and outbound routing similar to VLESS.
+        // Clone references needed for the accept task (similar to VLESS)
+        let outbound_manager = Arc::clone(&self.outbound_manager);
+        let rule_engine = Arc::clone(&self.rule_engine);
+        let ecmp_group_manager = self.ecmp_group_manager.clone();
+        let wg_egress_manager = self.wg_egress_manager.clone();
+        let vless_reply_registry = self.vless_reply_registry.clone();
         let listener_clone = Arc::clone(&listener);
+
+        // Start the accept loop in a background task with full routing support
         let accept_task = tokio::spawn(async move {
             info!("Shadowsocks inbound accept loop started");
 
             loop {
                 match listener_clone.accept_with_guard().await {
-                    Ok((conn, _guard)) => {
+                    Ok((conn, guard)) => {
+                        let client_addr = conn.client_addr();
+                        let destination = conn.destination().clone();
+
                         debug!(
-                            client = %conn.client_addr(),
-                            destination = %conn.destination(),
+                            client = %client_addr,
+                            destination = %destination,
                             "Accepted Shadowsocks connection"
                         );
-                        // Note: Actual connection handling would be done here
-                        // with routing through RuleEngine and forwarding to outbounds.
-                        // For now, we just log and the connection will be dropped.
+
+                        // Clone references for this connection's task
+                        let outbound_mgr = Arc::clone(&outbound_manager);
+                        let rule_eng = Arc::clone(&rule_engine);
+                        let ecmp_mgr = ecmp_group_manager.clone();
+                        let wg_mgr = wg_egress_manager.clone();
+                        let reply_registry = vless_reply_registry.clone();
+
+                        // Spawn a task to handle this connection
+                        tokio::spawn(async move {
+                            // Keep guard alive for the duration of connection handling
+                            let _guard = guard;
+
+                            // Extract destination info for routing
+                            let dest_port = destination.port();
+                            let dest_host = destination.host();
+
+                            // Try to parse as IP, otherwise treat as domain
+                            let (dest_ip, domain): (Option<std::net::IpAddr>, Option<String>) =
+                                match dest_host.parse::<std::net::IpAddr>() {
+                                    Ok(ip) => (Some(ip), None),
+                                    Err(_) => (None, Some(dest_host.clone())),
+                                };
+
+                            // Route the connection using the rule engine
+                            let conn_info = ConnectionInfo {
+                                domain: domain.clone(),
+                                dest_ip,
+                                dest_port,
+                                source_ip: Some(client_addr.ip()),
+                                protocol: "tcp", // Shadowsocks TCP
+                                sniffed_protocol: None,
+                            };
+
+                            // Match against rules to determine outbound
+                            let match_result = rule_eng.match_connection(&conn_info);
+                            let outbound_tag = match_result.outbound.clone();
+
+                            debug!(
+                                "Shadowsocks connection {} -> {} routed to outbound '{}'",
+                                client_addr, destination, outbound_tag
+                            );
+
+                            // Resolve destination address
+                            let dest_addr: std::net::SocketAddr = if let Some(ip) = dest_ip {
+                                std::net::SocketAddr::new(ip, dest_port)
+                            } else if let Some(ref d) = domain {
+                                match tokio::net::lookup_host(format!("{}:{}", d, dest_port)).await {
+                                    Ok(mut addrs) => match addrs.next() {
+                                        Some(addr) => addr,
+                                        None => {
+                                            warn!("No addresses found for domain {}", d);
+                                            return;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        warn!("Failed to resolve domain {}: {}", d, e);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                error!("No destination IP or domain available");
+                                return;
+                            };
+
+                            // Resolve the actual outbound tag (may be via ECMP group)
+                            let actual_outbound_tag: String = {
+                                if let Some(ref ecmp_manager) = ecmp_mgr {
+                                    if ecmp_manager.has_group(&outbound_tag) {
+                                        if let Some(group) = ecmp_manager.get_group(&outbound_tag) {
+                                            use crate::ecmp::{FiveTuple, Protocol as EcmpProtocol};
+                                            let five_tuple = FiveTuple::new(
+                                                client_addr.ip(),
+                                                dest_addr.ip(),
+                                                client_addr.port(),
+                                                dest_addr.port(),
+                                                EcmpProtocol::Tcp,
+                                            );
+                                            match group.select_by_connection(&five_tuple) {
+                                                Ok(member_tag) => {
+                                                    debug!(
+                                                        "ECMP group '{}' selected member '{}' for SS {} -> {}",
+                                                        outbound_tag, member_tag, client_addr, destination
+                                                    );
+                                                    member_tag
+                                                }
+                                                Err(e) => {
+                                                    warn!("ECMP selection failed: {}, using direct", e);
+                                                    "direct".to_string()
+                                                }
+                                            }
+                                        } else {
+                                            outbound_tag.clone()
+                                        }
+                                    } else {
+                                        outbound_tag.clone()
+                                    }
+                                } else {
+                                    outbound_tag.clone()
+                                }
+                            };
+
+                            // Check if the outbound is a WireGuard tunnel (userspace mode)
+                            let is_wg_tunnel = wg_mgr
+                                .as_ref()
+                                .map(|mgr| mgr.has_tunnel(&actual_outbound_tag))
+                                .unwrap_or(false);
+
+                            if is_wg_tunnel {
+                                // Route through WireGuard tunnel
+                                let wg_manager = wg_mgr.as_ref().unwrap();
+
+                                // Get tunnel status for local IP
+                                let tunnel_status = match wg_manager.get_tunnel_status(&actual_outbound_tag) {
+                                    Some(status) => status,
+                                    None => {
+                                        warn!(
+                                            "WireGuard tunnel '{}' not found for SS {} -> {}",
+                                            actual_outbound_tag, client_addr, destination
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                // Parse local IP
+                                let local_ip: std::net::IpAddr = match tunnel_status.local_ip {
+                                    Some(ref ip_str) => match ip_str.parse() {
+                                        Ok(ip) => ip,
+                                        Err(e) => {
+                                            warn!("Failed to parse local IP '{}': {}", ip_str, e);
+                                            return;
+                                        }
+                                    },
+                                    None => {
+                                        warn!("WireGuard tunnel '{}' has no local IP", actual_outbound_tag);
+                                        return;
+                                    }
+                                };
+
+                                info!(
+                                    "Shadowsocks routing {} -> {} via WireGuard tunnel '{}' (local_ip={})",
+                                    client_addr, destination, actual_outbound_tag, local_ip
+                                );
+
+                                // Use smoltcp bridge for WG tunnel (TCP only for now)
+                                // Create bridge with reply registry for proper WG reply routing
+                                let bridge = crate::vless_wg_bridge::VlessWgBridge::with_registry(
+                                    Arc::clone(wg_manager),
+                                    actual_outbound_tag.clone(),
+                                    local_ip,
+                                    reply_registry.clone(),
+                                );
+
+                                let client_stream = conn.into_stream();
+                                match bridge.handle_tcp_connection(client_addr, client_stream, dest_addr.ip(), dest_addr.port()).await {
+                                    Ok(()) => {
+                                        info!(
+                                            "Shadowsocks-WG connection closed: {} -> {} via {}",
+                                            client_addr, destination, actual_outbound_tag
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Shadowsocks-WG error: {} -> {} via {}: {}",
+                                            client_addr, destination, actual_outbound_tag, e
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Route through regular TCP outbound
+                                let outbound = match outbound_mgr.get(&actual_outbound_tag) {
+                                    Some(o) => o,
+                                    None => {
+                                        warn!("Outbound '{}' not found, using direct", actual_outbound_tag);
+                                        match outbound_mgr.get("direct") {
+                                            Some(o) => o,
+                                            None => {
+                                                error!("No 'direct' outbound available");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                };
+
+                                // Connect to upstream
+                                let upstream = match outbound.connect(dest_addr, Duration::from_secs(30)).await {
+                                    Ok(conn) => conn,
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to connect to {} via {}: {}",
+                                            destination, actual_outbound_tag, e
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                info!(
+                                    "Shadowsocks proxying {} -> {} via '{}'",
+                                    client_addr, destination, actual_outbound_tag
+                                );
+
+                                // Get streams for bidirectional copy
+                                let mut client_stream = conn.into_stream();
+                                let mut upstream_stream = upstream.into_stream();
+
+                                // Relay traffic bidirectionally
+                                match bidirectional_copy(&mut client_stream, &mut upstream_stream).await {
+                                    Ok(result) => {
+                                        info!(
+                                            "Shadowsocks connection closed: {} -> {}, {} up / {} down bytes",
+                                            client_addr, destination, result.client_to_upstream, result.upstream_to_client
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "Shadowsocks connection error: {} -> {}: {}",
+                                            client_addr, destination, e
+                                        );
+                                    }
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         if !listener_clone.is_active() {
@@ -7156,6 +7422,321 @@ impl IpcHandler {
         {
             let mut task_guard = self.ss_inbound_task.write();
             *task_guard = Some(accept_task);
+        }
+
+        // Start UDP relay if enabled
+        if let Some(udp_cfg) = udp_config {
+            use crate::ss_inbound::SsUdpRelayInbound;
+
+            // Clone rule engine reference for UDP relay
+            let udp_rule_engine = Arc::clone(&self.rule_engine);
+
+            match SsUdpRelayInbound::bind(udp_cfg).await {
+                Ok(udp_relay) => {
+                    let udp_relay = Arc::new(udp_relay);
+
+                    // Store UDP relay reference
+                    {
+                        let mut udp_guard = self.ss_udp_relay.write();
+                        *udp_guard = Some(Arc::clone(&udp_relay));
+                    }
+
+                    // Start UDP relay task with WireGuard tunnel support
+                    let udp_relay_clone = Arc::clone(&udp_relay);
+                    let udp_relay_for_reply = Arc::clone(&udp_relay);
+                    // Clone managers for UDP relay
+                    let udp_rule_engine_task = udp_rule_engine;
+                    let udp_wg_mgr = self.wg_egress_manager.clone();
+                    let udp_vless_reply_registry = self.vless_reply_registry.clone();
+                    let udp_ecmp_mgr = self.ecmp_group_manager.clone();
+
+                    // Map of WG tunnel tag -> VlessWgBridge for UDP
+                    use std::collections::HashMap;
+                    use parking_lot::RwLock as SyncRwLock;
+                    let wg_bridges: Arc<SyncRwLock<HashMap<String, Arc<crate::vless_wg_bridge::VlessWgBridge>>>> =
+                        Arc::new(SyncRwLock::new(HashMap::new()));
+                    let wg_bridges_for_poll = Arc::clone(&wg_bridges);
+
+                    let udp_task = tokio::spawn(async move {
+                        info!("Shadowsocks UDP relay started on {}", udp_relay_clone.listen_addr());
+
+                        // Run the UDP relay with packet handler
+                        let rule_engine_ref = Arc::clone(&udp_rule_engine_task);
+                        let wg_mgr_ref = udp_wg_mgr.clone();
+                        let registry_ref = udp_vless_reply_registry.clone();
+                        let ecmp_mgr_ref = udp_ecmp_mgr.clone();
+                        let bridges_ref = Arc::clone(&wg_bridges);
+
+                        if let Err(e) = udp_relay_clone.run(move |packet| {
+                            let rule_eng = Arc::clone(&rule_engine_ref);
+                            let wg_mgr = wg_mgr_ref.clone();
+                            let registry = registry_ref.clone();
+                            let ecmp_mgr = ecmp_mgr_ref.clone();
+                            let bridges = Arc::clone(&bridges_ref);
+
+                            async move {
+                                use crate::rules::ConnectionInfo;
+
+                                // Extract destination info
+                                let dest_host = packet.destination.host();
+                                let dest_port = packet.destination.port();
+
+                                // Parse destination
+                                let (dest_ip, domain): (Option<std::net::IpAddr>, Option<String>) =
+                                    match dest_host.parse::<std::net::IpAddr>() {
+                                        Ok(ip) => (Some(ip), None),
+                                        Err(_) => (None, Some(dest_host.clone())),
+                                    };
+
+                                // Create connection info for rule matching
+                                let conn_info = ConnectionInfo {
+                                    domain: domain.clone(),
+                                    dest_ip,
+                                    dest_port,
+                                    source_ip: Some(packet.client_addr.ip()),
+                                    protocol: "udp",
+                                    sniffed_protocol: None,
+                                };
+
+                                // Match against rules
+                                let match_result = rule_eng.match_connection(&conn_info);
+                                let outbound_tag = match_result.outbound.clone();
+
+                                // Resolve ECMP if needed
+                                let actual_outbound_tag: String = if let Some(ref ecmp_manager) = ecmp_mgr {
+                                    if ecmp_manager.has_group(&outbound_tag) {
+                                        if let Some(group) = ecmp_manager.get_group(&outbound_tag) {
+                                            use crate::ecmp::{FiveTuple, Protocol as EcmpProtocol};
+                                            let five_tuple = FiveTuple::new(
+                                                packet.client_addr.ip(),
+                                                dest_ip.unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                                                packet.client_addr.port(),
+                                                dest_port,
+                                                EcmpProtocol::Udp,
+                                            );
+                                            match group.select_by_connection(&five_tuple) {
+                                                Ok(member_tag) => {
+                                                    debug!(
+                                                        "ECMP group '{}' selected member '{}' for SS UDP {} -> {}:{}",
+                                                        outbound_tag, member_tag, packet.client_addr, dest_host, dest_port
+                                                    );
+                                                    member_tag
+                                                }
+                                                Err(e) => {
+                                                    warn!("ECMP selection failed: {}, using direct", e);
+                                                    "direct".to_string()
+                                                }
+                                            }
+                                        } else {
+                                            outbound_tag.clone()
+                                        }
+                                    } else {
+                                        outbound_tag.clone()
+                                    }
+                                } else {
+                                    outbound_tag.clone()
+                                };
+
+                                debug!(
+                                    "Shadowsocks UDP {} -> {}:{} routed to '{}'",
+                                    packet.client_addr, dest_host, dest_port, actual_outbound_tag
+                                );
+
+                                // Resolve destination address
+                                let dest_addr: std::net::SocketAddr = if let Some(ip) = dest_ip {
+                                    std::net::SocketAddr::new(ip, dest_port)
+                                } else if let Some(ref d) = domain {
+                                    match tokio::net::lookup_host(format!("{}:{}", d, dest_port)).await {
+                                        Ok(mut addrs) => match addrs.next() {
+                                            Some(addr) => addr,
+                                            None => {
+                                                warn!("No addresses found for domain {}", d);
+                                                return Ok(());
+                                            }
+                                        },
+                                        Err(e) => {
+                                            warn!("Failed to resolve domain {}: {}", d, e);
+                                            return Ok(());
+                                        }
+                                    }
+                                } else {
+                                    return Ok(());
+                                };
+
+                                // Check if the outbound is a WireGuard tunnel
+                                let is_wg_tunnel = wg_mgr
+                                    .as_ref()
+                                    .map(|mgr| mgr.has_tunnel(&actual_outbound_tag))
+                                    .unwrap_or(false);
+
+                                if is_wg_tunnel {
+                                    // Route through WireGuard tunnel using VlessWgBridge
+                                    let wg_manager = match wg_mgr.as_ref() {
+                                        Some(mgr) => mgr,
+                                        None => {
+                                            warn!("WG manager not available");
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    // Get or create bridge for this tunnel
+                                    let bridge = {
+                                        let bridges_read = bridges.read();
+                                        bridges_read.get(&actual_outbound_tag).cloned()
+                                    };
+
+                                    let bridge = match bridge {
+                                        Some(b) => b,
+                                        None => {
+                                            // Create new bridge for this tunnel
+                                            let tunnel_status = match wg_manager.get_tunnel_status(&actual_outbound_tag) {
+                                                Some(status) => status,
+                                                None => {
+                                                    warn!("WG tunnel '{}' not found", actual_outbound_tag);
+                                                    return Ok(());
+                                                }
+                                            };
+
+                                            let local_ip: std::net::IpAddr = match tunnel_status.local_ip {
+                                                Some(ref ip_str) => match ip_str.parse() {
+                                                    Ok(ip) => ip,
+                                                    Err(e) => {
+                                                        warn!("Failed to parse local IP '{}': {}", ip_str, e);
+                                                        return Ok(());
+                                                    }
+                                                },
+                                                None => {
+                                                    warn!("WG tunnel '{}' has no local IP", actual_outbound_tag);
+                                                    return Ok(());
+                                                }
+                                            };
+
+                                            let new_bridge = Arc::new(
+                                                crate::vless_wg_bridge::VlessWgBridge::with_registry(
+                                                    Arc::clone(wg_manager),
+                                                    actual_outbound_tag.clone(),
+                                                    local_ip,
+                                                    registry.clone(),
+                                                )
+                                            );
+
+                                            info!(
+                                                "Created VlessWgBridge for SS UDP via WG tunnel '{}' (local_ip={})",
+                                                actual_outbound_tag, local_ip
+                                            );
+
+                                            let mut bridges_write = bridges.write();
+                                            bridges_write.insert(actual_outbound_tag.clone(), Arc::clone(&new_bridge));
+                                            new_bridge
+                                        }
+                                    };
+
+                                    // Send UDP packet through bridge
+                                    if let Err(e) = bridge.send_raw_udp_packet(
+                                        packet.client_addr,
+                                        dest_addr.ip(),
+                                        dest_addr.port(),
+                                        &packet.payload,
+                                    ).await {
+                                        warn!(
+                                            "Failed to send UDP via WG tunnel '{}': {}",
+                                            actual_outbound_tag, e
+                                        );
+                                    } else {
+                                        trace!(
+                                            "Sent SS UDP via WG tunnel '{}': {} -> {}",
+                                            actual_outbound_tag, packet.client_addr, dest_addr
+                                        );
+                                    }
+                                } else {
+                                    // Direct UDP forwarding (non-WG outbound)
+                                    let outbound_socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            warn!("Failed to bind outbound UDP socket: {}", e);
+                                            return Ok(());
+                                        }
+                                    };
+
+                                    if let Err(e) = outbound_socket.send_to(&packet.payload, dest_addr).await {
+                                        warn!("Failed to send UDP packet to {}: {}", dest_addr, e);
+                                    }
+                                    // Note: Direct UDP replies are not captured yet
+                                    // Would need session tracking similar to WG bridge
+                                }
+
+                                Ok(())
+                            }
+                        }).await {
+                            error!("Shadowsocks UDP relay error: {}", e);
+                        }
+                    });
+
+                    // Start a background task to poll WG bridges for replies
+                    let udp_reply_task = tokio::spawn(async move {
+                        use tokio::time::{interval, Duration};
+                        let mut poll_interval = interval(Duration::from_millis(50));
+
+                        loop {
+                            poll_interval.tick().await;
+
+                            // Poll all bridges
+                            let bridges_snapshot: Vec<(String, Arc<crate::vless_wg_bridge::VlessWgBridge>)> = {
+                                let bridges = wg_bridges_for_poll.read();
+                                bridges.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+                            };
+
+                            for (tag, bridge) in bridges_snapshot {
+                                // Poll the bridge for smoltcp processing
+                                if let Err(e) = bridge.poll_raw_udp().await {
+                                    trace!("Error polling WG bridge '{}': {}", tag, e);
+                                }
+
+                                // Check for replies
+                                while let Some(reply) = bridge.try_recv_raw_udp_reply() {
+                                    // Send reply back to SS client
+                                    let source_dest = crate::ss_inbound::handler::ShadowsocksDestination::from_socket_addr(
+                                        std::net::SocketAddr::new(reply.source_ip, reply.source_port)
+                                    );
+
+                                    if let Err(e) = udp_relay_for_reply.send_reply(
+                                        reply.session_key.client_addr,
+                                        &source_dest,
+                                        &reply.payload,
+                                    ).await {
+                                        warn!(
+                                            "Failed to send SS UDP reply to {}: {}",
+                                            reply.session_key.client_addr, e
+                                        );
+                                    } else {
+                                        trace!(
+                                            "Sent SS UDP reply: {} -> {} ({} bytes)",
+                                            std::net::SocketAddr::new(reply.source_ip, reply.source_port),
+                                            reply.session_key.client_addr,
+                                            reply.payload.len()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    // Store UDP task handles
+                    {
+                        let mut udp_task_guard = self.ss_udp_task.write();
+                        *udp_task_guard = Some(udp_task);
+                    }
+                    {
+                        let mut udp_reply_task_guard = self.ss_udp_reply_task.write();
+                        *udp_reply_task_guard = Some(udp_reply_task);
+                    }
+
+                    info!(listen = %listen_addr, "Shadowsocks UDP relay started with WG tunnel support");
+                }
+                Err(e) => {
+                    warn!("Failed to start Shadowsocks UDP relay: {}", e);
+                }
+            }
         }
 
         info!(
@@ -7249,6 +7830,29 @@ impl IpcHandler {
             if let Some(task) = task_guard.take() {
                 task.abort();
                 info!("Shadowsocks inbound accept task aborted");
+            }
+        }
+
+        // Stop UDP relay if running
+        {
+            let mut udp_task_guard = self.ss_udp_task.write();
+            if let Some(task) = udp_task_guard.take() {
+                task.abort();
+                info!("Shadowsocks UDP relay task aborted");
+            }
+        }
+        {
+            let mut udp_reply_task_guard = self.ss_udp_reply_task.write();
+            if let Some(task) = udp_reply_task_guard.take() {
+                task.abort();
+                info!("Shadowsocks UDP reply poll task aborted");
+            }
+        }
+        {
+            let mut udp_guard = self.ss_udp_relay.write();
+            if let Some(relay) = udp_guard.take() {
+                relay.shutdown();
+                info!("Shadowsocks UDP relay stopped");
             }
         }
 

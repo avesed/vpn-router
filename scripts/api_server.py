@@ -4323,6 +4323,19 @@ async def api_switch_default_outbound(payload: DefaultOutboundRequest):
         if chain.get("tag"):
             available_outbounds.append(chain['tag'])
 
+    # Add Shadowsocks outbounds from rust-router IPC
+    if HAS_RUST_ROUTER_CLIENT:
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.list_shadowsocks_outbounds()
+                if resp.success:
+                    for ob in resp.data.get("outbounds", []):
+                        if ob.get("tag") and ob["tag"] not in available_outbounds:
+                            available_outbounds.append(ob["tag"])
+        except Exception as e:
+            logging.debug(f"Failed to get Shadowsocks outbounds from rust-router: {e}")
+
     if new_outbound not in available_outbounds:
         raise HTTPException(
             status_code=400,
@@ -8627,8 +8640,8 @@ def api_get_v2ray_inbound():
 
 
 @app.put("/api/ingress/v2ray")
-def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
-    """更新 V2Ray 入口配置（使用 Xray + TUN + TPROXY 架构）- VLESS only"""
+async def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
+    """更新 V2Ray 入口配置（使用 rust-router VLESS inbound）- VLESS only"""
     db = _get_db()
 
     # 验证协议 - [Xray-lite] 仅支持 VLESS
@@ -8699,11 +8712,76 @@ def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
 
-    # NOTE: Legacy xray-lite reload removed
-    # VLESS inbound is now configured via rust-router IPC (ConfigureVlessInbound)
-    # The rust-router will pick up changes via its own configuration mechanism
+    # Configure VLESS inbound via rust-router IPC
+    vless_status = ""
+    if payload.enabled:
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                # 先停止当前的VLESS inbound（如果正在运行）
+                try:
+                    await client.stop_vless_inbound()
+                except Exception:
+                    pass  # 忽略停止错误（可能本来就没有运行）
 
-    response = {"message": f"V2Ray inbound config updated{reload_status}"}
+                # Build user configs from database
+                users = db.get_v2ray_users(enabled_only=True)
+                user_configs = []
+                for user in users:
+                    user_configs.append({
+                        'uuid': user.get('uuid'),
+                        'email': user.get('email'),
+                        'flow': user.get('flow', 'xtls-rprx-vision'),
+                    })
+
+                listen = f"{payload.listen_address}:{payload.listen_port}"
+
+                # Build IPC command kwargs
+                kwargs = {
+                    'listen': listen,
+                    'users': user_configs,
+                    'tls_cert_path': payload.tls_cert_path,
+                    'tls_key_path': payload.tls_key_path,
+                    'fallback': payload.fallback_server,
+                    'udp_enabled': payload.udp_enabled,  # 使用前端传入的值
+                }
+
+                # Add REALITY parameters if enabled
+                if payload.reality_enabled and payload.reality_private_key:
+                    kwargs['reality_private_key'] = payload.reality_private_key
+                    kwargs['reality_short_ids'] = reality_short_ids
+                    kwargs['reality_dest'] = payload.reality_dest
+                    kwargs['reality_server_names'] = payload.reality_server_names
+                    kwargs['reality_max_time_diff_ms'] = 120000
+
+                resp = await client.configure_vless_inbound(**kwargs)
+                if resp.success:
+                    mode = 'REALITY' if payload.reality_enabled and payload.reality_private_key else ('TLS' if payload.tls_cert_path else 'TCP')
+                    vless_status = f", VLESS inbound configured ({mode} mode)"
+                    print(f"[api] VLESS inbound configured on {listen} ({mode} mode)")
+                else:
+                    vless_status = f", VLESS config failed: {resp.error}"
+                    print(f"[api] VLESS inbound configuration failed: {resp.error}")
+            else:
+                vless_status = ", rust-router not available"
+        except Exception as exc:
+            print(f"[api] VLESS inbound configuration error: {exc}")
+            vless_status = f", VLESS config error: {exc}"
+    else:
+        # Stop VLESS inbound if disabled
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.stop_vless_inbound()
+                if resp.success:
+                    vless_status = ", VLESS inbound stopped"
+                else:
+                    vless_status = f", VLESS stop failed: {resp.error}"
+        except Exception as exc:
+            print(f"[api] VLESS stop error: {exc}")
+            vless_status = f", VLESS stop error: {exc}"
+
+    response = {"message": f"V2Ray inbound config updated{reload_status}{vless_status}"}
     # 如果自动生成了 short_id，返回给前端以便显示
     if payload.reality_enabled and not payload.reality_short_ids and reality_short_ids:
         response["auto_generated_short_id"] = reality_short_ids[0]
@@ -9154,6 +9232,365 @@ def api_generate_reality_keys():
         return keys
     else:
         raise HTTPException(status_code=500, detail="Failed to generate REALITY keys")
+
+
+# ============ Shadowsocks Inbound APIs ============
+
+class ShadowsocksInboundConfigUpdateRequest(BaseModel):
+    """Shadowsocks 入口配置更新请求"""
+    enabled: Optional[bool] = None
+    listen_addr: Optional[str] = None
+    listen_port: Optional[int] = None
+    method: Optional[str] = None
+    password: Optional[str] = None
+    udp_enabled: Optional[bool] = None
+
+
+@app.get("/api/ingress/shadowsocks/config")
+def api_get_shadowsocks_inbound_config():
+    """获取 Shadowsocks 入口配置"""
+    db = _get_db()
+    config = db.get_shadowsocks_inbound_config()
+
+    # 返回默认配置如果数据库中没有
+    if not config:
+        config = {
+            "enabled": False,
+            "listen_address": "0.0.0.0",
+            "listen_port": 8388,
+            "method": "2022-blake3-aes-256-gcm",
+            "password": "",
+            "udp_enabled": True,
+            "default_outbound": None,
+        }
+
+    # 转换字段名以匹配前端类型
+    return {
+        "config": {
+            "enabled": bool(config.get("enabled", 0)),
+            "listen_addr": config.get("listen_address", "0.0.0.0"),
+            "listen_port": config.get("listen_port", 8388),
+            "method": config.get("method", "2022-blake3-aes-256-gcm"),
+            "password": config.get("password", ""),
+            "udp_enabled": bool(config.get("udp_enabled", 1)),
+        }
+    }
+
+
+@app.post("/api/ingress/shadowsocks/config")
+async def api_update_shadowsocks_inbound_config(payload: ShadowsocksInboundConfigUpdateRequest):
+    """更新 Shadowsocks 入口配置"""
+    db = _get_db()
+
+    # 获取当前配置
+    current_config = db.get_shadowsocks_inbound_config() or {}
+
+    # 合并更新
+    listen_addr = payload.listen_addr if payload.listen_addr is not None else current_config.get("listen_address", "0.0.0.0")
+    listen_port = payload.listen_port if payload.listen_port is not None else current_config.get("listen_port", 8388)
+    method = payload.method if payload.method is not None else current_config.get("method", "2022-blake3-aes-256-gcm")
+    password = payload.password if payload.password is not None else current_config.get("password", "")
+    udp_enabled = payload.udp_enabled if payload.udp_enabled is not None else bool(current_config.get("udp_enabled", 1))
+    enabled = payload.enabled if payload.enabled is not None else bool(current_config.get("enabled", 0))
+
+    # 验证密码（AEAD 2022 需要有效密码）
+    if enabled and not password:
+        raise HTTPException(status_code=400, detail="Password is required for Shadowsocks")
+
+    # 保存到数据库
+    db.set_shadowsocks_inbound_config(
+        listen_address=listen_addr,
+        listen_port=listen_port,
+        method=method,
+        password=password,
+        udp_enabled=udp_enabled,
+        enabled=enabled,
+    )
+
+    # 通过 rust-router IPC 配置 Shadowsocks inbound
+    ss_status = ""
+    if enabled:
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                # 先停止当前的 Shadowsocks inbound（如果正在运行）
+                try:
+                    await client.stop_shadowsocks_inbound()
+                except Exception:
+                    pass  # 忽略停止错误
+
+                listen = f"{listen_addr}:{listen_port}"
+                resp = await client.configure_shadowsocks_inbound(
+                    listen=listen,
+                    method=method,
+                    password=password,
+                    udp_enabled=udp_enabled,
+                )
+                if resp.success:
+                    ss_status = f", Shadowsocks inbound configured on {listen}"
+                    print(f"[api] Shadowsocks inbound configured on {listen}")
+                else:
+                    ss_status = f", Shadowsocks config failed: {resp.error}"
+                    print(f"[api] Shadowsocks inbound configuration failed: {resp.error}")
+            else:
+                ss_status = ", rust-router not available"
+        except Exception as exc:
+            print(f"[api] Shadowsocks inbound configuration error: {exc}")
+            ss_status = f", Shadowsocks config error: {exc}"
+    else:
+        # 停止 Shadowsocks inbound
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.stop_shadowsocks_inbound()
+                if resp.success:
+                    ss_status = ", Shadowsocks inbound stopped"
+                else:
+                    ss_status = f", Shadowsocks stop failed: {resp.error}"
+        except Exception as exc:
+            print(f"[api] Shadowsocks stop error: {exc}")
+            ss_status = f", Shadowsocks stop error: {exc}"
+
+    return {
+        "message": f"Shadowsocks inbound config updated{ss_status}",
+        "config": {
+            "enabled": enabled,
+            "listen_addr": listen_addr,
+            "listen_port": listen_port,
+            "method": method,
+            "password": password,
+            "udp_enabled": udp_enabled,
+        }
+    }
+
+
+@app.get("/api/ingress/shadowsocks/status")
+async def api_get_shadowsocks_inbound_status():
+    """获取 Shadowsocks 入口状态（从 rust-router）"""
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return {
+                "enabled": False,
+                "listen_addr": None,
+                "listen_port": None,
+                "method": None,
+                "udp_enabled": False,
+                "active_connections": 0,
+                "total_connections": 0,
+                "bytes_received": 0,
+                "bytes_sent": 0,
+                "message": "rust-router not available"
+            }
+
+        response = await client.get_shadowsocks_inbound_status()
+
+        if not response.success:
+            return {
+                "enabled": False,
+                "listen_addr": None,
+                "listen_port": None,
+                "method": None,
+                "udp_enabled": False,
+                "active_connections": 0,
+                "total_connections": 0,
+                "bytes_received": 0,
+                "bytes_sent": 0,
+                "error": response.error
+            }
+
+        # 返回 rust-router 返回的状态数据
+        data = response.data or {}
+        return {
+            "enabled": data.get("enabled", False),
+            "listen_addr": data.get("listen_addr"),
+            "listen_port": data.get("listen_port"),
+            "method": data.get("method"),
+            "udp_enabled": data.get("udp_enabled", False),
+            "active_connections": data.get("active_connections", 0),
+            "total_connections": data.get("total_connections", 0),
+            "bytes_received": data.get("bytes_received", 0),
+            "bytes_sent": data.get("bytes_sent", 0),
+        }
+
+    except Exception as exc:
+        print(f"[api] Shadowsocks inbound status error: {exc}")
+        return {
+            "enabled": False,
+            "listen_addr": None,
+            "listen_port": None,
+            "method": None,
+            "udp_enabled": False,
+            "active_connections": 0,
+            "total_connections": 0,
+            "bytes_received": 0,
+            "bytes_sent": 0,
+            "error": str(exc)
+        }
+
+
+@app.post("/api/ingress/shadowsocks/stop")
+async def api_stop_shadowsocks_inbound():
+    """停止 Shadowsocks 入口"""
+    # 更新数据库状态
+    db = _get_db()
+    db.update_shadowsocks_inbound_config(enabled=0)
+
+    # 通过 IPC 停止
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.stop_shadowsocks_inbound()
+            if resp.success:
+                return {"message": "Shadowsocks inbound stopped"}
+            else:
+                return {"message": f"Stop failed: {resp.error}"}
+        else:
+            return {"message": "rust-router not available"}
+    except Exception as exc:
+        print(f"[api] Shadowsocks stop error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/ingress/shadowsocks/outbound")
+def api_get_shadowsocks_ingress_outbound():
+    """获取 Shadowsocks 入口的绑定出口"""
+    db = _get_db()
+    config = db.get_shadowsocks_inbound_config()
+
+    global_default = db.get_setting("default_outbound") or "direct"
+    available = _get_available_outbounds(db)
+
+    return {
+        "outbound": config.get("default_outbound") if config else None,
+        "global_default": global_default,
+        "available_outbounds": available,
+    }
+
+
+@app.put("/api/ingress/shadowsocks/outbound")
+def api_set_shadowsocks_ingress_outbound(payload: dict):
+    """设置 Shadowsocks 入口的绑定出口"""
+    outbound = payload.get("outbound")
+    db = _get_db()
+
+    # 验证出口存在
+    if outbound:
+        available = _get_available_outbounds(db)
+        if outbound not in available:
+            raise HTTPException(status_code=400, detail=f"Outbound '{outbound}' not found")
+
+    # 更新配置
+    db.update_shadowsocks_inbound_config(default_outbound=outbound)
+
+    return {
+        "success": True,
+        "message": f"Shadowsocks ingress outbound set to {outbound or 'global default'}",
+        "outbound": outbound,
+        "reloaded": False,
+    }
+
+
+# ============ Shadowsocks Egress APIs ============
+
+class ShadowsocksEgressCreateRequest(BaseModel):
+    """创建 Shadowsocks 出口"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    server: str = Field(..., description="服务器地址")
+    server_port: int = Field(8388, ge=1, le=65535, description="服务器端口")
+    method: str = Field("2022-blake3-aes-256-gcm", description="加密方法")
+    password: str = Field(..., description="密码 (AEAD 2022 需要 Base64 编码)")
+    udp: bool = Field(False, description="启用 UDP")
+
+
+@app.get("/api/egress/shadowsocks")
+async def api_list_shadowsocks_egress():
+    """列出所有 Shadowsocks 出口"""
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            return {"egress": [], "error": "rust-router not available"}
+
+        resp = await client.list_shadowsocks_outbounds()
+        if resp.success:
+            outbounds = resp.data.get("outbounds", [])
+            return {"egress": outbounds}
+        else:
+            return {"egress": [], "error": resp.error}
+    except Exception as e:
+        return {"egress": [], "error": str(e)}
+
+
+@app.post("/api/egress/shadowsocks")
+async def api_create_shadowsocks_egress(payload: ShadowsocksEgressCreateRequest):
+    """创建 Shadowsocks 出口"""
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            raise HTTPException(status_code=503, detail="rust-router not available")
+
+        resp = await client.add_shadowsocks_outbound(
+            tag=payload.tag,
+            server=payload.server,
+            server_port=payload.server_port,
+            method=payload.method,
+            password=payload.password,
+            udp=payload.udp,
+        )
+
+        if resp.success:
+            return {
+                "success": True,
+                "message": f"Shadowsocks egress '{payload.tag}' created",
+                "tag": payload.tag,
+            }
+        else:
+            raise HTTPException(status_code=400, detail=resp.error)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/egress/shadowsocks/{tag}")
+async def api_get_shadowsocks_egress(tag: str):
+    """获取 Shadowsocks 出口详情"""
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            raise HTTPException(status_code=503, detail="rust-router not available")
+
+        resp = await client.get_shadowsocks_outbound(tag)
+        if resp.success:
+            return resp.data
+        else:
+            raise HTTPException(status_code=404, detail=resp.error)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/egress/shadowsocks/{tag}")
+async def api_delete_shadowsocks_egress(tag: str):
+    """删除 Shadowsocks 出口"""
+    try:
+        client = await _get_rust_router_client()
+        if not client:
+            raise HTTPException(status_code=503, detail="rust-router not available")
+
+        resp = await client.remove_shadowsocks_outbound(tag)
+        if resp.success:
+            return {
+                "success": True,
+                "message": f"Shadowsocks egress '{tag}' removed",
+            }
+        else:
+            raise HTTPException(status_code=404, detail=resp.error)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============ Xray Egress Control APIs (DEPRECATED - use rust-router VLESS) ============

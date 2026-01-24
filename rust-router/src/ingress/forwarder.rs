@@ -74,8 +74,38 @@ const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_ICMPV6: u8 = 58;
 
 /// Global storage for TCP write halves (used for forwarding client data to server)
-static TCP_WRITE_HALVES: Lazy<DashMap<FiveTuple, Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TcpStream>>>>> =
+/// Uses a boxed async writer to support various stream types (TCP, TLS, Shadowsocks, etc.)
+type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+static TCP_WRITE_HALVES: Lazy<DashMap<FiveTuple, Arc<tokio::sync::Mutex<BoxedAsyncWrite>>>> =
     Lazy::new(DashMap::new);
+
+/// Pending stream info for protocols that require write-before-read (e.g., Shadowsocks)
+/// These streams are stored unsplit and are split after the first client data arrives.
+struct PendingStreamInfo {
+    /// The unsplit stream (must be written to before reading)
+    stream: crate::outbound::OutboundStream,
+    /// Reply channel for sending packets back to the client
+    reply_tx: mpsc::Sender<ReplyPacket>,
+    /// Server IP (destination from client's perspective)
+    server_ip: Ipv4Addr,
+    /// Server port
+    server_port: u16,
+    /// Client IP
+    client_ip: Ipv4Addr,
+    /// Client port
+    client_port: u16,
+    /// Server's initial sequence number
+    server_seq: u32,
+    /// Outbound tag for stats and logging
+    outbound_tag: String,
+    /// Connection tracking entry
+    connection: Arc<RwLock<TcpConnection>>,
+}
+
+/// Global storage for pending streams (Shadowsocks and other write-before-read protocols)
+/// Key: 5-tuple (client_ip, client_port, server_ip, server_port, protocol)
+/// Value: PendingStreamInfo containing the unsplit stream and metadata
+static TCP_PENDING_STREAMS: Lazy<DashMap<FiveTuple, PendingStreamInfo>> = Lazy::new(DashMap::new);
 
 /// Global storage for UDP sessions (used for QUIC and other UDP traffic)
 /// Key: (client_ip, client_port, server_ip, server_port)
@@ -113,6 +143,70 @@ impl UdpSessionEntry {
 
     fn last_activity_secs(&self) -> u64 {
         self.last_activity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Global storage for proxy UDP sessions (Shadowsocks, SOCKS5)
+/// Key: 5-tuple (client_ip, client_port, server_ip, server_port, protocol)
+/// Value: ProxyUdpSessionEntry containing the UDP outbound handle
+static PROXY_UDP_SESSIONS: Lazy<DashMap<FiveTuple, Arc<ProxyUdpSessionEntry>>> =
+    Lazy::new(DashMap::new);
+
+/// Proxy UDP session entry for non-Direct outbounds (Shadowsocks, SOCKS5)
+///
+/// Unlike direct UDP sessions which use a raw `UdpSocket`, proxy sessions
+/// use a `UdpOutboundHandle` which encapsulates the proxy protocol logic.
+struct ProxyUdpSessionEntry {
+    /// The UDP outbound handle (Shadowsocks or SOCKS5)
+    handle: crate::outbound::UdpOutboundHandle,
+    /// Last activity timestamp (unix epoch seconds)
+    last_activity: AtomicU64,
+    /// Statistics: packets sent
+    packets_sent: AtomicU64,
+    /// Statistics: packets received
+    packets_received: AtomicU64,
+}
+
+impl ProxyUdpSessionEntry {
+    /// Create a new proxy UDP session entry
+    fn new(handle: crate::outbound::UdpOutboundHandle) -> Self {
+        Self {
+            handle,
+            last_activity: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            packets_sent: AtomicU64::new(0),
+            packets_received: AtomicU64::new(0),
+        }
+    }
+
+    /// Update the last activity timestamp
+    fn touch(&self) {
+        self.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Get the last activity timestamp in seconds since UNIX epoch
+    fn last_activity_secs(&self) -> u64 {
+        self.last_activity.load(Ordering::Relaxed)
+    }
+
+    /// Increment sent packet counter
+    fn record_sent(&self) {
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment received packet counter
+    fn record_received(&self) {
+        self.packets_received.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1921,11 +2015,27 @@ pub async fn run_forwarding_loop(
                 now_secs - session.last_activity_secs() <= 60
             });
             let udp_removed = udp_before.saturating_sub(UDP_SESSIONS.len());
-            
-            if sessions_removed > 0 || tcp_removed > 0 || udp_removed > 0 {
+
+            // Clean up stale proxy UDP sessions (Shadowsocks, SOCKS5)
+            let proxy_udp_before = PROXY_UDP_SESSIONS.len();
+            PROXY_UDP_SESSIONS.retain(|_, session| {
+                now_secs.saturating_sub(session.last_activity_secs()) <= PROXY_UDP_IDLE_TIMEOUT_SECS
+            });
+            let proxy_udp_removed = proxy_udp_before.saturating_sub(PROXY_UDP_SESSIONS.len());
+
+            // Clean up stale pending streams (Shadowsocks connections without first data)
+            // These are connections where the client never sent data after the TCP handshake
+            let pending_before = TCP_PENDING_STREAMS.len();
+            TCP_PENDING_STREAMS.retain(|five_tuple, _| {
+                // Check if the associated TCP connection still exists and is not stale
+                tcp_manager.get(five_tuple).is_some()
+            });
+            let pending_removed = pending_before.saturating_sub(TCP_PENDING_STREAMS.len());
+
+            if sessions_removed > 0 || tcp_removed > 0 || udp_removed > 0 || proxy_udp_removed > 0 || pending_removed > 0 {
                 debug!(
-                    "Cleaned up {} expired sessions, {} TCP connections, {} UDP sessions",
-                    sessions_removed, tcp_removed, udp_removed
+                    "Cleaned up {} expired sessions, {} TCP connections, {} UDP sessions, {} proxy UDP sessions, {} pending streams",
+                    sessions_removed, tcp_removed, udp_removed, proxy_udp_removed, pending_removed
                 );
             }
             last_cleanup = Instant::now();
@@ -2470,20 +2580,31 @@ async fn forward_tcp_packet(
                     let server_seq: u32 = rand::random();
 
                     // Get the stream for the reader task
-                    let stream = conn.into_stream();
-                    let (read_half, write_half) = tokio::io::split(stream);
+                    // Use into_outbound_stream() to support all stream types (TCP, TLS, Shadowsocks, etc.)
+                    let stream = conn.into_outbound_stream();
 
-                    // Update connection state (already created before connect)
-                    // Store outbound_stats for proper cleanup tracking
+                    // For proxy protocols like Shadowsocks that defer sending the target address
+                    // until the first write, we need to delay splitting the stream and spawning
+                    // the reader until after the first client data arrives.
+                    //
+                    // See: https://github.com/shadowsocks/shadowsocks-rust
+                    // The Shadowsocks protocol sends the target address with the first write.
+                    // If we split the stream and spawn the reader before any write, the reader
+                    // will try to read from the server before the handshake is complete,
+                    // causing "connection reset by peer".
+                    let stream_type = if stream.is_shadowsocks() { "Shadowsocks" }
+                        else if stream.is_tcp() { "TCP" }
+                        else if stream.is_transport() { "Transport" }
+                        else { "Unknown" };
+                    info!("TCP SYN: stream type = {} for outbound '{}'", stream_type, outbound_tag);
+
+                    // Update connection state and store outbound_stats
                     let outbound_stats = outbound.stats();
                     {
                         let mut conn_guard = tracked.write().await;
                         conn_guard.state = TcpConnectionState::Established;
                         conn_guard.server_seq = server_seq;
                         conn_guard.outbound_stats = Some(Arc::clone(&outbound_stats));
-                        // Store write half for sending data
-                        // Note: We'll need to modify TcpConnection to store OwnedWriteHalf
-                        // For now, we'll handle writes differently
                     }
 
                     // Send SYN-ACK back to client
@@ -2517,32 +2638,58 @@ async fn forward_tcp_packet(
                                 );
                             }
 
-                            // Spawn TCP reader task to forward server responses
-                            spawn_tcp_reader_task(
-                                read_half,
-                                reply_tx.clone(),
-                                server_ip,
-                                tcp_details.dst_port,
-                                client_ip,
-                                tcp_details.src_port,
-                                server_seq.wrapping_add(1), // Start after SYN-ACK
-                                tcp_details.seq_num.wrapping_add(1),
-                                outbound_tag.clone(),
-                                Arc::clone(&tracked),
-                                five_tuple, // Pass five_tuple for cleanup
-                            );
+                            // For Shadowsocks streams, defer splitting and reader spawning until first data
+                            if stream.requires_write_before_read() {
+                                info!(
+                                    "Deferring stream split for Shadowsocks: {}:{} -> {}:{} (waiting for first data)",
+                                    client_ip, tcp_details.src_port, server_ip, tcp_details.dst_port
+                                );
+                                let pending_info = PendingStreamInfo {
+                                    stream,
+                                    reply_tx: reply_tx.clone(),
+                                    server_ip,
+                                    server_port: tcp_details.dst_port,
+                                    client_ip,
+                                    client_port: tcp_details.src_port,
+                                    server_seq: server_seq.wrapping_add(1), // After SYN-ACK
+                                    outbound_tag: outbound_tag.clone(),
+                                    connection: Arc::clone(&tracked),
+                                };
+                                TCP_PENDING_STREAMS.insert(five_tuple, pending_info);
+                                debug!(
+                                    "TCP connection pending first data: {}:{} -> {}:{}",
+                                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                                );
+                            } else {
+                                // For non-Shadowsocks streams, split immediately and spawn reader
+                                let (read_half, write_half) = tokio::io::split(stream);
+
+                                spawn_tcp_reader_task(
+                                    read_half,
+                                    reply_tx.clone(),
+                                    server_ip,
+                                    tcp_details.dst_port,
+                                    client_ip,
+                                    tcp_details.src_port,
+                                    server_seq.wrapping_add(1), // Start after SYN-ACK
+                                    tcp_details.seq_num.wrapping_add(1),
+                                    outbound_tag.clone(),
+                                    Arc::clone(&tracked),
+                                    five_tuple,
+                                );
+
+                                // Store write half
+                                let write_half: BoxedAsyncWrite = Box::new(write_half);
+                                let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
+                                TCP_WRITE_HALVES.insert(five_tuple, write_half);
+
+                                debug!(
+                                    "TCP connection fully established with reply path: {}:{} -> {}:{}",
+                                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                                );
+                            }
                         }
                     }
-
-                    // Store write half in a separate structure for sending
-                    // We'll use a channel-based approach for the write half
-                    let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
-                    TCP_WRITE_HALVES.insert(five_tuple, write_half);
-
-                    debug!(
-                        "TCP connection fully established with reply path: {}:{} -> {}:{}",
-                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                    );
                 }
                 Err(e) => {
                     warn!(
@@ -2636,8 +2783,120 @@ async fn forward_tcp_packet(
                 return;
             }
 
-            // Try to use the write half from our global storage
+            // First check for pending streams (Shadowsocks waiting for first data)
             drop(conn_guard); // Release lock before async operation
+
+            // Check if this is a pending stream that needs the first write to trigger handshake
+            if let Some((_, pending)) = TCP_PENDING_STREAMS.remove(&five_tuple) {
+                info!(
+                    "First data for pending Shadowsocks stream: {}:{} -> {}:{} ({} bytes)",
+                    pending.client_ip, pending.client_port, pending.server_ip, pending.server_port, payload_len
+                );
+
+                // Write the payload to trigger Shadowsocks handshake (target address + data)
+                let mut stream = pending.stream;
+                use tokio::io::AsyncWriteExt;
+
+                match stream.write_all(payload).await {
+                    Ok(()) => {
+                        info!("Shadowsocks handshake triggered with {} bytes of data", payload_len);
+
+                        // Now split the stream and spawn the reader
+                        let (read_half, write_half) = tokio::io::split(stream);
+
+                        // Spawn the reader task
+                        spawn_tcp_reader_task(
+                            read_half,
+                            pending.reply_tx.clone(),
+                            pending.server_ip,
+                            pending.server_port,
+                            pending.client_ip,
+                            pending.client_port,
+                            pending.server_seq, // Sequence from SYN-ACK
+                            tcp_details.seq_num.wrapping_add(1), // Client's ACK
+                            pending.outbound_tag.clone(),
+                            Arc::clone(&pending.connection),
+                            five_tuple,
+                        );
+
+                        // Store write half for subsequent data
+                        let write_half: BoxedAsyncWrite = Box::new(write_half);
+                        let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
+                        TCP_WRITE_HALVES.insert(five_tuple, write_half);
+
+                        // Update connection state
+                        {
+                            let mut conn_guard = pending.connection.write().await;
+                            conn_guard.add_bytes_sent(payload_len as u64);
+                            conn_guard.touch();
+                            conn_guard.client_seq = tcp_details.seq_num.wrapping_add(payload_len as u32);
+                        }
+
+                        // Send ACK back to client
+                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
+                            let server_seq = {
+                                let conn_guard = pending.connection.read().await;
+                                conn_guard.server_seq
+                            };
+                            let ack_packet = build_tcp_packet(
+                                server_ip,
+                                tcp_details.dst_port,
+                                client_ip,
+                                tcp_details.src_port,
+                                server_seq,
+                                tcp_details.seq_num.wrapping_add(payload_len as u32),
+                                tcp_flag_bits::ACK,
+                                65535,
+                                &[],
+                            );
+                            let _ = pending.reply_tx.try_send(ReplyPacket {
+                                packet: ack_packet,
+                                tunnel_tag: pending.outbound_tag.clone(),
+                            });
+                        }
+
+                        debug!(
+                            "Shadowsocks stream activated: {}:{} -> {}:{}",
+                            pending.client_ip, pending.client_port, pending.server_ip, pending.server_port
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to trigger Shadowsocks handshake: {} (connection will be reset)",
+                            e
+                        );
+                        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+
+                        // Mark connection as closing
+                        {
+                            let mut conn_guard = pending.connection.write().await;
+                            conn_guard.state = TcpConnectionState::Closing;
+                        }
+
+                        // Send RST to client
+                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
+                            let rst_packet = build_tcp_packet(
+                                server_ip,
+                                tcp_details.dst_port,
+                                client_ip,
+                                tcp_details.src_port,
+                                pending.server_seq,
+                                tcp_details.seq_num,
+                                tcp_flag_bits::RST,
+                                0,
+                                &[],
+                            );
+                            let _ = pending.reply_tx.try_send(ReplyPacket {
+                                packet: rst_packet,
+                                tunnel_tag: pending.outbound_tag.clone(),
+                            });
+                        }
+                    }
+                }
+                return; // We've handled this packet
+            }
+
+            // Try to use the write half from our global storage
             // IMPORTANT: Clone the Arc and drop the DashMap Ref before any .await
             // Holding a DashMap Ref across .await can cause deadlocks due to
             // the internal sharded locking mechanism.
@@ -3208,7 +3467,27 @@ async fn forward_udp_packet(
             let outbound_tag_owned = outbound_tag.clone();
             let reply_tx = direct_reply_tx.clone();
 
-            // Check for existing UDP session
+            // Check for existing proxy UDP session (Shadowsocks, SOCKS5)
+            if let Some(proxy_session) = PROXY_UDP_SESSIONS.get(&five_tuple) {
+                // Reuse existing proxy session
+                proxy_session.touch();
+                proxy_session.record_sent();
+                match proxy_session.handle.send(udp_payload).await {
+                    Ok(bytes_sent) => {
+                        trace!(
+                            "Forwarded UDP via existing proxy session '{}': {} -> {}:{} ({} bytes)",
+                            outbound_tag, client_ip, server_ip, server_port, bytes_sent
+                        );
+                    }
+                    Err(e) => {
+                        debug!("Proxy UDP session send failed, removing: {}", e);
+                        PROXY_UDP_SESSIONS.remove(&five_tuple);
+                    }
+                }
+                return;
+            }
+
+            // Check for existing direct UDP session
             if let Some(session) = UDP_SESSIONS.get(&five_tuple) {
                 // Reuse existing session
                 session.touch();
@@ -3230,23 +3509,84 @@ async fn forward_udp_packet(
             // Create new UDP session
             match outbound.connect_udp(dst_addr, Duration::from_secs(5)).await {
                 Ok(handle) => {
-                    // Extract the socket from the handle
+                    // Extract the socket from the handle (Direct) or handle proxy sessions
                     let socket: Arc<UdpSocket> = match handle {
                         crate::outbound::UdpOutboundHandle::Direct(direct_handle) => {
                             Arc::clone(direct_handle.socket())
                         }
+                        // For non-direct handles (Shadowsocks, SOCKS5), use bidirectional session
                         _ => {
-                            // For non-direct handles, just send and return
+                            // Check session limit to prevent memory exhaustion
+                            if PROXY_UDP_SESSIONS.len() >= MAX_PROXY_UDP_SESSIONS {
+                                warn!(
+                                    "Proxy UDP session limit reached ({}), dropping packet to {}:{}",
+                                    MAX_PROXY_UDP_SESSIONS, server_ip, server_port
+                                );
+                                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+
+                            // Record UDP session in outbound stats
+                            let outbound_stats = outbound.stats();
+                            outbound_stats.record_connection();
+
+                            // Send the initial packet
                             match handle.send(udp_payload).await {
                                 Ok(bytes_sent) => {
                                     debug!(
-                                        "Forwarded UDP via '{}': {} -> {}:{} ({} bytes)",
+                                        "Forwarded UDP via new proxy session '{}': {} -> {}:{} ({} bytes)",
                                         outbound_tag, client_ip, server_ip, server_port, bytes_sent
                                     );
+
+                                    // Create and store the proxy session
+                                    // IMPORTANT: Insert into map BEFORE spawning listener to prevent race condition
+                                    // where listener exit cleanup finds no session to remove
+                                    let session = Arc::new(ProxyUdpSessionEntry::new(handle));
+                                    session.record_sent();
+                                    PROXY_UDP_SESSIONS.insert(five_tuple, Arc::clone(&session));
+
+                                    // Spawn reply listener if we have a reply channel
+                                    if let Some(tx) = reply_tx {
+                                        spawn_proxy_udp_reply_listener(
+                                            Arc::clone(&session),
+                                            five_tuple,
+                                            tx,
+                                            client_ip,
+                                            client_port,
+                                            server_ip,
+                                            server_port,
+                                            outbound_tag_owned,
+                                            outbound_stats,
+                                        );
+                                    } else {
+                                        // No reply channel - spawn cleanup task
+                                        let session_clone = Arc::clone(&session);
+                                        let ft = five_tuple;
+                                        let stats_clone = Arc::clone(&outbound_stats);
+                                        tokio::spawn(async move {
+                                            loop {
+                                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                                let now_secs = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                if now_secs.saturating_sub(session_clone.last_activity_secs())
+                                                    > PROXY_UDP_IDLE_TIMEOUT_SECS
+                                                {
+                                                    PROXY_UDP_SESSIONS.remove(&ft);
+                                                    stats_clone.record_completed(0, 0);
+                                                    debug!("Proxy UDP session (no reply) closed: {:?}", ft);
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    // Session already stored in PROXY_UDP_SESSIONS above
                                 }
                                 Err(e) => {
                                     warn!("Failed to send UDP via '{}': {}", outbound_tag, e);
                                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                                    outbound_stats.record_error();
                                 }
                             }
                             return;
@@ -3581,6 +3921,172 @@ fn spawn_direct_udp_reply_listener_raw(
     });
 }
 
+/// Timeout for proxy UDP reply operations (30 seconds)
+const PROXY_UDP_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle timeout for proxy UDP sessions (60 seconds without activity)
+const PROXY_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Maximum number of concurrent proxy UDP sessions to prevent memory exhaustion
+const MAX_PROXY_UDP_SESSIONS: usize = 10000;
+
+/// Spawn a task to listen for UDP replies on a proxy outbound handle (Shadowsocks, SOCKS5).
+///
+/// This function spawns an async task that loops waiting for replies from the proxy server
+/// and forwards them back to the WireGuard client. Unlike direct UDP which uses a single
+/// recv call, proxy sessions maintain long-lived connections that can receive multiple replies.
+///
+/// # Arguments
+///
+/// * `session` - Arc to the proxy UDP session entry
+/// * `five_tuple` - The 5-tuple key for session management
+/// * `reply_tx` - Channel to send reply packets to the reply router
+/// * `client_ip` - The original client's IP address (reply destination)
+/// * `client_port` - The original client's port (reply destination port)
+/// * `server_ip` - The server's IP address (reply source)
+/// * `server_port` - The server's port (reply source port)
+/// * `outbound_tag` - The outbound tag for logging and session matching
+/// * `outbound_stats` - Statistics tracker for the outbound
+fn spawn_proxy_udp_reply_listener(
+    session: Arc<ProxyUdpSessionEntry>,
+    five_tuple: FiveTuple,
+    reply_tx: mpsc::Sender<ReplyPacket>,
+    client_ip: IpAddr,
+    client_port: u16,
+    server_ip: IpAddr,
+    server_port: u16,
+    outbound_tag: String,
+    outbound_stats: Arc<crate::connection::OutboundStats>,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_UDP_REPLY_SIZE];
+        let mut total_bytes_rx: u64 = 0;
+        // Note: total_bytes_tx would be tracked from the sender side, not here
+        let total_bytes_tx: u64 = 0;
+
+        debug!(
+            "Proxy UDP reply listener started for {}:{} -> {}:{} via '{}'",
+            client_ip, client_port, server_ip, server_port, outbound_tag
+        );
+
+        loop {
+            // Wait for reply with timeout
+            match tokio::time::timeout(PROXY_UDP_REPLY_TIMEOUT, session.handle.recv(&mut buf)).await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    // Update session activity
+                    session.touch();
+                    session.record_received();
+                    total_bytes_rx += n as u64;
+
+                    let reply_payload = &buf[..n];
+
+                    // Build complete IP packet for the reply based on IP version
+                    let reply_packet = match (server_ip, client_ip) {
+                        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                            build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
+                        }
+                        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                            build_udp_reply_packet_v6(
+                                src,
+                                server_port,
+                                dst,
+                                client_port,
+                                reply_payload,
+                            )
+                        }
+                        _ => {
+                            warn!(
+                                "IP version mismatch in proxy UDP reply: server={}, client={}",
+                                server_ip, client_ip
+                            );
+                            break;
+                        }
+                    };
+
+                    // Send to reply router
+                    let reply = ReplyPacket {
+                        packet: reply_packet,
+                        tunnel_tag: outbound_tag.clone(),
+                    };
+
+                    if let Err(e) = reply_tx.try_send(reply) {
+                        debug!(
+                            "Failed to send proxy UDP reply (channel {}): {} -> {}:{}",
+                            e, server_ip, client_ip, client_port
+                        );
+                        // Channel full or closed - stop listening
+                        break;
+                    }
+
+                    trace!(
+                        "Proxy UDP reply forwarded via '{}': {}:{} -> {}:{} ({} bytes)",
+                        outbound_tag,
+                        server_ip,
+                        server_port,
+                        client_ip,
+                        client_port,
+                        n
+                    );
+                }
+                Ok(Ok(_)) => {
+                    // Zero bytes read - connection closed by proxy
+                    debug!(
+                        "Proxy UDP session closed (zero read): {} -> {}:{} via '{}'",
+                        client_ip, server_ip, server_port, outbound_tag
+                    );
+                    break;
+                }
+                Ok(Err(e)) => {
+                    // Error receiving from proxy
+                    debug!(
+                        "Proxy UDP recv error via '{}': {} -> {}:{}: {}",
+                        outbound_tag, client_ip, server_ip, server_port, e
+                    );
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - check if session is still active
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let idle_secs = now_secs.saturating_sub(session.last_activity_secs());
+
+                    if idle_secs > PROXY_UDP_IDLE_TIMEOUT_SECS {
+                        debug!(
+                            "Proxy UDP session idle timeout ({}s): {} -> {}:{} via '{}'",
+                            idle_secs, client_ip, server_ip, server_port, outbound_tag
+                        );
+                        break;
+                    }
+
+                    // Session still active, continue waiting
+                    trace!(
+                        "Proxy UDP recv timeout (idle {}s), continuing: {} -> {}:{} via '{}'",
+                        idle_secs,
+                        client_ip,
+                        server_ip,
+                        server_port,
+                        outbound_tag
+                    );
+                }
+            }
+        }
+
+        // Cleanup session from global map
+        PROXY_UDP_SESSIONS.remove(&five_tuple);
+
+        // Record completion with accumulated stats
+        outbound_stats.record_completed(total_bytes_rx, total_bytes_tx);
+
+        debug!(
+            "Proxy UDP session closed: {} -> {}:{} via '{}' (rx: {} bytes, tx: {} bytes)",
+            client_ip, server_ip, server_port, outbound_tag, total_bytes_rx, total_bytes_tx
+        );
+    });
+}
+
 // ============================================================================
 // TCP Reader Task
 // ============================================================================
@@ -3605,8 +4111,10 @@ const TCP_READ_BUFFER_SIZE: usize = 65536;
 ///
 /// This task reads data from the server and constructs TCP packets to send
 /// back to the WireGuard client via the reply router.
-fn spawn_tcp_reader_task(
-    read_half: tokio::io::ReadHalf<TcpStream>,
+///
+/// The reader type is generic to support various stream types (TCP, TLS, Shadowsocks, etc.)
+fn spawn_tcp_reader_task<R>(
+    read_half: R,
     reply_tx: mpsc::Sender<ReplyPacket>,
     server_ip: Ipv4Addr,
     server_port: u16,
@@ -3617,7 +4125,10 @@ fn spawn_tcp_reader_task(
     outbound_tag: String,
     connection: Arc<RwLock<TcpConnection>>,
     five_tuple: FiveTuple,
-) {
+)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         // Use a larger read buffer for better throughput
         let mut reader = BufReader::with_capacity(TCP_READ_BUFFER_SIZE, read_half);

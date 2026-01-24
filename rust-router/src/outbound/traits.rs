@@ -134,6 +134,53 @@ impl OutboundStream {
         matches!(self, Self::Transport(_))
     }
 
+    /// Check if this is a Shadowsocks stream
+    #[must_use]
+    pub const fn is_shadowsocks(&self) -> bool {
+        #[cfg(feature = "shadowsocks")]
+        {
+            matches!(self, Self::Shadowsocks(_))
+        }
+        #[cfg(not(feature = "shadowsocks"))]
+        {
+            false
+        }
+    }
+
+    /// Check if this stream requires a write operation before reading.
+    ///
+    /// Some proxy protocols (like Shadowsocks) defer sending the target address
+    /// until the first write operation. If you try to read before writing,
+    /// the remote server doesn't know where to connect and the read will fail.
+    ///
+    /// For such streams, you should either:
+    /// - Wait for client data and write it first, or
+    /// - Send an empty write to trigger address transmission before reading
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// if stream.requires_write_before_read() {
+    ///     // Trigger address transmission by sending empty data
+    ///     stream.write_all(&[]).await?;
+    ///     stream.flush().await?;
+    /// }
+    /// let (reader, writer) = tokio::io::split(stream);
+    /// ```
+    #[must_use]
+    pub const fn requires_write_before_read(&self) -> bool {
+        #[cfg(feature = "shadowsocks")]
+        {
+            matches!(self, Self::Shadowsocks(_))
+        }
+        #[cfg(not(feature = "shadowsocks"))]
+        {
+            false
+        }
+    }
+
     /// Try to get the underlying TCP stream
     ///
     /// Returns `None` if this is not a TCP stream.

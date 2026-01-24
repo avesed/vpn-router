@@ -10,7 +10,7 @@ FROM golang:1.23-bookworm AS ca-certs
 # - p99 latency: 2.775μs (360x better than target)
 # - Throughput: 50.7M ops/s (50x better than target)
 # - 720+ tests passing with 100% pass rate
-FROM rust:1.83-bookworm AS rust-router-builder
+FROM rust:1.93-bookworm AS rust-router-builder
 
 ARG TARGETARCH
 
@@ -38,7 +38,7 @@ COPY rust-router/benches ./benches
 # Rebuild with actual source (dependencies are cached)
 # Profile settings from Cargo.toml: lto=true, codegen-units=1, panic=abort, strip=true
 RUN touch src/main.rs src/lib.rs && \
-    cargo build --release --bin rust-router && \
+    cargo build --release --bin rust-router --features shadowsocks && \
     ls -lh target/release/rust-router
 
 # ==========================================

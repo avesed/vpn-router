@@ -20,7 +20,8 @@ import {
   useShadowsocksIngressOutbound,
   useSetShadowsocksIngressOutbound,
 } from "@/api/hooks/useShadowsocksIngress";
-import { Loader2, Eye, EyeOff } from "lucide-react";
+import { Loader2, Eye, EyeOff, RefreshCw } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { SHADOWSOCKS_METHODS, type ShadowsocksMethod } from "@/types";
 
 // SS2022 methods require specific key lengths (in bytes)
@@ -29,6 +30,27 @@ const SS2022_KEY_LENGTHS: Record<string, number> = {
   "2022-blake3-aes-128-gcm": 16,
   "2022-blake3-chacha20-poly1305": 32,
 };
+
+// Default key lengths for legacy AEAD methods (recommended, but not strict)
+const LEGACY_AEAD_KEY_LENGTH = 32;
+
+/**
+ * Generate a cryptographically secure random key for Shadowsocks.
+ * - SS2022 methods: generates Base64-encoded key of exact required length
+ * - Legacy AEAD methods: generates a random 32-byte Base64 key (will be derived via HKDF)
+ */
+function generateKey(method: string): string {
+  const keyLength = SS2022_KEY_LENGTHS[method] || LEGACY_AEAD_KEY_LENGTH;
+  const randomBytes = new Uint8Array(keyLength);
+  crypto.getRandomValues(randomBytes);
+
+  // Convert to Base64
+  let binary = "";
+  randomBytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
 
 // Validate base64 key length for SS2022 methods
 function validateSS2022Key(password: string, method: string): string | null {
@@ -201,36 +223,63 @@ export function ShadowsocksIngressConfig() {
 
             <div className="grid gap-2">
               <Label htmlFor="password">Password / Key</Label>
-              <div className="relative">
-                <Input
-                  id="password"
-                  type={showPassword ? "text" : "password"}
-                  placeholder="Leave blank to keep existing password"
-                  {...register("password")}
-                  className="pr-10"
-                />
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
-                  onClick={() => setShowPassword(!showPassword)}
-                >
-                  {showPassword ? (
-                    <EyeOff className="h-4 w-4 text-muted-foreground" />
-                  ) : (
-                    <Eye className="h-4 w-4 text-muted-foreground" />
-                  )}
-                  <span className="sr-only">
-                    {showPassword ? "Hide password" : "Show password"}
-                  </span>
-                </Button>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <Input
+                    id="password"
+                    type={showPassword ? "text" : "password"}
+                    placeholder="Leave blank to keep existing password"
+                    {...register("password")}
+                    className="pr-10"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
+                    onClick={() => setShowPassword(!showPassword)}
+                  >
+                    {showPassword ? (
+                      <EyeOff className="h-4 w-4 text-muted-foreground" />
+                    ) : (
+                      <Eye className="h-4 w-4 text-muted-foreground" />
+                    )}
+                    <span className="sr-only">
+                      {showPassword ? "Hide password" : "Show password"}
+                    </span>
+                  </Button>
+                </div>
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        onClick={() => {
+                          const newKey = generateKey(watchMethod);
+                          setValue("password", newKey);
+                          setKeyValidationError(null);
+                          setShowPassword(true); // Show the generated key
+                        }}
+                      >
+                        <RefreshCw className="h-4 w-4" />
+                        <span className="sr-only">Generate key</span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Generate random key ({SS2022_KEY_LENGTHS[watchMethod] || LEGACY_AEAD_KEY_LENGTH} bytes)</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
               </div>
               {keyValidationError && (
                 <p className="text-sm text-destructive">{keyValidationError}</p>
               )}
               <p className="text-xs text-muted-foreground">
-                Enter a new password to update, or leave blank to keep the existing one
+                {watchMethod?.startsWith("2022-")
+                  ? `SS2022 requires a ${SS2022_KEY_LENGTHS[watchMethod]}-byte base64 key. Click the refresh button to generate one.`
+                  : "Enter a password or click the refresh button to generate a random key."}
               </p>
             </div>
 

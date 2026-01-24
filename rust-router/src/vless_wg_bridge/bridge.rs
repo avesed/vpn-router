@@ -188,6 +188,42 @@ pub struct BridgeStatsSnapshot {
 /// The bridge uses `Arc<Mutex<SmoltcpBridge>>` to share the smoltcp bridge
 /// with socket guards (`TcpSocketGuard`, `UdpSocketGuard`). These guards
 /// implement RAII to ensure sockets are properly cleaned up on all code paths.
+/// Raw UDP session key for external callers (e.g., Shadowsocks UDP relay)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RawUdpSessionKey {
+    /// Client address
+    pub client_addr: SocketAddr,
+    /// Destination IP
+    pub dest_ip: IpAddr,
+    /// Destination port
+    pub dest_port: u16,
+}
+
+impl RawUdpSessionKey {
+    /// Create a new raw UDP session key
+    #[must_use]
+    pub fn new(client_addr: SocketAddr, dest_ip: IpAddr, dest_port: u16) -> Self {
+        Self {
+            client_addr,
+            dest_ip,
+            dest_port,
+        }
+    }
+}
+
+/// Raw UDP reply for external callers
+#[derive(Debug)]
+pub struct RawUdpReply {
+    /// Session key identifying which client/destination this is for
+    pub session_key: RawUdpSessionKey,
+    /// Source IP of the reply
+    pub source_ip: IpAddr,
+    /// Source port of the reply
+    pub source_port: u16,
+    /// Reply payload
+    pub payload: bytes::Bytes,
+}
+
 pub struct VlessWgBridge {
     /// smoltcp bridge (TCP/IP stack) - Arc for sharing with socket guards
     smoltcp: Arc<Mutex<SmoltcpBridge>>,
@@ -218,6 +254,14 @@ pub struct VlessWgBridge {
 
     /// Global VLESS reply registry (for routing WG replies back to this bridge)
     reply_registry: Option<Arc<VlessReplyRegistry>>,
+
+    /// Raw UDP sessions for external callers (Shadowsocks, etc.)
+    /// Key: (client_addr, dest_ip, dest_port) -> session state
+    raw_udp_sessions: parking_lot::RwLock<HashMap<RawUdpSessionKey, RawUdpSessionState>>,
+
+    /// Channel for raw UDP replies
+    raw_udp_reply_tx: mpsc::Sender<RawUdpReply>,
+    raw_udp_reply_rx: Mutex<mpsc::Receiver<RawUdpReply>>,
 }
 
 impl VlessWgBridge {
@@ -288,6 +332,9 @@ impl VlessWgBridge {
         // Create port allocator for session tracker
         let port_allocator = PortAllocator::new();
 
+        // Create channel for raw UDP replies (for Shadowsocks and similar protocols)
+        let (raw_udp_tx, raw_udp_rx) = mpsc::channel(WG_REPLY_CHANNEL_SIZE);
+
         info!(
             "VlessWgBridge created: wg_tag={}, local_ip={}, registry={}",
             wg_tag, local_ip, reply_registry.is_some()
@@ -304,6 +351,9 @@ impl VlessWgBridge {
             stats: BridgeStats::new(),
             shutdown: AtomicBool::new(false),
             reply_registry,
+            raw_udp_sessions: parking_lot::RwLock::new(HashMap::new()),
+            raw_udp_reply_tx: raw_udp_tx,
+            raw_udp_reply_rx: Mutex::new(raw_udp_rx),
         }
     }
 
@@ -1350,6 +1400,382 @@ impl VlessWgBridge {
             }
         }
     }
+
+    // ========================================================================
+    // Raw UDP API for Shadowsocks and similar protocols
+    // ========================================================================
+
+    /// Send a raw UDP packet through the WireGuard tunnel
+    ///
+    /// This is designed for protocols like Shadowsocks that send individual
+    /// UDP packets rather than using VLESS UDP framing.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_addr` - Original client address (for reply routing)
+    /// * `dest_ip` - Destination IP address
+    /// * `dest_port` - Destination port
+    /// * `payload` - UDP payload to send
+    ///
+    /// # Returns
+    ///
+    /// Returns Ok(()) if the packet was queued for sending.
+    /// Replies can be received via `try_recv_raw_udp_reply()`.
+    pub async fn send_raw_udp_packet(
+        &self,
+        client_addr: SocketAddr,
+        dest_ip: IpAddr,
+        dest_port: u16,
+        payload: &[u8],
+    ) -> Result<()> {
+        if self.is_shutdown() {
+            return Err(BridgeError::TunnelDown("bridge is shutting down".into()));
+        }
+
+        // Check tunnel health
+        if !self.check_tunnel_health().await {
+            return Err(BridgeError::TunnelDown(format!(
+                "WG tunnel '{}' is not healthy",
+                self.wg_tag
+            )));
+        }
+
+        let session_key = RawUdpSessionKey::new(client_addr, dest_ip, dest_port);
+
+        // Get or create session
+        let socket_handle = {
+            let sessions = self.raw_udp_sessions.read();
+            if let Some(session) = sessions.get(&session_key) {
+                // Update activity timestamp
+                session.last_activity.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    Ordering::Relaxed,
+                );
+                Some(session.socket_handle)
+            } else {
+                None
+            }
+        };
+
+        let socket_handle = match socket_handle {
+            Some(h) => h,
+            None => {
+                // Create new session
+                self.create_raw_udp_session(session_key).await?
+            }
+        };
+
+        // Send through smoltcp UDP socket
+        let smoltcp_dest = match dest_ip {
+            IpAddr::V4(v4) => smoltcp::wire::IpEndpoint {
+                addr: smoltcp::wire::IpAddress::Ipv4(
+                    smoltcp::wire::Ipv4Address::from_bytes(&v4.octets()),
+                ),
+                port: dest_port,
+            },
+            IpAddr::V6(_) => {
+                warn!("IPv6 not supported in smoltcp bridge");
+                return Err(BridgeError::SmoltcpUdp("IPv6 not supported".into()));
+            }
+        };
+
+        {
+            let mut bridge = self.smoltcp.lock().await;
+            if let Err(e) = bridge.udp_send(socket_handle, payload, smoltcp_dest) {
+                warn!("UDP send failed: {:?}", e);
+                return Err(BridgeError::SmoltcpUdp(format!("send failed: {:?}", e)));
+            }
+        }
+
+        self.stats
+            .bytes_to_wg
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+
+        trace!(
+            "Sent raw UDP packet: client={}, dest={}:{}, {} bytes",
+            client_addr,
+            dest_ip,
+            dest_port,
+            payload.len()
+        );
+
+        Ok(())
+    }
+
+    /// Create a raw UDP session
+    async fn create_raw_udp_session(&self, key: RawUdpSessionKey) -> Result<SocketHandle> {
+        // Allocate port
+        let port_guard = self
+            .sessions
+            .allocate_port()
+            .ok_or(BridgeError::PortExhausted)?;
+        let local_port = port_guard.take();
+
+        // Create UDP socket
+        let socket_handle = {
+            let mut bridge = self.smoltcp.lock().await;
+            let handle = bridge
+                .create_udp_socket()
+                .ok_or(BridgeError::SocketLimitReached(MAX_SOCKETS))?;
+
+            // Bind to local port
+            if let Err(e) = bridge.udp_bind(handle, local_port) {
+                bridge.remove_socket(handle);
+                self.sessions.return_port(local_port);
+                return Err(BridgeError::SmoltcpUdp(format!("bind failed: {e:?}")));
+            }
+
+            handle
+        };
+
+        // Register with reply registry for WG reply routing
+        let reply_key = if self.reply_registry.is_some() {
+            let rk = VlessReplyKey::new(
+                self.wg_tag.clone(),
+                self.local_ip,
+                local_port,
+                key.dest_ip,
+                key.dest_port,
+            );
+            if let Some(ref registry) = self.reply_registry {
+                registry.register(rk.clone(), self.wg_reply_tx.clone(), key.client_addr);
+                debug!(
+                    "Registered raw UDP session with reply registry: tunnel={} {}:{} -> {}:{}",
+                    self.wg_tag, self.local_ip, local_port, key.dest_ip, key.dest_port
+                );
+            }
+            Some(rk)
+        } else {
+            None
+        };
+
+        let session = RawUdpSessionState {
+            socket_handle,
+            local_port,
+            dest_ip: key.dest_ip,
+            dest_port: key.dest_port,
+            client_addr: key.client_addr,
+            last_activity: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            reply_key,
+        };
+
+        debug!(
+            "Created raw UDP session: client={}, local_port={}, dest={}:{}",
+            key.client_addr, local_port, key.dest_ip, key.dest_port
+        );
+
+        let mut sessions = self.raw_udp_sessions.write();
+        sessions.insert(key, session);
+
+        self.stats.udp_sessions.fetch_add(1, Ordering::Relaxed);
+        self.stats.active_udp.fetch_add(1, Ordering::Relaxed);
+
+        Ok(socket_handle)
+    }
+
+    /// Poll for raw UDP replies and queue them
+    ///
+    /// This should be called periodically to:
+    /// 1. Poll smoltcp and send outgoing WG packets
+    /// 2. Receive WG replies
+    /// 3. Check smoltcp sockets for incoming data
+    /// 4. Queue replies for retrieval via `try_recv_raw_udp_reply()`
+    pub async fn poll_raw_udp(&self) -> Result<()> {
+        if self.is_shutdown() {
+            return Ok(());
+        }
+
+        // Poll smoltcp and send packets
+        self.poll_and_send().await?;
+
+        // Receive WG replies
+        self.receive_wg_replies().await;
+
+        // Check for UDP data from smoltcp sockets
+        self.check_raw_udp_socket_replies().await?;
+
+        // Cleanup expired sessions
+        self.cleanup_raw_udp_sessions().await;
+
+        Ok(())
+    }
+
+    /// Check smoltcp UDP sockets for replies and queue them
+    async fn check_raw_udp_socket_replies(&self) -> Result<()> {
+        // Collect session info first to avoid holding the RwLock guard across await
+        let session_info: Vec<(RawUdpSessionKey, SocketHandle)> = {
+            let sessions = self.raw_udp_sessions.read();
+            sessions
+                .iter()
+                .map(|(k, s)| (*k, s.socket_handle))
+                .collect()
+        };
+
+        // Now lock the bridge (this is async)
+        let mut bridge = self.smoltcp.lock().await;
+
+        for (key, socket_handle) in session_info {
+            // Try to receive data from this socket
+            match bridge.udp_recv(socket_handle) {
+                Ok((data, endpoint)) => {
+                    if !data.is_empty() {
+                        let source_ip = match endpoint.addr {
+                            smoltcp::wire::IpAddress::Ipv4(v4) => {
+                                IpAddr::V4(std::net::Ipv4Addr::from(v4.0))
+                            }
+                        };
+
+                        let n = data.len();
+                        let reply = RawUdpReply {
+                            session_key: key,
+                            source_ip,
+                            source_port: endpoint.port,
+                            payload: bytes::Bytes::from(data),
+                        };
+
+                        self.stats
+                            .bytes_from_wg
+                            .fetch_add(n as u64, Ordering::Relaxed);
+
+                        trace!(
+                            "Received raw UDP reply: from {}:{} -> client {}, {} bytes",
+                            source_ip,
+                            endpoint.port,
+                            key.client_addr,
+                            n
+                        );
+
+                        // Queue the reply
+                        if let Err(e) = self.raw_udp_reply_tx.try_send(reply) {
+                            warn!("Failed to queue raw UDP reply: {:?}", e);
+                        }
+                    }
+                }
+                Err(smoltcp::socket::udp::RecvError::Exhausted) => {
+                    // No data available, that's fine
+                }
+                Err(e) => {
+                    trace!("UDP recv error (non-fatal): {:?}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Try to receive a raw UDP reply (non-blocking)
+    ///
+    /// Returns the next reply if available, or None if no replies are pending.
+    pub fn try_recv_raw_udp_reply(&self) -> Option<RawUdpReply> {
+        // We need to use try_lock since this might be called from sync context
+        if let Ok(mut rx) = self.raw_udp_reply_rx.try_lock() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Receive a raw UDP reply (async, blocking)
+    ///
+    /// Returns the next reply when available.
+    pub async fn recv_raw_udp_reply(&self) -> Option<RawUdpReply> {
+        let mut rx = self.raw_udp_reply_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Cleanup expired raw UDP sessions
+    async fn cleanup_raw_udp_sessions(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // First pass: find expired session keys (sync lock)
+        let expired: Vec<RawUdpSessionKey> = {
+            let sessions = self.raw_udp_sessions.read();
+            sessions
+                .iter()
+                .filter(|(_, session)| {
+                    let last = session.last_activity.load(Ordering::Relaxed);
+                    let timeout = if session.dest_port == 53 {
+                        UDP_DNS_TIMEOUT_SECS
+                    } else {
+                        UDP_DEFAULT_TIMEOUT_SECS
+                    };
+                    now.saturating_sub(last) > timeout
+                })
+                .map(|(k, _)| *k)
+                .collect()
+        };
+
+        if expired.is_empty() {
+            return;
+        }
+
+        // Lock smoltcp first (async) - before acquiring the sync lock
+        let mut bridge = self.smoltcp.lock().await;
+
+        // Now lock sessions (sync) and do cleanup
+        let mut sessions = self.raw_udp_sessions.write();
+        for key in expired {
+            if let Some(session) = sessions.remove(&key) {
+                debug!(
+                    "Expiring raw UDP session: client={}, dest={}:{}",
+                    key.client_addr, key.dest_ip, key.dest_port
+                );
+
+                // Unregister from reply registry first
+                if let Some(ref reply_key) = session.reply_key {
+                    if let Some(ref registry) = self.reply_registry {
+                        registry.unregister(reply_key);
+                    }
+                }
+
+                bridge.udp_close(session.socket_handle);
+                bridge.remove_socket(session.socket_handle);
+                self.sessions.return_port(session.local_port);
+                self.stats.active_udp.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Close all raw UDP sessions
+    ///
+    /// Call this when shutting down the bridge.
+    pub async fn close_all_raw_udp_sessions(&self) {
+        // Lock smoltcp first (async), then acquire sync lock
+        let mut bridge = self.smoltcp.lock().await;
+        let mut sessions = self.raw_udp_sessions.write();
+
+        for (key, session) in sessions.drain() {
+            debug!(
+                "Closing raw UDP session: client={}, dest={}:{}",
+                key.client_addr, key.dest_ip, key.dest_port
+            );
+
+            // Unregister from reply registry
+            if let Some(ref reply_key) = session.reply_key {
+                if let Some(ref registry) = self.reply_registry {
+                    registry.unregister(reply_key);
+                }
+            }
+
+            bridge.udp_close(session.socket_handle);
+            bridge.remove_socket(session.socket_handle);
+            self.sessions.return_port(session.local_port);
+            self.stats.active_udp.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        info!("Closed all raw UDP sessions");
+    }
 }
 
 /// Internal UDP session state
@@ -1366,6 +1792,27 @@ struct UdpSessionState {
     dest_ip: IpAddr,
     /// Destination port
     dest_port: u16,
+    /// Last activity timestamp (Unix timestamp in seconds)
+    last_activity: AtomicU64,
+    /// Reply registry key (for unregistration on cleanup)
+    reply_key: Option<VlessReplyKey>,
+}
+
+/// Raw UDP session state for external callers (Shadowsocks, etc.)
+///
+/// Similar to UdpSessionState but designed for packet-at-a-time operation
+/// rather than continuous stream processing.
+struct RawUdpSessionState {
+    /// smoltcp socket handle
+    socket_handle: SocketHandle,
+    /// Local port (allocated from port allocator)
+    local_port: u16,
+    /// Destination IP address
+    dest_ip: IpAddr,
+    /// Destination port
+    dest_port: u16,
+    /// Client address (for reply routing)
+    client_addr: SocketAddr,
     /// Last activity timestamp (Unix timestamp in seconds)
     last_activity: AtomicU64,
     /// Reply registry key (for unregistration on cleanup)

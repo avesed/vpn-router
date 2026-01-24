@@ -108,6 +108,9 @@ pub use udp_frame::{UdpFrameAddress, VlessUdpCodec, VlessUdpFrame};
 
 pub use socket_guard::{TcpSocketGuard, UdpSocketGuard};
 
-pub use bridge::{BridgeStats, BridgeStatsSnapshot, VlessUdpMode, VlessWgBridge, WgReplyPacket};
+pub use bridge::{
+    BridgeStats, BridgeStatsSnapshot, RawUdpReply, RawUdpSessionKey, VlessUdpMode, VlessWgBridge,
+    WgReplyPacket,
+};
 
 pub use reply_registry::{RegistryStatsSnapshot, VlessReplyKey, VlessReplyRegistry};

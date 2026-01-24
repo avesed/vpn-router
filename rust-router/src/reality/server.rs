@@ -1730,4 +1730,187 @@ mod tests {
         // Should fail because decryption will fail (wrong shared secret)
         assert!(result.is_err());
     }
+
+    /// End-to-end integration test: Client ↔ Server complete handshake
+    ///
+    /// This test verifies the full REALITY TLS 1.3 handshake between
+    /// a RealityClientConnection and RealityServer, followed by
+    /// bidirectional encrypted data transfer.
+    #[tokio::test]
+    async fn test_end_to_end_handshake_and_data_transfer() {
+        use crate::reality::client::{RealityClientConfig, RealityClientConnection};
+        use crate::reality::common::TLS_RECORD_HEADER_SIZE;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // === Setup: Generate matching client/server configurations ===
+        let server_private_key: [u8; 32] = random_bytes();
+        let short_id = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let server_name = "www.google.com";
+
+        // Server config
+        let server_config = RealityServerConfig {
+            private_key: server_private_key,
+            short_ids: vec![short_id.to_vec()],
+            dest: "www.google.com:443".to_string(),
+            server_names: vec![server_name.to_string()],
+            max_time_diff_ms: 120_000,
+        };
+        let server = RealityServer::new(server_config.clone());
+
+        // Client config - needs server's public key
+        let server_public_key = server_config.public_key();
+        let client_config = RealityClientConfig::new(
+            server_public_key,
+            short_id,
+            server_name.to_string(),
+        );
+
+        // === Create duplex stream for testing ===
+        let (client_stream, server_stream) = tokio::io::duplex(65536);
+
+        // === Run handshake concurrently ===
+        let server_handle = tokio::spawn({
+            let server = server.clone();
+            async move {
+                match server.accept_with_handshake(server_stream).await {
+                    Ok(RealityHandshakeResult::Authenticated { stream, short_id }) => {
+                        Ok((stream, short_id))
+                    }
+                    Ok(RealityHandshakeResult::Fallback) => {
+                        Err("Unexpected fallback".to_string())
+                    }
+                    Err(e) => Err(format!("Server handshake failed: {}", e)),
+                }
+            }
+        });
+
+        let client_handle = tokio::spawn(async move {
+            let mut conn = RealityClientConnection::new(client_config);
+
+            // Generate and send ClientHello
+            let client_hello = conn.start().map_err(|e| format!("start failed: {}", e))?;
+
+            let mut stream = client_stream;
+            stream
+                .write_all(&client_hello)
+                .await
+                .map_err(|e| format!("write client_hello failed: {}", e))?;
+
+            // Read and process server messages until handshake complete
+            let mut buf = vec![0u8; 16384];
+            while conn.is_handshaking() {
+                let n = stream
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| format!("read failed: {}", e))?;
+                if n == 0 {
+                    return Err("Connection closed during handshake".to_string());
+                }
+
+                let result = conn.feed(&buf[..n]).map_err(|e| format!("feed failed: {}", e))?;
+
+                // Send client Finished if needed
+                if !result.to_send.is_empty() {
+                    stream
+                        .write_all(&result.to_send)
+                        .await
+                        .map_err(|e| format!("write finished failed: {}", e))?;
+                }
+            }
+
+            assert!(conn.is_established(), "Client should be established");
+            Ok((conn, stream))
+        });
+
+        // Wait for both sides to complete
+        let (server_result, client_result) = tokio::join!(server_handle, client_handle);
+
+        let (mut server_stream, matched_short_id) = server_result
+            .expect("server task panicked")
+            .expect("server handshake failed");
+        let (mut client_conn, mut client_transport) = client_result
+            .expect("client task panicked")
+            .expect("client handshake failed");
+
+        assert_eq!(matched_short_id, short_id.to_vec(), "Short ID should match");
+
+        // === Test bidirectional data transfer ===
+
+        // Client -> Server
+        let client_message = b"Hello from client!";
+        let encrypted = client_conn.encrypt(client_message).expect("encrypt failed");
+        client_transport.write_all(&encrypted).await.expect("write failed");
+
+        let mut received = vec![0u8; 1024];
+        let n = server_stream.read(&mut received).await.expect("read failed");
+        assert!(n > 0, "Should receive data");
+        assert_eq!(&received[..n], client_message, "Message should match");
+
+        // Server -> Client
+        let server_message = b"Hello from server!";
+        server_stream.write_all(server_message).await.expect("server write failed");
+
+        // Read the encrypted response on client side
+        let mut response_buf = vec![0u8; 16384];
+        let n = client_transport.read(&mut response_buf).await.expect("client read failed");
+        assert!(n > 0, "Client should receive data");
+
+        let result = client_conn.feed(&response_buf[..n]).expect("client feed failed");
+        assert_eq!(result.app_data, server_message, "Server message should match");
+
+        println!("✓ End-to-end REALITY handshake and data transfer successful!");
+    }
+
+    /// Test that invalid client authentication falls back correctly
+    #[tokio::test]
+    async fn test_invalid_auth_triggers_fallback() {
+        use crate::reality::client::{RealityClientConfig, RealityClientConnection};
+        use tokio::io::AsyncWriteExt;
+
+        // Server with specific short_id
+        let server_private_key: [u8; 32] = random_bytes();
+        let server_config = RealityServerConfig {
+            private_key: server_private_key,
+            short_ids: vec![vec![0xFF; 8]], // Only accepts 0xFF short_id
+            dest: "127.0.0.1:1".to_string(), // Will fail to connect (that's OK for this test)
+            server_names: vec!["www.google.com".to_string()],
+            max_time_diff_ms: 120_000,
+        };
+        let server = RealityServer::new(server_config.clone());
+
+        // Client uses WRONG short_id (0xAB instead of 0xFF)
+        let server_public_key = server_config.public_key();
+        let wrong_short_id = [0xAB; 8];
+        let client_config = RealityClientConfig::new(
+            server_public_key,
+            wrong_short_id,
+            "www.google.com".to_string(),
+        );
+
+        let (mut client_stream, server_stream) = tokio::io::duplex(65536);
+
+        // Client sends ClientHello with wrong short_id
+        let mut client_conn = RealityClientConnection::new(client_config);
+        let client_hello = client_conn.start().expect("start failed");
+        client_stream.write_all(&client_hello).await.expect("write failed");
+        drop(client_stream); // Close to trigger server processing
+
+        // Server should attempt fallback (which will fail since dest is unreachable)
+        // But the important thing is it doesn't authenticate
+        let result = server.accept_with_handshake(server_stream).await;
+
+        // Result should be Fallback or error (depending on if fallback connects)
+        match result {
+            Ok(RealityHandshakeResult::Authenticated { .. }) => {
+                panic!("Should NOT authenticate with wrong short_id!");
+            }
+            Ok(RealityHandshakeResult::Fallback) => {
+                println!("✓ Correctly rejected invalid auth and went to fallback");
+            }
+            Err(_) => {
+                // Fallback connection failed (expected since dest is unreachable)
+                println!("✓ Correctly rejected invalid auth (fallback connection failed)");
+            }
+        }
+    }
 }

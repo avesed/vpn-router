@@ -2657,6 +2657,133 @@ class RustRouterClient:
         })
 
     # =========================================================================
+    # Shadowsocks Inbound Commands
+    # =========================================================================
+
+    async def configure_shadowsocks_inbound(
+        self,
+        listen: str,
+        method: str,
+        password: str,
+        udp_enabled: bool = True,
+    ) -> IpcResponse:
+        """Configure Shadowsocks inbound listener
+
+        Args:
+            listen: Listen address (e.g., "0.0.0.0:8388")
+            method: Encryption method (e.g., "2022-blake3-aes-256-gcm")
+            password: Password (Base64 for AEAD 2022 ciphers)
+            udp_enabled: Enable UDP relay
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "configure_shadowsocks_inbound",
+            "listen": listen,
+            "method": method,
+            "password": password,
+            "udp_enabled": udp_enabled,
+        })
+
+    async def stop_shadowsocks_inbound(self) -> IpcResponse:
+        """Stop Shadowsocks inbound listener
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({"type": "stop_shadowsocks_inbound"})
+
+    async def get_shadowsocks_inbound_status(self) -> IpcResponse:
+        """Get Shadowsocks inbound status
+
+        Returns:
+            IpcResponse with inbound status info including:
+            - enabled: bool
+            - listen_addr: str (if running)
+            - listen_port: int (if running)
+            - method: str (if running)
+            - udp_enabled: bool
+            - active_connections: int
+            - total_connections: int
+            - bytes_received: int
+            - bytes_sent: int
+        """
+        return await self._send_command({"type": "get_shadowsocks_inbound_status"})
+
+    # =========================================================================
+    # Shadowsocks Outbound Commands
+    # =========================================================================
+
+    async def add_shadowsocks_outbound(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        method: str,
+        password: str,
+        udp: bool = False,
+    ) -> IpcResponse:
+        """Add a Shadowsocks outbound
+
+        Args:
+            tag: Unique tag for this outbound
+            server: Server hostname or IP address
+            server_port: Server port
+            method: Encryption method (e.g., "2022-blake3-aes-256-gcm")
+            password: Password (Base64 for AEAD 2022 ciphers)
+            udp: Enable UDP support
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "add_shadowsocks_outbound",
+            "tag": tag,
+            "server": server,
+            "server_port": server_port,
+            "method": method,
+            "password": password,
+            "udp": udp,
+        })
+
+    async def remove_shadowsocks_outbound(self, tag: str) -> IpcResponse:
+        """Remove a Shadowsocks outbound
+
+        Args:
+            tag: Outbound tag to remove
+
+        Returns:
+            IpcResponse indicating success or failure
+        """
+        return await self._send_command({
+            "type": "remove_shadowsocks_outbound",
+            "tag": tag,
+        })
+
+    async def list_shadowsocks_outbounds(self) -> IpcResponse:
+        """List all Shadowsocks outbounds
+
+        Returns:
+            IpcResponse with list of outbounds
+        """
+        return await self._send_command({"type": "list_shadowsocks_outbounds"})
+
+    async def get_shadowsocks_outbound(self, tag: str) -> IpcResponse:
+        """Get Shadowsocks outbound info
+
+        Args:
+            tag: Outbound tag
+
+        Returns:
+            IpcResponse with outbound details
+        """
+        return await self._send_command({
+            "type": "get_shadowsocks_outbound",
+            "tag": tag,
+        })
+
+    # =========================================================================
     # Lifecycle Commands
     # =========================================================================
 

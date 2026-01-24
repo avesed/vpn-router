@@ -367,6 +367,33 @@ CREATE TABLE IF NOT EXISTS v2ray_users (
 CREATE INDEX IF NOT EXISTS idx_v2ray_users_uuid ON v2ray_users(uuid);
 CREATE INDEX IF NOT EXISTS idx_v2ray_users_enabled ON v2ray_users(enabled);
 
+-- Shadowsocks 入口服务器配置表（单行，类似 v2ray_inbound_config）
+CREATE TABLE IF NOT EXISTS shadowsocks_inbound_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+
+    -- 监听配置
+    listen_address TEXT DEFAULT '0.0.0.0',
+    listen_port INTEGER NOT NULL DEFAULT 8388,
+
+    -- 加密方式（仅支持 AEAD 2022 推荐）
+    -- 2022-blake3-aes-256-gcm, 2022-blake3-aes-128-gcm, 2022-blake3-chacha20-poly1305
+    -- aes-256-gcm, aes-128-gcm, chacha20-ietf-poly1305
+    method TEXT NOT NULL DEFAULT '2022-blake3-aes-256-gcm',
+
+    -- 密码（对于 AEAD 2022 需要 Base64 格式）
+    password TEXT NOT NULL DEFAULT '',
+
+    -- UDP 中继
+    udp_enabled INTEGER DEFAULT 1,
+
+    -- 入口绑定出口
+    default_outbound TEXT,
+
+    enabled INTEGER DEFAULT 0,    -- 默认禁用
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 远程规则集表（广告拦截等）
 CREATE TABLE IF NOT EXISTS remote_rule_sets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -880,11 +907,17 @@ def migrate_warp_egress_protocol(conn: sqlite3.Connection):
     columns = {row[1] for row in cursor.fetchall()}
 
     if "protocol" not in columns:
-        cursor.execute("ALTER TABLE warp_egress ADD COLUMN protocol TEXT DEFAULT 'masque'")
+        cursor.execute("ALTER TABLE warp_egress ADD COLUMN protocol TEXT DEFAULT 'wireguard'")
         conn.commit()
         print("✓ 添加 warp_egress.protocol 字段")
     else:
         print("⊘ warp_egress.protocol 字段已存在，跳过迁移")
+
+    # 将所有 masque 协议更新为 wireguard（MASQUE 已弃用）
+    cursor.execute("UPDATE warp_egress SET protocol='wireguard' WHERE protocol='masque'")
+    if cursor.rowcount > 0:
+        conn.commit()
+        print(f"✓ 已将 {cursor.rowcount} 个 WARP 出口从 masque 更新为 wireguard")
 
     # 添加 account_id 字段（用于 rust-router WARP 注册）
     if "account_id" not in columns:
