@@ -6,7 +6,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { useTestEgress } from "../../api/hooks/useEgress";
 import { toast } from "sonner";
-import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network, ArrowUpDown, RefreshCw } from "lucide-react";
+import { Activity, Trash2, Edit, Play, Globe, Server, Shield, Network, ArrowUpDown, RefreshCw, Lock } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface EgressCardProps {
@@ -54,6 +54,7 @@ export function EgressCard({ egress, onDelete, onEdit, onReconnect, showActions 
       case "direct": return <Network className="h-5 w-5 text-gray-500" />;
       case "warp": return <Globe className="h-5 w-5 text-orange-500" />;
       case "v2ray": return <Activity className="h-5 w-5 text-purple-500" />;
+      case "shadowsocks": return <Lock className="h-5 w-5 text-cyan-500" />;
       default: return <Globe className="h-5 w-5" />;
     }
   };

@@ -122,3 +122,12 @@ export function useSetV2RayIngressOutbound() {
     },
   });
 }
+
+// VLESS-WG Bridge Stats (from rust-router)
+export function useVlessBridgeStatus() {
+  return useQuery({
+    queryKey: ["vless-bridge", "status"],
+    queryFn: () => api.getVlessBridgeStatus(),
+    refetchInterval: 5000, // Update every 5 seconds
+  });
+}

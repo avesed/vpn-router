@@ -197,6 +197,7 @@
 
 mod detector;
 mod error;
+mod stream;
 
 // Re-export detector types and functions
 pub use detector::{
@@ -246,52 +247,31 @@ pub use detector::{
 // Re-export error types
 pub use error::{VisionError, VisionResult};
 
+// Re-export stream types
+pub use stream::{StreamState, VisionStream};
+
 // =============================================================================
-// TODO: Port Vision stream handling from shoes
+// VisionStream Implementation Notes
 // =============================================================================
 //
-// The shoes project (https://github.com/cfal/shoes) provides a complete
-// XTLS-Vision implementation under the MIT license. Key components to port:
+// VisionStream provides XTLS-Vision zero-copy passthrough functionality:
 //
-// 1. VisionStream (vision_stream.rs, 61KB)
-//    - Wraps AsyncRead + AsyncWrite
-//    - Detects TLS traffic on first read
-//    - Switches between passthrough and encrypted modes
-//    - Handles bidirectional traffic
+// - Wraps AsyncRead + AsyncWrite
+// - Detects TLS traffic on reads (ClientHello -> ServerHello -> AppData)
+// - Switches to passthrough mode when TLS handshake is detected
+// - Writes are transparent (Vision only inspects reads)
 //
-// 2. VisionFilter (vision_filter.rs)
-//    - Implements detection logic
-//    - Tracks TLS handshake state
-//    - Decides when to enable passthrough
+// State Machine:
+// - Inspecting: Initial state, examining first bytes
+// - AwaitServerHello: Saw ClientHello, waiting for ServerHello
+// - AwaitAppData: Saw ServerHello, waiting for ApplicationData
+// - Passthrough: TLS detected, zero-copy mode
+// - Encrypted: Non-TLS detected, normal encryption mode
 //
-// 3. VisionPad / VisionUnpad (vision_pad.rs, vision_unpad.rs)
-//    - Padding for traffic obfuscation
-//    - Removes padding on receive
-//    - Follows XTLS padding protocol
-//
-// Implementation notes:
-// - Use tokio's AsyncRead/AsyncWrite traits
-// - Implement as a stream wrapper similar to TlsStream
-// - Consider using pin-project for projection
-// - Add metrics for passthrough vs encrypted bytes
-//
-// Example API design:
-//
-// ```rust
-// pub struct VisionStream<S> {
-//     inner: S,
-//     state: VisionState,
-//     buffer: Vec<u8>,
-// }
-//
-// impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
-//     pub fn new(stream: S) -> Self { ... }
-//     pub fn state(&self) -> VisionState { ... }
-// }
-//
-// impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> { ... }
-// impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> { ... }
-// ```
+// Future Enhancements:
+// 1. VisionPad / VisionUnpad for traffic obfuscation padding
+// 2. Metrics for passthrough vs encrypted byte counts
+// 3. Zero-copy I/O using vectored writes
 // =============================================================================
 
 /// TLS record type constants module

@@ -3,22 +3,22 @@
 //! This module implements the VLESS UDP-over-TCP framing protocol.
 //! Each UDP datagram is encapsulated with length, address, and port information.
 //!
-//! # Wire Format
+//! # Wire Format (Xray-compatible)
 //!
 //! ```text
-//! +--------+--------+---------+----------+----------+
-//! | Length |  Port  |AddrType | Address  | Payload  |
-//! |   2B   |   2B   |   1B    | Variable | Variable |
-//! +--------+--------+---------+----------+----------+
+//! +--------+---------+----------+--------+----------+
+//! | Length |AddrType | Address  |  Port  | Payload  |
+//! |   2B   |   1B    | Variable |   2B   | Variable |
+//! +--------+---------+----------+--------+----------+
 //!
 //! Where:
-//! - Length (2B): Total length of (Port + AddrType + Address + Payload), big-endian
-//! - Port (2B): Destination port, big-endian
+//! - Length (2B): Total length of (AddrType + Address + Port + Payload), big-endian
 //! - AddrType (1B): Address type (0x01=IPv4, 0x02=Domain, 0x03=IPv6)
 //! - Address: Variable length depending on type
 //!   - IPv4: 4 bytes
 //!   - Domain: 1 byte length + domain string
 //!   - IPv6: 16 bytes
+//! - Port (2B): Destination port, big-endian
 //! - Payload: The actual UDP data
 //! ```
 
@@ -236,15 +236,15 @@ impl VlessUdpFrame {
     /// - Frame length is invalid (too short or too large)
     /// - Address decoding fails
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Self>> {
-        // Read length (2 bytes)
+        // Read length (2 bytes) - Xray format: length includes AddrType + Address + Port + Payload
         let length = match reader.read_u16().await {
             Ok(len) => len as usize,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
-        // Validate length
-        if length < 3 {
+        // Validate length (at least AddressType + 1 byte + Port)
+        if length < 4 {
             return Err(BridgeError::SmoltcpUdp(format!(
                 "frame too short: length={length}"
             )));
@@ -255,14 +255,14 @@ impl VlessUdpFrame {
             )));
         }
 
-        // Read port (2 bytes)
-        let port = reader.read_u16().await?;
-
-        // Read address
+        // Read address (type + address) - Xray format: address comes before port
         let address = UdpFrameAddress::decode(reader).await?;
 
-        // Calculate payload length
-        let header_len = 2 + address.encoded_len();
+        // Read port (2 bytes) - after address in Xray format
+        let port = reader.read_u16().await?;
+
+        // Calculate payload length: length - address.encoded_len() - 2 (port)
+        let header_len = address.encoded_len() + 2;
         if length < header_len {
             return Err(BridgeError::SmoltcpUdp(format!(
                 "invalid length: {length} < header {header_len}"
@@ -298,7 +298,7 @@ impl VlessUdpFrame {
         Ok(())
     }
 
-    /// Encode the frame to bytes
+    /// Encode the frame to bytes (Xray-compatible format)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // inner_len is bounded by MAX_UDP_PAYLOAD + header
     pub fn encode(&self) -> Bytes {
@@ -307,11 +307,11 @@ impl VlessUdpFrame {
         // Length (inner length, not including the length field itself)
         buf.put_u16(self.inner_len() as u16);
 
-        // Port
-        buf.put_u16(self.port);
-
-        // Address
+        // Address (type + address) - Xray format: address before port
         self.address.encode(&mut buf);
+
+        // Port - after address in Xray format
+        buf.put_u16(self.port);
 
         // Payload
         buf.put_slice(&self.payload);
@@ -351,7 +351,7 @@ impl VlessUdpCodec {
         self.buffer.extend_from_slice(data);
     }
 
-    /// Try to decode a frame from the buffer
+    /// Try to decode a frame from the buffer (Xray-compatible format)
     ///
     /// Returns `Ok(Some(frame))` if a complete frame is available,
     /// `Ok(None)` if more data is needed, or `Err` on parse error.
@@ -376,13 +376,7 @@ impl VlessUdpCodec {
         // Consume the length field
         self.buffer.advance(2);
 
-        // Read port
-        if self.buffer.len() < 2 {
-            return Err(BridgeError::SmoltcpUdp("incomplete port".into()));
-        }
-        let port = self.buffer.get_u16();
-
-        // Read address type
+        // Read address type first (Xray format: address before port)
         if self.buffer.is_empty() {
             return Err(BridgeError::SmoltcpUdp("missing address type".into()));
         }
@@ -425,8 +419,14 @@ impl VlessUdpCodec {
             }
         };
 
-        // Calculate remaining payload length
-        let header_consumed = 2 + address.encoded_len();
+        // Read port (after address in Xray format)
+        if self.buffer.len() < 2 {
+            return Err(BridgeError::SmoltcpUdp("incomplete port".into()));
+        }
+        let port = self.buffer.get_u16();
+
+        // Calculate remaining payload length: length - address.encoded_len() - 2 (port)
+        let header_consumed = address.encoded_len() + 2;
         let payload_len = length - header_consumed;
 
         if self.buffer.len() < payload_len {
@@ -584,19 +584,20 @@ mod tests {
         );
         let encoded = frame.encode();
 
-        // Length (inner): 2 (port) + 5 (addr) + 2 (payload) = 9
+        // Xray format: [Length][AddrType][Address][Port][Payload]
+        // Length (inner): 5 (addr) + 2 (port) + 2 (payload) = 9
         assert_eq!(encoded[0], 0);
         assert_eq!(encoded[1], 9);
 
+        // Address type: IPv4 = 0x01
+        assert_eq!(encoded[2], 0x01);
+
+        // IPv4: 8.8.8.8
+        assert_eq!(&encoded[3..7], &[8, 8, 8, 8]);
+
         // Port: 53 = 0x0035
-        assert_eq!(encoded[2], 0);
-        assert_eq!(encoded[3], 53);
-
-        // Address type
-        assert_eq!(encoded[4], 0x01);
-
-        // IPv4
-        assert_eq!(&encoded[5..9], &[8, 8, 8, 8]);
+        assert_eq!(encoded[7], 0);
+        assert_eq!(encoded[8], 53);
 
         // Payload
         assert_eq!(&encoded[9..], &[0xDE, 0xAD]);

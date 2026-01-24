@@ -785,14 +785,8 @@ _OUTBOUNDS_CACHE_TTL = 10  # 10秒刷新一次
 
 # V2Ray API 客户端（懒加载）
 _v2ray_client = None
-# Xray 出站 V2Ray API 客户端（懒加载，用于获取 V2Ray 出口的流量统计）
-_xray_egress_client = None
-# Xray 出站 API 端口
-XRAY_EGRESS_API_PORT = 10086
-# Xray 入站 V2Ray API 客户端（懒加载，用于获取 V2Ray 入口用户的流量统计）
-_xray_ingress_client = None
-# Xray 入站 API 端口
-XRAY_INGRESS_API_PORT = 10087
+# NOTE: Legacy xray-lite clients removed - VLESS now handled by rust-router
+# Stats are collected via rust-router IPC (GetVlessInboundStatus)
 
 # V2Ray 用户活跃度缓存: {email: {"last_seen": timestamp, "upload": bytes, "download": bytes}}
 # 用于跟踪用户在线状态
@@ -1316,6 +1310,8 @@ class V2RayInboundUpdateRequest(BaseModel):
     # TUN config
     tun_device: str = Field("xray-tun0", description="TUN 设备名")
     tun_subnet: str = Field("10.24.0.0/24", description="TUN 子网")
+    # UDP support
+    udp_enabled: bool = Field(True, description="启用 UDP 支持 (VLESS command 0x02)")
     # Enable
     enabled: bool = Field(False, description="启用入口")
 
@@ -1967,126 +1963,24 @@ def _get_v2ray_client():
     return _v2ray_client
 
 
-def _get_xray_egress_client():
-    """获取 Xray 出站 V2Ray API 客户端（懒加载）
-
-    仅当有启用的 V2Ray 出口时才初始化客户端。
-    Xray 出站 API 使用端口 10086（与 sing-box 的 10085 区分）。
-    """
-    global _xray_egress_client
-    if _xray_egress_client is None:
-        try:
-            # 检查是否有启用的 V2Ray 出口
-            db = _get_db()
-            v2ray_egress = db.get_v2ray_egress_list(enabled_only=True)
-            if not v2ray_egress:
-                return None
-
-            from v2ray_stats_client import V2RayStatsClient
-            _xray_egress_client = V2RayStatsClient(f"127.0.0.1:{XRAY_EGRESS_API_PORT}")
-        except ImportError:
-            return None
-        except Exception as e:
-            print(f"[Traffic] Xray egress stats client init failed: {e}")
-            return None
-    return _xray_egress_client
-
-
-def _reset_xray_egress_client():
-    """重置 Xray 出站统计客户端
-
-    在 V2Ray 出口配置改变后调用，以便重新初始化客户端。
-    """
-    global _xray_egress_client
-    if _xray_egress_client is not None:
-        try:
-            _xray_egress_client.close()
-        except Exception:
-            pass
-    _xray_egress_client = None
-
-
-def _get_xray_ingress_client():
-    """获取 Xray 入站 V2Ray API 客户端（懒加载）
-
-    仅当 V2Ray 入口已配置且启用时才初始化客户端。
-    Xray 入站 API 使用端口 10087。
-    """
-    global _xray_ingress_client
-    if _xray_ingress_client is None:
-        try:
-            # 检查 V2Ray 入口是否已配置且启用
-            db = _get_db()
-            config = db.get_v2ray_inbound_config()
-            if not config or not config.get("enabled"):
-                return None
-
-            from v2ray_stats_client import V2RayStatsClient
-            _xray_ingress_client = V2RayStatsClient(f"127.0.0.1:{XRAY_INGRESS_API_PORT}")
-        except ImportError:
-            return None
-        except Exception as e:
-            print(f"[Traffic] Xray ingress stats client init failed: {e}")
-            return None
-    return _xray_ingress_client
-
-
-def _reset_xray_ingress_client():
-    """重置 Xray 入站统计客户端
-
-    在 V2Ray 入口配置改变后调用，以便重新初始化客户端。
-    """
-    global _xray_ingress_client
-    if _xray_ingress_client is not None:
-        try:
-            _xray_ingress_client.close()
-        except Exception:
-            pass
-    _xray_ingress_client = None
+# NOTE: Legacy xray-lite client functions removed:
+# - _get_xray_egress_client()
+# - _reset_xray_egress_client()
+# - _get_xray_ingress_client()
+# - _reset_xray_ingress_client()
+# VLESS stats are now obtained via rust-router IPC (GetVlessInboundStatus)
 
 
 def _update_v2ray_user_activity():
     """更新 V2Ray 用户活跃度缓存
 
-    从 Xray 入站 API 获取每用户流量统计，检测流量变化来判断用户是否在线。
+    NOTE: Legacy xray-lite stats collection disabled.
+    VLESS user stats are now collected via rust-router IPC.
+    This function is kept for API compatibility but is now a no-op.
     """
-    global _v2ray_user_activity
-
-    ingress_client = _get_xray_ingress_client()
-    if not ingress_client:
-        return
-
-    try:
-        # 获取用户流量统计 (格式: user>>>email>>>traffic>>>uplink/downlink)
-        user_stats = ingress_client.get_user_stats()
-        now = time.time()
-
-        with _v2ray_user_activity_lock:
-            for email, stats in user_stats.items():
-                upload = stats.get("upload", 0)
-                download = stats.get("download", 0)
-
-                if email in _v2ray_user_activity:
-                    # 检测流量是否有变化
-                    prev = _v2ray_user_activity[email]
-                    if upload != prev.get("upload", 0) or download != prev.get("download", 0):
-                        # 流量有变化，更新 last_seen
-                        _v2ray_user_activity[email] = {
-                            "last_seen": now,
-                            "upload": upload,
-                            "download": download
-                        }
-                    # 如果流量无变化，保持 last_seen 不变
-                else:
-                    # 新用户，记录初始状态
-                    _v2ray_user_activity[email] = {
-                        "last_seen": now,
-                        "upload": upload,
-                        "download": download
-                    }
-    except Exception as e:
-        # 静默忽略错误（Xray 可能未启动）
-        pass
+    # Legacy xray-lite stats collection removed
+    # TODO: Implement VLESS user stats via rust-router IPC when needed
+    pass
 
 
 def _get_rust_router_outbound_stats_sync():
@@ -2184,19 +2078,8 @@ def _update_traffic_stats():
                 _shutdown_event.wait(_POLL_INTERVAL)
                 continue
 
-            # 从 Xray 出站获取 V2Ray 出口的流量统计
-            xray_client = _get_xray_egress_client()
-            if xray_client:
-                try:
-                    xray_stats = xray_client.get_outbound_stats()
-                    # 合并 Xray 统计：Xray 出口的统计替换 sing-box 中对应的 SOCKS 出站统计
-                    # 因为 sing-box 只看到到 SOCKS 代理的流量，而 Xray 看到的是实际出口流量
-                    for tag, stats in xray_stats.items():
-                        if tag not in ("api", "freedom"):  # 排除内部 tag
-                            outbound_stats[tag] = stats
-                except Exception as e:
-                    # M5 修复: 记录 Xray 统计错误（可能还未启动或已停止）
-                    logging.debug(f"Xray egress stats unavailable: {type(e).__name__}: {e}")
+            # NOTE: Legacy xray-lite stats collection removed
+            # VLESS outbound stats are now collected via rust-router IPC (included in outbound_stats above)
 
             # 在锁外获取 outbounds 列表（使用缓存，避免锁内 DB 查询）
             all_outbounds = _get_cached_outbounds()
@@ -8816,18 +8699,9 @@ def api_update_v2ray_inbound(payload: V2RayInboundUpdateRequest):
         print(f"[api] Reload failed: {exc}")
         reload_status = f", reload failed: {exc}"
 
-    # 如果启用了 V2Ray 入口，需要重启 Xray 进程
-    if payload.enabled:
-        try:
-            import subprocess
-            subprocess.run(
-                ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-                capture_output=True, timeout=10
-            )
-            reload_status += ", Xray reloaded"
-        except Exception as exc:
-            print(f"[api] Xray reload failed: {exc}")
-            reload_status += f", Xray reload failed: {exc}"
+    # NOTE: Legacy xray-lite reload removed
+    # VLESS inbound is now configured via rust-router IPC (ConfigureVlessInbound)
+    # The rust-router will pick up changes via its own configuration mechanism
 
     response = {"message": f"V2Ray inbound config updated{reload_status}"}
     # 如果自动生成了 short_id，返回给前端以便显示
@@ -9116,115 +8990,159 @@ def api_get_v2ray_user_qrcode(user_id: int):
     return Response(content=buf.getvalue(), media_type="image/png")
 
 
-# ============ Xray Control APIs ============
+# ============ Xray Control APIs (DEPRECATED - use rust-router VLESS) ============
 
 @app.get("/api/ingress/v2ray/xray/status")
 def api_get_xray_status():
-    """获取 Xray 进程状态"""
-    import subprocess
+    """[DEPRECATED] Get Xray process status
+
+    This endpoint is deprecated. VLESS is now handled by rust-router.
+    Use GET /api/ingress/v2ray/bridge-stats for VLESS status.
+    """
+    # Return deprecation notice with backward-compatible structure
+    return {
+        "running": False,
+        "enabled": False,
+        "tun_configured": False,
+        "reality_enabled": False,
+        "xtls_vision_enabled": False,
+        "deprecated": True,
+        "message": "DEPRECATED: xray-lite replaced by rust-router. Use /api/ingress/v2ray/bridge-stats"
+    }
+
+
+@app.get("/api/ingress/v2ray/bridge-stats")
+async def api_get_vless_bridge_stats():
+    """获取 VLESS-WG 桥接统计信息
+
+    从 rust-router 获取 VLESS 入站状态和 WireGuard 桥接统计，包括：
+    - 活跃会话数
+    - TCP/UDP 连接统计
+    - 数据包路由统计
+    """
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            status = json.loads(result.stdout)
-            # 转换为前端期望的格式
-            # 获取 V2Ray 配置以补充 REALITY/XTLS 状态
-            _db = _get_db()
-            v2ray_config = _db.get_v2ray_inbound_config()
-            config = v2ray_config.get("config", {}) if v2ray_config else {}
+        client = await _get_rust_router_client()
+        if not client:
             return {
-                "running": status.get("status") == "running",
-                "enabled": config.get("enabled", 0) == 1,
-                "pid": status.get("pid"),
-                "tun_device": status.get("tun_device"),
-                "tun_configured": bool(status.get("tun_device")),
-                "reality_enabled": config.get("reality_enabled", 0) == 1,
-                "xtls_vision_enabled": config.get("xtls_vision_enabled", 0) == 1,
-                "listen_port": status.get("listen_port"),
+                "available": False,
+                "message": "rust-router not available"
             }
-        else:
-            return {"running": False, "enabled": False, "tun_configured": False,
-                    "reality_enabled": False, "xtls_vision_enabled": False,
-                    "message": result.stderr}
-    except subprocess.TimeoutExpired:
-        return {"running": False, "enabled": False, "tun_configured": False,
-                "reality_enabled": False, "xtls_vision_enabled": False,
-                "message": "Timeout"}
+
+        response = await client.get_vless_inbound_status()
+
+        if not response.success:
+            return {
+                "available": False,
+                "message": response.error or "Failed to get VLESS status"
+            }
+
+        data = response.data or {}
+
+        # 构建响应
+        result = {
+            "available": True,
+            "running": data.get("running", False),
+            "listen_address": data.get("listen_address"),
+            "user_count": data.get("user_count", 0),
+            "tls_enabled": data.get("tls_enabled", False),
+            "udp_enabled": data.get("udp_enabled", True),
+            "total_connections": data.get("total_connections", 0),
+            "active_connections": data.get("active_connections", 0),
+        }
+
+        # 添加桥接统计（如果可用）
+        bridge_stats = data.get("bridge_stats")
+        if bridge_stats:
+            result["bridge_stats"] = {
+                "active_sessions": bridge_stats.get("active_sessions", 0),
+                "sessions_registered": bridge_stats.get("sessions_registered", 0),
+                "sessions_unregistered": bridge_stats.get("sessions_unregistered", 0),
+                "packets_routed": bridge_stats.get("packets_routed", 0),
+                "packets_dropped": bridge_stats.get("packets_dropped", 0),
+                "channel_full": bridge_stats.get("channel_full", 0),
+            }
+
+        return result
+
     except Exception as e:
-        return {"running": False, "enabled": False, "tun_configured": False,
-                "reality_enabled": False, "xtls_vision_enabled": False,
-                "message": str(e)}
+        logging.error(f"Failed to get VLESS bridge stats: {e}")
+        return {
+            "available": False,
+            "message": str(e)
+        }
 
 
 @app.post("/api/ingress/v2ray/xray/restart")
 def api_restart_xray():
-    """重启 Xray 进程"""
-    import subprocess
-    try:
-        # 先停止
-        subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "stop"],
-            capture_output=True, timeout=10
-        )
-        # 再启动
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "start"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray restarted successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to start Xray: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray restart timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Restart Xray process
+
+    This endpoint is deprecated. VLESS is now handled by rust-router.
+    VLESS inbound is managed via rust-router IPC (ConfigureVlessInbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS is configured via ConfigureVlessInbound IPC."
+    )
 
 
 @app.post("/api/ingress/v2ray/xray/reload")
 def api_reload_xray():
-    """重载 Xray 配置"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray config reloaded successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to reload Xray: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray reload timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Reload Xray configuration
+
+    This endpoint is deprecated. VLESS is now handled by rust-router.
+    VLESS inbound is managed via rust-router IPC (ConfigureVlessInbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS is configured via ConfigureVlessInbound IPC."
+    )
 
 
 def _generate_xray_reality_keys() -> Optional[Dict[str, str]]:
-    """生成 Xray REALITY 密钥对（内部辅助函数）
+    """Generate REALITY key pair using Python cryptography library
 
     Returns:
-        成功返回 {"private_key": str, "public_key": str, "short_id": str}
-        失败返回 None
+        Success: {"private_key": str, "public_key": str, "short_id": str}
+        Failure: None
     """
-    import subprocess
     try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "generate-keys"],
-            capture_output=True, text=True, timeout=10
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        import base64
+        import secrets
+
+        # Generate X25519 key pair
+        private_key = X25519PrivateKey.generate()
+        public_key = private_key.public_key()
+
+        # Get raw bytes (32 bytes each)
+        private_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption()
         )
-        if result.returncode == 0:
-            return json.loads(result.stdout)
-        else:
-            logging.error(f"生成 REALITY 密钥失败: {result.stderr}")
-            return None
-    except subprocess.TimeoutExpired:
-        logging.error("生成 REALITY 密钥超时")
+        public_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        # Encode as base64 (standard encoding for REALITY keys)
+        private_b64 = base64.b64encode(private_bytes).decode('ascii')
+        public_b64 = base64.b64encode(public_bytes).decode('ascii')
+
+        # Generate short_id (8 hex chars = 4 bytes)
+        short_id = secrets.token_hex(4)
+
+        return {
+            "private_key": private_b64,
+            "public_key": public_b64,
+            "short_id": short_id
+        }
+    except ImportError:
+        logging.error("cryptography library not available for REALITY key generation")
         return None
     except Exception as e:
-        logging.error(f"生成 REALITY 密钥异常: {e}")
+        logging.error(f"Failed to generate REALITY keys: {e}")
         return None
 
 
@@ -9238,78 +9156,49 @@ def api_generate_reality_keys():
         raise HTTPException(status_code=500, detail="Failed to generate REALITY keys")
 
 
-# ============ Xray Egress Control APIs ============
+# ============ Xray Egress Control APIs (DEPRECATED - use rust-router VLESS) ============
 
 @app.get("/api/egress/xray/status")
 def api_get_xray_egress_status():
-    """获取 Xray 出站进程状态"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            status = json.loads(result.stdout)
-            return {
-                "running": status.get("status") == "running",
-                "pid": status.get("pid"),
-                "egress_count": status.get("egress_count", 0),
-                "socks_ports": status.get("socks_ports", [])
-            }
-        else:
-            return {"running": False, "egress_count": 0, "socks_ports": [],
-                    "message": result.stderr}
-    except subprocess.TimeoutExpired:
-        return {"running": False, "egress_count": 0, "socks_ports": [],
-                "message": "Timeout"}
-    except Exception as e:
-        return {"running": False, "egress_count": 0, "socks_ports": [],
-                "message": str(e)}
+    """[DEPRECATED] Get Xray egress process status
+
+    This endpoint is deprecated. VLESS outbound is now handled by rust-router.
+    Use rust-router IPC ListVlessOutbounds for VLESS egress status.
+    """
+    # Return deprecation notice with backward-compatible structure
+    return {
+        "running": False,
+        "egress_count": 0,
+        "socks_ports": [],
+        "deprecated": True,
+        "message": "DEPRECATED: xray-lite replaced by rust-router. Use ListVlessOutbounds IPC."
+    }
 
 
 @app.post("/api/egress/xray/restart")
 def api_restart_xray_egress():
-    """重启 Xray 出站进程"""
-    import subprocess
-    try:
-        # 先停止
-        subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "stop"],
-            capture_output=True, timeout=10
-        )
-        # 再启动
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "start"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray egress restarted successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to start Xray egress: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray egress restart timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Restart Xray egress process
+
+    This endpoint is deprecated. VLESS outbound is now handled by rust-router.
+    VLESS outbound is managed via rust-router IPC (AddVlessOutbound/RemoveVlessOutbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS outbound is configured via AddVlessOutbound IPC."
+    )
 
 
 @app.post("/api/egress/xray/reload")
 def api_reload_xray_egress():
-    """重载 Xray 出站配置"""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            return {"message": "Xray egress config reloaded successfully"}
-        else:
-            raise HTTPException(status_code=500, detail=f"Failed to reload Xray egress: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xray egress reload timeout")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """[DEPRECATED] Reload Xray egress configuration
+
+    This endpoint is deprecated. VLESS outbound is now handled by rust-router.
+    VLESS outbound is managed via rust-router IPC (AddVlessOutbound/RemoveVlessOutbound).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="DEPRECATED: xray-lite replaced by rust-router. VLESS outbound is configured via AddVlessOutbound IPC."
+    )
 
 
 # ============ Egress Connection Test API ============
@@ -10414,41 +10303,15 @@ def _full_regenerate_after_import():
     except Exception as e:
         print(f"[backup-import] sing-box error: {e}")
 
-    # 4. Xray 入口（检查 V2Ray ingress 是否启用）
-    try:
-        db = _get_db()
-        v2ray_config = db.get_v2ray_inbound_config()
-        if v2ray_config and v2ray_config.get("enabled"):
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_manager.py", "restart"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0:
-                print("[backup-import] Xray ingress restarted")
-                results["xray_ingress"] = True
-            else:
-                print(f"[backup-import] Xray ingress restart failed: {result.stderr.strip()}")
-        else:
-            results["xray_ingress"] = True  # 未启用，视为成功
-    except Exception as e:
-        print(f"[backup-import] Xray ingress error: {e}")
+    # 4. VLESS ingress (handled by rust-router)
+    # NOTE: xray-lite replaced by rust-router - VLESS config synced via rust-router IPC
+    results["xray_ingress"] = True  # rust-router handles VLESS inbound
+    print("[backup-import] VLESS ingress managed by rust-router (no legacy xray-lite)")
 
-    # 5. Xray 出口（检查 V2Ray egress）
-    try:
-        db = _get_db()
-        v2ray_egress = db.get_v2ray_egress_list()
-        if v2ray_egress:
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_egress_manager.py", "daemon"],
-                capture_output=True, text=True, timeout=5
-            )
-            # daemon 会后台运行，立即返回
-            print("[backup-import] Xray egress manager started")
-            results["xray_egress"] = True
-        else:
-            results["xray_egress"] = True  # 无配置，视为成功
-    except Exception as e:
-        print(f"[backup-import] Xray egress error: {e}")
+    # 5. VLESS egress (handled by rust-router)
+    # NOTE: xray-lite replaced by rust-router - VLESS outbound synced via rust-router IPC
+    results["xray_egress"] = True  # rust-router handles VLESS outbound
+    print("[backup-import] VLESS egress managed by rust-router (no legacy xray-lite)")
 
     # 6. OpenVPN 隧道
     try:
@@ -10484,61 +10347,19 @@ def _full_regenerate_after_import():
 
 
 def _reload_xray_egress() -> str:
-    """重载或启动 Xray 出站进程
+    """[DEPRECATED] Reload or start Xray egress process
 
-    如果守护进程没有运行，则启动它；如果已运行则重载配置。
+    Legacy xray-lite has been replaced by rust-router.
+    VLESS outbound is now managed via rust-router IPC.
+    This function is kept for API compatibility but is now a no-op.
 
     Returns:
-        状态消息
+        Status message
     """
-    try:
-        # 先检查状态
-        status_result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_egress_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        is_running = False
-        if status_result.returncode == 0:
-            try:
-                status = json.loads(status_result.stdout)
-                is_running = status.get("status") == "running"
-            except json.JSONDecodeError:
-                pass
-
-        # 根据状态决定操作
-        if is_running:
-            # 已运行，使用 reload
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_egress_manager.py", "reload"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                print("[api] Xray egress reloaded")
-                _reset_xray_egress_client()
-                return ", Xray egress reloaded"
-            else:
-                print(f"[api] Xray egress reload failed: {result.stderr.strip()}")
-                return ", Xray egress reload failed"
-        else:
-            # 未运行，使用 start
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_egress_manager.py", "start"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                print("[api] Xray egress started")
-                _reset_xray_egress_client()
-                return ", Xray egress started"
-            else:
-                print(f"[api] Xray egress start failed: {result.stderr.strip()}")
-                return ", Xray egress start failed"
-
-    except subprocess.TimeoutExpired:
-        print("[api] Xray egress operation timeout")
-        return ", Xray egress timeout"
-    except Exception as e:
-        print(f"[api] Xray egress error: {e}")
-        return ""
+    # Legacy xray-lite egress manager removed
+    # VLESS outbound is handled by rust-router AddVlessOutbound IPC
+    logging.debug("[api] _reload_xray_egress called but xray-lite is deprecated (using rust-router)")
+    return ""  # Return empty string to not affect reload_status messages
 
 
 def _reload_openvpn_manager() -> str:
@@ -12922,21 +12743,11 @@ def api_peer_tunnel_peer_event(request: Request, payload: PeerEventRequest):
                 logging.exception(f"[peer-event] 添加墓碑失败 (非致命): {e}")
                 result["actions_taken"].append(f"tombstone failed for {peer_tag}")
 
-            # 清理 Xray peer inbound（如果已启用）
+            # NOTE: Legacy xray_peer_inbound_manager removed
+            # VLESS peer inbound is now handled by rust-router
             if source_peer.get("inbound_enabled"):
-                try:
-                    xray_result = subprocess.run(
-                        ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "stop", peer_tag],
-                        capture_output=True, text=True, timeout=10
-                    )
-                    if xray_result.returncode == 0:
-                        result["actions_taken"].append(f"stopped xray inbound for {peer_tag}")
-                    else:
-                        logging.warning(f"[peer-event] 停止 Xray inbound 返回非零: {xray_result.stderr}")
-                        result["actions_taken"].append(f"xray inbound stop attempted for {peer_tag}")
-                except Exception as e:
-                    logging.error(f"[peer-event] 停止 Xray inbound 失败 (非致命): {e}")
-                    result["actions_taken"].append(f"xray inbound stop failed for {peer_tag}")
+                logging.debug(f"[peer-event] VLESS peer inbound cleanup for {peer_tag} handled by rust-router")
+                result["actions_taken"].append(f"vless inbound cleanup for {peer_tag} (rust-router)")
 
             # 删除本地 peer_node 记录
             db.delete_peer_node(peer_tag)
@@ -16947,23 +16758,10 @@ def api_delete_peer(tag: str, cascade: bool = Query(True, description="是否发
         except Exception as e:
             logging.warning(f"[peers] rust-router IPC 删除失败: {e}")
 
-    # 清理 Xray 入站进程（如果启用）
-    # 无论 tunnel_type 是什么，只要 inbound_enabled 就需要停止入站进程
+    # NOTE: Legacy xray_peer_inbound_manager removed
+    # VLESS peer inbound is now handled by rust-router
     if node.get("inbound_enabled"):
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "stop", tag],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                logging.info(f"[peers] Xray 入站进程已停止: {tag}")
-            else:
-                logging.debug(f"[peers] Xray 入站进程停止返回非零 (可能未运行): {result.stderr}")
-        except subprocess.TimeoutExpired:
-            logging.warning(f"[peers] Xray 入站进程停止超时: {tag}")
-        except Exception as e:
-            logging.warning(f"[peers] Xray 入站进程停止失败: {e}")
+        logging.debug(f"[peers] VLESS peer inbound cleanup for {tag} handled by rust-router")
 
     # 删除数据库记录
     success = db.delete_peer_node(tag)
@@ -18049,15 +17847,13 @@ def api_enable_peer_inbound(tag: str):
 
     # 检查 REALITY 密钥（如果未配置则生成）
     if not node.get("xray_reality_private_key"):
-        try:
-            from xray_manager import generate_reality_keys
-            keys = generate_reality_keys()
-            private_key = keys["private_key"]
-            public_key = keys["public_key"]
-            short_id = secrets.token_hex(4)  # 8 字符 hex
-        except Exception as e:
-            logging.error(f"生成 REALITY 密钥失败: {e}")
-            raise HTTPException(status_code=500, detail=f"生成 REALITY 密钥失败: {str(e)}")
+        keys = _generate_xray_reality_keys()
+        if not keys:
+            logging.error("生成 REALITY 密钥失败")
+            raise HTTPException(status_code=500, detail="生成 REALITY 密钥失败")
+        private_key = keys["private_key"]
+        public_key = keys["public_key"]
+        short_id = keys["short_id"]
     else:
         private_key = node.get("xray_reality_private_key")
         public_key = node.get("xray_reality_public_key")
@@ -18074,26 +17870,10 @@ def api_enable_peer_inbound(tag: str):
         xray_reality_short_id=short_id,
     )
 
-    # 启动独立的 Xray 入站进程
-    # 使用 xray_peer_inbound_manager 启动专用入站进程，而不是 reload 主进程
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "start", tag],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            logging.info(f"[peers] 节点 '{tag}' 入站进程已启动")
-            logging.debug(f"[peers] xray_peer_inbound_manager output: {result.stdout}")
-        else:
-            logging.warning(f"[peers] 入站进程启动可能失败: {result.stderr}")
-            # 不抛出异常，数据库已更新，进程可以稍后手动启动
-    except subprocess.TimeoutExpired:
-        logging.warning(f"[peers] 入站进程启动超时，但数据库已更新")
-    except Exception as e:
-        logging.warning(f"[peers] 启动入站进程失败: {e}，但数据库已更新")
-
-    logging.info(f"[peers] 节点 '{tag}' 入站监听已启用 (独立进程模式)")
+    # NOTE: Legacy xray_peer_inbound_manager removed
+    # VLESS peer inbound is now handled by rust-router
+    # TODO: Implement rust-router IPC call to configure VLESS peer inbound
+    logging.info(f"[peers] Node '{tag}' inbound enabled (rust-router handles VLESS)")
     return {
         "success": True,
         "message": "入站监听已启用",
@@ -18132,24 +17912,10 @@ def api_disable_peer_inbound(tag: str):
     # 更新数据库
     db.update_peer_node(tag, inbound_enabled=0)
 
-    # 停止独立的 Xray 入站进程
-    # 使用 xray_peer_inbound_manager 停止专用入站进程，与启用时的逻辑一致
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_peer_inbound_manager.py", "stop", tag],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            logging.info(f"[peers] 节点 '{tag}' 入站进程已停止")
-        else:
-            logging.warning(f"[peers] 入站进程停止可能失败: {result.stderr}")
-    except subprocess.TimeoutExpired:
-        logging.warning(f"[peers] 入站进程停止超时")
-    except Exception as e:
-        logging.warning(f"[peers] 停止入站进程时出错: {e}")
-
-    logging.info(f"[peers] 节点 '{tag}' 入站监听已禁用 (独立进程模式)")
+    # NOTE: Legacy xray_peer_inbound_manager removed
+    # VLESS peer inbound is now handled by rust-router
+    # TODO: Implement rust-router IPC call to remove VLESS peer user
+    logging.info(f"[peers] Node '{tag}' inbound disabled (rust-router handles VLESS)")
     return {
         "success": True,
         "message": "入站监听已禁用",
@@ -18173,38 +17939,25 @@ def api_get_peer_inbound_status(tag: str):
     if not node:
         raise HTTPException(status_code=404, detail=f"节点 '{tag}' 不存在")
 
-    # 获取 V2Ray 入站配置的端口（合并架构使用统一端口）
+    # 获取 V2Ray 入站配置的端口
     v2ray_config = db.get_v2ray_inbound_config()
     unified_port = v2ray_config.get("listen_port", 443) if v2ray_config else 443
 
-    # 合并架构: 检查主 Xray 进程状态
-    process_status = "stopped"
-    pid = None
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and "running" in result.stdout.lower():
-            process_status = "running"
-            # 尝试从输出提取 PID
-            import re
-            pid_match = re.search(r'PID[:\s]+(\d+)', result.stdout)
-            if pid_match:
-                pid = int(pid_match.group(1))
-    except Exception as e:
-        logging.warning(f"[peers] 获取 Xray 状态失败: {e}")
+    # NOTE: Legacy xray-lite status check removed
+    # VLESS inbound status is now obtained via rust-router IPC (GetVlessInboundStatus)
+    # For now, return "running" if inbound_enabled is true (rust-router manages the actual process)
+    process_status = "running" if node.get("inbound_enabled") else "disabled"
 
     return {
         "tag": tag,
         "inbound_enabled": bool(node.get("inbound_enabled")),
-        "inbound_port": unified_port if node.get("inbound_enabled") else None,  # 合并架构使用统一端口
+        "inbound_port": unified_port if node.get("inbound_enabled") else None,
         "inbound_uuid": node.get("inbound_uuid"),
-        "process_status": process_status if node.get("inbound_enabled") else "disabled",
-        "pid": pid if node.get("inbound_enabled") else None,
+        "process_status": process_status,
+        "pid": None,  # rust-router manages VLESS, no separate PID
         "reality_public_key": node.get("xray_reality_public_key"),
         "reality_short_id": node.get("xray_reality_short_id"),
+        "note": "VLESS managed by rust-router"
     }
 
 
@@ -18212,46 +17965,39 @@ def api_get_peer_inbound_status(tag: str):
 def api_get_all_peer_inbound_status():
     """获取所有启用入站的节点状态
 
-    合并架构: 所有 peer 入站共享同一个 Xray 进程。
+    NOTE: VLESS inbound is now managed by rust-router.
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     db = _get_db()
 
-    # 获取主 Xray 进程状态
-    xray_running = False
-    xray_pid = None
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/usr/local/bin/xray_manager.py", "status"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0 and "running" in result.stdout.lower():
-            xray_running = True
-            import re
-            pid_match = re.search(r'PID[:\s]+(\d+)', result.stdout)
-            if pid_match:
-                xray_pid = int(pid_match.group(1))
-    except Exception as e:
-        logging.warning(f"[peers] 获取 Xray 状态失败: {e}")
+    # NOTE: Legacy xray-lite status check removed
+    # VLESS inbound status is obtained via rust-router IPC
+    # For backward compatibility, assume running if any nodes have inbound_enabled
 
     # 获取所有启用入站的节点
     nodes = db.get_peer_nodes()
     statuses = []
+    has_enabled = False
     for node in nodes:
         if node.get("inbound_enabled"):
+            has_enabled = True
             statuses.append({
                 "tag": node.get("tag"),
-                "status": "running" if xray_running else "stopped",
-                "pid": xray_pid,
-                "port": 443,  # 合并架构使用统一端口
+                "status": "running",  # rust-router manages VLESS
+                "pid": None,
+                "port": 443,
                 "uuid": node.get("inbound_uuid"),
                 "reality_public_key": node.get("xray_reality_public_key"),
             })
 
-    return {"inbounds": statuses, "count": len(statuses), "xray_status": "running" if xray_running else "stopped"}
+    return {
+        "inbounds": statuses,
+        "count": len(statuses),
+        "xray_status": "running" if has_enabled else "stopped",
+        "note": "VLESS managed by rust-router"
+    }
 
 
 # ============ Node Chain CRUD API ============

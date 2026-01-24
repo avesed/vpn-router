@@ -97,6 +97,7 @@ pub mod tls;
 // Protocol implementation
 mod auth;
 mod client;
+pub mod server;
 mod stream;
 
 // =============================================================================
@@ -137,6 +138,9 @@ pub use auth::{
 
 // Client connection
 pub use client::{FeedResult, RealityClientConfig, RealityClientConnection};
+
+// Server connection
+pub use server::{extract_client_sni, RealityAcceptResult, RealityServer, RealityServerConfig};
 
 // Async stream wrappers
 pub use stream::{RealityConnector, RealityStream};

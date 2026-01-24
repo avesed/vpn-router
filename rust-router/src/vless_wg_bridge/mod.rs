@@ -82,6 +82,7 @@ pub mod bridge;
 pub mod config;
 pub mod error;
 pub mod port_allocator;
+pub mod reply_registry;
 pub mod session;
 pub mod socket_guard;
 pub mod udp_frame;
@@ -107,4 +108,6 @@ pub use udp_frame::{UdpFrameAddress, VlessUdpCodec, VlessUdpFrame};
 
 pub use socket_guard::{TcpSocketGuard, UdpSocketGuard};
 
-pub use bridge::{BridgeStats, BridgeStatsSnapshot, VlessWgBridge, WgReplyPacket};
+pub use bridge::{BridgeStats, BridgeStatsSnapshot, VlessUdpMode, VlessWgBridge, WgReplyPacket};
+
+pub use reply_registry::{RegistryStatsSnapshot, VlessReplyKey, VlessReplyRegistry};

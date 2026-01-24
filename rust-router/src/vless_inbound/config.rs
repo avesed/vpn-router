@@ -1,7 +1,7 @@
 //! Configuration types for VLESS inbound listener
 //!
 //! This module provides configuration structures for the VLESS inbound listener,
-//! including user management, TLS settings, and fallback configuration.
+//! including user management, TLS settings, REALITY settings, and fallback configuration.
 //!
 //! # Example
 //!
@@ -17,6 +17,8 @@
 //!     ],
 //!     tls: Some(InboundTlsConfig::new("/path/to/cert.pem", "/path/to/key.pem")),
 //!     fallback: Some("127.0.0.1:80".parse().unwrap()),
+//!     reality: None,
+//!     udp_enabled: true,
 //! };
 //! ```
 
@@ -25,12 +27,14 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use super::error::{VlessInboundError, VlessInboundResult};
+use crate::reality::server::RealityServerConfig;
 use crate::vless::{VlessAccount, VlessAccountManager};
 
 /// Configuration for VLESS inbound listener
 ///
 /// This structure contains all settings needed to run a VLESS inbound listener,
-/// including the listen address, user accounts, TLS configuration, and fallback.
+/// including the listen address, user accounts, TLS configuration, REALITY
+/// configuration, and fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VlessInboundConfig {
     /// Listen address (e.g., "0.0.0.0:443")
@@ -40,16 +44,283 @@ pub struct VlessInboundConfig {
     pub users: Vec<VlessUser>,
 
     /// TLS configuration (optional, for plain VLESS without TLS)
+    ///
+    /// Note: When REALITY is enabled, this is ignored as REALITY handles TLS.
     #[serde(default)]
     pub tls: Option<InboundTlsConfig>,
+
+    /// REALITY configuration (optional, for VLESS with REALITY camouflage)
+    ///
+    /// When enabled, incoming connections are validated using the REALITY
+    /// protocol. Valid connections proceed with VLESS, while invalid
+    /// connections are transparently proxied to the fallback destination
+    /// specified in the REALITY config.
+    #[serde(default)]
+    pub reality: Option<InboundRealityConfig>,
 
     /// Fallback address for invalid requests (optional)
     ///
     /// When set, invalid requests (wrong version, unknown UUID) are forwarded
     /// to this address instead of being dropped. This helps disguise the
     /// VLESS server as a normal web server.
+    ///
+    /// Note: When REALITY is enabled, the REALITY config's `dest` field is
+    /// used for fallback instead.
     #[serde(default)]
     pub fallback: Option<SocketAddr>,
+
+    /// Enable UDP support (default: true)
+    ///
+    /// When enabled, VLESS command 0x02 (UDP) is accepted and forwarded
+    /// through the VLESS-WG bridge. Supports both Basic and XUDP modes.
+    /// Disable to only allow TCP connections.
+    #[serde(default = "default_udp_enabled")]
+    pub udp_enabled: bool,
+}
+
+fn default_udp_enabled() -> bool {
+    true
+}
+
+/// Default maximum timestamp difference for REALITY (2 minutes)
+fn default_max_time_diff_ms() -> u64 {
+    120_000
+}
+
+/// REALITY configuration for inbound connections
+///
+/// This structure contains the REALITY protocol settings needed to validate
+/// incoming TLS connections and provide camouflage through fallback proxying.
+///
+/// # Example
+///
+/// ```
+/// use rust_router::vless_inbound::InboundRealityConfig;
+///
+/// let config = InboundRealityConfig {
+///     private_key: "base64_encoded_private_key".to_string(),
+///     short_ids: vec!["12345678".to_string(), "abcdef01".to_string()],
+///     dest: "www.google.com:443".to_string(),
+///     server_names: vec!["www.google.com".to_string()],
+///     max_time_diff_ms: 120_000,
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboundRealityConfig {
+    /// Server private key (Base64-encoded X25519, 32 bytes)
+    pub private_key: String,
+
+    /// Allowed short IDs (hex strings, up to 16 characters each)
+    ///
+    /// Each short ID is used for client authentication. Clients must use
+    /// one of these IDs in their encrypted session_id.
+    pub short_ids: Vec<String>,
+
+    /// Fallback destination (e.g., "www.google.com:443")
+    ///
+    /// Unauthenticated connections are transparently proxied to this address,
+    /// making the server indistinguishable from a real TLS server.
+    pub dest: String,
+
+    /// Allowed SNI server names
+    ///
+    /// Connections with SNI not in this list are rejected and proxied to fallback.
+    pub server_names: Vec<String>,
+
+    /// Maximum timestamp difference in milliseconds (default: 120000 = 2 minutes)
+    ///
+    /// REALITY validates that the timestamp in the encrypted session_id is
+    /// within this range of the server's current time.
+    #[serde(default = "default_max_time_diff_ms")]
+    pub max_time_diff_ms: u64,
+}
+
+impl InboundRealityConfig {
+    /// Create a new REALITY inbound configuration
+    ///
+    /// # Arguments
+    /// * `private_key` - Base64-encoded X25519 private key
+    /// * `dest` - Fallback destination address
+    #[must_use]
+    pub fn new(private_key: impl Into<String>, dest: impl Into<String>) -> Self {
+        Self {
+            private_key: private_key.into(),
+            short_ids: Vec::new(),
+            dest: dest.into(),
+            server_names: Vec::new(),
+            max_time_diff_ms: default_max_time_diff_ms(),
+        }
+    }
+
+    /// Add an allowed short ID
+    #[must_use]
+    pub fn with_short_id(mut self, short_id: impl Into<String>) -> Self {
+        self.short_ids.push(short_id.into());
+        self
+    }
+
+    /// Add an allowed server name
+    #[must_use]
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_names.push(name.into());
+        self
+    }
+
+    /// Set maximum timestamp difference
+    #[must_use]
+    pub fn with_max_time_diff_ms(mut self, ms: u64) -> Self {
+        self.max_time_diff_ms = ms;
+        self
+    }
+
+    /// Validate the configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns error if configuration is invalid.
+    pub fn validate(&self) -> VlessInboundResult<()> {
+        // Validate private key is valid Base64
+        if self.private_key.is_empty() {
+            return Err(VlessInboundError::invalid_config("REALITY private_key is empty"));
+        }
+
+        let key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &self.private_key,
+        )
+        .map_err(|e| {
+            VlessInboundError::invalid_config(format!("Invalid REALITY private_key Base64: {}", e))
+        })?;
+
+        if key_bytes.len() != 32 {
+            return Err(VlessInboundError::invalid_config(format!(
+                "REALITY private_key has invalid length: {} (expected 32 bytes)",
+                key_bytes.len()
+            )));
+        }
+
+        // Validate short IDs
+        if self.short_ids.is_empty() {
+            return Err(VlessInboundError::invalid_config(
+                "REALITY short_ids is empty",
+            ));
+        }
+
+        for (i, short_id) in self.short_ids.iter().enumerate() {
+            if short_id.is_empty() || short_id.len() > 16 {
+                return Err(VlessInboundError::invalid_config(format!(
+                    "REALITY short_id[{}] has invalid length: {} (expected 1-16 hex chars)",
+                    i,
+                    short_id.len()
+                )));
+            }
+
+            // Validate hex
+            if hex::decode(short_id).is_err() {
+                return Err(VlessInboundError::invalid_config(format!(
+                    "REALITY short_id[{}] is not valid hex: {}",
+                    i, short_id
+                )));
+            }
+        }
+
+        // Validate dest
+        if self.dest.is_empty() {
+            return Err(VlessInboundError::invalid_config("REALITY dest is empty"));
+        }
+
+        // Validate server names
+        if self.server_names.is_empty() {
+            return Err(VlessInboundError::invalid_config(
+                "REALITY server_names is empty",
+            ));
+        }
+
+        if self.max_time_diff_ms == 0 {
+            return Err(VlessInboundError::invalid_config(
+                "REALITY max_time_diff_ms cannot be zero",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Build a `RealityServerConfig` from this configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns error if configuration is invalid.
+    pub fn build_server_config(&self) -> VlessInboundResult<RealityServerConfig> {
+        self.validate()?;
+
+        // Decode private key
+        let key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &self.private_key,
+        )
+        .map_err(|e| {
+            VlessInboundError::invalid_config(format!("Invalid REALITY private_key: {}", e))
+        })?;
+
+        let mut private_key = [0u8; 32];
+        private_key.copy_from_slice(&key_bytes);
+
+        // Decode short IDs
+        let short_ids: Vec<Vec<u8>> = self
+            .short_ids
+            .iter()
+            .map(|s| {
+                let mut id = hex::decode(s).unwrap_or_default();
+                // Pad to 8 bytes
+                while id.len() < 8 {
+                    id.push(0);
+                }
+                id.truncate(8);
+                id
+            })
+            .collect();
+
+        Ok(RealityServerConfig {
+            private_key,
+            short_ids,
+            dest: self.dest.clone(),
+            server_names: self.server_names.clone(),
+            max_time_diff_ms: self.max_time_diff_ms,
+        })
+    }
+
+    /// Get the server's public key derived from private key
+    ///
+    /// # Errors
+    ///
+    /// Returns error if private key is invalid.
+    pub fn public_key(&self) -> VlessInboundResult<String> {
+        let key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &self.private_key,
+        )
+        .map_err(|e| {
+            VlessInboundError::invalid_config(format!("Invalid REALITY private_key: {}", e))
+        })?;
+
+        if key_bytes.len() != 32 {
+            return Err(VlessInboundError::invalid_config(
+                "REALITY private_key has invalid length",
+            ));
+        }
+
+        let mut private_key = [0u8; 32];
+        private_key.copy_from_slice(&key_bytes);
+
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let secret = StaticSecret::from(private_key);
+        let public = PublicKey::from(&secret);
+
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            public.as_bytes(),
+        ))
+    }
 }
 
 impl VlessInboundConfig {
@@ -64,7 +335,9 @@ impl VlessInboundConfig {
             listen,
             users: Vec::new(),
             tls: None,
+            reality: None,
             fallback: None,
+            udp_enabled: true,
         }
     }
 
@@ -89,11 +362,40 @@ impl VlessInboundConfig {
         self
     }
 
+    /// Set REALITY configuration
+    ///
+    /// When REALITY is enabled, the server validates incoming TLS connections
+    /// using the REALITY protocol. Valid connections proceed with VLESS,
+    /// while invalid connections are transparently proxied to fallback.
+    ///
+    /// Note: When REALITY is enabled, the `tls` configuration is ignored.
+    #[must_use]
+    pub fn with_reality(mut self, reality: InboundRealityConfig) -> Self {
+        self.reality = Some(reality);
+        self
+    }
+
     /// Set fallback address
     #[must_use]
     pub fn with_fallback(mut self, fallback: SocketAddr) -> Self {
         self.fallback = Some(fallback);
         self
+    }
+
+    /// Enable or disable UDP support
+    ///
+    /// When disabled, only TCP connections (VLESS command 0x01) are accepted.
+    /// UDP connections (command 0x02) will be rejected.
+    #[must_use]
+    pub fn with_udp_enabled(mut self, enabled: bool) -> Self {
+        self.udp_enabled = enabled;
+        self
+    }
+
+    /// Check if UDP is enabled
+    #[must_use]
+    pub fn is_udp_enabled(&self) -> bool {
+        self.udp_enabled
     }
 
     /// Validate the configuration
@@ -103,6 +405,8 @@ impl VlessInboundConfig {
     /// Returns `VlessInboundError::InvalidConfig` if:
     /// - No users are configured
     /// - Any user has an invalid UUID
+    /// - TLS configuration is invalid (when enabled)
+    /// - REALITY configuration is invalid (when enabled)
     pub fn validate(&self) -> VlessInboundResult<()> {
         if self.users.is_empty() {
             return Err(VlessInboundError::invalid_config("no users configured"));
@@ -112,8 +416,16 @@ impl VlessInboundConfig {
             user.validate()?;
         }
 
+        // Validate TLS config (only if REALITY is not enabled)
         if let Some(ref tls) = self.tls {
-            tls.validate()?;
+            if self.reality.is_none() {
+                tls.validate()?;
+            }
+        }
+
+        // Validate REALITY config
+        if let Some(ref reality) = self.reality {
+            reality.validate()?;
         }
 
         Ok(())
@@ -136,15 +448,37 @@ impl VlessInboundConfig {
     }
 
     /// Check if TLS is enabled
+    ///
+    /// Note: Returns false when REALITY is enabled, as REALITY handles TLS.
     #[must_use]
     pub fn has_tls(&self) -> bool {
-        self.tls.is_some()
+        self.tls.is_some() && self.reality.is_none()
+    }
+
+    /// Check if REALITY is enabled
+    #[must_use]
+    pub fn has_reality(&self) -> bool {
+        self.reality.is_some()
     }
 
     /// Check if fallback is configured
     #[must_use]
     pub fn has_fallback(&self) -> bool {
         self.fallback.is_some()
+    }
+
+    /// Build the REALITY server from configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns error if REALITY is not configured or configuration is invalid.
+    pub fn build_reality_server(&self) -> VlessInboundResult<crate::reality::RealityServer> {
+        let reality = self.reality.as_ref().ok_or_else(|| {
+            VlessInboundError::invalid_config("REALITY is not configured")
+        })?;
+
+        let server_config = reality.build_server_config()?;
+        Ok(crate::reality::RealityServer::new(server_config))
     }
 }
 
@@ -154,7 +488,9 @@ impl Default for VlessInboundConfig {
             listen: "0.0.0.0:443".parse().unwrap(),
             users: Vec::new(),
             tls: None,
+            reality: None,
             fallback: None,
+            udp_enabled: true,
         }
     }
 }

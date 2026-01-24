@@ -884,20 +884,61 @@ pub enum IpcCommand {
     /// Configure VLESS inbound listener
     ///
     /// Sets up a VLESS inbound listener that accepts connections from VLESS clients.
+    /// Supports plain TCP, TLS, and REALITY transport modes.
     ConfigureVlessInbound {
         /// Listen address (e.g., "0.0.0.0:443")
         listen: String,
         /// Allowed users
         users: Vec<VlessUserConfig>,
         /// TLS certificate path (optional, for VLESS over TLS)
+        ///
+        /// Note: Ignored when REALITY is enabled.
         #[serde(default)]
         tls_cert_path: Option<String>,
         /// TLS private key path
+        ///
+        /// Note: Ignored when REALITY is enabled.
         #[serde(default)]
         tls_key_path: Option<String>,
         /// Fallback address for non-VLESS connections
+        ///
+        /// Note: When REALITY is enabled, use `reality_dest` instead.
         #[serde(default)]
         fallback: Option<String>,
+        /// Enable UDP support (default: true)
+        ///
+        /// When enabled, VLESS command 0x02 (UDP) is accepted and forwarded.
+        /// Supports both Basic and XUDP modes.
+        #[serde(default = "default_enabled")]
+        udp_enabled: bool,
+        /// REALITY private key (Base64-encoded X25519, 32 bytes)
+        ///
+        /// When set, enables REALITY protocol for TLS 1.3 camouflage.
+        /// Generate with: `openssl rand -base64 32`
+        #[serde(default)]
+        reality_private_key: Option<String>,
+        /// REALITY allowed short IDs (hex strings, up to 16 characters each)
+        ///
+        /// Each short ID is used for client authentication.
+        /// Clients must use one of these IDs in their encrypted session_id.
+        #[serde(default)]
+        reality_short_ids: Option<Vec<String>>,
+        /// REALITY fallback destination (e.g., "www.google.com:443")
+        ///
+        /// Unauthenticated connections are transparently proxied to this address.
+        #[serde(default)]
+        reality_dest: Option<String>,
+        /// REALITY allowed SNI server names
+        ///
+        /// Connections with SNI not in this list are proxied to fallback.
+        #[serde(default)]
+        reality_server_names: Option<Vec<String>>,
+        /// REALITY maximum timestamp difference in milliseconds (default: 120000)
+        ///
+        /// REALITY validates that the timestamp in the encrypted session_id
+        /// is within this range of the server's current time.
+        #[serde(default)]
+        reality_max_time_diff_ms: Option<u64>,
     },
 
     /// Add a user to VLESS inbound
@@ -926,6 +967,82 @@ pub enum IpcCommand {
 
     /// Stop VLESS inbound listener
     StopVlessInbound,
+
+    // ========================================================================
+    // Shadowsocks Protocol Commands
+    // ========================================================================
+
+    /// Add a Shadowsocks outbound
+    ///
+    /// Creates a new Shadowsocks client outbound for encrypted proxy connections.
+    #[cfg(feature = "shadowsocks")]
+    AddShadowsocksOutbound {
+        /// Unique tag for this outbound
+        tag: String,
+        /// Server hostname or IP address
+        server: String,
+        /// Server port
+        server_port: u16,
+        /// Encryption method (default: 2022-blake3-aes-256-gcm)
+        #[serde(default = "default_shadowsocks_method")]
+        method: String,
+        /// Password for authentication
+        password: String,
+        /// Enable UDP support (default: false, not yet implemented)
+        #[serde(default)]
+        udp: bool,
+    },
+
+    /// Remove a Shadowsocks outbound
+    #[cfg(feature = "shadowsocks")]
+    RemoveShadowsocksOutbound {
+        /// Outbound tag to remove
+        tag: String,
+    },
+
+    /// List all Shadowsocks outbounds
+    #[cfg(feature = "shadowsocks")]
+    ListShadowsocksOutbounds,
+
+    /// Get Shadowsocks outbound info
+    #[cfg(feature = "shadowsocks")]
+    GetShadowsocksOutbound {
+        /// Outbound tag
+        tag: String,
+    },
+
+    // ========================================================================
+    // Shadowsocks Inbound Commands
+    // ========================================================================
+
+    /// Configure Shadowsocks inbound listener
+    ///
+    /// Sets up a Shadowsocks inbound listener that accepts connections from
+    /// Shadowsocks clients. Supports AEAD 2022 and legacy AEAD ciphers.
+    #[cfg(feature = "shadowsocks")]
+    ConfigureShadowsocksInbound {
+        /// Listen address (e.g., "0.0.0.0:8388")
+        listen: String,
+        /// Encryption method (default: 2022-blake3-aes-256-gcm)
+        #[serde(default = "default_shadowsocks_method")]
+        method: String,
+        /// Password for authentication
+        ///
+        /// For AEAD 2022 ciphers, this should be a Base64-encoded key.
+        /// For legacy AEAD ciphers, this is a plaintext password.
+        password: String,
+        /// Enable UDP support (default: false, not yet implemented)
+        #[serde(default)]
+        udp_enabled: bool,
+    },
+
+    /// Get Shadowsocks inbound status
+    #[cfg(feature = "shadowsocks")]
+    GetShadowsocksInboundStatus,
+
+    /// Stop Shadowsocks inbound listener
+    #[cfg(feature = "shadowsocks")]
+    StopShadowsocksInbound,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -976,6 +1093,12 @@ fn default_peer_request_timeout() -> u32 {
 /// Default VLESS transport type (TCP)
 fn default_vless_transport() -> String {
     "tcp".to_string()
+}
+
+/// Default Shadowsocks encryption method
+#[cfg(feature = "shadowsocks")]
+fn default_shadowsocks_method() -> String {
+    "2022-blake3-aes-256-gcm".to_string()
 }
 
 /// Egress action type for `NotifyEgressChange`
@@ -1182,6 +1305,31 @@ pub enum IpcResponse {
     VlessUserList {
         users: Vec<VlessUserInfo>,
     },
+
+    // ========================================================================
+    // Shadowsocks Protocol Responses
+    // ========================================================================
+
+    /// Shadowsocks outbound added successfully
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksOutboundAdded {
+        /// The tag of the created outbound
+        tag: String,
+    },
+
+    /// Shadowsocks outbound info response
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksOutboundInfo(ShadowsocksOutboundInfoResponse),
+
+    /// Shadowsocks outbound list response
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksOutboundList {
+        outbounds: Vec<ShadowsocksOutboundInfoResponse>,
+    },
+
+    /// Shadowsocks inbound status response
+    #[cfg(feature = "shadowsocks")]
+    ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -2705,12 +2853,58 @@ pub struct VlessInboundStatusResponse {
     pub listen_address: Option<String>,
     /// Number of configured users
     pub user_count: usize,
-    /// Whether TLS is enabled
+    /// Whether TLS is enabled (standard TLS, not REALITY)
     pub tls_enabled: bool,
+    /// Whether REALITY is enabled
+    pub reality_enabled: bool,
+    /// Whether UDP support is enabled
+    pub udp_enabled: bool,
     /// Total connections since start
     pub total_connections: u64,
     /// Currently active connections
     pub active_connections: u64,
+    /// REALITY statistics (when REALITY is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reality_stats: Option<RealityInboundStats>,
+    /// VLESS-WG bridge statistics (when routing through WireGuard)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_stats: Option<VlessWgBridgeStats>,
+}
+
+/// REALITY inbound statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RealityInboundStats {
+    /// Total REALITY authentication attempts
+    pub auth_attempts: u64,
+    /// Successful REALITY authentications
+    pub auth_success: u64,
+    /// Failed REALITY authentications (proxied to fallback)
+    pub auth_failures: u64,
+    /// Connections currently being proxied to fallback
+    pub fallback_active: u64,
+    /// Total bytes proxied to fallback
+    pub fallback_bytes: u64,
+    /// Fallback destination
+    pub fallback_dest: String,
+    /// Allowed server names
+    pub server_names: Vec<String>,
+}
+
+/// VLESS-WG bridge statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VlessWgBridgeStats {
+    /// Active sessions in the reply registry
+    pub active_sessions: usize,
+    /// Total sessions registered
+    pub sessions_registered: u64,
+    /// Total sessions unregistered
+    pub sessions_unregistered: u64,
+    /// Packets successfully routed to VLESS sessions
+    pub packets_routed: u64,
+    /// Packets dropped (no session found)
+    pub packets_dropped: u64,
+    /// Packets dropped due to channel full
+    pub channel_full: u64,
 }
 
 /// VLESS user info
@@ -2722,6 +2916,56 @@ pub struct VlessUserInfo {
     pub email: Option<String>,
     /// Flow control type
     pub flow: Option<String>,
+}
+
+// ============================================================================
+// Shadowsocks Protocol Types
+// ============================================================================
+
+/// Shadowsocks outbound info response
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowsocksOutboundInfoResponse {
+    /// Outbound tag
+    pub tag: String,
+    /// Server address
+    pub server: String,
+    /// Server port
+    pub server_port: u16,
+    /// Encryption method
+    pub method: String,
+    /// Whether UDP is enabled
+    pub udp: bool,
+    /// Whether the outbound is enabled
+    pub enabled: bool,
+    /// Health status (healthy, unhealthy, unknown)
+    pub health_status: String,
+    /// Number of active connections
+    pub active_connections: u64,
+}
+
+/// Shadowsocks inbound status response
+#[cfg(feature = "shadowsocks")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowsocksInboundStatusResponse {
+    /// Whether the listener is active
+    pub active: bool,
+    /// Listen address
+    pub listen: String,
+    /// Encryption method
+    pub method: String,
+    /// Whether UDP is enabled
+    pub udp_enabled: bool,
+    /// Total connections accepted
+    pub connections_accepted: u64,
+    /// Active connections
+    pub active_connections: u64,
+    /// Total protocol errors
+    pub protocol_errors: u64,
+    /// Total bytes received
+    pub bytes_received: u64,
+    /// Total bytes sent
+    pub bytes_sent: u64,
 }
 
 /// IPC error
@@ -4753,6 +4997,12 @@ rust_router_connections_total 12345
             tls_cert_path: Some("/etc/ssl/cert.pem".into()),
             tls_key_path: Some("/etc/ssl/key.pem".into()),
             fallback: Some("127.0.0.1:80".into()),
+            udp_enabled: true,
+            reality_private_key: None,
+            reality_short_ids: None,
+            reality_dest: None,
+            reality_server_names: None,
+            reality_max_time_diff_ms: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"configure_vless_inbound\""));
@@ -4771,6 +5021,44 @@ rust_router_connections_total 12345
                 assert_eq!(users[0].email, Some("user1@example.com".into()));
                 assert!(tls_cert_path.is_some());
                 assert_eq!(fallback, Some("127.0.0.1:80".into()));
+            }
+            _ => panic!("Expected ConfigureVlessInbound command"),
+        }
+    }
+
+    #[test]
+    fn test_configure_vless_inbound_with_reality() {
+        let cmd = IpcCommand::ConfigureVlessInbound {
+            listen: "0.0.0.0:443".into(),
+            users: vec![
+                VlessUserConfig {
+                    uuid: "uuid-1".into(),
+                    email: Some("user1@example.com".into()),
+                    flow: Some("xtls-rprx-vision".into()),
+                },
+            ],
+            tls_cert_path: None,
+            tls_key_path: None,
+            fallback: None,
+            udp_enabled: true,
+            reality_private_key: Some("QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=".into()),
+            reality_short_ids: Some(vec!["1234567890abcdef".into()]),
+            reality_dest: Some("www.google.com:443".into()),
+            reality_server_names: Some(vec!["www.google.com".into()]),
+            reality_max_time_diff_ms: Some(120_000),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"reality_private_key\""));
+        assert!(json.contains("\"reality_short_ids\""));
+        assert!(json.contains("\"reality_dest\""));
+        assert!(json.contains("\"www.google.com\""));
+
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            IpcCommand::ConfigureVlessInbound { reality_private_key, reality_short_ids, reality_dest, .. } => {
+                assert!(reality_private_key.is_some());
+                assert!(reality_short_ids.is_some());
+                assert_eq!(reality_dest, Some("www.google.com:443".into()));
             }
             _ => panic!("Expected ConfigureVlessInbound command"),
         }
@@ -4879,8 +5167,19 @@ rust_router_connections_total 12345
             listen_address: Some("0.0.0.0:443".into()),
             user_count: 10,
             tls_enabled: true,
+            reality_enabled: false,
+            udp_enabled: true,
             total_connections: 1000,
             active_connections: 25,
+            reality_stats: None,
+            bridge_stats: Some(VlessWgBridgeStats {
+                active_sessions: 5,
+                sessions_registered: 100,
+                sessions_unregistered: 95,
+                packets_routed: 5000,
+                packets_dropped: 10,
+                channel_full: 2,
+            }),
         };
         let resp = IpcResponse::VlessInboundStatus(status);
         let json = serde_json::to_string(&resp).unwrap();
@@ -4889,12 +5188,89 @@ rust_router_connections_total 12345
         assert!(json.contains("\"user_count\":10"));
         assert!(json.contains("\"tls_enabled\":true"));
         assert!(json.contains("\"active_connections\":25"));
+        assert!(json.contains("\"bridge_stats\""));
+        assert!(json.contains("\"active_sessions\":5"));
 
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
         if let IpcResponse::VlessInboundStatus(s) = parsed {
             assert!(s.running);
             assert_eq!(s.user_count, 10);
             assert!(s.tls_enabled);
+            assert!(!s.reality_enabled);
+            assert!(s.bridge_stats.is_some());
+            let bs = s.bridge_stats.unwrap();
+            assert_eq!(bs.active_sessions, 5);
+            assert_eq!(bs.packets_routed, 5000);
+        } else {
+            panic!("Expected VlessInboundStatus response");
+        }
+    }
+
+    #[test]
+    fn test_vless_inbound_status_with_reality() {
+        let status = VlessInboundStatusResponse {
+            running: true,
+            listen_address: Some("0.0.0.0:443".into()),
+            user_count: 5,
+            tls_enabled: false,
+            reality_enabled: true,
+            udp_enabled: true,
+            total_connections: 500,
+            active_connections: 10,
+            reality_stats: Some(RealityInboundStats {
+                auth_attempts: 100,
+                auth_success: 90,
+                auth_failures: 10,
+                fallback_active: 2,
+                fallback_bytes: 1024,
+                fallback_dest: "www.google.com:443".into(),
+                server_names: vec!["www.google.com".into()],
+            }),
+            bridge_stats: None,
+        };
+        let resp = IpcResponse::VlessInboundStatus(status);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"reality_enabled\":true"));
+        assert!(json.contains("\"reality_stats\""));
+        assert!(json.contains("\"auth_attempts\":100"));
+        assert!(json.contains("\"fallback_dest\":\"www.google.com:443\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessInboundStatus(s) = parsed {
+            assert!(s.reality_enabled);
+            assert!(!s.tls_enabled);
+            assert!(s.reality_stats.is_some());
+            let rs = s.reality_stats.unwrap();
+            assert_eq!(rs.auth_success, 90);
+            assert_eq!(rs.auth_failures, 10);
+        } else {
+            panic!("Expected VlessInboundStatus response");
+        }
+    }
+
+    #[test]
+    fn test_vless_inbound_status_without_bridge_stats() {
+        let status = VlessInboundStatusResponse {
+            running: false,
+            listen_address: None,
+            user_count: 0,
+            tls_enabled: false,
+            reality_enabled: false,
+            udp_enabled: false,
+            total_connections: 0,
+            active_connections: 0,
+            reality_stats: None,
+            bridge_stats: None,
+        };
+        let resp = IpcResponse::VlessInboundStatus(status);
+        let json = serde_json::to_string(&resp).unwrap();
+        // bridge_stats should be omitted when None (skip_serializing_if)
+        assert!(!json.contains("\"bridge_stats\""));
+
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        if let IpcResponse::VlessInboundStatus(s) = parsed {
+            assert!(!s.running);
+            assert!(s.bridge_stats.is_none());
         } else {
             panic!("Expected VlessInboundStatus response");
         }

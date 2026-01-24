@@ -87,6 +87,8 @@
     "ingressClientDesc": "WireGuard 客户端管理",
     "v2rayIngress": "V2Ray 客户端",
     "v2rayIngressDesc": "VMess/VLESS/Trojan 客户端管理",
+    "ssIngress": "Shadowsocks",
+    "ssIngressDesc": "Shadowsocks 服务器管理",
     "peerNodes": "对等节点",
     "peerNodesDesc": "管理 vpn-router 对等连接",
     "nodeChains": "多跳链路",

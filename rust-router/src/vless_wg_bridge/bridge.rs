@@ -57,8 +57,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, trace, warn};
 
-use super::udp_frame::{UdpFrameAddress, VlessUdpFrame};
-
 use crate::egress::config::EgressState;
 use crate::egress::manager::WgEgressManager;
 use crate::tunnel::smoltcp_bridge::SmoltcpBridge;
@@ -69,8 +67,10 @@ use super::config::{
 };
 use super::error::{BridgeError, Result};
 use super::port_allocator::PortAllocator;
+use super::reply_registry::{VlessReplyKey, VlessReplyRegistry};
 use super::session::{SessionKey, SessionTracker, VlessConnectionId};
 use super::socket_guard::TcpSocketGuard;
+use super::udp_frame::{address_type, UdpFrameAddress, VlessUdpFrame};
 
 /// WireGuard reply packet
 #[derive(Debug)]
@@ -79,6 +79,38 @@ pub struct WgReplyPacket {
     pub tag: String,
     /// IP packet data
     pub packet: Vec<u8>,
+}
+
+/// VLESS UDP protocol mode
+///
+/// Xray supports two UDP modes:
+/// - **Basic**: `[Length(2)][Payload]` - single destination in VLESS header
+/// - **XUDP**: `[Length(2)][AddrType][Address][Port][Payload]` - per-packet addressing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VlessUdpMode {
+    /// Basic VLESS UDP: single destination, payload only in frames
+    Basic,
+    /// XUDP mode: each frame contains destination address
+    Xudp,
+}
+
+impl VlessUdpMode {
+    /// Detect UDP mode by examining the first byte after the length
+    ///
+    /// If it's 0x01/0x02/0x03 (VLESS address types), it's XUDP mode.
+    /// Otherwise, it's basic UDP with raw payload.
+    ///
+    /// Note: This heuristic could have false positives if the first byte
+    /// of a UDP payload happens to be 0x01-0x03, but in practice:
+    /// - DNS queries start with transaction ID (random, 2 bytes)
+    /// - Most protocols don't start with these specific bytes
+    #[must_use]
+    pub fn detect(first_byte: u8) -> Self {
+        match first_byte {
+            address_type::IPV4 | address_type::DOMAIN | address_type::IPV6 => Self::Xudp,
+            _ => Self::Basic,
+        }
+    }
 }
 
 /// Bridge statistics
@@ -183,6 +215,9 @@ pub struct VlessWgBridge {
 
     /// Shutdown flag
     shutdown: AtomicBool,
+
+    /// Global VLESS reply registry (for routing WG replies back to this bridge)
+    reply_registry: Option<Arc<VlessReplyRegistry>>,
 }
 
 impl VlessWgBridge {
@@ -205,6 +240,39 @@ impl VlessWgBridge {
     /// ```
     #[must_use]
     pub fn new(wg_egress: Arc<WgEgressManager>, wg_tag: String, local_ip: IpAddr) -> Self {
+        Self::with_registry(wg_egress, wg_tag, local_ip, None)
+    }
+
+    /// Create a new VLESS-WG bridge with a reply registry
+    ///
+    /// The reply registry allows the global WgReplyHandler to route decrypted
+    /// WireGuard packets back to this bridge, solving the reply routing problem.
+    ///
+    /// # Arguments
+    ///
+    /// * `wg_egress` - WireGuard egress manager
+    /// * `wg_tag` - Target WireGuard tunnel tag
+    /// * `local_ip` - Local IP assigned to this bridge (from WG tunnel config)
+    /// * `reply_registry` - Global VLESS reply registry for routing replies
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let registry = Arc::new(VlessReplyRegistry::new());
+    /// let bridge = VlessWgBridge::with_registry(
+    ///     wg_egress_manager,
+    ///     "wg-tunnel-1".to_string(),
+    ///     "10.200.200.2".parse().unwrap(),
+    ///     Some(registry),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_registry(
+        wg_egress: Arc<WgEgressManager>,
+        wg_tag: String,
+        local_ip: IpAddr,
+        reply_registry: Option<Arc<VlessReplyRegistry>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(WG_REPLY_CHANNEL_SIZE);
 
         // Create smoltcp bridge with local IP
@@ -221,8 +289,8 @@ impl VlessWgBridge {
         let port_allocator = PortAllocator::new();
 
         info!(
-            "VlessWgBridge created: wg_tag={}, local_ip={}",
-            wg_tag, local_ip
+            "VlessWgBridge created: wg_tag={}, local_ip={}, registry={}",
+            wg_tag, local_ip, reply_registry.is_some()
         );
 
         Self {
@@ -235,6 +303,7 @@ impl VlessWgBridge {
             wg_tag,
             stats: BridgeStats::new(),
             shutdown: AtomicBool::new(false),
+            reply_registry,
         }
     }
 
@@ -405,6 +474,22 @@ impl VlessWgBridge {
                 BridgeError::SmoltcpTcp(format!("session registration failed: {e}"))
             })?;
 
+        // Register with the global reply registry so WgReplyHandler can route replies to us
+        let reply_key = VlessReplyKey::new(
+            self.wg_tag.clone(),
+            self.local_ip,
+            local_port,
+            dest_ip,
+            dest_port,
+        );
+        if let Some(ref registry) = self.reply_registry {
+            registry.register(reply_key.clone(), self.wg_reply_tx.clone(), client_addr);
+            debug!(
+                "Registered VLESS session with reply registry: tunnel={} {}:{} -> {}:{}",
+                self.wg_tag, self.local_ip, local_port, dest_ip, dest_port
+            );
+        }
+
         // Update stats
         self.stats.tcp_connections.fetch_add(1, Ordering::Relaxed);
         self.stats.active_tcp.fetch_add(1, Ordering::Relaxed);
@@ -433,6 +518,15 @@ impl VlessWgBridge {
 
         // Send any pending packets before cleanup
         self.drain_and_send_packets().await?;
+
+        // Unregister from the global reply registry
+        if let Some(ref registry) = self.reply_registry {
+            registry.unregister(&reply_key);
+            debug!(
+                "Unregistered VLESS session from reply registry: tunnel={} {}:{} -> {}:{}",
+                self.wg_tag, self.local_ip, local_port, dest_ip, dest_port
+            );
+        }
 
         // Remove session from tracker
         self.sessions.remove_tcp(&session_key);
@@ -685,6 +779,14 @@ impl VlessWgBridge {
     }
 
     /// Receive WG reply packets and feed to smoltcp
+    ///
+    /// NOTE: This method currently reads from wg_reply_rx channel which must be
+    /// fed by an external mechanism. In the current architecture, the WgEgressManager's
+    /// reply handler sends packets to IngressForwarder. For VlessWgBridge to receive
+    /// replies, it needs to be registered with the reply routing mechanism.
+    ///
+    /// TODO: Integrate with IngressForwarder's session tracker or implement
+    /// a shared reply routing mechanism based on destination IP.
     async fn receive_wg_replies(&self) {
         let mut rx = self.wg_reply_rx.lock().await;
 
@@ -739,10 +841,23 @@ impl VlessWgBridge {
     /// - The bridge is shutting down
     /// - The WG tunnel is not healthy
     /// - I/O errors occur
+    /// Handle a VLESS UDP connection
+    ///
+    /// In VLESS, the destination is specified ONCE in the header, and UDP frames
+    /// are just `[Length(2)][Payload]` - no per-packet addressing.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_addr` - Client's source address
+    /// * `stream` - The VLESS TCP stream carrying UDP frames
+    /// * `dest_ip` - Destination IP (from VLESS header)
+    /// * `dest_port` - Destination port (from VLESS header)
     pub async fn handle_udp_connection<S>(
         &self,
         client_addr: SocketAddr,
         mut stream: S,
+        dest_ip: IpAddr,
+        dest_port: u16,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -774,13 +889,23 @@ impl VlessWgBridge {
         self.stats.active_udp.fetch_add(1, Ordering::Relaxed);
 
         let result = self
-            .udp_forward_loop(&conn_id, &mut stream, &mut udp_sessions)
+            .udp_forward_loop(&conn_id, &mut stream, &mut udp_sessions, dest_ip, dest_port)
             .await;
 
         // Cleanup all UDP sessions
         {
             let mut bridge = self.smoltcp.lock().await;
             for (_, session) in udp_sessions.drain() {
+                // Unregister from reply registry first
+                if let Some(ref reply_key) = session.reply_key {
+                    if let Some(ref registry) = self.reply_registry {
+                        registry.unregister(reply_key);
+                        debug!(
+                            "Unregistered UDP session from reply registry: {}:{} -> {}:{}",
+                            self.local_ip, session.local_port, session.dest_ip, session.dest_port
+                        );
+                    }
+                }
                 bridge.udp_close(session.socket_handle);
                 bridge.remove_socket(session.socket_handle);
                 // Return port to allocator for TIME_WAIT
@@ -803,17 +928,26 @@ impl VlessWgBridge {
     }
 
     /// UDP forwarding loop
+    ///
+    /// Supports both VLESS UDP modes:
+    /// - **Basic**: `[Length(2)][Payload]` - uses dest_ip/dest_port from VLESS header
+    /// - **XUDP**: `[Length(2)][AddrType][Address][Port][Payload]` - per-packet addressing
+    ///
+    /// The mode is auto-detected on the first frame by examining the first byte after length.
     async fn udp_forward_loop<S>(
         &self,
         conn_id: &VlessConnectionId,
         stream: &mut S,
         sessions: &mut HashMap<(IpAddr, u16), UdpSessionState>,
+        header_dest_ip: IpAddr,
+        header_dest_port: u16,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let (mut reader, mut writer) = tokio::io::split(stream);
-        let mut _read_buf = vec![0u8; UDP_RX_BUFFER];
+        let mut frame_buf = vec![0u8; UDP_RX_BUFFER];
+        let mut detected_mode: Option<VlessUdpMode> = None;
 
         loop {
             if self.is_shutdown() {
@@ -827,7 +961,9 @@ impl VlessWgBridge {
             self.receive_wg_replies().await;
 
             // Check for UDP data to send back to VLESS
-            self.check_udp_replies(&mut writer, sessions).await?;
+            // Pass the detected mode so we know how to format replies
+            self.check_udp_replies_with_mode(&mut writer, sessions, detected_mode)
+                .await?;
 
             // Cleanup expired sessions
             self.cleanup_expired_udp_sessions(sessions).await;
@@ -835,35 +971,78 @@ impl VlessWgBridge {
             tokio::select! {
                 biased;
 
-                // Read UDP frame from VLESS (with timeout)
-                result = VlessUdpFrame::read_from(&mut reader) => {
-                    match result {
-                        Ok(Some(frame)) => {
+                // Read UDP frame length
+                length_result = reader.read_u16() => {
+                    match length_result {
+                        Ok(length) => {
+                            let length = length as usize;
+                            if length == 0 {
+                                debug!("VLESS UDP stream closed (zero length)");
+                                return Ok(());
+                            }
+                            if length > frame_buf.len() {
+                                warn!("UDP frame too large: {} bytes", length);
+                                return Err(BridgeError::SmoltcpUdp(format!(
+                                    "UDP frame too large: {} bytes", length
+                                )));
+                            }
+
+                            // Read the frame content (could be [Payload] or [AddrType][Address][Port][Payload])
+                            if let Err(e) = reader.read_exact(&mut frame_buf[..length]).await {
+                                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                    debug!("VLESS UDP stream closed (EOF reading frame)");
+                                    return Ok(());
+                                }
+                                return Err(e.into());
+                            }
+
+                            // Detect mode on first packet
+                            let mode = *detected_mode.get_or_insert_with(|| {
+                                let mode = VlessUdpMode::detect(frame_buf[0]);
+                                debug!(
+                                    "Detected VLESS UDP mode: {:?} (first_byte=0x{:02x})",
+                                    mode, frame_buf[0]
+                                );
+                                mode
+                            });
+
+                            // Parse frame based on mode
+                            let (dest_ip, dest_port, payload) = match mode {
+                                VlessUdpMode::Basic => {
+                                    // Basic mode: entire frame is payload
+                                    // Destination is from VLESS header
+                                    (header_dest_ip, header_dest_port, &frame_buf[..length])
+                                }
+                                VlessUdpMode::Xudp => {
+                                    // XUDP mode: [AddrType][Address][Port][Payload]
+                                    // Parse the frame to extract destination
+                                    match self.parse_xudp_frame(&frame_buf[..length]) {
+                                        Ok((ip, port, payload_start)) => {
+                                            (ip, port, &frame_buf[payload_start..length])
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to parse XUDP frame: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+
                             trace!(
-                                "Received UDP frame: {}:{}, {} bytes",
-                                frame.address,
-                                frame.port,
-                                frame.payload.len()
+                                "Received UDP frame ({:?}): {}:{}, {} bytes payload",
+                                mode,
+                                dest_ip,
+                                dest_port,
+                                payload.len()
                             );
 
                             self.stats
                                 .bytes_to_wg
-                                .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
-
-                            // Resolve destination IP
-                            let dest_ip = match &frame.address {
-                                UdpFrameAddress::Ipv4(ip) => IpAddr::V4(*ip),
-                                UdpFrameAddress::Ipv6(ip) => IpAddr::V6(*ip),
-                                UdpFrameAddress::Domain(domain) => {
-                                    // For now, skip domain resolution - would need DNS resolver
-                                    warn!("Domain resolution not implemented: {}", domain);
-                                    continue;
-                                }
-                            };
+                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
 
                             // Get or create UDP session for this destination
                             let session = self
-                                .get_or_create_udp_session(conn_id, sessions, dest_ip, frame.port)
+                                .get_or_create_udp_session(conn_id, sessions, dest_ip, dest_port)
                                 .await?;
 
                             // Send through smoltcp UDP socket
@@ -872,7 +1051,7 @@ impl VlessWgBridge {
                                     addr: smoltcp::wire::IpAddress::Ipv4(
                                         smoltcp::wire::Ipv4Address::from_bytes(&v4.octets()),
                                     ),
-                                    port: frame.port,
+                                    port: dest_port,
                                 },
                                 IpAddr::V6(_) => {
                                     warn!("IPv6 not supported in smoltcp bridge");
@@ -883,7 +1062,7 @@ impl VlessWgBridge {
                             {
                                 let mut bridge = self.smoltcp.lock().await;
                                 if let Err(e) =
-                                    bridge.udp_send(session.socket_handle, &frame.payload, smoltcp_dest)
+                                    bridge.udp_send(session.socket_handle, payload, smoltcp_dest)
                                 {
                                     warn!("UDP send failed: {:?}", e);
                                 }
@@ -898,14 +1077,13 @@ impl VlessWgBridge {
                                 Ordering::Relaxed,
                             );
                         }
-                        Ok(None) => {
-                            // Clean EOF from VLESS
-                            debug!("VLESS UDP stream closed");
-                            return Ok(());
-                        }
                         Err(e) => {
-                            warn!("Error reading UDP frame: {}", e);
-                            return Err(e);
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                debug!("VLESS UDP stream closed (EOF reading length)");
+                                return Ok(());
+                            }
+                            warn!("Error reading UDP frame length: {}", e);
+                            return Err(e.into());
                         }
                     }
                 }
@@ -916,10 +1094,74 @@ impl VlessWgBridge {
         }
     }
 
+    /// Parse XUDP frame: [AddrType][Address][Port][Payload]
+    ///
+    /// Returns (dest_ip, dest_port, payload_start_offset) on success.
+    fn parse_xudp_frame(&self, frame: &[u8]) -> Result<(IpAddr, u16, usize)> {
+        if frame.is_empty() {
+            return Err(BridgeError::SmoltcpUdp("empty XUDP frame".into()));
+        }
+
+        let addr_type = frame[0];
+        let (addr, addr_end) = match addr_type {
+            address_type::IPV4 => {
+                if frame.len() < 1 + 4 + 2 {
+                    return Err(BridgeError::SmoltcpUdp("XUDP frame too short for IPv4".into()));
+                }
+                let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                    frame[1], frame[2], frame[3], frame[4],
+                ));
+                (ip, 5) // 1 (type) + 4 (IPv4)
+            }
+            address_type::DOMAIN => {
+                if frame.len() < 2 {
+                    return Err(BridgeError::SmoltcpUdp("XUDP frame too short for domain".into()));
+                }
+                let domain_len = frame[1] as usize;
+                let domain_end = 2 + domain_len;
+                if frame.len() < domain_end + 2 {
+                    return Err(BridgeError::SmoltcpUdp("XUDP domain truncated".into()));
+                }
+                let domain = std::str::from_utf8(&frame[2..domain_end])
+                    .map_err(|e| BridgeError::SmoltcpUdp(format!("invalid domain: {}", e)))?;
+
+                // For XUDP domains, we need DNS resolution
+                // For now, log a warning and skip (or could implement async DNS)
+                warn!("XUDP domain addressing not fully supported: {}", domain);
+                return Err(BridgeError::SmoltcpUdp(format!(
+                    "XUDP domain {} requires DNS resolution (not implemented)", domain
+                )));
+            }
+            address_type::IPV6 => {
+                if frame.len() < 1 + 16 + 2 {
+                    return Err(BridgeError::SmoltcpUdp("XUDP frame too short for IPv6".into()));
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&frame[1..17]);
+                let ip = IpAddr::V6(std::net::Ipv6Addr::from(octets));
+                (ip, 17) // 1 (type) + 16 (IPv6)
+            }
+            _ => {
+                return Err(BridgeError::SmoltcpUdp(format!(
+                    "invalid XUDP address type: 0x{:02x}", addr_type
+                )));
+            }
+        };
+
+        // Read port (2 bytes after address)
+        if frame.len() < addr_end + 2 {
+            return Err(BridgeError::SmoltcpUdp("XUDP frame missing port".into()));
+        }
+        let port = u16::from_be_bytes([frame[addr_end], frame[addr_end + 1]]);
+
+        let payload_start = addr_end + 2;
+        Ok((addr, port, payload_start))
+    }
+
     /// Get or create a UDP session for the given destination
     async fn get_or_create_udp_session<'a>(
         &self,
-        _conn_id: &VlessConnectionId,
+        conn_id: &VlessConnectionId,
         sessions: &'a mut HashMap<(IpAddr, u16), UdpSessionState>,
         dest_ip: IpAddr,
         dest_port: u16,
@@ -951,6 +1193,27 @@ impl VlessWgBridge {
                 handle
             };
 
+            // Register with reply registry for WG reply routing
+            let reply_key = if self.reply_registry.is_some() {
+                let key = VlessReplyKey::new(
+                    self.wg_tag.clone(),
+                    self.local_ip,
+                    local_port,
+                    dest_ip,
+                    dest_port,
+                );
+                if let Some(ref registry) = self.reply_registry {
+                    registry.register(key.clone(), self.wg_reply_tx.clone(), conn_id.client_addr);
+                    debug!(
+                        "Registered UDP session with reply registry: tunnel={} {}:{} -> {}:{}",
+                        self.wg_tag, self.local_ip, local_port, dest_ip, dest_port
+                    );
+                }
+                Some(key)
+            } else {
+                None
+            };
+
             debug!(
                 "Created UDP session: local_port={}, dest={}:{}",
                 local_port, dest_ip, dest_port
@@ -967,6 +1230,7 @@ impl VlessWgBridge {
                         .unwrap_or_default()
                         .as_secs(),
                 ),
+                reply_key,
             };
 
             sessions.insert(key, session);
@@ -975,11 +1239,16 @@ impl VlessWgBridge {
         Ok(sessions.get_mut(&key).expect("session was just inserted"))
     }
 
-    /// Check for UDP replies and send back to VLESS
-    async fn check_udp_replies<W>(
+    /// Check for UDP replies and write them back to VLESS client
+    ///
+    /// Writes in the appropriate VLESS UDP format based on detected mode:
+    /// - **Basic**: `[Length(2)][Payload]`
+    /// - **XUDP**: `[Length(2)][AddrType][Address][Port][Payload]`
+    async fn check_udp_replies_with_mode<W>(
         &self,
         writer: &mut W,
         sessions: &HashMap<(IpAddr, u16), UdpSessionState>,
+        mode: Option<VlessUdpMode>,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin,
@@ -996,25 +1265,29 @@ impl VlessWgBridge {
                             .bytes_from_wg
                             .fetch_add(data.len() as u64, Ordering::Relaxed);
 
-                        // Convert endpoint to address
-                        let address = match endpoint.addr {
-                            smoltcp::wire::IpAddress::Ipv4(v4) => {
-                                UdpFrameAddress::Ipv4(std::net::Ipv4Addr::from(v4.0))
-                            }
-                            // smoltcp IPv6 is optional, handle if present
-                            #[allow(unreachable_patterns)]
-                            _ => {
-                                warn!("Unsupported IP address type in UDP reply");
-                                continue;
-                            }
-                        };
-
-                        let frame = VlessUdpFrame::new(address, endpoint.port, data);
-
                         // Release lock before async write
                         drop(bridge);
 
-                        frame.write_to(writer).await?;
+                        // Write in appropriate format based on mode
+                        match mode.unwrap_or(VlessUdpMode::Basic) {
+                            VlessUdpMode::Basic => {
+                                // Basic: [Length(2)][Payload]
+                                let length = data.len() as u16;
+                                writer.write_u16(length).await?;
+                                writer.write_all(&data).await?;
+                            }
+                            VlessUdpMode::Xudp => {
+                                // XUDP: [Length(2)][AddrType][Address][Port][Payload]
+                                // Use VlessUdpFrame for proper formatting
+                                let frame = VlessUdpFrame::from_ip(
+                                    session.dest_ip,
+                                    session.dest_port,
+                                    data,
+                                );
+                                let encoded = frame.encode();
+                                writer.write_all(&encoded).await?;
+                            }
+                        }
 
                         // Re-acquire lock for next iteration
                         bridge = self.smoltcp.lock().await;
@@ -1059,6 +1332,16 @@ impl VlessWgBridge {
             for key in expired {
                 if let Some(session) = sessions.remove(&key) {
                     debug!("Expiring UDP session: dest={}:{}", key.0, key.1);
+                    // Unregister from reply registry first
+                    if let Some(ref reply_key) = session.reply_key {
+                        if let Some(ref registry) = self.reply_registry {
+                            registry.unregister(reply_key);
+                            debug!(
+                                "Unregistered expired UDP session from reply registry: {}:{} -> {}:{}",
+                                self.local_ip, session.local_port, session.dest_ip, session.dest_port
+                            );
+                        }
+                    }
                     bridge.udp_close(session.socket_handle);
                     bridge.remove_socket(session.socket_handle);
                     // Return port to allocator for TIME_WAIT
@@ -1085,6 +1368,8 @@ struct UdpSessionState {
     dest_port: u16,
     /// Last activity timestamp (Unix timestamp in seconds)
     last_activity: AtomicU64,
+    /// Reply registry key (for unregistration on cleanup)
+    reply_key: Option<VlessReplyKey>,
 }
 
 impl Drop for VlessWgBridge {

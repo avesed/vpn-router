@@ -339,7 +339,7 @@ export interface CustomEgressCreateRequest {
 export interface EgressItem {
   tag: string;
   description: string;
-  type: "pia" | "custom" | "direct" | "openvpn" | "v2ray" | "warp";
+  type: "pia" | "custom" | "direct" | "openvpn" | "v2ray" | "warp" | "shadowsocks";
   server?: string;
   port?: number;
   is_configured: boolean;
@@ -355,6 +355,9 @@ export interface EgressItem {
   // V2Ray specific fields
   transport?: string;
   tls_enabled?: number;
+  // Shadowsocks specific fields
+  method?: string;
+  udp?: boolean;
 }
 
 export interface AllEgressResponse {
@@ -364,6 +367,7 @@ export interface AllEgressResponse {
   openvpn: EgressItem[];
   v2ray: EgressItem[];
   warp?: EgressItem[];
+  shadowsocks?: EgressItem[];
 }
 
 // Traffic stats for WireGuard tunnels
@@ -651,7 +655,66 @@ export interface SpeedTestResponse {
 
 export type V2RayProtocol = "vmess" | "vless" | "trojan";
 export type V2RayProtocolSupported = "vless"; // Only VLESS supported in xray-lite
-export type V2RayTransport = "tcp" | "ws" | "grpc" | "h2" | "quic" | "httpupgrade" | "xhttp";
+export type V2RayTransport = "tcp" | "ws" | "quic";
+
+// Shadowsocks encryption methods
+export const SHADOWSOCKS_METHODS = [
+  { value: "2022-blake3-aes-256-gcm", label: "2022-blake3-aes-256-gcm (Recommended)" },
+  { value: "2022-blake3-aes-128-gcm", label: "2022-blake3-aes-128-gcm" },
+  { value: "2022-blake3-chacha20-poly1305", label: "2022-blake3-chacha20-poly1305" },
+  { value: "aes-256-gcm", label: "aes-256-gcm" },
+  { value: "aes-128-gcm", label: "aes-128-gcm" },
+  { value: "chacha20-ietf-poly1305", label: "chacha20-ietf-poly1305" },
+] as const;
+
+export type ShadowsocksMethod = typeof SHADOWSOCKS_METHODS[number]["value"];
+
+// Shadowsocks outbound config interface
+export interface ShadowsocksOutbound {
+  id?: number;
+  tag: string;
+  description?: string;
+  server: string;
+  server_port: number;
+  method: ShadowsocksMethod;
+  password: string;
+  udp: boolean;
+  enabled?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface ShadowsocksOutboundCreateRequest {
+  tag: string;
+  description?: string;
+  server: string;
+  server_port?: number;
+  method: ShadowsocksMethod;
+  password: string;
+  udp?: boolean;
+}
+
+export interface ShadowsocksOutboundUpdateRequest {
+  description?: string;
+  server?: string;
+  server_port?: number;
+  method?: ShadowsocksMethod;
+  password?: string;
+  udp?: boolean;
+  enabled?: number;
+}
+
+export interface ShadowsocksOutboundListResponse {
+  egress: ShadowsocksOutbound[];
+}
+
+export interface ShadowsocksURIParseResult {
+  method: ShadowsocksMethod;
+  password: string;
+  server: string;
+  server_port: number;
+  tag?: string;
+}
 
 export interface V2RayTransportConfig {
   path?: string;
@@ -813,6 +876,8 @@ export interface V2RayInboundConfig {
   reality_server_names?: string[];  // Parsed from JSON
   tun_device?: string;
   tun_subnet?: string;
+  // UDP support
+  udp_enabled: number;
   enabled: number;
   created_at?: string;
   updated_at?: string;
@@ -841,6 +906,8 @@ export interface V2RayInboundUpdateRequest {
   reality_server_names?: string[];
   tun_device?: string;
   tun_subnet?: string;
+  // UDP support
+  udp_enabled?: boolean;
   enabled?: boolean;
 }
 
@@ -905,6 +972,30 @@ export interface RealityKeyPair {
   public_key: string;
 }
 
+// VLESS-WG Bridge statistics
+export interface VlessWgBridgeStats {
+  active_sessions: number;
+  sessions_registered: number;
+  sessions_unregistered: number;
+  packets_routed: number;
+  packets_dropped: number;
+  channel_full: number;
+}
+
+// VLESS Bridge Status (from rust-router)
+export interface VlessBridgeStatus {
+  available: boolean;
+  running?: boolean;
+  listen_address?: string;
+  user_count?: number;
+  tls_enabled?: boolean;
+  udp_enabled?: boolean;
+  total_connections?: number;
+  active_connections?: number;
+  bridge_stats?: VlessWgBridgeStats;
+  message?: string;
+}
+
 // V2Ray protocol options for UI
 // Only VLESS is supported - VMess/Trojan removed from xray-lite
 export const V2RAY_PROTOCOLS = [
@@ -914,14 +1005,11 @@ export const V2RAY_PROTOCOLS = [
 // Legacy protocol type for displaying existing configs (read-only)
 export type V2RayProtocolLegacy = "vmess" | "vless" | "trojan";
 
+// Transport types - only include implemented transports
 export const V2RAY_TRANSPORTS = [
   { value: "tcp", label: "TCP", description: "Raw TCP" },
   { value: "ws", label: "WebSocket", description: "WebSocket transport" },
-  { value: "grpc", label: "gRPC", description: "gRPC transport" },
-  { value: "h2", label: "HTTP/2", description: "HTTP/2 transport" },
   { value: "quic", label: "QUIC", description: "QUIC transport" },
-  { value: "httpupgrade", label: "HTTPUpgrade", description: "HTTP upgrade" },
-  { value: "xhttp", label: "XHTTP", description: "XHTTP transport (Xray)" },
 ] as const;
 
 export const V2RAY_SECURITY_OPTIONS = [
@@ -1468,4 +1556,40 @@ export interface DisableInboundResponse {
   message: string;
   tag: string;
 }
+// ============ Shadowsocks Inbound Types ============
+
+export interface ShadowsocksInboundConfig {
+  enabled: boolean;
+  listen_addr: string;
+  listen_port: number;
+  method: string;
+  password: string;
+  udp_enabled: boolean;
+}
+
+export interface ShadowsocksInboundStatus {
+  enabled: boolean;
+  listen_addr: string | null;
+  listen_port: number | null;
+  method: string | null;
+  udp_enabled: boolean;
+  active_connections: number;
+  total_connections: number;
+  bytes_received: number;
+  bytes_sent: number;
+}
+
+export interface ShadowsocksInboundConfigUpdateRequest {
+  enabled?: boolean;
+  listen_addr?: string;
+  listen_port?: number;
+  method?: string;
+  password?: string;
+  udp_enabled?: boolean;
+}
+
+export interface ShadowsocksInboundConfigResponse {
+  config: ShadowsocksInboundConfig;
+}
+
 // Updated types

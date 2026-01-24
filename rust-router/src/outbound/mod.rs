@@ -38,6 +38,8 @@
 mod block;
 mod direct;
 mod manager;
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks;
 pub mod socks5;
 pub mod socks5_common;
 pub mod socks5_udp;
@@ -48,6 +50,8 @@ pub mod wireguard;
 pub use block::BlockOutbound;
 pub use direct::DirectOutbound;
 pub use manager::{OutboundManager, OutboundManagerBuilder};
+#[cfg(feature = "shadowsocks")]
+pub use shadowsocks::{ShadowsocksOutbound, ShadowsocksStream};
 pub use socks5::{PoolStats, Socks5Config, Socks5Error, Socks5Outbound};
 pub use socks5_udp::{Socks5Auth, Socks5UdpAssociation, Socks5UdpError};
 pub use vless::{

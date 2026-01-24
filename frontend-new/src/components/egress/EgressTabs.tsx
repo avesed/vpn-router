@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAllEgress, useDeleteCustomEgress, useDeleteDirectEgress, useDeleteWarpEgress, useDeleteOpenVPNEgress, useDeleteV2RayEgress, useEgressTraffic } from "../../api/hooks/useEgress";
+import { useAllEgress, useDeleteCustomEgress, useDeleteDirectEgress, useDeleteWarpEgress, useDeleteOpenVPNEgress, useDeleteV2RayEgress, useDeleteShadowsocksEgress, useEgressTraffic } from "../../api/hooks/useEgress";
 import { useDeletePIALine, useReconnectPIALine, usePIAStatus } from "../../api/hooks/usePIA";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { EgressCard } from "./EgressCard";
@@ -12,8 +12,9 @@ import { AddWarpDialog } from "./AddWarpDialog";
 import { AddPIADialog, PIALoginDialog } from "./AddPIADialog";
 import { AddOpenVPNDialog } from "./AddOpenVPNDialog";
 import { AddV2RayDialog } from "./AddV2RayDialog";
+import { AddShadowsocksDialog } from "./AddShadowsocksDialog";
 import { toast } from "sonner";
-import type { EgressItem, VpnProfile, OpenVPNEgress, V2RayEgress } from "../../types";
+import type { EgressItem, VpnProfile, OpenVPNEgress, V2RayEgress, ShadowsocksOutbound } from "../../types";
 
 export function EgressTabs() {
   const { t } = useTranslation();
@@ -27,6 +28,7 @@ export function EgressTabs() {
   const reconnectPIA = useReconnectPIALine();
   const deleteOpenVPN = useDeleteOpenVPNEgress();
   const deleteV2Ray = useDeleteV2RayEgress();
+  const deleteShadowsocks = useDeleteShadowsocksEgress();
 
   const [activeTab, setActiveTab] = useState("pia");
   const [showAddWireGuard, setShowAddWireGuard] = useState(false);
@@ -39,6 +41,8 @@ export function EgressTabs() {
   const [editingOpenVPN, setEditingOpenVPN] = useState<OpenVPNEgress | undefined>(undefined);
   const [showAddV2Ray, setShowAddV2Ray] = useState(false);
   const [editingV2Ray, setEditingV2Ray] = useState<V2RayEgress | undefined>(undefined);
+  const [showAddShadowsocks, setShowAddShadowsocks] = useState(false);
+  const [editingShadowsocks, setEditingShadowsocks] = useState<ShadowsocksOutbound | undefined>(undefined);
   const [pendingReconnectTag, setPendingReconnectTag] = useState<string | null>(null);
 
   if (isLoading) {
@@ -87,6 +91,9 @@ export function EgressTabs() {
         break;
       case "v2ray":
         promise = deleteV2Ray.mutateAsync(tag);
+        break;
+      case "shadowsocks":
+        promise = deleteShadowsocks.mutateAsync(tag);
         break;
       default:
         return;
@@ -140,6 +147,7 @@ export function EgressTabs() {
               type === "pia" ? () => setEditingPIA(egress as unknown as VpnProfile) :
               type === "openvpn" ? () => setEditingOpenVPN(egress as unknown as OpenVPNEgress) :
               type === "v2ray" ? () => setEditingV2Ray(egress as unknown as V2RayEgress) :
+              type === "shadowsocks" ? () => setEditingShadowsocks(egress as unknown as ShadowsocksOutbound) :
               undefined
             }
             onReconnect={type === "pia" ? () => handleReconnectPIA(egress.tag) : undefined}
@@ -193,17 +201,23 @@ export function EgressTabs() {
               <Plus className="mr-2 h-4 w-4" /> {t("egress.v2ray.add", { defaultValue: "Add V2Ray" })}
             </Button>
           )}
+          {activeTab === "shadowsocks" && (
+            <Button onClick={() => { setEditingShadowsocks(undefined); setShowAddShadowsocks(true); }}>
+              <Plus className="mr-2 h-4 w-4" /> {t("egress.shadowsocks.add", { defaultValue: "Add Shadowsocks" })}
+            </Button>
+          )}
         </div>
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-        <TabsList className="grid w-full grid-cols-6">
+        <TabsList className="grid w-full grid-cols-7">
           <TabsTrigger value="pia">PIA</TabsTrigger>
           <TabsTrigger value="custom">WireGuard</TabsTrigger>
           <TabsTrigger value="direct">{t("common.direct")}</TabsTrigger>
           <TabsTrigger value="warp">WARP</TabsTrigger>
           <TabsTrigger value="openvpn">OpenVPN</TabsTrigger>
           <TabsTrigger value="v2ray">V2Ray</TabsTrigger>
+          <TabsTrigger value="shadowsocks">SS</TabsTrigger>
         </TabsList>
 
         <TabsContent value="pia" className="mt-4">
@@ -223,6 +237,9 @@ export function EgressTabs() {
         </TabsContent>
         <TabsContent value="v2ray" className="mt-4">
           {renderEgressList(allEgress.v2ray, "v2ray")}
+        </TabsContent>
+        <TabsContent value="shadowsocks" className="mt-4">
+          {renderEgressList(allEgress.shadowsocks || [], "shadowsocks")}
         </TabsContent>
       </Tabs>
 
@@ -249,6 +266,11 @@ export function EgressTabs() {
         open={showAddV2Ray || !!editingV2Ray}
         onOpenChange={(open) => { setShowAddV2Ray(open); if (!open) setEditingV2Ray(undefined); }}
         editEgress={editingV2Ray}
+      />
+      <AddShadowsocksDialog
+        open={showAddShadowsocks || !!editingShadowsocks}
+        onOpenChange={(open) => { setShowAddShadowsocks(open); if (!open) setEditingShadowsocks(undefined); }}
+        editEgress={editingShadowsocks}
       />
     </div>
   );

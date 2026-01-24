@@ -3,6 +3,7 @@ import { useV2RayIngressConfig } from "@/api/hooks/useV2RayIngress";
 import { V2RayIngressConfig } from "@/components/v2ray-ingress/V2RayIngressConfig";
 import { V2RayUserTable } from "@/components/v2ray-ingress/V2RayUserTable";
 import { AddV2RayUserDialog } from "@/components/v2ray-ingress/AddV2RayUserDialog";
+import { VlessBridgeStats } from "@/components/v2ray-ingress/VlessBridgeStats";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Plus, Loader2 } from "lucide-react";
@@ -39,8 +40,9 @@ export default function V2RayIngressPage() {
         <TabsList>
           <TabsTrigger value="users">Users</TabsTrigger>
           <TabsTrigger value="config">Server Configuration</TabsTrigger>
+          <TabsTrigger value="stats">Bridge Status</TabsTrigger>
         </TabsList>
-        
+
         <TabsContent value="users" className="space-y-4">
           <Card>
             <CardHeader>
@@ -54,9 +56,13 @@ export default function V2RayIngressPage() {
             </CardContent>
           </Card>
         </TabsContent>
-        
+
         <TabsContent value="config">
           <V2RayIngressConfig />
+        </TabsContent>
+
+        <TabsContent value="stats">
+          <VlessBridgeStats />
         </TabsContent>
       </Tabs>
 

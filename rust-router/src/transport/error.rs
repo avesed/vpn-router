@@ -69,6 +69,23 @@ pub enum TransportError {
     #[error("Invalid WebSocket URL: {0}")]
     InvalidWebSocketUrl(String),
 
+    /// QUIC connection failed
+    #[error("QUIC connection to {address} failed: {reason}")]
+    QuicConnectionFailed {
+        /// Target address
+        address: String,
+        /// Failure reason
+        reason: String,
+    },
+
+    /// QUIC stream error
+    #[error("QUIC stream error: {0}")]
+    QuicStreamError(String),
+
+    /// QUIC endpoint creation failed
+    #[error("Failed to create QUIC endpoint: {0}")]
+    QuicEndpointError(String),
+
     /// Address parse error
     #[error("Invalid address format: {0}")]
     InvalidAddress(String),
@@ -104,6 +121,9 @@ impl TransportError {
             Self::WebSocketHandshakeFailed(_) => true,
             Self::WebSocketProtocolError(_) => false,
             Self::InvalidWebSocketUrl(_) => false,
+            Self::QuicConnectionFailed { .. } => true,
+            Self::QuicStreamError(_) => true,
+            Self::QuicEndpointError(_) => false,
             Self::InvalidAddress(_) => false,
             Self::SocketOption { .. } => false,
             Self::Io(e) => matches!(
@@ -174,6 +194,24 @@ impl TransportError {
         Self::InvalidWebSocketUrl(msg.into())
     }
 
+    /// Create a QUIC connection failed error
+    pub fn quic_connection(address: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::QuicConnectionFailed {
+            address: address.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Create a QUIC stream error
+    pub fn quic_stream(msg: impl Into<String>) -> Self {
+        Self::QuicStreamError(msg.into())
+    }
+
+    /// Create a QUIC endpoint error
+    pub fn quic_endpoint(msg: impl Into<String>) -> Self {
+        Self::QuicEndpointError(msg.into())
+    }
+
     /// Create an invalid address error
     pub fn invalid_address(msg: impl Into<String>) -> Self {
         Self::InvalidAddress(msg.into())
@@ -205,12 +243,15 @@ impl From<TransportError> for io::Error {
             TransportError::TlsConfigError(_)
             | TransportError::InvalidServerName(_)
             | TransportError::InvalidWebSocketUrl(_)
-            | TransportError::InvalidAddress(_) => {
+            | TransportError::InvalidAddress(_)
+            | TransportError::QuicEndpointError(_) => {
                 io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
             }
             TransportError::TlsHandshakeFailed { .. }
             | TransportError::WebSocketHandshakeFailed(_)
-            | TransportError::WebSocketProtocolError(_) => {
+            | TransportError::WebSocketProtocolError(_)
+            | TransportError::QuicConnectionFailed { .. }
+            | TransportError::QuicStreamError(_) => {
                 io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string())
             }
             TransportError::SocketOption { .. } => {
@@ -246,12 +287,15 @@ mod tests {
         assert!(TransportError::dns_failed("addr", "nxdomain").is_recoverable());
         assert!(TransportError::tls_handshake("name", "reason").is_recoverable());
         assert!(TransportError::websocket_handshake("reason").is_recoverable());
+        assert!(TransportError::quic_connection("addr", "reason").is_recoverable());
+        assert!(TransportError::quic_stream("error").is_recoverable());
 
         // Configuration errors are not recoverable
         assert!(!TransportError::tls_config("bad config").is_recoverable());
         assert!(!TransportError::invalid_server_name("bad").is_recoverable());
         assert!(!TransportError::invalid_address("bad").is_recoverable());
         assert!(!TransportError::websocket_protocol("error").is_recoverable());
+        assert!(!TransportError::quic_endpoint("error").is_recoverable());
     }
 
     #[test]
@@ -289,5 +333,48 @@ mod tests {
             }
             _ => panic!("Wrong error type"),
         }
+    }
+
+    #[test]
+    fn test_quic_error_constructors() {
+        let err = TransportError::quic_connection("127.0.0.1:443", "handshake failed");
+        match err {
+            TransportError::QuicConnectionFailed { address, reason } => {
+                assert_eq!(address, "127.0.0.1:443");
+                assert_eq!(reason, "handshake failed");
+            }
+            _ => panic!("Wrong error type"),
+        }
+
+        let err = TransportError::quic_stream("stream reset");
+        match err {
+            TransportError::QuicStreamError(msg) => {
+                assert_eq!(msg, "stream reset");
+            }
+            _ => panic!("Wrong error type"),
+        }
+
+        let err = TransportError::quic_endpoint("bind failed");
+        match err {
+            TransportError::QuicEndpointError(msg) => {
+                assert_eq!(msg, "bind failed");
+            }
+            _ => panic!("Wrong error type"),
+        }
+    }
+
+    #[test]
+    fn test_quic_error_to_io_error() {
+        let transport_err = TransportError::quic_connection("addr", "reason");
+        let io_err: io::Error = transport_err.into();
+        assert_eq!(io_err.kind(), io::ErrorKind::ConnectionAborted);
+
+        let transport_err = TransportError::quic_stream("stream error");
+        let io_err: io::Error = transport_err.into();
+        assert_eq!(io_err.kind(), io::ErrorKind::ConnectionAborted);
+
+        let transport_err = TransportError::quic_endpoint("endpoint error");
+        let io_err: io::Error = transport_err.into();
+        assert_eq!(io_err.kind(), io::ErrorKind::InvalidInput);
     }
 }

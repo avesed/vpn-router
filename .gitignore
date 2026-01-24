@@ -118,7 +118,7 @@ htmlcov/
 /config-node*
 /test-config-rust/
 test_dir/
-
+test-vless-client/
 
 # Temporary test scripts in root directory
 /test_*.sh
@@ -200,3 +200,4 @@ verify_phase3.sh
 verify_warp_integration.sh
 WARP_API_VERIFICATION.md
 WARP_REGISTRATION.md
+

@@ -70,6 +70,9 @@ mod tls;
 #[cfg(feature = "transport-ws")]
 mod websocket;
 
+#[cfg(feature = "transport-quic")]
+pub mod quic;
+
 // Re-exports
 pub use error::TransportError;
 pub use tcp::TcpTransport;
@@ -79,6 +82,9 @@ pub use tls::TlsTransport;
 
 #[cfg(feature = "transport-ws")]
 pub use websocket::WebSocketTransport;
+
+#[cfg(feature = "transport-quic")]
+pub use quic::{QuicClientConfig, QuicEndpointPool, QuicStream};
 
 use std::io;
 use std::pin::Pin;
@@ -95,7 +101,7 @@ use tokio_rustls::client::TlsStream;
 /// Configuration for establishing a transport connection
 ///
 /// This struct holds all the information needed to connect to a remote server,
-/// including optional TLS and WebSocket configurations.
+/// including optional TLS, WebSocket, and QUIC configurations.
 ///
 /// # Example
 ///
@@ -127,6 +133,10 @@ pub struct TransportConfig {
 
     /// WebSocket configuration (None for raw TCP/TLS)
     pub websocket: Option<WebSocketConfig>,
+
+    /// QUIC configuration (None for TCP-based transports)
+    #[cfg(feature = "transport-quic")]
+    pub quic: Option<QuicClientConfig>,
 
     /// Connection timeout
     pub connect_timeout: Duration,
@@ -163,6 +173,8 @@ impl TransportConfig {
             port,
             tls: None,
             websocket: None,
+            #[cfg(feature = "transport-quic")]
+            quic: None,
             connect_timeout: Duration::from_secs(30),
             tcp_keepalive: true,
             tcp_nodelay: true,
@@ -211,6 +223,31 @@ impl TransportConfig {
         self
     }
 
+    /// Add QUIC configuration
+    ///
+    /// When QUIC is configured, it takes priority over other transport types.
+    /// QUIC provides encrypted, multiplexed connections over UDP.
+    ///
+    /// # Arguments
+    ///
+    /// * `quic` - QUIC client configuration
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use rust_router::transport::{TransportConfig, QuicClientConfig};
+    ///
+    /// let config = TransportConfig::tcp("example.com", 443)
+    ///     .with_quic(QuicClientConfig::new("example.com").with_alpn(vec!["h3"]));
+    /// assert!(config.is_quic());
+    /// ```
+    #[cfg(feature = "transport-quic")]
+    #[must_use]
+    pub fn with_quic(mut self, quic: QuicClientConfig) -> Self {
+        self.quic = Some(quic);
+        self
+    }
+
     /// Set connection timeout
     ///
     /// # Arguments
@@ -246,6 +283,13 @@ impl TransportConfig {
     #[must_use]
     pub fn is_websocket(&self) -> bool {
         self.websocket.is_some()
+    }
+
+    /// Check if this configuration uses QUIC
+    #[cfg(feature = "transport-quic")]
+    #[must_use]
+    pub fn is_quic(&self) -> bool {
+        self.quic.is_some()
     }
 
     /// Get the full address string (host:port)
@@ -458,6 +502,10 @@ pub enum TransportStream {
     /// WebSocket over TCP or TLS
     #[cfg(feature = "transport-ws")]
     WebSocket(websocket::WebSocketWrapper),
+
+    /// QUIC bidirectional stream
+    #[cfg(feature = "transport-quic")]
+    Quic(QuicStream),
 }
 
 impl std::fmt::Debug for TransportStream {
@@ -478,6 +526,12 @@ impl std::fmt::Debug for TransportStream {
                 .debug_struct("TransportStream::WebSocket")
                 .field("inner", &"WebSocketWrapper")
                 .finish(),
+            #[cfg(feature = "transport-quic")]
+            Self::Quic(s) => f
+                .debug_struct("TransportStream::Quic")
+                .field("remote_address", &s.remote_address())
+                .field("stable_id", &s.stable_id())
+                .finish(),
         }
     }
 }
@@ -494,6 +548,8 @@ impl AsyncRead for TransportStream {
             Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(feature = "transport-ws")]
             Self::WebSocket(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "transport-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -510,6 +566,8 @@ impl AsyncWrite for TransportStream {
             Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "transport-ws")]
             Self::WebSocket(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "transport-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -520,6 +578,8 @@ impl AsyncWrite for TransportStream {
             Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "transport-ws")]
             Self::WebSocket(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "transport-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -530,6 +590,8 @@ impl AsyncWrite for TransportStream {
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(feature = "transport-ws")]
             Self::WebSocket(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "transport-quic")]
+            Self::Quic(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -556,7 +618,7 @@ pub trait Transport: Send + Sync {
 /// Connect to a remote server using the appropriate transport
 ///
 /// This function automatically selects the correct transport based on
-/// the configuration (TCP, TLS, WebSocket).
+/// the configuration. The priority order is: QUIC > WebSocket > TLS > TCP.
 ///
 /// # Arguments
 ///
@@ -583,7 +645,12 @@ pub trait Transport: Send + Sync {
 /// # }
 /// ```
 pub async fn connect(config: &TransportConfig) -> Result<TransportStream, TransportError> {
-    // Determine which transport to use based on configuration
+    // Priority: QUIC > WebSocket > TLS > TCP
+    #[cfg(feature = "transport-quic")]
+    if let Some(ref quic_config) = config.quic {
+        return connect_quic(config, quic_config).await;
+    }
+
     #[cfg(feature = "transport-ws")]
     if config.websocket.is_some() {
         return WebSocketTransport.connect(config).await;
@@ -595,6 +662,46 @@ pub async fn connect(config: &TransportConfig) -> Result<TransportStream, Transp
     }
 
     TcpTransport.connect(config).await
+}
+
+/// Connect using QUIC transport
+///
+/// This function establishes a QUIC connection and opens a bidirectional stream.
+#[cfg(feature = "transport-quic")]
+async fn connect_quic(
+    config: &TransportConfig,
+    quic_config: &QuicClientConfig,
+) -> Result<TransportStream, TransportError> {
+    use std::net::ToSocketAddrs;
+
+    // Resolve the address
+    let addr_str = format!("{}:{}", config.address, config.port);
+    let addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| TransportError::dns_failed(&addr_str, e.to_string()))?
+        .next()
+        .ok_or_else(|| TransportError::dns_failed(&addr_str, "no addresses returned"))?;
+
+    // Create endpoint pool (single endpoint for simple connect)
+    let pool_config = QuicClientConfig {
+        server_name: quic_config.server_name.clone(),
+        alpn_protocols: quic_config.alpn_protocols.clone(),
+        skip_verify: quic_config.skip_verify,
+        idle_timeout_secs: quic_config.idle_timeout_secs,
+        keep_alive_interval_secs: quic_config.keep_alive_interval_secs,
+        num_endpoints: 1, // Use single endpoint for simple connect
+    };
+
+    let pool = QuicEndpointPool::new(&pool_config).await?;
+    let stream = pool.connect(addr, &quic_config.server_name).await?;
+
+    tracing::debug!(
+        addr = %addr,
+        server_name = %quic_config.server_name,
+        "QUIC transport connection established"
+    );
+
+    Ok(TransportStream::Quic(stream))
 }
 
 #[cfg(test)]

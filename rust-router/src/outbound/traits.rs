@@ -104,6 +104,9 @@ pub enum OutboundStream {
     Tcp(TcpStream),
     /// Transport layer stream (TLS, WebSocket, etc.)
     Transport(TransportStream),
+    /// Shadowsocks encrypted stream
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks(super::shadowsocks::ShadowsocksStream),
 }
 
 impl OutboundStream {
@@ -139,6 +142,8 @@ impl OutboundStream {
         match self {
             Self::Tcp(s) => Some(s),
             Self::Transport(_) => None,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(_) => None,
         }
     }
 
@@ -149,6 +154,8 @@ impl OutboundStream {
         match self {
             Self::Tcp(s) => Some(s),
             Self::Transport(_) => None,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(_) => None,
         }
     }
 
@@ -158,6 +165,7 @@ impl OutboundStream {
     pub fn try_into_tcp(self) -> Result<TcpStream, Self> {
         match self {
             Self::Tcp(s) => Ok(s),
+            #[allow(unused_variables)]
             other => Err(other),
         }
     }
@@ -175,6 +183,10 @@ impl OutboundStream {
             }
             #[cfg(feature = "transport-ws")]
             Self::Transport(TransportStream::WebSocket(_)) => None, // WebSocket doesn't expose local addr
+            #[cfg(feature = "transport-quic")]
+            Self::Transport(TransportStream::Quic(s)) => Some(s.remote_address()), // Return remote address for QUIC
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(_) => None, // Shadowsocks doesn't expose local addr directly
         }
     }
 }
@@ -191,6 +203,11 @@ impl std::fmt::Debug for OutboundStream {
                 .debug_struct("OutboundStream::Transport")
                 .field("inner", &t)
                 .finish(),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(s) => f
+                .debug_struct("OutboundStream::Shadowsocks")
+                .field("inner", &s)
+                .finish(),
         }
     }
 }
@@ -204,6 +221,8 @@ impl AsyncRead for OutboundStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Self::Transport(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -217,6 +236,8 @@ impl AsyncWrite for OutboundStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Self::Transport(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -224,6 +245,8 @@ impl AsyncWrite for OutboundStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_flush(cx),
             Self::Transport(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -231,6 +254,8 @@ impl AsyncWrite for OutboundStream {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Self::Transport(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -260,6 +285,9 @@ pub enum UdpOutboundHandle {
     Direct(DirectUdpHandle),
     /// SOCKS5 UDP ASSOCIATE handle
     Socks5(Socks5UdpHandle),
+    /// Shadowsocks UDP relay handle
+    #[cfg(feature = "shadowsocks")]
+    Shadowsocks(super::shadowsocks::ShadowsocksUdpHandle),
 }
 
 impl UdpOutboundHandle {
@@ -269,6 +297,8 @@ impl UdpOutboundHandle {
         match self {
             Self::Direct(h) => h.dest_addr,
             Self::Socks5(h) => h.dest_addr,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(h) => h.dest_addr(),
         }
     }
 
@@ -281,6 +311,8 @@ impl UdpOutboundHandle {
         match self {
             Self::Direct(h) => h.send(data).await,
             Self::Socks5(h) => h.send(data).await,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(h) => h.send(data).await,
         }
     }
 
@@ -293,6 +325,8 @@ impl UdpOutboundHandle {
         match self {
             Self::Direct(h) => h.recv(buf).await,
             Self::Socks5(h) => h.recv(buf).await,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(h) => h.recv(buf).await,
         }
     }
 
@@ -305,6 +339,8 @@ impl UdpOutboundHandle {
         match self {
             Self::Direct(h) => h.try_recv(buf),
             Self::Socks5(h) => h.try_recv(buf),
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(h) => h.try_recv(buf),
         }
     }
 
@@ -314,6 +350,8 @@ impl UdpOutboundHandle {
         match self {
             Self::Direct(h) => h.routing_mark,
             Self::Socks5(_) => None,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(_) => None, // Shadowsocks handles routing at protocol level
         }
     }
 }
@@ -552,6 +590,8 @@ impl OutboundConnection {
             TransportStream::Tls(s) => s.get_ref().0.local_addr().ok(),
             #[cfg(feature = "transport-ws")]
             TransportStream::WebSocket(_) => None,
+            #[cfg(feature = "transport-quic")]
+            TransportStream::Quic(s) => Some(s.remote_address()),
         };
         Self {
             stream: OutboundStream::Transport(stream),
@@ -625,6 +665,14 @@ impl OutboundConnection {
             #[cfg(feature = "transport-ws")]
             OutboundStream::Transport(TransportStream::WebSocket(_)) => {
                 panic!("Cannot convert WebSocket stream to TcpStream; use into_outbound_stream() instead")
+            }
+            #[cfg(feature = "transport-quic")]
+            OutboundStream::Transport(TransportStream::Quic(_)) => {
+                panic!("Cannot convert QUIC stream to TcpStream; use into_outbound_stream() instead")
+            }
+            #[cfg(feature = "shadowsocks")]
+            OutboundStream::Shadowsocks(_) => {
+                panic!("Cannot convert Shadowsocks stream to TcpStream; use into_outbound_stream() instead")
             }
         }
     }

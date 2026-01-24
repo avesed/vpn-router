@@ -1,7 +1,7 @@
 //! VLESS inbound listener
 //!
 //! This module provides the main VLESS inbound listener that accepts connections
-//! from VLESS clients. It supports both plain TCP and TLS modes, with optional
+//! from VLESS clients. It supports plain TCP, TLS, and REALITY modes, with optional
 //! fallback for non-VLESS connections.
 //!
 //! # Architecture
@@ -16,10 +16,11 @@
 //!        |
 //!        v
 //! +------------------+
-//! | TLS Handshake    | (optional)
+//! | REALITY/TLS      | (optional)
+//! | Handshake        |
 //! +------------------+
 //!        |
-//!        v
+//!        v (if valid)
 //! +------------------+
 //! | VLESS Handler    |
 //! | - Read header    |
@@ -32,6 +33,9 @@
 //! | Authenticated    |
 //! | VlessConnection  |
 //! +------------------+
+//!
+//! If REALITY validation fails, connection is
+//! transparently proxied to fallback destination.
 //! ```
 //!
 //! # Example
@@ -71,6 +75,7 @@ use tracing::{debug, error, info, trace, warn};
 use super::config::VlessInboundConfig;
 use super::error::{VlessInboundError, VlessInboundResult};
 use super::handler::{VlessConnection, VlessConnectionHandler};
+use crate::reality::{RealityAcceptResult, RealityServer};
 
 #[cfg(feature = "transport-tls")]
 use {
@@ -87,6 +92,19 @@ use {
 ///
 /// This listener accepts incoming connections from VLESS clients, performs
 /// authentication, and returns authenticated connections for forwarding.
+///
+/// # Transport Modes
+///
+/// The listener supports three transport modes:
+///
+/// 1. **Plain TCP**: No encryption, VLESS header sent in plaintext (not recommended)
+/// 2. **TLS**: Standard TLS 1.2/1.3 encryption using rustls
+/// 3. **REALITY**: TLS 1.3 camouflage with transparent fallback
+///
+/// When REALITY is enabled, the listener validates incoming ClientHello messages
+/// against the configured authentication parameters. Valid connections proceed
+/// to VLESS protocol handling, while invalid connections are transparently
+/// proxied to the fallback destination.
 pub struct VlessInboundListener {
     /// TCP listener
     tcp_listener: TcpListener,
@@ -94,6 +112,9 @@ pub struct VlessInboundListener {
     /// TLS acceptor (if TLS is enabled)
     #[cfg(feature = "transport-tls")]
     tls_acceptor: Option<TlsAcceptor>,
+
+    /// REALITY server (if REALITY is enabled)
+    reality_server: Option<RealityServer>,
 
     /// Connection handler
     handler: Arc<VlessConnectionHandler>,
@@ -128,6 +149,7 @@ impl VlessInboundListener {
         info!(
             listen = %config.listen,
             tls = config.has_tls(),
+            reality = config.has_reality(),
             users = config.users.len(),
             fallback = ?config.fallback,
             "Creating VLESS inbound listener"
@@ -138,10 +160,25 @@ impl VlessInboundListener {
             .await
             .map_err(|e| VlessInboundError::bind_failed(config.listen, e.to_string()))?;
 
-        // Create TLS acceptor if configured
+        // Create REALITY server if configured
+        let reality_server = if config.has_reality() {
+            let server = config.build_reality_server()?;
+            info!(
+                dest = %server.config().dest,
+                short_ids = server.config().short_ids.len(),
+                server_names = ?server.config().server_names,
+                "REALITY server enabled"
+            );
+            Some(server)
+        } else {
+            None
+        };
+
+        // Create TLS acceptor if configured (only when REALITY is not enabled)
         #[cfg(feature = "transport-tls")]
-        let tls_acceptor = if let Some(ref tls_config) = config.tls {
-            Some(Self::create_tls_acceptor(tls_config)?)
+        let tls_acceptor = if config.has_tls() {
+            // has_tls() already checks that REALITY is not enabled
+            Some(Self::create_tls_acceptor(config.tls.as_ref().unwrap())?)
         } else {
             None
         };
@@ -165,6 +202,7 @@ impl VlessInboundListener {
             tcp_listener,
             #[cfg(feature = "transport-tls")]
             tls_acceptor,
+            reality_server,
             handler,
             config,
             shutdown_tx,
@@ -375,6 +413,7 @@ impl VlessInboundListener {
     ) -> VlessInboundResult<Option<VlessConnection<TcpStream>>> {
         // Handle VLESS authentication directly (no TLS)
         // For TLS, use accept_tls() instead
+        // For REALITY, use accept_reality() instead
         match self.handler.handle(tcp_stream, client_addr).await {
             Ok(conn) => Ok(Some(conn)),
             Err(VlessInboundError::AuthenticationFailed) if self.config.fallback.is_some() => {
@@ -388,6 +427,153 @@ impl VlessInboundListener {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Accept a new VLESS connection with REALITY
+    ///
+    /// This method accepts connections with REALITY protocol validation.
+    /// Valid REALITY clients proceed with VLESS authentication, while
+    /// invalid clients are transparently proxied to the fallback destination.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(VlessConnection)` for authenticated VLESS clients,
+    /// or `None` if the connection was proxied to fallback (REALITY validation failed).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if REALITY is not configured, bind/accept fails, or
+    /// VLESS authentication fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use rust_router::vless_inbound::{
+    ///     VlessInboundListener, VlessInboundConfig, VlessUser, InboundRealityConfig
+    /// };
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = VlessInboundConfig::new("0.0.0.0:443".parse()?)
+    ///     .with_user(VlessUser::new(
+    ///         "550e8400-e29b-41d4-a716-446655440000",
+    ///         Some("admin"),
+    ///     ))
+    ///     .with_reality(
+    ///         InboundRealityConfig::new(
+    ///             "base64_private_key",
+    ///             "www.google.com:443"
+    ///         )
+    ///         .with_short_id("1234567890abcdef")
+    ///         .with_server_name("www.google.com")
+    ///     );
+    ///
+    /// let listener = VlessInboundListener::new(config).await?;
+    ///
+    /// loop {
+    ///     match listener.accept_reality().await? {
+    ///         Some(conn) => {
+    ///             println!("Authenticated connection to {}", conn.destination());
+    ///         }
+    ///         None => {
+    ///             // Connection was proxied to fallback
+    ///         }
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    pub async fn accept_reality(
+        &self,
+    ) -> VlessInboundResult<Option<VlessConnection<TcpStream>>> {
+        if !self.active {
+            return Err(VlessInboundError::NotActive);
+        }
+
+        let reality_server = self
+            .reality_server
+            .as_ref()
+            .ok_or_else(|| VlessInboundError::invalid_config("REALITY not configured"))?;
+
+        loop {
+            // Accept TCP connection
+            let (tcp_stream, client_addr) = self
+                .tcp_listener
+                .accept()
+                .await
+                .map_err(|e| VlessInboundError::accept(e.to_string()))?;
+
+            trace!(client = %client_addr, "Accepted TCP connection (REALITY mode)");
+
+            // Perform REALITY validation
+            match reality_server.accept(tcp_stream).await {
+                Ok(RealityAcceptResult::Authenticated { stream, short_id, .. }) => {
+                    debug!(
+                        client = %client_addr,
+                        short_id = ?short_id,
+                        "REALITY authentication successful"
+                    );
+
+                    // Now handle VLESS authentication on the authenticated stream
+                    match self.handler.handle(stream, client_addr).await {
+                        Ok(conn) => return Ok(Some(conn)),
+                        Err(e) => {
+                            if e.is_recoverable() {
+                                warn!(
+                                    client = %client_addr,
+                                    error = %e,
+                                    "Recoverable VLESS error after REALITY, continuing"
+                                );
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(RealityAcceptResult::Fallback) => {
+                    // Connection was proxied to fallback
+                    debug!(
+                        client = %client_addr,
+                        "REALITY authentication failed, proxied to fallback"
+                    );
+                    // Continue accepting new connections
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        client = %client_addr,
+                        error = %e,
+                        "REALITY accept error"
+                    );
+                    // Continue accepting new connections
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Accept a connection using the configured transport mode
+    ///
+    /// This method automatically selects the appropriate accept method based on
+    /// the configuration:
+    /// - REALITY mode: Uses REALITY protocol validation
+    /// - TLS mode: Uses standard TLS handshake
+    /// - Plain mode: Direct VLESS protocol
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(VlessConnection)` for authenticated clients, or `None` if
+    /// the connection was handled (e.g., proxied to fallback in REALITY mode).
+    pub async fn accept_auto(&self) -> VlessInboundResult<Option<VlessConnection<TcpStream>>> {
+        if self.reality_server.is_some() {
+            self.accept_reality().await
+        } else {
+            self.accept().await.map(Some)
+        }
+    }
+
+    /// Check if REALITY is enabled
+    #[must_use]
+    pub fn has_reality(&self) -> bool {
+        self.reality_server.is_some()
     }
 
     /// Run the listener with a connection handler callback
@@ -492,6 +678,12 @@ impl VlessInboundListener {
     #[must_use]
     pub fn user_count(&self) -> usize {
         self.handler.user_count()
+    }
+
+    /// Check if UDP support is enabled
+    #[must_use]
+    pub fn is_udp_enabled(&self) -> bool {
+        self.config.is_udp_enabled()
     }
 
     /// Subscribe to shutdown signal

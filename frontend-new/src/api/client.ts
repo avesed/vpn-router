@@ -60,6 +60,7 @@ import type {
   // Xray types
   XrayStatus,
   RealityKeyPair,
+  VlessBridgeStatus,
   // WARP types
   WarpEgress,
   WarpEgressRegisterRequest,
@@ -70,6 +71,17 @@ import type {
   WarpEgressStatus,
   WarpEndpointTestRequest,
   WarpEndpointTestResponse,
+  // Shadowsocks types
+  ShadowsocksOutbound,
+  ShadowsocksOutboundCreateRequest,
+  ShadowsocksOutboundUpdateRequest,
+  ShadowsocksOutboundListResponse,
+  ShadowsocksURIParseResult,
+  // Shadowsocks Inbound types
+  ShadowsocksInboundConfig,
+  ShadowsocksInboundStatus,
+  ShadowsocksInboundConfigUpdateRequest,
+  ShadowsocksInboundConfigResponse,
   // Outbound Groups types
   OutboundGroup,
   OutboundGroupCreateRequest,
@@ -650,6 +662,9 @@ export const api = {
   generateRealityKeys: () =>
     request<RealityKeyPair>("/ingress/v2ray/reality/generate-keys", { method: "POST" }),
 
+  // VLESS-WG Bridge Status (from rust-router)
+  getVlessBridgeStatus: () => request<VlessBridgeStatus>("/ingress/v2ray/bridge-stats"),
+
   // ============ WARP Egress Management (Cloudflare WARP via usque MASQUE) ============
   getWarpEgress: () => request<WarpEgressListResponse>("/egress/warp"),
   getWarpEgressByTag: (tag: string) =>
@@ -874,5 +889,67 @@ export const api = {
   disablePeerInbound: (tag: string) =>
     request<DisableInboundResponse>(`/peers/${encodeURIComponent(tag)}/inbound/disable`, {
       method: "POST"
+    }),
+
+  // ============ Shadowsocks Egress Management ============
+  getShadowsocksEgress: () => request<ShadowsocksOutboundListResponse>("/egress/shadowsocks"),
+
+  getShadowsocksEgressByTag: (tag: string) =>
+    request<ShadowsocksOutbound>(`/egress/shadowsocks/${encodeURIComponent(tag)}`),
+
+  createShadowsocksEgress: (data: ShadowsocksOutboundCreateRequest) =>
+    request<{ message: string; tag: string; id: number }>("/egress/shadowsocks", {
+      method: "POST",
+      body: data
+    }),
+
+  updateShadowsocksEgress: (tag: string, data: ShadowsocksOutboundUpdateRequest) =>
+    request<{ message: string }>(`/egress/shadowsocks/${encodeURIComponent(tag)}`, {
+      method: "PUT",
+      body: data
+    }),
+
+  deleteShadowsocksEgress: (tag: string) =>
+    request<{ message: string }>(`/egress/shadowsocks/${encodeURIComponent(tag)}`, { method: "DELETE" }),
+
+  parseShadowsocksURI: (uri: string) =>
+    request<ShadowsocksURIParseResult>("/egress/shadowsocks/parse", {
+      method: "POST",
+      body: { uri }
+    }),
+
+  // ============ Shadowsocks Inbound Management ============
+  getShadowsocksInboundConfig: () =>
+    request<ShadowsocksInboundConfigResponse>("/ingress/shadowsocks/config"),
+
+  updateShadowsocksInboundConfig: (data: ShadowsocksInboundConfigUpdateRequest) =>
+    request<{ message: string; config: ShadowsocksInboundConfig }>("/ingress/shadowsocks/config", {
+      method: "POST",
+      body: data
+    }),
+
+  getShadowsocksInboundStatus: () =>
+    request<ShadowsocksInboundStatus>("/ingress/shadowsocks/status"),
+
+  stopShadowsocksIngress: () =>
+    request<{ message: string }>("/ingress/shadowsocks/stop", {
+      method: "POST"
+    }),
+
+  getShadowsocksIngressOutbound: () =>
+    request<{ outbound: string | null; global_default: string; available_outbounds: string[] }>(
+      "/ingress/shadowsocks/outbound"
+    ),
+
+  setShadowsocksIngressOutbound: (outbound: string | null) =>
+    request<{
+      success: boolean;
+      message: string;
+      outbound: string | null;
+      reloaded: boolean;
+      error?: string;
+    }>("/ingress/shadowsocks/outbound", {
+      method: "PUT",
+      body: { outbound }
     }),
 };

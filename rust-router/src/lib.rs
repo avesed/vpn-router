@@ -63,6 +63,7 @@
 //! - [`vision`]: XTLS-Vision TLS detection and zero-copy passthrough
 //! - [`reality`]: REALITY protocol configuration (TLS 1.3 camouflage)
 //! - [`transport`]: Transport layer abstraction (TCP, TLS, WebSocket)
+//! - [`ss_inbound`]: Shadowsocks inbound listener (server mode)
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -82,7 +83,11 @@ pub mod outbound;
 pub mod peer;
 pub mod reality;
 pub mod rules;
+#[cfg(feature = "shadowsocks")]
+pub mod shadowsocks;
 pub mod sniff;
+#[cfg(feature = "shadowsocks")]
+pub mod ss_inbound;
 pub mod tproxy;
 pub mod transport;
 pub mod tunnel;
@@ -156,8 +161,9 @@ pub use vless::{
 pub use reality::{RealityConfig, RealityError, RealityResult};
 pub use vision::{
     is_application_data, is_client_hello, is_server_hello, is_tls_traffic, is_valid_tls_version,
-    parse_tls_record_header, VisionError, VisionResult, VisionState, HANDSHAKE_CLIENT_HELLO,
-    HANDSHAKE_SERVER_HELLO, TLS_APPLICATION_DATA, TLS_HANDSHAKE, TLS_RECORD_HEADER_SIZE,
+    parse_tls_record_header, StreamState, VisionError, VisionResult, VisionState, VisionStream,
+    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_SERVER_HELLO, TLS_APPLICATION_DATA, TLS_HANDSHAKE,
+    TLS_RECORD_HEADER_SIZE,
 };
 pub use transport::{
     connect, TcpTransport, TlsConfig, Transport, TransportConfig, TransportError, TransportStream,
@@ -176,6 +182,19 @@ pub use vless_wg_bridge::{
     BridgeError, BridgeStats, BridgeStatsSnapshot, PortAllocator, PortAllocatorConfig, PortGuard,
     SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig,
     UdpSession as BridgeUdpSession, VlessConnectionId, VlessWgBridge, WgReplyPacket,
+};
+#[cfg(feature = "shadowsocks")]
+pub use shadowsocks::{
+    ShadowsocksError, ShadowsocksMethod, ShadowsocksOutboundConfig, ShadowsocksOutboundInfo,
+};
+#[cfg(feature = "shadowsocks")]
+pub use outbound::{ShadowsocksOutbound, ShadowsocksStream};
+#[cfg(feature = "shadowsocks")]
+pub use ss_inbound::{
+    ConnectionStats as SsConnectionStats, ShadowsocksConnection, ShadowsocksDestination,
+    ShadowsocksInboundConfig, ShadowsocksInboundError, ShadowsocksInboundListener,
+    ShadowsocksInboundResult, ShadowsocksInboundStats, ShadowsocksInboundStatsSnapshot,
+    ShadowsocksInboundStatus,
 };
 
 /// Crate version

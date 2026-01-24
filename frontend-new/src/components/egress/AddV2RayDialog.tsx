@@ -532,7 +532,7 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
                 </Select>
               </div>
 
-              {(transportType === "ws" || transportType === "h2" || transportType === "httpupgrade" || transportType === "xhttp") && (
+              {transportType === "ws" && (
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="transportPath">{t("egress.v2ray.path", { defaultValue: "Path" })}</Label>
@@ -551,17 +551,6 @@ export function AddV2RayDialog({ open, onOpenChange, editEgress }: AddV2RayDialo
                       onChange={(e) => setTransportHost(e.target.value)}
                     />
                   </div>
-                </div>
-              )}
-
-              {transportType === "grpc" && (
-                <div className="space-y-2">
-                  <Label htmlFor="transportServiceName">{t("egress.v2ray.serviceName", { defaultValue: "Service Name" })}</Label>
-                  <Input
-                    id="transportServiceName"
-                    value={transportServiceName}
-                    onChange={(e) => setTransportServiceName(e.target.value)}
-                  />
                 </div>
               )}
             </div>

@@ -483,6 +483,7 @@ async fn main() -> Result<()> {
     // Create WireGuard egress manager (always created for IPC support)
     // The reply handler forwards decrypted packets back to the ingress reply router
     // For peer tunnels (peer-*), packets go to the peer tunnel processor for chain routing
+    // For VLESS sessions, packets go to the VlessReplyRegistry first
     let reply_router_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
         Arc::new(parking_lot::RwLock::new(None));
     let peer_tunnel_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
@@ -491,12 +492,24 @@ async fn main() -> Result<()> {
     let forwarding_stats = Arc::new(rust_router::ingress::ForwardingStats::default());
     let peer_tunnel_stats = Arc::new(rust_router::ingress::PeerTunnelProcessorStats::default());
 
+    // Create VLESS reply registry for routing WG replies back to VLESS sessions
+    let vless_reply_registry = Arc::new(rust_router::vless_wg_bridge::VlessReplyRegistry::new());
+    debug!("Created VlessReplyRegistry for VLESS-WG bridge reply routing");
+
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
         let reply_router_tx = Arc::clone(&reply_router_tx);
         let peer_tunnel_tx = Arc::clone(&peer_tunnel_tx);
         let reply_stats = Arc::clone(&reply_stats);
         let peer_tunnel_stats = Arc::clone(&peer_tunnel_stats);
+        let vless_registry = Arc::clone(&vless_reply_registry);
         move |packet, tunnel_tag: String| {
+            // First, try to route to VLESS sessions (Layer 4 TCP inbound -> Layer 3 WG outbound)
+            // This handles replies from WG tunnels used by VlessWgBridge
+            if vless_registry.try_route(&tunnel_tag, &packet) {
+                // Successfully routed to a VLESS session
+                return;
+            }
+
             // Route peer tunnel packets (peer-*) to the peer tunnel processor
             // for DSCP-based chain routing on Terminal nodes
             if tunnel_tag.starts_with("peer-") {
@@ -634,7 +647,8 @@ async fn main() -> Result<()> {
         .with_peer_manager(Arc::clone(&peer_manager))
         .with_chain_manager(Arc::clone(&chain_manager), userspace_wg_config.node_tag.clone())
         .with_ecmp_group_manager(Arc::clone(&ecmp_group_manager))
-        .with_wg_egress_manager(Arc::clone(&wg_egress_manager));
+        .with_wg_egress_manager(Arc::clone(&wg_egress_manager))
+        .with_vless_reply_registry(Arc::clone(&vless_reply_registry));
 
     // Add WireGuard ingress manager if available
     if let Some(ref ingress_mgr) = wg_ingress_manager {

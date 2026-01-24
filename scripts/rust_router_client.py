@@ -2439,6 +2439,7 @@ class RustRouterClient:
         tls_cert_path: Optional[str] = None,
         tls_key_path: Optional[str] = None,
         fallback: Optional[str] = None,
+        udp_enabled: bool = True,
     ) -> IpcResponse:
         """Configure VLESS inbound listener
 
@@ -2451,6 +2452,7 @@ class RustRouterClient:
             tls_cert_path: Path to TLS certificate file
             tls_key_path: Path to TLS private key file
             fallback: Fallback address for non-VLESS connections
+            udp_enabled: Enable UDP support (VLESS command 0x02), default True
 
         Returns:
             IpcResponse indicating success or failure
@@ -2459,6 +2461,7 @@ class RustRouterClient:
             "type": "configure_vless_inbound",
             "listen": listen,
             "users": users,
+            "udp_enabled": udp_enabled,
         }
         if tls_cert_path:
             command["tls_cert_path"] = tls_cert_path

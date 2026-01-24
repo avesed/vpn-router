@@ -77,6 +77,9 @@ hmac = "0.12"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 
+# Constant-time comparison for security-sensitive operations
+subtle = "2.5"
+
 # Base64 encoding
 base64 = "0.22"
 
@@ -132,6 +135,19 @@ http = { version = "1", optional = true }
 # WebSocket support for transport layer
 tokio-tungstenite = { version = "0.24", optional = true }
 
+# QUIC transport layer
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "runtime-tokio",
+    "rustls",
+], optional = true }
+
+# Shadowsocks protocol support
+shadowsocks = { version = "1.21", default-features = false, features = [
+    "aead-cipher-2022",
+    "aead-cipher",
+], optional = true }
+
 [features]
 default = ["dns-doh", "dns-dot", "handshake_retry", "transport-tls", "transport-ws"]
 dns-doh = ["hyper", "hyper-util", "http-body-util", "hyper-rustls", "http", "rustls", "rustls-pki-types", "webpki-roots"]
@@ -139,6 +155,10 @@ dns-dot = ["tokio-rustls", "rustls", "rustls-pki-types", "webpki-roots"]
 # Transport layer features for VLESS outbound and inbound
 transport-tls = ["tokio-rustls", "rustls", "rustls-pki-types", "rustls-pemfile", "webpki-roots"]
 transport-ws = ["tokio-tungstenite", "transport-tls"]
+# QUIC transport layer (requires TLS-related deps)
+transport-quic = ["quinn", "rustls", "webpki-roots"]
+# Shadowsocks protocol support
+shadowsocks = ["dep:shadowsocks"]
 # Handshake retry with exponential backoff to prevent busy loop on invalid egress
 handshake_retry = []
 

@@ -142,7 +142,7 @@ pub mod handler;
 pub mod listener;
 
 // Re-export commonly used types
-pub use config::{InboundTlsConfig, VlessInboundConfig, VlessUser};
+pub use config::{InboundRealityConfig, InboundTlsConfig, VlessInboundConfig, VlessUser};
 pub use error::{VlessInboundError, VlessInboundResult};
 pub use handler::{AuthenticatedUser, VlessConnection, VlessConnectionHandler, VlessDestination};
 pub use listener::{VlessInboundListener, VlessInboundStats};

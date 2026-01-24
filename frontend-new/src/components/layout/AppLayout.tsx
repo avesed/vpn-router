@@ -21,6 +21,7 @@ import {
   Search,
   Languages,
   Scale,
+  Shield,
 } from "lucide-react";
 import { MobileBottomNav } from "./MobileBottomNav";
 import {
@@ -77,6 +78,7 @@ const navGroups: NavGroup[] = [
     items: [
       { labelKey: "nav.ingressClient", path: "/ingress", icon: Users },
       { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: Server },
+      { labelKey: "nav.ssIngress", path: "/ingress-shadowsocks", icon: Shield },
       { labelKey: "nav.peerNodes", path: "/peers", icon: ServerCog },
       { labelKey: "nav.nodeChains", path: "/chains", icon: Link2 },
       { labelKey: "nav.topology", path: "/topology", icon: Map },

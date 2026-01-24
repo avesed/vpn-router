@@ -22,6 +22,7 @@ use super::protocol::{
     UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
     UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
     VlessOutboundInfoResponse, VlessInboundStatusResponse, VlessUserInfo, VlessUserConfig,
+    VlessWgBridgeStats,
 };
 use crate::chain::ChainManager;
 use crate::dns::cache::DnsCache;
@@ -233,6 +234,9 @@ pub struct IpcHandler {
 
     /// VLESS inbound accept task handle
     vless_inbound_task: RwLock<Option<JoinHandle<()>>>,
+
+    /// VLESS reply registry for routing WG replies back to VLESS sessions
+    vless_reply_registry: Option<Arc<crate::vless_wg_bridge::VlessReplyRegistry>>,
 }
 
 impl IpcHandler {
@@ -270,6 +274,7 @@ impl IpcHandler {
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
+            vless_reply_registry: None,
         }
     }
 
@@ -313,6 +318,7 @@ impl IpcHandler {
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
+            vless_reply_registry: None,
         }
     }
 
@@ -355,6 +361,7 @@ impl IpcHandler {
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
+            vless_reply_registry: None,
         }
     }
 
@@ -400,6 +407,7 @@ impl IpcHandler {
             vless_total_connections: AtomicU64::new(0),
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
+            vless_reply_registry: None,
         }
     }
 
@@ -481,6 +489,25 @@ impl IpcHandler {
     /// Get a reference to the DNS engine (if available)
     pub fn dns_engine(&self) -> Option<&Arc<DnsEngine>> {
         self.dns_engine.as_ref()
+    }
+
+    /// Set the VLESS reply registry after construction
+    ///
+    /// This allows routing WireGuard reply packets back to VLESS sessions
+    /// when using VlessWgBridge for Layer 4 → Layer 3 bridging.
+    pub fn with_vless_reply_registry(
+        mut self,
+        registry: Arc<crate::vless_wg_bridge::VlessReplyRegistry>,
+    ) -> Self {
+        self.vless_reply_registry = Some(registry);
+        self
+    }
+
+    /// Get a reference to the VLESS reply registry (if available)
+    pub fn vless_reply_registry(
+        &self,
+    ) -> Option<&Arc<crate::vless_wg_bridge::VlessReplyRegistry>> {
+        self.vless_reply_registry.as_ref()
     }
 
     /// Create a new IPC handler with a default (empty) rule engine
@@ -931,8 +958,14 @@ impl IpcHandler {
             IpcCommand::GetVlessOutbound { tag } => {
                 self.handle_get_vless_outbound(&tag)
             }
-            IpcCommand::ConfigureVlessInbound { listen, users, tls_cert_path, tls_key_path, fallback } => {
-                self.handle_configure_vless_inbound(listen, users, tls_cert_path, tls_key_path, fallback).await
+            IpcCommand::ConfigureVlessInbound {
+                listen, users, tls_cert_path, tls_key_path, fallback, udp_enabled,
+                reality_private_key, reality_short_ids, reality_dest, reality_server_names, reality_max_time_diff_ms
+            } => {
+                self.handle_configure_vless_inbound(
+                    listen, users, tls_cert_path, tls_key_path, fallback, udp_enabled,
+                    reality_private_key, reality_short_ids, reality_dest, reality_server_names, reality_max_time_diff_ms
+                ).await
             }
             IpcCommand::AddVlessUser { uuid, email, flow } => {
                 self.handle_add_vless_user(uuid, email, flow)
@@ -948,6 +981,50 @@ impl IpcHandler {
             }
             IpcCommand::StopVlessInbound => {
                 self.handle_stop_vless_inbound()
+            }
+
+            // Shadowsocks commands
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::AddShadowsocksOutbound {
+                tag,
+                server,
+                server_port,
+                method,
+                password,
+                udp,
+            } => {
+                self.handle_add_shadowsocks_outbound(tag, server, server_port, method, password, udp)
+            }
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::RemoveShadowsocksOutbound { tag } => {
+                self.handle_remove_shadowsocks_outbound(&tag)
+            }
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::ListShadowsocksOutbounds => {
+                self.handle_list_shadowsocks_outbounds()
+            }
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::GetShadowsocksOutbound { tag } => {
+                self.handle_get_shadowsocks_outbound(&tag)
+            }
+
+            // Shadowsocks inbound commands
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::ConfigureShadowsocksInbound {
+                listen,
+                method,
+                password,
+                udp_enabled,
+            } => {
+                self.handle_configure_shadowsocks_inbound(&listen, &method, &password, udp_enabled)
+            }
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::GetShadowsocksInboundStatus => {
+                self.handle_get_shadowsocks_inbound_status()
+            }
+            #[cfg(feature = "shadowsocks")]
+            IpcCommand::StopShadowsocksInbound => {
+                self.handle_stop_shadowsocks_inbound()
             }
         }
     }
@@ -5989,6 +6066,8 @@ impl IpcHandler {
     /// Handle ConfigureVlessInbound command
     ///
     /// Creates and starts a VLESS inbound listener.
+    /// Supports plain TCP, TLS, and REALITY transport modes.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_configure_vless_inbound(
         &self,
         listen: String,
@@ -5996,8 +6075,15 @@ impl IpcHandler {
         tls_cert_path: Option<String>,
         tls_key_path: Option<String>,
         fallback: Option<String>,
+        udp_enabled: bool,
+        reality_private_key: Option<String>,
+        reality_short_ids: Option<Vec<String>>,
+        reality_dest: Option<String>,
+        reality_server_names: Option<Vec<String>>,
+        reality_max_time_diff_ms: Option<u64>,
     ) -> IpcResponse {
         use std::net::SocketAddr;
+        use crate::vless_inbound::InboundRealityConfig;
 
         // Check if already running
         {
@@ -6049,28 +6135,66 @@ impl IpcHandler {
 
         // Build configuration
         let mut config = VlessInboundConfig::new(listen_addr)
-            .with_users(inbound_users.clone());
+            .with_users(inbound_users.clone())
+            .with_udp_enabled(udp_enabled);
 
-        // Add TLS if configured
-        if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
-            use crate::vless_inbound::InboundTlsConfig;
-            config = config.with_tls(
-                InboundTlsConfig::new(&cert_path, &key_path)
-                    .with_alpn(vec!["h2", "http/1.1"]),
-            );
+        // Add REALITY if configured
+        let reality_enabled = reality_private_key.is_some();
+        if let Some(private_key) = reality_private_key {
+            let short_ids = reality_short_ids.unwrap_or_default();
+            let dest = reality_dest.unwrap_or_else(|| "www.google.com:443".to_string());
+            let server_names = reality_server_names.unwrap_or_default();
+
+            if short_ids.is_empty() {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    "REALITY requires at least one short_id",
+                );
+            }
+
+            if server_names.is_empty() {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    "REALITY requires at least one server_name",
+                );
+            }
+
+            let mut reality_config = InboundRealityConfig::new(private_key, dest);
+            for short_id in short_ids {
+                reality_config = reality_config.with_short_id(short_id);
+            }
+            for server_name in server_names {
+                reality_config = reality_config.with_server_name(server_name);
+            }
+            if let Some(max_time_diff) = reality_max_time_diff_ms {
+                reality_config = reality_config.with_max_time_diff_ms(max_time_diff);
+            }
+
+            config = config.with_reality(reality_config);
+        } else {
+            // Add TLS if configured (only when REALITY is not enabled)
+            if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
+                use crate::vless_inbound::InboundTlsConfig;
+                config = config.with_tls(
+                    InboundTlsConfig::new(&cert_path, &key_path)
+                        .with_alpn(vec!["h2", "http/1.1"]),
+                );
+            }
         }
 
-        // Add fallback if configured
-        if let Some(fallback_addr) = fallback {
-            match fallback_addr.parse::<SocketAddr>() {
-                Ok(addr) => {
-                    config = config.with_fallback(addr);
-                }
-                Err(e) => {
-                    return IpcResponse::error(
-                        ErrorCode::InvalidParameters,
-                        format!("Invalid fallback address '{}': {}", fallback_addr, e),
-                    );
+        // Add fallback if configured (only when REALITY is not enabled)
+        if !reality_enabled {
+            if let Some(fallback_addr) = fallback {
+                match fallback_addr.parse::<SocketAddr>() {
+                    Ok(addr) => {
+                        config = config.with_fallback(addr);
+                    }
+                    Err(e) => {
+                        return IpcResponse::error(
+                            ErrorCode::InvalidParameters,
+                            format!("Invalid fallback address '{}': {}", fallback_addr, e),
+                        );
+                    }
                 }
             }
         }
@@ -6112,6 +6236,8 @@ impl IpcHandler {
         let outbound_manager = Arc::clone(&self.outbound_manager);
         let rule_engine = Arc::clone(&self.rule_engine);
         let ecmp_group_manager = self.ecmp_group_manager.clone();
+        let wg_egress_manager = self.wg_egress_manager.clone();
+        let vless_reply_registry = self.vless_reply_registry.clone();
         let total_connections = Arc::new(AtomicU64::new(0));
         let active_connections = Arc::new(AtomicU64::new(0));
 
@@ -6150,9 +6276,21 @@ impl IpcHandler {
                 // Get connection details
                 let client_addr = conn.client_addr();
                 let destination = conn.destination().clone();
+                let is_udp_conn = conn.is_udp();
+
+                // Check if UDP is enabled when handling UDP connections
+                if is_udp_conn && !listener.is_udp_enabled() {
+                    warn!(
+                        "Rejecting UDP connection from {} - UDP disabled in config",
+                        client_addr
+                    );
+                    active_conn_stat.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
 
                 info!(
-                    "VLESS connection from {} to {}",
+                    "VLESS {} connection from {} to {}",
+                    if is_udp_conn { "UDP" } else { "TCP" },
                     client_addr,
                     destination
                 );
@@ -6161,6 +6299,8 @@ impl IpcHandler {
                 let outbound_manager = Arc::clone(&outbound_manager);
                 let rule_engine = Arc::clone(&rule_engine);
                 let ecmp_mgr = ecmp_group_manager.clone();
+                let wg_mgr = wg_egress_manager.clone();
+                let reply_registry = vless_reply_registry.clone();
                 let active_conn = Arc::clone(&active_conn_stat);
 
                 // Spawn a task to handle this connection
@@ -6185,7 +6325,7 @@ impl IpcHandler {
                         dest_ip,
                         dest_port,
                         source_ip: Some(client_addr.ip()),
-                        protocol: "tcp",
+                        protocol: if is_udp_conn { "udp" } else { "tcp" },
                         sniffed_protocol: None,  // VLESS doesn't do protocol sniffing
                     };
 
@@ -6226,16 +6366,12 @@ impl IpcHandler {
                         return;
                     };
 
-                    // Get the outbound (handling both direct outbounds and ECMP groups)
-                    let (outbound, actual_outbound_tag) = {
-                        // Try direct lookup first
-                        if let Some(o) = outbound_manager.get(&outbound_tag) {
-                            (o, outbound_tag.clone())
-                        } else if let Some(ref ecmp_manager) = ecmp_mgr {
-                            // Check if it's an ECMP group
+                    // Resolve the actual outbound tag (may be via ECMP group)
+                    let actual_outbound_tag: String = {
+                        // Check if it's an ECMP group first
+                        if let Some(ref ecmp_manager) = ecmp_mgr {
                             if ecmp_manager.has_group(&outbound_tag) {
                                 if let Some(group) = ecmp_manager.get_group(&outbound_tag) {
-                                    // Use default five-tuple hash for connection affinity
                                     use crate::ecmp::{FiveTuple, Protocol as EcmpProtocol};
                                     let five_tuple = FiveTuple::new(
                                         client_addr.ip(),
@@ -6250,56 +6386,134 @@ impl IpcHandler {
                                                 "ECMP group '{}' selected member '{}' for VLESS {} -> {}",
                                                 outbound_tag, member_tag, client_addr, destination
                                             );
-                                            if let Some(o) = outbound_manager.get(&member_tag) {
-                                                (o, member_tag)
-                                            } else {
-                                                warn!(
-                                                    "ECMP member '{}' not found, using direct",
-                                                    member_tag
-                                                );
-                                                match outbound_manager.get("direct") {
-                                                    Some(o) => (o, "direct".to_string()),
-                                                    None => {
-                                                        error!("No 'direct' outbound available");
-                                                        active_conn.fetch_sub(1, Ordering::Relaxed);
-                                                        return;
-                                                    }
-                                                }
-                                            }
+                                            member_tag
                                         }
                                         Err(e) => {
                                             warn!("ECMP group '{}' selection failed: {}, using direct", outbound_tag, e);
-                                            match outbound_manager.get("direct") {
-                                                Some(o) => (o, "direct".to_string()),
-                                                None => {
-                                                    error!("No 'direct' outbound available");
-                                                    active_conn.fetch_sub(1, Ordering::Relaxed);
-                                                    return;
-                                                }
-                                            }
+                                            "direct".to_string()
                                         }
                                     }
                                 } else {
-                                    warn!(
-                                        "Outbound '{}' not found for VLESS connection {} -> {}, using direct",
-                                        outbound_tag, client_addr, destination
-                                    );
-                                    match outbound_manager.get("direct") {
-                                        Some(o) => (o, "direct".to_string()),
-                                        None => {
-                                            error!("No 'direct' outbound available");
-                                            active_conn.fetch_sub(1, Ordering::Relaxed);
-                                            return;
-                                        }
-                                    }
+                                    outbound_tag.clone()
                                 }
                             } else {
+                                outbound_tag.clone()
+                            }
+                        } else {
+                            outbound_tag.clone()
+                        }
+                    };
+
+                    // Check if the outbound is a WireGuard tunnel (userspace mode)
+                    // This must be checked BEFORE trying outbound_manager.get() because
+                    // WireGuard tunnels in userspace mode are not registered as TCP outbounds
+                    let is_wg_tunnel = wg_mgr
+                        .as_ref()
+                        .map(|mgr| mgr.has_tunnel(&actual_outbound_tag))
+                        .unwrap_or(false);
+
+                    if is_wg_tunnel {
+                        // Route through WireGuard tunnel using VlessWgBridge
+                        let wg_manager = wg_mgr.as_ref().unwrap();
+
+                        // Get tunnel status to retrieve local IP
+                        let tunnel_status = match wg_manager.get_tunnel_status(&actual_outbound_tag) {
+                            Some(status) => status,
+                            None => {
                                 warn!(
-                                    "Outbound '{}' not found for VLESS connection {} -> {}, using direct",
-                                    outbound_tag, client_addr, destination
+                                    "WireGuard tunnel '{}' not found for VLESS connection {} -> {}",
+                                    actual_outbound_tag, client_addr, destination
+                                );
+                                active_conn.fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        };
+
+                        // Parse local IP from tunnel status
+                        let local_ip: std::net::IpAddr = match tunnel_status.local_ip {
+                            Some(ref ip_str) => match ip_str.parse() {
+                                Ok(ip) => ip,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to parse local IP '{}' for WireGuard tunnel '{}': {}",
+                                        ip_str, actual_outbound_tag, e
+                                    );
+                                    active_conn.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            },
+                            None => {
+                                warn!(
+                                    "WireGuard tunnel '{}' has no local IP configured",
+                                    actual_outbound_tag
+                                );
+                                active_conn.fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        };
+
+                        // Create bridge for this WireGuard tunnel
+                        // Pass the reply registry so WgReplyHandler can route replies back
+                        let bridge = crate::vless_wg_bridge::VlessWgBridge::with_registry(
+                            Arc::clone(wg_manager),
+                            actual_outbound_tag.clone(),
+                            local_ip,
+                            reply_registry,
+                        );
+
+                        info!(
+                            "VLESS routing {} {} -> {} via WireGuard tunnel '{}' (local_ip={})",
+                            if is_udp_conn { "UDP" } else { "TCP" },
+                            client_addr, destination, actual_outbound_tag, local_ip
+                        );
+
+                        // Handle the connection through the bridge (TCP or UDP)
+                        let client_stream = conn.into_stream();
+                        if is_udp_conn {
+                            // Handle UDP connection (VLESS UDP frames over TCP)
+                            // Pass destination from VLESS header - UDP frames are [Length][Payload] only
+                            match bridge.handle_udp_connection(client_addr, client_stream, dest_addr.ip(), dest_port).await {
+                                Ok(()) => {
+                                    info!(
+                                        "VLESS-WG UDP bridge connection closed: {} via {}",
+                                        client_addr, actual_outbound_tag
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "VLESS-WG UDP bridge error: {} via {}: {}",
+                                        client_addr, actual_outbound_tag, e
+                                    );
+                                }
+                            }
+                        } else {
+                            // Handle TCP connection
+                            match bridge.handle_tcp_connection(client_addr, client_stream, dest_addr.ip(), dest_port).await {
+                                Ok(()) => {
+                                    info!(
+                                        "VLESS-WG TCP bridge connection closed: {} -> {} via {}",
+                                        client_addr, destination, actual_outbound_tag
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "VLESS-WG TCP bridge error: {} -> {} via {}: {}",
+                                        client_addr, destination, actual_outbound_tag, e
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        // Route through regular TCP outbound
+                        let outbound = match outbound_manager.get(&actual_outbound_tag) {
+                            Some(o) => o,
+                            None => {
+                                warn!(
+                                    "Outbound '{}' not found, using direct",
+                                    actual_outbound_tag
                                 );
                                 match outbound_manager.get("direct") {
-                                    Some(o) => (o, "direct".to_string()),
+                                    Some(o) => o,
                                     None => {
                                         error!("No 'direct' outbound available");
                                         active_conn.fetch_sub(1, Ordering::Relaxed);
@@ -6307,60 +6521,46 @@ impl IpcHandler {
                                     }
                                 }
                             }
-                        } else {
-                            warn!(
-                                "Outbound '{}' not found for VLESS connection {} -> {}, using direct",
-                                outbound_tag, client_addr, destination
-                            );
-                            match outbound_manager.get("direct") {
-                                Some(o) => (o, "direct".to_string()),
-                                None => {
-                                    error!("No 'direct' outbound available");
-                                    active_conn.fetch_sub(1, Ordering::Relaxed);
-                                    return;
-                                }
+                        };
+
+                        let upstream = match outbound.connect(dest_addr, Duration::from_secs(30)).await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to connect to {} via {}: {}",
+                                    destination, actual_outbound_tag, e
+                                );
+                                active_conn.fetch_sub(1, Ordering::Relaxed);
+                                return;
                             }
-                        }
-                    };
+                        };
 
-                    // Connect to upstream via outbound
-                    let upstream = match outbound.connect(dest_addr, Duration::from_secs(30)).await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            warn!(
-                                "Failed to connect to {} via {}: {}",
-                                destination, actual_outbound_tag, e
-                            );
-                            active_conn.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
-                    };
+                        info!(
+                            "VLESS proxying {} -> {} via TCP outbound '{}'",
+                            client_addr, destination, actual_outbound_tag
+                        );
 
-                    info!(
-                        "VLESS proxying {} -> {} via {}",
-                        client_addr, destination, actual_outbound_tag
-                    );
+                        // Get mutable streams for bidirectional copy
+                        let mut client_stream = conn.into_stream();
+                        let mut upstream_stream = upstream.into_stream();
 
-                    // Get mutable streams for bidirectional copy
-                    let mut client_stream = conn.into_stream();
-                    let mut upstream_stream = upstream.into_stream();
-
-                    // Relay traffic bidirectionally
-                    match bidirectional_copy(&mut client_stream, &mut upstream_stream).await {
-                        Ok(result) => {
-                            info!(
-                                "VLESS connection closed: {} -> {}, {} up / {} down bytes",
-                                client_addr,
-                                destination,
-                                result.client_to_upstream,
-                                result.upstream_to_client
-                            );
-                        }
-                        Err(e) => {
-                            debug!(
-                                "VLESS connection error: {} -> {}: {}",
-                                client_addr, destination, e
-                            );
+                        // Relay traffic bidirectionally
+                        match bidirectional_copy(&mut client_stream, &mut upstream_stream).await {
+                            Ok(result) => {
+                                info!(
+                                    "VLESS connection closed: {} -> {}, {} up / {} down bytes",
+                                    client_addr,
+                                    destination,
+                                    result.client_to_upstream,
+                                    result.upstream_to_client
+                                );
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "VLESS connection error: {} -> {}: {}",
+                                    client_addr, destination, e
+                                );
+                            }
                         }
                     }
 
@@ -6509,14 +6709,31 @@ impl IpcHandler {
     fn handle_get_vless_inbound_status(&self) -> IpcResponse {
         let inbound_guard = self.vless_inbound.read();
 
+        // Get bridge stats from reply registry if available
+        let bridge_stats = self.vless_reply_registry.as_ref().map(|registry| {
+            let stats = registry.stats();
+            VlessWgBridgeStats {
+                active_sessions: stats.active_sessions,
+                sessions_registered: stats.registered,
+                sessions_unregistered: stats.unregistered,
+                packets_routed: stats.packets_routed,
+                packets_dropped: stats.packets_dropped,
+                channel_full: stats.channel_full,
+            }
+        });
+
         let status = if let Some(ref listener) = *inbound_guard {
             VlessInboundStatusResponse {
                 running: listener.is_active(),
                 listen_address: listener.local_addr().ok().map(|a| a.to_string()),
                 user_count: listener.user_count(),
                 tls_enabled: listener.has_tls(),
+                reality_enabled: listener.has_reality(),
+                udp_enabled: listener.is_udp_enabled(),
                 total_connections: self.vless_total_connections.load(Ordering::Relaxed),
                 active_connections: self.vless_active_connections.load(Ordering::Relaxed),
+                reality_stats: None, // TODO: implement REALITY stats collection
+                bridge_stats,
             }
         } else {
             VlessInboundStatusResponse {
@@ -6524,8 +6741,12 @@ impl IpcHandler {
                 listen_address: None,
                 user_count: 0,
                 tls_enabled: false,
+                reality_enabled: false,
+                udp_enabled: true, // Default when not running
                 total_connections: 0,
                 active_connections: 0,
+                reality_stats: None,
+                bridge_stats,
             }
         };
 
@@ -6558,6 +6779,296 @@ impl IpcHandler {
                 "VLESS inbound is not running",
             )
         }
+    }
+
+    // ========================================================================
+    // Shadowsocks Handlers
+    // ========================================================================
+
+    /// Handle AddShadowsocksOutbound command
+    #[cfg(feature = "shadowsocks")]
+    fn handle_add_shadowsocks_outbound(
+        &self,
+        tag: String,
+        server: String,
+        server_port: u16,
+        method: String,
+        password: String,
+        udp: bool,
+    ) -> IpcResponse {
+        use crate::outbound::ShadowsocksOutbound;
+        use crate::shadowsocks::{ShadowsocksMethod, ShadowsocksOutboundConfig};
+
+        // Check if outbound already exists
+        if self.outbound_manager.contains(&tag) {
+            return IpcResponse::error(
+                ErrorCode::AlreadyExists,
+                format!("Outbound '{tag}' already exists"),
+            );
+        }
+
+        // Parse the method
+        let ss_method = match ShadowsocksMethod::parse_method(&method) {
+            Ok(m) => m,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid Shadowsocks method: {e}"),
+                );
+            }
+        };
+
+        // Build config
+        let config = ShadowsocksOutboundConfig::new(&server, server_port, &password)
+            .with_method(ss_method)
+            .with_udp(udp);
+
+        // Create the outbound
+        let outbound = match ShadowsocksOutbound::new(&tag, config) {
+            Ok(o) => o,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to create Shadowsocks outbound: {e}"),
+                );
+            }
+        };
+
+        // Add to outbound manager
+        self.outbound_manager.add(Box::new(outbound));
+
+        info!(
+            "Added Shadowsocks outbound '{}' -> {}:{} (method: {})",
+            tag, server, server_port, method
+        );
+        IpcResponse::ShadowsocksOutboundAdded { tag }
+    }
+
+    /// Handle RemoveShadowsocksOutbound command
+    #[cfg(feature = "shadowsocks")]
+    fn handle_remove_shadowsocks_outbound(&self, tag: &str) -> IpcResponse {
+        // Check if the outbound exists
+        let outbound = match self.outbound_manager.get(tag) {
+            Some(o) => o,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Outbound '{tag}' not found"),
+                );
+            }
+        };
+
+        // Verify it's a Shadowsocks outbound
+        if outbound.outbound_type() != "shadowsocks" {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!(
+                    "Outbound '{tag}' is not a Shadowsocks outbound (type: {})",
+                    outbound.outbound_type()
+                ),
+            );
+        }
+
+        // Remove the outbound
+        if self.outbound_manager.remove(tag).is_some() {
+            info!("Removed Shadowsocks outbound '{}'", tag);
+            IpcResponse::success_with_message(format!("Shadowsocks outbound '{tag}' removed"))
+        } else {
+            IpcResponse::error(
+                ErrorCode::OperationFailed,
+                format!("Failed to remove Shadowsocks outbound '{tag}'"),
+            )
+        }
+    }
+
+    /// Handle ListShadowsocksOutbounds command
+    #[cfg(feature = "shadowsocks")]
+    fn handle_list_shadowsocks_outbounds(&self) -> IpcResponse {
+        use crate::ipc::protocol::ShadowsocksOutboundInfoResponse;
+
+        let mut outbounds = Vec::new();
+
+        for outbound in self.outbound_manager.all() {
+            if outbound.outbound_type() == "shadowsocks" {
+                // Get server info
+                let server_info = outbound.proxy_server_info();
+                let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+
+                // Parse address into host and port
+                let (server, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
+                    let host = address_str[..colon_pos].to_string();
+                    let port = address_str[colon_pos + 1..].parse().unwrap_or(0);
+                    (host, port)
+                } else {
+                    (address_str, 0u16)
+                };
+
+                outbounds.push(ShadowsocksOutboundInfoResponse {
+                    tag: outbound.tag().to_string(),
+                    server,
+                    server_port,
+                    method: "***".to_string(), // Hidden in list view
+                    udp: outbound.supports_udp(),
+                    enabled: outbound.is_enabled(),
+                    health_status: format!("{:?}", outbound.health_status()),
+                    active_connections: outbound.active_connections(),
+                });
+            }
+        }
+
+        IpcResponse::ShadowsocksOutboundList { outbounds }
+    }
+
+    /// Handle GetShadowsocksOutbound command
+    #[cfg(feature = "shadowsocks")]
+    fn handle_get_shadowsocks_outbound(&self, tag: &str) -> IpcResponse {
+        use crate::ipc::protocol::ShadowsocksOutboundInfoResponse;
+
+        let outbound = match self.outbound_manager.get(tag) {
+            Some(o) => o,
+            None => {
+                return IpcResponse::error(
+                    ErrorCode::NotFound,
+                    format!("Outbound '{tag}' not found"),
+                );
+            }
+        };
+
+        if outbound.outbound_type() != "shadowsocks" {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                format!(
+                    "Outbound '{tag}' is not a Shadowsocks outbound (type: {})",
+                    outbound.outbound_type()
+                ),
+            );
+        }
+
+        // Get server info
+        let server_info = outbound.proxy_server_info();
+        let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+
+        // Parse address into host and port
+        let (server, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
+            let host = address_str[..colon_pos].to_string();
+            let port = address_str[colon_pos + 1..].parse().unwrap_or(0);
+            (host, port)
+        } else {
+            (address_str, 0u16)
+        };
+
+        IpcResponse::ShadowsocksOutboundInfo(ShadowsocksOutboundInfoResponse {
+            tag: outbound.tag().to_string(),
+            server,
+            server_port,
+            method: "***".to_string(), // Hidden for security
+            udp: outbound.supports_udp(),
+            enabled: outbound.is_enabled(),
+            health_status: format!("{:?}", outbound.health_status()),
+            active_connections: outbound.active_connections(),
+        })
+    }
+
+    /// Handle ConfigureShadowsocksInbound command
+    ///
+    /// Note: This is a placeholder implementation. The actual listener management
+    /// will be done in main.rs similar to VlessInboundListener.
+    #[cfg(feature = "shadowsocks")]
+    fn handle_configure_shadowsocks_inbound(
+        &self,
+        listen: &str,
+        method: &str,
+        password: &str,
+        udp_enabled: bool,
+    ) -> IpcResponse {
+        use crate::ipc::protocol::ShadowsocksInboundStatusResponse;
+        use crate::shadowsocks::ShadowsocksMethod;
+
+        // Parse listen address
+        let listen_addr: std::net::SocketAddr = match listen.parse() {
+            Ok(addr) => addr,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid listen address '{}': {}", listen, e),
+                );
+            }
+        };
+
+        // Parse method
+        let ss_method = match method.parse::<ShadowsocksMethod>() {
+            Ok(m) => m,
+            Err(e) => {
+                return IpcResponse::error(
+                    ErrorCode::InvalidParameters,
+                    format!("Invalid Shadowsocks method '{}': {}", method, e),
+                );
+            }
+        };
+
+        // Validate password
+        if password.is_empty() {
+            return IpcResponse::error(
+                ErrorCode::InvalidParameters,
+                "Password cannot be empty",
+            );
+        }
+
+        // Log the configuration (actual listener will be started by main.rs)
+        info!(
+            listen = %listen_addr,
+            method = %ss_method,
+            udp = udp_enabled,
+            "Shadowsocks inbound configuration received"
+        );
+
+        // Return success with initial status
+        // Note: The actual listener lifecycle is managed externally
+        IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
+            active: false, // Will be updated once listener starts
+            listen: listen_addr.to_string(),
+            method: ss_method.to_string(),
+            udp_enabled,
+            connections_accepted: 0,
+            active_connections: 0,
+            protocol_errors: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
+        })
+    }
+
+    /// Handle GetShadowsocksInboundStatus command
+    ///
+    /// Note: This is a placeholder implementation. The actual status
+    /// will be retrieved from the listener managed by main.rs.
+    #[cfg(feature = "shadowsocks")]
+    fn handle_get_shadowsocks_inbound_status(&self) -> IpcResponse {
+        use crate::ipc::protocol::ShadowsocksInboundStatusResponse;
+
+        // Return status indicating no listener is running
+        // In production, this would query the actual listener state
+        IpcResponse::ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse {
+            active: false,
+            listen: "0.0.0.0:8388".to_string(),
+            method: "2022-blake3-aes-256-gcm".to_string(),
+            udp_enabled: false,
+            connections_accepted: 0,
+            active_connections: 0,
+            protocol_errors: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
+        })
+    }
+
+    /// Handle StopShadowsocksInbound command
+    ///
+    /// Note: This is a placeholder implementation. The actual shutdown
+    /// will be handled by main.rs.
+    #[cfg(feature = "shadowsocks")]
+    fn handle_stop_shadowsocks_inbound(&self) -> IpcResponse {
+        info!("Shadowsocks inbound stop requested");
+        // In production, this would signal the listener to shut down
+        IpcResponse::success_with_message("Shadowsocks inbound stop signal sent")
     }
 }
 

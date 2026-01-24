@@ -14,6 +14,7 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use crate::reality::common::{
     REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE, REALITY_DEFAULT_MAX_TIME_DIFF_MS,
@@ -132,8 +133,24 @@ impl SessionId {
     }
 
     /// Validate that short_id matches one of the allowed values
+    ///
+    /// This uses constant-time comparison to prevent timing side-channel attacks.
+    /// An attacker cannot determine which bytes of the short_id are correct
+    /// by measuring response times.
     pub fn validate_short_id(&self, allowed: &[[u8; REALITY_SHORT_ID_SIZE]]) -> RealityResult<()> {
-        if allowed.contains(&self.short_id) {
+        // Use constant-time comparison to prevent timing attacks.
+        // We check all allowed IDs regardless of whether we find a match,
+        // ensuring the same execution time for valid and invalid short_ids.
+        let mut found = subtle::Choice::from(0u8);
+
+        for allowed_id in allowed {
+            // Constant-time equality check
+            let eq = self.short_id.ct_eq(allowed_id);
+            // Accumulate matches using constant-time OR
+            found = found | eq;
+        }
+
+        if bool::from(found) {
             Ok(())
         } else {
             Err(RealityError::AuthenticationFailed)

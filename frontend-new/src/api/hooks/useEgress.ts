@@ -1,11 +1,12 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../client";
-import type { 
+import type {
   DirectEgressUpdateRequest,
   WarpEgressUpdateRequest,
   WarpEgressEndpointRequest,
   WarpEgressLicenseRequest,
-  WarpEndpointTestRequest
+  WarpEndpointTestRequest,
+  ShadowsocksOutboundUpdateRequest
 } from "../../types";
 
 // Keys
@@ -17,6 +18,7 @@ export const egressKeys = {
   openvpn: ["egress", "openvpn"] as const,
   v2ray: ["egress", "v2ray"] as const,
   pia: ["egress", "pia"] as const,
+  shadowsocks: ["egress", "shadowsocks"] as const,
 };
 
 // All Egress
@@ -303,5 +305,53 @@ export function useDeleteV2RayEgress() {
 export function useParseV2RayURI() {
   return useMutation({
     mutationFn: api.parseV2RayURI,
+  });
+}
+
+// Shadowsocks Egress
+export function useShadowsocksEgress() {
+  return useQuery({
+    queryKey: egressKeys.shadowsocks,
+    queryFn: api.getShadowsocksEgress,
+  });
+}
+
+export function useCreateShadowsocksEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.createShadowsocksEgress,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.shadowsocks });
+    },
+  });
+}
+
+export function useUpdateShadowsocksEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ tag, data }: { tag: string; data: ShadowsocksOutboundUpdateRequest }) =>
+      api.updateShadowsocksEgress(tag, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.shadowsocks });
+    },
+  });
+}
+
+export function useDeleteShadowsocksEgress() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteShadowsocksEgress,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: egressKeys.all });
+      queryClient.invalidateQueries({ queryKey: egressKeys.shadowsocks });
+    },
+  });
+}
+
+export function useParseShadowsocksURI() {
+  return useMutation({
+    mutationFn: api.parseShadowsocksURI,
   });
 }

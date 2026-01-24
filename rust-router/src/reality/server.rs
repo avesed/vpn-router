@@ -1,0 +1,1039 @@
+//! REALITY Server Implementation
+//!
+//! This module implements the server-side REALITY protocol, which provides
+//! TLS 1.3 camouflage for incoming VLESS connections.
+//!
+//! # How Server-Side REALITY Works
+//!
+//! 1. **Accept TLS Connection**: Server receives a TLS 1.3 ClientHello
+//!
+//! 2. **Extract Client Info**: Parse ClientHello for:
+//!    - session_id (contains encrypted REALITY metadata)
+//!    - client_random (contains salt and nonce for decryption)
+//!    - client's X25519 public key (from key_share extension)
+//!    - SNI server name
+//!
+//! 3. **Validate REALITY Auth**: Decrypt and validate session_id:
+//!    - Derive shared secret using server private key + client public key
+//!    - Derive auth key using HKDF
+//!    - Decrypt session_id using AES-256-GCM
+//!    - Validate short_id is in allowed list
+//!    - Validate timestamp is within acceptable range
+//!
+//! 4. **Handle Result**:
+//!    - If valid: Complete TLS handshake and proceed with VLESS
+//!    - If invalid: Transparently proxy to fallback destination
+//!
+//! # Example
+//!
+//! ```no_run
+//! use rust_router::reality::server::{RealityServer, RealityServerConfig, RealityAcceptResult};
+//! use tokio::net::TcpListener;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = RealityServerConfig {
+//!     private_key: [0x42u8; 32],
+//!     short_ids: vec![vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]],
+//!     dest: "www.google.com:443".to_string(),
+//!     server_names: vec!["www.google.com".to_string()],
+//!     max_time_diff_ms: 120_000,
+//! };
+//!
+//! let server = RealityServer::new(config);
+//! let listener = TcpListener::bind("0.0.0.0:443").await?;
+//!
+//! loop {
+//!     let (stream, _) = listener.accept().await?;
+//!     let server = server.clone();
+//!
+//!     tokio::spawn(async move {
+//!         match server.accept(stream).await {
+//!             Ok(RealityAcceptResult::Authenticated { stream, short_id }) => {
+//!                 // Valid REALITY client - proceed with VLESS
+//!                 println!("Authenticated with short_id: {:?}", short_id);
+//!             }
+//!             Ok(RealityAcceptResult::Fallback) => {
+//!                 // Invalid auth - already proxied to fallback
+//!                 println!("Proxied to fallback");
+//!             }
+//!             Err(e) => {
+//!                 eprintln!("Accept error: {}", e);
+//!             }
+//!         }
+//!     });
+//! }
+//! # }
+//! ```
+
+use std::sync::Arc;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tracing::{debug, trace, warn};
+
+use crate::reality::auth::{decode_short_id, validate_auth};
+use crate::reality::common::{
+    CONTENT_TYPE_HANDSHAKE, REALITY_DEFAULT_MAX_TIME_DIFF_MS, REALITY_SESSION_ID_SIZE,
+    REALITY_SHORT_ID_SIZE, TLS_RECORD_HEADER_SIZE,
+};
+use crate::reality::error::{RealityError, RealityResult};
+use crate::reality::tls::{extract_client_public_key, extract_client_random, extract_session_id};
+
+/// Maximum size of ClientHello we'll accept (reasonable limit)
+const MAX_CLIENT_HELLO_SIZE: usize = 16384;
+
+/// REALITY server configuration
+#[derive(Debug, Clone)]
+pub struct RealityServerConfig {
+    /// Server private key (X25519, 32 bytes)
+    pub private_key: [u8; 32],
+    /// Allowed short IDs (each up to 8 bytes)
+    pub short_ids: Vec<Vec<u8>>,
+    /// Fallback destination (e.g., "www.google.com:443")
+    pub dest: String,
+    /// Allowed SNI server names
+    pub server_names: Vec<String>,
+    /// Maximum timestamp difference in milliseconds (default: 120000 = 2 minutes)
+    pub max_time_diff_ms: u64,
+}
+
+impl RealityServerConfig {
+    /// Create a new REALITY server configuration
+    ///
+    /// # Arguments
+    /// * `private_key` - Server's X25519 private key (32 bytes)
+    /// * `dest` - Fallback destination address
+    pub fn new(private_key: [u8; 32], dest: impl Into<String>) -> Self {
+        Self {
+            private_key,
+            short_ids: Vec::new(),
+            dest: dest.into(),
+            server_names: Vec::new(),
+            max_time_diff_ms: REALITY_DEFAULT_MAX_TIME_DIFF_MS * 2, // 2 minutes
+        }
+    }
+
+    /// Add an allowed short ID
+    #[must_use]
+    pub fn with_short_id(mut self, short_id: impl Into<Vec<u8>>) -> Self {
+        self.short_ids.push(short_id.into());
+        self
+    }
+
+    /// Add an allowed short ID from hex string
+    ///
+    /// # Errors
+    /// Returns error if hex string is invalid
+    pub fn with_short_id_hex(mut self, hex_str: &str) -> RealityResult<Self> {
+        let short_id = decode_short_id(hex_str)?;
+        self.short_ids.push(short_id.to_vec());
+        Ok(self)
+    }
+
+    /// Add an allowed server name
+    #[must_use]
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_names.push(name.into());
+        self
+    }
+
+    /// Set maximum timestamp difference
+    #[must_use]
+    pub fn with_max_time_diff_ms(mut self, ms: u64) -> Self {
+        self.max_time_diff_ms = ms;
+        self
+    }
+
+    /// Validate the configuration
+    ///
+    /// # Errors
+    /// Returns error if configuration is invalid
+    pub fn validate(&self) -> RealityResult<()> {
+        if self.short_ids.is_empty() {
+            return Err(RealityError::config("No short IDs configured"));
+        }
+
+        for (i, short_id) in self.short_ids.iter().enumerate() {
+            if short_id.is_empty() || short_id.len() > REALITY_SHORT_ID_SIZE {
+                return Err(RealityError::config(format!(
+                    "Short ID {} has invalid length: {} (expected 1-8 bytes)",
+                    i,
+                    short_id.len()
+                )));
+            }
+        }
+
+        if self.dest.is_empty() {
+            return Err(RealityError::config("Fallback destination is empty"));
+        }
+
+        if self.server_names.is_empty() {
+            return Err(RealityError::config("No server names configured"));
+        }
+
+        if self.max_time_diff_ms == 0 {
+            return Err(RealityError::config("max_time_diff_ms cannot be zero"));
+        }
+
+        Ok(())
+    }
+
+    /// Get the server's public key derived from private key
+    #[must_use]
+    pub fn public_key(&self) -> [u8; 32] {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let secret = StaticSecret::from(self.private_key);
+        let public = PublicKey::from(&secret);
+        *public.as_bytes()
+    }
+
+    /// Normalize short IDs to 8-byte arrays for comparison
+    fn normalized_short_ids(&self) -> Vec<[u8; REALITY_SHORT_ID_SIZE]> {
+        self.short_ids
+            .iter()
+            .map(|id| {
+                let mut arr = [0u8; REALITY_SHORT_ID_SIZE];
+                let len = id.len().min(REALITY_SHORT_ID_SIZE);
+                arr[..len].copy_from_slice(&id[..len]);
+                arr
+            })
+            .collect()
+    }
+}
+
+impl Default for RealityServerConfig {
+    fn default() -> Self {
+        Self {
+            private_key: [0u8; 32],
+            short_ids: Vec::new(),
+            dest: "www.google.com:443".to_string(),
+            server_names: vec!["www.google.com".to_string()],
+            max_time_diff_ms: REALITY_DEFAULT_MAX_TIME_DIFF_MS * 2,
+        }
+    }
+}
+
+/// Connection result after REALITY validation
+#[derive(Debug)]
+pub enum RealityAcceptResult<S> {
+    /// Valid REALITY auth - proceed with VLESS
+    Authenticated {
+        /// The authenticated stream
+        stream: S,
+        /// The matched short ID
+        short_id: Vec<u8>,
+        /// Buffered data after ClientHello (if any)
+        buffered: Vec<u8>,
+    },
+    /// Invalid auth - connection proxied to fallback
+    Fallback,
+}
+
+/// REALITY server for accepting and validating connections
+///
+/// This server validates incoming connections against the REALITY protocol.
+/// Valid connections are returned for further processing, while invalid
+/// connections are transparently proxied to the fallback destination.
+#[derive(Clone)]
+pub struct RealityServer {
+    config: Arc<RealityServerConfig>,
+}
+
+impl RealityServer {
+    /// Create a new REALITY server
+    pub fn new(config: RealityServerConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
+
+    /// Get the server configuration
+    #[must_use]
+    pub fn config(&self) -> &RealityServerConfig {
+        &self.config
+    }
+
+    /// Accept and validate a REALITY connection
+    ///
+    /// This method reads the ClientHello, validates the REALITY authentication,
+    /// and either returns an authenticated connection or proxies to fallback.
+    ///
+    /// # Arguments
+    /// * `stream` - Incoming TCP stream
+    ///
+    /// # Returns
+    /// * `Authenticated` - Valid REALITY client, proceed with VLESS
+    /// * `Fallback` - Invalid auth, connection was proxied to fallback
+    ///
+    /// # Errors
+    /// Returns error on I/O failure or if fallback connection fails
+    pub async fn accept<S>(&self, mut stream: S) -> RealityResult<RealityAcceptResult<S>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Read ClientHello
+        let (client_hello, record_data) = self.read_client_hello(&mut stream).await?;
+
+        trace!(
+            client_hello_len = client_hello.len(),
+            "Received ClientHello"
+        );
+
+        // Parse ClientHello
+        let parsed = match self.parse_client_hello(&client_hello) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "Failed to parse ClientHello - proxying to fallback");
+                self.proxy_to_fallback(stream, &record_data).await?;
+                return Ok(RealityAcceptResult::Fallback);
+            }
+        };
+
+        // Validate SNI
+        if !self.validate_sni(&parsed.sni) {
+            debug!(sni = %parsed.sni, "Invalid SNI - proxying to fallback");
+            self.proxy_to_fallback(stream, &record_data).await?;
+            return Ok(RealityAcceptResult::Fallback);
+        }
+
+        // Validate REALITY authentication
+        let normalized_short_ids = self.config.normalized_short_ids();
+        let client_hello_aad = self.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+
+        match validate_auth(
+            &parsed.client_random,
+            &parsed.encrypted_session_id,
+            &self.config.private_key,
+            &parsed.client_public_key,
+            &normalized_short_ids,
+            self.config.max_time_diff_ms,
+            &client_hello_aad,
+        ) {
+            Ok(session_id) => {
+                debug!(short_id = ?session_id.short_id, "REALITY authentication successful");
+
+                Ok(RealityAcceptResult::Authenticated {
+                    stream,
+                    short_id: session_id.short_id.to_vec(),
+                    buffered: Vec::new(),
+                })
+            }
+            Err(e) => {
+                debug!(error = %e, "REALITY authentication failed - proxying to fallback");
+                self.proxy_to_fallback(stream, &record_data).await?;
+                Ok(RealityAcceptResult::Fallback)
+            }
+        }
+    }
+
+    /// Read and validate the ClientHello from the stream
+    async fn read_client_hello<S>(&self, stream: &mut S) -> RealityResult<(Vec<u8>, Vec<u8>)>
+    where
+        S: AsyncRead + Unpin,
+    {
+        // Read TLS record header (5 bytes)
+        let mut header = [0u8; TLS_RECORD_HEADER_SIZE];
+        stream.read_exact(&mut header).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read TLS record header: {}", e),
+            ))
+        })?;
+
+        // Validate content type
+        if header[0] != CONTENT_TYPE_HANDSHAKE {
+            return Err(RealityError::protocol(format!(
+                "Expected Handshake record (0x16), got 0x{:02x}",
+                header[0]
+            )));
+        }
+
+        // Extract record length
+        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+        if record_len > MAX_CLIENT_HELLO_SIZE {
+            return Err(RealityError::protocol(format!(
+                "ClientHello too large: {} bytes (max {})",
+                record_len, MAX_CLIENT_HELLO_SIZE
+            )));
+        }
+
+        // Read record payload
+        let mut payload = vec![0u8; record_len];
+        stream.read_exact(&mut payload).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to read ClientHello: {}", e),
+            ))
+        })?;
+
+        // Combine for fallback proxying
+        let mut record_data = header.to_vec();
+        record_data.extend_from_slice(&payload);
+
+        Ok((payload, record_data))
+    }
+
+    /// Parse relevant fields from ClientHello
+    fn parse_client_hello(&self, client_hello: &[u8]) -> RealityResult<ParsedClientHello> {
+        // Extract client random
+        let client_random = extract_client_random(client_hello)?;
+
+        // Extract session ID
+        let session_id_bytes = extract_session_id(client_hello)?;
+        if session_id_bytes.len() != REALITY_SESSION_ID_SIZE {
+            return Err(RealityError::protocol(format!(
+                "Invalid session ID length: {} (expected {})",
+                session_id_bytes.len(),
+                REALITY_SESSION_ID_SIZE
+            )));
+        }
+        let mut encrypted_session_id = [0u8; REALITY_SESSION_ID_SIZE];
+        encrypted_session_id.copy_from_slice(&session_id_bytes);
+
+        // Extract client public key
+        let client_public_key = extract_client_public_key(client_hello)?;
+
+        // Extract SNI
+        let sni = extract_client_sni(client_hello)?;
+
+        Ok(ParsedClientHello {
+            client_random,
+            encrypted_session_id,
+            client_public_key,
+            sni,
+        })
+    }
+
+    /// Validate SNI against allowed server names
+    fn validate_sni(&self, sni: &str) -> bool {
+        if self.config.server_names.is_empty() {
+            // If no server names configured, accept any SNI
+            return true;
+        }
+
+        self.config.server_names.iter().any(|allowed| {
+            allowed.eq_ignore_ascii_case(sni)
+        })
+    }
+
+    /// Build ClientHello AAD with zeroed session ID
+    fn build_client_hello_aad(
+        &self,
+        client_hello: &[u8],
+        _encrypted_session_id: &[u8; REALITY_SESSION_ID_SIZE],
+    ) -> Vec<u8> {
+        let mut aad = client_hello.to_vec();
+
+        // Find and zero the session ID in the AAD
+        // Session ID starts at offset 39 (after type, length, version, random, session_id_len)
+        if aad.len() >= 71 {
+            aad[39..71].fill(0);
+        }
+
+        aad
+    }
+
+    /// Proxy the connection to the fallback destination
+    async fn proxy_to_fallback<S>(
+        &self,
+        mut client_stream: S,
+        initial_data: &[u8],
+    ) -> RealityResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        debug!(dest = %self.config.dest, "Proxying to fallback");
+
+        // Connect to fallback destination
+        let mut fallback_stream = TcpStream::connect(&self.config.dest)
+            .await
+            .map_err(|e| {
+                RealityError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to connect to fallback {}: {}", self.config.dest, e),
+                ))
+            })?;
+
+        // Forward the initial ClientHello
+        fallback_stream.write_all(initial_data).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to forward ClientHello to fallback: {}", e),
+            ))
+        })?;
+
+        // Bidirectionally proxy all traffic
+        let result = tokio::io::copy_bidirectional(&mut client_stream, &mut fallback_stream).await;
+
+        match result {
+            Ok((client_to_fallback, fallback_to_client)) => {
+                trace!(
+                    client_to_fallback,
+                    fallback_to_client,
+                    "Fallback proxy completed"
+                );
+            }
+            Err(e) => {
+                // Connection closed is normal for proxied connections
+                if e.kind() != std::io::ErrorKind::ConnectionReset
+                    && e.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    warn!(error = %e, "Fallback proxy error");
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Parsed ClientHello fields for REALITY validation
+struct ParsedClientHello {
+    /// Client random (32 bytes)
+    client_random: [u8; 32],
+    /// Encrypted session ID (32 bytes)
+    encrypted_session_id: [u8; REALITY_SESSION_ID_SIZE],
+    /// Client's X25519 public key (32 bytes)
+    client_public_key: [u8; 32],
+    /// SNI server name
+    sni: String,
+}
+
+/// Extract SNI from ClientHello
+///
+/// Parses the server_name extension (type 0) to extract the SNI hostname.
+///
+/// # Arguments
+/// * `client_hello` - ClientHello handshake message (without record header)
+///
+/// # Returns
+/// SNI hostname string
+pub fn extract_client_sni(client_hello: &[u8]) -> RealityResult<String> {
+    // Find extensions
+    // Type (1) + Length (3) + Version (2) + Random (32) + SessionID length (1)
+    if client_hello.len() < 39 {
+        return Err(RealityError::protocol("ClientHello too short"));
+    }
+
+    let session_id_len = client_hello[38] as usize;
+    let mut offset = 39 + session_id_len;
+
+    // Cipher suites length (2)
+    if client_hello.len() < offset + 2 {
+        return Err(RealityError::protocol("ClientHello truncated at cipher suites"));
+    }
+    let cipher_suites_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    offset += 2 + cipher_suites_len;
+
+    // Compression methods length (1)
+    if client_hello.len() < offset + 1 {
+        return Err(RealityError::protocol("ClientHello truncated at compression"));
+    }
+    let compression_len = client_hello[offset] as usize;
+    offset += 1 + compression_len;
+
+    // Extensions length (2)
+    if client_hello.len() < offset + 2 {
+        return Err(RealityError::protocol("ClientHello truncated at extensions length"));
+    }
+    let extensions_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    offset += 2;
+
+    if client_hello.len() < offset + extensions_len {
+        return Err(RealityError::protocol("Extensions truncated"));
+    }
+
+    let extensions = &client_hello[offset..offset + extensions_len];
+
+    // Parse extensions to find server_name (type 0)
+    let mut ext_offset = 0;
+    while ext_offset + 4 <= extensions.len() {
+        let ext_type = u16::from_be_bytes([extensions[ext_offset], extensions[ext_offset + 1]]);
+        let ext_len = u16::from_be_bytes([extensions[ext_offset + 2], extensions[ext_offset + 3]]) as usize;
+
+        if ext_offset + 4 + ext_len > extensions.len() {
+            break;
+        }
+
+        if ext_type == 0x0000 {
+            // server_name extension
+            let ext_data = &extensions[ext_offset + 4..ext_offset + 4 + ext_len];
+
+            // Parse server name list
+            if ext_data.len() >= 2 {
+                let _list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                let entries = &ext_data[2..];
+
+                // Parse first entry (host_name type = 0)
+                if entries.len() >= 3 {
+                    let name_type = entries[0];
+                    let name_len = u16::from_be_bytes([entries[1], entries[2]]) as usize;
+
+                    if name_type == 0 && entries.len() >= 3 + name_len {
+                        let name_bytes = &entries[3..3 + name_len];
+                        return String::from_utf8(name_bytes.to_vec())
+                            .map_err(|_| RealityError::protocol("Invalid SNI encoding"));
+                    }
+                }
+            }
+        }
+
+        ext_offset += 4 + ext_len;
+    }
+
+    Err(RealityError::protocol("SNI extension not found in ClientHello"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reality::auth::{derive_auth_key, encrypt_session_id, SessionId};
+    use crate::reality::common::REALITY_AUTH_INFO;
+    use crate::reality::crypto::{generate_keypair, perform_ecdh, random_bytes, X25519KeyPair};
+    use crate::reality::tls::{construct_client_hello, DEFAULT_ALPN_PROTOCOLS};
+
+    fn create_test_config() -> RealityServerConfig {
+        let mut private_key = [0u8; 32];
+        private_key[0] = 0x42;
+
+        RealityServerConfig {
+            private_key,
+            short_ids: vec![vec![0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]],
+            dest: "www.google.com:443".to_string(),
+            server_names: vec!["www.google.com".to_string()],
+            max_time_diff_ms: 120_000,
+        }
+    }
+
+    #[test]
+    fn test_config_new() {
+        let config = RealityServerConfig::new([0x42u8; 32], "example.com:443");
+        assert_eq!(config.dest, "example.com:443");
+        assert!(config.short_ids.is_empty());
+    }
+
+    #[test]
+    fn test_config_builder() {
+        let config = RealityServerConfig::new([0x42u8; 32], "example.com:443")
+            .with_short_id(vec![0x12, 0x34])
+            .with_server_name("example.com")
+            .with_max_time_diff_ms(60_000);
+
+        assert_eq!(config.short_ids.len(), 1);
+        assert_eq!(config.server_names.len(), 1);
+        assert_eq!(config.max_time_diff_ms, 60_000);
+    }
+
+    #[test]
+    fn test_config_with_short_id_hex() {
+        let config = RealityServerConfig::new([0x42u8; 32], "example.com:443")
+            .with_short_id_hex("1234567890abcdef")
+            .unwrap();
+
+        assert_eq!(config.short_ids.len(), 1);
+        assert_eq!(
+            config.short_ids[0],
+            vec![0x12, 0x34, 0x56, 0x78, 0x90, 0xAB, 0xCD, 0xEF]
+        );
+    }
+
+    #[test]
+    fn test_config_validate_success() {
+        let config = create_test_config();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_no_short_ids() {
+        let config = RealityServerConfig {
+            short_ids: vec![],
+            ..create_test_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_empty_dest() {
+        let config = RealityServerConfig {
+            dest: String::new(),
+            ..create_test_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_no_server_names() {
+        let config = RealityServerConfig {
+            server_names: vec![],
+            ..create_test_config()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_public_key() {
+        let config = create_test_config();
+        let public_key = config.public_key();
+        assert_eq!(public_key.len(), 32);
+        // Public key should not be all zeros
+        assert!(public_key.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_server_new() {
+        let config = create_test_config();
+        let server = RealityServer::new(config.clone());
+        assert_eq!(server.config().dest, config.dest);
+    }
+
+    #[test]
+    fn test_sni_validation() {
+        let config = create_test_config();
+        let server = RealityServer::new(config);
+
+        // Exact match
+        assert!(server.validate_sni("www.google.com"));
+
+        // Case insensitive
+        assert!(server.validate_sni("WWW.GOOGLE.COM"));
+        assert!(server.validate_sni("www.Google.Com"));
+
+        // No match
+        assert!(!server.validate_sni("example.com"));
+        assert!(!server.validate_sni("google.com"));
+    }
+
+    #[test]
+    fn test_sni_validation_empty_allowed() {
+        let config = RealityServerConfig {
+            server_names: vec![],
+            ..create_test_config()
+        };
+        // Skip validation since we explicitly test this to see behavior
+        let server = RealityServer::new(config);
+
+        // With no server names configured, any SNI is accepted
+        assert!(server.validate_sni("anything.example.com"));
+    }
+
+    #[test]
+    fn test_extract_client_sni() {
+        let client_random = [0x42u8; 32];
+        let session_id = [0x99u8; 32];
+        let public_key = [0xAAu8; 32];
+        let cipher_suites = &[0x1301, 0x1302, 0x1303];
+
+        let client_hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &public_key,
+            "www.example.com",
+            cipher_suites,
+            DEFAULT_ALPN_PROTOCOLS,
+        )
+        .unwrap();
+
+        let sni = extract_client_sni(&client_hello).unwrap();
+        assert_eq!(sni, "www.example.com");
+    }
+
+    #[test]
+    fn test_extract_client_sni_google() {
+        let client_random = [0x42u8; 32];
+        let session_id = [0x99u8; 32];
+        let public_key = [0xAAu8; 32];
+        let cipher_suites = &[0x1301];
+
+        let client_hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &public_key,
+            "www.google.com",
+            cipher_suites,
+            DEFAULT_ALPN_PROTOCOLS,
+        )
+        .unwrap();
+
+        let sni = extract_client_sni(&client_hello).unwrap();
+        assert_eq!(sni, "www.google.com");
+    }
+
+    #[test]
+    fn test_normalized_short_ids() {
+        let config = RealityServerConfig {
+            short_ids: vec![
+                vec![0x12, 0x34],  // Shorter than 8 bytes
+                vec![0xAB; 8],     // Exactly 8 bytes
+            ],
+            ..create_test_config()
+        };
+
+        let normalized = config.normalized_short_ids();
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0], [0x12, 0x34, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(normalized[1], [0xAB; 8]);
+    }
+
+    #[test]
+    fn test_client_hello_aad_building() {
+        let server = RealityServer::new(create_test_config());
+
+        let client_random = [0x42u8; 32];
+        let session_id = [0x99u8; 32];
+        let public_key = [0xAAu8; 32];
+
+        let client_hello = construct_client_hello(
+            &client_random,
+            &session_id,
+            &public_key,
+            "www.google.com",
+            &[0x1301],
+            DEFAULT_ALPN_PROTOCOLS,
+        )
+        .unwrap();
+
+        let aad = server.build_client_hello_aad(&client_hello, &session_id);
+
+        // AAD should have zeroed session ID at offset 39-71
+        assert_eq!(aad[39..71], [0u8; 32]);
+
+        // Rest should match original
+        assert_eq!(aad[0..39], client_hello[0..39]);
+        assert_eq!(aad[71..], client_hello[71..]);
+    }
+
+    // Integration test for full validation flow
+    #[test]
+    fn test_full_validation_flow() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        // Server setup
+        let server_private_key: [u8; 32] = random_bytes();
+        let server_secret = StaticSecret::from(server_private_key);
+        let server_public_key = PublicKey::from(&server_secret);
+
+        let short_id = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+
+        let config = RealityServerConfig {
+            private_key: server_private_key,
+            short_ids: vec![short_id.to_vec()],
+            dest: "www.google.com:443".to_string(),
+            server_names: vec!["www.google.com".to_string()],
+            max_time_diff_ms: 120_000,
+        };
+
+        let server = RealityServer::new(config);
+
+        // Client setup
+        let client_keypair = generate_keypair();
+        let client_random: [u8; 32] = random_bytes();
+
+        // Derive shared secret and auth key (client side)
+        let shared_secret = perform_ecdh(
+            &client_keypair.private_key_bytes(),
+            server_public_key.as_bytes(),
+        )
+        .unwrap();
+
+        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+
+        // Create session ID
+        let session_id = SessionId::new([1, 8, 1], short_id);
+        let plaintext = session_id.to_plaintext();
+
+        // Build ClientHello with zeroed session ID first (for AAD)
+        let mut session_id_for_hello = [0u8; 32];
+        let mut client_hello = construct_client_hello(
+            &client_random,
+            &session_id_for_hello,
+            &client_keypair.public_key_bytes(),
+            "www.google.com",
+            &[0x1301],
+            DEFAULT_ALPN_PROTOCOLS,
+        )
+        .unwrap();
+
+        // Zero session ID in client_hello for AAD
+        client_hello[39..71].fill(0);
+
+        // Encrypt session ID
+        let nonce = &client_random[20..32];
+        let encrypted_session_id = encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
+
+        // Put encrypted session ID back
+        client_hello[39..71].copy_from_slice(&encrypted_session_id);
+
+        // Server validation
+        let parsed = server.parse_client_hello(&client_hello).unwrap();
+
+        assert_eq!(parsed.sni, "www.google.com");
+        assert_eq!(parsed.client_random, client_random);
+        assert_eq!(parsed.client_public_key, client_keypair.public_key_bytes());
+        assert_eq!(parsed.encrypted_session_id, encrypted_session_id);
+
+        // Validate SNI
+        assert!(server.validate_sni(&parsed.sni));
+
+        // Validate REALITY auth
+        let normalized_short_ids = server.config.normalized_short_ids();
+        let client_hello_aad = server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+
+        let result = validate_auth(
+            &parsed.client_random,
+            &parsed.encrypted_session_id,
+            &server.config.private_key,
+            &parsed.client_public_key,
+            &normalized_short_ids,
+            server.config.max_time_diff_ms,
+            &client_hello_aad,
+        );
+
+        assert!(result.is_ok(), "Validation failed: {:?}", result.err());
+
+        let validated_session = result.unwrap();
+        assert_eq!(validated_session.short_id, short_id);
+    }
+
+    #[test]
+    fn test_validation_wrong_short_id() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let server_private_key: [u8; 32] = random_bytes();
+        let server_secret = StaticSecret::from(server_private_key);
+        let server_public_key = PublicKey::from(&server_secret);
+
+        // Server only allows short_id 0xFF..
+        let config = RealityServerConfig {
+            private_key: server_private_key,
+            short_ids: vec![vec![0xFF; 8]],
+            dest: "www.google.com:443".to_string(),
+            server_names: vec!["www.google.com".to_string()],
+            max_time_diff_ms: 120_000,
+        };
+
+        let server = RealityServer::new(config);
+
+        // Client uses different short_id 0x12..
+        let short_id = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+        let client_keypair = generate_keypair();
+        let client_random: [u8; 32] = random_bytes();
+
+        let shared_secret = perform_ecdh(
+            &client_keypair.private_key_bytes(),
+            server_public_key.as_bytes(),
+        )
+        .unwrap();
+
+        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+
+        let session_id = SessionId::new([1, 8, 1], short_id);
+        let plaintext = session_id.to_plaintext();
+
+        let mut client_hello = construct_client_hello(
+            &client_random,
+            &[0u8; 32],
+            &client_keypair.public_key_bytes(),
+            "www.google.com",
+            &[0x1301],
+            DEFAULT_ALPN_PROTOCOLS,
+        )
+        .unwrap();
+
+        client_hello[39..71].fill(0);
+
+        let nonce = &client_random[20..32];
+        let encrypted_session_id = encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
+        client_hello[39..71].copy_from_slice(&encrypted_session_id);
+
+        let parsed = server.parse_client_hello(&client_hello).unwrap();
+        let normalized_short_ids = server.config.normalized_short_ids();
+        let client_hello_aad = server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+
+        let result = validate_auth(
+            &parsed.client_random,
+            &parsed.encrypted_session_id,
+            &server.config.private_key,
+            &parsed.client_public_key,
+            &normalized_short_ids,
+            server.config.max_time_diff_ms,
+            &client_hello_aad,
+        );
+
+        // Should fail because short_id doesn't match
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validation_wrong_server_key() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        // Server with one key
+        let server_private_key: [u8; 32] = random_bytes();
+
+        // Client encrypts with different public key
+        let different_private_key: [u8; 32] = random_bytes();
+        let different_secret = StaticSecret::from(different_private_key);
+        let different_public_key = PublicKey::from(&different_secret);
+
+        let short_id = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+
+        let config = RealityServerConfig {
+            private_key: server_private_key,
+            short_ids: vec![short_id.to_vec()],
+            dest: "www.google.com:443".to_string(),
+            server_names: vec!["www.google.com".to_string()],
+            max_time_diff_ms: 120_000,
+        };
+
+        let server = RealityServer::new(config);
+
+        let client_keypair = generate_keypair();
+        let client_random: [u8; 32] = random_bytes();
+
+        // Client uses WRONG public key for key exchange
+        let shared_secret = perform_ecdh(
+            &client_keypair.private_key_bytes(),
+            different_public_key.as_bytes(),  // Wrong key!
+        )
+        .unwrap();
+
+        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+
+        let session_id = SessionId::new([1, 8, 1], short_id);
+        let plaintext = session_id.to_plaintext();
+
+        let mut client_hello = construct_client_hello(
+            &client_random,
+            &[0u8; 32],
+            &client_keypair.public_key_bytes(),
+            "www.google.com",
+            &[0x1301],
+            DEFAULT_ALPN_PROTOCOLS,
+        )
+        .unwrap();
+
+        client_hello[39..71].fill(0);
+
+        let nonce = &client_random[20..32];
+        let encrypted_session_id = encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
+        client_hello[39..71].copy_from_slice(&encrypted_session_id);
+
+        let parsed = server.parse_client_hello(&client_hello).unwrap();
+        let normalized_short_ids = server.config.normalized_short_ids();
+        let client_hello_aad = server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+
+        let result = validate_auth(
+            &parsed.client_random,
+            &parsed.encrypted_session_id,
+            &server.config.private_key,
+            &parsed.client_public_key,
+            &normalized_short_ids,
+            server.config.max_time_diff_ms,
+            &client_hello_aad,
+        );
+
+        // Should fail because decryption will fail (wrong shared secret)
+        assert!(result.is_err());
+    }
+}

@@ -87,6 +87,8 @@
     "ingressClientDesc": "WireGuard client management",
     "v2rayIngress": "V2Ray Clients",
     "v2rayIngressDesc": "VMess/VLESS/Trojan client management",
+    "ssIngress": "Shadowsocks",
+    "ssIngressDesc": "Shadowsocks server management",
     "peerNodes": "Peer Nodes",
     "peerNodesDesc": "Manage vpn-router peer connections",
     "nodeChains": "Multi-hop Chains",

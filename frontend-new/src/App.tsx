@@ -22,6 +22,7 @@ const ChainsPage = lazy(() => import("@/pages/ChainsPage"));
 const RulesPage = lazy(() => import("@/pages/RulesPage"));
 const IngressPage = lazy(() => import("@/pages/IngressPage"));
 const V2RayIngressPage = lazy(() => import("@/pages/V2RayIngressPage"));
+const ShadowsocksIngressPage = lazy(() => import("@/pages/ShadowsocksIngressPage"));
 const AdBlockPage = lazy(() => import("@/pages/AdBlockPage"));
 const PIAPage = lazy(() => import("@/pages/PIAPage"));
 const BackupPage = lazy(() => import("@/pages/BackupPage"));
@@ -80,6 +81,7 @@ function AppRoutes() {
           <Route index element={<DashboardPage />} />
           <Route path="ingress" element={<IngressPage />} />
           <Route path="ingress-v2ray" element={<V2RayIngressPage />} />
+          <Route path="ingress-shadowsocks" element={<ShadowsocksIngressPage />} />
           <Route path="peers" element={<PeersPage />} />
           <Route path="chains" element={<ChainsPage />} />
           <Route path="topology" element={<TopologyPage />} />

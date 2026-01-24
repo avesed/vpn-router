@@ -28,7 +28,7 @@ const configSchema = z.object({
   enabled: z.boolean(),
   protocol: z.enum(["vless", "vmess", "trojan"]),
   listen_port: z.number().min(1).max(65535),
-  transport_type: z.enum(["tcp", "ws", "grpc", "h2", "quic", "httpupgrade", "xhttp"]),
+  transport_type: z.enum(["tcp", "ws", "quic"]),  // Only implemented transports
   tls_enabled: z.boolean(),
   reality_enabled: z.boolean(),
   reality_private_key: z.string().optional(),
@@ -36,6 +36,7 @@ const configSchema = z.object({
   reality_dest: z.string().optional(),
   reality_server_names: z.string().optional(),
   reality_short_ids: z.string().optional(),
+  udp_enabled: z.boolean(),
 });
 
 type ConfigFormValues = z.infer<typeof configSchema>;
@@ -62,6 +63,7 @@ export function V2RayIngressConfig() {
       transport_type: "tcp",
       tls_enabled: false,
       reality_enabled: false,
+      udp_enabled: true,
     },
   });
 
@@ -88,6 +90,8 @@ export function V2RayIngressConfig() {
         "reality_short_ids",
         config.config.reality_short_ids?.join(", ") || ""
       );
+      // UDP enabled defaults to true if not set
+      setValue("udp_enabled", config.config.udp_enabled !== 0);
     }
   }, [config, setValue]);
 
@@ -108,6 +112,7 @@ export function V2RayIngressConfig() {
       reality_short_ids: data.reality_short_ids
         ? data.reality_short_ids.split(",").map((s) => s.trim()).filter(Boolean)
         : [],
+      udp_enabled: data.udp_enabled,
     });
   };
 
@@ -200,6 +205,22 @@ export function V2RayIngressConfig() {
               </div>
             </div>
 
+            {/* UDP Support */}
+            <div className="space-y-4 pt-4 border-t">
+              <div className="flex items-center space-x-2">
+                <Switch
+                  id="udp_enabled"
+                  checked={watch("udp_enabled")}
+                  onCheckedChange={(checked) => setValue("udp_enabled", checked)}
+                />
+                <Label htmlFor="udp_enabled">Enable UDP Support</Label>
+                <span className="text-xs text-muted-foreground ml-2">
+                  (VLESS command 0x02, required for DNS over UDP)
+                </span>
+              </div>
+            </div>
+
+            {/* TLS Settings */}
             <div className="space-y-4 pt-4 border-t">
               <div className="flex items-center space-x-2">
                 <Switch

@@ -89,6 +89,9 @@ impl VlessError {
                     | io::ErrorKind::Interrupted
                     | io::ErrorKind::WouldBlock
                     | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof  // Client disconnected during handshake
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
             ),
             _ => false,
         }
