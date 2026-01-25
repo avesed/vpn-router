@@ -119,6 +119,7 @@ htmlcov/
 /test-config-rust/
 test_dir/
 test-vless-client/
+test-configs/
 
 # Temporary test scripts in root directory
 /test_*.sh
@@ -142,6 +143,8 @@ test-vless-client/
 docker-compose.override.yml
 docker-compose.local.yml
 docker-compose.peer-test.yml
+docker-compose.test-server.yml
+docker-compose.test.yml
 
 # ==========================================
 # Claude Code
@@ -200,4 +203,6 @@ verify_phase3.sh
 verify_warp_integration.sh
 WARP_API_VERIFICATION.md
 WARP_REGISTRATION.md
+
+
 

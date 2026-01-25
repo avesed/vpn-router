@@ -387,9 +387,19 @@ async fn main() -> Result<()> {
     connection_manager.set_ecmp_group_manager(Arc::clone(&ecmp_group_manager));
     let connection_manager = Arc::new(connection_manager);
 
-    // Create TPROXY listener (TCP)
-    let listener = TproxyListener::bind(&config.listen)
-        .map_err(|e| anyhow::anyhow!("Failed to create TPROXY listener: {}", e))?;
+    // Create TPROXY listener (TCP) - only if enabled via env var
+    // TPROXY requires iptables rules; not needed for pure userspace WG mode
+    let tproxy_enabled = std::env::var("RUST_ROUTER_TPROXY_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let tproxy_listener: Option<TproxyListener> = if tproxy_enabled {
+        info!("TPROXY listener enabled (RUST_ROUTER_TPROXY_ENABLED=true)");
+        Some(TproxyListener::bind(&config.listen)
+            .map_err(|e| anyhow::anyhow!("Failed to create TPROXY listener: {}", e))?)
+    } else {
+        debug!("TPROXY listener disabled (set RUST_ROUTER_TPROXY_ENABLED=true to enable)");
+        None
+    };
 
     // Create UDP components (if enabled)
     let (udp_session_manager, udp_worker_pool, udp_buffer_pool) = if config.listen.udp_enabled {
@@ -963,8 +973,16 @@ async fn main() -> Result<()> {
     );
 
     // Run accept loop with signal handling
-    let accept_result = tokio::select! {
-        result = run_accept_loop(listener, Arc::clone(&connection_manager)) => {
+    // When TPROXY is disabled, just wait for shutdown signals
+    let accept_result: Result<(), rust_router::error::RustRouterError> = tokio::select! {
+        result = async {
+            if let Some(listener) = tproxy_listener {
+                run_accept_loop(listener, Arc::clone(&connection_manager)).await
+            } else {
+                // TPROXY disabled - wait indefinitely for shutdown signal
+                std::future::pending::<Result<(), rust_router::error::RustRouterError>>().await
+            }
+        } => {
             result
         }
         _ = signal::ctrl_c() => {

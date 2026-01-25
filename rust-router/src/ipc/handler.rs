@@ -4902,8 +4902,13 @@ impl IpcHandler {
                 Err("ECMP manager not available".to_string())
             }
         } else {
-            // Regular outbound - not supported for speed test
-            Err("Speed test only supported for WireGuard tunnels and ECMP groups".to_string())
+            // Regular outbound (VLESS, Shadowsocks, Direct, SOCKS5, etc.)
+            // Use TCP-based speed test via Outbound::connect()
+            if let Some(outbound) = self.outbound_manager.get(&tag) {
+                self.speed_test_via_outbound(outbound, size_bytes, timeout_secs).await
+            } else {
+                Err(format!("Outbound '{}' not found", tag))
+            }
         };
 
         let duration = start.elapsed();
@@ -5019,6 +5024,7 @@ impl IpcHandler {
             .uri(path)
             .header("Host", host)
             .header("User-Agent", "rust-router-speedtest/1.0")
+            .header("Accept", "*/*")
             .body(http_body_util::Empty::<bytes::Bytes>::new())
             .map_err(|e| format!("Failed to build request: {}", e))?;
 
@@ -5064,6 +5070,132 @@ impl IpcHandler {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         roots
+    }
+
+    // ========================================================================
+    // Speed Test via Regular Outbound (VLESS, Shadowsocks, Direct, SOCKS5)
+    // ========================================================================
+
+    /// Perform speed test through a regular outbound (VLESS, SS, Direct, SOCKS5).
+    ///
+    /// This method uses the Outbound::connect() method to establish a TCP connection
+    /// to speed.cloudflare.com, then performs an HTTP download test.
+    ///
+    /// # Protocol Flow
+    /// 1. Connect to speed.cloudflare.com:443 through the outbound
+    /// 2. Perform TLS handshake on the established connection
+    /// 3. Send HTTP GET request for the specified download size
+    /// 4. Count downloaded bytes to calculate speed
+    #[cfg(feature = "dns-doh")]
+    async fn speed_test_via_outbound(
+        &self,
+        outbound: Arc<dyn Outbound>,
+        size_bytes: u64,
+        timeout_secs: u64,
+    ) -> Result<u64, String> {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        use http_body_util::BodyExt;
+        use tokio::net::lookup_host;
+
+        let host = "speed.cloudflare.com";
+        let port = 443;
+
+        // Resolve DNS to get the actual IP (Cloudflare uses different IPs for different services)
+        let target_addr = lookup_host(format!("{}:{}", host, port))
+            .await
+            .map_err(|e| format!("DNS lookup failed for {}: {}", host, e))?
+            .find(|addr| addr.is_ipv4())  // Prefer IPv4
+            .ok_or_else(|| format!("No IPv4 address found for {}", host))?;
+
+        let tag = outbound.tag().to_string();
+        info!("Speed test via outbound '{}' starting (size={}B, target={})", tag, size_bytes, target_addr);
+
+        // Connect via outbound with timeout
+        let connect_timeout = Duration::from_secs(10.min(timeout_secs));
+        let connection = timeout(
+            connect_timeout,
+            outbound.connect(target_addr, connect_timeout)
+        )
+        .await
+        .map_err(|_| format!("Connection to {} timed out", host))?
+        .map_err(|e| format!("Connection failed: {}", e))?;
+
+        let stream = connection.into_outbound_stream();
+        debug!("Connected to {} via outbound '{}'", host, tag);
+
+        // Upgrade to TLS
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(self.get_root_certs())
+            .with_no_client_auth();
+
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid server name: {}", e))?;
+
+        let tls_stream = connector.connect(server_name, stream)
+            .await
+            .map_err(|e| format!("TLS handshake failed: {}", e))?;
+
+        debug!("TLS handshake complete for speed test via '{}'", tag);
+
+        // Create HTTP connection
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("HTTP handshake failed: {}", e))?;
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("HTTP connection error: {}", e);
+            }
+        });
+
+        // Build request
+        let path = format!("/__down?bytes={}", size_bytes);
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(&path)
+            .header("Host", host)
+            .header("User-Agent", "rust-router-speedtest/1.0")
+            .header("Accept", "*/*")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .map_err(|e| format!("Failed to build request: {}", e))?;
+
+        // Send request with timeout
+        let response = timeout(
+            Duration::from_secs(timeout_secs),
+            sender.send_request(req)
+        )
+        .await
+        .map_err(|_| "Request timed out".to_string())?
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("HTTP error: {}", response.status()));
+        }
+
+        // Read response body and count bytes
+        let body = response.into_body();
+        let bytes = body.collect()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?
+            .to_bytes();
+
+        info!("Speed test via outbound '{}' downloaded {} bytes", tag, bytes.len());
+        Ok(bytes.len() as u64)
+    }
+
+    /// Fallback when dns-doh feature is not enabled
+    #[cfg(not(feature = "dns-doh"))]
+    async fn speed_test_via_outbound(
+        &self,
+        _outbound: Arc<dyn Outbound>,
+        _size_bytes: u64,
+        _timeout_secs: u64,
+    ) -> Result<u64, String> {
+        Err("Speed test requires dns-doh feature to be enabled".to_string())
     }
 
     // ========================================================================
@@ -6080,7 +6212,7 @@ impl IpcHandler {
                     server_port,
                     uuid: "***".to_string(), // Hidden for security in list view
                     flow: String::new(), // Not available through trait
-                    transport: "unknown".to_string(), // Not available through trait
+                    transport: outbound.transport_type().unwrap_or("unknown").to_string(),
                     enabled: outbound.is_enabled(),
                     health_status: outbound.health_status().to_string(),
                     active_connections: outbound.active_connections(),

@@ -2602,7 +2602,9 @@ class RustRouterClient:
             "server_port": server_port,
             "uuid": uuid,
             "transport": transport,
+            "tls_enabled": tls_enabled,
             "tls_skip_verify": tls_skip_verify,
+            "reality_enabled": reality_enabled,
         }
         if flow:
             command["flow"] = flow
