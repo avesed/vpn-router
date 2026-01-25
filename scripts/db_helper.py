@@ -1789,6 +1789,211 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
+    # ============ Shadowsocks 出口 ============
+
+    def get_shadowsocks_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 Shadowsocks 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM shadowsocks_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM shadowsocks_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_shadowsocks_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 Shadowsocks 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM shadowsocks_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_shadowsocks_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        method: str,
+        password: str,
+        description: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = True
+    ) -> int:
+        """添加 Shadowsocks 出口
+
+        Args:
+            tag: 出口标识符
+            server: 服务器地址
+            server_port: 服务器端口
+            method: 加密方法 (aes-256-gcm, 2022-blake3-aes-256-gcm, etc.)
+            password: 密码 (AEAD 2022 需要 Base64 格式)
+            description: 描述
+            udp_enabled: 是否启用 UDP
+            enabled: 是否启用
+
+        Returns:
+            新创建记录的 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO shadowsocks_egress
+                (tag, description, server, server_port, method, password, udp_enabled, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, description, server, server_port, method, password,
+                  1 if udp_enabled else 0, 1 if enabled else 0))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_shadowsocks_egress(self, tag: str, **kwargs) -> bool:
+        """更新 Shadowsocks 出口"""
+        allowed_fields = {
+            "description", "server", "server_port", "method", "password",
+            "udp_enabled", "enabled"
+        }
+        updates = []
+        values = []
+        for key, value in kwargs.items():
+            if key in allowed_fields:
+                updates.append(f"{key} = ?")
+                values.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(tag)
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                UPDATE shadowsocks_egress SET {', '.join(updates)} WHERE tag = ?
+            """, values)
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_shadowsocks_egress(self, tag: str) -> bool:
+        """删除 Shadowsocks 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM shadowsocks_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ VLESS 出口 ============
+
+    def get_vless_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        """获取所有 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute(
+                    "SELECT * FROM vless_egress WHERE enabled = 1 ORDER BY tag"
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM vless_egress ORDER BY tag"
+                ).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_vless_egress(self, tag: str) -> Optional[Dict]:
+        """根据 tag 获取 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM vless_egress WHERE tag = ?", (tag,)
+            ).fetchone()
+            if not row:
+                return None
+            columns = [desc[0] for desc in cursor.description]
+            return dict(zip(columns, row))
+
+    def add_vless_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        uuid: str,
+        description: str = "",
+        flow: Optional[str] = None,
+        transport: str = "tcp",
+        ws_path: Optional[str] = None,
+        ws_host: Optional[str] = None,
+        tls_enabled: bool = True,
+        tls_server_name: Optional[str] = None,
+        tls_skip_verify: bool = False,
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        enabled: bool = True
+    ) -> int:
+        """添加 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO vless_egress (
+                    tag, description, server, server_port, uuid, flow,
+                    transport, ws_path, ws_host,
+                    tls_enabled, tls_server_name, tls_skip_verify,
+                    reality_enabled, reality_public_key, reality_short_id,
+                    enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                tag, description, server, server_port, uuid, flow,
+                transport, ws_path, ws_host,
+                1 if tls_enabled else 0, tls_server_name, 1 if tls_skip_verify else 0,
+                1 if reality_enabled else 0, reality_public_key, reality_short_id,
+                1 if enabled else 0
+            ))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_vless_egress(self, tag: str, **kwargs) -> bool:
+        """更新 VLESS 出口"""
+        allowed_fields = {
+            'description', 'server', 'server_port', 'uuid', 'flow',
+            'transport', 'ws_path', 'ws_host',
+            'tls_enabled', 'tls_server_name', 'tls_skip_verify',
+            'reality_enabled', 'reality_public_key', 'reality_short_id',
+            'enabled'
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+        if not updates:
+            return False
+
+        # Convert booleans to integers
+        for key in ['tls_enabled', 'tls_skip_verify', 'reality_enabled', 'enabled']:
+            if key in updates and isinstance(updates[key], bool):
+                updates[key] = 1 if updates[key] else 0
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [tag]
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE vless_egress SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE tag = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_vless_egress(self, tag: str) -> bool:
+        """删除 VLESS 出口"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM vless_egress WHERE tag = ?", (tag,))
+            conn.commit()
+            return cursor.rowcount > 0
+
     # ============ WARP 出口 ============
 
     def get_warp_egress_list(self, enabled_only: bool = False) -> List[Dict]:
@@ -4901,6 +5106,75 @@ class DatabaseManager:
 
     def delete_v2ray_egress(self, tag: str) -> bool:
         return self.user.delete_v2ray_egress(tag)
+
+    # Shadowsocks Egress
+    def get_shadowsocks_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_shadowsocks_egress_list(enabled_only)
+
+    def get_shadowsocks_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_shadowsocks_egress(tag)
+
+    def add_shadowsocks_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        method: str,
+        password: str,
+        description: str = "",
+        udp_enabled: bool = True,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_shadowsocks_egress(
+            tag, server, server_port, method, password,
+            description, udp_enabled, enabled
+        )
+
+    def update_shadowsocks_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_shadowsocks_egress(tag, **kwargs)
+
+    def delete_shadowsocks_egress(self, tag: str) -> bool:
+        return self.user.delete_shadowsocks_egress(tag)
+
+    # VLESS Egress
+    def get_vless_egress_list(self, enabled_only: bool = False) -> List[Dict]:
+        return self.user.get_vless_egress_list(enabled_only)
+
+    def get_vless_egress(self, tag: str) -> Optional[Dict]:
+        return self.user.get_vless_egress(tag)
+
+    def add_vless_egress(
+        self,
+        tag: str,
+        server: str,
+        server_port: int,
+        uuid: str,
+        description: str = "",
+        flow: Optional[str] = None,
+        transport: str = "tcp",
+        ws_path: Optional[str] = None,
+        ws_host: Optional[str] = None,
+        tls_enabled: bool = True,
+        tls_server_name: Optional[str] = None,
+        tls_skip_verify: bool = False,
+        reality_enabled: bool = False,
+        reality_public_key: Optional[str] = None,
+        reality_short_id: Optional[str] = None,
+        enabled: bool = True
+    ) -> int:
+        return self.user.add_vless_egress(
+            tag, server, server_port, uuid, description, flow,
+            transport, ws_path, ws_host,
+            tls_enabled, tls_server_name, tls_skip_verify,
+            reality_enabled, reality_public_key, reality_short_id,
+            enabled
+        )
+
+    def update_vless_egress(self, tag: str, **kwargs) -> bool:
+        return self.user.update_vless_egress(tag, **kwargs)
+
+    def delete_vless_egress(self, tag: str) -> bool:
+        return self.user.delete_vless_egress(tag)
 
     # WARP Egress
     def get_warp_egress_list(self, enabled_only: bool = False) -> List[Dict]:

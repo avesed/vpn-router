@@ -2611,6 +2611,172 @@ def _recover_orphaned_chains():
         return 0
 
 
+def _restore_shadowsocks_egress():
+    """启动时从数据库恢复 Shadowsocks 出口到 rust-router
+
+    在服务重启后，rust-router 会丢失运行时状态，需要从数据库重新加载
+    所有已启用的 Shadowsocks 出口配置。
+
+    此函数使用后台线程和 asyncio 事件循环来调用 IPC 客户端。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return
+
+    import asyncio
+
+    async def _restore_ss_egress_async():
+        try:
+            db = _get_db()
+            ss_egress_list = db.get_shadowsocks_egress_list(enabled_only=True)
+
+            if not ss_egress_list:
+                logging.debug("[SS Restore] 没有已启用的 Shadowsocks 出口需要恢复")
+                return
+
+            # 等待 rust-router 启动（延迟 10 秒，API server 先于 rust-router 启动）
+            await asyncio.sleep(10)
+
+            # 创建独立的客户端实例（避免与其他恢复函数的竞争条件）
+            try:
+                client = RustRouterClient()
+                await client.connect()
+            except Exception as e:
+                logging.warning(f"[SS Restore] 无法连接到 rust-router: {e}")
+                return
+
+            restored = 0
+            failed = 0
+
+            for egress in ss_egress_list:
+                tag = egress.get("tag")
+                if not tag:
+                    continue
+
+                try:
+                    resp = await client.add_shadowsocks_outbound(
+                        tag=tag,
+                        server=egress.get("server", ""),
+                        server_port=egress.get("server_port", 8388),
+                        method=egress.get("method", "aes-256-gcm"),
+                        password=egress.get("password", ""),
+                        udp=bool(egress.get("udp_enabled", True)),
+                    )
+                    if resp.success:
+                        restored += 1
+                        logging.info(f"[SS Restore] 已恢复 Shadowsocks 出口: {tag}")
+                    else:
+                        failed += 1
+                        logging.warning(f"[SS Restore] 恢复出口 '{tag}' 失败: {resp.error}")
+                except Exception as e:
+                    failed += 1
+                    logging.warning(f"[SS Restore] 恢复出口 '{tag}' 异常: {e}")
+
+            print(f"[SS Restore] Shadowsocks 出口恢复完成: 成功 {restored}, 失败 {failed}")
+
+        except Exception as e:
+            logging.error(f"[SS Restore] Shadowsocks 出口恢复失败: {e}")
+
+    def _run_restore():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_restore_ss_egress_async())
+        finally:
+            loop.close()
+
+    # 在后台线程中执行恢复
+    threading.Thread(target=_run_restore, name="ss-egress-restore", daemon=True).start()
+
+
+def _restore_vless_egress():
+    """启动时从数据库恢复 VLESS 出口到 rust-router
+
+    在服务重启后，rust-router 会丢失运行时状态，需要从数据库重新加载
+    所有已启用的 VLESS 出口配置。
+
+    此函数使用后台线程和 asyncio 事件循环来调用 IPC 客户端。
+    """
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        return
+
+    import asyncio
+
+    async def _restore_vless_egress_async():
+        try:
+            print("[VLESS Restore] Starting VLESS egress restore...")
+            db = _get_db()
+            vless_egress_list = db.get_vless_egress_list(enabled_only=True)
+            print(f"[VLESS Restore] Found {len(vless_egress_list)} enabled VLESS egress in database")
+
+            if not vless_egress_list:
+                logging.debug("[VLESS Restore] 没有已启用的 VLESS 出口需要恢复")
+                return
+
+            # 等待 rust-router 启动（延迟 10 秒，API server 先于 rust-router 启动）
+            await asyncio.sleep(10)
+
+            # 创建独立的客户端实例（避免与其他恢复函数的竞争条件）
+            try:
+                client = RustRouterClient()
+                await client.connect()
+            except Exception as e:
+                logging.warning(f"[VLESS Restore] 无法连接到 rust-router: {e}")
+                return
+
+            restored = 0
+            failed = 0
+
+            for egress in vless_egress_list:
+                tag = egress.get("tag")
+                if not tag:
+                    continue
+
+                try:
+                    resp = await client.add_vless_outbound(
+                        tag=tag,
+                        server_address=egress.get("server", ""),
+                        server_port=egress.get("server_port", 443),
+                        uuid=egress.get("uuid", ""),
+                        flow=egress.get("flow"),
+                        transport=egress.get("transport", "tcp"),
+                        tls_enabled=bool(egress.get("tls_enabled", 1)),
+                        tls_sni=egress.get("tls_server_name"),
+                        tls_skip_verify=bool(egress.get("tls_skip_verify", 0)),
+                        reality_enabled=bool(egress.get("reality_enabled", 0)),
+                        reality_public_key=egress.get("reality_public_key"),
+                        reality_short_id=egress.get("reality_short_id"),
+                        ws_path=egress.get("ws_path"),
+                        ws_host=egress.get("ws_host"),
+                    )
+                    if resp.success:
+                        restored += 1
+                        logging.info(f"[VLESS Restore] 已恢复 VLESS 出口: {tag}")
+                    else:
+                        failed += 1
+                        logging.warning(f"[VLESS Restore] 恢复出口 '{tag}' 失败: {resp.error}")
+                except Exception as e:
+                    failed += 1
+                    logging.warning(f"[VLESS Restore] 恢复出口 '{tag}' 异常: {e}")
+
+            print(f"[VLESS Restore] VLESS 出口恢复完成: 成功 {restored}, 失败 {failed}")
+
+        except Exception as e:
+            import traceback
+            logging.error(f"[VLESS Restore] VLESS 出口恢复失败: {e}")
+            traceback.print_exc()
+
+    def _run_restore():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_restore_vless_egress_async())
+        finally:
+            loop.close()
+
+    # 在后台线程中执行恢复
+    threading.Thread(target=_run_restore, name="vless-egress-restore", daemon=True).start()
+
+
 @app.on_event("startup")
 async def startup_event():
     """应用启动时加载数据"""
@@ -2666,6 +2832,12 @@ async def startup_event():
     chain_restore_thread.start()
     _background_threads.append(chain_restore_thread)
     print("[Chain] 启动 chain 路由恢复后台任务")
+    # 恢复 Shadowsocks 出口到 rust-router
+    _restore_shadowsocks_egress()
+    print("[SS Egress] 启动 Shadowsocks 出口恢复后台任务")
+    # 恢复 VLESS 出口到 rust-router
+    _restore_vless_egress()
+    print("[VLESS Egress] 启动 VLESS 出口恢复后台任务")
 
 
 def _validate_network_config():
@@ -9496,101 +9668,397 @@ def api_set_shadowsocks_ingress_outbound(payload: dict):
 class ShadowsocksEgressCreateRequest(BaseModel):
     """创建 Shadowsocks 出口"""
     tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    description: str = Field("", description="描述")
     server: str = Field(..., description="服务器地址")
     server_port: int = Field(8388, ge=1, le=65535, description="服务器端口")
     method: str = Field("2022-blake3-aes-256-gcm", description="加密方法")
     password: str = Field(..., description="密码 (AEAD 2022 需要 Base64 编码)")
-    udp: bool = Field(False, description="启用 UDP")
+    udp: bool = Field(True, description="启用 UDP")
 
 
 @app.get("/api/egress/shadowsocks")
 async def api_list_shadowsocks_egress():
-    """列出所有 Shadowsocks 出口"""
+    """列出所有 Shadowsocks 出口 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    # 从数据库获取配置
+    db_egress = db.get_shadowsocks_egress_list()
+    result = []
+
+    # 尝试从 rust-router 获取运行时状态
+    runtime_status = {}
     try:
         client = await _get_rust_router_client()
-        if not client:
-            return {"egress": [], "error": "rust-router not available"}
+        if client:
+            resp = await client.list_shadowsocks_outbounds()
+            if resp.success:
+                for out in resp.data.get("outbounds", []):
+                    runtime_status[out.get("tag")] = out
+    except Exception:
+        pass  # rust-router 不可用时仍然返回数据库配置
 
-        resp = await client.list_shadowsocks_outbounds()
-        if resp.success:
-            outbounds = resp.data.get("outbounds", [])
-            return {"egress": outbounds}
-        else:
-            return {"egress": [], "error": resp.error}
-    except Exception as e:
-        return {"egress": [], "error": str(e)}
+    # 合并数据库配置和运行时状态
+    for egress in db_egress:
+        tag = egress.get("tag")
+        runtime = runtime_status.get(tag, {})
+        result.append({
+            "tag": tag,
+            "description": egress.get("description", ""),
+            "server": egress.get("server"),
+            "server_port": egress.get("server_port"),
+            "method": egress.get("method"),
+            "udp": bool(egress.get("udp_enabled", 1)),
+            "enabled": bool(egress.get("enabled", 1)),
+            # 运行时状态
+            "health_status": runtime.get("health", "unknown"),
+            "active_connections": runtime.get("active_connections", 0),
+        })
+
+    return {"egress": result}
 
 
 @app.post("/api/egress/shadowsocks")
 async def api_create_shadowsocks_egress(payload: ShadowsocksEgressCreateRequest):
-    """创建 Shadowsocks 出口"""
-    try:
-        client = await _get_rust_router_client()
-        if not client:
-            raise HTTPException(status_code=503, detail="rust-router not available")
+    """创建 Shadowsocks 出口 (保存到数据库 + 添加到 rust-router)"""
+    db = _get_db()
 
-        resp = await client.add_shadowsocks_outbound(
+    # 检查 tag 是否已存在
+    if db.get_shadowsocks_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Shadowsocks egress '{payload.tag}' already exists")
+
+    # 检查是否与其他出口冲突
+    if db.get_v2ray_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with V2Ray egress")
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with custom WireGuard egress")
+
+    try:
+        # 1. 保存到数据库
+        egress_id = db.add_shadowsocks_egress(
             tag=payload.tag,
             server=payload.server,
             server_port=payload.server_port,
             method=payload.method,
             password=payload.password,
-            udp=payload.udp,
+            description=payload.description,
+            udp_enabled=payload.udp,
+            enabled=True
         )
 
-        if resp.success:
-            return {
-                "success": True,
-                "message": f"Shadowsocks egress '{payload.tag}' created",
-                "tag": payload.tag,
-            }
-        else:
-            raise HTTPException(status_code=400, detail=resp.error)
-    except HTTPException:
-        raise
+        # 2. 添加到 rust-router
+        ipc_error = None
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.add_shadowsocks_outbound(
+                    tag=payload.tag,
+                    server=payload.server,
+                    server_port=payload.server_port,
+                    method=payload.method,
+                    password=payload.password,
+                    udp=payload.udp,
+                )
+                if not resp.success:
+                    ipc_error = resp.error
+        except Exception as e:
+            ipc_error = str(e)
+
+        return {
+            "success": True,
+            "message": f"Shadowsocks egress '{payload.tag}' created",
+            "tag": payload.tag,
+            "id": egress_id,
+            "ipc_error": ipc_error,  # None if IPC succeeded
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"[api] Error creating Shadowsocks egress: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
 @app.get("/api/egress/shadowsocks/{tag}")
 async def api_get_shadowsocks_egress(tag: str):
-    """获取 Shadowsocks 出口详情"""
+    """获取 Shadowsocks 出口详情 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    # 从数据库获取配置
+    egress = db.get_shadowsocks_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"Shadowsocks egress '{tag}' not found")
+
+    # 尝试获取运行时状态
+    runtime = {}
     try:
         client = await _get_rust_router_client()
-        if not client:
-            raise HTTPException(status_code=503, detail="rust-router not available")
+        if client:
+            resp = await client.get_shadowsocks_outbound(tag)
+            if resp.success:
+                runtime = resp.data
+    except Exception:
+        pass
 
-        resp = await client.get_shadowsocks_outbound(tag)
-        if resp.success:
-            return resp.data
-        else:
-            raise HTTPException(status_code=404, detail=resp.error)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "tag": egress.get("tag"),
+        "description": egress.get("description", ""),
+        "server": egress.get("server"),
+        "server_port": egress.get("server_port"),
+        "method": egress.get("method"),
+        "udp": bool(egress.get("udp_enabled", 1)),
+        "enabled": bool(egress.get("enabled", 1)),
+        # 运行时状态
+        "health_status": runtime.get("health_status", "unknown"),
+        "active_connections": runtime.get("active_connections", 0),
+    }
 
 
 @app.delete("/api/egress/shadowsocks/{tag}")
 async def api_delete_shadowsocks_egress(tag: str):
-    """删除 Shadowsocks 出口"""
+    """删除 Shadowsocks 出口 (从数据库和 rust-router 删除)"""
+    db = _get_db()
+
+    # 检查是否存在
+    if not db.get_shadowsocks_egress(tag):
+        raise HTTPException(status_code=404, detail=f"Shadowsocks egress '{tag}' not found")
+
+    # 1. 从 rust-router 移除
+    ipc_error = None
     try:
         client = await _get_rust_router_client()
-        if not client:
-            raise HTTPException(status_code=503, detail="rust-router not available")
-
-        resp = await client.remove_shadowsocks_outbound(tag)
-        if resp.success:
-            return {
-                "success": True,
-                "message": f"Shadowsocks egress '{tag}' removed",
-            }
-        else:
-            raise HTTPException(status_code=404, detail=resp.error)
-    except HTTPException:
-        raise
+        if client:
+            resp = await client.remove_shadowsocks_outbound(tag)
+            if not resp.success:
+                ipc_error = resp.error
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        ipc_error = str(e)
+
+    # 2. 从数据库删除
+    db.delete_shadowsocks_egress(tag)
+
+    return {
+        "success": True,
+        "message": f"Shadowsocks egress '{tag}' deleted",
+        "ipc_error": ipc_error,
+    }
+
+
+# ============ VLESS Egress APIs ============
+
+class VlessEgressCreateRequest(BaseModel):
+    """创建 VLESS 出口"""
+    tag: str = Field(..., pattern=r"^[a-z][a-z0-9-]*$", description="出口标识符")
+    description: str = Field("", description="描述")
+    server: str = Field(..., description="服务器地址")
+    server_port: int = Field(443, ge=1, le=65535, description="服务器端口")
+    uuid: str = Field(..., description="用户 UUID")
+    flow: Optional[str] = Field(None, description="流控 (xtls-rprx-vision)")
+    transport: str = Field("tcp", description="传输层 (tcp, ws, grpc)")
+    ws_path: Optional[str] = Field(None, description="WebSocket 路径")
+    ws_host: Optional[str] = Field(None, description="WebSocket Host 头")
+    tls_enabled: bool = Field(True, description="启用 TLS")
+    tls_server_name: Optional[str] = Field(None, description="TLS SNI")
+    tls_skip_verify: bool = Field(False, description="跳过 TLS 验证")
+    reality_enabled: bool = Field(False, description="启用 REALITY")
+    reality_public_key: Optional[str] = Field(None, description="REALITY 公钥")
+    reality_short_id: Optional[str] = Field(None, description="REALITY Short ID")
+
+
+@app.get("/api/egress/vless")
+async def api_list_vless_egress():
+    """列出所有 VLESS 出口 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    # 从数据库获取配置
+    db_egress = db.get_vless_egress_list()
+    result = []
+
+    # 尝试从 rust-router 获取运行时状态
+    runtime_status = {}
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.list_vless_outbounds()
+            if resp.success:
+                for out in resp.data.get("outbounds", []):
+                    runtime_status[out.get("tag")] = out
+    except Exception:
+        pass  # rust-router 不可用时仍然返回数据库配置
+
+    # 合并数据库配置和运行时状态
+    for egress in db_egress:
+        tag = egress.get("tag")
+        runtime = runtime_status.get(tag, {})
+        result.append({
+            "tag": tag,
+            "description": egress.get("description", ""),
+            "server": egress.get("server"),
+            "server_port": egress.get("server_port"),
+            "uuid": egress.get("uuid"),
+            "flow": egress.get("flow"),
+            "transport": egress.get("transport", "tcp"),
+            "tls_enabled": bool(egress.get("tls_enabled", 1)),
+            "tls_server_name": egress.get("tls_server_name"),
+            "reality_enabled": bool(egress.get("reality_enabled", 0)),
+            "enabled": bool(egress.get("enabled", 1)),
+            # 运行时状态
+            "health_status": runtime.get("health_status", "unknown"),
+            "active_connections": runtime.get("active_connections", 0),
+        })
+
+    return {"egress": result}
+
+
+@app.post("/api/egress/vless")
+async def api_create_vless_egress(payload: VlessEgressCreateRequest):
+    """创建 VLESS 出口 (保存到数据库 + 添加到 rust-router)"""
+    db = _get_db()
+
+    # 检查 tag 是否已存在
+    if db.get_vless_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"VLESS egress '{payload.tag}' already exists")
+
+    # 检查是否与其他出口冲突
+    if db.get_v2ray_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with V2Ray egress")
+    if db.get_shadowsocks_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with Shadowsocks egress")
+    if db.get_custom_egress(payload.tag):
+        raise HTTPException(status_code=400, detail=f"Egress '{payload.tag}' conflicts with custom WireGuard egress")
+
+    try:
+        # 1. 保存到数据库
+        egress_id = db.add_vless_egress(
+            tag=payload.tag,
+            server=payload.server,
+            server_port=payload.server_port,
+            uuid=payload.uuid,
+            description=payload.description,
+            flow=payload.flow,
+            transport=payload.transport,
+            ws_path=payload.ws_path,
+            ws_host=payload.ws_host,
+            tls_enabled=payload.tls_enabled,
+            tls_server_name=payload.tls_server_name,
+            tls_skip_verify=payload.tls_skip_verify,
+            reality_enabled=payload.reality_enabled,
+            reality_public_key=payload.reality_public_key,
+            reality_short_id=payload.reality_short_id,
+            enabled=True
+        )
+
+        # 2. 添加到 rust-router
+        ipc_error = None
+        try:
+            client = await _get_rust_router_client()
+            if client:
+                resp = await client.add_vless_outbound(
+                    tag=payload.tag,
+                    server_address=payload.server,
+                    server_port=payload.server_port,
+                    uuid=payload.uuid,
+                    flow=payload.flow,
+                    transport=payload.transport,
+                    tls_enabled=payload.tls_enabled,
+                    tls_sni=payload.tls_server_name,
+                    tls_skip_verify=payload.tls_skip_verify,
+                    reality_enabled=payload.reality_enabled,
+                    reality_public_key=payload.reality_public_key,
+                    reality_short_id=payload.reality_short_id,
+                    ws_path=payload.ws_path,
+                    ws_host=payload.ws_host,
+                )
+                if not resp.success:
+                    ipc_error = resp.error
+        except Exception as e:
+            ipc_error = str(e)
+
+        return {
+            "success": True,
+            "message": f"VLESS egress '{payload.tag}' created",
+            "tag": payload.tag,
+            "id": egress_id,
+            "ipc_error": ipc_error,
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[api] Error creating VLESS egress: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/api/egress/vless/{tag}")
+async def api_get_vless_egress(tag: str):
+    """获取 VLESS 出口详情 (合并数据库和运行时状态)"""
+    db = _get_db()
+
+    egress = db.get_vless_egress(tag)
+    if not egress:
+        raise HTTPException(status_code=404, detail=f"VLESS egress '{tag}' not found")
+
+    # 尝试获取运行时状态
+    runtime = {}
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.get_vless_outbound(tag)
+            if resp.success:
+                runtime = resp.data or {}
+    except Exception:
+        pass
+
+    return {
+        "tag": tag,
+        "description": egress.get("description", ""),
+        "server": egress.get("server"),
+        "server_port": egress.get("server_port"),
+        "uuid": egress.get("uuid"),
+        "flow": egress.get("flow"),
+        "transport": egress.get("transport", "tcp"),
+        "ws_path": egress.get("ws_path"),
+        "ws_host": egress.get("ws_host"),
+        "tls_enabled": bool(egress.get("tls_enabled", 1)),
+        "tls_server_name": egress.get("tls_server_name"),
+        "tls_skip_verify": bool(egress.get("tls_skip_verify", 0)),
+        "reality_enabled": bool(egress.get("reality_enabled", 0)),
+        "reality_public_key": egress.get("reality_public_key"),
+        "reality_short_id": egress.get("reality_short_id"),
+        "enabled": bool(egress.get("enabled", 1)),
+        # 运行时状态
+        "health_status": runtime.get("health_status", "unknown"),
+        "active_connections": runtime.get("active_connections", 0),
+    }
+
+
+@app.delete("/api/egress/vless/{tag}")
+async def api_delete_vless_egress(tag: str):
+    """删除 VLESS 出口 (从数据库和 rust-router 删除)"""
+    db = _get_db()
+
+    # 检查是否存在
+    if not db.get_vless_egress(tag):
+        raise HTTPException(status_code=404, detail=f"VLESS egress '{tag}' not found")
+
+    # 1. 从 rust-router 移除
+    ipc_error = None
+    try:
+        client = await _get_rust_router_client()
+        if client:
+            resp = await client.remove_vless_outbound(tag)
+            if not resp.success:
+                ipc_error = resp.error
+    except Exception as e:
+        ipc_error = str(e)
+
+    # 2. 从数据库删除
+    db.delete_vless_egress(tag)
+
+    return {
+        "success": True,
+        "message": f"VLESS egress '{tag}' deleted",
+        "ipc_error": ipc_error,
+    }
 
 
 # ============ Xray Egress Control APIs (DEPRECATED - use rust-router VLESS) ============

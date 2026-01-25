@@ -50,6 +50,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::error::OutboundError;
+use crate::io::bidirectional_copy;
 use crate::outbound::socks5_common::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_METHOD_NONE, CMD_CONNECT,
     REPLY_ADDRESS_TYPE_NOT_SUPPORTED, REPLY_COMMAND_NOT_SUPPORTED, REPLY_CONNECTION_REFUSED,
@@ -299,11 +300,13 @@ async fn handle_connection(
     // Send success reply
     send_reply(&mut stream, REPLY_SUCCEEDED, dest_addr).await?;
 
-    // Get the underlying TcpStream for relay
-    let outbound_stream = outbound_conn.into_stream();
+    // Get the underlying stream for relay (supports TCP, TLS, VLESS, Shadowsocks, etc.)
+    let mut outbound_stream = outbound_conn.into_outbound_stream();
 
-    // Bidirectional relay
-    let (bytes_sent, bytes_recv) = relay_data(stream, outbound_stream).await?;
+    // Bidirectional relay using generic copy function
+    let copy_result = bidirectional_copy(&mut stream, &mut outbound_stream).await?;
+    let bytes_sent = copy_result.client_to_upstream;
+    let bytes_recv = copy_result.upstream_to_client;
 
     stats.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
     stats.bytes_received.fetch_add(bytes_recv, Ordering::Relaxed);
@@ -465,52 +468,6 @@ async fn send_reply(stream: &mut TcpStream, reply: u8, bound_addr: SocketAddr) -
 
     buf.extend_from_slice(&bound_addr.port().to_be_bytes());
     stream.write_all(&buf).await
-}
-
-/// Relay data bidirectionally between client and outbound
-async fn relay_data(
-    client: TcpStream,
-    outbound: TcpStream,
-) -> io::Result<(u64, u64)> {
-    let (mut client_read, mut client_write) = client.into_split();
-    let (mut outbound_read, mut outbound_write) = outbound.into_split();
-
-    let client_to_outbound = async {
-        let mut total = 0u64;
-        let mut buf = vec![0u8; 32768];
-        loop {
-            let n = client_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            outbound_write.write_all(&buf[..n]).await?;
-            total += n as u64;
-        }
-        let _ = outbound_write.shutdown().await;
-        Ok::<_, io::Error>(total)
-    };
-
-    let outbound_to_client = async {
-        let mut total = 0u64;
-        let mut buf = vec![0u8; 32768];
-        loop {
-            let n = outbound_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            client_write.write_all(&buf[..n]).await?;
-            total += n as u64;
-        }
-        let _ = client_write.shutdown().await;
-        Ok::<_, io::Error>(total)
-    };
-
-    let (sent_result, recv_result) = tokio::join!(client_to_outbound, outbound_to_client);
-
-    let bytes_sent = sent_result.unwrap_or(0);
-    let bytes_recv = recv_result.unwrap_or(0);
-
-    Ok((bytes_sent, bytes_recv))
 }
 
 /// Simple DNS resolution (placeholder - uses system resolver)

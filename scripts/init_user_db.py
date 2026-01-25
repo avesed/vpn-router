@@ -261,6 +261,72 @@ CREATE INDEX IF NOT EXISTS idx_v2ray_egress_tag ON v2ray_egress(tag);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_protocol ON v2ray_egress(protocol);
 CREATE INDEX IF NOT EXISTS idx_v2ray_egress_enabled ON v2ray_egress(enabled);
 
+-- Shadowsocks 出口表
+CREATE TABLE IF NOT EXISTS shadowsocks_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+
+    -- 服务器配置
+    server TEXT NOT NULL,
+    server_port INTEGER NOT NULL DEFAULT 8388,
+
+    -- 加密方式（支持 AEAD 2022 和传统 AEAD）
+    -- 2022-blake3-aes-256-gcm, 2022-blake3-aes-128-gcm, 2022-blake3-chacha20-poly1305
+    -- aes-256-gcm, aes-128-gcm, chacha20-ietf-poly1305
+    method TEXT NOT NULL DEFAULT 'aes-256-gcm',
+
+    -- 密码（对于 AEAD 2022 需要 Base64 格式的 32 字节密钥）
+    password TEXT NOT NULL,
+
+    -- UDP 支持
+    udp_enabled INTEGER DEFAULT 1,
+
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_shadowsocks_egress_tag ON shadowsocks_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_shadowsocks_egress_enabled ON shadowsocks_egress(enabled);
+
+-- VLESS 出口表
+CREATE TABLE IF NOT EXISTS vless_egress (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tag TEXT NOT NULL UNIQUE,
+    description TEXT DEFAULT '',
+
+    -- 服务器配置
+    server TEXT NOT NULL,
+    server_port INTEGER NOT NULL DEFAULT 443,
+
+    -- 认证
+    uuid TEXT NOT NULL,
+    flow TEXT,                                  -- xtls-rprx-vision 等
+
+    -- 传输层配置
+    transport TEXT NOT NULL DEFAULT 'tcp',      -- tcp, ws, grpc
+    ws_path TEXT,                               -- WebSocket 路径
+    ws_host TEXT,                               -- WebSocket Host 头
+
+    -- TLS 配置
+    tls_enabled INTEGER DEFAULT 1,
+    tls_server_name TEXT,                       -- SNI
+    tls_skip_verify INTEGER DEFAULT 0,
+
+    -- REALITY 配置（Xray 专有）
+    reality_enabled INTEGER DEFAULT 0,
+    reality_public_key TEXT,                    -- REALITY 服务器公钥
+    reality_short_id TEXT,                      -- REALITY Short ID
+
+    -- 状态
+    enabled INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_vless_egress_tag ON vless_egress(tag);
+CREATE INDEX IF NOT EXISTS idx_vless_egress_enabled ON vless_egress(enabled);
+
 -- WARP 出口表（Cloudflare WARP via WireGuard）
 -- Simplified schema - WireGuard only (MASQUE removed)
 -- Added WireGuard config fields for persistence
