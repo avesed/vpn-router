@@ -6130,7 +6130,7 @@ impl IpcHandler {
             server_port,
             uuid: "***".to_string(), // Hidden for security
             flow: String::new(), // Not available through trait
-            transport: "unknown".to_string(), // Not available through trait
+            transport: outbound.transport_type().unwrap_or("unknown").to_string(),
             enabled: outbound.is_enabled(),
             health_status: outbound.health_status().to_string(),
             active_connections: outbound.active_connections(),

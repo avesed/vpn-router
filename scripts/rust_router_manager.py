@@ -25,6 +25,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import ipaddress
 import logging
@@ -65,7 +66,8 @@ EGRESS_TYPE_MAP = {
     "custom": "wireguard",
     "warp": "wireguard",  # WARP WireGuard mode
     "warp-masque": "socks5",  # WARP MASQUE mode
-    "v2ray": "socks5",
+    "v2ray": "socks5",  # VMess/Trojan still use Xray SOCKS5
+    "vless": "vless",  # Native VLESS in rust-router
     "direct": "direct",
     "openvpn": "direct",  # OpenVPN uses tun device binding
 }
@@ -344,6 +346,8 @@ class RustRouterManager:
         self._db = None  # Lazy loaded
         # Userspace WireGuard is now the only mode (kernel WG deprecated)
         self._peer_repair_attempted_tags: Set[str] = set()
+        # Track outbound config fingerprints to detect DB config changes
+        self._outbound_config_fingerprints: Dict[str, str] = {}
 
     def _get_db(self):
         """Get database instance (lazy load)"""
@@ -612,6 +616,19 @@ class RustRouterManager:
     # Outbound Sync
     # =========================================================================
 
+    @staticmethod
+    def _config_fingerprint(config: Dict[str, Any]) -> str:
+        """Compute a fingerprint of an outbound config dict for change detection.
+
+        Excludes transient fields (like egress_type) that don't affect the
+        actual outbound behavior. Uses sorted JSON for deterministic hashing.
+        """
+        # Only include fields that affect the actual outbound configuration
+        # Exclude 'egress_type' which is metadata, not config
+        relevant = {k: v for k, v in config.items() if k != "egress_type"}
+        canonical = json.dumps(relevant, sort_keys=True, default=str)
+        return hashlib.md5(canonical.encode()).hexdigest()
+
     async def sync_outbounds(self) -> SyncResult:
         """Sync all outbounds from database to rust-router.
 
@@ -649,16 +666,70 @@ class RustRouterManager:
                                 "egress_type": "warp-masque",
                             }
 
-                # V2Ray egress (SOCKS5)
+                # V2Ray egress - VLESS uses native rust-router, VMess/Trojan use Xray SOCKS5
                 for egress in db.get_v2ray_egress_list(enabled_only=True):
                     tag = egress.get("tag", "")
-                    socks_port = egress.get("socks_port")
-                    if tag and socks_port:
+                    protocol = egress.get("protocol", "").lower()
+
+                    if not tag:
+                        continue
+
+                    if protocol == "vless":
+                        # Native VLESS outbound in rust-router
+                        # Determine transport type based on DB fields
+                        transport_type = egress.get("transport_type", "tcp").lower()
+                        tls_enabled = egress.get("tls_enabled", False)
+                        reality_enabled = egress.get("reality_enabled", False)
+
+                        # Map transport to rust-router format
+                        if transport_type == "ws" or transport_type == "websocket":
+                            if tls_enabled:
+                                transport = "websocket_tls"
+                            else:
+                                transport = "websocket"
+                        elif tls_enabled:
+                            transport = "tls"
+                        else:
+                            transport = "tcp"
+
+                        # Get WebSocket config if applicable
+                        ws_path = None
+                        ws_host = None
+                        transport_config = egress.get("transport_config") or {}
+                        if isinstance(transport_config, str):
+                            try:
+                                transport_config = json.loads(transport_config)
+                            except (json.JSONDecodeError, TypeError):
+                                transport_config = {}
+                        if transport_type in ("ws", "websocket"):
+                            ws_path = transport_config.get("path", "/")
+                            ws_host = transport_config.get("host")
+
                         db_outbounds[tag] = {
-                            "type": "socks5",
-                            "server_addr": f"127.0.0.1:{socks_port}",
-                            "egress_type": "v2ray",
+                            "type": "vless",
+                            "server_address": egress.get("server", ""),
+                            "server_port": egress.get("server_port", 443),
+                            "uuid": egress.get("uuid", ""),
+                            "flow": egress.get("flow") or "",
+                            "transport": transport,
+                            "tls_sni": egress.get("tls_sni"),
+                            "tls_skip_verify": bool(egress.get("tls_allow_insecure", 0)),
+                            "reality_enabled": bool(reality_enabled),
+                            "reality_public_key": egress.get("reality_public_key"),
+                            "reality_short_id": egress.get("reality_short_id"),
+                            "ws_path": ws_path,
+                            "ws_host": ws_host,
+                            "egress_type": "vless",
                         }
+                    else:
+                        # VMess/Trojan: use Xray SOCKS5 proxy
+                        socks_port = egress.get("socks_port")
+                        if socks_port:
+                            db_outbounds[tag] = {
+                                "type": "socks5",
+                                "server_addr": f"127.0.0.1:{socks_port}",
+                                "egress_type": "v2ray",
+                            }
 
                 # Direct egress
                 for egress in db.get_direct_egress_list(enabled_only=True):
@@ -701,14 +772,54 @@ class RustRouterManager:
                     except Exception as e:
                         logger.debug(f"Failed to get WG tunnel tags: {e}")
 
-                    # Add missing outbounds
+                    # Add missing outbounds and update changed configs
                     for tag, config in db_outbounds.items():
+                        new_fingerprint = self._config_fingerprint(config)
+
                         if tag not in current_tags:
+                            # New outbound - add it
                             add_result = await self._add_outbound(client, tag, config)
                             if add_result.success:
                                 result.outbounds_added += 1
+                                self._outbound_config_fingerprints[tag] = new_fingerprint
                             else:
                                 result.errors.append(f"Failed to add {tag}: {add_result.error}")
+                        elif tag not in self._outbound_config_fingerprints:
+                            # Outbound exists but no fingerprint yet (first sync after restart)
+                            # Remove and re-add to ensure DB config is authoritative
+                            # (DB may have been changed while process was down)
+                            # Skip built-in outbounds (direct, block) which don't need re-adding
+                            if config.get("type") in ("direct", "block"):
+                                self._outbound_config_fingerprints[tag] = new_fingerprint
+                                continue
+                            logger.info(f"First sync for '{tag}', ensuring DB config is applied")
+                            remove_result = await client.remove_outbound(tag)
+                            if remove_result.success:
+                                add_result = await self._add_outbound(client, tag, config)
+                                if add_result.success:
+                                    result.outbounds_added += 1
+                                    result.outbounds_removed += 1
+                                    self._outbound_config_fingerprints[tag] = new_fingerprint
+                                else:
+                                    result.errors.append(f"Failed to re-add {tag}: {add_result.error}")
+                            else:
+                                # Removal failed - just record fingerprint and move on
+                                logger.warning(f"Failed to remove '{tag}' for re-add: {remove_result.error}")
+                                self._outbound_config_fingerprints[tag] = new_fingerprint
+                        elif self._outbound_config_fingerprints[tag] != new_fingerprint:
+                            # Config changed in DB - remove and re-add
+                            logger.info(f"Config changed for '{tag}', updating outbound")
+                            remove_result = await client.remove_outbound(tag)
+                            if remove_result.success:
+                                add_result = await self._add_outbound(client, tag, config)
+                                if add_result.success:
+                                    result.outbounds_added += 1
+                                    result.outbounds_removed += 1
+                                    self._outbound_config_fingerprints[tag] = new_fingerprint
+                                else:
+                                    result.errors.append(f"Failed to re-add {tag}: {add_result.error}")
+                            else:
+                                result.errors.append(f"Failed to remove {tag} for update: {remove_result.error}")
 
                     # Remove stale outbounds (except built-in ones and WireGuard tunnels)
                     builtin_tags = {"direct", "block"}
@@ -723,6 +834,7 @@ class RustRouterManager:
                         remove_result = await client.remove_outbound(current_tag)
                         if remove_result.success:
                             result.outbounds_removed += 1
+                            self._outbound_config_fingerprints.pop(current_tag, None)
                         else:
                             result.errors.append(f"Failed to remove {current_tag}: {remove_result.error}")
 
@@ -768,6 +880,25 @@ class RustRouterManager:
                 server_addr=server_addr,
                 username=username,
                 password=password,
+            )
+
+        elif outbound_type == "vless":
+            # Native VLESS outbound
+            return await client.add_vless_outbound(
+                tag=tag,
+                server_address=config.get("server_address", ""),
+                server_port=config.get("server_port", 443),
+                uuid=config.get("uuid", ""),
+                flow=config.get("flow"),
+                transport=config.get("transport", "tcp"),
+                tls_enabled=config.get("transport", "tcp") in ("tls", "websocket_tls"),
+                tls_sni=config.get("tls_sni"),
+                tls_skip_verify=config.get("tls_skip_verify", False),
+                reality_enabled=config.get("reality_enabled", False),
+                reality_public_key=config.get("reality_public_key"),
+                reality_short_id=config.get("reality_short_id"),
+                ws_path=config.get("ws_path"),
+                ws_host=config.get("ws_host"),
             )
 
         elif outbound_type == "direct":

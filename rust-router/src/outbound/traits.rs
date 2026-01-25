@@ -26,6 +26,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
 use crate::transport::TransportStream;
+use crate::vless::VlessStream;
 
 /// Connection pool statistics (for pooled outbound types like SOCKS5)
 #[derive(Debug, Clone, Copy, Default)]
@@ -107,6 +108,8 @@ pub enum OutboundStream {
     /// Shadowsocks encrypted stream
     #[cfg(feature = "shadowsocks")]
     Shadowsocks(super::shadowsocks::ShadowsocksStream),
+    /// VLESS stream with deferred response header handling
+    Vless(VlessStream),
 }
 
 impl OutboundStream {
@@ -120,6 +123,12 @@ impl OutboundStream {
     #[must_use]
     pub fn transport(stream: TransportStream) -> Self {
         Self::Transport(stream)
+    }
+
+    /// Create from a VLESS stream
+    #[must_use]
+    pub fn vless(stream: VlessStream) -> Self {
+        Self::Vless(stream)
     }
 
     /// Check if this is a TCP stream
@@ -145,6 +154,12 @@ impl OutboundStream {
         {
             false
         }
+    }
+
+    /// Check if this is a VLESS stream
+    #[must_use]
+    pub const fn is_vless(&self) -> bool {
+        matches!(self, Self::Vless(_))
     }
 
     /// Check if this stream requires a write operation before reading.
@@ -191,6 +206,7 @@ impl OutboundStream {
             Self::Transport(_) => None,
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
+            Self::Vless(_) => None,
         }
     }
 
@@ -203,6 +219,7 @@ impl OutboundStream {
             Self::Transport(_) => None,
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None,
+            Self::Vless(_) => None,
         }
     }
 
@@ -234,6 +251,7 @@ impl OutboundStream {
             Self::Transport(TransportStream::Quic(s)) => Some(s.remote_address()), // Return remote address for QUIC
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(_) => None, // Shadowsocks doesn't expose local addr directly
+            Self::Vless(_) => None, // VLESS wraps transport, doesn't expose local addr directly
         }
     }
 }
@@ -255,6 +273,10 @@ impl std::fmt::Debug for OutboundStream {
                 .debug_struct("OutboundStream::Shadowsocks")
                 .field("inner", &s)
                 .finish(),
+            Self::Vless(s) => f
+                .debug_struct("OutboundStream::Vless")
+                .field("header_consumed", &s.is_header_consumed())
+                .finish(),
         }
     }
 }
@@ -270,6 +292,7 @@ impl AsyncRead for OutboundStream {
             Self::Transport(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Vless(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -285,6 +308,7 @@ impl AsyncWrite for OutboundStream {
             Self::Transport(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Vless(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -294,6 +318,7 @@ impl AsyncWrite for OutboundStream {
             Self::Transport(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_flush(cx),
+            Self::Vless(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -303,6 +328,7 @@ impl AsyncWrite for OutboundStream {
             Self::Transport(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "shadowsocks")]
             Self::Shadowsocks(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Vless(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -657,6 +683,17 @@ impl OutboundConnection {
         }
     }
 
+    /// Create a new outbound connection from a VLESS stream
+    ///
+    /// Use this constructor for VLESS connections that use deferred response header.
+    pub fn from_vless(stream: VlessStream, remote_addr: SocketAddr) -> Self {
+        Self {
+            stream: OutboundStream::Vless(stream),
+            local_addr: None, // VlessStream doesn't expose local address
+            remote_addr,
+        }
+    }
+
     /// Get the underlying stream reference (generic)
     ///
     /// This returns the `OutboundStream` enum which can be matched to get
@@ -720,6 +757,9 @@ impl OutboundConnection {
             #[cfg(feature = "shadowsocks")]
             OutboundStream::Shadowsocks(_) => {
                 panic!("Cannot convert Shadowsocks stream to TcpStream; use into_outbound_stream() instead")
+            }
+            OutboundStream::Vless(_) => {
+                panic!("Cannot convert VLESS stream to TcpStream; use into_outbound_stream() instead")
             }
         }
     }
@@ -846,6 +886,13 @@ pub trait Outbound: Send + Sync {
     ///
     /// Returns `None` for non-proxy outbound types like Direct.
     fn proxy_server_info(&self) -> Option<ProxyServerInfo> {
+        None
+    }
+
+    /// Get the transport type name (e.g., "tcp", "tls", "websocket")
+    ///
+    /// Returns `None` for outbound types that don't have a configurable transport.
+    fn transport_type(&self) -> Option<&str> {
         None
     }
 

@@ -138,6 +138,7 @@ pub mod account;
 pub mod addons;
 pub mod error;
 pub mod protocol;
+pub mod stream;
 
 // Re-export commonly used types at module level
 pub use account::{VlessAccount, VlessAccountManager};
@@ -147,6 +148,7 @@ pub use protocol::{
     address_type, VlessAddress, VlessCommand, VlessRequestHeader, VlessResponseHeader,
     VLESS_VERSION,
 };
+pub use stream::VlessStream;
 
 /// VLESS protocol constants
 pub mod constants {

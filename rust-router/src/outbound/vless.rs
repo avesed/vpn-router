@@ -57,7 +57,7 @@ use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
 use crate::transport::{connect as transport_connect, TlsConfig, TransportConfig, WebSocketConfig};
 use crate::vless::{
-    VlessAddons, VlessAddress, VlessCommand, VlessRequestHeader, VlessResponseHeader,
+    VlessAddons, VlessAddress, VlessCommand, VlessRequestHeader, VlessStream,
 };
 
 // ============================================================================
@@ -483,14 +483,18 @@ impl VlessOutbound {
         }
     }
 
-    /// Perform VLESS handshake on a connected stream
-    async fn vless_handshake<S>(
+    /// Send VLESS request header on a connected stream
+    ///
+    /// This only sends the request header. The response header will be consumed
+    /// by `VlessStream` on the first read, implementing the "deferred response"
+    /// pattern that VLESS servers use.
+    async fn send_vless_request<S>(
         &self,
         stream: &mut S,
         dest_addr: SocketAddr,
     ) -> Result<(), VlessOutboundError>
     where
-        S: AsyncReadExt + AsyncWriteExt + Unpin,
+        S: AsyncWriteExt + Unpin,
     {
         // Build addons
         let addons = if self.config.flow.is_empty() {
@@ -524,17 +528,22 @@ impl VlessOutbound {
             .await
             .map_err(|e| VlessOutboundError::HandshakeFailed(format!("failed to send request: {e}")))?;
 
-        // Read response header
-        // Response format: version (1 byte) + addons length (1 byte) + addons (variable)
-        let response = VlessResponseHeader::read_from(stream)
+        // Flush to ensure the request is sent
+        stream
+            .flush()
             .await
-            .map_err(|e| VlessOutboundError::HandshakeFailed(format!("failed to read response: {e}")))?;
+            .map_err(|e| VlessOutboundError::HandshakeFailed(format!("failed to flush request: {e}")))?;
 
-        trace!(
-            "Received VLESS response header: version={}, addons_empty={}",
-            response.version,
-            response.addons.is_empty()
+        debug!(
+            "VLESS request header sent ({} bytes) for {}",
+            encoded.len(),
+            dest_addr
         );
+
+        // NOTE: We do NOT read the response header here.
+        // The response header will be consumed by VlessStream on first read.
+        // This is the "deferred response" pattern - the server only sends the
+        // response header after it has data from the target to send back.
 
         Ok(())
     }
@@ -589,20 +598,21 @@ impl Outbound for VlessOutbound {
             }
         };
 
-        // Perform VLESS handshake with remaining timeout
-        let handshake_result = timeout(connect_timeout, self.vless_handshake(&mut stream, addr)).await;
+        // Send VLESS request header (do NOT wait for response - deferred pattern)
+        let request_result = timeout(connect_timeout, self.send_vless_request(&mut stream, addr)).await;
 
-        match handshake_result {
+        match request_result {
             Ok(Ok(())) => {
                 self.update_health(true);
                 debug!(
-                    "VLESS connection to {} via {} successful",
+                    "VLESS connection to {} via {} ready (deferred response)",
                     addr, self.config.tag
                 );
 
-                // Create OutboundConnection from the TransportStream
-                // This supports all transport types (TCP, TLS, WebSocket)
-                Ok(OutboundConnection::from_transport(stream, addr))
+                // Wrap in VlessStream for deferred response header handling
+                // The response header will be consumed on first read
+                let vless_stream = VlessStream::new(stream);
+                Ok(OutboundConnection::from_vless(vless_stream, addr))
             }
             Ok(Err(e)) => {
                 self.update_health(false);
@@ -652,6 +662,15 @@ impl Outbound for VlessOutbound {
         Some(ProxyServerInfo {
             address: self.config.server_string(),
             has_auth: true, // VLESS always uses UUID auth
+        })
+    }
+
+    fn transport_type(&self) -> Option<&str> {
+        Some(match &self.config.transport {
+            VlessTransportConfig::Tcp => "tcp",
+            VlessTransportConfig::Tls { .. } => "tls",
+            VlessTransportConfig::WebSocket { tls: Some(_), .. } => "websocket_tls",
+            VlessTransportConfig::WebSocket { tls: None, .. } => "websocket",
         })
     }
 

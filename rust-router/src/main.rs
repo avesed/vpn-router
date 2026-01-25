@@ -326,6 +326,12 @@ impl UserspaceWgConfig {
 async fn main() -> Result<()> {
     let start_time = Instant::now();
 
+    // Install the default CryptoProvider (ring) for rustls 0.23+
+    // Must be called before any TLS operations (VLESS TLS outbound, DoT, DoH, etc.)
+    // Without this, ClientConfig::builder() panics with "no process-level CryptoProvider"
+    #[cfg(feature = "transport-tls")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Parse arguments
     let args = Args::parse();
 

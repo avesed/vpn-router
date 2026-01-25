@@ -73,6 +73,10 @@ pub enum VlessError {
     /// Protocol error (general malformed message)
     #[error("Protocol error: {0}")]
     ProtocolError(String),
+
+    /// Invalid or incomplete response header
+    #[error("Invalid or incomplete VLESS response header")]
+    InvalidHeader,
 }
 
 impl VlessError {
@@ -132,7 +136,8 @@ impl From<VlessError> for io::Error {
             | VlessError::InvalidCommand(_)
             | VlessError::InvalidAddressType(_)
             | VlessError::AddonsParseError(_)
-            | VlessError::ProtocolError(_) => {
+            | VlessError::ProtocolError(_)
+            | VlessError::InvalidHeader => {
                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
             }
             VlessError::InvalidUuid(_) | VlessError::AuthenticationFailed => {
