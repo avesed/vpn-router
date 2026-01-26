@@ -524,6 +524,10 @@ impl VlessWgBridge {
                 BridgeError::SmoltcpTcp(format!("session registration failed: {e}"))
             })?;
 
+        // Create per-connection channel for WG replies (performance optimization)
+        // This allows event-driven reply handling instead of polling
+        let (conn_reply_tx, conn_reply_rx) = mpsc::channel::<WgReplyPacket>(64);
+
         // Register with the global reply registry so WgReplyHandler can route replies to us
         let reply_key = VlessReplyKey::new(
             self.wg_tag.clone(),
@@ -533,7 +537,8 @@ impl VlessWgBridge {
             dest_port,
         );
         if let Some(ref registry) = self.reply_registry {
-            registry.register(reply_key.clone(), self.wg_reply_tx.clone(), client_addr);
+            // Use per-connection sender for event-driven reply handling
+            registry.register(reply_key.clone(), conn_reply_tx, client_addr);
             debug!(
                 "Registered VLESS session with reply registry: tunnel={} {}:{} -> {}:{}",
                 self.wg_tag, self.local_ip, local_port, dest_ip, dest_port
@@ -544,9 +549,9 @@ impl VlessWgBridge {
         self.stats.tcp_connections.fetch_add(1, Ordering::Relaxed);
         self.stats.active_tcp.fetch_add(1, Ordering::Relaxed);
 
-        // Run the forwarding loop
+        // Run the forwarding loop with per-connection reply channel
         let result = self
-            .tcp_forward_loop(&conn_id, stream, socket_handle, &session_key)
+            .tcp_forward_loop(&conn_id, stream, socket_handle, &session_key, conn_reply_rx)
             .await;
 
         // Cleanup stats
@@ -603,110 +608,85 @@ impl VlessWgBridge {
     /// TCP forwarding loop
     ///
     /// Handles bidirectional data transfer between VLESS stream and smoltcp socket.
+    /// Uses event-driven architecture with per-connection reply channel for optimal throughput.
     async fn tcp_forward_loop<S>(
         &self,
         _conn_id: &VlessConnectionId,
         stream: S,
         socket_handle: SocketHandle,
         _session_key: &SessionKey,
+        mut conn_reply_rx: mpsc::Receiver<WgReplyPacket>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let (mut reader, mut writer) = tokio::io::split(stream);
-        let mut vless_buf = vec![0u8; TCP_RX_BUFFER];
-        let mut smoltcp_buf = vec![0u8; TCP_TX_BUFFER];
+        // Use larger buffers for better throughput (64KB instead of 16KB)
+        let mut vless_buf = vec![0u8; 65536];
+        let mut smoltcp_buf = vec![0u8; 65536];
 
         // Half-close tracking
         let mut vless_closed = false;
         let mut smoltcp_closed = false;
 
-        // Wait for connection to establish
-        let connected = self.wait_for_tcp_connect(socket_handle).await?;
+        // Wait for connection to establish (using per-connection reply channel)
+        let connected = self
+            .wait_for_tcp_connect_with_rx(socket_handle, &mut conn_reply_rx)
+            .await?;
         if !connected {
             return Err(BridgeError::ConnectionTimeout);
         }
 
+        // TCP timer interval - check state and handle retransmissions
+        // Using 5ms for better responsiveness while keeping event-driven benefits
+        let timer_interval = Duration::from_millis(5);
+
         loop {
-            // Check shutdown
+            // Check shutdown (no lock needed - atomic check)
             if self.is_shutdown() {
                 return Err(BridgeError::TunnelDown("bridge shutdown".into()));
             }
 
-            // Poll smoltcp and send generated packets
-            self.poll_and_send().await?;
+            // OPTIMIZATION: Only lock smoltcp when we have actual work to do!
+            // The select! below is event-driven - we only process when data arrives
+            // TCP timers are handled in the timeout branch (every 50ms)
 
-            // Receive WG replies and feed to smoltcp
-            self.receive_wg_replies().await;
-
-            // Poll again after feeding replies
-            {
-                let mut bridge = self.smoltcp.lock().await;
-                bridge.poll();
-            }
-
-            // Check socket state
-            let socket_state = {
-                let bridge = self.smoltcp.lock().await;
-                bridge.tcp_socket_state(socket_handle)
-            };
-
-            // Handle various TCP states
-            match socket_state {
-                TcpState::Closed | TcpState::TimeWait => {
-                    debug!("TCP socket closed/timewait, ending loop");
-                    smoltcp_closed = true;
-                    if vless_closed {
-                        break;
-                    }
-                }
-                TcpState::CloseWait => {
-                    // Remote closed, but we can still send
-                    smoltcp_closed = true;
-                }
-                TcpState::LastAck | TcpState::Closing => {
-                    // Connection is closing
-                    if vless_closed {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-
-            // Calculate poll delay
-            let poll_delay = {
-                let mut bridge = self.smoltcp.lock().await;
-                bridge.poll_delay().unwrap_or(Duration::from_millis(10))
-            };
-            let poll_delay = poll_delay.min(Duration::from_millis(100));
-
+            // Event-driven select! with biased priority (data first, then timeout)
             tokio::select! {
                 biased;
-
-                // VLESS -> smoltcp (forward direction)
+                // VLESS -> smoltcp (forward direction, event-driven)
                 result = reader.read(&mut vless_buf), if !vless_closed => {
                     match result {
                         Ok(0) => {
-                            // VLESS client closed - send FIN
-                            debug!("VLESS client closed, sending FIN to remote");
+                            debug!("VLESS client half-closed, continuing to receive from remote");
                             vless_closed = true;
-                            let mut bridge = self.smoltcp.lock().await;
-                            bridge.tcp_close(socket_handle);
                         }
                         Ok(n) => {
                             trace!("Read {} bytes from VLESS", n);
                             self.stats.bytes_to_wg.fetch_add(n as u64, Ordering::Relaxed);
 
-                            // Send to smoltcp socket
-                            let mut bridge = self.smoltcp.lock().await;
-                            let socket = bridge.get_tcp_socket_mut(socket_handle);
-                            if socket.can_send() {
-                                if let Err(e) = socket.send_slice(&vless_buf[..n]) {
-                                    warn!("Failed to send to smoltcp: {:?}", e);
-                                    return Err(BridgeError::SmoltcpTcp(format!("send failed: {e:?}")));
+                            // Write to smoltcp, poll to generate IP packets, and send IMMEDIATELY
+                            let tx_packets = {
+                                let mut bridge = self.smoltcp.lock().await;
+                                let socket = bridge.get_tcp_socket_mut(socket_handle);
+                                if socket.can_send() {
+                                    if let Err(e) = socket.send_slice(&vless_buf[..n]) {
+                                        warn!("Failed to send to smoltcp: {:?}", e);
+                                        return Err(BridgeError::SmoltcpTcp(format!("send failed: {e:?}")));
+                                    }
+                                } else {
+                                    warn!("smoltcp socket cannot send");
                                 }
-                            } else {
-                                warn!("smoltcp socket cannot send");
+                                // CRITICAL: Poll immediately to generate IP packets!
+                                bridge.poll();
+                                bridge.drain_tx_packets()
+                            };
+
+                            // Send generated packets to WG in batch (reduces lock overhead)
+                            if !tx_packets.is_empty() {
+                                if let Err(e) = self.wg_egress.send_batch(&self.wg_tag, tx_packets).await {
+                                    trace!("WG batch send error: {}", e);
+                                }
                             }
                         }
                         Err(e) => {
@@ -716,48 +696,220 @@ impl VlessWgBridge {
                     }
                 }
 
-                // smoltcp -> VLESS (reverse direction)
-                _ = tokio::time::sleep(Duration::from_millis(1)), if !smoltcp_closed => {
-                    let mut bridge = self.smoltcp.lock().await;
-                    let socket = bridge.get_tcp_socket_mut(socket_handle);
+                // WG reply -> smoltcp -> VLESS (event-driven with batch processing!)
+                Some(reply) = conn_reply_rx.recv(), if !smoltcp_closed => {
+                    // Batch process all available WG replies for better throughput
+                    let (total_read, tx_packets) = {
+                        let mut bridge = self.smoltcp.lock().await;
+                        bridge.feed_rx_packet(reply.packet);
 
-                    if socket.can_recv() {
-                        match socket.recv_slice(&mut smoltcp_buf) {
-                            Ok(n) if n > 0 => {
-                                trace!("Read {} bytes from smoltcp", n);
-                                self.stats.bytes_from_wg.fetch_add(n as u64, Ordering::Relaxed);
+                        // Drain any additional pending replies (non-blocking)
+                        while let Ok(additional) = conn_reply_rx.try_recv() {
+                            bridge.feed_rx_packet(additional.packet);
+                        }
 
-                                // Release lock before async write
-                                drop(bridge);
+                        // Process all fed packets at once
+                        bridge.poll();
 
-                                if let Err(e) = writer.write_all(&smoltcp_buf[..n]).await {
-                                    warn!("VLESS write error: {}", e);
-                                    return Err(e.into());
+                        // Read all available data from the socket
+                        let socket = bridge.get_tcp_socket_mut(socket_handle);
+                        let mut read_total = 0;
+                        while socket.can_recv() {
+                            match socket.recv_slice(&mut smoltcp_buf[read_total..]) {
+                                Ok(n) if n > 0 => {
+                                    read_total += n;
+                                    // If buffer is full, write it out
+                                    if read_total >= smoltcp_buf.len() - 1500 {
+                                        break;
+                                    }
                                 }
+                                Ok(_) => break,
+                                Err(_) => break,
                             }
-                            Ok(_) => {}
-                            Err(e) => {
-                                trace!("smoltcp recv error: {:?}", e);
-                            }
+                        }
+
+                        // CRITICAL: Get ACK packets to send immediately!
+                        let packets = bridge.drain_tx_packets();
+                        (read_total, packets)
+                    };
+
+                    // Send ACK packets to WG in batch (outside lock)
+                    if !tx_packets.is_empty() {
+                        if let Err(e) = self.wg_egress.send_batch(&self.wg_tag, tx_packets).await {
+                            trace!("WG batch send error: {}", e);
+                        }
+                    }
+
+                    if total_read > 0 {
+                        trace!("Read {} bytes from smoltcp (batch)", total_read);
+                        self.stats.bytes_from_wg.fetch_add(total_read as u64, Ordering::Relaxed);
+
+                        if let Err(e) = writer.write_all(&smoltcp_buf[..total_read]).await {
+                            warn!("VLESS write error: {}", e);
+                            return Err(e.into());
+                        }
+                        // CRITICAL: Flush immediately to avoid Nagle/buffering delays!
+                        if let Err(e) = writer.flush().await {
+                            warn!("VLESS flush error: {}", e);
+                            return Err(e.into());
                         }
                     }
                 }
 
-                // Poll timeout
-                _ = tokio::time::sleep(poll_delay) => {}
+                // Timer for TCP state machine, retransmissions, and keepalives
+                _ = tokio::time::sleep(timer_interval), if !vless_closed || !smoltcp_closed => {
+                    // Poll smoltcp and handle TCP timers/state
+                    let (socket_state, can_recv_data, bytes_read, tx_packets) = {
+                        let mut bridge = self.smoltcp.lock().await;
+                        bridge.poll(); // Handle retransmissions and TCP timers
+
+                        let socket = bridge.get_tcp_socket_mut(socket_handle);
+                        let state = socket.state();
+                        let can_recv = socket.can_recv();
+
+                        // Read any available data
+                        let n = if can_recv {
+                            match socket.recv_slice(&mut smoltcp_buf) {
+                                Ok(n) if n > 0 => n,
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+
+                        let packets = bridge.drain_tx_packets();
+                        (state, can_recv, n, packets)
+                    };
+
+                    // Send retransmission/keepalive packets in batch
+                    if !tx_packets.is_empty() {
+                        if let Err(e) = self.wg_egress.send_batch(&self.wg_tag, tx_packets).await {
+                            trace!("WG batch send error: {}", e);
+                        }
+                    }
+
+                    // Write any data we read
+                    if bytes_read > 0 {
+                        trace!("Read {} bytes from smoltcp on timeout poll", bytes_read);
+                        self.stats.bytes_from_wg.fetch_add(bytes_read as u64, Ordering::Relaxed);
+                        if let Err(e) = writer.write_all(&smoltcp_buf[..bytes_read]).await {
+                            warn!("VLESS write error: {}", e);
+                            return Err(e.into());
+                        }
+                        // CRITICAL: Flush immediately!
+                        if let Err(e) = writer.flush().await {
+                            warn!("VLESS flush error: {}", e);
+                            return Err(e.into());
+                        }
+                    }
+
+                    // Handle TCP states (moved from top of loop)
+                    match socket_state {
+                        TcpState::Closed | TcpState::TimeWait => {
+                            debug!("TCP socket closed/timewait, ending loop");
+                            smoltcp_closed = true;
+                            if vless_closed {
+                                break;
+                            }
+                        }
+                        TcpState::CloseWait => {
+                            if !can_recv_data {
+                                debug!("TCP socket in CloseWait, receive buffer drained");
+                                smoltcp_closed = true;
+                            }
+                        }
+                        TcpState::LastAck | TcpState::Closing => {
+                            if vless_closed {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // Exit if both sides closed
             if vless_closed && smoltcp_closed {
                 debug!("Both sides closed, exiting loop");
+                let mut bridge = self.smoltcp.lock().await;
+                bridge.tcp_close(socket_handle);
                 break;
+            }
+
+            // Proactive close check when VLESS client has closed
+            if vless_closed && !smoltcp_closed {
+                let bridge = self.smoltcp.lock().await;
+                let socket = bridge.get_tcp_socket(socket_handle);
+                if !socket.can_recv() && !socket.may_recv() {
+                    debug!("VLESS closed and no more data from remote, closing TCP");
+                    drop(bridge);
+                    let mut bridge = self.smoltcp.lock().await;
+                    bridge.tcp_close(socket_handle);
+                    smoltcp_closed = true;
+                }
             }
         }
 
         Ok(())
     }
 
-    /// Wait for TCP connection to establish
+    /// Wait for TCP connection to establish (using per-connection reply channel)
+    async fn wait_for_tcp_connect_with_rx(
+        &self,
+        socket_handle: SocketHandle,
+        conn_reply_rx: &mut mpsc::Receiver<WgReplyPacket>,
+    ) -> Result<bool> {
+        let timeout = Duration::from_secs(TCP_IDLE_TIMEOUT_SECS / 10); // 30 seconds for connect
+        let start = std::time::Instant::now();
+
+        loop {
+            // Poll and send packets
+            self.poll_and_send().await?;
+
+            // Check state
+            let state = {
+                let mut bridge = self.smoltcp.lock().await;
+                bridge.poll();
+                bridge.tcp_socket_state(socket_handle)
+            };
+
+            match state {
+                TcpState::Established => {
+                    debug!("TCP connection established");
+                    return Ok(true);
+                }
+                TcpState::Closed => {
+                    return Err(BridgeError::ConnectionRefused);
+                }
+                TcpState::SynSent | TcpState::SynReceived => {
+                    // Still connecting, wait for reply
+                }
+                _ => {
+                    trace!("Unexpected state during connect: {:?}", state);
+                }
+            }
+
+            if start.elapsed() > timeout {
+                return Ok(false);
+            }
+
+            // Wait for WG reply or timeout (event-driven!)
+            tokio::select! {
+                Some(reply) = conn_reply_rx.recv() => {
+                    trace!("Received {} byte WG reply during connect", reply.packet.len());
+                    let mut bridge = self.smoltcp.lock().await;
+                    bridge.feed_rx_packet(reply.packet);
+                    bridge.poll();
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    // Timeout poll for retransmissions
+                }
+            }
+        }
+    }
+
+    /// Wait for TCP connection to establish (legacy, uses shared channel)
+    #[allow(dead_code)]
     async fn wait_for_tcp_connect(&self, socket_handle: SocketHandle) -> Result<bool> {
         let timeout = Duration::from_secs(TCP_IDLE_TIMEOUT_SECS / 10); // 30 seconds for connect
         let start = std::time::Instant::now();

@@ -50,14 +50,15 @@ pub const WG_MTU: usize = 1420;
 
 /// TCP receive buffer size
 ///
-/// Set to 16 KB to balance latency and throughput. Larger buffers increase
-/// latency due to bufferbloat, while smaller buffers may limit throughput.
-pub const TCP_RX_BUFFER: usize = 16384;
+/// Set to 64 KB for better throughput over high-latency links.
+/// Larger buffers allow bigger TCP windows which improves performance
+/// when RTT is significant.
+pub const TCP_RX_BUFFER: usize = 65536;
 
 /// TCP transmit buffer size
 ///
 /// Matched to the receive buffer size for symmetric performance.
-pub const TCP_TX_BUFFER: usize = 16384;
+pub const TCP_TX_BUFFER: usize = 65536;
 
 /// UDP receive buffer size
 ///
@@ -229,8 +230,9 @@ mod tests {
         // UDP buffers should be equal
         assert_eq!(UDP_RX_BUFFER, UDP_TX_BUFFER);
 
-        // UDP buffers should be larger than TCP for burst handling
-        assert!(UDP_RX_BUFFER >= TCP_RX_BUFFER);
+        // Both TCP and UDP should have at least 64KB buffers for throughput
+        assert!(TCP_RX_BUFFER >= 65536);
+        assert!(UDP_RX_BUFFER >= 65536);
     }
 
     #[test]

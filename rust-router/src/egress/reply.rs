@@ -182,7 +182,7 @@ impl WgReplyHandler {
         // Invoke the callback
         (self.reply_callback)(packet, tag);
 
-        debug!("Dispatched reply packet ({} bytes)", len);
+        trace!("Dispatched reply packet ({} bytes)", len);
     }
 
     /// Handle multiple reply packets at once

@@ -903,7 +903,7 @@ impl UserspaceWgTunnel {
                                 created_at: Instant::now(),
                             });
                             
-                            debug!(
+                            trace!(
                                 "Tunnel {} SNAT: {} -> {} (proto={}, {}:{} -> {}:{})",
                                 self.tag, tuple.src_ip, tunnel_ip, tuple.protocol,
                                 tuple.src_ip, tuple.src_port, tuple.dst_ip, tuple.dst_port
@@ -926,9 +926,9 @@ impl UserspaceWgTunnel {
             std::borrow::Cow::Borrowed(packet)
         };
 
-        // Log packet details for debugging (after potential SNAT)
+        // Log packet details at trace level (hot path - debug is too expensive)
         if let Some(src_ip) = extract_source_ip(&packet_to_send) {
-            debug!(
+            trace!(
                 "Tunnel {} send: {} bytes, src_ip={}, tunnel_local_ip={:?}",
                 self.tag,
                 packet_to_send.len(),
@@ -960,17 +960,20 @@ impl UserspaceWgTunnel {
             tunn.encapsulate(&packet_to_send, &mut dst)
         };
 
-        // Log encapsulation result for debugging
-        let result_type = match &result {
-            TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
-            TunnResult::Done => "Done".to_string(),
-            TunnResult::Err(e) => format!("Err({:?})", e),
-            _ => "Other".to_string(),
-        };
-        debug!(
-            "Tunnel {} encapsulate result: {} for {} byte packet",
-            self.tag, result_type, packet_to_send.len()
-        );
+        // Log encapsulation result at trace level (hot path - debug is too expensive)
+        // Only format the result string if trace is enabled to avoid overhead
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let result_type = match &result {
+                TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
+                TunnResult::Done => "Done".to_string(),
+                TunnResult::Err(e) => format!("Err({:?})", e),
+                _ => "Other".to_string(),
+            };
+            trace!(
+                "Tunnel {} encapsulate result: {} for {} byte packet",
+                self.tag, result_type, packet_to_send.len()
+            );
+        }
 
         // Process result
         match result {
@@ -987,7 +990,7 @@ impl UserspaceWgTunnel {
                     .fetch_add(packet_to_send.len() as u64, Ordering::Relaxed);
                 self.shared.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
 
-                debug!("Sent {} bytes through tunnel {} to {:?}", packet_to_send.len(), self.tag, self.peer_addr_parsed);
+                trace!("Sent {} bytes through tunnel {} to {:?}", packet_to_send.len(), self.tag, self.peer_addr_parsed);
                 Ok(())
             }
             TunnResult::Done => {
@@ -1027,9 +1030,9 @@ impl UserspaceWgTunnel {
             return Err(WgTunnelError::NotConnected);
         }
 
-        // Log packet details for debugging (no SNAT applied)
+        // Log packet details at trace level (hot path - debug is too expensive)
         if let Some(src_ip) = extract_source_ip(packet) {
-            debug!(
+            trace!(
                 "Tunnel {} send_preserve_src: {} bytes, src_ip={} (preserved)",
                 self.tag,
                 packet.len(),
@@ -1057,17 +1060,19 @@ impl UserspaceWgTunnel {
             tunn.encapsulate(packet, &mut dst)
         };
 
-        // Log encapsulation result
-        let result_type = match &result {
-            TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
-            TunnResult::Done => "Done".to_string(),
-            TunnResult::Err(e) => format!("Err({:?})", e),
-            _ => "Other".to_string(),
-        };
-        debug!(
-            "Tunnel {} send_preserve_src encapsulate: {} for {} byte packet",
-            self.tag, result_type, packet.len()
-        );
+        // Log encapsulation result at trace level (hot path - debug is too expensive)
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let result_type = match &result {
+                TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
+                TunnResult::Done => "Done".to_string(),
+                TunnResult::Err(e) => format!("Err({:?})", e),
+                _ => "Other".to_string(),
+            };
+            trace!(
+                "Tunnel {} send_preserve_src encapsulate: {} for {} byte packet",
+                self.tag, result_type, packet.len()
+            );
+        }
 
         // Process result
         match result {
@@ -1083,7 +1088,7 @@ impl UserspaceWgTunnel {
                     .fetch_add(packet.len() as u64, Ordering::Relaxed);
                 self.shared.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
 
-                debug!(
+                trace!(
                     "Sent {} bytes (preserved src) through tunnel {} to {:?}",
                     packet.len(), self.tag, self.peer_addr_parsed
                 );
@@ -1149,8 +1154,8 @@ impl UserspaceWgTunnel {
 
         match packet {
             Some(data) => {
-                // Log received packets at debug level
-                debug!("Tunnel {} recv(): got {} bytes from channel", self.tag, data.len());
+                // Log received packets at trace level (hot path - debug is too expensive)
+                trace!("Tunnel {} recv(): got {} bytes from channel", self.tag, data.len());
                 Ok(data)
             }
             None => {
@@ -1463,8 +1468,8 @@ async fn run_background_task(
             result = socket.recv_from(&mut recv_buf) => {
                 match result {
                     Ok((len, src_addr)) => {
-                        // Log received UDP packets at debug level for troubleshooting
-                        debug!("Tunnel {} UDP recv: {} bytes from {} (expecting {})", tunnel_tag_for_task, len, src_addr, peer_addr);
+                        // Log received UDP packets at trace level (hot path - debug is too expensive)
+                        trace!("Tunnel {} UDP recv: {} bytes from {} (expecting {})", tunnel_tag_for_task, len, src_addr, peer_addr);
 
                         if !shared.connected.load(Ordering::Acquire) {
                             break;
@@ -1482,16 +1487,18 @@ async fn run_background_task(
                             tunn_guard.as_mut().map(|tunn| tunn.decapsulate(None, &recv_buf[..len], &mut dst_buf))
                         };
 
-                        if let Some(ref result) = process_result {
-                            // Log decapsulate result at debug level
-                            let result_type = match result {
-                                TunnResult::WriteToTunnelV4(data, _) => format!("WriteToTunnelV4({} bytes)", data.len()),
-                                TunnResult::WriteToTunnelV6(data, _) => format!("WriteToTunnelV6({} bytes)", data.len()),
-                                TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
-                                TunnResult::Done => "Done".to_string(),
-                                TunnResult::Err(e) => format!("Err({:?})", e),
-                            };
-                            debug!("Tunnel {} decapsulate: {} bytes -> {}", tunnel_tag_for_task, len, result_type);
+                        // Log decapsulate result at trace level (hot path - debug is too expensive)
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            if let Some(ref result) = process_result {
+                                let result_type = match result {
+                                    TunnResult::WriteToTunnelV4(data, _) => format!("WriteToTunnelV4({} bytes)", data.len()),
+                                    TunnResult::WriteToTunnelV6(data, _) => format!("WriteToTunnelV6({} bytes)", data.len()),
+                                    TunnResult::WriteToNetwork(data) => format!("WriteToNetwork({} bytes)", data.len()),
+                                    TunnResult::Done => "Done".to_string(),
+                                    TunnResult::Err(e) => format!("Err({:?})", e),
+                                };
+                                trace!("Tunnel {} decapsulate: {} bytes -> {}", tunnel_tag_for_task, len, result_type);
+                            }
                         }
 
                         if let Some(result) = process_result {

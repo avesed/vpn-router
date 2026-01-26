@@ -56,11 +56,13 @@ use tracing::{debug, trace, warn};
 
 use crate::tunnel::smoltcp_device::{TunnelPacketQueue, WgTunnelDevice, DEFAULT_WG_MTU};
 
-/// Default TCP receive buffer size (64 KB)
-const DEFAULT_TCP_RX_BUFFER: usize = 65536;
+/// Default TCP receive buffer size (1 MB for high-latency tunnels)
+/// With 70ms effective RTT, 1MB allows ~114 Mbps throughput
+/// Note: Each connection uses 2MB total (RX + TX buffers)
+const DEFAULT_TCP_RX_BUFFER: usize = 1048576;
 
-/// Default TCP transmit buffer size (64 KB)
-const DEFAULT_TCP_TX_BUFFER: usize = 65536;
+/// Default TCP transmit buffer size (1 MB for high-latency tunnels)
+const DEFAULT_TCP_TX_BUFFER: usize = 1048576;
 
 /// Maximum number of sockets in the socket set
 const MAX_SOCKETS: usize = 1024;
@@ -308,11 +310,12 @@ impl SmoltcpBridge {
         let tx_buffer = SocketBuffer::new(vec![0u8; tx_buffer_size]);
         let mut socket = TcpSocket::new(rx_buffer, tx_buffer);
 
-        // Configure MSS to fit within WireGuard MTU
-        // MSS = MTU (1420) - IP header (20) - TCP header (20) = 1380
-        // Note: smoltcp determines MSS from interface MTU, but we disable
-        // Nagle's algorithm for lower latency in tunnel scenarios.
+        // Configure TCP socket for high throughput tunnel scenarios:
+        // 1. Disable Nagle's algorithm for lower latency
+        // 2. Disable delayed ACKs for faster acknowledgments
+        // 3. These settings are critical for TCP-over-TCP performance
         socket.set_nagle_enabled(false);
+        socket.set_ack_delay(None); // Disable delayed ACKs - CRITICAL for throughput!
 
         let handle = self.sockets.add(socket);
 
