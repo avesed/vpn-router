@@ -52,9 +52,8 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, RwLock};
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, trace, warn};
 
 use super::manager::{ProcessedPacket, WgIngressManager};
@@ -67,45 +66,15 @@ use crate::outbound::OutboundManager;
 use crate::peer::manager::PeerManager;
 use crate::rules::fwmark::ChainMark;
 
+// IpStack bridge imports (feature-gated)
+#[cfg(feature = "ipstack-tcp")]
+use super::ipstack_bridge::IpStackBridge;
+
 /// IP protocol numbers
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_ICMPV6: u8 = 58;
-
-/// Global storage for TCP write halves (used for forwarding client data to server)
-/// Uses a boxed async writer to support various stream types (TCP, TLS, Shadowsocks, etc.)
-type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
-static TCP_WRITE_HALVES: Lazy<DashMap<FiveTuple, Arc<tokio::sync::Mutex<BoxedAsyncWrite>>>> =
-    Lazy::new(DashMap::new);
-
-/// Pending stream info for protocols that require write-before-read (e.g., Shadowsocks)
-/// These streams are stored unsplit and are split after the first client data arrives.
-struct PendingStreamInfo {
-    /// The unsplit stream (must be written to before reading)
-    stream: crate::outbound::OutboundStream,
-    /// Reply channel for sending packets back to the client
-    reply_tx: mpsc::Sender<ReplyPacket>,
-    /// Server IP (destination from client's perspective)
-    server_ip: Ipv4Addr,
-    /// Server port
-    server_port: u16,
-    /// Client IP
-    client_ip: Ipv4Addr,
-    /// Client port
-    client_port: u16,
-    /// Server's initial sequence number
-    server_seq: u32,
-    /// Outbound tag for stats and logging
-    outbound_tag: String,
-    /// Connection tracking entry
-    connection: Arc<RwLock<TcpConnection>>,
-}
-
-/// Global storage for pending streams (Shadowsocks and other write-before-read protocols)
-/// Key: 5-tuple (client_ip, client_port, server_ip, server_port, protocol)
-/// Value: PendingStreamInfo containing the unsplit stream and metadata
-static TCP_PENDING_STREAMS: Lazy<DashMap<FiveTuple, PendingStreamInfo>> = Lazy::new(DashMap::new);
 
 /// Global storage for UDP sessions (used for QUIC and other UDP traffic)
 /// Key: (client_ip, client_port, server_ip, server_port)
@@ -151,6 +120,20 @@ impl UdpSessionEntry {
 /// Value: ProxyUdpSessionEntry containing the UDP outbound handle
 static PROXY_UDP_SESSIONS: Lazy<DashMap<FiveTuple, Arc<ProxyUdpSessionEntry>>> =
     Lazy::new(DashMap::new);
+
+// ============================================================================
+// IpStack Bridge Integration (feature-gated)
+// ============================================================================
+
+/// Global IpStack bridge for TCP handling (replaces manual TCP state machine)
+/// Feature-gated: only active when ipstack-tcp feature is enabled
+#[cfg(feature = "ipstack-tcp")]
+static IPSTACK_BRIDGE: once_cell::sync::OnceCell<std::sync::Arc<tokio::sync::RwLock<IpStackBridge>>> =
+    once_cell::sync::OnceCell::new();
+
+/// Environment variable to enable/disable ipstack at runtime
+#[cfg(feature = "ipstack-tcp")]
+static IPSTACK_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Proxy UDP session entry for non-Direct outbounds (Shadowsocks, SOCKS5)
 ///
@@ -230,266 +213,6 @@ pub mod tcp_flags {
     pub const URG: u8 = 0x20;
 }
 
-/// TCP connection state
-///
-/// Simplified state machine for ingress TCP tracking:
-/// ```text
-///     SynReceived --> Established --> Closing --> Closed
-///           |              |             ^
-///           +-- RST -------+-------------+
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpConnectionState {
-    /// SYN received from client, waiting for outbound connection
-    SynReceived,
-    /// Connection established (outbound connected)
-    Established,
-    /// FIN received, connection closing
-    Closing,
-    /// Connection closed
-    Closed,
-}
-
-impl std::fmt::Display for TcpConnectionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SynReceived => write!(f, "SYN_RECEIVED"),
-            Self::Established => write!(f, "ESTABLISHED"),
-            Self::Closing => write!(f, "CLOSING"),
-            Self::Closed => write!(f, "CLOSED"),
-        }
-    }
-}
-
-/// Tracked TCP connection
-///
-/// Stores state and metadata for a TCP connection flowing through ingress.
-pub struct TcpConnection {
-    /// Connection state
-    pub state: TcpConnectionState,
-    /// Outbound tag used for routing
-    pub outbound_tag: String,
-    /// Peer's `WireGuard` public key (for reply routing)
-    pub peer_public_key: String,
-    /// Peer's external endpoint
-    pub peer_endpoint: SocketAddr,
-    /// Outbound TCP stream (if established)
-    pub outbound_stream: Option<TcpStream>,
-    /// Bytes sent to destination
-    pub bytes_sent: AtomicU64,
-    /// Bytes received from destination (replies)
-    pub bytes_received: AtomicU64,
-    /// Last activity timestamp
-    pub last_activity: Instant,
-    /// Client's initial sequence number
-    pub client_seq: u32,
-    /// Server's initial sequence number (from SYN-ACK)
-    pub server_seq: u32,
-    /// Outbound stats reference for recording completion
-    pub outbound_stats: Option<Arc<crate::connection::OutboundStats>>,
-    /// Flag to prevent double-counting stats
-    pub stats_recorded: AtomicBool,
-}
-
-impl TcpConnection {
-    /// Create a new TCP connection entry
-    pub fn new(
-        outbound_tag: String,
-        peer_public_key: String,
-        peer_endpoint: SocketAddr,
-    ) -> Self {
-        Self {
-            state: TcpConnectionState::SynReceived,
-            outbound_tag,
-            peer_public_key,
-            peer_endpoint,
-            outbound_stream: None,
-            bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
-            last_activity: Instant::now(),
-            client_seq: 0,
-            server_seq: 0,
-            outbound_stats: None,
-            stats_recorded: AtomicBool::new(false),
-        }
-    }
-    
-    /// Record connection completion in outbound stats (only once)
-    /// Returns true if this was the first call that recorded stats
-    pub fn record_stats_completion(&self) -> bool {
-        // Use compare_exchange to ensure only one caller records stats
-        if self.stats_recorded.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            if let Some(ref stats) = self.outbound_stats {
-                let bytes_rx = self.bytes_received.load(Ordering::Relaxed);
-                let bytes_tx = self.bytes_sent.load(Ordering::Relaxed);
-                stats.record_completed(bytes_rx, bytes_tx);
-                return true;
-            }
-        }
-        false
-    }
-    
-    /// Record connection error in outbound stats (only once)
-    /// Returns true if this was the first call that recorded stats
-    pub fn record_stats_error(&self) -> bool {
-        // Use compare_exchange to ensure only one caller records stats
-        if self.stats_recorded.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            if let Some(ref stats) = self.outbound_stats {
-                stats.record_error();
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Update the last activity timestamp
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
-    }
-
-    /// Add bytes sent
-    pub fn add_bytes_sent(&self, bytes: u64) {
-        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Add bytes received
-    pub fn add_bytes_received(&self, bytes: u64) {
-        self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Get bytes sent
-    pub fn get_bytes_sent(&self) -> u64 {
-        self.bytes_sent.load(Ordering::Relaxed)
-    }
-
-    /// Get bytes received
-    pub fn get_bytes_received(&self) -> u64 {
-        self.bytes_received.load(Ordering::Relaxed)
-    }
-}
-
-/// Manages TCP connections for ingress forwarding
-///
-/// Thread-safe connection tracker using `DashMap` for concurrent access.
-/// Each connection is wrapped in `RwLock` for fine-grained locking.
-pub struct TcpConnectionManager {
-    /// Active connections keyed by 5-tuple
-    connections: DashMap<FiveTuple, Arc<RwLock<TcpConnection>>>,
-    /// Connection timeout for cleanup
-    connection_timeout: Duration,
-}
-
-impl TcpConnectionManager {
-    /// Create a new TCP connection manager
-    ///
-    /// # Arguments
-    ///
-    /// * `connection_timeout` - How long to keep idle connections before cleanup
-    pub fn new(connection_timeout: Duration) -> Self {
-        Self {
-            connections: DashMap::new(),
-            connection_timeout,
-        }
-    }
-
-    /// Get or create a connection entry
-    ///
-    /// If a connection already exists, returns the existing entry.
-    /// Otherwise, creates a new entry with `SynReceived` state.
-    pub fn get_or_create(
-        &self,
-        five_tuple: FiveTuple,
-        peer_public_key: String,
-        peer_endpoint: SocketAddr,
-        outbound_tag: String,
-    ) -> Arc<RwLock<TcpConnection>> {
-        self.connections
-            .entry(five_tuple)
-            .or_insert_with(|| {
-                Arc::new(RwLock::new(TcpConnection::new(
-                    outbound_tag,
-                    peer_public_key,
-                    peer_endpoint,
-                )))
-            })
-            .clone()
-    }
-
-    /// Get an existing connection
-    pub fn get(&self, five_tuple: &FiveTuple) -> Option<Arc<RwLock<TcpConnection>>> {
-        self.connections.get(five_tuple).map(|r| r.clone())
-    }
-
-    /// Remove a connection
-    pub fn remove(&self, five_tuple: &FiveTuple) -> Option<Arc<RwLock<TcpConnection>>> {
-        self.connections.remove(five_tuple).map(|(_, v)| v)
-    }
-
-    /// Cleanup stale connections
-    ///
-    /// Removes connections that have been idle longer than `connection_timeout`.
-    /// Also records stats completion for cleaned up connections.
-    ///
-    /// # Returns
-    ///
-    /// Number of connections removed.
-    pub fn cleanup(&self) -> usize {
-        let timeout = self.connection_timeout;
-        let _before = self.connections.len();
-        
-        // Collect keys to remove
-        let keys_to_remove: Vec<FiveTuple> = self.connections
-            .iter()
-            .filter_map(|entry| {
-                if let Ok(guard) = entry.value().try_read() {
-                    if guard.last_activity.elapsed() >= timeout {
-                        Some(*entry.key())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-        
-        // Remove from both connections and TCP_WRITE_HALVES
-        // Record stats completion for each removed connection
-        for key in &keys_to_remove {
-            if let Some((_, conn)) = self.connections.remove(key) {
-                // Try to record stats completion before dropping
-                if let Ok(guard) = conn.try_read() {
-                    guard.record_stats_completion();
-                }
-            }
-            TCP_WRITE_HALVES.remove(key);
-        }
-        
-        keys_to_remove.len()
-    }
-
-    /// Get the number of active connections
-    pub fn len(&self) -> usize {
-        self.connections.len()
-    }
-
-    /// Check if there are no connections
-    pub fn is_empty(&self) -> bool {
-        self.connections.is_empty()
-    }
-
-    /// Get the connection timeout
-    pub fn connection_timeout(&self) -> Duration {
-        self.connection_timeout
-    }
-}
-
-impl Default for TcpConnectionManager {
-    fn default() -> Self {
-        Self::new(Duration::from_secs(300)) // 5 minute default timeout
-    }
-}
-
 /// Parsed TCP header details
 #[derive(Debug, Clone)]
 pub struct TcpDetails {
@@ -505,6 +228,8 @@ pub struct TcpDetails {
     pub data_offset: usize,
     /// TCP flags
     pub flags: u8,
+    /// Client's advertised receive window
+    pub window: u16,
     /// Offset to TCP payload within the packet
     pub payload_offset: usize,
 }
@@ -627,6 +352,9 @@ pub fn parse_tcp_details(packet: &[u8], ip_header_len: usize) -> Option<TcpDetai
 
     let flags = packet[tcp_start + 13];
 
+    // Window size is at bytes 14-15 of TCP header
+    let window = u16::from_be_bytes([packet[tcp_start + 14], packet[tcp_start + 15]]);
+
     Some(TcpDetails {
         src_port,
         dst_port,
@@ -634,6 +362,7 @@ pub fn parse_tcp_details(packet: &[u8], ip_header_len: usize) -> Option<TcpDetai
         ack_num,
         data_offset,
         flags,
+        window,
         payload_offset: tcp_start + data_offset,
     })
 }
@@ -960,17 +689,25 @@ impl IngressSessionTracker {
     ///
     /// # Returns
     ///
-    /// The session if found, or None if not found or expired.
+    /// The session if found, or None if not found.
+    ///
+    /// # Note
+    ///
+    /// This method intentionally does NOT check session expiration. The periodic
+    /// `cleanup()` method handles removal of stale sessions.
+    ///
+    /// **Why**: During download-heavy transfers (e.g., speed tests), the client
+    /// sends very little data (mostly ACKs), so `last_seen` is rarely updated.
+    /// If we check expiration here, sessions expire mid-transfer after 5 minutes,
+    /// causing all server reply packets to be dropped and speed to drop to 0.
+    ///
+    /// By deferring expiration checks to `cleanup()` (which runs every 60 seconds),
+    /// active sessions remain valid as long as they exist in the map. The caller
+    /// should use `update_received()` after successfully routing a reply, which
+    /// will refresh the session's `last_seen` timestamp.
     #[must_use]
     pub fn get(&self, key: &FiveTuple) -> Option<PeerSession> {
-        self.sessions.get(key).and_then(|entry| {
-            let session = entry.value();
-            if session.is_expired(self.session_ttl) {
-                None
-            } else {
-                Some(session.clone())
-            }
-        })
+        self.sessions.get(key).map(|entry| entry.value().clone())
     }
 
     /// Update bytes received for a session (for reply tracking)
@@ -1320,137 +1057,6 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
         sum = sum.wrapping_add(u32::from(word));
     }
     // Fold 32-bit sum to 16 bits
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-// ============================================================================
-// TCP Packet Building
-// ============================================================================
-
-/// TCP flags constants
-pub mod tcp_flag_bits {
-    pub const FIN: u8 = 0x01;
-    pub const SYN: u8 = 0x02;
-    pub const RST: u8 = 0x04;
-    pub const PSH: u8 = 0x08;
-    pub const ACK: u8 = 0x10;
-}
-
-/// Build a TCP packet with IP header.
-///
-/// Creates a complete IPv4 TCP packet for sending back to the WireGuard client.
-///
-/// # Arguments
-///
-/// * `src_ip` - Source IP address (server)
-/// * `src_port` - Source port (server)
-/// * `dst_ip` - Destination IP address (client)
-/// * `dst_port` - Destination port (client)
-/// * `seq_num` - TCP sequence number
-/// * `ack_num` - TCP acknowledgment number
-/// * `flags` - TCP flags (SYN, ACK, FIN, etc.)
-/// * `window` - TCP window size
-/// * `payload` - TCP payload data
-fn build_tcp_packet(
-    src_ip: Ipv4Addr,
-    src_port: u16,
-    dst_ip: Ipv4Addr,
-    dst_port: u16,
-    seq_num: u32,
-    ack_num: u32,
-    flags: u8,
-    window: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    // Check if this is a SYN or SYN-ACK packet (needs MSS option)
-    let is_syn = (flags & tcp_flag_bits::SYN) != 0;
-    
-    // TCP header length: 20 bytes base + 4 bytes MSS option if SYN
-    let tcp_header_len = if is_syn { 24 } else { 20 };
-    let tcp_len = tcp_header_len + payload.len();
-    let total_len = 20 + tcp_len; // IP header + TCP
-
-    let mut packet = vec![0u8; total_len];
-
-    // IPv4 header (20 bytes)
-    packet[0] = 0x45; // Version 4, IHL 5
-    packet[1] = 0x00; // DSCP/ECN
-    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    packet[4..6].copy_from_slice(&rand::random::<u16>().to_be_bytes()); // ID
-    packet[6..8].copy_from_slice(&[0x40, 0x00]); // Don't fragment
-    packet[8] = 64; // TTL
-    packet[9] = IPPROTO_TCP;
-    // Checksum calculated below
-    packet[12..16].copy_from_slice(&src_ip.octets());
-    packet[16..20].copy_from_slice(&dst_ip.octets());
-
-    // Calculate IP header checksum
-    let ip_checksum = ipv4_header_checksum(&packet[..20]);
-    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    // TCP header
-    let tcp_start = 20;
-    packet[tcp_start..tcp_start + 2].copy_from_slice(&src_port.to_be_bytes());
-    packet[tcp_start + 2..tcp_start + 4].copy_from_slice(&dst_port.to_be_bytes());
-    packet[tcp_start + 4..tcp_start + 8].copy_from_slice(&seq_num.to_be_bytes());
-    packet[tcp_start + 8..tcp_start + 12].copy_from_slice(&ack_num.to_be_bytes());
-    packet[tcp_start + 12] = (tcp_header_len as u8 / 4) << 4; // Data offset
-    packet[tcp_start + 13] = flags;
-    packet[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
-    // Checksum calculated below
-    // Urgent pointer = 0
-
-    // Add MSS option for SYN packets
-    // MSS = 1300 to fit within WireGuard MTU after encryption
-    if is_syn {
-        packet[tcp_start + 20] = 0x02; // MSS option kind
-        packet[tcp_start + 21] = 0x04; // MSS option length
-        packet[tcp_start + 22..tcp_start + 24].copy_from_slice(&1300u16.to_be_bytes()); // MSS value
-    }
-
-    // Copy payload (after options if any)
-    if !payload.is_empty() {
-        packet[tcp_start + tcp_header_len..].copy_from_slice(payload);
-    }
-
-    // Calculate TCP checksum (includes pseudo-header)
-    let tcp_checksum = tcp_checksum(&packet[tcp_start..], src_ip, dst_ip);
-    packet[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
-
-    packet
-}
-
-/// Calculate TCP checksum including pseudo-header.
-fn tcp_checksum(tcp_segment: &[u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> u16 {
-    let mut sum: u32 = 0;
-
-    // Pseudo-header
-    let src = src_ip.octets();
-    let dst = dst_ip.octets();
-    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([src[0], src[1]])));
-    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([src[2], src[3]])));
-    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([dst[0], dst[1]])));
-    sum = sum.wrapping_add(u32::from(u16::from_be_bytes([dst[2], dst[3]])));
-    sum = sum.wrapping_add(u32::from(IPPROTO_TCP)); // Protocol
-    sum = sum.wrapping_add(tcp_segment.len() as u32); // TCP length
-
-    // TCP segment (skip checksum field at offset 16-17)
-    for i in (0..tcp_segment.len()).step_by(2) {
-        if i == 16 {
-            continue; // Skip checksum field
-        }
-        let word = if i + 1 < tcp_segment.len() {
-            u16::from_be_bytes([tcp_segment[i], tcp_segment[i + 1]])
-        } else {
-            u16::from_be_bytes([tcp_segment[i], 0])
-        };
-        sum = sum.wrapping_add(u32::from(word));
-    }
-
-    // Fold to 16 bits
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -1857,20 +1463,23 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 /// # Arguments
 ///
 /// * `packet_rx` - Receiver for processed packets from ingress
-/// * `outbound_manager` - Manager for direct/SOCKS5 outbounds
+/// * `outbound_manager` - Manager for direct/SOCKS5 outbounds (used for UDP)
 /// * `wg_egress_manager` - Manager for `WireGuard` egress tunnels
-/// * `tcp_manager` - TCP connection manager for stateful connection tracking
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 /// * `local_ip` - Gateway's local IP for responding to pings to self
 /// * `ecmp_group_manager` - Optional ECMP group manager for load balancing
 /// * `peer_manager` - Optional peer manager for peer tunnel forwarding
+///
+/// # Note
+///
+/// TCP connections are handled by IpStack bridge (when `ipstack-tcp` feature is enabled).
+/// The manual TCP state machine was removed due to bugs.
 pub async fn run_forwarding_loop(
     mut packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
     wg_egress_manager: Arc<WgEgressManager>,
-    tcp_manager: Arc<TcpConnectionManager>,
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
@@ -1949,12 +1558,9 @@ pub async fn run_forwarding_loop(
                         &processed,
                         &parsed,
                         &tcp_details,
-                        &outbound_manager,
                         &wg_egress_manager,
-                        &tcp_manager,
                         &session_tracker,
                         &stats,
-                        direct_reply_tx.clone(),
                         ecmp_group_manager.as_ref(),
                         peer_manager.as_ref(),
                     )
@@ -2000,11 +1606,11 @@ pub async fn run_forwarding_loop(
             .bytes_forwarded
             .fetch_add(packet_len as u64, Ordering::Relaxed);
 
-        // Periodic session and TCP connection cleanup
+        // Periodic session cleanup
+        // Note: TCP connection cleanup is now handled by IpStack bridge's session_cleanup_task
         if last_cleanup.elapsed() >= cleanup_interval {
             let sessions_removed = session_tracker.cleanup();
-            let tcp_removed = tcp_manager.cleanup();
-            
+
             // Clean up stale UDP sessions (Issue: UDP_SESSIONS had no periodic cleanup)
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2023,19 +1629,10 @@ pub async fn run_forwarding_loop(
             });
             let proxy_udp_removed = proxy_udp_before.saturating_sub(PROXY_UDP_SESSIONS.len());
 
-            // Clean up stale pending streams (Shadowsocks connections without first data)
-            // These are connections where the client never sent data after the TCP handshake
-            let pending_before = TCP_PENDING_STREAMS.len();
-            TCP_PENDING_STREAMS.retain(|five_tuple, _| {
-                // Check if the associated TCP connection still exists and is not stale
-                tcp_manager.get(five_tuple).is_some()
-            });
-            let pending_removed = pending_before.saturating_sub(TCP_PENDING_STREAMS.len());
-
-            if sessions_removed > 0 || tcp_removed > 0 || udp_removed > 0 || proxy_udp_removed > 0 || pending_removed > 0 {
+            if sessions_removed > 0 || udp_removed > 0 || proxy_udp_removed > 0 {
                 debug!(
-                    "Cleaned up {} expired sessions, {} TCP connections, {} UDP sessions, {} proxy UDP sessions, {} pending streams",
-                    sessions_removed, tcp_removed, udp_removed, proxy_udp_removed, pending_removed
+                    "Cleaned up {} expired sessions, {} UDP sessions, {} proxy UDP sessions",
+                    sessions_removed, udp_removed, proxy_udp_removed
                 );
             }
             last_cleanup = Instant::now();
@@ -2054,6 +1651,12 @@ pub async fn run_forwarding_loop(
 /// If an `IpDomainCache` is provided, DNS responses (UDP from port 53) are parsed
 /// to populate the IP-to-domain cache. This enables domain-based routing for
 /// subsequent connections.
+///
+/// # Concurrency Model
+///
+/// This function uses bounded concurrency (32 parallel sends) to improve throughput.
+/// Packet parsing and validation happens in the main loop (fast), while the actual
+/// WireGuard encryption and UDP send is offloaded to spawned tasks with semaphore control.
 pub async fn run_reply_router_loop(
     mut reply_rx: mpsc::Receiver<ReplyPacket>,
     ingress_manager: Arc<WgIngressManager>,
@@ -2062,9 +1665,33 @@ pub async fn run_reply_router_loop(
     dns_cache: Option<Arc<super::dns_cache::IpDomainCache>>,
     peer_manager: Arc<PeerManager>,
 ) {
-    info!("Ingress reply router started");
+    info!("Ingress reply router started (concurrent mode, max 1024 parallel sends)");
+
+    // Semaphore to limit concurrent send operations
+    // Increased from 256 to 1024 to handle high throughput bursts
+    // Without enough permits, the reply router blocks and causes cascading stalls
+    let send_semaphore = Arc::new(Semaphore::new(1024));
+
+    // Periodic throughput logging for diagnostics
+    let mut last_stats_log = std::time::Instant::now();
+    let mut packets_since_log: u64 = 0;
 
     while let Some(reply) = reply_rx.recv().await {
+        // Periodic throughput stats logging
+        packets_since_log += 1;
+        if last_stats_log.elapsed().as_secs() >= 5 {
+            let forwarded = stats.packets_forwarded.load(Ordering::Relaxed);
+            let received = stats.packets_received.load(Ordering::Relaxed);
+            let misses = stats.session_misses.load(Ordering::Relaxed);
+            let errors = stats.send_errors.load(Ordering::Relaxed);
+            info!(
+                "Reply router stats: received={}, forwarded={}, misses={}, errors={}, rate={}/5s",
+                received, forwarded, misses, errors, packets_since_log
+            );
+            packets_since_log = 0;
+            last_stats_log = std::time::Instant::now();
+        }
+
         let Some(parsed) = parse_ip_packet(&reply.packet) else {
             stats.parse_errors.fetch_add(1, Ordering::Relaxed);
             warn!("Failed to parse reply IP header");
@@ -2107,7 +1734,7 @@ pub async fn run_reply_router_loop(
             }
         }
 
-        // Handle ICMP separately (no ports)
+        // Handle ICMP separately (no ports) - these are rare, process inline
         if parsed.protocol == IPPROTO_ICMP || parsed.protocol == IPPROTO_ICMPV6 {
             // For ICMP, extract ID from the ICMP header and use it as port
             if let Some((icmp_type, _, id, seq, _)) = parse_icmp_echo(&reply.packet, parsed.ip_header_len) {
@@ -2255,29 +1882,62 @@ pub async fn run_reply_router_loop(
             continue;
         }
 
-        match ingress_manager
-            .send_to_peer(&session.peer_public_key, session.peer_endpoint, &reply.packet)
-            .await
-        {
-            Ok(()) => {
-                stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                session_tracker.update_received(&lookup_key, reply.packet.len() as u64);
-                trace!(
-                    "Forwarded reply {} via peer {}",
-                    reply_tuple,
-                    session.peer_public_key
-                );
+        // Spawn concurrent send task with semaphore control
+        // This allows up to 1024 parallel WireGuard encryptions + UDP sends
+        let permit = match send_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Semaphore full - wait with timeout to avoid indefinite blocking
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    send_semaphore.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        warn!("Reply router semaphore closed unexpectedly");
+                        continue;
+                    }
+                    Err(_) => {
+                        // Timeout - semaphore exhausted for too long, skip this packet
+                        warn!("Reply router semaphore timeout - dropping packet due to backpressure");
+                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
             }
-            Err(e) => {
-                stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "Failed to forward reply {} via peer {}: {}",
-                    reply_tuple,
-                    session.peer_public_key,
-                    e
-                );
+        };
+
+        let ingress_mgr = Arc::clone(&ingress_manager);
+        let stats_clone = Arc::clone(&stats);
+        let tracker_clone = Arc::clone(&session_tracker);
+        let peer_public_key = session.peer_public_key.clone();
+        let peer_endpoint = session.peer_endpoint;
+        let packet = reply.packet;
+        let packet_len = packet.len();
+
+        tokio::spawn(async move {
+            match ingress_mgr
+                .send_to_peer(&peer_public_key, peer_endpoint, &packet)
+                .await
+            {
+                Ok(()) => {
+                    stats_clone.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                    tracker_clone.update_received(&lookup_key, packet_len as u64);
+                }
+                Err(e) => {
+                    stats_clone.send_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Failed to forward reply {} via peer {}: {}",
+                        reply_tuple,
+                        peer_public_key,
+                        e
+                    );
+                }
             }
-        }
+            drop(permit); // Release semaphore permit
+        });
     }
 
     info!("Ingress reply router stopped (channel closed)");
@@ -2304,12 +1964,9 @@ async fn forward_tcp_packet(
     processed: &ProcessedPacket,
     parsed: &ParsedPacket,
     tcp_details: &TcpDetails,
-    outbound_manager: &Arc<OutboundManager>,
     wg_egress_manager: &Arc<WgEgressManager>,
-    tcp_manager: &Arc<TcpConnectionManager>,
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
-    direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
     peer_manager: Option<&Arc<PeerManager>>,
 ) {
@@ -2466,532 +2123,118 @@ async fn forward_tcp_packet(
         return;
     }
 
-    // For direct/SOCKS5, we need to establish and manage connections
-    // Register in session tracker for potential reply routing
-    session_tracker.register(
-        five_tuple,
-        processed.peer_public_key.clone(),
-        processed.src_addr,
-        outbound_tag.clone(),
-        parsed.total_len as u64,
-    );
+    // === IPSTACK INTEGRATION ===
+    // When ipstack-tcp feature is enabled and ipstack is active, route non-WG TCP
+    // traffic through IpStackBridge which provides a complete TCP/IP stack.
+    // This REPLACES the manual TCP state machine (which has bugs with retransmission,
+    // out-of-order handling, and window management). No fallback - if ipstack fails,
+    // drop the packet and let TCP retransmit.
+    #[cfg(feature = "ipstack-tcp")]
+    if is_ipstack_enabled() {
+        if let Some(bridge) = IPSTACK_BRIDGE.get() {
+            // Convert peer_public_key to 32-byte array
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use base64::Engine;
 
-    if tcp_details.is_syn() && !tcp_details.is_ack() {
-        // New connection (SYN without ACK) - establish outbound
-        let dst_addr = SocketAddr::new(parsed.dst_ip, tcp_details.dst_port);
-
-        // Check if connection already exists (handles SYN retransmissions)
-        if let Some(existing_conn) = tcp_manager.get(&five_tuple) {
-            let conn_guard = existing_conn.read().await;
-            match conn_guard.state {
-                TcpConnectionState::Established => {
-                    // Connection exists, resend SYN-ACK for the retransmitted SYN
-                    if let Some(ref reply_tx) = direct_reply_tx {
-                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
-                            let syn_ack = build_tcp_packet(
-                                server_ip,
-                                tcp_details.dst_port,
-                                client_ip,
-                                tcp_details.src_port,
-                                conn_guard.server_seq,
-                                tcp_details.seq_num.wrapping_add(1),
-                                tcp_flag_bits::SYN | tcp_flag_bits::ACK,
-                                65535,
-                                &[],
-                            );
-                            let reply = ReplyPacket {
-                                packet: syn_ack,
-                                tunnel_tag: outbound_tag.clone(),
-                            };
-                            if reply_tx.try_send(reply).is_ok() {
-                                debug!(
-                                    "Resent SYN-ACK for retransmitted SYN: {}:{} -> {}:{}",
-                                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                                );
-                            }
-                        }
-                    }
-                    return; // Don't create duplicate connection
+            let peer_key: [u8; 32] = match BASE64.decode(&processed.peer_public_key) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    arr
                 }
-                TcpConnectionState::SynReceived => {
-                    // Connection is being established, drop duplicate SYN
-                    debug!(
-                        "Dropping duplicate SYN (connection in progress): {}:{} -> {}:{}",
-                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                    );
-                    return;
-                }
-                TcpConnectionState::Closing | TcpConnectionState::Closed => {
-                    // Old connection is closing, remove it and establish new one
-                    drop(conn_guard);
-                    tcp_manager.remove(&five_tuple);
-                    TCP_WRITE_HALVES.remove(&five_tuple);
-                    debug!(
-                        "Removed stale connection for new SYN: {}:{} -> {}:{}",
-                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                    );
-                }
-            }
-        }
-
-        // Create connection entry BEFORE async connect to prevent race with SYN retransmit
-        let tracked = tcp_manager.get_or_create(
-            five_tuple,
-            processed.peer_public_key.clone(),
-            processed.src_addr,
-            outbound_tag.clone(),
-        );
-        // Mark as SynReceived immediately
-        {
-            let mut conn_guard = tracked.write().await;
-            conn_guard.state = TcpConnectionState::SynReceived;
-            conn_guard.client_seq = tcp_details.seq_num;
-        }
-
-        if let Some(outbound) = outbound_manager.get(outbound_tag) {
-            // Try to establish TCP connection
-            let connect_start = Instant::now();
-            match outbound.connect(dst_addr, Duration::from_secs(10)).await {
-                Ok(conn) => {
-                    let connect_time = connect_start.elapsed();
-                    if connect_time.as_millis() > 100 {
-                        info!(
-                            "Established TCP connection via '{}': {}:{} -> {}:{} ({}ms - SLOW)",
-                            outbound_tag,
-                            parsed.src_ip,
-                            tcp_details.src_port,
-                            parsed.dst_ip,
-                            tcp_details.dst_port,
-                            connect_time.as_millis()
-                        );
-                    } else {
-                        info!(
-                            "Established TCP connection via '{}': {}:{} -> {}:{} ({}ms)",
-                            outbound_tag,
-                            parsed.src_ip,
-                            tcp_details.src_port,
-                            parsed.dst_ip,
-                            tcp_details.dst_port,
-                            connect_time.as_millis()
-                        );
-                    }
-
-                    // Generate server's initial sequence number
-                    let server_seq: u32 = rand::random();
-
-                    // Get the stream for the reader task
-                    // Use into_outbound_stream() to support all stream types (TCP, TLS, Shadowsocks, etc.)
-                    let stream = conn.into_outbound_stream();
-
-                    // For proxy protocols like Shadowsocks that defer sending the target address
-                    // until the first write, we need to delay splitting the stream and spawning
-                    // the reader until after the first client data arrives.
-                    //
-                    // See: https://github.com/shadowsocks/shadowsocks-rust
-                    // The Shadowsocks protocol sends the target address with the first write.
-                    // If we split the stream and spawn the reader before any write, the reader
-                    // will try to read from the server before the handshake is complete,
-                    // causing "connection reset by peer".
-                    let stream_type = if stream.is_shadowsocks() { "Shadowsocks" }
-                        else if stream.is_tcp() { "TCP" }
-                        else if stream.is_transport() { "Transport" }
-                        else { "Unknown" };
-                    info!("TCP SYN: stream type = {} for outbound '{}'", stream_type, outbound_tag);
-
-                    // Update connection state and store outbound_stats
-                    let outbound_stats = outbound.stats();
-                    {
-                        let mut conn_guard = tracked.write().await;
-                        conn_guard.state = TcpConnectionState::Established;
-                        conn_guard.server_seq = server_seq;
-                        conn_guard.outbound_stats = Some(Arc::clone(&outbound_stats));
-                    }
-
-                    // Send SYN-ACK back to client
-                    if let Some(ref reply_tx) = direct_reply_tx {
-                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
-                            let syn_ack = build_tcp_packet(
-                                server_ip,
-                                tcp_details.dst_port,
-                                client_ip,
-                                tcp_details.src_port,
-                                server_seq,
-                                tcp_details.seq_num.wrapping_add(1), // ACK = client_seq + 1
-                                tcp_flag_bits::SYN | tcp_flag_bits::ACK,
-                                65535, // Window size
-                                &[],
-                            );
-
-                            let reply = ReplyPacket {
-                                packet: syn_ack,
-                                tunnel_tag: outbound_tag.clone(),
-                            };
-
-                            if let Err(e) = reply_tx.try_send(reply) {
-                                warn!("Failed to send SYN-ACK to reply router: {}", e);
-                            } else {
-                                debug!(
-                                    "Sent SYN-ACK: {}:{} -> {}:{} (seq={}, ack={})",
-                                    server_ip, tcp_details.dst_port,
-                                    client_ip, tcp_details.src_port,
-                                    server_seq, tcp_details.seq_num.wrapping_add(1)
-                                );
-                            }
-
-                            // For Shadowsocks streams, defer splitting and reader spawning until first data
-                            if stream.requires_write_before_read() {
-                                info!(
-                                    "Deferring stream split for Shadowsocks: {}:{} -> {}:{} (waiting for first data)",
-                                    client_ip, tcp_details.src_port, server_ip, tcp_details.dst_port
-                                );
-                                let pending_info = PendingStreamInfo {
-                                    stream,
-                                    reply_tx: reply_tx.clone(),
-                                    server_ip,
-                                    server_port: tcp_details.dst_port,
-                                    client_ip,
-                                    client_port: tcp_details.src_port,
-                                    server_seq: server_seq.wrapping_add(1), // After SYN-ACK
-                                    outbound_tag: outbound_tag.clone(),
-                                    connection: Arc::clone(&tracked),
-                                };
-                                TCP_PENDING_STREAMS.insert(five_tuple, pending_info);
-                                debug!(
-                                    "TCP connection pending first data: {}:{} -> {}:{}",
-                                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                                );
-                            } else {
-                                // For non-Shadowsocks streams, split immediately and spawn reader
-                                let (read_half, write_half) = tokio::io::split(stream);
-
-                                spawn_tcp_reader_task(
-                                    read_half,
-                                    reply_tx.clone(),
-                                    server_ip,
-                                    tcp_details.dst_port,
-                                    client_ip,
-                                    tcp_details.src_port,
-                                    server_seq.wrapping_add(1), // Start after SYN-ACK
-                                    tcp_details.seq_num.wrapping_add(1),
-                                    outbound_tag.clone(),
-                                    Arc::clone(&tracked),
-                                    five_tuple,
-                                );
-
-                                // Store write half
-                                let write_half: BoxedAsyncWrite = Box::new(write_half);
-                                let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
-                                TCP_WRITE_HALVES.insert(five_tuple, write_half);
-
-                                debug!(
-                                    "TCP connection fully established with reply path: {}:{} -> {}:{}",
-                                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
+                _ => {
                     warn!(
-                        "Failed to establish TCP connection via '{}' to {}: {}",
-                        outbound_tag, dst_addr, e
+                        "Invalid peer key for ipstack, dropping packet: {}:{} -> {}:{} (peer={})",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port,
+                        &processed.peer_public_key[..8.min(processed.peer_public_key.len())]
                     );
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-
-                    // Cleanup the connection entry we created before attempting connect
-                    tcp_manager.remove(&five_tuple);
-
-                    // Send RST back to client
-                    if let Some(ref reply_tx) = direct_reply_tx {
-                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
-                            let rst = build_tcp_packet(
-                                server_ip,
-                                tcp_details.dst_port,
-                                client_ip,
-                                tcp_details.src_port,
-                                0,
-                                tcp_details.seq_num.wrapping_add(1),
-                                tcp_flag_bits::RST | tcp_flag_bits::ACK,
-                                0,
-                                &[],
-                            );
-                            let _ = reply_tx.try_send(ReplyPacket {
-                                packet: rst,
-                                tunnel_tag: outbound_tag.clone(),
-                            });
-                        }
-                    }
+                    return;
                 }
-            }
-        } else {
-            warn!("Unknown outbound '{}' for TCP connection", outbound_tag);
-            // Cleanup the connection entry we created
-            tcp_manager.remove(&five_tuple);
-            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-        }
-    } else if tcp_details.is_fin() || tcp_details.is_rst() {
-        // Connection closing - clean up resources
-        TCP_WRITE_HALVES.remove(&five_tuple);
-        
-        if let Some(conn) = tcp_manager.get(&five_tuple) {
-            {
-                let mut conn_guard = conn.write().await;
-                conn_guard.state = TcpConnectionState::Closing;
-                conn_guard.touch();
-            }
-            // Record stats completion (only if not already recorded by reader task)
-            {
-                let conn_guard = conn.read().await;
-                conn_guard.record_stats_completion();
-            }
-            debug!(
-                "TCP connection closing: {}:{} -> {}:{} (flags={})",
-                parsed.src_ip,
-                tcp_details.src_port,
-                parsed.dst_ip,
-                tcp_details.dst_port,
-                tcp_details.flags_string()
-            );
+            };
 
-            // Also forward FIN/RST to WireGuard egress if applicable
-            // (handled above for WG egress, here we just track state)
-        } else {
-            // FIN/RST for unknown connection - likely already cleaned up
-            debug!(
-                "TCP FIN/RST for untracked connection: {}:{} -> {}:{}",
-                parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-            );
-        }
-    } else if tcp_details.has_payload(processed.data.len()) {
-        // Data packet - forward through established connection
-        if let Some(conn) = tcp_manager.get(&five_tuple) {
-            let payload_len = tcp_details.payload_len(processed.data.len());
-            let payload = &processed.data[tcp_details.payload_offset..];
+            // Convert the processed packet to BytesMut for ipstack
+            let packet_data = bytes::BytesMut::from(&processed.data[..]);
 
-            let conn_guard = conn.write().await;
+            // Try to inject into ipstack (non-blocking to avoid holding up the forwarder)
+            if let Ok(guard) = bridge.try_read() {
+                if guard.try_inject_packet(packet_data, peer_key) {
+                    // Register session in IngressSessionTracker for reply routing
+                    // This is needed because spawn_ipstack_reply_router looks up sessions here
+                    let five_tuple = FiveTuple::new(
+                        parsed.src_ip,
+                        tcp_details.src_port,
+                        parsed.dst_ip,
+                        tcp_details.dst_port,
+                        IPPROTO_TCP,
+                    );
+                    session_tracker.register(
+                        five_tuple,
+                        processed.peer_public_key.clone(),
+                        processed.src_addr,
+                        processed.routing.outbound.clone(),
+                        processed.data.len() as u64,
+                    );
 
-            if conn_guard.state != TcpConnectionState::Established {
-                debug!(
-                    "TCP data for connection in {} state: {}:{} -> {}:{}",
-                    conn_guard.state,
-                    parsed.src_ip,
-                    tcp_details.src_port,
-                    parsed.dst_ip,
-                    tcp_details.dst_port
-                );
-                // Don't forward data if connection not established
-                return;
-            }
-
-            // First check for pending streams (Shadowsocks waiting for first data)
-            drop(conn_guard); // Release lock before async operation
-
-            // Check if this is a pending stream that needs the first write to trigger handshake
-            if let Some((_, pending)) = TCP_PENDING_STREAMS.remove(&five_tuple) {
-                info!(
-                    "First data for pending Shadowsocks stream: {}:{} -> {}:{} ({} bytes)",
-                    pending.client_ip, pending.client_port, pending.server_ip, pending.server_port, payload_len
-                );
-
-                // Write the payload to trigger Shadowsocks handshake (target address + data)
-                let mut stream = pending.stream;
-                use tokio::io::AsyncWriteExt;
-
-                match stream.write_all(payload).await {
-                    Ok(()) => {
-                        info!("Shadowsocks handshake triggered with {} bytes of data", payload_len);
-
-                        // Now split the stream and spawn the reader
-                        let (read_half, write_half) = tokio::io::split(stream);
-
-                        // Spawn the reader task
-                        spawn_tcp_reader_task(
-                            read_half,
-                            pending.reply_tx.clone(),
-                            pending.server_ip,
-                            pending.server_port,
-                            pending.client_ip,
-                            pending.client_port,
-                            pending.server_seq, // Sequence from SYN-ACK
-                            tcp_details.seq_num.wrapping_add(1), // Client's ACK
-                            pending.outbound_tag.clone(),
-                            Arc::clone(&pending.connection),
-                            five_tuple,
-                        );
-
-                        // Store write half for subsequent data
-                        let write_half: BoxedAsyncWrite = Box::new(write_half);
-                        let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
-                        TCP_WRITE_HALVES.insert(five_tuple, write_half);
-
-                        // Update connection state
-                        {
-                            let mut conn_guard = pending.connection.write().await;
-                            conn_guard.add_bytes_sent(payload_len as u64);
-                            conn_guard.touch();
-                            conn_guard.client_seq = tcp_details.seq_num.wrapping_add(payload_len as u32);
-                        }
-
-                        // Send ACK back to client
-                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
-                            let server_seq = {
-                                let conn_guard = pending.connection.read().await;
-                                conn_guard.server_seq
-                            };
-                            let ack_packet = build_tcp_packet(
-                                server_ip,
-                                tcp_details.dst_port,
-                                client_ip,
-                                tcp_details.src_port,
-                                server_seq,
-                                tcp_details.seq_num.wrapping_add(payload_len as u32),
-                                tcp_flag_bits::ACK,
-                                65535,
-                                &[],
-                            );
-                            let _ = pending.reply_tx.try_send(ReplyPacket {
-                                packet: ack_packet,
-                                tunnel_tag: pending.outbound_tag.clone(),
-                            });
-                        }
-
-                        debug!(
-                            "Shadowsocks stream activated: {}:{} -> {}:{}",
-                            pending.client_ip, pending.client_port, pending.server_ip, pending.server_port
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to trigger Shadowsocks handshake: {} (connection will be reset)",
-                            e
-                        );
-                        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-
-                        // Mark connection as closing
-                        {
-                            let mut conn_guard = pending.connection.write().await;
-                            conn_guard.state = TcpConnectionState::Closing;
-                        }
-
-                        // Send RST to client
-                        if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
-                            let rst_packet = build_tcp_packet(
-                                server_ip,
-                                tcp_details.dst_port,
-                                client_ip,
-                                tcp_details.src_port,
-                                pending.server_seq,
-                                tcp_details.seq_num,
-                                tcp_flag_bits::RST,
-                                0,
-                                &[],
-                            );
-                            let _ = pending.reply_tx.try_send(ReplyPacket {
-                                packet: rst_packet,
-                                tunnel_tag: pending.outbound_tag.clone(),
-                            });
-                        }
-                    }
-                }
-                return; // We've handled this packet
-            }
-
-            // Try to use the write half from our global storage
-            // IMPORTANT: Clone the Arc and drop the DashMap Ref before any .await
-            // Holding a DashMap Ref across .await can cause deadlocks due to
-            // the internal sharded locking mechanism.
-            let write_half = TCP_WRITE_HALVES.get(&five_tuple).map(|r| Arc::clone(&*r));
-            if let Some(write_half) = write_half {
-                let mut stream = write_half.lock().await;
-                match stream.write_all(payload).await {
-                    Ok(()) => {
-                        // Combine connection updates into a single lock acquisition
-                        let server_seq = {
-                            let mut conn_guard = conn.write().await;
-                            conn_guard.add_bytes_sent(payload_len as u64);
-                            conn_guard.touch();
-                            conn_guard.client_seq = tcp_details.seq_num.wrapping_add(payload_len as u32);
-                            conn_guard.server_seq
-                        };
-                        
-                        // Send ACK back to client to acknowledge received data
-                        // This is critical for TCP flow control
-                        if let Some(ref reply_tx) = direct_reply_tx {
-                            if let (IpAddr::V4(client_ip), IpAddr::V4(server_ip)) = (parsed.src_ip, parsed.dst_ip) {
-                                let ack_packet = build_tcp_packet(
-                                    server_ip,
-                                    tcp_details.dst_port,
-                                    client_ip,
-                                    tcp_details.src_port,
-                                    server_seq,
-                                    tcp_details.seq_num.wrapping_add(payload_len as u32),
-                                    tcp_flag_bits::ACK,
-                                    65535,
-                                    &[],
-                                );
-                                let _ = reply_tx.try_send(ReplyPacket {
-                                    packet: ack_packet,
-                                    tunnel_tag: outbound_tag.clone(),
-                                });
-                            }
-                        }
-                        
-                        trace!(
-                            "Forwarded {} bytes TCP payload: {}:{} -> {}:{}",
-                            payload_len,
-                            parsed.src_ip,
-                            tcp_details.src_port,
-                            parsed.dst_ip,
-                            tcp_details.dst_port
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to write TCP payload: {} (connection may be closed)",
-                            e
-                        );
-                        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-                        // Mark connection as closing on write error
-                        {
-                            let mut conn_guard = conn.write().await;
-                            conn_guard.state = TcpConnectionState::Closing;
-                        }
-                        // Remove write half
-                        TCP_WRITE_HALVES.remove(&five_tuple);
-                    }
+                    trace!(
+                        "Routed TCP to ipstack: {}:{} -> {}:{}",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                    );
+                    stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                    stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                } else {
+                    // Channel full - drop packet, TCP will retransmit
+                    warn!(
+                        "IpStack channel full, dropping TCP packet (will retransmit): {}:{} -> {}:{}",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                    );
+                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
             } else {
-                debug!(
-                    "TCP data for connection without write half: {}:{} -> {}:{}",
+                // Bridge is locked - drop packet, TCP will retransmit
+                warn!(
+                    "IpStack bridge busy, dropping TCP packet (will retransmit): {}:{} -> {}:{}",
                     parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
                 );
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                return;
             }
         } else {
-            // Data for unknown connection (maybe missed the SYN)
-            debug!(
-                "TCP data for untracked connection: {}:{} -> {}:{} ({} bytes payload)",
-                parsed.src_ip,
-                tcp_details.src_port,
-                parsed.dst_ip,
-                tcp_details.dst_port,
-                tcp_details.payload_len(processed.data.len())
+            // Bridge not initialized - this shouldn't happen if ipstack is enabled
+            warn!(
+                "IpStack enabled but bridge not initialized, dropping TCP packet: {}:{} -> {}:{}",
+                parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
             );
-        }
-    } else {
-        // ACK without data - update connection state
-        if let Some(conn) = tcp_manager.get(&five_tuple) {
-            let mut conn_guard = conn.write().await;
-            conn_guard.touch();
-            trace!(
-                "TCP ACK (no data): {}:{} -> {}:{}, state={}",
-                parsed.src_ip,
-                tcp_details.src_port,
-                parsed.dst_ip,
-                tcp_details.dst_port,
-                conn_guard.state
-            );
+            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+            return;
         }
     }
+    // === END IPSTACK INTEGRATION ===
+
+    // When ipstack-tcp feature is not compiled, log error and drop packet
+    // (The manual TCP state machine has known bugs and is no longer supported)
+    #[cfg(not(feature = "ipstack-tcp"))]
+    {
+        warn!(
+            "TCP packet dropped: ipstack-tcp feature not enabled. \
+             Manual TCP state machine removed due to bugs. \
+             Rebuild with --features ipstack-tcp. \
+             Packet: {}:{} -> {}:{}",
+            parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+        );
+        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // REMOVED: Manual TCP state machine code (lines 2654-3314)
+    // The manual implementation had bugs:
+    // - server_seq initialization error causing wrong ACK numbers
+    // - No retransmission mechanism causing connection stalls on packet loss
+    // - Out-of-order packet dropping causing data loss
+    // - Fixed window size (65535) with no flow control
+    // All TCP traffic now goes through IpStack which handles these correctly.
+
 }
 
 /// DNS hijacking statistics
@@ -4101,181 +3344,6 @@ fn spawn_proxy_udp_reply_listener(
 /// - Safety margin: additional bytes for IPv6, options, etc.
 /// 
 /// Conservative value: 1420 - 20 (IP) - 60 (TCP max) - 32 (WG) - 8 (safety) = 1300
-const MAX_TCP_SEGMENT_SIZE: usize = 1300;
-
-/// Read buffer size for TCP reader - larger buffer reduces syscall overhead
-/// We read into a larger buffer but still send in MSS-sized chunks
-const TCP_READ_BUFFER_SIZE: usize = 65536;
-
-/// Spawn a task to read server responses and forward them to the client.
-///
-/// This task reads data from the server and constructs TCP packets to send
-/// back to the WireGuard client via the reply router.
-///
-/// The reader type is generic to support various stream types (TCP, TLS, Shadowsocks, etc.)
-fn spawn_tcp_reader_task<R>(
-    read_half: R,
-    reply_tx: mpsc::Sender<ReplyPacket>,
-    server_ip: Ipv4Addr,
-    server_port: u16,
-    client_ip: Ipv4Addr,
-    client_port: u16,
-    initial_seq: u32,
-    _initial_ack: u32, // Now read from connection.client_seq for accurate ACK tracking
-    outbound_tag: String,
-    connection: Arc<RwLock<TcpConnection>>,
-    five_tuple: FiveTuple,
-)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        // Use a larger read buffer for better throughput
-        let mut reader = BufReader::with_capacity(TCP_READ_BUFFER_SIZE, read_half);
-        let mut buf = vec![0u8; MAX_TCP_SEGMENT_SIZE];
-        let mut seq_num = initial_seq;
-
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
-                    // Connection closed by server - send FIN and cleanup
-                    debug!(
-                        "Server closed TCP connection: {}:{} -> {}:{}",
-                        server_ip, server_port, client_ip, client_port
-                    );
-
-                    // Get current client_seq from connection for ACK
-                    let ack_num = {
-                        let conn_guard = connection.read().await;
-                        conn_guard.client_seq
-                    };
-
-                    let fin_packet = build_tcp_packet(
-                        server_ip,
-                        server_port,
-                        client_ip,
-                        client_port,
-                        seq_num,
-                        ack_num,
-                        tcp_flag_bits::FIN | tcp_flag_bits::ACK,
-                        65535,
-                        &[],
-                    );
-
-                    let _ = reply_tx.try_send(ReplyPacket {
-                        packet: fin_packet,
-                        tunnel_tag: outbound_tag.clone(),
-                    });
-
-                    // Update connection state and cleanup
-                    {
-                        let mut conn_guard = connection.write().await;
-                        conn_guard.state = TcpConnectionState::Closing;
-                    }
-                    TCP_WRITE_HALVES.remove(&five_tuple);
-                    // Record connection completion in outbound stats (only if not already recorded)
-                    {
-                        let conn_guard = connection.read().await;
-                        conn_guard.record_stats_completion();
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    // Data received from server - forward to client
-                    let payload = &buf[..n];
-                    
-                    // Get current client_seq from connection for ACK
-                    let ack_num = {
-                        let conn_guard = connection.read().await;
-                        conn_guard.client_seq
-                    };
-
-                    let data_packet = build_tcp_packet(
-                        server_ip,
-                        server_port,
-                        client_ip,
-                        client_port,
-                        seq_num,
-                        ack_num,
-                        tcp_flag_bits::ACK | tcp_flag_bits::PSH,
-                        65535,
-                        payload,
-                    );
-
-                    if let Err(e) = reply_tx.send(ReplyPacket {
-                        packet: data_packet,
-                        tunnel_tag: outbound_tag.clone(),
-                    }).await {
-                        warn!("Failed to send TCP data to reply router: {}", e);
-                        TCP_WRITE_HALVES.remove(&five_tuple);
-                        {
-                            let conn_guard = connection.read().await;
-                            conn_guard.record_stats_error();
-                        }
-                        return;
-                    }
-
-                    trace!(
-                        "TCP data: {}:{} -> {}:{} ({} bytes, seq={})",
-                        server_ip, server_port, client_ip, client_port, n, seq_num
-                    );
-
-                    // Update sequence number for next packet
-                    seq_num = seq_num.wrapping_add(n as u32);
-
-                    // Update connection stats
-                    {
-                        let conn_guard = connection.read().await;
-                        conn_guard.add_bytes_received(n as u64);
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "TCP read error: {}:{} -> {}:{}: {}",
-                        server_ip, server_port, client_ip, client_port, e
-                    );
-
-                    // Get current client_seq from connection for ACK
-                    let ack_num = {
-                        let conn_guard = connection.read().await;
-                        conn_guard.client_seq
-                    };
-
-                    // Send RST on error
-                    let rst_packet = build_tcp_packet(
-                        server_ip,
-                        server_port,
-                        client_ip,
-                        client_port,
-                        seq_num,
-                        ack_num,
-                        tcp_flag_bits::RST,
-                        0,
-                        &[],
-                    );
-
-                    let _ = reply_tx.try_send(ReplyPacket {
-                        packet: rst_packet,
-                        tunnel_tag: outbound_tag.clone(),
-                    });
-                    // Cleanup on error and record error in stats (only if not already recorded)
-                    TCP_WRITE_HALVES.remove(&five_tuple);
-                    {
-                        let conn_guard = connection.read().await;
-                        conn_guard.record_stats_error();
-                    }
-                    break;
-                }
-            }
-        }
-
-        debug!(
-            "TCP reader task finished: {}:{} -> {}:{}",
-            server_ip, server_port, client_ip, client_port
-        );
-    });
-}
-
 // ============================================================================
 // ICMP Forwarding
 // ============================================================================
@@ -4498,13 +3566,14 @@ async fn create_icmp_socket() -> std::io::Result<UdpSocket> {
 /// # Arguments
 ///
 /// * `packet_rx` - Receiver for processed packets from ingress
-/// * `outbound_manager` - Manager for direct/SOCKS5 outbounds
+/// * `outbound_manager` - Manager for direct/SOCKS5 outbounds (used for UDP)
 /// * `wg_egress_manager` - Manager for `WireGuard` egress tunnels
-/// * `tcp_manager` - TCP connection manager for stateful connection tracking
 /// * `session_tracker` - Session tracker for reply routing
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 /// * `local_ip` - Gateway's local IP for responding to pings to self
+/// * `ecmp_group_manager` - Optional ECMP group manager for load balancing
+/// * `peer_manager` - Optional peer manager for peer tunnel forwarding
 ///
 /// # Returns
 ///
@@ -4513,7 +3582,6 @@ pub fn spawn_forwarding_task(
     packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
     wg_egress_manager: Arc<WgEgressManager>,
-    tcp_manager: Arc<TcpConnectionManager>,
     session_tracker: Arc<IngressSessionTracker>,
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
@@ -4525,7 +3593,6 @@ pub fn spawn_forwarding_task(
         packet_rx,
         outbound_manager,
         wg_egress_manager,
-        tcp_manager,
         session_tracker,
         stats,
         direct_reply_tx,
@@ -5020,6 +4087,205 @@ pub fn spawn_peer_tunnel_processor(
         ingress_manager,
         peer_manager,
     ))
+}
+
+// ============================================================================
+// UDP Session Stats Helpers
+// ============================================================================
+
+/// Get the number of active UDP sessions
+///
+/// This returns the count of active UDP sessions for QUIC and other UDP traffic.
+#[must_use]
+pub fn get_udp_session_count() -> usize {
+    UDP_SESSIONS.len()
+}
+
+/// Get the number of active proxy UDP sessions (Shadowsocks, SOCKS5)
+#[must_use]
+pub fn get_proxy_udp_session_count() -> usize {
+    PROXY_UDP_SESSIONS.len()
+}
+
+// ============================================================================
+// IpStack Bridge Public API (feature-gated)
+// ============================================================================
+
+/// Initialize the IpStack bridge (call once at startup)
+///
+/// Returns a receiver channel for reply packets that should be sent back
+/// through WireGuard to clients.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The bridge has already been initialized
+/// - Failed to start the internal ipstack tasks
+#[cfg(feature = "ipstack-tcp")]
+pub async fn init_ipstack_bridge() -> anyhow::Result<mpsc::Receiver<(bytes::BytesMut, [u8; 32])>> {
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let mut bridge = IpStackBridge::new();
+    let reply_rx = bridge
+        .take_reply_rx()
+        .ok_or_else(|| anyhow::anyhow!("Failed to take reply_rx from IpStackBridge"))?;
+
+    bridge.start().await?;
+
+    IPSTACK_BRIDGE
+        .set(Arc::new(RwLock::new(bridge)))
+        .map_err(|_| anyhow::anyhow!("IpStackBridge already initialized"))?;
+
+    info!("IpStack bridge initialized");
+    Ok(reply_rx)
+}
+
+/// Check if ipstack is enabled and running
+///
+/// Returns true if:
+/// - The ipstack-tcp feature is enabled
+/// - The bridge has been initialized
+/// - Runtime enable flag is set (default: true)
+#[cfg(feature = "ipstack-tcp")]
+#[must_use]
+pub fn is_ipstack_enabled() -> bool {
+    IPSTACK_ENABLED.load(Ordering::Relaxed) && IPSTACK_BRIDGE.get().is_some()
+}
+
+/// Set ipstack enabled/disabled at runtime
+///
+/// This allows dynamically enabling or disabling ipstack without
+/// restarting the router. When disabled, traffic falls back to
+/// the manual TCP state machine.
+#[cfg(feature = "ipstack-tcp")]
+pub fn set_ipstack_enabled(enabled: bool) {
+    IPSTACK_ENABLED.store(enabled, Ordering::Relaxed);
+    info!(
+        "IpStack bridge {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+}
+
+/// Get IpStack bridge statistics
+///
+/// Returns None if the bridge is not initialized or locked.
+#[cfg(feature = "ipstack-tcp")]
+#[must_use]
+pub async fn get_ipstack_stats() -> Option<super::ipstack_bridge::IpStackBridgeStatsSnapshot> {
+    let bridge = IPSTACK_BRIDGE.get()?;
+    // Use try_read to avoid blocking; if locked, return None
+    bridge.try_read().ok().map(|guard| guard.stats().snapshot())
+}
+
+/// Get IpStack bridge diagnostic snapshot
+///
+/// Returns detailed diagnostics including session counts and statistics.
+#[cfg(feature = "ipstack-tcp")]
+#[must_use]
+pub async fn get_ipstack_diagnostics() -> Option<super::ipstack_bridge::DiagnosticSnapshot> {
+    let bridge = IPSTACK_BRIDGE.get()?;
+    bridge.try_read().ok().map(|guard| guard.diagnostic_snapshot())
+}
+
+/// Spawn a task to route ipstack reply packets to WireGuard peers
+///
+/// This task receives reply packets from the IpStackBridge and sends them
+/// back to the appropriate WireGuard peer based on the peer_key.
+///
+/// # Arguments
+///
+/// * `ipstack_reply_rx` - Receiver for (packet, peer_key) tuples from IpStackBridge
+/// * `wg_ingress_manager` - Reference to the WireGuard ingress manager for sending packets
+/// * `session_tracker` - Session tracker for looking up peer endpoints
+///
+/// # Returns
+///
+/// A JoinHandle for the spawned task.
+#[cfg(feature = "ipstack-tcp")]
+pub fn spawn_ipstack_reply_router(
+    mut ipstack_reply_rx: mpsc::Receiver<(bytes::BytesMut, [u8; 32])>,
+    wg_ingress_manager: Arc<super::manager::WgIngressManager>,
+    session_tracker: Arc<IngressSessionTracker>,
+) -> tokio::task::JoinHandle<()> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+
+    tokio::spawn(async move {
+        info!("IpStack reply router started");
+
+        let mut packets_routed: u64 = 0;
+        let mut packets_failed: u64 = 0;
+
+        while let Some((packet, peer_key)) = ipstack_reply_rx.recv().await {
+            // Convert peer_key bytes to base64 string for WgIngressManager
+            let peer_key_b64 = BASE64.encode(peer_key);
+
+            // Parse the packet to find the session info
+            let Some(parsed) = parse_ip_packet(&packet) else {
+                debug!("Failed to parse ipstack reply packet");
+                packets_failed += 1;
+                continue;
+            };
+
+            // Get ports for session lookup
+            let (Some(src_port), Some(dst_port)) = (parsed.src_port, parsed.dst_port) else {
+                debug!("IpStack reply packet missing ports");
+                packets_failed += 1;
+                continue;
+            };
+
+            // Look up the original session to get the peer endpoint
+            // Reply packets have swapped src/dst compared to the original flow
+            let lookup_key = FiveTuple::new(parsed.dst_ip, dst_port, parsed.src_ip, src_port, parsed.protocol);
+
+            let Some(session) = session_tracker.get(&lookup_key) else {
+                trace!(
+                    "No session for ipstack reply: {} -> {}",
+                    parsed.src_ip, parsed.dst_ip
+                );
+                packets_failed += 1;
+                continue;
+            };
+
+            // Verify peer key matches
+            if session.peer_public_key != peer_key_b64 {
+                debug!(
+                    "IpStack reply peer key mismatch: expected {}, got {}",
+                    &peer_key_b64[..8], &session.peer_public_key[..8.min(session.peer_public_key.len())]
+                );
+                packets_failed += 1;
+                continue;
+            }
+
+            // Send the packet back to the peer
+            match wg_ingress_manager
+                .send_to_peer(&session.peer_public_key, session.peer_endpoint, &packet)
+                .await
+            {
+                Ok(()) => {
+                    packets_routed += 1;
+                    trace!(
+                        "IpStack reply sent to peer {}: {} bytes",
+                        &peer_key_b64[..8],
+                        packet.len()
+                    );
+                }
+                Err(e) => {
+                    packets_failed += 1;
+                    debug!(
+                        "Failed to send ipstack reply to peer {}: {}",
+                        &peer_key_b64[..8], e
+                    );
+                }
+            }
+        }
+
+        info!(
+            "IpStack reply router stopped: routed={}, failed={}",
+            packets_routed, packets_failed
+        );
+    })
 }
 
 // ============================================================================
@@ -6201,222 +5467,11 @@ mod tests {
     }
 
     // ========================================================================
-    // TCP Connection State Tests
-    // ========================================================================
-
-    #[test]
-    fn test_tcp_connection_state_display() {
-        assert_eq!(TcpConnectionState::SynReceived.to_string(), "SYN_RECEIVED");
-        assert_eq!(TcpConnectionState::Established.to_string(), "ESTABLISHED");
-        assert_eq!(TcpConnectionState::Closing.to_string(), "CLOSING");
-        assert_eq!(TcpConnectionState::Closed.to_string(), "CLOSED");
-    }
-
-    #[test]
-    fn test_tcp_connection_new() {
-        let conn = TcpConnection::new(
-            "direct".to_string(),
-            "test_peer_key".to_string(),
-            "192.168.1.100:51820".parse().unwrap(),
-        );
-
-        assert_eq!(conn.state, TcpConnectionState::SynReceived);
-        assert_eq!(conn.outbound_tag, "direct");
-        assert_eq!(conn.peer_public_key, "test_peer_key");
-        assert!(conn.outbound_stream.is_none());
-        assert_eq!(conn.get_bytes_sent(), 0);
-        assert_eq!(conn.get_bytes_received(), 0);
-        assert_eq!(conn.client_seq, 0);
-        assert_eq!(conn.server_seq, 0);
-    }
-
-    #[test]
-    fn test_tcp_connection_bytes_tracking() {
-        let conn = TcpConnection::new(
-            "direct".to_string(),
-            "key".to_string(),
-            "127.0.0.1:1234".parse().unwrap(),
-        );
-
-        conn.add_bytes_sent(100);
-        conn.add_bytes_sent(50);
-        conn.add_bytes_received(200);
-        conn.add_bytes_received(100);
-
-        assert_eq!(conn.get_bytes_sent(), 150);
-        assert_eq!(conn.get_bytes_received(), 300);
-    }
-
-    // ========================================================================
-    // TCP Connection Manager Tests
-    // ========================================================================
-
-    #[test]
-    fn test_tcp_connection_manager_new() {
-        let manager = TcpConnectionManager::new(Duration::from_secs(300));
-
-        assert_eq!(manager.len(), 0);
-        assert!(manager.is_empty());
-        assert_eq!(manager.connection_timeout(), Duration::from_secs(300));
-    }
-
-    #[test]
-    fn test_tcp_connection_manager_default() {
-        let manager = TcpConnectionManager::default();
-        assert_eq!(manager.connection_timeout(), Duration::from_secs(300));
-    }
-
-    #[tokio::test]
-    async fn test_tcp_connection_manager_get_or_create() {
-        let manager = TcpConnectionManager::new(Duration::from_secs(300));
-
-        let five_tuple = FiveTuple::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            1234,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            80,
-            IPPROTO_TCP,
-        );
-
-        let conn = manager.get_or_create(
-            five_tuple,
-            "peer_key".to_string(),
-            "192.168.1.100:51820".parse().unwrap(),
-            "direct".to_string(),
-        );
-
-        assert_eq!(manager.len(), 1);
-
-        let guard = conn.read().await;
-        assert_eq!(guard.state, TcpConnectionState::SynReceived);
-        assert_eq!(guard.outbound_tag, "direct");
-        assert_eq!(guard.peer_public_key, "peer_key");
-    }
-
-    #[tokio::test]
-    async fn test_tcp_connection_manager_get_existing() {
-        let manager = TcpConnectionManager::new(Duration::from_secs(300));
-
-        let five_tuple = FiveTuple::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            1234,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            80,
-            IPPROTO_TCP,
-        );
-
-        // Create first connection
-        let conn1 = manager.get_or_create(
-            five_tuple,
-            "key1".to_string(),
-            "192.168.1.100:51820".parse().unwrap(),
-            "out1".to_string(),
-        );
-
-        // Try to create again with same 5-tuple - should return existing
-        let conn2 = manager.get_or_create(
-            five_tuple,
-            "key2".to_string(), // Different key - but should use existing
-            "192.168.1.200:51820".parse().unwrap(),
-            "out2".to_string(),
-        );
-
-        assert_eq!(manager.len(), 1);
-
-        // Both should point to the same connection
-        let guard1 = conn1.read().await;
-        let guard2 = conn2.read().await;
-        assert_eq!(guard1.peer_public_key, guard2.peer_public_key);
-        assert_eq!(guard1.peer_public_key, "key1"); // Original value
-    }
-
-    #[test]
-    fn test_tcp_connection_manager_get() {
-        let manager = TcpConnectionManager::new(Duration::from_secs(300));
-
-        let five_tuple = FiveTuple::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            1234,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            80,
-            IPPROTO_TCP,
-        );
-
-        // Get on empty manager
-        assert!(manager.get(&five_tuple).is_none());
-
-        // Create connection
-        manager.get_or_create(
-            five_tuple,
-            "key".to_string(),
-            "127.0.0.1:1234".parse().unwrap(),
-            "direct".to_string(),
-        );
-
-        // Now get should succeed
-        assert!(manager.get(&five_tuple).is_some());
-    }
-
-    #[test]
-    fn test_tcp_connection_manager_remove() {
-        let manager = TcpConnectionManager::new(Duration::from_secs(300));
-
-        let five_tuple = FiveTuple::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            1234,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            80,
-            IPPROTO_TCP,
-        );
-
-        manager.get_or_create(
-            five_tuple,
-            "key".to_string(),
-            "127.0.0.1:1234".parse().unwrap(),
-            "direct".to_string(),
-        );
-
-        assert_eq!(manager.len(), 1);
-
-        let removed = manager.remove(&five_tuple);
-        assert!(removed.is_some());
-        assert_eq!(manager.len(), 0);
-
-        // Second remove should return None
-        assert!(manager.remove(&five_tuple).is_none());
-    }
-
-    #[test]
-    fn test_tcp_connection_manager_cleanup() {
-        let manager = TcpConnectionManager::new(Duration::ZERO); // Immediate timeout
-
-        let five_tuple = FiveTuple::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            1234,
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            80,
-            IPPROTO_TCP,
-        );
-
-        manager.get_or_create(
-            five_tuple,
-            "key".to_string(),
-            "127.0.0.1:1234".parse().unwrap(),
-            "direct".to_string(),
-        );
-
-        // Should expire immediately
-        let removed = manager.cleanup();
-        assert_eq!(removed, 1);
-        assert!(manager.is_empty());
-    }
-
-    // ========================================================================
     // TCP Details Parsing Tests
     // ========================================================================
 
-    /// Build a TCP packet with specified flags
-    fn build_tcp_packet(
+    /// Build a TCP packet with specified flags and window size
+    fn build_tcp_packet_with_window(
         src_ip: Ipv4Addr,
         src_port: u16,
         dst_ip: Ipv4Addr,
@@ -6424,6 +5479,7 @@ mod tests {
         seq: u32,
         ack: u32,
         flags: u8,
+        window: u16,
         payload: &[u8],
     ) -> Vec<u8> {
         let tcp_header_len = 20; // No options
@@ -6449,6 +5505,8 @@ mod tests {
         // Data offset = 5 (20 bytes), shifted to high nibble
         packet[tcp_start + 12] = (5 << 4);
         packet[tcp_start + 13] = flags;
+        // Window size at bytes 14-15 of TCP header
+        packet[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
 
         // Payload
         if !payload.is_empty() {
@@ -6456,6 +5514,20 @@ mod tests {
         }
 
         packet
+    }
+
+    /// Build a TCP packet with specified flags (default window 65535)
+    fn build_tcp_packet(
+        src_ip: Ipv4Addr,
+        src_port: u16,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        build_tcp_packet_with_window(src_ip, src_port, dst_ip, dst_port, seq, ack, flags, 65535, payload)
     }
 
     #[test]
@@ -6478,11 +5550,47 @@ mod tests {
         assert_eq!(details.seq_num, 1000);
         assert_eq!(details.ack_num, 0);
         assert_eq!(details.data_offset, 20);
+        assert_eq!(details.window, 65535); // Default window from build_tcp_packet
         assert!(details.is_syn());
         assert!(!details.is_ack());
         assert!(!details.is_fin());
         assert!(!details.is_rst());
         assert!(!details.has_payload(packet.len()));
+    }
+
+    #[test]
+    fn test_parse_tcp_details_window() {
+        // Test with custom window size
+        let packet = build_tcp_packet_with_window(
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            1000, // seq
+            0,    // ack
+            tcp_flags::SYN,
+            32768, // Custom window size
+            &[],
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+        assert_eq!(details.window, 32768);
+
+        // Test with minimum window
+        let packet = build_tcp_packet_with_window(
+            Ipv4Addr::new(10, 0, 0, 1),
+            12345,
+            Ipv4Addr::new(8, 8, 8, 8),
+            80,
+            1000,
+            0,
+            tcp_flags::ACK,
+            0, // Zero window (flow control)
+            &[],
+        );
+
+        let details = parse_tcp_details(&packet, 20).unwrap();
+        assert_eq!(details.window, 0);
     }
 
     #[test]
@@ -6578,6 +5686,7 @@ mod tests {
             ack_num: 0,
             data_offset: 20,
             flags: tcp_flags::SYN,
+            window: 65535,
             payload_offset: 40,
         };
         assert_eq!(details.flags_string(), "SYN");
@@ -6657,6 +5766,7 @@ mod tests {
             ack_num: 0,
             data_offset: 20,
             flags: tcp_flags::SYN,
+            window: 65535,
             payload_offset: 40, // 20 IP + 20 TCP
         };
 

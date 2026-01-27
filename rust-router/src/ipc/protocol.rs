@@ -1043,6 +1043,19 @@ pub enum IpcCommand {
     /// Stop Shadowsocks inbound listener
     #[cfg(feature = "shadowsocks")]
     StopShadowsocksInbound,
+
+    // ========================================================================
+    // TCP Connection Statistics
+    // ========================================================================
+
+    /// Get TCP connection statistics
+    ///
+    /// Returns detailed TCP connection statistics for debugging, including:
+    /// - Active write halves (outbound connections)
+    /// - Pending streams (Shadowsocks waiting for first data)
+    /// - UDP session counts
+    /// - Ingress session tracker counts (if available)
+    GetTcpStats,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -1330,6 +1343,13 @@ pub enum IpcResponse {
     /// Shadowsocks inbound status response
     #[cfg(feature = "shadowsocks")]
     ShadowsocksInboundStatus(ShadowsocksInboundStatusResponse),
+
+    // ========================================================================
+    // TCP Connection Statistics Response
+    // ========================================================================
+
+    /// TCP connection statistics response
+    TcpStats(TcpStatsResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -1754,6 +1774,44 @@ pub struct BufferPoolStatsResponse {
     pub available: bool,
     /// Buffer pool statistics
     pub stats: Option<BufferPoolInfo>,
+}
+
+// ============================================================================
+// TCP Connection Statistics Types
+// ============================================================================
+
+/// TCP connection statistics response
+///
+/// Provides detailed TCP connection statistics for debugging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TcpStatsResponse {
+    /// Number of active TCP write halves (outbound connections)
+    ///
+    /// This represents TCP connections where data can be forwarded to the server.
+    pub tcp_write_halves: usize,
+
+    /// Number of pending TCP streams
+    ///
+    /// These are TCP connections waiting for first client data,
+    /// used by Shadowsocks and other write-before-read protocols.
+    pub tcp_pending_streams: usize,
+
+    /// Number of active TCP reader tasks
+    ///
+    /// This represents spawned tasks that read responses from outbound
+    /// connections and forward them back to clients.
+    pub tcp_active_readers: u64,
+
+    /// Number of active UDP sessions (QUIC and other UDP traffic)
+    pub udp_sessions: usize,
+
+    /// Number of active proxy UDP sessions (Shadowsocks, SOCKS5)
+    pub proxy_udp_sessions: usize,
+
+    /// Number of active ingress sessions (from session tracker)
+    ///
+    /// None if the ingress session tracker is not available.
+    pub ingress_sessions: Option<usize>,
 }
 
 // ============================================================================

@@ -20,7 +20,7 @@ import {
   useShadowsocksIngressOutbound,
   useSetShadowsocksIngressOutbound,
 } from "@/api/hooks/useShadowsocksIngress";
-import { Loader2, Eye, EyeOff, RefreshCw } from "lucide-react";
+import { Loader2, RefreshCw, Copy, Check } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { SHADOWSOCKS_METHODS, type ShadowsocksMethod } from "@/types";
 
@@ -80,6 +80,20 @@ const configSchema = z.object({
 
 type ConfigFormValues = z.infer<typeof configSchema>;
 
+/**
+ * Generate Shadowsocks URL (SIP002 format)
+ * Format: ss://BASE64(method:password)@host:port#tag
+ */
+function generateSsUrl(method: string, password: string, host: string, port: number, tag?: string): string {
+  // SIP002 format uses userinfo encoding
+  const userinfo = btoa(`${method}:${password}`);
+  const baseUrl = `ss://${userinfo}@${host}:${port}`;
+  if (tag) {
+    return `${baseUrl}#${encodeURIComponent(tag)}`;
+  }
+  return baseUrl;
+}
+
 export function ShadowsocksIngressConfig() {
   const { data: configData, isLoading: isLoadingConfig } = useShadowsocksIngressConfig();
   const { mutate: updateConfig, isPending: isUpdatingConfig } = useUpdateShadowsocksIngressConfig();
@@ -87,8 +101,8 @@ export function ShadowsocksIngressConfig() {
   const { data: outboundData, isLoading: isLoadingOutbound } = useShadowsocksIngressOutbound();
   const { mutate: setOutbound, isPending: isSettingOutbound } = useSetShadowsocksIngressOutbound();
 
-  const [showPassword, setShowPassword] = useState(false);
   const [keyValidationError, setKeyValidationError] = useState<string | null>(null);
+  const [copiedUrl, setCopiedUrl] = useState(false);
 
   const {
     register,
@@ -114,10 +128,16 @@ export function ShadowsocksIngressConfig() {
   useEffect(() => {
     if (configData?.config) {
       setValue("enabled", configData.config.enabled);
-      setValue("listen_addr", configData.config.listen_addr);
-      setValue("listen_port", configData.config.listen_port);
-      setValue("method", configData.config.method);
-      // Password is typically not returned for security
+      setValue("listen_addr", configData.config.listen_addr || "0.0.0.0");
+      setValue("listen_port", configData.config.listen_port || 8388);
+      // Ensure method has a valid value from SHADOWSOCKS_METHODS
+      const method = configData.config.method;
+      const validMethod = SHADOWSOCKS_METHODS.find(m => m.value === method);
+      setValue("method", validMethod ? method : "2022-blake3-aes-256-gcm");
+      // Set password if returned from API
+      if (configData.config.password) {
+        setValue("password", configData.config.password);
+      }
       setValue("udp_enabled", configData.config.udp_enabled);
     }
   }, [configData, setValue]);
@@ -224,31 +244,13 @@ export function ShadowsocksIngressConfig() {
             <div className="grid gap-2">
               <Label htmlFor="password">Password / Key</Label>
               <div className="flex gap-2">
-                <div className="relative flex-1">
-                  <Input
-                    id="password"
-                    type={showPassword ? "text" : "password"}
-                    placeholder="Leave blank to keep existing password"
-                    {...register("password")}
-                    className="pr-10"
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
-                    onClick={() => setShowPassword(!showPassword)}
-                  >
-                    {showPassword ? (
-                      <EyeOff className="h-4 w-4 text-muted-foreground" />
-                    ) : (
-                      <Eye className="h-4 w-4 text-muted-foreground" />
-                    )}
-                    <span className="sr-only">
-                      {showPassword ? "Hide password" : "Show password"}
-                    </span>
-                  </Button>
-                </div>
+                <Input
+                  id="password"
+                  type="text"
+                  placeholder="Leave blank to keep existing password"
+                  {...register("password")}
+                  className="flex-1 font-mono text-sm"
+                />
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -260,7 +262,6 @@ export function ShadowsocksIngressConfig() {
                           const newKey = generateKey(watchMethod);
                           setValue("password", newKey);
                           setKeyValidationError(null);
-                          setShowPassword(true); // Show the generated key
                         }}
                       >
                         <RefreshCw className="h-4 w-4" />
@@ -344,6 +345,77 @@ export function ShadowsocksIngressConfig() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Quick Connect URL - show when password exists (from form or saved config) */}
+      {(watch("password") || configData?.config?.password) && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Quick Connect</CardTitle>
+            <CardDescription>
+              Use this URL to connect from Shadowsocks clients
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {!watchEnabled && (
+              <div className="text-sm text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 p-3 rounded-md">
+                ⚠️ Shadowsocks ingress is currently disabled. Enable it and save to accept connections.
+              </div>
+            )}
+            <div className="grid gap-2">
+              <Label>Connection URL</Label>
+              <div className="flex gap-2">
+                <Input
+                  readOnly
+                  value={generateSsUrl(
+                    watchMethod || configData?.config?.method || "2022-blake3-aes-256-gcm",
+                    watch("password") || configData?.config?.password || "",
+                    window.location.hostname,
+                    watch("listen_port") || configData?.config?.listen_port || 8388,
+                    "VPN-Gateway-SS"
+                  )}
+                  className="font-mono text-xs flex-1"
+                />
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="icon"
+                        onClick={() => {
+                          const url = generateSsUrl(
+                            watchMethod || configData?.config?.method || "2022-blake3-aes-256-gcm",
+                            watch("password") || configData?.config?.password || "",
+                            window.location.hostname,
+                            watch("listen_port") || configData?.config?.listen_port || 8388,
+                            "VPN-Gateway-SS"
+                          );
+                          navigator.clipboard.writeText(url);
+                          setCopiedUrl(true);
+                          setTimeout(() => setCopiedUrl(false), 2000);
+                        }}
+                      >
+                        {copiedUrl ? (
+                          <Check className="h-4 w-4 text-green-500" />
+                        ) : (
+                          <Copy className="h-4 w-4" />
+                        )}
+                        <span className="sr-only">Copy URL</span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>{copiedUrl ? "Copied!" : "Copy to clipboard"}</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Import this URL in your Shadowsocks client (Clash, Shadowrocket, etc.)
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

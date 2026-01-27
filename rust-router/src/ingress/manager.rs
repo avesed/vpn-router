@@ -303,11 +303,17 @@ impl RegisteredPeer {
     ///
     /// Returns the decrypted data if successful, or None if decryption failed
     /// (e.g., packet is not from this peer or invalid).
-    fn decrypt(&self, encrypted: &[u8], dst: &mut [u8]) -> Option<DecryptedPacket> {
+    ///
+    /// # Arguments
+    ///
+    /// * `encrypted` - The encrypted packet data
+    /// * `dst` - Buffer for decrypted output
+    /// * `src_addr` - Source IP address of the packet sender (required for rate limiting under load)
+    fn decrypt(&self, encrypted: &[u8], dst: &mut [u8], src_addr: Option<IpAddr>) -> Option<DecryptedPacket> {
         let mut tunn_guard = self.tunn.lock();
         let tunn = tunn_guard.as_mut()?;
 
-        match tunn.decapsulate(None, encrypted, dst) {
+        match tunn.decapsulate(src_addr, encrypted, dst) {
             TunnResult::WriteToTunnelV4(data, _) => {
                 Some(DecryptedPacket {
                     data: data.to_vec(),
@@ -330,8 +336,24 @@ impl RegisteredPeer {
                     response: Some(response.to_vec()),
                 })
             }
-            TunnResult::Done => None,
-            TunnResult::Err(_e) => None,
+            TunnResult::Done => {
+                // Done typically means the packet was processed but no output needed
+                // (e.g., keepalive received). This is normal for some packet types.
+                None
+            }
+            TunnResult::Err(e) => {
+                // Log the specific error for debugging handshake failures
+                // Common errors:
+                // - WrongKey: client's public key doesn't match this peer
+                // - InvalidAeadTag: server's private key wrong or packet corrupted
+                // - WrongTai64nTimestamp: replay attack or client clock issue
+                debug!(
+                    error = ?e,
+                    packet_len = encrypted.len(),
+                    "Decapsulate error for peer"
+                );
+                None
+            }
         }
     }
 
@@ -1337,7 +1359,7 @@ impl WgIngressManager {
         // WireGuard uses the receiver's public key index to identify
         // which peer sent the packet, but boringtun handles this internally
         let (decrypted_data, peer_public_key, peer_ref) =
-            if let Some(result) = Self::identify_and_decrypt(peers, encrypted_data, decrypt_buf, stats) { result } else {
+            if let Some(result) = Self::identify_and_decrypt(peers, encrypted_data, decrypt_buf, stats, src_addr.ip()) { result } else {
                 trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
                 stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -1441,11 +1463,20 @@ impl WgIngressManager {
     /// doesn't expose the receiver index directly.
     ///
     /// Returns None if no peer could decrypt the packet.
+    ///
+    /// # Arguments
+    ///
+    /// * `peers` - Map of registered peers to try
+    /// * `encrypted` - The encrypted packet data
+    /// * `dst` - Buffer for decrypted output
+    /// * `stats` - Statistics collector
+    /// * `src_addr` - Source IP address of the packet sender (required for rate limiting under load)
     fn identify_and_decrypt<'a>(
         peers: &'a HashMap<String, Arc<RegisteredPeer>>,
         encrypted: &[u8],
         dst: &mut [u8],
         stats: &StatsInner,
+        src_addr: IpAddr,
     ) -> Option<(DecryptedPacket, String, &'a Arc<RegisteredPeer>)> {
         // Log packet type for debugging
         let msg_type = if encrypted.len() >= 4 { encrypted[0] } else { 0 };
@@ -1461,7 +1492,7 @@ impl WgIngressManager {
         // In a real implementation with many peers, we'd use the receiver index
         // to look up the peer directly, but boringtun handles sessions internally
         for (public_key, peer) in peers {
-            if let Some(decrypted) = peer.decrypt(encrypted, dst) {
+            if let Some(decrypted) = peer.decrypt(encrypted, dst, Some(src_addr)) {
                 debug!(
                     msg_type = type_name,
                     peer = %public_key,

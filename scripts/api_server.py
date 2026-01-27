@@ -397,6 +397,7 @@ def _get_available_outbounds(db) -> list:
     - OpenVPN 出口
     - V2Ray 出口
     - WARP 出口
+    - Shadowsocks 出口
     - 出口组（负载均衡/故障转移）
     """
     available = ["direct"]
@@ -428,6 +429,11 @@ def _get_available_outbounds(db) -> list:
 
     # WARP egress
     for egress in db.get_warp_egress_list(enabled_only=True):
+        if egress.get("tag"):
+            available.append(egress["tag"])
+
+    # Shadowsocks egress
+    for egress in db.get_shadowsocks_egress_list(enabled_only=True):
         if egress.get("tag"):
             available.append(egress["tag"])
 
@@ -4227,6 +4233,12 @@ def api_get_rules():
                 if egress.get("tag") and egress["tag"] not in available_outbounds:
                     available_outbounds.append(egress["tag"])
 
+            # 从数据库读取 Shadowsocks 出口
+            shadowsocks_egress = db.get_shadowsocks_egress_list(enabled_only=True)
+            for egress in shadowsocks_egress:
+                if egress.get("tag") and egress["tag"] not in available_outbounds:
+                    available_outbounds.append(egress["tag"])
+
             # 从数据库读取出口组（负载均衡/故障转移）
             outbound_groups = db.get_outbound_groups(enabled_only=True)
             for group in outbound_groups:
@@ -4488,6 +4500,9 @@ async def api_switch_default_outbound(payload: DefaultOutboundRequest):
     for egress in db.get_warp_egress_list(enabled_only=True):
         available_outbounds.append(egress["tag"])
 
+    for egress in db.get_shadowsocks_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
     for group in db.get_outbound_groups(enabled_only=True):
         available_outbounds.append(group["tag"])
 
@@ -4495,7 +4510,7 @@ async def api_switch_default_outbound(payload: DefaultOutboundRequest):
         if chain.get("tag"):
             available_outbounds.append(chain['tag'])
 
-    # Add Shadowsocks outbounds from rust-router IPC
+    # Add Shadowsocks outbounds from rust-router IPC (for runtime-only outbounds)
     if HAS_RUST_ROUTER_CLIENT:
         try:
             client = await _get_rust_router_client()
@@ -4631,6 +4646,9 @@ def api_get_default_outbound():
         available_outbounds.append(egress["tag"])
 
     for egress in db.get_warp_egress_list(enabled_only=True):
+        available_outbounds.append(egress["tag"])
+
+    for egress in db.get_shadowsocks_egress_list(enabled_only=True):
         available_outbounds.append(egress["tag"])
 
     for group in db.get_outbound_groups(enabled_only=True):
@@ -6339,10 +6357,12 @@ def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
         allowed_ips = "0.0.0.0/0"
 
     # 构建配置
+    # DNS 使用 VPN 网关地址，确保 Split Tunnel 时 DNS 查询也走 VPN
+    vpn_gateway_ip = interface.get("address", "10.25.0.1").split("/")[0]
     client_config = f"""[Interface]
 PrivateKey = {private_key or 'YOUR_PRIVATE_KEY'}
 Address = {client_ip}
-DNS = 1.1.1.1
+DNS = {vpn_gateway_ip}
 
 [Peer]
 PublicKey = {server_public_key}
@@ -6866,13 +6886,14 @@ def api_announce_port_change(payload: PortChangeAnnouncementRequest):
 
 @app.get("/api/egress")
 def api_list_all_egress():
-    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray + WARP）"""
+    """列出所有出口（PIA + 自定义 + Direct + OpenVPN + V2Ray + WARP + Shadowsocks）"""
     pia_result = []
     custom_result = []
     direct_result = []
     openvpn_result = []
     v2ray_result = []
     warp_result = []
+    shadowsocks_result = []
 
     # 从数据库获取 PIA profiles
     db = _get_db()
@@ -6961,7 +6982,21 @@ def api_list_all_egress():
             "is_configured": True,
         })
 
-    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result, "warp": warp_result}
+    # 获取 Shadowsocks 出口
+    shadowsocks_egress = db.get_shadowsocks_egress_list()
+    for eg in shadowsocks_egress:
+        shadowsocks_result.append({
+            "tag": eg.get("tag", ""),
+            "type": "shadowsocks",
+            "description": eg.get("description", ""),
+            "server": eg.get("server", ""),
+            "port": eg.get("server_port", 8388),
+            "method": eg.get("method", ""),
+            "enabled": eg.get("enabled", 1),
+            "is_configured": True,
+        })
+
+    return {"pia": pia_result, "custom": custom_result, "direct": direct_result, "openvpn": openvpn_result, "v2ray": v2ray_result, "warp": warp_result, "shadowsocks": shadowsocks_result}
 
 
 # ============ Default Direct Outbound DNS APIs ============
@@ -9676,6 +9711,117 @@ class ShadowsocksEgressCreateRequest(BaseModel):
     udp: bool = Field(True, description="启用 UDP")
 
 
+class ShadowsocksURIParseRequest(BaseModel):
+    """解析 Shadowsocks URI"""
+    uri: str = Field(..., description="Shadowsocks URI (ss://...)")
+
+
+def parse_shadowsocks_uri(uri: str) -> dict:
+    """
+    解析 Shadowsocks URI (SIP002 格式)
+    格式: ss://BASE64(method:password)@host:port#tag
+    或旧格式: ss://BASE64(method:password@host:port)#tag
+    """
+    import base64
+    from urllib.parse import urlparse, unquote
+
+    if not uri.startswith("ss://"):
+        raise ValueError("Invalid Shadowsocks URI: must start with ss://")
+
+    # 移除 ss:// 前缀
+    uri_body = uri[5:]
+
+    # 提取 fragment (tag)
+    tag = None
+    if "#" in uri_body:
+        uri_body, fragment = uri_body.rsplit("#", 1)
+        tag = unquote(fragment)
+
+    # SIP002 格式: userinfo@host:port
+    if "@" in uri_body:
+        userinfo_part, server_part = uri_body.rsplit("@", 1)
+
+        # 解码 userinfo (base64)
+        # 先尝试标准 base64 (大多数客户端使用，包括浏览器的 btoa)
+        # 再尝试 URL 安全 base64
+        padded = userinfo_part
+        padding = 4 - len(padded) % 4
+        if padding != 4:
+            padded += "=" * padding
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8")
+        except Exception:
+            try:
+                decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to decode userinfo: {e}")
+
+        # method:password
+        if ":" not in decoded:
+            raise ValueError("Invalid userinfo format: expected method:password")
+        method, password = decoded.split(":", 1)
+
+        # host:port
+        if ":" not in server_part:
+            raise ValueError("Invalid server format: expected host:port")
+        host, port_str = server_part.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError(f"Invalid port: {port_str}")
+
+    else:
+        # 旧格式: 整个 body 是 base64 编码
+        padded = uri_body
+        padding = 4 - len(padded) % 4
+        if padding != 4:
+            padded += "=" * padding
+        try:
+            decoded = base64.b64decode(padded).decode("utf-8")
+        except Exception:
+            try:
+                decoded = base64.urlsafe_b64decode(padded).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to decode URI: {e}")
+
+        # method:password@host:port
+        if "@" not in decoded:
+            raise ValueError("Invalid URI format")
+        auth_part, server_part = decoded.rsplit("@", 1)
+
+        if ":" not in auth_part:
+            raise ValueError("Invalid auth format: expected method:password")
+        method, password = auth_part.split(":", 1)
+
+        if ":" not in server_part:
+            raise ValueError("Invalid server format: expected host:port")
+        host, port_str = server_part.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError(f"Invalid port: {port_str}")
+
+    return {
+        "method": method,
+        "password": password,
+        "server": host,
+        "server_port": port,
+        "tag": tag,
+    }
+
+
+@app.post("/api/egress/shadowsocks/parse")
+def api_parse_shadowsocks_uri(payload: ShadowsocksURIParseRequest):
+    """解析 Shadowsocks URI (ss://)"""
+    try:
+        result = parse_shadowsocks_uri(payload.uri)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse Shadowsocks URI: {e}")
+
+
 @app.get("/api/egress/shadowsocks")
 async def api_list_shadowsocks_egress():
     """列出所有 Shadowsocks 出口 (合并数据库和运行时状态)"""
@@ -10125,7 +10271,18 @@ def api_test_egress_connection(tag: str, timeout: int = 5000):
     test_url = "http://cp.cloudflare.com/"  # Cloudflare 204 测试 (国内可访问)
     timeout_sec = timeout / 1000
 
-    # 首先获取出口类型
+    # 首先检查数据库中的出口类型
+    db_egress_type = None
+    if HAS_DATABASE:
+        db = _get_db()
+        # 检查 Shadowsocks 出口
+        if db.get_shadowsocks_egress(tag):
+            db_egress_type = "shadowsocks"
+        # 检查 V2Ray 出口
+        elif db.get_v2ray_egress(tag):
+            db_egress_type = "v2ray"
+
+    # 然后尝试从 clash API 获取类型
     proxy_type = None
     try:
         clash_proxy_url = f"http://127.0.0.1:{DEFAULT_CLASH_API_PORT}/proxies/{urllib.parse.quote(tag)}"
@@ -10146,6 +10303,10 @@ def api_test_egress_connection(tag: str, timeout: int = 5000):
     # SOCKS 类型：尝试获取端口并使用 curl + SOCKS 代理
     if proxy_type == "socks":
         return _test_socks_connection(tag, test_url, timeout_sec)
+
+    # Shadowsocks/V2Ray 类型：通过 rust-router IPC 测试
+    if db_egress_type in ("shadowsocks", "v2ray"):
+        return _test_rust_router_outbound(tag, test_url, timeout)
 
     # WireGuard 和其他类型：先检查活跃流量，再尝试 clash_api
     return _test_wireguard_endpoint(tag, test_url, timeout)
@@ -10347,6 +10508,52 @@ def _test_simple_curl(test_url: str, timeout_sec: float) -> dict:
 
     except subprocess.TimeoutExpired:
         return {"success": False, "delay": -1, "message": "Connection timeout"}
+    except Exception as e:
+        return {"success": False, "delay": -1, "message": str(e)}
+
+
+def _test_rust_router_outbound(tag: str, test_url: str, timeout: int) -> dict:
+    """测试 rust-router 管理的出口 (Shadowsocks, V2Ray)
+
+    通过 rust-router IPC 获取健康状态。
+    """
+    import asyncio
+
+    if not HAS_RUST_ROUTER_CLIENT:
+        return {"success": False, "delay": -1, "message": "rust-router not available"}
+
+    try:
+        async def _get_health():
+            try:
+                client = RustRouterClient()
+                await client.connect()
+                try:
+                    # Get outbound health status
+                    health_list = await client.get_outbound_health()
+                    for health in health_list:
+                        if health.tag == tag:
+                            if health.health in ("healthy", "active"):
+                                # Return success with placeholder delay (health check doesn't measure latency)
+                                return {"success": True, "delay": 0, "message": "Connected (health: OK)"}
+                            else:
+                                return {"success": False, "delay": -1, "message": f"Health: {health.health}"}
+
+                    # If not found in health list, check if it exists in outbounds
+                    resp = await client._send_command({"type": "list_outbounds"})
+                    if resp.success and resp.data:
+                        outbounds = resp.data.get("outbounds", [])
+                        for ob in outbounds:
+                            if ob.get("tag") == tag:
+                                # Outbound exists but no health data
+                                return {"success": True, "delay": 0, "message": "Configured (no traffic yet)"}
+
+                    return {"success": False, "delay": -1, "message": "Outbound not found in rust-router"}
+                finally:
+                    await client.close()
+            except Exception as e:
+                return {"success": False, "delay": -1, "message": str(e)}
+
+        return asyncio.run(_get_health())
     except Exception as e:
         return {"success": False, "delay": -1, "message": str(e)}
 

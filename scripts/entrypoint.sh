@@ -550,6 +550,7 @@ asyncio.run(configure_vless())
 }
 
 start_xray_egress_manager() {
+  # Count only VMess/Trojan egress - VLESS is handled natively by rust-router
   local egress_count
   egress_count=$(python3 -c "
 import sys
@@ -557,15 +558,23 @@ sys.path.insert(0, '/usr/local/bin')
 from db_helper import get_db
 db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
 egress_list = db.get_v2ray_egress_list(enabled_only=True)
-print(len(egress_list))
+# Count only non-VLESS protocols (VMess/Trojan need Xray SOCKS5 proxy)
+non_vless_count = sum(1 for e in egress_list if e.get('protocol', '').lower() != 'vless')
+print(non_vless_count)
 " 2>/dev/null || echo "0")
 
   if [ "${egress_count}" -gt "0" ]; then
-    echo "[entrypoint] starting Xray egress manager for ${egress_count} V2Ray egress"
-    python3 /usr/local/bin/xray_egress_manager.py daemon >/var/log/xray-egress-manager.log 2>&1 &
-    XRAY_EGRESS_MGR_PID=$!
+    # Check if xray_egress_manager.py exists (was removed in favor of native rust-router VLESS)
+    if [ -f "/usr/local/bin/xray_egress_manager.py" ]; then
+      echo "[entrypoint] starting Xray egress manager for ${egress_count} VMess/Trojan egress"
+      python3 /usr/local/bin/xray_egress_manager.py daemon >/var/log/xray-egress-manager.log 2>&1 &
+      XRAY_EGRESS_MGR_PID=$!
+    else
+      echo "[entrypoint] WARNING: ${egress_count} VMess/Trojan egress configured but xray_egress_manager.py not found"
+      echo "[entrypoint] VMess/Trojan egress require xray_egress_manager.py. VLESS egress use native rust-router."
+    fi
   else
-    echo "[entrypoint] No V2Ray egress configured, skipping Xray egress manager"
+    echo "[entrypoint] No VMess/Trojan egress configured (VLESS uses native rust-router)"
   fi
 }
 

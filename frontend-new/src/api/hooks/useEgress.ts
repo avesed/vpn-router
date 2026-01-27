@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../client";
+import { toast } from "sonner";
 import type {
   DirectEgressUpdateRequest,
   WarpEgressUpdateRequest,
@@ -323,6 +324,10 @@ export function useCreateShadowsocksEgress() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: egressKeys.all });
       queryClient.invalidateQueries({ queryKey: egressKeys.shadowsocks });
+      toast.success("Shadowsocks egress created successfully");
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to create Shadowsocks egress: ${error.message}`);
     },
   });
 }
@@ -335,6 +340,10 @@ export function useUpdateShadowsocksEgress() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: egressKeys.all });
       queryClient.invalidateQueries({ queryKey: egressKeys.shadowsocks });
+      toast.success("Shadowsocks egress updated successfully");
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to update Shadowsocks egress: ${error.message}`);
     },
   });
 }
@@ -346,6 +355,10 @@ export function useDeleteShadowsocksEgress() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: egressKeys.all });
       queryClient.invalidateQueries({ queryKey: egressKeys.shadowsocks });
+      toast.success("Shadowsocks egress deleted successfully");
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to delete Shadowsocks egress: ${error.message}`);
     },
   });
 }

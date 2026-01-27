@@ -194,8 +194,14 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     } else if (response.status === 403) {
       safeMessage = "Access denied";
     } else {
-      // 4xx 客户端错误 - 可以显示后端消息（但限制长度）
-      safeMessage = text?.slice(0, 200) || `Request failed: ${response.status}`;
+      // 4xx 客户端错误 - 尝试解析 FastAPI 的 JSON 错误响应
+      try {
+        const errorJson = JSON.parse(text);
+        safeMessage = errorJson.detail || errorJson.message || text?.slice(0, 200);
+      } catch {
+        // 非 JSON 响应，使用原始文本
+        safeMessage = text?.slice(0, 200) || `Request failed: ${response.status}`;
+      }
     }
     throw new Error(safeMessage);
   }

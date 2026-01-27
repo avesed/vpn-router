@@ -74,6 +74,7 @@ pub mod config;
 pub mod dns_cache;
 pub mod error;
 pub mod forwarder;
+pub mod ipstack_bridge;
 pub mod manager;
 pub mod processor;
 pub mod socks5_server;
@@ -87,9 +88,19 @@ pub use forwarder::{
     spawn_forwarding_task, spawn_reply_router, spawn_peer_tunnel_processor, tcp_flags,
     FiveTuple, ForwardingStats, ForwardingStatsSnapshot, IngressReplyStats, IngressReplyStatsSnapshot,
     IngressSessionTracker, ParsedPacket, PeerSession, PeerTunnelProcessorStats,
-    PeerTunnelProcessorStatsSnapshot, ReplyPacket, TcpConnection, TcpConnectionManager,
-    TcpConnectionState, TcpDetails,
+    PeerTunnelProcessorStatsSnapshot, ReplyPacket, TcpDetails,
+    // UDP stats helper functions
+    get_udp_session_count, get_proxy_udp_session_count,
 };
 pub use manager::{WgIngressManager, WgIngressStats};
 pub use processor::{IngressProcessor, RoutingDecision};
 pub use socks5_server::{Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot};
+
+// IpStack bridge (feature-gated)
+#[cfg(feature = "ipstack-tcp")]
+pub use ipstack_bridge::{DiagnosticSnapshot as IpStackDiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot};
+#[cfg(feature = "ipstack-tcp")]
+pub use forwarder::{
+    init_ipstack_bridge, is_ipstack_enabled, set_ipstack_enabled,
+    get_ipstack_stats, get_ipstack_diagnostics, spawn_ipstack_reply_router,
+};

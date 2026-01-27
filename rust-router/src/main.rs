@@ -56,6 +56,10 @@ use rust_router::peer::manager::PeerManager;
 use rust_router::rules::{RuleEngine, RuleEngineRoutingCallback, RoutingSnapshotBuilder};
 use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig};
 
+// IpStack bridge for TCP handling (feature-gated)
+#[cfg(feature = "ipstack-tcp")]
+use rust_router::ingress::{init_ipstack_bridge, spawn_ipstack_reply_router};
+
 /// Command-line arguments
 struct Args {
     /// Configuration file path
@@ -859,6 +863,8 @@ async fn main() -> Result<()> {
     let mut forwarding_task_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut peer_tunnel_task_handle: Option<tokio::task::JoinHandle<()>> = None;
+    #[cfg(feature = "ipstack-tcp")]
+    let mut ipstack_reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     if let Some(ref ingress_mgr) = wg_ingress_manager {
         info!("Starting userspace WireGuard ingress...");
@@ -875,11 +881,7 @@ async fn main() -> Result<()> {
 
             // Take the packet receiver and spawn forwarding task
             if let Some(packet_rx) = ingress_mgr.take_packet_receiver().await {
-                let tcp_manager = Arc::new(
-                    rust_router::ingress::TcpConnectionManager::new(
-                        std::time::Duration::from_secs(300), // 5 minute connection timeout
-                    ),
-                );
+                // Note: TcpConnectionManager removed - TCP now handled by IpStack bridge
                 let session_tracker = Arc::new(
                     rust_router::ingress::IngressSessionTracker::new(
                         std::time::Duration::from_secs(300), // 5 minute session TTL
@@ -900,7 +902,8 @@ async fn main() -> Result<()> {
                 // Set DNS cache on the processor for domain lookups
                 ingress_mgr.processor().set_dns_cache(Arc::clone(&dns_cache));
 
-                let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(8192);
+                // Increased capacity to handle high throughput (was 8192)
+                let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(16384);
                 // Clone reply_tx for direct UDP reply handling before storing in reply_router_tx
                 let direct_reply_tx = reply_tx.clone();
                 *reply_router_tx.write() = Some(reply_tx);
@@ -913,6 +916,27 @@ async fn main() -> Result<()> {
                     Some(dns_cache), // Pass DNS cache to reply router for parsing DNS responses
                     Arc::clone(&peer_manager), // Peer manager for Terminal chain reply routing
                 );
+
+                // Initialize IpStack bridge for TCP handling (replaces manual TCP state machine)
+                #[cfg(feature = "ipstack-tcp")]
+                {
+                    match init_ipstack_bridge().await {
+                        Ok(ipstack_reply_rx) => {
+                            info!("IpStack bridge initialized for TCP handling");
+                            // Spawn reply router for ipstack (routes TCP replies back to WireGuard peers)
+                            let ipstack_handle = spawn_ipstack_reply_router(
+                                ipstack_reply_rx,
+                                Arc::clone(ingress_mgr),
+                                Arc::clone(&session_tracker),
+                            );
+                            ipstack_reply_task_handle = Some(ipstack_handle);
+                            info!("IpStack reply router started");
+                        }
+                        Err(e) => {
+                            error!("Failed to initialize IpStack bridge: {}. TCP connections will use fallback.", e);
+                        }
+                    }
+                }
 
                 // Spawn peer tunnel processor for chain routing on Terminal nodes
                 // This processes packets from peer-* tunnels through the ingress processor
@@ -942,7 +966,6 @@ async fn main() -> Result<()> {
                     packet_rx,
                     Arc::clone(&outbound_manager),
                     Arc::clone(&wg_egress_manager),
-                    tcp_manager,
                     session_tracker,
                     Arc::clone(&fwd_stats),
                     Some(direct_reply_tx), // Enable direct UDP reply handling
@@ -1061,6 +1084,18 @@ async fn main() -> Result<()> {
         )
         .await;
         info!("Reply router task shutdown complete");
+    }
+
+    // Shutdown IpStack reply router task
+    #[cfg(feature = "ipstack-tcp")]
+    if let Some(handle) = ipstack_reply_task_handle {
+        info!("Waiting for IpStack reply router task to complete...");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle,
+        )
+        .await;
+        info!("IpStack reply router task shutdown complete");
     }
 
     // Shutdown peer tunnel processor task (drop sender to close channel)

@@ -88,7 +88,15 @@ export function AddShadowsocksDialog({ open, onOpenChange, editEgress }: AddShad
       // Populate form fields from parsed result
       if (result.server) setServer(result.server);
       if (result.server_port) setServerPort(result.server_port);
-      if (result.method) setMethod(result.method);
+      // Validate method against known methods
+      if (result.method) {
+        const validMethod = SHADOWSOCKS_METHODS.find(m => m.value === result.method);
+        if (validMethod) {
+          setMethod(result.method);
+        } else {
+          console.warn(`Unknown Shadowsocks method: ${result.method}, using default`);
+        }
+      }
       if (result.password) setPassword(result.password);
 
       // Generate tag from server or remark

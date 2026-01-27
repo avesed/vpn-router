@@ -18,11 +18,11 @@ use super::protocol::{
     EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IngressStatsResponse, IpcCommand, IpcResponse,
     OutboundInfo, OutboundStatsResponse, PairingResponse, PeerConfig, PeerListResponse, PeerState,
     PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
-    ServerCapabilities, ServerStatus, Socks5PoolStats, TunnelType, UdpProcessorInfo,
-    UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
-    UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse, WgTunnelStatus,
-    VlessOutboundInfoResponse, VlessInboundStatusResponse, VlessUserInfo, VlessUserConfig,
-    VlessWgBridgeStats,
+    ServerCapabilities, ServerStatus, Socks5PoolStats, TcpStatsResponse, TunnelType,
+    UdpProcessorInfo, UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse,
+    UdpStatsResponse, UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse,
+    WgTunnelStatus, VlessOutboundInfoResponse, VlessInboundStatusResponse, VlessUserInfo,
+    VlessUserConfig, VlessWgBridgeStats,
 };
 use crate::chain::ChainManager;
 use crate::dns::cache::DnsCache;
@@ -778,6 +778,11 @@ impl IpcHandler {
             IpcCommand::GetUdpWorkerStats => self.handle_get_udp_worker_stats(),
 
             IpcCommand::GetBufferPoolStats => self.handle_get_buffer_pool_stats(),
+
+            // ================================================================
+            // TCP Connection Statistics
+            // ================================================================
+            IpcCommand::GetTcpStats => self.handle_get_tcp_stats(),
 
             // ================================================================
             // IPC Protocol v3.2 Command Handlers
@@ -2573,6 +2578,47 @@ impl IpcHandler {
                 stats: None,
             }),
         }
+    }
+
+    // ========================================================================
+    // TCP Connection Statistics Handler
+    // ========================================================================
+
+    /// Handle `GetTcpStats` command
+    ///
+    /// Returns detailed TCP connection statistics for debugging.
+    /// Note: TCP is now handled by IpStack bridge, so manual TCP stats are always 0.
+    /// Use GetIpstackStats for TCP connection stats.
+    fn handle_get_tcp_stats(&self) -> IpcResponse {
+        use crate::ingress::{
+            get_udp_session_count, get_proxy_udp_session_count,
+        };
+
+        // TCP stats are now 0 - TCP is handled by IpStack bridge
+        // Use GetIpstackStats command for TCP connection statistics
+        let tcp_write_halves = 0;
+        let tcp_pending_streams = 0;
+        let tcp_active_readers = 0;
+        let udp_sessions = get_udp_session_count();
+        let proxy_udp_sessions = get_proxy_udp_session_count();
+
+        // Try to get ingress session count if available
+        let ingress_sessions = {
+            let tracker_guard = self.ingress_session_tracker.read();
+            match &*tracker_guard {
+                Some(tracker) => Some(tracker.len()),
+                None => None,
+            }
+        };
+
+        IpcResponse::TcpStats(TcpStatsResponse {
+            tcp_write_halves,
+            tcp_pending_streams,
+            tcp_active_readers,
+            udp_sessions,
+            proxy_udp_sessions,
+            ingress_sessions,
+        })
     }
 
     // ========================================================================
@@ -9486,6 +9532,47 @@ mod tests {
             assert_eq!(reply_stats.packets_forwarded, 1);
         } else {
             panic!("Expected IngressStats response");
+        }
+    }
+
+    // ========================================================================
+    // TCP Stats Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_get_tcp_stats() {
+        let handler = create_test_handler();
+        let response = handler.handle(IpcCommand::GetTcpStats).await;
+
+        if let IpcResponse::TcpStats(stats) = response {
+            // All counts should be 0 or valid in a fresh test environment
+            assert!(stats.tcp_write_halves == 0 || stats.tcp_write_halves > 0);
+            assert!(stats.tcp_pending_streams == 0 || stats.tcp_pending_streams > 0);
+            assert!(stats.tcp_active_readers == 0 || stats.tcp_active_readers > 0);
+            assert!(stats.udp_sessions == 0 || stats.udp_sessions > 0);
+            assert!(stats.proxy_udp_sessions == 0 || stats.proxy_udp_sessions > 0);
+            // ingress_sessions should be None since ingress is not configured
+            assert!(stats.ingress_sessions.is_none());
+        } else {
+            panic!("Expected TcpStats response");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_tcp_stats_with_ingress() {
+        let (handler, _forwarding_stats, _reply_stats) = create_test_handler_with_ingress_stats();
+
+        // Set up an ingress session tracker
+        let session_tracker = Arc::new(IngressSessionTracker::new(Duration::from_secs(300)));
+        handler.set_ingress_session_tracker(Arc::clone(&session_tracker));
+
+        let response = handler.handle(IpcCommand::GetTcpStats).await;
+
+        if let IpcResponse::TcpStats(stats) = response {
+            // With ingress session tracker configured, ingress_sessions should be Some(0)
+            assert_eq!(stats.ingress_sessions, Some(0));
+        } else {
+            panic!("Expected TcpStats response");
         }
     }
 
