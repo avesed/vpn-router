@@ -66,6 +66,8 @@ mod config;
 mod packet_channel;
 #[cfg(feature = "ipstack-tcp")]
 mod session_tracker;
+#[cfg(feature = "ipstack-tcp")]
+mod sharded_bridge;
 
 #[cfg(feature = "ipstack-tcp")]
 pub use bridge::{DiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot};
@@ -75,3 +77,8 @@ pub use config::*;
 pub use packet_channel::PacketChannel;
 #[cfg(feature = "ipstack-tcp")]
 pub use session_tracker::{FiveTuple, SessionInfo, SessionTracker};
+#[cfg(feature = "ipstack-tcp")]
+pub use sharded_bridge::{
+    ShardStats, ShardedBridgeStats, ShardedBridgeStatsSnapshot, ShardedDiagnosticSnapshot,
+    ShardedIpStackBridge,
+};

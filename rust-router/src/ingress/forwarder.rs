@@ -68,7 +68,11 @@ use crate::rules::fwmark::ChainMark;
 
 // IpStack bridge imports (feature-gated)
 #[cfg(feature = "ipstack-tcp")]
-use super::ipstack_bridge::IpStackBridge;
+use super::ipstack_bridge::ShardedIpStackBridge;
+#[cfg(feature = "ipstack-tcp")]
+use super::ipstack_bridge::{
+    FiveTuple as IpStackFiveTuple, SessionTracker as IpStackSessionTracker,
+};
 
 /// IP protocol numbers
 const IPPROTO_TCP: u8 = 6;
@@ -127,8 +131,15 @@ static PROXY_UDP_SESSIONS: Lazy<DashMap<FiveTuple, Arc<ProxyUdpSessionEntry>>> =
 
 /// Global IpStack bridge for TCP handling (replaces manual TCP state machine)
 /// Feature-gated: only active when ipstack-tcp feature is enabled
+///
+/// Note: We use Arc<ShardedIpStackBridge> without RwLock because all public methods
+/// on ShardedIpStackBridge only require &self (interior mutability via atomics and channels).
+/// This eliminates lock contention on the hot path.
+///
+/// The sharded bridge distributes packets across multiple ipstack instances using 5-tuple
+/// hashing for parallel processing, improving throughput on multi-core systems.
 #[cfg(feature = "ipstack-tcp")]
-static IPSTACK_BRIDGE: once_cell::sync::OnceCell<std::sync::Arc<tokio::sync::RwLock<IpStackBridge>>> =
+static IPSTACK_BRIDGE: once_cell::sync::OnceCell<std::sync::Arc<ShardedIpStackBridge>> =
     once_cell::sync::OnceCell::new();
 
 /// Environment variable to enable/disable ipstack at runtime
@@ -566,6 +577,15 @@ impl PeerSession {
 ///
 /// Uses a concurrent hash map (`DashMap`) for thread-safe access
 /// from multiple async tasks.
+///
+/// **DEPRECATED**: Use `ipstack_bridge::SessionTracker` instead, which provides
+/// unified session tracking with `peer_endpoint` support. The ipstack bridge's
+/// `SessionTracker` is now the single source of truth for session information,
+/// eliminating duplicate tracking between this struct and the bridge.
+#[deprecated(
+    since = "0.15.0",
+    note = "Use ipstack_bridge::SessionTracker instead for unified session tracking"
+)]
 pub struct IngressSessionTracker {
     /// Active sessions indexed by 5-tuple
     sessions: DashMap<FiveTuple, PeerSession>,
@@ -2156,46 +2176,26 @@ async fn forward_tcp_packet(
             // Convert the processed packet to BytesMut for ipstack
             let packet_data = bytes::BytesMut::from(&processed.data[..]);
 
-            // Try to inject into ipstack (non-blocking to avoid holding up the forwarder)
-            if let Ok(guard) = bridge.try_read() {
-                if guard.try_inject_packet(packet_data, peer_key) {
-                    // Register session in IngressSessionTracker for reply routing
-                    // This is needed because spawn_ipstack_reply_router looks up sessions here
-                    let five_tuple = FiveTuple::new(
-                        parsed.src_ip,
-                        tcp_details.src_port,
-                        parsed.dst_ip,
-                        tcp_details.dst_port,
-                        IPPROTO_TCP,
-                    );
-                    session_tracker.register(
-                        five_tuple,
-                        processed.peer_public_key.clone(),
-                        processed.src_addr,
-                        processed.routing.outbound.clone(),
-                        processed.data.len() as u64,
-                    );
+            // Get the outbound tag from routing decision
+            let outbound_tag = &processed.routing.outbound;
 
-                    trace!(
-                        "Routed TCP to ipstack: {}:{} -> {}:{}",
-                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                    );
-                    stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                    stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
-                    return;
-                } else {
-                    // Channel full - drop packet, TCP will retransmit
-                    warn!(
-                        "IpStack channel full, dropping TCP packet (will retransmit): {}:{} -> {}:{}",
-                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
-                    );
-                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+            // Try to inject into ipstack (non-blocking to avoid holding up the forwarder)
+            // Note: No RwLock needed - IpStackBridge uses interior mutability
+            // The bridge's SessionTracker now handles session tracking with peer_endpoint,
+            // so we no longer need separate IngressSessionTracker registration.
+            // The outbound_tag is passed to enable routing through OutboundManager.
+            if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                trace!(
+                    "Routed TCP to ipstack: {}:{} -> {}:{}",
+                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                );
+                stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
+                return;
             } else {
-                // Bridge is locked - drop packet, TCP will retransmit
+                // Channel full - drop packet, TCP will retransmit
                 warn!(
-                    "IpStack bridge busy, dropping TCP packet (will retransmit): {}:{} -> {}:{}",
+                    "IpStack channel full, dropping TCP packet (will retransmit): {}:{} -> {}:{}",
                     parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
                 );
                 stats.forward_errors.fetch_add(1, Ordering::Relaxed);
@@ -3025,65 +3025,88 @@ fn spawn_direct_udp_reply_listener(
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_REPLY_SIZE];
+        let mut last_activity = std::time::Instant::now();
 
-        // Wait for reply with timeout
-        match tokio::time::timeout(DIRECT_UDP_REPLY_TIMEOUT, handle.recv(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                let reply_payload = &buf[..n];
+        debug!(
+            "Direct UDP reply listener started for {}:{} -> {}:{} via '{}'",
+            client_ip, client_port, server_ip, server_port, outbound_tag
+        );
 
-                // Build complete IP packet for the reply
-                let reply_packet = match (server_ip, client_ip) {
-                    (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                        build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
-                    }
-                    (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                        build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
-                    }
-                    _ => {
+        // Loop to receive multiple replies (like shadowsocks-rust pattern)
+        loop {
+            // Wait for reply with timeout
+            match tokio::time::timeout(DIRECT_UDP_REPLY_TIMEOUT, handle.recv(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    last_activity = std::time::Instant::now();
+                    let reply_payload = &buf[..n];
+
+                    // Build complete IP packet for the reply
+                    let reply_packet = match (server_ip, client_ip) {
+                        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                            build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
+                        }
+                        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                            build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
+                        }
+                        _ => {
+                            warn!(
+                                "IP version mismatch in direct UDP reply: server={}, client={}",
+                                server_ip, client_ip
+                            );
+                            break;
+                        }
+                    };
+
+                    // Send to reply router
+                    let reply = ReplyPacket {
+                        packet: reply_packet,
+                        tunnel_tag: outbound_tag.clone(),
+                    };
+
+                    if let Err(e) = reply_tx.try_send(reply) {
                         warn!(
-                            "IP version mismatch in direct UDP reply: server={}, client={}",
-                            server_ip, client_ip
+                            "Failed to send direct UDP reply to router ({}): {} -> {}:{}",
+                            e, server_ip, client_ip, client_port
                         );
-                        return;
+                        // Channel full or closed, stop listening
+                        break;
+                    } else {
+                        trace!(
+                            "Direct UDP reply forwarded: {}:{} -> {}:{} ({} bytes)",
+                            server_ip, server_port, client_ip, client_port, n
+                        );
                     }
-                };
-
-                // Send to reply router
-                let reply = ReplyPacket {
-                    packet: reply_packet,
-                    tunnel_tag: outbound_tag.clone(),
-                };
-
-                if let Err(e) = reply_tx.try_send(reply) {
-                    warn!(
-                        "Failed to send direct UDP reply to router ({}): {} -> {}:{}",
-                        e, server_ip, client_ip, client_port
+                }
+                Ok(Ok(_)) => {
+                    // Zero-length reply, continue listening
+                    trace!("Empty direct UDP reply from {}:{}", server_ip, server_port);
+                }
+                Ok(Err(e)) => {
+                    // Socket error, stop listening
+                    debug!(
+                        "Error receiving direct UDP reply from {}:{}: {}",
+                        server_ip, server_port, e
                     );
-                } else {
-                    trace!(
-                        "Direct UDP reply forwarded: {}:{} -> {}:{} ({} bytes)",
-                        server_ip, server_port, client_ip, client_port, n
-                    );
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - check if we've been idle too long (60 seconds total)
+                    if last_activity.elapsed() > Duration::from_secs(60) {
+                        trace!(
+                            "Direct UDP reply listener idle timeout: {}:{} -> {}:{}",
+                            client_ip, client_port, server_ip, server_port
+                        );
+                        break;
+                    }
+                    // Otherwise keep waiting for more replies
                 }
             }
-            Ok(Ok(_)) => {
-                // Zero-length reply, ignore
-                trace!("Empty direct UDP reply from {}:{}", server_ip, server_port);
-            }
-            Ok(Err(e)) => {
-                debug!(
-                    "Error receiving direct UDP reply from {}:{}: {}",
-                    server_ip, server_port, e
-                );
-            }
-            Err(_) => {
-                // Timeout - normal for UDP, no reply expected or reply lost
-                trace!(
-                    "Direct UDP reply timeout: {}:{} -> {}:{}",
-                    client_ip, client_port, server_ip, server_port
-                );
-            }
         }
+
+        debug!(
+            "Direct UDP reply listener ended for {}:{} -> {}:{} via '{}'",
+            client_ip, client_port, server_ip, server_port, outbound_tag
+        );
     });
 }
 
@@ -3102,65 +3125,88 @@ fn spawn_direct_udp_reply_listener_raw(
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_REPLY_SIZE];
+        let mut last_activity = std::time::Instant::now();
 
-        // Wait for reply with timeout
-        match tokio::time::timeout(DIRECT_UDP_REPLY_TIMEOUT, socket.recv(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                let reply_payload = &buf[..n];
+        debug!(
+            "Direct UDP reply listener (raw) started for {}:{} -> {}:{} via '{}'",
+            client_ip, client_port, server_ip, server_port, outbound_tag
+        );
 
-                // Build complete IP packet for the reply
-                let reply_packet = match (server_ip, client_ip) {
-                    (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                        build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
-                    }
-                    (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                        build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
-                    }
-                    _ => {
+        // Loop to receive multiple replies (like shadowsocks-rust pattern)
+        loop {
+            // Wait for reply with timeout
+            match tokio::time::timeout(DIRECT_UDP_REPLY_TIMEOUT, socket.recv(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    last_activity = std::time::Instant::now();
+                    let reply_payload = &buf[..n];
+
+                    // Build complete IP packet for the reply
+                    let reply_packet = match (server_ip, client_ip) {
+                        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                            build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
+                        }
+                        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                            build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
+                        }
+                        _ => {
+                            warn!(
+                                "IP version mismatch in direct UDP reply: server={}, client={}",
+                                server_ip, client_ip
+                            );
+                            break;
+                        }
+                    };
+
+                    // Send to reply router
+                    let reply = ReplyPacket {
+                        packet: reply_packet,
+                        tunnel_tag: outbound_tag.clone(),
+                    };
+
+                    if let Err(e) = reply_tx.try_send(reply) {
                         warn!(
-                            "IP version mismatch in direct UDP reply: server={}, client={}",
-                            server_ip, client_ip
+                            "Failed to send direct UDP reply to router ({}): {} -> {}:{}",
+                            e, server_ip, client_ip, client_port
                         );
-                        return;
+                        // Channel full or closed, stop listening
+                        break;
+                    } else {
+                        trace!(
+                            "Direct UDP reply (raw) forwarded: {}:{} -> {}:{} ({} bytes)",
+                            server_ip, server_port, client_ip, client_port, n
+                        );
                     }
-                };
-
-                // Send to reply router
-                let reply = ReplyPacket {
-                    packet: reply_packet,
-                    tunnel_tag: outbound_tag.clone(),
-                };
-
-                if let Err(e) = reply_tx.try_send(reply) {
-                    warn!(
-                        "Failed to send direct UDP reply to router ({}): {} -> {}:{}",
-                        e, server_ip, client_ip, client_port
+                }
+                Ok(Ok(_)) => {
+                    // Zero-length reply, continue listening
+                    trace!("Empty direct UDP reply from {}:{}", server_ip, server_port);
+                }
+                Ok(Err(e)) => {
+                    // Socket error, stop listening
+                    debug!(
+                        "Error receiving direct UDP reply from {}:{}: {}",
+                        server_ip, server_port, e
                     );
-                } else {
-                    trace!(
-                        "Direct UDP reply (raw) forwarded: {}:{} -> {}:{} ({} bytes)",
-                        server_ip, server_port, client_ip, client_port, n
-                    );
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - check if we've been idle too long (60 seconds total)
+                    if last_activity.elapsed() > Duration::from_secs(60) {
+                        trace!(
+                            "Direct UDP reply listener (raw) idle timeout: {}:{} -> {}:{}",
+                            client_ip, client_port, server_ip, server_port
+                        );
+                        break;
+                    }
+                    // Otherwise keep waiting for more replies
                 }
             }
-            Ok(Ok(_)) => {
-                // Zero-length reply, ignore
-                trace!("Empty direct UDP reply from {}:{}", server_ip, server_port);
-            }
-            Ok(Err(e)) => {
-                debug!(
-                    "Error receiving direct UDP reply from {}:{}: {}",
-                    server_ip, server_port, e
-                );
-            }
-            Err(_) => {
-                // Timeout - normal for UDP
-                trace!(
-                    "Direct UDP reply timeout (raw): {}:{} -> {}:{}",
-                    client_ip, client_port, server_ip, server_port
-                );
-            }
         }
+
+        debug!(
+            "Direct UDP reply listener (raw) ended for {}:{} -> {}:{} via '{}'",
+            client_ip, client_port, server_ip, server_port, outbound_tag
+        );
     });
 }
 
@@ -4114,31 +4160,42 @@ pub fn get_proxy_udp_session_count() -> usize {
 /// Initialize the IpStack bridge (call once at startup)
 ///
 /// Returns a receiver channel for reply packets that should be sent back
-/// through WireGuard to clients.
+/// through WireGuard to clients. Each tuple contains:
+/// - The IP packet (BytesMut)
+/// - The peer's public key ([u8; 32])
+/// - The peer's endpoint (SocketAddr) - avoids session lookup in reply router
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The bridge has already been initialized
 /// - Failed to start the internal ipstack tasks
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - The reply receiver channel for routing packets back to WireGuard peers
+/// - The session tracker Arc for session lookup (used by `spawn_ipstack_reply_router`)
 #[cfg(feature = "ipstack-tcp")]
-pub async fn init_ipstack_bridge() -> anyhow::Result<mpsc::Receiver<(bytes::BytesMut, [u8; 32])>> {
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
+pub async fn init_ipstack_bridge(
+) -> anyhow::Result<(mpsc::Receiver<(bytes::BytesMut, [u8; 32])>, Arc<IpStackSessionTracker>)> {
+    use super::ipstack_bridge::configured_shard_count;
 
-    let mut bridge = IpStackBridge::new();
+    let shard_count = configured_shard_count();
+    let mut bridge = ShardedIpStackBridge::new(shard_count);
     let reply_rx = bridge
         .take_reply_rx()
-        .ok_or_else(|| anyhow::anyhow!("Failed to take reply_rx from IpStackBridge"))?;
+        .ok_or_else(|| anyhow::anyhow!("Failed to take reply_rx from ShardedIpStackBridge"))?;
+    let session_tracker = Arc::clone(bridge.session_tracker());
 
     bridge.start().await?;
 
     IPSTACK_BRIDGE
-        .set(Arc::new(RwLock::new(bridge)))
-        .map_err(|_| anyhow::anyhow!("IpStackBridge already initialized"))?;
+        .set(Arc::new(bridge))
+        .map_err(|_| anyhow::anyhow!("ShardedIpStackBridge already initialized"))?;
 
-    info!("IpStack bridge initialized");
-    Ok(reply_rx)
+    info!(shard_count, "ShardedIpStackBridge initialized with {} shards", shard_count);
+    Ok((reply_rx, session_tracker))
 }
 
 /// Check if ipstack is enabled and running
@@ -4169,23 +4226,25 @@ pub fn set_ipstack_enabled(enabled: bool) {
 
 /// Get IpStack bridge statistics
 ///
-/// Returns None if the bridge is not initialized or locked.
+/// Returns None if the bridge is not initialized.
+/// Returns ShardedBridgeStatsSnapshot which includes per-shard stats for debugging.
 #[cfg(feature = "ipstack-tcp")]
 #[must_use]
-pub async fn get_ipstack_stats() -> Option<super::ipstack_bridge::IpStackBridgeStatsSnapshot> {
+pub fn get_ipstack_stats() -> Option<super::ipstack_bridge::ShardedBridgeStatsSnapshot> {
     let bridge = IPSTACK_BRIDGE.get()?;
-    // Use try_read to avoid blocking; if locked, return None
-    bridge.try_read().ok().map(|guard| guard.stats().snapshot())
+    // No lock needed - ShardedIpStackBridge uses interior mutability (atomics)
+    Some(bridge.stats().snapshot())
 }
 
 /// Get IpStack bridge diagnostic snapshot
 ///
-/// Returns detailed diagnostics including session counts and statistics.
+/// Returns detailed diagnostics including session counts, per-shard stats, and distribution skew.
 #[cfg(feature = "ipstack-tcp")]
 #[must_use]
-pub async fn get_ipstack_diagnostics() -> Option<super::ipstack_bridge::DiagnosticSnapshot> {
+pub fn get_ipstack_diagnostics() -> Option<super::ipstack_bridge::ShardedDiagnosticSnapshot> {
     let bridge = IPSTACK_BRIDGE.get()?;
-    bridge.try_read().ok().map(|guard| guard.diagnostic_snapshot())
+    // No lock needed - ShardedIpStackBridge uses interior mutability
+    Some(bridge.diagnostic_snapshot())
 }
 
 /// Spawn a task to route ipstack reply packets to WireGuard peers
@@ -4197,95 +4256,345 @@ pub async fn get_ipstack_diagnostics() -> Option<super::ipstack_bridge::Diagnost
 ///
 /// * `ipstack_reply_rx` - Receiver for (packet, peer_key) tuples from IpStackBridge
 /// * `wg_ingress_manager` - Reference to the WireGuard ingress manager for sending packets
-/// * `session_tracker` - Session tracker for looking up peer endpoints
+/// * `session_tracker` - Session tracker for looking up peer_endpoint from 5-tuple
 ///
 /// # Returns
 ///
 /// A JoinHandle for the spawned task.
+///
+/// # Implementation Notes
+///
+/// This function processes packets **sequentially** for correct WireGuard operation:
+/// - WireGuard uses nonce counters that must be sequential per peer
+/// - The `send_to_peer` call handles encryption with proper nonce ordering
+/// - Per-peer sequential processing ensures reply packets arrive in the correct order
+///
+/// # Parallel Processing Architecture
+///
+/// WireGuard nonces only need to be sequential **per peer**, not globally.
+/// This implementation uses per-peer reply channels that allow parallel processing
+/// across different peers while maintaining sequential ordering within each peer:
+///
+/// ```text
+///                      ipstack_reply_rx (global)
+///                             |
+///                             v
+///                     +--------------+
+///                     | Fan-out task |
+///                     | (routes by   |
+///                     |  peer_key)   |
+///                     +--------------+
+///                             |
+///          +------------------+------------------+
+///          |                  |                  |
+///          v                  v                  v
+///    +----------+       +----------+       +----------+
+///    | Peer A   |       | Peer B   |       | Peer C   |
+///    | channel  |       | channel  |       | channel  |
+///    | + task   |       | + task   |       | + task   |
+///    +----------+       +----------+       +----------+
+///          |                  |                  |
+///          v                  v                  v
+///    send_to_peer()    send_to_peer()    send_to_peer()
+///    (sequential)      (sequential)      (sequential)
+/// ```
+///
+/// For throughput optimization, the ShardedIpStackBridge distributes incoming
+/// packets across multiple ipstack instances using 5-tuple hashing.
 #[cfg(feature = "ipstack-tcp")]
 pub fn spawn_ipstack_reply_router(
     mut ipstack_reply_rx: mpsc::Receiver<(bytes::BytesMut, [u8; 32])>,
     wg_ingress_manager: Arc<super::manager::WgIngressManager>,
-    session_tracker: Arc<IngressSessionTracker>,
+    session_tracker: Arc<IpStackSessionTracker>,
 ) -> tokio::task::JoinHandle<()> {
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use base64::Engine;
+    let router = ParallelReplyRouter::new(wg_ingress_manager, session_tracker);
 
     tokio::spawn(async move {
-        info!("IpStack reply router started");
-
-        let mut packets_routed: u64 = 0;
-        let mut packets_failed: u64 = 0;
+        info!("Parallel IpStack reply router started");
 
         while let Some((packet, peer_key)) = ipstack_reply_rx.recv().await {
-            // Convert peer_key bytes to base64 string for WgIngressManager
-            let peer_key_b64 = BASE64.encode(peer_key);
-
-            // Parse the packet to find the session info
-            let Some(parsed) = parse_ip_packet(&packet) else {
-                debug!("Failed to parse ipstack reply packet");
-                packets_failed += 1;
-                continue;
-            };
-
-            // Get ports for session lookup
-            let (Some(src_port), Some(dst_port)) = (parsed.src_port, parsed.dst_port) else {
-                debug!("IpStack reply packet missing ports");
-                packets_failed += 1;
-                continue;
-            };
-
-            // Look up the original session to get the peer endpoint
-            // Reply packets have swapped src/dst compared to the original flow
-            let lookup_key = FiveTuple::new(parsed.dst_ip, dst_port, parsed.src_ip, src_port, parsed.protocol);
-
-            let Some(session) = session_tracker.get(&lookup_key) else {
-                trace!(
-                    "No session for ipstack reply: {} -> {}",
-                    parsed.src_ip, parsed.dst_ip
-                );
-                packets_failed += 1;
-                continue;
-            };
-
-            // Verify peer key matches
-            if session.peer_public_key != peer_key_b64 {
-                debug!(
-                    "IpStack reply peer key mismatch: expected {}, got {}",
-                    &peer_key_b64[..8], &session.peer_public_key[..8.min(session.peer_public_key.len())]
-                );
-                packets_failed += 1;
-                continue;
-            }
-
-            // Send the packet back to the peer
-            match wg_ingress_manager
-                .send_to_peer(&session.peer_public_key, session.peer_endpoint, &packet)
-                .await
-            {
-                Ok(()) => {
-                    packets_routed += 1;
-                    trace!(
-                        "IpStack reply sent to peer {}: {} bytes",
-                        &peer_key_b64[..8],
-                        packet.len()
-                    );
-                }
-                Err(e) => {
-                    packets_failed += 1;
-                    debug!(
-                        "Failed to send ipstack reply to peer {}: {}",
-                        &peer_key_b64[..8], e
-                    );
-                }
-            }
+            router.route_packet(packet, peer_key).await;
         }
 
+        let stats = router.stats();
         info!(
-            "IpStack reply router stopped: routed={}, failed={}",
-            packets_routed, packets_failed
+            "Parallel IpStack reply router stopped: routed={}, failed={}, tasks_spawned={}, channel_drops={}",
+            stats.packets_routed.load(Ordering::Relaxed),
+            stats.packets_failed.load(Ordering::Relaxed),
+            stats.peer_tasks_spawned.load(Ordering::Relaxed),
+            stats.channel_full_drops.load(Ordering::Relaxed),
         );
     })
+}
+
+/// Information needed to send a reply packet to a peer
+#[cfg(feature = "ipstack-tcp")]
+struct ReplyPacketInfo {
+    /// Decrypted IP packet to send
+    packet: bytes::BytesMut,
+    /// Peer's external endpoint (IP:port)
+    peer_endpoint: SocketAddr,
+    /// Peer's WireGuard public key (Base64)
+    peer_key_b64: String,
+}
+
+/// Statistics for the parallel reply router
+#[cfg(feature = "ipstack-tcp")]
+pub struct ParallelReplyRouterStats {
+    /// Number of packets successfully routed to peers
+    pub packets_routed: AtomicU64,
+    /// Number of packets that failed to route
+    pub packets_failed: AtomicU64,
+    /// Number of per-peer tasks spawned
+    pub peer_tasks_spawned: AtomicU64,
+    /// Number of packets dropped due to full per-peer channel
+    pub channel_full_drops: AtomicU64,
+}
+
+#[cfg(feature = "ipstack-tcp")]
+impl Default for ParallelReplyRouterStats {
+    fn default() -> Self {
+        Self {
+            packets_routed: AtomicU64::new(0),
+            packets_failed: AtomicU64::new(0),
+            peer_tasks_spawned: AtomicU64::new(0),
+            channel_full_drops: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Per-peer channel buffer size
+///
+/// This determines how many packets can be queued for a single peer before
+/// backpressure is applied. A larger buffer reduces the chance of drops
+/// during traffic bursts but increases memory usage per active peer.
+#[cfg(feature = "ipstack-tcp")]
+const PEER_CHANNEL_BUFFER_SIZE: usize = 256;
+
+/// Parallel reply router that distributes packets to per-peer channels
+///
+/// This allows multiple peers to process their reply packets concurrently
+/// while maintaining sequential ordering within each peer (required for
+/// WireGuard nonce correctness).
+#[cfg(feature = "ipstack-tcp")]
+struct ParallelReplyRouter {
+    /// Per-peer reply channels: peer_key bytes -> sender
+    peer_channels: Arc<DashMap<[u8; 32], mpsc::Sender<ReplyPacketInfo>>>,
+    /// WireGuard ingress manager for sending packets
+    wg_manager: Arc<super::manager::WgIngressManager>,
+    /// Session tracker for endpoint lookup (unified with ipstack bridge)
+    session_tracker: Arc<IpStackSessionTracker>,
+    /// Statistics
+    stats: Arc<ParallelReplyRouterStats>,
+}
+
+#[cfg(feature = "ipstack-tcp")]
+impl ParallelReplyRouter {
+    /// Create a new parallel reply router
+    fn new(
+        wg_manager: Arc<super::manager::WgIngressManager>,
+        session_tracker: Arc<IpStackSessionTracker>,
+    ) -> Self {
+        Self {
+            peer_channels: Arc::new(DashMap::new()),
+            wg_manager,
+            session_tracker,
+            stats: Arc::new(ParallelReplyRouterStats::default()),
+        }
+    }
+
+    /// Get router statistics
+    fn stats(&self) -> &ParallelReplyRouterStats {
+        &self.stats
+    }
+
+    /// Route a packet to the appropriate per-peer channel
+    ///
+    /// This method:
+    /// 1. Parses the packet and looks up the session
+    /// 2. Gets or creates a per-peer channel
+    /// 3. Sends the packet info to the channel (non-blocking)
+    async fn route_packet(&self, packet: bytes::BytesMut, peer_key: [u8; 32]) {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+
+        // Parse packet and look up session first (before routing)
+        let Some(info) = self.prepare_packet_info(packet, peer_key) else {
+            return;
+        };
+
+        // Get or create per-peer channel
+        let sender = self.get_or_create_peer_channel(peer_key);
+
+        // Non-blocking send to per-peer channel
+        match sender.try_send(info) {
+            Ok(()) => {
+                // Successfully queued for per-peer processing
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stats.channel_full_drops.fetch_add(1, Ordering::Relaxed);
+                // Don't log at trace level to avoid log spam under load
+                // The packet is dropped; TCP will retransmit if needed
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Peer task died unexpectedly, remove stale channel and retry once
+                self.peer_channels.remove(&peer_key);
+                debug!(
+                    "Peer task closed unexpectedly for {}..., removed channel",
+                    &BASE64.encode(peer_key)[..8]
+                );
+            }
+        }
+    }
+
+    /// Prepare packet info by parsing and looking up the session
+    ///
+    /// Returns `None` if the packet is invalid or no session exists.
+    fn prepare_packet_info(
+        &self,
+        packet: bytes::BytesMut,
+        peer_key: [u8; 32],
+    ) -> Option<ReplyPacketInfo> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+
+        let peer_key_b64 = BASE64.encode(peer_key);
+
+        // Parse the packet to find the session info
+        let parsed = match parse_ip_packet(&packet) {
+            Some(p) => p,
+            None => {
+                debug!("Failed to parse ipstack reply packet");
+                self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        // Get ports for session lookup
+        let (src_port, dst_port) = match (parsed.src_port, parsed.dst_port) {
+            (Some(s), Some(d)) => (s, d),
+            _ => {
+                debug!("IpStack reply packet missing ports");
+                self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        // Look up the original session to get the peer endpoint
+        // Reply packets have swapped src/dst compared to the original flow
+        // Create lookup key using ipstack_bridge FiveTuple (uses SocketAddr)
+        let src_addr = SocketAddr::new(parsed.dst_ip, dst_port);
+        let dst_addr = SocketAddr::new(parsed.src_ip, src_port);
+        let lookup_key = if parsed.protocol == IPPROTO_TCP {
+            IpStackFiveTuple::tcp(src_addr, dst_addr)
+        } else {
+            IpStackFiveTuple::udp(src_addr, dst_addr)
+        };
+
+        // Use unified session tracker lookup
+        let (session_peer_key_b64, peer_endpoint) =
+            match self.session_tracker.lookup_for_reply(&lookup_key) {
+                Some(info) => info,
+                None => {
+                    trace!(
+                        "No session for ipstack reply: {} -> {}",
+                        parsed.src_ip,
+                        parsed.dst_ip
+                    );
+                    self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            };
+
+        // Verify peer key matches
+        if session_peer_key_b64 != peer_key_b64 {
+            debug!(
+                "IpStack reply peer key mismatch: expected {}, got {}",
+                &peer_key_b64[..8.min(peer_key_b64.len())],
+                &session_peer_key_b64[..8.min(session_peer_key_b64.len())]
+            );
+            self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        Some(ReplyPacketInfo {
+            packet,
+            peer_endpoint,
+            peer_key_b64,
+        })
+    }
+
+    /// Get or create a per-peer channel
+    ///
+    /// If a channel already exists for this peer, returns the sender.
+    /// Otherwise, creates a new channel and spawns a task to process it.
+    fn get_or_create_peer_channel(&self, peer_key: [u8; 32]) -> mpsc::Sender<ReplyPacketInfo> {
+        // Fast path: channel exists
+        if let Some(sender) = self.peer_channels.get(&peer_key) {
+            return sender.clone();
+        }
+
+        // Slow path: create new channel and spawn task
+        // Use entry API to avoid race conditions
+        let entry = self.peer_channels.entry(peer_key);
+        entry
+            .or_insert_with(|| {
+                let (tx, rx) = mpsc::channel(PEER_CHANNEL_BUFFER_SIZE);
+                self.spawn_peer_task(peer_key, rx);
+                self.stats.peer_tasks_spawned.fetch_add(1, Ordering::Relaxed);
+                tx
+            })
+            .clone()
+    }
+
+    /// Spawn a task to process packets for a single peer
+    ///
+    /// This task processes packets sequentially for the peer, ensuring
+    /// WireGuard nonces remain in order. The task automatically terminates
+    /// when the channel is closed (sender dropped or router shutdown).
+    fn spawn_peer_task(&self, peer_key: [u8; 32], mut rx: mpsc::Receiver<ReplyPacketInfo>) {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+
+        let wg_manager = Arc::clone(&self.wg_manager);
+        let stats = Arc::clone(&self.stats);
+        let peer_channels = Arc::clone(&self.peer_channels);
+        let peer_key_b64_for_log = BASE64.encode(peer_key);
+
+        tokio::spawn(async move {
+            trace!(
+                "Per-peer reply task started for {}...",
+                &peer_key_b64_for_log[..8]
+            );
+
+            // Process packets sequentially for this peer
+            while let Some(info) = rx.recv().await {
+                match wg_manager
+                    .send_to_peer(&info.peer_key_b64, info.peer_endpoint, &info.packet)
+                    .await
+                {
+                    Ok(()) => {
+                        stats.packets_routed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        stats.packets_failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            "Failed to send reply to peer {}: {}",
+                            &info.peer_key_b64[..8],
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Channel closed, clean up
+            peer_channels.remove(&peer_key);
+            trace!(
+                "Per-peer reply task stopped for {}...",
+                &peer_key_b64_for_log[..8]
+            );
+        });
+    }
 }
 
 // ============================================================================

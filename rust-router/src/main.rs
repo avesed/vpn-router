@@ -18,6 +18,13 @@
 //! RUST_ROUTER_USERSPACE_WG=true sudo ./rust-router
 //! ```
 
+// Use jemalloc as the global allocator for high-throughput packet processing.
+// jemalloc provides better multi-threaded performance and reduced fragmentation
+// compared to the system allocator, which is crucial for network packet handling.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -921,13 +928,14 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "ipstack-tcp")]
                 {
                     match init_ipstack_bridge().await {
-                        Ok(ipstack_reply_rx) => {
+                        Ok((ipstack_reply_rx, ipstack_session_tracker)) => {
                             info!("IpStack bridge initialized for TCP handling");
                             // Spawn reply router for ipstack (routes TCP replies back to WireGuard peers)
+                            // Uses the bridge's unified SessionTracker which now includes peer_endpoint
                             let ipstack_handle = spawn_ipstack_reply_router(
                                 ipstack_reply_rx,
                                 Arc::clone(ingress_mgr),
-                                Arc::clone(&session_tracker),
+                                ipstack_session_tracker,
                             );
                             ipstack_reply_task_handle = Some(ipstack_handle);
                             info!("IpStack reply router started");

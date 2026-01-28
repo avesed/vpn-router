@@ -97,8 +97,15 @@ pub use processor::{IngressProcessor, RoutingDecision};
 pub use socks5_server::{Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot};
 
 // IpStack bridge (feature-gated)
+// Note: Uses ShardedIpStackBridge internally for parallel processing across CPU cores.
+// The sharded bridge distributes packets using 5-tuple hashing for consistent session routing.
 #[cfg(feature = "ipstack-tcp")]
-pub use ipstack_bridge::{DiagnosticSnapshot as IpStackDiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot};
+pub use ipstack_bridge::{
+    // Sharded bridge types (primary)
+    ShardedIpStackBridge, ShardedBridgeStats, ShardedBridgeStatsSnapshot, ShardedDiagnosticSnapshot,
+    // Single-instance bridge types (kept for compatibility)
+    DiagnosticSnapshot as IpStackDiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot,
+};
 #[cfg(feature = "ipstack-tcp")]
 pub use forwarder::{
     init_ipstack_bridge, is_ipstack_enabled, set_ipstack_enabled,

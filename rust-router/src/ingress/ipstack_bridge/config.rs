@@ -39,22 +39,41 @@ pub const WG_MTU: usize = 1420;
 /// fragmentation.
 pub const TCP_MSS: u16 = 1380;
 
-/// Buffer size for TCP copy operations (64KB)
+/// Buffer size for TCP copy operations (32KB)
 ///
-/// This is the buffer size used by `copy_bidirectional_with_sizes` for
-/// bridging IpStackTcpStream to outbound TcpStream. Larger buffers improve
-/// throughput by reducing context switches and allowing more data to be
-/// copied per syscall.
+/// NOTE: This constant is currently unused. We now use `tokio::io::copy_bidirectional`
+/// which has internal pipelining and uses its own optimized 8KB buffers. This constant
+/// is retained for potential future use or if custom buffer sizes are needed again.
 ///
-/// 64KB is chosen as it:
-/// - Matches typical socket buffer sizes
-/// - Provides good throughput for bulk transfers
-/// - Is large enough to hold multiple WireGuard packets (1420 * ~45)
-pub const TCP_COPY_BUFFER_SIZE: usize = 64 * 1024;
+/// Previously used by the custom `copy_bidirectional_with_sizes` function.
+/// 32KB was chosen as it:
+/// - Fits in L2 cache on most CPUs (better cache utilization)
+/// - Still holds ~23 WireGuard packets (1420 bytes each)
+/// - Reduces per-connection memory by 50% compared to 64KB
+/// - Balances syscall overhead vs memory usage
+#[allow(dead_code)]
+pub const TCP_COPY_BUFFER_SIZE: usize = 32 * 1024;
+
+/// Socket buffer size for TCP connections (256KB)
+///
+/// Larger socket buffers allow the OS to buffer more data, improving throughput
+/// especially for high-bandwidth connections. This sets both SO_RCVBUF and SO_SNDBUF.
+///
+/// 256KB is chosen as it:
+/// - Allows for larger TCP windows (better for high-latency links)
+/// - Reduces the chance of buffer underrun during high-throughput transfers
+/// - Is within typical OS limits (Linux default max is often 4MB+)
+pub const TCP_SOCKET_BUFFER_SIZE: usize = 256 * 1024;
 
 // =============================================================================
 // Timeout Parameters
 // =============================================================================
+
+/// TCP connection timeout in seconds
+///
+/// Maximum time to wait for a TCP connection to be established.
+/// Set to 10 seconds, which is reasonable for most outbound connections.
+pub const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// TCP idle timeout in seconds
 ///
@@ -105,17 +124,26 @@ pub const MAX_TOTAL_SESSIONS: usize = 10000;
 ///
 /// Size of the async channel used for IP packet queues between the
 /// forwarder and the IpStack bridge. Should be large enough to handle bursts.
-pub const PACKET_CHANNEL_SIZE: usize = 1024;
+/// Increased from 1024 to 4096 to reduce backpressure during high throughput.
+pub const PACKET_CHANNEL_SIZE: usize = 4096;
 
 /// Channel size for reply packets back to WireGuard
 ///
 /// Size of the async channel used to send reply packets from the
 /// IpStack bridge back to WireGuard for transmission to peers.
-pub const REPLY_CHANNEL_SIZE: usize = 1024;
+/// Increased from 1024 to 4096 to prevent TCP stack stalls during high throughput.
+pub const REPLY_CHANNEL_SIZE: usize = 4096;
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Get the TCP connection timeout as a Duration
+#[inline]
+#[must_use]
+pub const fn tcp_connect_timeout() -> Duration {
+    Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS)
+}
 
 /// Get the TCP idle timeout as a Duration
 #[inline]
@@ -143,6 +171,58 @@ pub const fn udp_dns_timeout() -> Duration {
 #[must_use]
 pub const fn session_cleanup_interval() -> Duration {
     Duration::from_secs(SESSION_CLEANUP_INTERVAL_SECS)
+}
+
+// =============================================================================
+// Sharding Configuration
+// =============================================================================
+
+/// Default shard count based on CPU cores
+///
+/// Uses cores/2, clamped to [2, 8] for optimal performance.
+/// This provides a good balance between parallelism and overhead.
+///
+/// # Rationale
+///
+/// - Minimum 2 shards: Even single-core systems benefit from some parallelism
+///   due to async I/O patterns
+/// - Maximum 8 shards: Beyond 8, the overhead of managing shards typically
+///   outweighs the benefits, and memory usage increases significantly
+/// - cores/2: Leaves headroom for other system tasks and avoids
+///   over-subscription
+#[inline]
+#[must_use]
+pub fn default_shard_count() -> usize {
+    let cores = num_cpus::get();
+    (cores / 2).clamp(2, 8)
+}
+
+/// Get configured shard count from environment or defaults
+///
+/// Checks the `IPSTACK_SHARDS` environment variable first, then falls back
+/// to `default_shard_count()`.
+///
+/// # Environment Variable
+///
+/// Set `IPSTACK_SHARDS=4` to force 4 shards regardless of CPU count.
+///
+/// # Examples
+///
+/// ```bash
+/// # Force 4 shards
+/// IPSTACK_SHARDS=4 cargo run
+///
+/// # Use default (cores/2, clamped to [2, 8])
+/// cargo run
+/// ```
+#[inline]
+#[must_use]
+pub fn configured_shard_count() -> usize {
+    std::env::var("IPSTACK_SHARDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0 && n <= 64) // Sanity check: max 64 shards
+        .unwrap_or_else(default_shard_count)
 }
 
 #[cfg(test)]
@@ -173,14 +253,31 @@ mod tests {
 
     #[test]
     fn test_channel_sizes() {
-        // Channels should be large enough for bursts
-        assert!(PACKET_CHANNEL_SIZE >= 256);
-        assert!(REPLY_CHANNEL_SIZE >= 256);
+        // Channels should be large enough for bursts (4096 to reduce backpressure)
+        assert!(PACKET_CHANNEL_SIZE >= 4096);
+        assert!(REPLY_CHANNEL_SIZE >= 4096);
     }
 
     #[test]
     fn test_wg_mtu() {
         // Standard WireGuard MTU
         assert_eq!(WG_MTU, 1420);
+    }
+
+    #[test]
+    fn test_default_shard_count() {
+        let count = default_shard_count();
+        // Should be between 2 and 8
+        assert!(count >= 2);
+        assert!(count <= 8);
+    }
+
+    #[test]
+    fn test_configured_shard_count_default() {
+        // When IPSTACK_SHARDS is not set, should return default
+        // (This test may be affected by env vars set in other tests)
+        let count = configured_shard_count();
+        assert!(count >= 2);
+        assert!(count <= 64);
     }
 }

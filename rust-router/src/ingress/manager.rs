@@ -35,7 +35,7 @@
 //!
 //! When acquiring multiple locks in `WgIngressManager`, always follow this order:
 //! 1. `state` (`RwLock`) - State machine
-//! 2. `peers` (`RwLock`) - Peer registry
+//! 2. `peers` (`DashMap`) - Peer registry (lock-free concurrent access)
 //! 3. `socket` (`RwLock`) - UDP socket
 //! 4. `shutdown_tx` (`RwLock`) - Shutdown signal
 //! 5. `task_handle` (`RwLock`) - Background task handle
@@ -74,10 +74,11 @@
 //! manager.stop().await?;
 //! ```
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use dashmap::DashMap;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -104,8 +105,10 @@ use crate::rules::RuleEngine;
 /// Default buffer size for UDP receive
 const UDP_RECV_BUFFER_SIZE: usize = 65536;
 
-/// Channel capacity for processed packets - increased for better throughput
-const PACKET_CHANNEL_CAPACITY: usize = 1024;
+/// Channel capacity for processed packets
+/// Increased from 1024 to 4096 to match ipstack bridge capacity and reduce backpressure.
+/// At 250 Mbps with 1420 byte packets (~22K pps), 1024 fills in 46ms causing stalls.
+const PACKET_CHANNEL_CAPACITY: usize = 4096;
 
 /// `WireGuard` transport data packet overhead
 const WG_TRANSPORT_OVERHEAD: usize = 32;
@@ -255,6 +258,10 @@ struct RegisteredPeer {
     tunnel_index: u32,
     /// Last known endpoint address (for sending timer-generated packets)
     last_endpoint: RwLock<Option<SocketAddr>>,
+    /// Current receiver_index assigned during handshake (for O(1) lookup cleanup).
+    /// This is the `sender` field from our handshake response (type 2 packet, bytes 4-7).
+    /// Updated on each new handshake. Used to clean up `receiver_index_to_peer` on peer removal.
+    current_receiver_index: RwLock<Option<u32>>,
 }
 
 impl RegisteredPeer {
@@ -296,6 +303,7 @@ impl RegisteredPeer {
             allowed_ips_parsed,
             tunnel_index,
             last_endpoint: RwLock::new(None),
+            current_receiver_index: RwLock::new(None),
         })
     }
 
@@ -475,12 +483,13 @@ fn decode_psk(key: &str) -> Result<[u8; 32], String> {
 ///
 /// When acquiring multiple locks, always follow this order:
 /// 1. `state` (`RwLock`)
-/// 2. `peers` (`RwLock`)
-/// 3. `socket` (`RwLock`)
-/// 4. `shutdown_tx` (`RwLock`)
-/// 5. `task_handle` (`RwLock`)
-/// 6. `packet_rx` (`tokio::Mutex`)
-/// 7. Per-peer `tunn` locks (Mutex) - see `RegisteredPeer`
+/// 2. `peers` (`DashMap`) - lock-free concurrent access
+/// 3. `receiver_index_to_peer` (`DashMap`) - lock-free concurrent access
+/// 4. `socket` (`RwLock`)
+/// 5. `shutdown_tx` (`RwLock`)
+/// 6. `task_handle` (`RwLock`)
+/// 7. `packet_rx` (`tokio::Mutex`)
+/// 8. Per-peer `tunn` locks (Mutex) - see `RegisteredPeer`
 ///
 /// Never hold a higher-numbered lock while acquiring a lower-numbered lock.
 pub struct WgIngressManager {
@@ -497,8 +506,15 @@ pub struct WgIngressManager {
     state: RwLock<IngressState>,
 
     /// Registered peers (`public_key` -> peer info)
-    /// Wrapped in Arc so it can be shared with the packet loop task
-    peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
+    /// Uses DashMap for lock-free concurrent access, avoiding the need to clone
+    /// the entire map on every packet (which was a ~5-10% performance bottleneck).
+    peers: Arc<DashMap<String, Arc<RegisteredPeer>>>,
+
+    /// Reverse lookup map for O(1) peer identification from WireGuard type 4 (transport data) packets.
+    /// Maps `receiver_index` (bytes 4-7 of type 4 packets) to the peer.
+    /// This index is assigned by boringtun during handshake and sent back in the handshake response.
+    /// Updated when we send a handshake response (type 2 packet).
+    receiver_index_to_peer: Arc<DashMap<u32, Arc<RegisteredPeer>>>,
 
     /// Statistics
     stats: Arc<StatsInner>,
@@ -586,7 +602,8 @@ impl WgIngressManager {
             private_key,
             processor,
             state: RwLock::new(IngressState::Created),
-            peers: Arc::new(RwLock::new(HashMap::new())),
+            peers: Arc::new(DashMap::new()),
+            receiver_index_to_peer: Arc::new(DashMap::new()),
             stats: Arc::new(StatsInner::default()),
             socket: RwLock::new(None),
             shutdown_tx: RwLock::new(None),
@@ -690,6 +707,7 @@ impl WgIngressManager {
 
         // Share peers reference with the background task (not a copy!)
         let task_peers = Arc::clone(&self.peers);
+        let task_receiver_index_map = Arc::clone(&self.receiver_index_to_peer);
 
         // Spawn background task
         let task_socket = Arc::clone(&socket);
@@ -704,6 +722,7 @@ impl WgIngressManager {
                 task_stats,
                 task_config,
                 task_peers,
+                task_receiver_index_map,
                 packet_tx,
                 shutdown_rx,
             )
@@ -797,20 +816,17 @@ impl WgIngressManager {
 
         let public_key = peer.public_key.clone();
 
-        // Add peer
-        let tunnel_index = {
-            let mut peers = self.peers.write();
-            if peers.contains_key(&public_key) {
-                return Err(IngressError::peer_already_exists(&public_key));
-            }
+        // Check if peer already exists (DashMap provides concurrent access)
+        if self.peers.contains_key(&public_key) {
+            return Err(IngressError::peer_already_exists(&public_key));
+        }
 
-            let tunnel_index = self.next_tunnel_index.fetch_add(1, Ordering::Relaxed) as u32;
-            let registered_peer = RegisteredPeer::new(peer, &self.private_key, tunnel_index)?;
+        let tunnel_index = self.next_tunnel_index.fetch_add(1, Ordering::Relaxed) as u32;
+        let registered_peer = RegisteredPeer::new(peer, &self.private_key, tunnel_index)?;
 
-            peers.insert(public_key.clone(), Arc::new(registered_peer));
-            self.stats.peer_count.fetch_add(1, Ordering::Relaxed);
-            tunnel_index
-        };
+        // Insert peer (DashMap handles concurrent inserts safely)
+        self.peers.insert(public_key.clone(), Arc::new(registered_peer));
+        self.stats.peer_count.fetch_add(1, Ordering::Relaxed);
 
         info!(public_key = %public_key, tunnel_index = tunnel_index, "Added peer to ingress");
         Ok(())
@@ -832,14 +848,17 @@ impl WgIngressManager {
     /// manager.remove_peer("public_key").await?;
     /// ```
     pub async fn remove_peer(&self, public_key: &str) -> IngressResult<()> {
-        let mut peers = self.peers.write();
-        let removed = peers.remove(public_key);
-        if removed.is_none() {
+        // DashMap's remove returns Option<(K, V)>
+        let removed = self.peers.remove(public_key);
+        let Some((_, peer)) = removed else {
             return Err(IngressError::peer_not_found(public_key));
-        }
+        };
 
-        if let Some(peer) = &removed {
-            peer.is_removed.store(true, Ordering::Relaxed);
+        peer.is_removed.store(true, Ordering::Relaxed);
+
+        // Clean up the receiver_index mapping for O(1) lookup
+        if let Some(receiver_index) = *peer.current_receiver_index.read() {
+            self.receiver_index_to_peer.remove(&receiver_index);
         }
 
         let _ = self.stats.peer_count.fetch_update(
@@ -847,14 +866,12 @@ impl WgIngressManager {
             Ordering::Relaxed,
             |value: usize| value.checked_sub(1),
         );
-        if let Some(peer) = removed {
-            if peer.is_connected.load(Ordering::Relaxed) {
-                let _ = self.stats.active_peer_count.fetch_update(
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                    |value: usize| value.checked_sub(1),
-                );
-            }
+        if peer.is_connected.load(Ordering::Relaxed) {
+            let _ = self.stats.active_peer_count.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |value: usize| value.checked_sub(1),
+            );
         }
 
         info!(public_key = %public_key, "Removed peer from ingress");
@@ -915,7 +932,7 @@ impl WgIngressManager {
     /// Check if a public key is registered as a peer
     #[must_use]
     pub fn has_peer(&self, public_key: &str) -> bool {
-        self.peers.read().contains_key(public_key)
+        self.peers.contains_key(public_key)
     }
 
     /// List all registered peers
@@ -923,19 +940,23 @@ impl WgIngressManager {
     /// Returns information about all peers registered with the ingress.
     #[must_use]
     pub fn list_peers(&self) -> Vec<IngressPeerListItem> {
-        let peers = self.peers.read();
-        peers
+        // DashMap allows lock-free iteration
+        self.peers
             .iter()
-            .map(|(public_key, p)| IngressPeerListItem {
-                public_key: public_key.clone(),
-                allowed_ips: p.config.allowed_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(","),
-                name: None, // Name is stored in database, not in WireGuard config
-                rx_bytes: p.rx_bytes.load(Ordering::Relaxed),
-                tx_bytes: p.tx_bytes.load(Ordering::Relaxed),
-                last_handshake: {
-                    let ts = p.last_handshake.load(Ordering::Relaxed);
-                    if ts > 0 { Some(ts) } else { None }
-                },
+            .map(|entry| {
+                let public_key = entry.key().clone();
+                let p = entry.value();
+                IngressPeerListItem {
+                    public_key,
+                    allowed_ips: p.config.allowed_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(","),
+                    name: None, // Name is stored in database, not in WireGuard config
+                    rx_bytes: p.rx_bytes.load(Ordering::Relaxed),
+                    tx_bytes: p.tx_bytes.load(Ordering::Relaxed),
+                    last_handshake: {
+                        let ts = p.last_handshake.load(Ordering::Relaxed);
+                        if ts > 0 { Some(ts) } else { None }
+                    },
+                }
             })
             .collect()
     }
@@ -943,7 +964,7 @@ impl WgIngressManager {
     /// Get list of registered peer public keys
     #[must_use]
     pub fn peer_keys(&self) -> Vec<String> {
-        self.peers.read().keys().cloned().collect()
+        self.peers.iter().map(|entry| entry.key().clone()).collect()
     }
 
     /// Take the packet receiver (for testing/integration)
@@ -965,10 +986,9 @@ impl WgIngressManager {
     /// Check whether an IP is allowed for a specific peer
     #[must_use]
     pub fn is_peer_ip_allowed(&self, peer_public_key: &str, ip: IpAddr) -> bool {
-        let peers = self.peers.read();
-        peers
+        self.peers
             .get(peer_public_key)
-            .is_some_and(|peer| peer.is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip))
+            .is_some_and(|entry| entry.value().is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip))
     }
 
     /// Send a decrypted IP packet back to a `WireGuard` peer
@@ -978,11 +998,11 @@ impl WgIngressManager {
         peer_endpoint: SocketAddr,
         packet: &[u8],
     ) -> IngressResult<()> {
-        let peer = {
-            let peers = self.peers.read();
-            peers.get(peer_public_key).cloned()
-        }
-        .ok_or_else(|| IngressError::peer_not_found(peer_public_key))?;
+        // DashMap get returns a Ref guard, clone the Arc to release the lock immediately
+        let peer = self.peers
+            .get(peer_public_key)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| IngressError::peer_not_found(peer_public_key))?;
 
         let socket = self
             .socket
@@ -1048,7 +1068,8 @@ impl WgIngressManager {
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
         config: WgIngressConfig,
-        peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
+        peers: Arc<DashMap<String, Arc<RegisteredPeer>>>,
+        receiver_index_to_peer: Arc<DashMap<u32, Arc<RegisteredPeer>>>,
         packet_tx: mpsc::Sender<ProcessedPacket>,
         shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -1062,6 +1083,7 @@ impl WgIngressManager {
                     stats,
                     config,
                     peers,
+                    receiver_index_to_peer,
                     packet_tx,
                     shutdown_rx,
                 )
@@ -1077,6 +1099,7 @@ impl WgIngressManager {
             stats,
             config,
             peers,
+            receiver_index_to_peer,
             packet_tx,
             shutdown_rx,
         )
@@ -1089,7 +1112,8 @@ impl WgIngressManager {
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
         config: WgIngressConfig,
-        peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
+        peers: Arc<DashMap<String, Arc<RegisteredPeer>>>,
+        receiver_index_to_peer: Arc<DashMap<u32, Arc<RegisteredPeer>>>,
         packet_tx: mpsc::Sender<ProcessedPacket>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -1113,8 +1137,7 @@ impl WgIngressManager {
                 result = socket.recv_from(&mut recv_buf) => {
                     match result {
                         Ok((len, src_addr)) => {
-                            // Get current peers snapshot for this packet
-                            let peers_snapshot = peers.read().clone();
+                            // DashMap allows lock-free access, no need to clone
                             Self::process_single_packet(
                                 &recv_buf[..len],
                                 src_addr,
@@ -1122,10 +1145,11 @@ impl WgIngressManager {
                                 &processor,
                                 &stats,
                                 &config,
-                                &peers_snapshot,
+                                &peers,
+                                &receiver_index_to_peer,
                                 &packet_tx,
                                 &mut decrypt_buf,
-                            ).await;
+                            );
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to receive packet");
@@ -1135,8 +1159,10 @@ impl WgIngressManager {
 
                 _ = timer_interval.tick() => {
                     // Call update_timers() on all connected peers
-                    let peers_snapshot = peers.read().clone();
-                    for (public_key, peer) in peers_snapshot.iter() {
+                    // DashMap allows lock-free iteration
+                    for entry in peers.iter() {
+                        let public_key = entry.key();
+                        let peer = entry.value();
                         // Skip disconnected or removed peers
                         if !peer.is_connected.load(Ordering::Relaxed) || peer.is_removed.load(Ordering::Relaxed) {
                             continue;
@@ -1201,7 +1227,8 @@ impl WgIngressManager {
         processor: Arc<IngressProcessor>,
         stats: Arc<StatsInner>,
         config: WgIngressConfig,
-        peers: Arc<RwLock<HashMap<String, Arc<RegisteredPeer>>>>,
+        peers: Arc<DashMap<String, Arc<RegisteredPeer>>>,
+        receiver_index_to_peer: Arc<DashMap<u32, Arc<RegisteredPeer>>>,
         packet_tx: mpsc::Sender<ProcessedPacket>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
@@ -1245,8 +1272,7 @@ impl WgIngressManager {
                     // Try to receive a batch of packets
                     match batch_receiver.recv_batch() {
                         Ok(packets) => {
-                            // Get current peers snapshot for this batch
-                            let peers_snapshot = peers.read().clone();
+                            // DashMap allows lock-free access, no need to clone
                             for received in packets {
                                 Self::process_single_packet(
                                     &received.data[..received.len],
@@ -1255,10 +1281,11 @@ impl WgIngressManager {
                                     &processor,
                                     &stats,
                                     &config,
-                                    &peers_snapshot,
+                                    &peers,
+                                    &receiver_index_to_peer,
                                     &packet_tx,
                                     &mut decrypt_buf,
-                                ).await;
+                                );
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1273,8 +1300,10 @@ impl WgIngressManager {
 
                 _ = timer_interval.tick() => {
                     // Call update_timers() on all connected peers
-                    let peers_snapshot = peers.read().clone();
-                    for (public_key, peer) in peers_snapshot.iter() {
+                    // DashMap allows lock-free iteration
+                    for entry in peers.iter() {
+                        let public_key = entry.key();
+                        let peer = entry.value();
                         // Skip disconnected or removed peers
                         if !peer.is_connected.load(Ordering::Relaxed) || peer.is_removed.load(Ordering::Relaxed) {
                             continue;
@@ -1340,14 +1369,15 @@ impl WgIngressManager {
     ///
     /// This helper is used by both single-packet and batch I/O loops.
     #[allow(clippy::too_many_arguments)]
-    async fn process_single_packet(
+    fn process_single_packet(
         encrypted_data: &[u8],
         src_addr: SocketAddr,
         socket: &Arc<UdpSocket>,
         processor: &Arc<IngressProcessor>,
         stats: &Arc<StatsInner>,
         config: &WgIngressConfig,
-        peers: &HashMap<String, Arc<RegisteredPeer>>,
+        peers: &DashMap<String, Arc<RegisteredPeer>>,
+        receiver_index_to_peer: &DashMap<u32, Arc<RegisteredPeer>>,
         packet_tx: &mpsc::Sender<ProcessedPacket>,
         decrypt_buf: &mut [u8],
     ) {
@@ -1356,40 +1386,67 @@ impl WgIngressManager {
         stats.rx_packets.fetch_add(1, Ordering::Relaxed);
 
         // Try to identify peer and decrypt packet
-        // WireGuard uses the receiver's public key index to identify
-        // which peer sent the packet, but boringtun handles this internally
+        // For type 4 (transport data) packets, use O(1) receiver_index lookup
+        // For handshakes (type 1, 2, 3), fallback to O(n) iteration
         let (decrypted_data, peer_public_key, peer_ref) =
-            if let Some(result) = Self::identify_and_decrypt(peers, encrypted_data, decrypt_buf, stats, src_addr.ip()) { result } else {
+            if let Some(result) = Self::identify_and_decrypt(peers, receiver_index_to_peer, encrypted_data, decrypt_buf, stats, src_addr.ip()) { result } else {
                 trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
                 stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
                 return;
             };
 
-        // Handle handshake responses
-        if let Some(response) = decrypted_data.response {
-            if let Err(e) = socket.send_to(&response, src_addr).await {
-                warn!(error = %e, "Failed to send handshake response");
-            } else {
-                trace!(src_addr = %src_addr, "Sent handshake response");
-                stats.handshake_count.fetch_add(1, Ordering::Relaxed);
-                peer_ref.update_handshake();
-                // Update endpoint on handshake so timer can send keepalives
-                peer_ref.update_activity_with_endpoint(src_addr);
-                let was_connected = peer_ref.is_connected.swap(true, Ordering::Relaxed);
-                if !was_connected {
-                    if peer_ref.is_removed.load(Ordering::Relaxed) {
-                        peer_ref.is_connected.store(false, Ordering::Relaxed);
-                    } else {
-                        stats.active_peer_count.fetch_add(1, Ordering::Relaxed);
+        // Handle handshake responses (non-blocking)
+        if let Some(ref response) = decrypted_data.response {
+            match socket.try_send_to(response, src_addr) {
+                Ok(_) => {
+                    trace!(src_addr = %src_addr, "Sent handshake response");
+                    stats.handshake_count.fetch_add(1, Ordering::Relaxed);
+                    peer_ref.update_handshake();
+                    // Update endpoint on handshake so timer can send keepalives
+                    peer_ref.update_activity_with_endpoint(src_addr);
+
+                    // Register receiver_index for O(1) lookup on future type 4 packets
+                    // Type 2 (Handshake Response): bytes 4-7 contain the `sender` field
+                    // This is the index the client will use as `receiver` in type 4 packets
+                    if response.len() >= 8 && response[0] == 2 {
+                        let receiver_index = u32::from_le_bytes([
+                            response[4], response[5], response[6], response[7]
+                        ]);
+                        // Remove old index if this peer had a previous session
+                        if let Some(old_index) = peer_ref.current_receiver_index.read().as_ref() {
+                            receiver_index_to_peer.remove(old_index);
+                        }
+                        // Register new index
+                        *peer_ref.current_receiver_index.write() = Some(receiver_index);
+                        receiver_index_to_peer.insert(receiver_index, Arc::clone(&peer_ref));
+                        trace!(
+                            receiver_index = receiver_index,
+                            "Registered receiver_index for O(1) lookup"
+                        );
+                    }
+
+                    let was_connected = peer_ref.is_connected.swap(true, Ordering::Relaxed);
+                    if !was_connected {
                         if peer_ref.is_removed.load(Ordering::Relaxed) {
-                            let _ = stats.active_peer_count.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |value: usize| value.checked_sub(1),
-                            );
                             peer_ref.is_connected.store(false, Ordering::Relaxed);
+                        } else {
+                            stats.active_peer_count.fetch_add(1, Ordering::Relaxed);
+                            if peer_ref.is_removed.load(Ordering::Relaxed) {
+                                let _ = stats.active_peer_count.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |value: usize| value.checked_sub(1),
+                                );
+                                peer_ref.is_connected.store(false, Ordering::Relaxed);
+                            }
                         }
                     }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    trace!("Handshake response dropped (socket buffer full)");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to send handshake response");
                 }
             }
         }
@@ -1444,9 +1501,16 @@ impl WgIngressManager {
                     src_addr,
                 };
 
-                if packet_tx.send(processed).await.is_err() {
-                    debug!("Packet channel closed");
-                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                match packet_tx.try_send(processed) {
+                    Ok(()) => { /* success */ }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        trace!("Packet channel full, dropping packet");
+                        stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!("Packet channel closed");
+                        stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             Err(e) => {
@@ -1458,26 +1522,27 @@ impl WgIngressManager {
 
     /// Identify the peer that sent a packet and decrypt it
     ///
-    /// `WireGuard` packets contain a receiver index that identifies the session,
-    /// but we need to try decryption with each peer's tunnel since boringtun
-    /// doesn't expose the receiver index directly.
+    /// For type 4 (transport data) packets, uses O(1) receiver_index lookup.
+    /// For handshakes (type 1, 2, 3), falls back to O(n) iteration through all peers.
     ///
     /// Returns None if no peer could decrypt the packet.
     ///
     /// # Arguments
     ///
-    /// * `peers` - Map of registered peers to try
+    /// * `peers` - Map of registered peers to try (used for fallback O(n) lookup)
+    /// * `receiver_index_to_peer` - Reverse lookup map for O(1) peer identification
     /// * `encrypted` - The encrypted packet data
     /// * `dst` - Buffer for decrypted output
     /// * `stats` - Statistics collector
     /// * `src_addr` - Source IP address of the packet sender (required for rate limiting under load)
-    fn identify_and_decrypt<'a>(
-        peers: &'a HashMap<String, Arc<RegisteredPeer>>,
+    fn identify_and_decrypt(
+        peers: &DashMap<String, Arc<RegisteredPeer>>,
+        receiver_index_to_peer: &DashMap<u32, Arc<RegisteredPeer>>,
         encrypted: &[u8],
         dst: &mut [u8],
         stats: &StatsInner,
         src_addr: IpAddr,
-    ) -> Option<(DecryptedPacket, String, &'a Arc<RegisteredPeer>)> {
+    ) -> Option<(DecryptedPacket, String, Arc<RegisteredPeer>)> {
         // Log packet type for debugging
         let msg_type = if encrypted.len() >= 4 { encrypted[0] } else { 0 };
         let type_name = match msg_type {
@@ -1488,19 +1553,53 @@ impl WgIngressManager {
             _ => "unknown",
         };
 
-        // Try to decrypt with each peer's tunnel
-        // In a real implementation with many peers, we'd use the receiver index
-        // to look up the peer directly, but boringtun handles sessions internally
-        for (public_key, peer) in peers {
+        // Fast path: type 4 (transport data) packets have receiver_index at bytes 4-7
+        // Use O(1) lookup instead of iterating through all peers
+        if msg_type == 4 && encrypted.len() >= 8 {
+            let receiver_index = u32::from_le_bytes([
+                encrypted[4], encrypted[5], encrypted[6], encrypted[7]
+            ]);
+
+            if let Some(peer_ref) = receiver_index_to_peer.get(&receiver_index) {
+                let peer = Arc::clone(peer_ref.value());
+                drop(peer_ref); // Release DashMap guard before decrypt to avoid holding lock
+
+                if let Some(decrypted) = peer.decrypt(encrypted, dst, Some(src_addr)) {
+                    // Need to find the public key for this peer
+                    let public_key = peer.config.public_key.clone();
+                    debug!(
+                        msg_type = type_name,
+                        peer = %public_key,
+                        receiver_index = receiver_index,
+                        has_response = decrypted.response.is_some(),
+                        data_len = decrypted.data.len(),
+                        "Decrypted WireGuard packet (O(1) lookup)"
+                    );
+                    return Some((decrypted, public_key, peer));
+                }
+                // If decryption failed with indexed peer, fall through to linear scan
+                // This handles edge cases like index reuse after session expiry
+                trace!(
+                    receiver_index = receiver_index,
+                    "O(1) lookup found peer but decryption failed, falling back to linear scan"
+                );
+            }
+        }
+
+        // Fallback: try to decrypt with each peer's tunnel (O(n))
+        // Used for handshakes (type 1, 2, 3) or when receiver_index lookup fails
+        for entry in peers.iter() {
+            let public_key = entry.key();
+            let peer = entry.value();
             if let Some(decrypted) = peer.decrypt(encrypted, dst, Some(src_addr)) {
                 debug!(
                     msg_type = type_name,
                     peer = %public_key,
                     has_response = decrypted.response.is_some(),
                     data_len = decrypted.data.len(),
-                    "Decrypted WireGuard packet"
+                    "Decrypted WireGuard packet (linear scan)"
                 );
-                return Some((decrypted, public_key.clone(), peer));
+                return Some((decrypted, public_key.clone(), Arc::clone(peer)));
             }
         }
 
@@ -1565,7 +1664,7 @@ impl std::fmt::Debug for WgIngressManager {
             .field("listen_addr", &self.config.listen_addr)
             .field("local_ip", &self.config.local_ip)
             .field("state", &*self.state.read())
-            .field("peer_count", &self.peers.read().len())
+            .field("peer_count", &self.peers.len())
             .finish()
     }
 }
