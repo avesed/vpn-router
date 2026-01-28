@@ -69,6 +69,13 @@ mod session_tracker;
 #[cfg(feature = "ipstack-tcp")]
 mod sharded_bridge;
 
+// Domain routing modules (Phase 0 of unified ipstack architecture)
+#[cfg(all(feature = "ipstack-tcp", feature = "fakedns"))]
+pub mod dns_hijack;
+
+#[cfg(all(feature = "ipstack-tcp", any(feature = "sni-sniffing", feature = "fakedns")))]
+pub mod domain_resolver;
+
 #[cfg(feature = "ipstack-tcp")]
 pub use bridge::{DiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot};
 #[cfg(feature = "ipstack-tcp")]

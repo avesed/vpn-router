@@ -176,6 +176,18 @@ pub struct QuicSniffResult {
     pub is_initial: bool,
     /// Destination Connection ID (for debugging)
     pub dcid: Option<Vec<u8>>,
+    /// Whether SNI was obtained through cryptographic decryption
+    ///
+    /// When `true`, the SNI was extracted by decrypting the QUIC Initial
+    /// packet and parsing the TLS ClientHello. When `false`, SNI was
+    /// extracted using heuristic pattern matching (less reliable).
+    #[serde(default)]
+    pub decrypted: bool,
+    /// ALPN (Application-Layer Protocol Negotiation) protocols
+    ///
+    /// Only populated when `decrypted` is `true`.
+    #[serde(default)]
+    pub alpn: Vec<String>,
 }
 
 impl QuicSniffResult {
@@ -188,6 +200,8 @@ impl QuicSniffResult {
             packet_type: None,
             is_initial: false,
             dcid: None,
+            decrypted: false,
+            alpn: Vec::new(),
         }
     }
 
@@ -234,6 +248,8 @@ impl QuicSniffer {
                 is_initial: false,
                 server_name: None,
                 dcid: None,
+                decrypted: false,
+                alpn: Vec::new(),
             };
         }
 
@@ -255,6 +271,8 @@ impl QuicSniffer {
                 is_initial: false,
                 server_name: None,
                 dcid: None,
+                decrypted: false,
+                alpn: Vec::new(),
             };
         }
 
@@ -273,6 +291,8 @@ impl QuicSniffer {
                 is_initial,
                 server_name: None,
                 dcid: None,
+                decrypted: false,
+                alpn: Vec::new(),
             };
         }
 
@@ -287,6 +307,8 @@ impl QuicSniffer {
                 is_initial,
                 server_name: None,
                 dcid: Some(dcid),
+                decrypted: false,
+                alpn: Vec::new(),
             };
         }
 
@@ -329,13 +351,24 @@ impl QuicSniffer {
             is_initial,
             server_name,
             dcid: Some(dcid),
+            decrypted: false,
+            alpn: Vec::new(),
         }
     }
 
     /// Parse a QUIC variable-length integer.
     ///
     /// Returns `(value, bytes_consumed)` if successful.
-    fn parse_varint(data: &[u8]) -> Option<(u64, usize)> {
+    ///
+    /// # QUIC Variable-Length Integer Encoding
+    ///
+    /// The two most significant bits of the first byte encode the length:
+    /// - `00`: 1 byte (6-bit value, 0-63)
+    /// - `01`: 2 bytes (14-bit value, 0-16383)
+    /// - `10`: 4 bytes (30-bit value, 0-1073741823)
+    /// - `11`: 8 bytes (62-bit value)
+    #[must_use]
+    pub fn parse_varint(data: &[u8]) -> Option<(u64, usize)> {
         if data.is_empty() {
             return None;
         }
@@ -940,6 +973,8 @@ mod tests {
             packet_type: Some(QuicPacketType::Initial),
             is_initial: true,
             dcid: Some(vec![0x01, 0x02, 0x03]),
+            decrypted: true,
+            alpn: vec!["h3".to_string()],
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -948,6 +983,19 @@ mod tests {
         assert_eq!(parsed.server_name, result.server_name);
         assert_eq!(parsed.version, result.version);
         assert_eq!(parsed.is_initial, result.is_initial);
+        assert_eq!(parsed.decrypted, result.decrypted);
+        assert_eq!(parsed.alpn, result.alpn);
+    }
+
+    #[test]
+    fn test_sniff_result_serialization_defaults() {
+        // Test that decrypted and alpn default correctly when deserializing old JSON
+        let json = r#"{"server_name":"test.com","version":"V1","packet_type":"Initial","is_initial":true,"dcid":[1,2,3]}"#;
+        let parsed: QuicSniffResult = serde_json::from_str(json).unwrap();
+
+        assert_eq!(parsed.server_name, Some("test.com".to_string()));
+        assert!(!parsed.decrypted); // Should default to false
+        assert!(parsed.alpn.is_empty()); // Should default to empty
     }
 
     // === Integration-style Tests ===

@@ -52,6 +52,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
+#[cfg(feature = "fakedns")]
+use crate::fakedns::FakeDnsManager;
+
+#[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+use super::domain_resolver::{resolve_domain, DomainSource};
+
 /// Statistics for the IpStack bridge
 ///
 /// All counters use relaxed atomic ordering for performance,
@@ -76,6 +82,15 @@ pub struct IpStackBridgeStats {
     pub reply_backpressure: AtomicU64,
     /// Packets dropped due to reply channel timeout
     pub reply_drops: AtomicU64,
+    // Domain routing statistics (Phase 0)
+    /// DNS queries hijacked by FakeDNS
+    pub dns_queries_hijacked: AtomicU64,
+    /// Successful FakeDNS reverse lookups
+    pub fakedns_reverse_hits: AtomicU64,
+    /// Successful SNI extractions
+    pub sni_extractions: AtomicU64,
+    /// Successful HTTP Host extractions
+    pub http_host_extractions: AtomicU64,
 }
 
 impl IpStackBridgeStats {
@@ -91,6 +106,10 @@ impl IpStackBridgeStats {
             bytes_from_outbound: self.bytes_from_outbound.load(Ordering::Relaxed),
             reply_backpressure: self.reply_backpressure.load(Ordering::Relaxed),
             reply_drops: self.reply_drops.load(Ordering::Relaxed),
+            dns_queries_hijacked: self.dns_queries_hijacked.load(Ordering::Relaxed),
+            fakedns_reverse_hits: self.fakedns_reverse_hits.load(Ordering::Relaxed),
+            sni_extractions: self.sni_extractions.load(Ordering::Relaxed),
+            http_host_extractions: self.http_host_extractions.load(Ordering::Relaxed),
         }
     }
 
@@ -105,6 +124,10 @@ impl IpStackBridgeStats {
         self.bytes_from_outbound.store(0, Ordering::Relaxed);
         self.reply_backpressure.store(0, Ordering::Relaxed);
         self.reply_drops.store(0, Ordering::Relaxed);
+        self.dns_queries_hijacked.store(0, Ordering::Relaxed);
+        self.fakedns_reverse_hits.store(0, Ordering::Relaxed);
+        self.sni_extractions.store(0, Ordering::Relaxed);
+        self.http_host_extractions.store(0, Ordering::Relaxed);
     }
 }
 
@@ -131,6 +154,15 @@ pub struct IpStackBridgeStatsSnapshot {
     pub reply_backpressure: u64,
     /// Packets dropped due to reply channel timeout
     pub reply_drops: u64,
+    // Domain routing statistics (Phase 0)
+    /// DNS queries hijacked by FakeDNS
+    pub dns_queries_hijacked: u64,
+    /// Successful FakeDNS reverse lookups
+    pub fakedns_reverse_hits: u64,
+    /// Successful SNI extractions
+    pub sni_extractions: u64,
+    /// Successful HTTP Host extractions
+    pub http_host_extractions: u64,
 }
 
 /// IpStack Bridge for handling TCP/UDP over WireGuard
@@ -172,6 +204,9 @@ pub struct IpStackBridge {
     cleanup_task: Option<JoinHandle<()>>,
     /// Outbound manager for routing decisions
     outbound_manager: Option<Arc<OutboundManager>>,
+    /// FakeDNS manager for domain-based routing
+    #[cfg(feature = "fakedns")]
+    fakedns_manager: Option<Arc<FakeDnsManager>>,
 }
 
 impl IpStackBridge {
@@ -196,7 +231,24 @@ impl IpStackBridge {
             reply_task: None,
             cleanup_task: None,
             outbound_manager: None,
+            #[cfg(feature = "fakedns")]
+            fakedns_manager: None,
         }
+    }
+
+    /// Set the FakeDNS manager for DNS hijacking
+    ///
+    /// When set, DNS queries (port 53) will be intercepted and resolved
+    /// using FakeDNS, enabling domain-based routing.
+    #[cfg(feature = "fakedns")]
+    pub fn set_fakedns_manager(&mut self, manager: Arc<FakeDnsManager>) {
+        self.fakedns_manager = Some(manager);
+    }
+
+    /// Get the FakeDNS manager reference
+    #[cfg(feature = "fakedns")]
+    pub fn fakedns_manager(&self) -> Option<&Arc<FakeDnsManager>> {
+        self.fakedns_manager.as_ref()
     }
 
     /// Set the outbound manager for routing decisions
@@ -475,6 +527,19 @@ impl IpStackBridge {
         let mut ipstack_config = ipstack::IpStackConfig::default();
         ipstack_config.mtu_unchecked(WG_MTU as u16);
 
+        // Configure TCP parameters for high throughput
+        // The default MAX_UNACK and READ_BUFFER_SIZE of 16KB severely limits throughput
+        // We use configurable values (default 256KB) for better BDP support
+        //
+        // Critical: max_unacked_bytes controls SEND throughput (download to client)
+        //           read_buffer_size controls RECEIVE window (upload from client)
+        // Both must be increased for bidirectional high throughput!
+        let max_unack = configured_max_unack();
+        let mut tcp_config = ipstack::TcpConfig::default();
+        tcp_config.max_unacked_bytes = max_unack;
+        tcp_config.read_buffer_size = max_unack as usize; // Same BDP applies to both directions
+        ipstack_config.with_tcp_config(tcp_config);
+
         // Create the ipstack instance
         let ip_stack = ipstack::IpStack::new(ipstack_config, packet_channel);
 
@@ -507,12 +572,16 @@ impl IpStackBridge {
         let stats = Arc::clone(&self.stats);
         let session_tracker = Arc::clone(&self.session_tracker);
         let outbound_manager = self.outbound_manager.clone();
+        #[cfg(feature = "fakedns")]
+        let fakedns_manager = self.fakedns_manager.clone();
         let accept_task = tokio::spawn(Self::accept_loop_task(
             ip_stack,
             running,
             stats,
             session_tracker,
             outbound_manager,
+            #[cfg(feature = "fakedns")]
+            fakedns_manager,
         ));
         self.accept_task = Some(accept_task);
 
@@ -688,6 +757,7 @@ impl IpStackBridge {
         stats: Arc<IpStackBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
         debug!("Accept loop task started");
 
@@ -699,6 +769,8 @@ impl IpStackBridge {
                         Arc::clone(&stats),
                         Arc::clone(&session_tracker),
                         outbound_manager.clone(),
+                        #[cfg(feature = "fakedns")]
+                        fakedns_manager.clone(),
                     );
                 }
                 Err(e) => {
@@ -722,6 +794,7 @@ impl IpStackBridge {
         stats: Arc<IpStackBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
         match stream {
             ipstack::IpStackStream::Tcp(tcp_stream) => {
@@ -742,6 +815,8 @@ impl IpStackBridge {
                     stats,
                     session_tracker,
                     outbound_manager,
+                    #[cfg(feature = "fakedns")]
+                    fakedns_manager,
                 ));
             }
             ipstack::IpStackStream::Udp(udp_stream) => {
@@ -762,6 +837,8 @@ impl IpStackBridge {
                     stats,
                     session_tracker,
                     outbound_manager,
+                    #[cfg(feature = "fakedns")]
+                    fakedns_manager,
                 ));
             }
             ipstack::IpStackStream::UnknownTransport(unknown) => {
@@ -782,13 +859,93 @@ impl IpStackBridge {
     /// Routes the connection through the appropriate outbound based on
     /// the outbound_tag stored in the session tracker.
     async fn handle_tcp_connection(
-        mut tcp_stream: ipstack::IpStackTcpStream,
+        tcp_stream: ipstack::IpStackTcpStream,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
         stats: Arc<IpStackBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
+        // Wrap stream in BufReader for peek functionality (needed for SNI sniffing)
+        // We do this early so we can use it for both DNS hijack and domain resolution
+        use tokio::io::BufReader;
+        let mut buffered = BufReader::with_capacity(configured_sni_buffer_size(), tcp_stream);
+
+        // TCP DNS hijack for port 53
+        #[cfg(feature = "fakedns")]
+        if peer_addr.port() == 53 {
+            if let Some(ref fakedns) = fakedns_manager {
+                use super::dns_hijack::handle_tcp_dns_query;
+
+                match handle_tcp_dns_query(&mut buffered, fakedns.as_ref()).await {
+                    Ok(()) => {
+                        stats.dns_queries_hijacked.fetch_add(1, Ordering::Relaxed);
+                        trace!("TCP DNS query hijacked via FakeDNS");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "TCP DNS hijack failed");
+                    }
+                }
+                // DNS handled, remove session and return
+                let five_tuple = FiveTuple::tcp(local_addr, peer_addr);
+                session_tracker.remove(&five_tuple);
+                return;
+            }
+        }
+
+        // Phase 2: Domain resolution using hybrid approach (FakeDNS + SNI + HTTP Host)
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        let domain_resolution = {
+            use tokio::io::AsyncBufReadExt;
+
+            // Peek first packet for SNI/HTTP sniffing (with timeout)
+            let first_packet: Option<Vec<u8>> = match tokio::time::timeout(
+                sni_peek_timeout(),
+                buffered.fill_buf(),
+            )
+            .await
+            {
+                Ok(Ok(data)) if !data.is_empty() => Some(data.to_vec()),
+                _ => None,
+            };
+
+            resolve_domain(
+                peer_addr.ip(),
+                peer_addr.port(),
+                first_packet.as_deref(),
+                #[cfg(feature = "fakedns")]
+                fakedns_manager.as_ref().map(|m| m.as_ref()),
+                #[cfg(not(feature = "fakedns"))]
+                None,
+            )
+        };
+
+        // Update statistics based on resolution source
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        match domain_resolution.source {
+            DomainSource::FakeDns => {
+                stats.fakedns_reverse_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            DomainSource::TlsSni => {
+                stats.sni_extractions.fetch_add(1, Ordering::Relaxed);
+            }
+            DomainSource::HttpHost => {
+                stats.http_host_extractions.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+
+        // Log domain resolution result
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        debug!(
+            local = %local_addr,
+            peer = %peer_addr,
+            domain = ?domain_resolution.domain,
+            source = %domain_resolution.source,
+            "TCP connection with domain resolution"
+        );
+
         // Look up the session to get the outbound_tag
         let five_tuple = FiveTuple::tcp(local_addr, peer_addr);
         let outbound_tag = session_tracker
@@ -796,9 +953,20 @@ impl IpStackBridge {
             .map(|s| s.outbound_tag.clone())
             .unwrap_or_else(|| "direct".to_string());
 
+        // Log for non-domain-routing case
+        #[cfg(not(any(feature = "sni-sniffing", feature = "fakedns")))]
         debug!(
             "Handling TCP connection: local={}, peer={}, outbound={}",
             local_addr, peer_addr, outbound_tag
+        );
+
+        // Log outbound tag for domain-routing case (already logged domain above)
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        trace!(
+            local = %local_addr,
+            peer = %peer_addr,
+            outbound = %outbound_tag,
+            "TCP connection outbound selection"
         );
 
         // Handle block outbound
@@ -899,9 +1067,21 @@ impl IpStackBridge {
             }
         };
 
-        // Bridge the streams using tokio's built-in copy_bidirectional
-        // This has internal pipelining for better performance than serial read-write
-        match tokio::io::copy_bidirectional(&mut tcp_stream, &mut outbound_stream).await {
+        // Bridge the streams using tokio's copy_bidirectional_with_sizes
+        // Using configurable buffers (default 64KB) instead of default 8KB for better
+        // throughput on high-bandwidth connections (reduces syscall overhead by 8x)
+        // Buffer size can be tuned via IPSTACK_TCP_BUFFER_KB environment variable
+        // IMPORTANT: Use `buffered` stream (BufReader) instead of raw tcp_stream
+        // to preserve the peeked data from SNI/HTTP sniffing
+        let buffer_size = configured_tcp_buffer_size();
+        match tokio::io::copy_bidirectional_with_sizes(
+            &mut buffered,
+            &mut outbound_stream,
+            buffer_size,
+            buffer_size,
+        )
+        .await
+        {
             Ok((to_outbound, from_outbound)) => {
                 stats
                     .bytes_to_outbound
@@ -940,7 +1120,56 @@ impl IpStackBridge {
         stats: Arc<IpStackBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
+        // DNS hijack for port 53
+        #[cfg(feature = "fakedns")]
+        if peer_addr.port() == 53 {
+            if let Some(ref fakedns) = fakedns_manager {
+                use super::dns_hijack::handle_udp_dns_query;
+
+                match handle_udp_dns_query(&mut udp_stream, fakedns.as_ref()).await {
+                    Ok(()) => {
+                        stats.dns_queries_hijacked.fetch_add(1, Ordering::Relaxed);
+                        trace!("UDP DNS query hijacked via FakeDNS");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "UDP DNS hijack failed");
+                    }
+                }
+                // DNS handled, remove session and return
+                let five_tuple = FiveTuple::udp(local_addr, peer_addr);
+                session_tracker.remove(&five_tuple);
+                return;
+            }
+        }
+
+        // Phase 2: For non-DNS UDP, try FakeDNS reverse lookup
+        // UDP does not have protocol-level sniffing like TCP (no SNI/HTTP headers)
+        // so we can only use FakeDNS reverse lookup for domain resolution
+        #[cfg(feature = "fakedns")]
+        let resolved_domain = if let Some(ref fakedns) = fakedns_manager {
+            if fakedns.is_fake_ip(peer_addr.ip()) {
+                let domain = fakedns.map_ip_domain(peer_addr.ip());
+                if domain.is_some() {
+                    stats.fakedns_reverse_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                domain
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "fakedns")]
+        debug!(
+            local = %local_addr,
+            peer = %peer_addr,
+            domain = ?resolved_domain,
+            "UDP stream with FakeDNS lookup"
+        );
+
         // Look up the session to get the outbound_tag
         let five_tuple = FiveTuple::udp(local_addr, peer_addr);
         let outbound_tag = session_tracker
@@ -948,9 +1177,20 @@ impl IpStackBridge {
             .map(|s| s.outbound_tag.clone())
             .unwrap_or_else(|| "direct".to_string());
 
+        // Log for non-fakedns case
+        #[cfg(not(feature = "fakedns"))]
         debug!(
             "Handling UDP stream: local={}, peer={}, outbound={}",
             local_addr, peer_addr, outbound_tag
+        );
+
+        // Log outbound tag for fakedns case (already logged domain above)
+        #[cfg(feature = "fakedns")]
+        trace!(
+            local = %local_addr,
+            peer = %peer_addr,
+            outbound = %outbound_tag,
+            "UDP stream outbound selection"
         );
 
         // Handle block outbound
@@ -1445,6 +1685,10 @@ mod tests {
             bytes_from_outbound: 10000,
             reply_backpressure: 5,
             reply_drops: 1,
+            dns_queries_hijacked: 15,
+            fakedns_reverse_hits: 12,
+            sni_extractions: 8,
+            http_host_extractions: 3,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
@@ -1452,6 +1696,10 @@ mod tests {
         assert!(json.contains("100"));
         assert!(json.contains("reply_backpressure"));
         assert!(json.contains("reply_drops"));
+        assert!(json.contains("dns_queries_hijacked"));
+        assert!(json.contains("fakedns_reverse_hits"));
+        assert!(json.contains("sni_extractions"));
+        assert!(json.contains("http_host_extractions"));
     }
 
     #[test]

@@ -924,10 +924,34 @@ async fn main() -> Result<()> {
                     Arc::clone(&peer_manager), // Peer manager for Terminal chain reply routing
                 );
 
+                // Initialize FakeDNS manager for domain-based routing (Phase 3)
+                // This enables ipstack bridge to hijack DNS queries and map domains to fake IPs,
+                // allowing domain-based routing for TCP connections
+                #[cfg(feature = "fakedns")]
+                let fakedns_manager: Option<Arc<rust_router::fakedns::FakeDnsManager>> = {
+                    use rust_router::fakedns::{FakeDnsConfig, FakeDnsManager};
+
+                    let config = FakeDnsConfig::new()
+                        .with_ipv4_pool("198.18.0.0/15".parse().expect("Invalid FakeDNS IPv4 pool"))
+                        .with_ttl(std::time::Duration::from_secs(300))
+                        .with_max_entries(65536);
+
+                    let manager = FakeDnsManager::new(&config);
+                    info!("FakeDNS manager initialized with pool 198.18.0.0/15");
+                    Some(Arc::new(manager))
+                };
+
                 // Initialize IpStack bridge for TCP handling (replaces manual TCP state machine)
                 #[cfg(feature = "ipstack-tcp")]
                 {
-                    match init_ipstack_bridge().await {
+                    // Pass rule_engine for domain-based routing (SNI/FakeDNS)
+                    let ipstack_rule_engine = Some(Arc::clone(&rule_engine));
+                    #[cfg(feature = "fakedns")]
+                    let init_result = init_ipstack_bridge(ipstack_rule_engine, fakedns_manager.clone()).await;
+                    #[cfg(not(feature = "fakedns"))]
+                    let init_result = init_ipstack_bridge(ipstack_rule_engine).await;
+
+                    match init_result {
                         Ok((ipstack_reply_rx, ipstack_session_tracker)) => {
                             info!("IpStack bridge initialized for TCP handling");
                             // Spawn reply router for ipstack (routes TCP replies back to WireGuard peers)

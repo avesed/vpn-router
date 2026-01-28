@@ -73,6 +73,8 @@ pub mod chain;
 pub mod config;
 pub mod connection;
 pub mod dns;
+#[cfg(feature = "fakedns")]
+pub mod fakedns;
 pub mod ecmp;
 pub mod egress;
 pub mod error;
@@ -128,7 +130,8 @@ pub use rules::{
     SnapshotStats, DSCP_MAX, DSCP_MIN, ENTRY_ROUTING_MARK_BASE, MAX_CHAINS, RESERVED_DSCP_VALUES,
 };
 pub use sniff::{
-    sniff_tls_sni, Protocol, QuicPacketType, QuicSniffResult, QuicSniffer, QuicVersion, SniffResult,
+    looks_like_tls, sniff_tls, sniff_tls_sni, Protocol, QuicPacketType, QuicSniffResult,
+    QuicSniffer, QuicVersion, SniffResult, TlsSniffResult,
 };
 pub use tproxy::{
     TproxyConnection, TproxyListener, TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo,
@@ -207,6 +210,11 @@ pub use quic_inbound::{
 pub use transport::{
     QuicConnection, QuicConnectionGuard, QuicInboundStats, QuicInboundStatsSnapshot,
     QuicServerConfig, build_server_config, load_certs_from_pem, load_key_from_pem,
+};
+#[cfg(feature = "fakedns")]
+pub use fakedns::{
+    FakeDns, FakeDnsBuilder, FakeDnsCache, FakeDnsCacheStats, FakeDnsCacheStatsSnapshot,
+    FakeDnsConfig, FakeDnsError, FakeDnsManager, FakeDnsResult,
 };
 
 /// Crate version

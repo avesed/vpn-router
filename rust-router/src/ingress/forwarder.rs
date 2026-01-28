@@ -2575,6 +2575,40 @@ async fn forward_udp_packet(
             }
         }
     } else if outbound_tag == "direct" || outbound_tag.starts_with("direct-") {
+        // === DIRECT UDP IPSTACK INTEGRATION (Phase 3) ===
+        // Route direct UDP traffic through ipstack for FakeDNS support
+        #[cfg(feature = "ipstack-tcp")]
+        if is_ipstack_enabled() {
+            if let Some(bridge) = IPSTACK_BRIDGE.get() {
+                use base64::engine::general_purpose::STANDARD as BASE64;
+                use base64::Engine;
+
+                let peer_key: [u8; 32] = match BASE64.decode(&processed.peer_public_key) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    _ => [0u8; 32], // Invalid key will cause fallback
+                };
+
+                if peer_key != [0u8; 32] {
+                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
+                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                        trace!(
+                            "Routed direct UDP to ipstack: {}:{} -> {}:{}",
+                            parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                        );
+                        stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                        stats.udp_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Fall through to manual direct UDP handling
+                }
+            }
+        }
+        // === END DIRECT UDP IPSTACK INTEGRATION ===
+
         // Direct outbound - send UDP directly to destination and listen for reply
         let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
 
@@ -2682,6 +2716,68 @@ async fn forward_udp_packet(
         debug!("Dropping UDP packet (blocked): {} -> {}", parsed.src_ip, parsed.dst_ip);
         stats.blocked_packets.fetch_add(1, Ordering::Relaxed);
     } else {
+        // === UDP IPSTACK INTEGRATION (Phase 3) ===
+        // When ipstack-tcp feature is enabled and ipstack is active, route non-WG UDP
+        // traffic through IpStackBridge for:
+        // 1. Unified session management with TCP
+        // 2. FakeDNS support for domain-based routing
+        // 3. Consistent reply routing through ipstack reply router
+        //
+        // Falls back to manual UDP handling if ipstack injection fails.
+        #[cfg(feature = "ipstack-tcp")]
+        if is_ipstack_enabled() {
+            if let Some(bridge) = IPSTACK_BRIDGE.get() {
+                // Convert peer_public_key to 32-byte array
+                use base64::engine::general_purpose::STANDARD as BASE64;
+                use base64::Engine;
+
+                let peer_key: [u8; 32] = match BASE64.decode(&processed.peer_public_key) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    _ => {
+                        warn!(
+                            "Invalid peer key for ipstack UDP, using fallback: {}:{} -> {}:{} (peer={})",
+                            parsed.src_ip, src_port, parsed.dst_ip, dst_port,
+                            &processed.peer_public_key[..8.min(processed.peer_public_key.len())]
+                        );
+                        // Fall through to manual UDP handling below
+                        [0u8; 32] // Invalid key will cause fallback
+                    }
+                };
+
+                // Only proceed with ipstack if we have a valid peer key
+                if peer_key != [0u8; 32] {
+                    // Convert the processed packet to BytesMut for ipstack
+                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
+
+                    // Try to inject into ipstack (non-blocking)
+                    // UDP packets can tolerate loss better than TCP, so we use try_inject
+                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                        trace!(
+                            "Routed UDP to ipstack: {}:{} -> {}:{}",
+                            parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                        );
+                        stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                        stats.udp_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    } else {
+                        // Channel full - fall through to manual UDP handling
+                        // UDP is lossy by nature, so this is acceptable
+                        debug!(
+                            "IpStack channel full for UDP, using fallback: {}:{} -> {}:{}",
+                            parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                        );
+                        // Continue to manual UDP handling below
+                    }
+                }
+            }
+        }
+        // === END UDP IPSTACK INTEGRATION ===
+
+        // Manual UDP handling (fallback when ipstack disabled or channel full)
         // Try to get SOCKS5 or other outbound from manager
         if let Some(outbound) = outbound_manager.get(outbound_tag) {
             let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
@@ -4171,6 +4267,12 @@ pub fn get_proxy_udp_session_count() -> usize {
 /// - The bridge has already been initialized
 /// - Failed to start the internal ipstack tasks
 ///
+/// # Arguments
+///
+/// * `rule_engine` - Optional RuleEngine for domain-based routing decisions (SNI/FakeDNS)
+/// * `fakedns_manager` - Optional FakeDnsManager for DNS hijacking and domain-based routing
+///   (only available when both `ipstack-tcp` and `fakedns` features are enabled)
+///
 /// # Returns
 ///
 /// A tuple containing:
@@ -4178,11 +4280,27 @@ pub fn get_proxy_udp_session_count() -> usize {
 /// - The session tracker Arc for session lookup (used by `spawn_ipstack_reply_router`)
 #[cfg(feature = "ipstack-tcp")]
 pub async fn init_ipstack_bridge(
+    rule_engine: Option<std::sync::Arc<crate::rules::engine::RuleEngine>>,
+    #[cfg(feature = "fakedns")] fakedns_manager: Option<std::sync::Arc<crate::fakedns::FakeDnsManager>>,
 ) -> anyhow::Result<(mpsc::Receiver<(bytes::BytesMut, [u8; 32])>, Arc<IpStackSessionTracker>)> {
     use super::ipstack_bridge::configured_shard_count;
 
     let shard_count = configured_shard_count();
     let mut bridge = ShardedIpStackBridge::new(shard_count);
+
+    // Set RuleEngine for domain-based routing (enables SNI/FakeDNS routing overrides)
+    if let Some(engine) = rule_engine {
+        bridge.set_rule_engine(engine);
+        info!("RuleEngine configured for ipstack bridge domain-based routing");
+    }
+
+    // Set FakeDNS manager if provided (enables DNS hijacking for domain-based routing)
+    #[cfg(feature = "fakedns")]
+    if let Some(fakedns) = fakedns_manager {
+        bridge.set_fakedns_manager(fakedns);
+        info!("FakeDNS manager configured for ipstack bridge");
+    }
+
     let reply_rx = bridge
         .take_reply_rx()
         .ok_or_else(|| anyhow::anyhow!("Failed to take reply_rx from ShardedIpStackBridge"))?;
@@ -4368,8 +4486,14 @@ impl Default for ParallelReplyRouterStats {
 /// This determines how many packets can be queued for a single peer before
 /// backpressure is applied. A larger buffer reduces the chance of drops
 /// during traffic bursts but increases memory usage per active peer.
+///
+/// At 1.5 Gbps with 1420-byte packets (~132K pps), a buffer of 256 fills in
+/// only 1.9ms, causing frequent drops. Increased to 4096 for ~31ms buffer,
+/// matching the global reply channel capacity.
+///
+/// Memory impact: ~60KB per active peer (4096 * ~15 bytes per packet info)
 #[cfg(feature = "ipstack-tcp")]
-const PEER_CHANNEL_BUFFER_SIZE: usize = 256;
+const PEER_CHANNEL_BUFFER_SIZE: usize = 4096;
 
 /// Parallel reply router that distributes packets to per-peer channels
 ///

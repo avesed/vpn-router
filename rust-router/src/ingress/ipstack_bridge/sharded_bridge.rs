@@ -62,6 +62,7 @@ use super::config::*;
 use super::packet_channel::PacketChannel;
 use super::session_tracker::{FiveTuple, SessionTracker};
 use crate::outbound::{OutboundManager, OutboundStream};
+use crate::rules::engine::{ConnectionInfo, RuleEngine};
 use ahash::AHasher;
 use bytes::BytesMut;
 use std::hash::{Hash, Hasher};
@@ -73,6 +74,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
+
+#[cfg(feature = "fakedns")]
+use crate::fakedns::FakeDnsManager;
+
+#[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+use super::domain_resolver::{resolve_domain, DomainSource};
 
 /// Aggregated statistics across all shards
 ///
@@ -92,6 +99,17 @@ pub struct ShardedBridgeStats {
     pub bytes_from_outbound: AtomicU64,
     pub reply_backpressure: AtomicU64,
     pub reply_drops: AtomicU64,
+    // Domain routing statistics (Phase 0)
+    /// DNS queries hijacked by FakeDNS
+    pub dns_queries_hijacked: AtomicU64,
+    /// Successful FakeDNS reverse lookups
+    pub fakedns_reverse_hits: AtomicU64,
+    /// Successful SNI extractions
+    pub sni_extractions: AtomicU64,
+    /// Successful HTTP Host extractions
+    pub http_host_extractions: AtomicU64,
+    /// Connections re-routed based on domain rules (SNI/FakeDNS override)
+    pub domain_reroutes: AtomicU64,
 }
 
 impl ShardedBridgeStats {
@@ -112,6 +130,11 @@ impl ShardedBridgeStats {
             bytes_from_outbound: AtomicU64::new(0),
             reply_backpressure: AtomicU64::new(0),
             reply_drops: AtomicU64::new(0),
+            dns_queries_hijacked: AtomicU64::new(0),
+            fakedns_reverse_hits: AtomicU64::new(0),
+            sni_extractions: AtomicU64::new(0),
+            http_host_extractions: AtomicU64::new(0),
+            domain_reroutes: AtomicU64::new(0),
         }
     }
 
@@ -133,6 +156,11 @@ impl ShardedBridgeStats {
             bytes_from_outbound: self.bytes_from_outbound.load(Ordering::Relaxed),
             reply_backpressure: self.reply_backpressure.load(Ordering::Relaxed),
             reply_drops: self.reply_drops.load(Ordering::Relaxed),
+            dns_queries_hijacked: self.dns_queries_hijacked.load(Ordering::Relaxed),
+            fakedns_reverse_hits: self.fakedns_reverse_hits.load(Ordering::Relaxed),
+            sni_extractions: self.sni_extractions.load(Ordering::Relaxed),
+            http_host_extractions: self.http_host_extractions.load(Ordering::Relaxed),
+            domain_reroutes: self.domain_reroutes.load(Ordering::Relaxed),
         }
     }
 
@@ -150,6 +178,11 @@ impl ShardedBridgeStats {
         self.bytes_from_outbound.store(0, Ordering::Relaxed);
         self.reply_backpressure.store(0, Ordering::Relaxed);
         self.reply_drops.store(0, Ordering::Relaxed);
+        self.dns_queries_hijacked.store(0, Ordering::Relaxed);
+        self.fakedns_reverse_hits.store(0, Ordering::Relaxed);
+        self.sni_extractions.store(0, Ordering::Relaxed);
+        self.http_host_extractions.store(0, Ordering::Relaxed);
+        self.domain_reroutes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -224,6 +257,17 @@ pub struct ShardedBridgeStatsSnapshot {
     pub reply_backpressure: u64,
     /// Reply drops
     pub reply_drops: u64,
+    // Domain routing statistics (Phase 0)
+    /// DNS queries hijacked by FakeDNS
+    pub dns_queries_hijacked: u64,
+    /// Successful FakeDNS reverse lookups
+    pub fakedns_reverse_hits: u64,
+    /// Successful SNI extractions
+    pub sni_extractions: u64,
+    /// Successful HTTP Host extractions
+    pub http_host_extractions: u64,
+    /// Connections re-routed based on domain rules (SNI/FakeDNS override)
+    pub domain_reroutes: u64,
 }
 
 impl ShardedBridgeStatsSnapshot {
@@ -294,6 +338,11 @@ pub struct ShardedIpStackBridge {
     packet_rxs: Option<Vec<mpsc::Receiver<BytesMut>>>,
     /// Outbound manager for routing decisions
     outbound_manager: Option<Arc<OutboundManager>>,
+    /// Rule engine for domain-based routing decisions (SNI/FakeDNS)
+    rule_engine: Option<Arc<RuleEngine>>,
+    /// FakeDNS manager for domain-based routing (shared across all shards)
+    #[cfg(feature = "fakedns")]
+    fakedns_manager: Option<Arc<FakeDnsManager>>,
 }
 
 impl ShardedIpStackBridge {
@@ -339,6 +388,9 @@ impl ShardedIpStackBridge {
             cleanup_task: None,
             packet_rxs: Some(packet_rxs),
             outbound_manager: None,
+            rule_engine: None,
+            #[cfg(feature = "fakedns")]
+            fakedns_manager: None,
         }
     }
 
@@ -348,6 +400,36 @@ impl ShardedIpStackBridge {
     /// If not set, all connections will use direct TCP connection.
     pub fn set_outbound_manager(&mut self, manager: Arc<OutboundManager>) {
         self.outbound_manager = Some(manager);
+    }
+
+    /// Set the rule engine for domain-based routing decisions
+    ///
+    /// When set, connections with resolved domains (from SNI/FakeDNS)
+    /// will be routed based on domain rules instead of IP-only rules.
+    /// This enables features like domain-based routing for encrypted traffic.
+    pub fn set_rule_engine(&mut self, engine: Arc<RuleEngine>) {
+        self.rule_engine = Some(engine);
+    }
+
+    /// Get the rule engine reference
+    pub fn rule_engine(&self) -> Option<&Arc<RuleEngine>> {
+        self.rule_engine.as_ref()
+    }
+
+    /// Set the FakeDNS manager for DNS hijacking
+    ///
+    /// When set, DNS queries (port 53) will be intercepted and resolved
+    /// using FakeDNS, enabling domain-based routing.
+    /// The manager is shared across all shards.
+    #[cfg(feature = "fakedns")]
+    pub fn set_fakedns_manager(&mut self, manager: Arc<FakeDnsManager>) {
+        self.fakedns_manager = Some(manager);
+    }
+
+    /// Get the FakeDNS manager reference
+    #[cfg(feature = "fakedns")]
+    pub fn fakedns_manager(&self) -> Option<&Arc<FakeDnsManager>> {
+        self.fakedns_manager.as_ref()
     }
 
     /// Create a new sharded bridge with default shard count
@@ -687,6 +769,19 @@ impl ShardedIpStackBridge {
             let mut ipstack_config = ipstack::IpStackConfig::default();
             ipstack_config.mtu_unchecked(WG_MTU as u16);
 
+            // Configure TCP parameters for high throughput
+            // The default MAX_UNACK and READ_BUFFER_SIZE of 16KB severely limits throughput
+            // We use configurable values (default 256KB) for better BDP support
+            //
+            // Critical: max_unacked_bytes controls SEND throughput (download to client)
+            //           read_buffer_size controls RECEIVE window (upload from client)
+            // Both must be increased for bidirectional high throughput!
+            let max_unack = configured_max_unack();
+            let mut tcp_config = ipstack::TcpConfig::default();
+            tcp_config.max_unacked_bytes = max_unack;
+            tcp_config.read_buffer_size = max_unack as usize; // Same BDP applies to both directions
+            ipstack_config.with_tcp_config(tcp_config);
+
             // Create the ipstack instance for this shard
             let ip_stack = ipstack::IpStack::new(ipstack_config, packet_channel);
 
@@ -723,6 +818,9 @@ impl ShardedIpStackBridge {
             let global_stats = Arc::clone(&self.stats);
             let session_tracker = Arc::clone(&self.session_tracker);
             let outbound_manager = self.outbound_manager.clone();
+            let rule_engine = self.rule_engine.clone();
+            #[cfg(feature = "fakedns")]
+            let fakedns_manager = self.fakedns_manager.clone();
             let accept_task = tokio::spawn(Self::accept_loop_task(
                 shard_id,
                 ip_stack,
@@ -731,6 +829,9 @@ impl ShardedIpStackBridge {
                 global_stats,
                 session_tracker,
                 outbound_manager,
+                rule_engine,
+                #[cfg(feature = "fakedns")]
+                fakedns_manager,
             ));
 
             // Update shard with task handles
@@ -879,6 +980,8 @@ impl ShardedIpStackBridge {
         global_stats: Arc<ShardedBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        rule_engine: Option<Arc<RuleEngine>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
         debug!(shard_id, "Accept loop task started");
 
@@ -892,6 +995,9 @@ impl ShardedIpStackBridge {
                         Arc::clone(&global_stats),
                         Arc::clone(&session_tracker),
                         outbound_manager.clone(),
+                        rule_engine.clone(),
+                        #[cfg(feature = "fakedns")]
+                        fakedns_manager.clone(),
                     );
                 }
                 Err(e) => {
@@ -915,6 +1021,8 @@ impl ShardedIpStackBridge {
         global_stats: Arc<ShardedBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        rule_engine: Option<Arc<RuleEngine>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
         match stream {
             ipstack::IpStackStream::Tcp(tcp_stream) => {
@@ -943,6 +1051,9 @@ impl ShardedIpStackBridge {
                     global_stats,
                     session_tracker,
                     outbound_manager,
+                    rule_engine,
+                    #[cfg(feature = "fakedns")]
+                    fakedns_manager,
                 ));
             }
             ipstack::IpStackStream::Udp(udp_stream) => {
@@ -971,6 +1082,8 @@ impl ShardedIpStackBridge {
                     global_stats,
                     session_tracker,
                     outbound_manager,
+                    #[cfg(feature = "fakedns")]
+                    fakedns_manager,
                 ));
             }
             ipstack::IpStackStream::UnknownTransport(unknown) => {
@@ -989,31 +1102,185 @@ impl ShardedIpStackBridge {
 
     /// Handle a TCP connection from ipstack
     ///
-    /// Routes the connection through the appropriate outbound based on
-    /// the outbound_tag stored in the session tracker.
+    /// Routes the connection through the appropriate outbound based on:
+    /// 1. Domain-based rules (if domain was resolved via SNI/FakeDNS and rule_engine is set)
+    /// 2. IP-based rules from session tracker (fallback)
     async fn handle_tcp_connection(
         shard_id: usize,
-        mut tcp_stream: ipstack::IpStackTcpStream,
+        tcp_stream: ipstack::IpStackTcpStream,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
         shard_stats: Arc<ShardStats>,
         global_stats: Arc<ShardedBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        rule_engine: Option<Arc<RuleEngine>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
-        // Look up the session to get the outbound_tag
+        // Wrap stream in BufReader for peek functionality (needed for SNI sniffing)
+        // We do this early so we can use it for both DNS hijack and domain resolution
+        use tokio::io::BufReader;
+        let mut buffered = BufReader::with_capacity(configured_sni_buffer_size(), tcp_stream);
+
+        // TCP DNS hijack for port 53
+        #[cfg(feature = "fakedns")]
+        if peer_addr.port() == 53 {
+            if let Some(ref fakedns) = fakedns_manager {
+                use super::dns_hijack::handle_tcp_dns_query;
+
+                match handle_tcp_dns_query(&mut buffered, fakedns.as_ref()).await {
+                    Ok(()) => {
+                        global_stats.dns_queries_hijacked.fetch_add(1, Ordering::Relaxed);
+                        trace!(shard_id, "TCP DNS query hijacked via FakeDNS");
+                    }
+                    Err(e) => {
+                        warn!(shard_id, error = %e, "TCP DNS hijack failed");
+                    }
+                }
+                // DNS handled, remove session and return
+                let five_tuple = FiveTuple::tcp(local_addr, peer_addr);
+                session_tracker.remove(&five_tuple);
+                return;
+            }
+        }
+
+        // Phase 2: Domain resolution using hybrid approach (FakeDNS + SNI + HTTP Host)
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        let domain_resolution = {
+            use tokio::io::AsyncBufReadExt;
+
+            // Peek first packet for SNI/HTTP sniffing (with timeout)
+            let first_packet: Option<Vec<u8>> = match tokio::time::timeout(
+                sni_peek_timeout(),
+                buffered.fill_buf(),
+            )
+            .await
+            {
+                Ok(Ok(data)) if !data.is_empty() => Some(data.to_vec()),
+                _ => None,
+            };
+
+            resolve_domain(
+                peer_addr.ip(),
+                peer_addr.port(),
+                first_packet.as_deref(),
+                #[cfg(feature = "fakedns")]
+                fakedns_manager.as_ref().map(|m| m.as_ref()),
+                #[cfg(not(feature = "fakedns"))]
+                None,
+            )
+        };
+
+        // Update statistics based on resolution source
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        match domain_resolution.source {
+            DomainSource::FakeDns => {
+                global_stats
+                    .fakedns_reverse_hits
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DomainSource::TlsSni => {
+                global_stats
+                    .sni_extractions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DomainSource::HttpHost => {
+                global_stats
+                    .http_host_extractions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+
+        // Log domain resolution result
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        debug!(
+            shard_id,
+            local = %local_addr,
+            peer = %peer_addr,
+            domain = ?domain_resolution.domain,
+            source = %domain_resolution.source,
+            "TCP connection with domain resolution"
+        );
+
+        // Look up the session to get the initial outbound_tag (from IP-based routing)
         let five_tuple = FiveTuple::tcp(local_addr, peer_addr);
-        let outbound_tag = session_tracker
+        let ip_based_tag = session_tracker
             .lookup(&five_tuple)
             .map(|s| s.outbound_tag.clone())
             .unwrap_or_else(|| "direct".to_string());
 
+        // Domain-based re-routing: if we have a domain and rule_engine, use domain rules
+        // This allows SNI/FakeDNS resolved domains to override IP-based routing decisions
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        let (outbound_tag, routing_source) = if let Some(domain) = domain_resolution.domain.as_ref()
+        {
+            if let Some(ref engine) = rule_engine {
+                // Build ConnectionInfo with the resolved domain
+                let conn_info = ConnectionInfo {
+                    domain: Some(domain.clone()),
+                    dest_ip: Some(peer_addr.ip()),
+                    dest_port: peer_addr.port(),
+                    source_ip: Some(local_addr.ip()),
+                    protocol: "tcp",
+                    sniffed_protocol: match domain_resolution.source {
+                        DomainSource::TlsSni => Some("tls"),
+                        DomainSource::HttpHost => Some("http"),
+                        _ => None,
+                    },
+                };
+
+                // Match using domain rules
+                let match_result = engine.match_connection(&conn_info);
+
+                // If domain rule matched and gave a different outbound, use it
+                if match_result.matched_rule.is_some() {
+                    global_stats.domain_reroutes.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        shard_id,
+                        domain = %domain,
+                        ip_tag = %ip_based_tag,
+                        domain_tag = %match_result.outbound,
+                        rule = ?match_result.matched_rule,
+                        "Domain-based routing override"
+                    );
+                    (match_result.outbound, "domain")
+                } else {
+                    // No domain rule matched, use IP-based tag
+                    (ip_based_tag, "ip")
+                }
+            } else {
+                // No rule_engine, use IP-based tag
+                (ip_based_tag, "ip")
+            }
+        } else {
+            // No domain resolved, use IP-based tag
+            (ip_based_tag, "ip")
+        };
+
+        // For non-domain-routing builds, just use IP-based tag
+        #[cfg(not(any(feature = "sni-sniffing", feature = "fakedns")))]
+        let (outbound_tag, routing_source) = (ip_based_tag, "ip");
+
+        // Log for non-domain-routing case
+        #[cfg(not(any(feature = "sni-sniffing", feature = "fakedns")))]
         debug!(
             shard_id,
             local = %local_addr,
             peer = %peer_addr,
             outbound = %outbound_tag,
             "Handling TCP connection"
+        );
+
+        // Log outbound tag for domain-routing case
+        #[cfg(any(feature = "sni-sniffing", feature = "fakedns"))]
+        trace!(
+            shard_id,
+            local = %local_addr,
+            peer = %peer_addr,
+            outbound = %outbound_tag,
+            routing_source = %routing_source,
+            "TCP connection outbound selection"
         );
 
         // Handle block outbound
@@ -1124,8 +1391,21 @@ impl ShardedIpStackBridge {
             }
         };
 
-        // Bridge the streams
-        match tokio::io::copy_bidirectional(&mut tcp_stream, &mut outbound_stream).await {
+        // Bridge the streams using copy_bidirectional_with_sizes
+        // Using configurable buffers (default 64KB) instead of default 8KB for better
+        // throughput on high-bandwidth connections (reduces syscall overhead by 8x)
+        // Buffer size can be tuned via IPSTACK_TCP_BUFFER_KB environment variable
+        // IMPORTANT: Use `buffered` stream (BufReader) instead of raw tcp_stream
+        // to preserve the peeked data from SNI/HTTP sniffing
+        let buffer_size = configured_tcp_buffer_size();
+        match tokio::io::copy_bidirectional_with_sizes(
+            &mut buffered,
+            &mut outbound_stream,
+            buffer_size,
+            buffer_size,
+        )
+        .await
+        {
             Ok((to_outbound, from_outbound)) => {
                 shard_stats.bytes_to_outbound.fetch_add(to_outbound, Ordering::Relaxed);
                 shard_stats.bytes_from_outbound.fetch_add(from_outbound, Ordering::Relaxed);
@@ -1172,7 +1452,59 @@ impl ShardedIpStackBridge {
         global_stats: Arc<ShardedBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
+        #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
     ) {
+        // DNS hijack for port 53
+        #[cfg(feature = "fakedns")]
+        if peer_addr.port() == 53 {
+            if let Some(ref fakedns) = fakedns_manager {
+                use super::dns_hijack::handle_udp_dns_query;
+
+                match handle_udp_dns_query(&mut udp_stream, fakedns.as_ref()).await {
+                    Ok(()) => {
+                        global_stats.dns_queries_hijacked.fetch_add(1, Ordering::Relaxed);
+                        trace!(shard_id, "UDP DNS query hijacked via FakeDNS");
+                    }
+                    Err(e) => {
+                        warn!(shard_id, error = %e, "UDP DNS hijack failed");
+                    }
+                }
+                // DNS handled, remove session and return
+                let five_tuple = FiveTuple::udp(local_addr, peer_addr);
+                session_tracker.remove(&five_tuple);
+                return;
+            }
+        }
+
+        // Phase 2: For non-DNS UDP, try FakeDNS reverse lookup
+        // UDP does not have protocol-level sniffing like TCP (no SNI/HTTP headers)
+        // so we can only use FakeDNS reverse lookup for domain resolution
+        #[cfg(feature = "fakedns")]
+        let resolved_domain = if let Some(ref fakedns) = fakedns_manager {
+            if fakedns.is_fake_ip(peer_addr.ip()) {
+                let domain = fakedns.map_ip_domain(peer_addr.ip());
+                if domain.is_some() {
+                    global_stats
+                        .fakedns_reverse_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                domain
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        #[cfg(feature = "fakedns")]
+        debug!(
+            shard_id,
+            local = %local_addr,
+            peer = %peer_addr,
+            domain = ?resolved_domain,
+            "UDP stream with FakeDNS lookup"
+        );
+
         // Look up the session to get the outbound_tag
         let five_tuple = FiveTuple::udp(local_addr, peer_addr);
         let outbound_tag = session_tracker
@@ -1180,12 +1512,24 @@ impl ShardedIpStackBridge {
             .map(|s| s.outbound_tag.clone())
             .unwrap_or_else(|| "direct".to_string());
 
+        // Log for non-fakedns case
+        #[cfg(not(feature = "fakedns"))]
         debug!(
             shard_id,
             local = %local_addr,
             peer = %peer_addr,
             outbound = %outbound_tag,
             "Handling UDP stream"
+        );
+
+        // Log outbound tag for fakedns case (already logged domain above)
+        #[cfg(feature = "fakedns")]
+        trace!(
+            shard_id,
+            local = %local_addr,
+            peer = %peer_addr,
+            outbound = %outbound_tag,
+            "UDP stream outbound selection"
         );
 
         // Handle block outbound
@@ -1764,12 +2108,22 @@ mod tests {
             bytes_from_outbound: 100000,
             reply_backpressure: 5,
             reply_drops: 1,
+            dns_queries_hijacked: 25,
+            fakedns_reverse_hits: 20,
+            sni_extractions: 15,
+            http_host_extractions: 5,
+            domain_reroutes: 10,
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("shard_count"));
         assert!(json.contains("per_shard_packets"));
         assert!(json.contains("400"));
+        assert!(json.contains("dns_queries_hijacked"));
+        assert!(json.contains("fakedns_reverse_hits"));
+        assert!(json.contains("sni_extractions"));
+        assert!(json.contains("http_host_extractions"));
+        assert!(json.contains("domain_reroutes"));
     }
 
     #[test]

@@ -40,6 +40,8 @@
 pub mod ab_comparison;
 pub mod chaos;
 pub mod dns_ipc;
+#[cfg(any(feature = "sni-sniffing", feature = "fakedns", feature = "quic-sni", feature = "domain-routing"))]
+pub mod domain_routing;
 pub mod dscp_chain;
 pub mod e2e;
 pub mod failover_integration;

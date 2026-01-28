@@ -44,7 +44,7 @@ serde_json = "1"
 bytes = "1"
 
 # Concurrent data structures
-dashmap = "5"
+dashmap = "6"
 crossbeam-queue = "0.3"
 once_cell = "1"
 ahash = "0.8"  # Fast hash for DashMap (2-3x faster than SipHash)
@@ -66,6 +66,12 @@ regex = "1"
 ipnet = { version = "2", features = ["serde"] }
 aho-corasick = "1"
 
+# TLS SNI parsing (replaces hand-written parser)
+tls-parser = { version = "0.12", optional = true }
+
+# HTTP Host header parsing
+httparse = { version = "1.10", optional = true }
+
 # Cryptographic hashing
 md-5 = "0.10"
 sha2 = "0.10"
@@ -76,6 +82,7 @@ hmac = "0.12"
 
 # AEAD ciphers for REALITY protocol
 aes-gcm = "0.10"
+aes = "0.8"  # AES-ECB for QUIC header protection
 chacha20poly1305 = "0.10"
 
 # Constant-time comparison for security-sensitive operations
@@ -179,6 +186,14 @@ shadowsocks = ["dep:shadowsocks"]
 handshake_retry = []
 # IpStack-based TCP/IP stack for WireGuard ingress (replaces manual TCP state machine)
 ipstack-tcp = ["dep:ipstack"]
+# SNI sniffing for domain-based routing (TLS ClientHello + HTTP Host header)
+sni-sniffing = ["tls-parser", "httparse"]
+# FakeDNS for IP-to-domain mapping (uses ipnet for CIDR ranges)
+fakedns = []
+# QUIC SNI extraction (uses rustls quic module for Initial packet decryption)
+quic-sni = ["rustls"]
+# Complete domain routing suite
+domain-routing = ["sni-sniffing", "fakedns", "quic-sni"]
 
 [dev-dependencies]
 tempfile = "3"
