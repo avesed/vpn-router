@@ -15,14 +15,15 @@ use super::protocol::{
     ChainListResponse, ChainRole, ChainRoleResponse, ChainState, DnsBlockStatsResponse,
     DnsCacheStatsResponse, DnsConfigResponse, DnsQueryLogResponse, DnsQueryResponse,
     DnsStatsResponse, DnsUpstreamInfo, DnsUpstreamStatusResponse, EcmpGroupListResponse,
-    EcmpGroupStatus, EcmpMemberStatus, ErrorCode, IngressStatsResponse, IpcCommand, IpcResponse,
-    OutboundInfo, OutboundStatsResponse, PairingResponse, PeerConfig, PeerListResponse, PeerState,
-    PoolStatsResponse, PrepareResponse, PrometheusMetricsResponse, RuleStatsResponse,
-    ServerCapabilities, ServerStatus, Socks5PoolStats, TcpStatsResponse, TunnelType,
-    UdpProcessorInfo, UdpSessionInfo, UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse,
-    UdpStatsResponse, UdpWorkerPoolInfo, UdpWorkerStatsResponse, WgTunnelListResponse,
-    WgTunnelStatus, VlessOutboundInfoResponse, VlessInboundStatusResponse, VlessUserInfo,
-    VlessUserConfig, VlessWgBridgeStats,
+    EcmpGroupStatus, EcmpMemberStatus, ErrorCode, GlobalWgSniRoutingUpdatedResponse,
+    IngressStatsResponse, IpcCommand, IpcResponse, OutboundInfo, OutboundStatsResponse,
+    PairingResponse, PeerConfig, PeerListResponse, PeerState, PoolStatsResponse, PrepareResponse,
+    PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus,
+    Socks5PoolStats, TcpStatsResponse, TunnelType, UdpProcessorInfo, UdpSessionInfo,
+    UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
+    UdpWorkerPoolInfo, UdpWorkerStatsResponse, VlessInboundStatusResponse, VlessOutboundInfoResponse,
+    VlessUserConfig, VlessUserInfo, VlessWgBridgeStats, WgSniRoutingConfigResponse,
+    WgSniRoutingUpdatedResponse, WgTunnelListResponse, WgTunnelStatus,
 };
 use crate::chain::ChainManager;
 use crate::dns::cache::DnsCache;
@@ -36,7 +37,7 @@ use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::ecmp::group::EcmpGroupManager;
 use crate::egress::manager::WgEgressManager;
 use crate::ingress::manager::WgIngressManager;
-use crate::ingress::{ForwardingStats, IngressReplyStats, IngressSessionTracker};
+use crate::ingress::{ForwardingStats, IngressReplyStats, IngressSessionTracker, get_sni_routing_config};
 use crate::io::UdpBufferPool;
 use crate::outbound::{Outbound, OutboundManager};
 use crate::peer::manager::PeerManager;
@@ -44,7 +45,7 @@ use crate::peer::pairing::PairRequestConfig;
 use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
 use crate::tproxy::UdpWorkerPool;
 use crate::outbound::vless::{VlessConfig, VlessOutbound, VlessTransportConfig, TlsSettings};
-use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessInboundStream, VlessUser as VlessInboundUser};
+use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessUser as VlessInboundUser};
 use crate::vless::{VlessAccount, VlessAccountManager};
 use crate::io::bidirectional_copy;
 
@@ -1106,6 +1107,19 @@ impl IpcHandler {
             #[cfg(feature = "shadowsocks")]
             IpcCommand::StopShadowsocksInbound => {
                 self.handle_stop_shadowsocks_inbound()
+            }
+
+            // ================================================================
+            // WireGuard SNI Routing Configuration Command Handlers
+            // ================================================================
+            IpcCommand::SetWgSniRouting { tunnel_tag, enabled } => {
+                self.handle_set_wg_sni_routing(tunnel_tag, enabled)
+            }
+            IpcCommand::GetWgSniRoutingConfig => {
+                self.handle_get_wg_sni_routing_config()
+            }
+            IpcCommand::SetGlobalWgSniRouting { enabled } => {
+                self.handle_set_global_wg_sni_routing(enabled)
             }
         }
     }
@@ -8058,6 +8072,68 @@ impl IpcHandler {
                 "Shadowsocks inbound listener is not running",
             )
         }
+    }
+
+    // ========================================================================
+    // WireGuard SNI Routing Configuration Handlers
+    // ========================================================================
+
+    /// Handle SetWgSniRouting command
+    ///
+    /// Enables or disables SNI routing for a specific WireGuard tunnel.
+    fn handle_set_wg_sni_routing(&self, tunnel_tag: String, enabled: bool) -> IpcResponse {
+        let config = get_sni_routing_config();
+
+        if enabled {
+            config.enable_tunnel(&tunnel_tag);
+            info!(
+                tunnel = %tunnel_tag,
+                "WireGuard SNI routing enabled for tunnel"
+            );
+        } else {
+            config.disable_tunnel(&tunnel_tag);
+            info!(
+                tunnel = %tunnel_tag,
+                "WireGuard SNI routing disabled for tunnel"
+            );
+        }
+
+        IpcResponse::WgSniRoutingUpdated(WgSniRoutingUpdatedResponse {
+            tunnel_tag,
+            enabled,
+            success: true,
+        })
+    }
+
+    /// Handle GetWgSniRoutingConfig command
+    ///
+    /// Returns the current WireGuard SNI routing configuration.
+    fn handle_get_wg_sni_routing_config(&self) -> IpcResponse {
+        let config = get_sni_routing_config();
+
+        IpcResponse::WgSniRoutingConfig(WgSniRoutingConfigResponse {
+            global_enabled: config.is_globally_enabled(),
+            enabled_tunnels: config.enabled_tunnels(),
+        })
+    }
+
+    /// Handle SetGlobalWgSniRouting command
+    ///
+    /// Globally enables or disables SNI routing for all WireGuard tunnels.
+    fn handle_set_global_wg_sni_routing(&self, enabled: bool) -> IpcResponse {
+        let config = get_sni_routing_config();
+        config.set_global_enabled(enabled);
+
+        info!(
+            enabled = %enabled,
+            "WireGuard SNI routing globally {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+
+        IpcResponse::GlobalWgSniRoutingUpdated(GlobalWgSniRoutingUpdatedResponse {
+            enabled,
+            success: true,
+        })
     }
 }
 

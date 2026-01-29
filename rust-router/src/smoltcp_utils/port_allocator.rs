@@ -1,8 +1,8 @@
 //! Ephemeral port allocator with TIME_WAIT tracking
 //!
-//! This module provides a thread-safe port allocator for the VLESS-WG bridge.
-//! It manages ephemeral ports (49152-65535) and tracks TIME_WAIT state to
-//! prevent port reuse issues.
+//! This module provides a thread-safe port allocator for smoltcp bridge
+//! implementations. It manages ephemeral ports (49152-65535) and tracks
+//! TIME_WAIT state to prevent port reuse issues.
 //!
 //! # Features
 //!
@@ -14,7 +14,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use rust_router::vless_wg_bridge::{PortAllocator, PortAllocatorConfig};
+//! use rust_router::smoltcp_utils::{PortAllocator, PortAllocatorConfig};
 //!
 //! // Create allocator with default config (IANA ephemeral ports)
 //! let allocator = PortAllocator::new();
@@ -72,6 +72,23 @@ impl Default for PortAllocatorConfig {
 
 impl PortAllocatorConfig {
     /// Create a new configuration with custom settings
+    ///
+    /// # Arguments
+    ///
+    /// * `range` - The port range to allocate from
+    /// * `time_wait_duration` - How long to keep ports in TIME_WAIT after release
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use rust_router::smoltcp_utils::PortAllocatorConfig;
+    ///
+    /// let config = PortAllocatorConfig::new(
+    ///     50000..=50099, // 100 ports
+    ///     Duration::from_secs(30), // 30 second TIME_WAIT
+    /// );
+    /// ```
     #[must_use]
     pub fn new(range: RangeInclusive<u16>, time_wait_duration: Duration) -> Self {
         Self {
@@ -93,6 +110,11 @@ impl PortAllocatorConfig {
 /// 1. Ports are not reused while in TIME_WAIT state
 /// 2. Allocations start from a random port to distribute usage
 /// 3. Automatic cleanup of expired TIME_WAIT entries
+///
+/// # Thread Safety
+///
+/// `PortAllocator` is `Send + Sync` and can be safely shared across tasks.
+/// It uses lock-free data structures internally for high concurrency.
 pub struct PortAllocator {
     /// Set of currently allocated ports
     allocated: DashSet<u16>,
@@ -106,16 +128,36 @@ pub struct PortAllocator {
 
 impl PortAllocator {
     /// Create a new port allocator with default configuration
+    ///
+    /// Uses the IANA ephemeral port range (49152-65535) and 60 second TIME_WAIT.
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(PortAllocatorConfig::default())
     }
 
     /// Create a new port allocator with custom configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Port allocator configuration
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use rust_router::smoltcp_utils::{PortAllocator, PortAllocatorConfig};
+    ///
+    /// let config = PortAllocatorConfig::new(
+    ///     50000..=50099,
+    ///     Duration::from_secs(30),
+    /// );
+    /// let allocator = PortAllocator::with_config(config);
+    /// ```
     #[must_use]
     pub fn with_config(config: PortAllocatorConfig) -> Self {
         // Start from a random port within the range
-        let start_port = *config.range.start() + (rand::random::<u16>() % config.port_count() as u16);
+        let start_port =
+            *config.range.start() + (rand::random::<u16>() % config.port_count() as u16);
 
         debug!(
             "PortAllocator created: range={:?}, time_wait={:?}, start={}",
@@ -139,6 +181,18 @@ impl PortAllocator {
     ///
     /// - `Some(PortGuard)` if a port was successfully allocated
     /// - `None` if all ports are in use or in TIME_WAIT
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let allocator = PortAllocator::new();
+    /// if let Some(guard) = allocator.allocate() {
+    ///     println!("Got port: {}", guard.port());
+    ///     // Port released when guard drops
+    /// } else {
+    ///     println!("No ports available");
+    /// }
+    /// ```
     pub fn allocate(&self) -> Option<PortGuard<'_>> {
         // Clean up expired TIME_WAIT entries first
         self.cleanup_time_wait();
@@ -151,7 +205,8 @@ impl PortAllocator {
 
         for offset in 0..range_len {
             // Calculate port with wrapping within range
-            let port = range_start + ((start.wrapping_sub(range_start) as usize + offset) % range_len) as u16;
+            let port = range_start
+                + ((start.wrapping_sub(range_start) as usize + offset) % range_len) as u16;
 
             // Skip ports in TIME_WAIT
             if self.time_wait.contains_key(&port) {
@@ -287,6 +342,25 @@ impl std::fmt::Debug for PortAllocator {
 /// When this guard is dropped, the port is automatically released into
 /// TIME_WAIT state. Use `take()` to consume the guard and take ownership
 /// of the port for manual management.
+///
+/// # Example
+///
+/// ```ignore
+/// let allocator = PortAllocator::new();
+///
+/// // Automatic release on drop
+/// {
+///     let guard = allocator.allocate().unwrap();
+///     let port = guard.port();
+///     // ... use port ...
+/// } // Port released here
+///
+/// // Manual management
+/// let guard = allocator.allocate().unwrap();
+/// let port = guard.take(); // Consumes guard
+/// // ... use port ...
+/// allocator.release(port); // Manual release
+/// ```
 pub struct PortGuard<'a> {
     /// Reference to the allocator
     allocator: &'a PortAllocator,
@@ -595,8 +669,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_allocation() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
 
         let allocator = Arc::new(PortAllocator::new());
         let successful_allocations = Arc::new(AtomicUsize::new(0));

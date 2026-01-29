@@ -17,11 +17,11 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::reality::common::{
-    REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE, REALITY_DEFAULT_MAX_TIME_DIFF_MS,
+    REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE,
     REALITY_NONCE_SIZE, REALITY_SALT_SIZE, REALITY_SESSION_ID_PLAINTEXT_SIZE,
     REALITY_SESSION_ID_SIZE, REALITY_SHORT_ID_SIZE,
 };
-use crate::reality::crypto::{perform_ecdh, X25519PublicKey};
+use crate::reality::crypto::perform_ecdh;
 use crate::reality::error::{RealityError, RealityResult};
 
 /// REALITY SessionId structure

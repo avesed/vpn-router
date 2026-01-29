@@ -93,7 +93,7 @@ use crate::reality::common::{
 use crate::reality::crypto::{
     compute_finished_verify_data, decrypt_handshake_message, derive_application_secrets,
     derive_handshake_keys, derive_traffic_keys, generate_keypair, perform_ecdh, AeadKey,
-    CipherSuite, HashAlgorithm, DEFAULT_CIPHER_SUITES,
+    CipherSuite, HashAlgorithm,
 };
 use crate::reality::error::{RealityError, RealityResult};
 use crate::reality::tls::{
@@ -708,7 +708,7 @@ impl RealityServer {
 
         // 3. Use default cipher suite (AES_128_GCM_SHA256)
         let cipher_suite = DEFAULT_SERVER_CIPHER_SUITE;
-        let hash_len = cipher_suite.hash_len();
+        let _hash_len = cipher_suite.hash_len();
 
         // 3.5. Derive auth_key for HMAC certificate (same derivation as client)
         let shared_secret_for_auth =
@@ -763,7 +763,7 @@ impl RealityServer {
         // 8. Derive client handshake traffic keys (for receiving client Finished)
         let (client_hs_key_bytes, client_hs_iv) =
             derive_traffic_keys(&hs_keys.client_handshake_traffic_secret, cipher_suite)?;
-        let client_hs_key = AeadKey::new(cipher_suite, &client_hs_key_bytes)?;
+        let _client_hs_key = AeadKey::new(cipher_suite, &client_hs_key_bytes)?;
 
         // 9. Build encrypted handshake messages: EncryptedExtensions + Certificate + CertificateVerify + Finished
         let encrypted_extensions = construct_encrypted_extensions()?;

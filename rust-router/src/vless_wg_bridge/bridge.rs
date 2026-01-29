@@ -61,16 +61,15 @@ use crate::egress::config::EgressState;
 use crate::egress::manager::WgEgressManager;
 use crate::tunnel::smoltcp_bridge::SmoltcpBridge;
 
-use super::config::{
-    MAX_SOCKETS, TCP_IDLE_TIMEOUT_SECS, TCP_RX_BUFFER, TCP_TX_BUFFER, UDP_DEFAULT_TIMEOUT_SECS,
-    UDP_DNS_TIMEOUT_SECS, UDP_RX_BUFFER, WG_MTU, WG_REPLY_CHANNEL_SIZE,
+use crate::smoltcp_utils::{
+    BridgeError, PortAllocator, Result, TcpSocketGuard, MAX_SOCKETS, TCP_IDLE_TIMEOUT_SECS,
+    TCP_RX_BUFFER, TCP_TX_BUFFER, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS, UDP_RX_BUFFER,
+    WG_MTU, WG_REPLY_CHANNEL_SIZE,
 };
-use super::error::{BridgeError, Result};
-use super::port_allocator::PortAllocator;
+
 use super::reply_registry::{VlessReplyKey, VlessReplyRegistry};
 use super::session::{SessionKey, SessionTracker, VlessConnectionId};
-use super::socket_guard::TcpSocketGuard;
-use super::udp_frame::{address_type, UdpFrameAddress, VlessUdpFrame};
+use super::udp_frame::{address_type, VlessUdpFrame};
 
 /// WireGuard reply packet
 #[derive(Debug)]

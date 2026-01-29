@@ -27,7 +27,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::error::{BridgeError, Result};
+use crate::smoltcp_utils::{BridgeError, Result};
 
 /// Address type constants (same as VLESS protocol)
 pub mod address_type {

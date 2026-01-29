@@ -6,7 +6,7 @@ Manager class that syncs database configuration to rust-router.
 Handles outbound lifecycle, routing rule sync, and configuration updates.
 
 Features:
-- Full sync of all egress types (PIA, Custom WG, WARP, V2Ray, Direct, OpenVPN)
+- Full sync of all egress types (PIA, Custom WG, WARP, V2Ray, Shadowsocks, Direct, OpenVPN)
 - Incremental sync on egress add/remove/update
 - Routing rule sync from database
 - Graceful degradation when rust-router unavailable
@@ -68,6 +68,7 @@ EGRESS_TYPE_MAP = {
     "warp-masque": "socks5",  # WARP MASQUE mode
     "v2ray": "socks5",  # VMess/Trojan still use Xray SOCKS5
     "vless": "vless",  # Native VLESS in rust-router
+    "shadowsocks": "shadowsocks",  # Native Shadowsocks in rust-router
     "direct": "direct",
     "openvpn": "direct",  # OpenVPN uses tun device binding
 }
@@ -633,7 +634,7 @@ class RustRouterManager:
         """Sync all outbounds from database to rust-router.
 
         This method:
-        1. Gets all enabled egress from database (PIA, Custom, WARP, V2Ray, Direct, OpenVPN)
+        1. Gets all enabled egress from database (PIA, Custom, WARP, V2Ray, Shadowsocks, Direct, OpenVPN)
         2. Gets current outbounds from rust-router
         3. Adds missing outbounds, removes stale outbounds
 
@@ -753,6 +754,21 @@ class RustRouterManager:
                             "bind_interface": tun_device,
                             "egress_type": "openvpn",
                         }
+
+                # Shadowsocks egress - native rust-router
+                for egress in db.get_shadowsocks_egress_list(enabled_only=True):
+                    tag = egress.get("tag", "")
+                    if tag:
+                        db_outbounds[tag] = {
+                            "type": "shadowsocks",
+                            "server": egress.get("server", ""),
+                            "server_port": egress.get("server_port", 8388),
+                            "method": egress.get("method", "aes-256-gcm"),
+                            "password": egress.get("password", ""),
+                            "udp": bool(egress.get("udp_enabled", True)),
+                            "egress_type": "shadowsocks",
+                        }
+                        logger.info(f"Loaded Shadowsocks egress: {tag}")
 
                 # Always add direct and block outbounds
                 db_outbounds["direct"] = {"type": "direct", "egress_type": "direct"}
@@ -900,6 +916,17 @@ class RustRouterManager:
                 reality_short_id=config.get("reality_short_id"),
                 ws_path=config.get("ws_path"),
                 ws_host=config.get("ws_host"),
+            )
+
+        elif outbound_type == "shadowsocks":
+            # Native Shadowsocks outbound
+            return await client.add_shadowsocks_outbound(
+                tag=tag,
+                server=config.get("server", ""),
+                server_port=config.get("server_port", 8388),
+                method=config.get("method", "aes-256-gcm"),
+                password=config.get("password", ""),
+                udp=config.get("udp", True),
             )
 
         elif outbound_type == "direct":

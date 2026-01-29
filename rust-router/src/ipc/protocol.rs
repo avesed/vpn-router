@@ -1056,6 +1056,38 @@ pub enum IpcCommand {
     /// - UDP session counts
     /// - Ingress session tracker counts (if available)
     GetTcpStats,
+
+    // ========================================================================
+    // WireGuard SNI Routing Configuration
+    // ========================================================================
+
+    /// Set SNI routing for a specific WireGuard tunnel
+    ///
+    /// Enables or disables SNI-based domain routing for a specific WG egress tunnel.
+    /// When enabled, traffic matching domain-based rules will go through ipstack
+    /// for SNI extraction (30-80 Mbps). When disabled, direct IP packet forwarding
+    /// is used (200+ Mbps).
+    SetWgSniRouting {
+        /// WireGuard tunnel tag (e.g., "wg-pia-nyc")
+        tunnel_tag: String,
+        /// Whether to enable SNI routing for this tunnel
+        enabled: bool,
+    },
+
+    /// Get current WireGuard SNI routing configuration
+    ///
+    /// Returns the global SNI routing state and list of tunnels with SNI routing enabled.
+    GetWgSniRoutingConfig,
+
+    /// Set global WireGuard SNI routing enable/disable
+    ///
+    /// Globally enables or disables SNI routing for all WG egress tunnels.
+    /// Individual tunnel settings are preserved but only take effect when global
+    /// routing is enabled.
+    SetGlobalWgSniRouting {
+        /// Whether to enable SNI routing globally
+        enabled: bool,
+    },
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -1350,6 +1382,19 @@ pub enum IpcResponse {
 
     /// TCP connection statistics response
     TcpStats(TcpStatsResponse),
+
+    // ========================================================================
+    // WireGuard SNI Routing Configuration Responses
+    // ========================================================================
+
+    /// WireGuard SNI routing updated response
+    WgSniRoutingUpdated(WgSniRoutingUpdatedResponse),
+
+    /// WireGuard SNI routing configuration response
+    WgSniRoutingConfig(WgSniRoutingConfigResponse),
+
+    /// Global WireGuard SNI routing updated response
+    GlobalWgSniRoutingUpdated(GlobalWgSniRoutingUpdatedResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -3024,6 +3069,39 @@ pub struct ShadowsocksInboundStatusResponse {
     pub bytes_received: u64,
     /// Total bytes sent
     pub bytes_sent: u64,
+}
+
+// ============================================================================
+// WireGuard SNI Routing Configuration Response Types
+// ============================================================================
+
+/// Response for `SetWgSniRouting` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgSniRoutingUpdatedResponse {
+    /// WireGuard tunnel tag that was updated
+    pub tunnel_tag: String,
+    /// New enabled state for SNI routing
+    pub enabled: bool,
+    /// Whether the operation was successful
+    pub success: bool,
+}
+
+/// Response for `GetWgSniRoutingConfig` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WgSniRoutingConfigResponse {
+    /// Whether global SNI routing is enabled
+    pub global_enabled: bool,
+    /// List of tunnels with SNI routing enabled
+    pub enabled_tunnels: Vec<String>,
+}
+
+/// Response for `SetGlobalWgSniRouting` command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalWgSniRoutingUpdatedResponse {
+    /// New global enabled state
+    pub enabled: bool,
+    /// Whether the operation was successful
+    pub success: bool,
 }
 
 /// IPC error
@@ -5384,5 +5462,74 @@ rust_router_connections_total 12345
         assert_eq!(parsed.uuid, "minimal-uuid");
         assert!(parsed.email.is_none());
         assert!(parsed.flow.is_none());
+    }
+
+    #[test]
+    fn test_wg_sni_routing_command_serialization() {
+        // SetWgSniRouting command
+        let cmd = IpcCommand::SetWgSniRouting {
+            tunnel_tag: "wg-pia-nyc".to_string(),
+            enabled: true,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"set_wg_sni_routing\""));
+        assert!(json.contains("\"tunnel_tag\":\"wg-pia-nyc\""));
+        assert!(json.contains("\"enabled\":true"));
+
+        // Parse back
+        let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
+        if let IpcCommand::SetWgSniRouting { tunnel_tag, enabled } = parsed {
+            assert_eq!(tunnel_tag, "wg-pia-nyc");
+            assert!(enabled);
+        } else {
+            panic!("Expected SetWgSniRouting command");
+        }
+
+        // GetWgSniRoutingConfig command
+        let cmd = IpcCommand::GetWgSniRoutingConfig;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"get_wg_sni_routing_config\""));
+
+        // SetGlobalWgSniRouting command
+        let cmd = IpcCommand::SetGlobalWgSniRouting { enabled: false };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"set_global_wg_sni_routing\""));
+        assert!(json.contains("\"enabled\":false"));
+    }
+
+    #[test]
+    fn test_wg_sni_routing_response_serialization() {
+        // WgSniRoutingUpdated response
+        let resp = IpcResponse::WgSniRoutingUpdated(WgSniRoutingUpdatedResponse {
+            tunnel_tag: "wg-custom-uk".to_string(),
+            enabled: true,
+            success: true,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"wg_sni_routing_updated\""));
+        assert!(json.contains("\"tunnel_tag\":\"wg-custom-uk\""));
+        assert!(json.contains("\"enabled\":true"));
+        assert!(json.contains("\"success\":true"));
+
+        // WgSniRoutingConfig response
+        let resp = IpcResponse::WgSniRoutingConfig(WgSniRoutingConfigResponse {
+            global_enabled: true,
+            enabled_tunnels: vec!["wg-pia-nyc".to_string(), "wg-custom-uk".to_string()],
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"wg_sni_routing_config\""));
+        assert!(json.contains("\"global_enabled\":true"));
+        assert!(json.contains("\"wg-pia-nyc\""));
+        assert!(json.contains("\"wg-custom-uk\""));
+
+        // GlobalWgSniRoutingUpdated response
+        let resp = IpcResponse::GlobalWgSniRoutingUpdated(GlobalWgSniRoutingUpdatedResponse {
+            enabled: false,
+            success: true,
+        });
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"global_wg_sni_routing_updated\""));
+        assert!(json.contains("\"enabled\":false"));
+        assert!(json.contains("\"success\":true"));
     }
 }

@@ -549,6 +549,73 @@ asyncio.run(configure_vless())
   fi
 }
 
+start_shadowsocks_inbound() {
+  # Configure Shadowsocks inbound via rust-router IPC
+  local enabled
+  enabled=$(python3 -c "
+import sys
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db')
+config = db.get_shadowsocks_inbound_config()
+print('1' if config and config.get('enabled') else '0')
+" 2>/dev/null || echo "0")
+
+  if [ "${enabled}" = "1" ]; then
+    echo "[entrypoint] configuring Shadowsocks inbound via rust-router IPC"
+    python3 -c "
+import sys
+import os
+import asyncio
+from pathlib import Path
+sys.path.insert(0, '/usr/local/bin')
+from db_helper import get_db
+from rust_router_client import RustRouterClient
+
+async def configure_ss():
+    # Get encryption key from environment or fallback to file
+    encryption_key = os.environ.get('SQLCIPHER_KEY')
+    if not encryption_key:
+        key_file = Path('/etc/sing-box/encryption.key')
+        if key_file.exists():
+            encryption_key = key_file.read_text().strip()
+
+    db = get_db('/etc/sing-box/geoip-geodata.db', '/etc/sing-box/user-config.db', encryption_key)
+    config = db.get_shadowsocks_inbound_config()
+    if not config or not config.get('enabled'):
+        return
+
+    listen_addr = config.get('listen_address', '0.0.0.0')
+    listen_port = config.get('listen_port', 8388)
+    listen = f'{listen_addr}:{listen_port}'
+    method = config.get('method', '2022-blake3-aes-256-gcm')
+    password = config.get('password')
+    udp_enabled = bool(config.get('udp_enabled', True))
+
+    if not password:
+        print('[ss] No password configured, skipping')
+        return
+
+    async with RustRouterClient() as client:
+        resp = await client.configure_shadowsocks_inbound(
+            listen=listen,
+            method=method,
+            password=password,
+            udp_enabled=udp_enabled,
+        )
+        if resp.success:
+            udp_status = 'TCP+UDP' if udp_enabled else 'TCP only'
+            print(f'[ss] Inbound configured on {listen} ({method}, {udp_status})')
+        else:
+            print(f'[ss] Failed to configure: {resp.error}')
+
+asyncio.run(configure_ss())
+" 2>&1 || echo "[entrypoint] Shadowsocks inbound configuration failed"
+  else
+    echo "[entrypoint] Shadowsocks ingress not enabled, skipping"
+  fi
+}
+
 start_xray_egress_manager() {
   # Count only VMess/Trojan egress - VLESS is handled natively by rust-router
   local egress_count
@@ -781,8 +848,9 @@ else
   exit 1
 fi
 
-# Configure VLESS inbound AFTER rust-router is ready (needs IPC socket)
+# Configure VLESS/Shadowsocks inbound AFTER rust-router is ready (needs IPC socket)
 start_xray_manager
+start_shadowsocks_inbound
 start_xray_egress_manager
 
 # Start health checker AFTER rust-router (needs IPC socket)
@@ -891,6 +959,9 @@ while true; do
     if start_rust_router; then
       echo "[entrypoint] rust-router restarted successfully"
       sync_rust_router || echo "[entrypoint] WARNING: sync after restart failed"
+      # Re-configure inbounds after restart (VLESS and Shadowsocks)
+      start_xray_manager
+      start_shadowsocks_inbound
     else
       echo "[entrypoint] FATAL: rust-router restart failed" >&2
       exit 1

@@ -1,4 +1,4 @@
-//! RAII guard for smoltcp socket handles
+//! RAII guards for smoltcp socket handles
 //!
 //! Ensures sockets are properly cleaned up on all code paths,
 //! including early returns and panics.
@@ -17,12 +17,20 @@
 //! - Socket handles are removed from the socket set
 //! - No socket leaks on early returns or panics
 //!
+//! # Deferred Cleanup
+//!
+//! When `try_lock()` fails in `Drop`, orphaned sockets are sent to a deferred
+//! cleanup channel. A background task (spawned via `spawn_cleanup_task`) processes
+//! these orphaned sockets asynchronously, ensuring no socket leaks even under
+//! lock contention.
+//!
 //! # Example
 //!
 //! ```ignore
 //! use std::sync::Arc;
 //! use tokio::sync::Mutex;
-//! use rust_router::vless_wg_bridge::TcpSocketGuard;
+//! use rust_router::smoltcp_utils::TcpSocketGuard;
+//! use rust_router::tunnel::smoltcp_bridge::SmoltcpBridge;
 //!
 //! async fn handle_connection(bridge: Arc<Mutex<SmoltcpBridge>>) {
 //!     let handle = {
@@ -44,14 +52,142 @@
 //!     guard.close_gracefully().await;
 //! }
 //! ```
+//!
+//! # Thread Safety
+//!
+//! Both guard types are `Send + Sync` as they hold `Arc<Mutex<SmoltcpBridge>>`.
+//! The `Drop` implementation uses `try_lock()` which may fail if the lock is held
+//! elsewhere. In that case, cleanup is deferred to a background task via the
+//! cleanup channel.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use smoltcp::iface::SocketHandle;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, trace, warn};
 
 use crate::tunnel::smoltcp_bridge::SmoltcpBridge;
+
+// =============================================================================
+// Deferred Cleanup Channel
+// =============================================================================
+
+/// Entry for deferred socket cleanup
+struct OrphanedSocket {
+    /// The smoltcp bridge
+    bridge: Arc<Mutex<SmoltcpBridge>>,
+    /// The socket handle to clean up
+    handle: SocketHandle,
+    /// Whether to abort (RST) or close (FIN) for TCP
+    abort: bool,
+    /// Whether this is a TCP socket (true) or UDP socket (false)
+    is_tcp: bool,
+}
+
+/// Global cleanup channel sender
+static CLEANUP_TX: OnceLock<mpsc::UnboundedSender<OrphanedSocket>> = OnceLock::new();
+
+/// Receiver for orphaned socket cleanup
+///
+/// This is an opaque wrapper around the channel receiver, used to pass
+/// to `run_cleanup_task`. Created by `init_cleanup_channel`.
+pub struct SocketCleanupReceiver {
+    rx: mpsc::UnboundedReceiver<OrphanedSocket>,
+}
+
+/// Initialize the cleanup channel and return the receiver
+///
+/// This should be called once at startup. Returns the receiver that should
+/// be passed to `run_cleanup_task`.
+///
+/// # Returns
+///
+/// `Some(receiver)` on first call, `None` on subsequent calls.
+#[must_use]
+pub fn init_cleanup_channel() -> Option<SocketCleanupReceiver> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    if CLEANUP_TX.set(tx).is_ok() {
+        Some(SocketCleanupReceiver { rx })
+    } else {
+        None
+    }
+}
+
+/// Spawn the background cleanup task
+///
+/// This task processes orphaned sockets that couldn't be cleaned up in `Drop`
+/// due to lock contention. Call this once at startup with the receiver from
+/// `init_cleanup_channel()`.
+///
+/// # Example
+///
+/// ```ignore
+/// if let Some(rx) = init_cleanup_channel() {
+///     tokio::spawn(run_cleanup_task(rx));
+/// }
+/// ```
+pub async fn run_cleanup_task(receiver: SocketCleanupReceiver) {
+    debug!("Socket cleanup task started");
+    let mut rx = receiver.rx;
+
+    while let Some(orphan) = rx.recv().await {
+        // Acquire lock and clean up
+        let mut bridge = orphan.bridge.lock().await;
+
+        if orphan.is_tcp {
+            if orphan.abort {
+                debug!(
+                    "Deferred cleanup: aborting TCP socket {:?} (RST)",
+                    orphan.handle
+                );
+                bridge.tcp_abort(orphan.handle);
+            } else {
+                debug!(
+                    "Deferred cleanup: closing TCP socket {:?} (FIN)",
+                    orphan.handle
+                );
+                bridge.tcp_close(orphan.handle);
+            }
+        } else {
+            debug!("Deferred cleanup: closing UDP socket {:?}", orphan.handle);
+            bridge.udp_close(orphan.handle);
+        }
+
+        bridge.poll();
+        bridge.remove_socket(orphan.handle);
+    }
+
+    debug!("Socket cleanup task stopped");
+}
+
+/// Send an orphaned socket to the cleanup channel
+///
+/// Returns true if successfully queued, false if the channel is not initialized
+/// or is closed.
+fn queue_orphan_cleanup(
+    bridge: Arc<Mutex<SmoltcpBridge>>,
+    handle: SocketHandle,
+    abort: bool,
+    is_tcp: bool,
+) -> bool {
+    if let Some(tx) = CLEANUP_TX.get() {
+        let orphan = OrphanedSocket {
+            bridge,
+            handle,
+            abort,
+            is_tcp,
+        };
+        if tx.send(orphan).is_ok() {
+            debug!(
+                "Queued orphaned {} socket {:?} for deferred cleanup",
+                if is_tcp { "TCP" } else { "UDP" },
+                handle
+            );
+            return true;
+        }
+    }
+    false
+}
 
 /// RAII guard for TCP socket handles
 ///
@@ -76,6 +212,31 @@ use crate::tunnel::smoltcp_bridge::SmoltcpBridge;
 /// However, the `Drop` implementation uses `try_lock()` which may fail
 /// if the lock is held elsewhere. In that case, a warning is logged
 /// and the socket may be orphaned until smoltcp times it out.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use tokio::sync::Mutex;
+/// use rust_router::smoltcp_utils::TcpSocketGuard;
+///
+/// async fn example(bridge: Arc<Mutex<SmoltcpBridge>>) {
+///     let handle = {
+///         let mut b = bridge.lock().await;
+///         b.create_tcp_socket_default().unwrap()
+///     };
+///
+///     // Default: abort on drop
+///     let guard = TcpSocketGuard::new(bridge.clone(), handle);
+///
+///     // Configure for graceful close
+///     let mut guard = TcpSocketGuard::new(bridge.clone(), handle);
+///     guard.set_graceful_close();
+///
+///     // Or use the async method for immediate graceful close
+///     guard.close_gracefully().await;
+/// }
+/// ```
 pub struct TcpSocketGuard {
     /// Shared reference to the smoltcp bridge
     bridge: Arc<Mutex<SmoltcpBridge>>,
@@ -92,13 +253,6 @@ impl TcpSocketGuard {
     ///
     /// * `bridge` - Shared reference to the smoltcp bridge
     /// * `handle` - The socket handle to guard
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = bridge.lock().await.create_tcp_socket_default().unwrap();
-    /// let guard = TcpSocketGuard::new(bridge.clone(), handle);
-    /// ```
     #[must_use]
     pub fn new(bridge: Arc<Mutex<SmoltcpBridge>>, handle: SocketHandle) -> Self {
         trace!("TcpSocketGuard created for handle {:?}", handle);
@@ -149,14 +303,6 @@ impl TcpSocketGuard {
     /// # Panics
     ///
     /// Panics if the handle has already been taken.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let guard = TcpSocketGuard::new(bridge.clone(), handle);
-    /// let handle = guard.take();
-    /// // Now you must manually clean up the socket
-    /// ```
     #[must_use]
     pub fn take(mut self) -> SocketHandle {
         self.handle.take().expect("socket handle already taken")
@@ -170,14 +316,6 @@ impl TcpSocketGuard {
     /// 2. Polls smoltcp to transmit the FIN
     /// 3. Waits briefly for the FIN to be processed
     /// 4. Removes the socket from the socket set
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let guard = TcpSocketGuard::new(bridge.clone(), handle);
-    /// // ... use the socket ...
-    /// guard.close_gracefully().await;
-    /// ```
     pub async fn close_gracefully(mut self) {
         if let Some(handle) = self.handle.take() {
             debug!(
@@ -203,14 +341,6 @@ impl TcpSocketGuard {
     /// 1. Sends RST to the remote peer
     /// 2. Polls smoltcp to transmit the RST
     /// 3. Removes the socket from the socket set
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let guard = TcpSocketGuard::new(bridge.clone(), handle);
-    /// // ... error occurred ...
-    /// guard.abort().await;
-    /// ```
     pub async fn abort(mut self) {
         if let Some(handle) = self.handle.take() {
             debug!("TcpSocketGuard: aborting socket {:?} (RST)", handle);
@@ -235,7 +365,7 @@ impl Drop for TcpSocketGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             // We're in a sync context, so we need to use try_lock
-            // If we can't get the lock, log a warning but don't panic
+            // If we can't get the lock, defer cleanup to the background task
             match self.bridge.try_lock() {
                 Ok(mut bridge) => {
                     if self.abort_on_drop {
@@ -249,14 +379,20 @@ impl Drop for TcpSocketGuard {
                     bridge.remove_socket(handle);
                 }
                 Err(_) => {
-                    // Can't get lock in sync context - this is a code smell
-                    // but we shouldn't panic. The socket will be orphaned
-                    // until smoltcp eventually times it out.
-                    warn!(
-                        "TcpSocketGuard: could not acquire lock in drop for socket {:?}, \
-                         socket may be orphaned",
-                        handle
-                    );
+                    // Can't get lock in sync context - defer to cleanup task
+                    if !queue_orphan_cleanup(
+                        Arc::clone(&self.bridge),
+                        handle,
+                        self.abort_on_drop,
+                        true,
+                    ) {
+                        // Cleanup channel not initialized or closed
+                        warn!(
+                            "TcpSocketGuard: could not acquire lock or queue cleanup for socket {:?}, \
+                             socket may be orphaned",
+                            handle
+                        );
+                    }
                 }
             }
         }
@@ -271,6 +407,28 @@ impl Drop for TcpSocketGuard {
 /// # Thread Safety
 ///
 /// Same considerations as `TcpSocketGuard` - uses `try_lock()` in drop.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use tokio::sync::Mutex;
+/// use rust_router::smoltcp_utils::UdpSocketGuard;
+///
+/// async fn example(bridge: Arc<Mutex<SmoltcpBridge>>) {
+///     let handle = {
+///         let mut b = bridge.lock().await;
+///         b.create_udp_socket().unwrap()
+///     };
+///
+///     let guard = UdpSocketGuard::new(bridge.clone(), handle);
+///
+///     // ... use the socket ...
+///
+///     // Socket closed on drop, or explicitly:
+///     guard.close().await;
+/// }
+/// ```
 pub struct UdpSocketGuard {
     /// Shared reference to the smoltcp bridge
     bridge: Arc<Mutex<SmoltcpBridge>>,
@@ -349,11 +507,20 @@ impl Drop for UdpSocketGuard {
                     bridge.remove_socket(handle);
                 }
                 Err(_) => {
-                    warn!(
-                        "UdpSocketGuard: could not acquire lock in drop for socket {:?}, \
-                         socket may be orphaned",
-                        handle
-                    );
+                    // Can't get lock in sync context - defer to cleanup task
+                    if !queue_orphan_cleanup(
+                        Arc::clone(&self.bridge),
+                        handle,
+                        false, // UDP doesn't have abort concept
+                        false, // is_tcp = false
+                    ) {
+                        // Cleanup channel not initialized or closed
+                        warn!(
+                            "UdpSocketGuard: could not acquire lock or queue cleanup for socket {:?}, \
+                             socket may be orphaned",
+                            handle
+                        );
+                    }
                 }
             }
         }
@@ -619,8 +786,9 @@ mod tests {
     async fn test_guard_early_return_cleanup() {
         let bridge = create_test_bridge();
 
-        async fn simulate_early_return(bridge: Arc<Mutex<SmoltcpBridge>>) -> Result<(), &'static str>
-        {
+        async fn simulate_early_return(
+            bridge: Arc<Mutex<SmoltcpBridge>>,
+        ) -> Result<(), &'static str> {
             let handle = {
                 let mut b = bridge.lock().await;
                 b.create_tcp_socket_default().unwrap()

@@ -945,11 +945,13 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "ipstack-tcp")]
                 {
                     // Pass rule_engine for domain-based routing (SNI/FakeDNS)
+                    // Pass outbound_manager for proxy routing (VLESS, Shadowsocks, SOCKS5, etc.)
                     let ipstack_rule_engine = Some(Arc::clone(&rule_engine));
+                    let ipstack_outbound_manager = Some(Arc::clone(&outbound_manager));
                     #[cfg(feature = "fakedns")]
-                    let init_result = init_ipstack_bridge(ipstack_rule_engine, fakedns_manager.clone()).await;
+                    let init_result = init_ipstack_bridge(ipstack_rule_engine, fakedns_manager.clone(), ipstack_outbound_manager).await;
                     #[cfg(not(feature = "fakedns"))]
-                    let init_result = init_ipstack_bridge(ipstack_rule_engine).await;
+                    let init_result = init_ipstack_bridge(ipstack_rule_engine, ipstack_outbound_manager).await;
 
                     match init_result {
                         Ok((ipstack_reply_rx, ipstack_session_tracker)) => {

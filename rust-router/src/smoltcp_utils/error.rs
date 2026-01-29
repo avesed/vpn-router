@@ -1,21 +1,41 @@
-//! Error types for the VLESS-WG Bridge
+//! Error types for smoltcp bridge utilities
 //!
-//! This module defines the error types used throughout the bridge implementation.
+//! This module defines the error types used throughout the bridge implementations.
 //! All errors are designed to be informative for debugging while also being
 //! suitable for logging and metrics.
 //!
 //! # Error Categories
 //!
-//! - **Resource Exhaustion**: Port exhaustion, socket limits
-//! - **Session Errors**: Session not found, invalid state
-//! - **Tunnel Errors**: Tunnel down, connection refused
-//! - **Network Errors**: DNS resolution, timeouts
-//! - **Protocol Errors**: smoltcp TCP/UDP errors
+//! Errors are classified into categories that help determine appropriate handling:
+//!
+//! - **Transient**: May resolve on retry (port exhaustion, timeouts)
+//! - **Permanent**: Will not resolve without intervention (invalid address, connection refused)
+//! - **Resource Exhaustion**: System resource limits reached
+//!
+//! # Example
+//!
+//! ```ignore
+//! use rust_router::smoltcp_utils::{BridgeError, Result};
+//!
+//! fn handle_connection() -> Result<()> {
+//!     // ... operation that might fail ...
+//!     Err(BridgeError::ConnectionTimeout)
+//! }
+//!
+//! fn main() {
+//!     match handle_connection() {
+//!         Ok(()) => println!("Success"),
+//!         Err(e) if e.is_transient() => println!("Retry later: {}", e),
+//!         Err(e) if e.is_permanent() => println!("Cannot recover: {}", e),
+//!         Err(e) => println!("Error: {}", e),
+//!     }
+//! }
+//! ```
 
 use std::io;
 use thiserror::Error;
 
-/// Errors that can occur during VLESS-WG bridge operations
+/// Errors that can occur during smoltcp bridge operations
 #[derive(Error, Debug)]
 pub enum BridgeError {
     /// All ephemeral ports in the configured range are in use
@@ -66,6 +86,10 @@ pub enum BridgeError {
     #[error("per-client session limit reached: max {0} sessions per client")]
     PerClientSessionLimitReached(usize),
 
+    /// The client is creating sessions too fast (rate limited)
+    #[error("session creation rate limit exceeded: max {0} sessions per second")]
+    SessionRateLimitExceeded(usize),
+
     /// Invalid session state for the requested operation
     #[error("invalid session state: expected {expected}, got {actual}")]
     InvalidSessionState {
@@ -90,10 +114,35 @@ pub enum BridgeError {
     /// Channel receive failed
     #[error("channel receive failed: {0}")]
     ChannelReceiveFailed(String),
+
+    /// Socket not found
+    #[error("socket not found: {0}")]
+    SocketNotFound(String),
+
+    /// Bridge not initialized
+    #[error("bridge not initialized")]
+    NotInitialized,
+
+    /// Operation cancelled
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl BridgeError {
     /// Returns true if this error indicates a transient condition that may resolve
+    ///
+    /// Transient errors may succeed on retry after waiting or when resources
+    /// become available.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let err = BridgeError::ConnectionTimeout;
+    /// assert!(err.is_transient());
+    ///
+    /// let err = BridgeError::ConnectionRefused;
+    /// assert!(!err.is_transient());
+    /// ```
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(
@@ -104,10 +153,25 @@ impl BridgeError {
                 | Self::TunnelDown(_)
                 | Self::SessionLimitReached(_)
                 | Self::PerClientSessionLimitReached(_)
+                | Self::SessionRateLimitExceeded(_)
+                | Self::Cancelled
         )
     }
 
     /// Returns true if this error indicates a permanent failure
+    ///
+    /// Permanent errors will not resolve without external intervention
+    /// (e.g., configuration change, network fix).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let err = BridgeError::ConnectionRefused;
+    /// assert!(err.is_permanent());
+    ///
+    /// let err = BridgeError::ConnectionTimeout;
+    /// assert!(!err.is_permanent());
+    /// ```
     #[must_use]
     pub fn is_permanent(&self) -> bool {
         matches!(
@@ -116,10 +180,21 @@ impl BridgeError {
                 | Self::DnsResolutionFailed(_)
                 | Self::InvalidAddress(_)
                 | Self::InvalidSessionState { .. }
+                | Self::NotInitialized
         )
     }
 
     /// Returns true if this error indicates a resource exhaustion condition
+    ///
+    /// Resource exhaustion errors indicate system limits have been reached.
+    /// The caller should wait for resources to be freed or reduce load.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let err = BridgeError::PortExhausted;
+    /// assert!(err.is_resource_exhaustion());
+    /// ```
     #[must_use]
     pub fn is_resource_exhaustion(&self) -> bool {
         matches!(
@@ -128,31 +203,50 @@ impl BridgeError {
                 | Self::SocketLimitReached(_)
                 | Self::SessionLimitReached(_)
                 | Self::PerClientSessionLimitReached(_)
+                | Self::SessionRateLimitExceeded(_)
         )
     }
 
-    /// Create a SmoltcpTcp error from a smoltcp connect error
+    /// Create a `SmoltcpTcp` error from a smoltcp connect error
     #[must_use]
     pub fn from_tcp_connect_error(err: smoltcp::socket::tcp::ConnectError) -> Self {
         Self::SmoltcpTcp(format!("connect error: {err:?}"))
     }
 
-    /// Create a SmoltcpTcp error from a smoltcp send error
+    /// Create a `SmoltcpTcp` error from a smoltcp send error
     #[must_use]
     pub fn from_tcp_send_error(err: smoltcp::socket::tcp::SendError) -> Self {
         Self::SmoltcpTcp(format!("send error: {err:?}"))
     }
 
-    /// Create a SmoltcpTcp error from a smoltcp recv error
+    /// Create a `SmoltcpTcp` error from a smoltcp recv error
     #[must_use]
     pub fn from_tcp_recv_error(err: smoltcp::socket::tcp::RecvError) -> Self {
         Self::SmoltcpTcp(format!("recv error: {err:?}"))
     }
 
-    /// Create a SmoltcpTcp error from a smoltcp listen error
+    /// Create a `SmoltcpTcp` error from a smoltcp listen error
     #[must_use]
     pub fn from_tcp_listen_error(err: smoltcp::socket::tcp::ListenError) -> Self {
         Self::SmoltcpTcp(format!("listen error: {err:?}"))
+    }
+
+    /// Create a `SmoltcpUdp` error from a smoltcp bind error
+    #[must_use]
+    pub fn from_udp_bind_error(err: smoltcp::socket::udp::BindError) -> Self {
+        Self::SmoltcpUdp(format!("bind error: {err:?}"))
+    }
+
+    /// Create a `SmoltcpUdp` error from a smoltcp send error
+    #[must_use]
+    pub fn from_udp_send_error(err: smoltcp::socket::udp::SendError) -> Self {
+        Self::SmoltcpUdp(format!("send error: {err:?}"))
+    }
+
+    /// Create a `SmoltcpUdp` error from a smoltcp recv error
+    #[must_use]
+    pub fn from_udp_recv_error(err: smoltcp::socket::udp::RecvError) -> Self {
+        Self::SmoltcpUdp(format!("recv error: {err:?}"))
     }
 }
 
@@ -206,6 +300,7 @@ mod tests {
         assert!(BridgeError::TunnelDown("test".to_string()).is_transient());
         assert!(BridgeError::SessionLimitReached(10000).is_transient());
         assert!(BridgeError::PerClientSessionLimitReached(100).is_transient());
+        assert!(BridgeError::Cancelled.is_transient());
 
         assert!(!BridgeError::ConnectionRefused.is_transient());
         assert!(!BridgeError::DnsResolutionFailed("test".to_string()).is_transient());
@@ -221,6 +316,7 @@ mod tests {
             actual: "closed".to_string()
         }
         .is_permanent());
+        assert!(BridgeError::NotInitialized.is_permanent());
 
         assert!(!BridgeError::PortExhausted.is_permanent());
         assert!(!BridgeError::ConnectionTimeout.is_permanent());
@@ -239,8 +335,6 @@ mod tests {
 
     #[test]
     fn test_smoltcp_error_helpers() {
-        // Note: We can't easily construct smoltcp errors, so we just verify the helpers exist
-        // and produce reasonable output format
         let err = BridgeError::SmoltcpTcp("test error".to_string());
         assert!(err.to_string().contains("smoltcp TCP error"));
 
@@ -263,5 +357,17 @@ mod tests {
 
         let err = BridgeError::ChannelReceiveFailed("channel closed".to_string());
         assert!(err.to_string().contains("channel receive failed"));
+    }
+
+    #[test]
+    fn test_new_error_variants() {
+        let err = BridgeError::SocketNotFound("handle-123".to_string());
+        assert!(err.to_string().contains("socket not found"));
+
+        let err = BridgeError::NotInitialized;
+        assert!(err.to_string().contains("not initialized"));
+
+        let err = BridgeError::Cancelled;
+        assert!(err.to_string().contains("cancelled"));
     }
 }

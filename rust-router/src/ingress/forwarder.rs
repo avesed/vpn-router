@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -65,6 +65,7 @@ use crate::ipc::ChainRole;
 use crate::outbound::OutboundManager;
 use crate::peer::manager::PeerManager;
 use crate::rules::fwmark::ChainMark;
+use crate::rules::MatchedRule;
 
 // IpStack bridge imports (feature-gated)
 #[cfg(feature = "ipstack-tcp")]
@@ -145,6 +146,189 @@ static IPSTACK_BRIDGE: once_cell::sync::OnceCell<std::sync::Arc<ShardedIpStackBr
 /// Environment variable to enable/disable ipstack at runtime
 #[cfg(feature = "ipstack-tcp")]
 static IPSTACK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+// ============================================================================
+// WireGuard SNI Routing Configuration
+// ============================================================================
+
+/// Global SNI routing configuration for WireGuard egress tunnels
+///
+/// This configuration controls selective routing: WG-to-WG traffic that matches
+/// domain-based rules goes through ipstack for SNI extraction (30-80 Mbps),
+/// while pure IP-rule-matched traffic uses direct forwarding (200+ Mbps).
+///
+/// Environment variables:
+/// - `WG_SNI_ROUTING`: Enable/disable SNI routing globally (default: false)
+/// - `WG_SNI_ROUTING_TUNNELS`: Comma-separated list of tunnels requiring SNI routing
+static WG_SNI_ROUTING_CONFIG: Lazy<WgSniRoutingConfig> = Lazy::new(load_sni_routing_config);
+
+/// SNI routing configuration for WireGuard egress tunnels
+///
+/// Controls which WG egress tunnels require SNI (domain) routing through ipstack
+/// versus high-performance direct IP packet forwarding.
+///
+/// # Performance Implications
+///
+/// - **Direct forwarding (default)**: 200+ Mbps throughput for WG-to-WG traffic
+/// - **SNI routing via ipstack**: 30-80 Mbps but enables domain-based routing rules
+///
+/// # Usage
+///
+/// SNI routing is needed when:
+/// 1. A routing rule matched based on domain (e.g., `domain:*.netflix.com -> wg-us`)
+/// 2. The tunnel is explicitly marked as requiring SNI routing
+///
+/// SNI routing is NOT needed for:
+/// 1. Pure IP/CIDR rules (e.g., `geoip:US -> wg-us`)
+/// 2. Port-based rules without domain conditions
+#[derive(Debug)]
+pub struct WgSniRoutingConfig {
+    /// Globally enable/disable SNI routing for WG egress
+    enabled: AtomicBool,
+    /// Per-tunnel SNI routing enabled flags (tunnel tags)
+    tunnels: DashSet<String>,
+}
+
+impl WgSniRoutingConfig {
+    /// Create a new SNI routing configuration (disabled by default)
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            tunnels: DashSet::new(),
+        }
+    }
+
+    /// Check if SNI routing is enabled for a specific tunnel
+    ///
+    /// Returns true if:
+    /// 1. Global SNI routing is enabled, AND
+    /// 2. The specific tunnel is in the enabled tunnels set
+    #[must_use]
+    pub fn is_enabled_for(&self, tunnel_tag: &str) -> bool {
+        self.enabled.load(Ordering::Relaxed) && self.tunnels.contains(tunnel_tag)
+    }
+
+    /// Enable SNI routing for a specific tunnel
+    pub fn enable_tunnel(&self, tunnel_tag: &str) {
+        self.tunnels.insert(tunnel_tag.to_string());
+    }
+
+    /// Disable SNI routing for a specific tunnel
+    pub fn disable_tunnel(&self, tunnel_tag: &str) {
+        self.tunnels.remove(tunnel_tag);
+    }
+
+    /// Set global enable/disable for SNI routing
+    pub fn set_global_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Check if global SNI routing is enabled
+    #[must_use]
+    pub fn is_globally_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of tunnels with SNI routing enabled
+    #[must_use]
+    pub fn tunnel_count(&self) -> usize {
+        self.tunnels.len()
+    }
+
+    /// Get a list of all tunnels with SNI routing enabled
+    #[must_use]
+    pub fn enabled_tunnels(&self) -> Vec<String> {
+        self.tunnels.iter().map(|r| r.clone()).collect()
+    }
+}
+
+impl Default for WgSniRoutingConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Load SNI routing configuration from environment variables
+///
+/// Environment variables:
+/// - `WG_SNI_ROUTING`: "true" or "1" to enable globally (default: false)
+/// - `WG_SNI_ROUTING_TUNNELS`: Comma-separated tunnel tags (e.g., "wg-pia-nyc,wg-custom-uk")
+#[must_use]
+pub fn load_sni_routing_config() -> WgSniRoutingConfig {
+    let config = WgSniRoutingConfig::new();
+
+    // WG_SNI_ROUTING=true/false
+    if let Ok(val) = std::env::var("WG_SNI_ROUTING") {
+        let enabled = val.eq_ignore_ascii_case("true") || val == "1";
+        config.set_global_enabled(enabled);
+        if enabled {
+            info!("WG SNI routing globally enabled via WG_SNI_ROUTING env var");
+        }
+    }
+
+    // WG_SNI_ROUTING_TUNNELS=wg-pia-nyc,wg-custom-uk
+    if let Ok(tunnels) = std::env::var("WG_SNI_ROUTING_TUNNELS") {
+        for tunnel in tunnels.split(',') {
+            let tunnel = tunnel.trim();
+            if !tunnel.is_empty() {
+                config.enable_tunnel(tunnel);
+                info!(tunnel = %tunnel, "WG SNI routing enabled for tunnel");
+            }
+        }
+    }
+
+    config
+}
+
+/// Get the global SNI routing configuration
+#[must_use]
+pub fn get_sni_routing_config() -> &'static WgSniRoutingConfig {
+    &WG_SNI_ROUTING_CONFIG
+}
+
+/// Determine if a connection needs domain-based routing (SNI extraction)
+///
+/// This function implements the selective routing decision for WG-to-WG traffic.
+/// Traffic that matches domain-based rules needs to go through ipstack for SNI
+/// extraction, while pure IP-rule traffic can use direct high-performance forwarding.
+///
+/// # Returns
+///
+/// Returns `true` if:
+/// 1. The matched rule was a domain rule (domain:*, domain_suffix:*, etc.), OR
+/// 2. The outbound tunnel is explicitly marked for SNI routing in config
+///
+/// Returns `false` if:
+/// 1. The match was based on IP/GeoIP/CIDR rules, OR
+/// 2. The match was based on port/protocol rules, OR
+/// 3. The default outbound was used (no rule matched)
+///
+/// # Arguments
+///
+/// * `matched_rule` - The rule that matched (from RoutingDecision.match_info)
+/// * `outbound_tag` - The resolved outbound tag
+/// * `sni_config` - SNI routing configuration
+#[must_use]
+pub fn needs_domain_routing(
+    matched_rule: Option<&MatchedRule>,
+    outbound_tag: &str,
+    sni_config: &WgSniRoutingConfig,
+) -> bool {
+    // 1. Check if matched rule was a domain-based rule
+    if let Some(rule) = matched_rule {
+        if matches!(rule, MatchedRule::Domain(_)) {
+            return true;
+        }
+    }
+
+    // 2. Check if outbound tunnel has SNI routing explicitly enabled
+    if sni_config.is_enabled_for(outbound_tag) {
+        return true;
+    }
+
+    false
+}
 
 /// Proxy UDP session entry for non-Direct outbounds (Shadowsocks, SOCKS5)
 ///
@@ -880,6 +1064,10 @@ pub struct ForwardingStats {
     pub blocked_packets: AtomicU64,
     /// Parse errors (invalid IP headers, etc.)
     pub parse_errors: AtomicU64,
+    /// WG egress packets routed via SNI/ipstack (domain-based routing)
+    pub wg_sni_routed: AtomicU64,
+    /// WG egress packets using direct forwarding (IP-based routing, high performance)
+    pub wg_direct_forwarded: AtomicU64,
 }
 
 impl ForwardingStats {
@@ -896,6 +1084,8 @@ impl ForwardingStats {
             unknown_protocol: self.unknown_protocol.load(Ordering::Relaxed),
             blocked_packets: self.blocked_packets.load(Ordering::Relaxed),
             parse_errors: self.parse_errors.load(Ordering::Relaxed),
+            wg_sni_routed: self.wg_sni_routed.load(Ordering::Relaxed),
+            wg_direct_forwarded: self.wg_direct_forwarded.load(Ordering::Relaxed),
         }
     }
 
@@ -910,6 +1100,8 @@ impl ForwardingStats {
         self.unknown_protocol.store(0, Ordering::Relaxed);
         self.blocked_packets.store(0, Ordering::Relaxed);
         self.parse_errors.store(0, Ordering::Relaxed);
+        self.wg_sni_routed.store(0, Ordering::Relaxed);
+        self.wg_direct_forwarded.store(0, Ordering::Relaxed);
     }
 }
 
@@ -934,6 +1126,10 @@ pub struct ForwardingStatsSnapshot {
     pub blocked_packets: u64,
     /// Parse errors
     pub parse_errors: u64,
+    /// WG egress packets routed via SNI/ipstack (domain-based routing)
+    pub wg_sni_routed: u64,
+    /// WG egress packets using direct forwarding (IP-based routing, high performance)
+    pub wg_direct_forwarded: u64,
 }
 
 impl ForwardingStatsSnapshot {
@@ -2045,6 +2241,62 @@ async fn forward_tcp_packet(
         || wg_egress_manager.has_tunnel(outbound_tag);
 
     if is_wg_egress {
+        // === SELECTIVE ROUTING FOR WG EGRESS ===
+        // Check if this traffic needs domain-based routing (SNI extraction via ipstack).
+        // - Domain-matched traffic -> ipstack (30-80 Mbps, accurate domain routing)
+        // - IP/GeoIP-matched traffic -> direct forwarding (200+ Mbps, high performance)
+        let sni_config = get_sni_routing_config();
+        let needs_sni = needs_domain_routing(
+            processed.routing.matched_rule.as_ref(),
+            outbound_tag,
+            sni_config,
+        );
+
+        // If domain routing is needed, route through ipstack for SNI extraction
+        #[cfg(feature = "ipstack-tcp")]
+        if needs_sni && is_ipstack_enabled() {
+            if let Some(bridge) = IPSTACK_BRIDGE.get() {
+                use base64::engine::general_purpose::STANDARD as BASE64;
+                use base64::Engine;
+
+                let peer_key: [u8; 32] = match BASE64.decode(&processed.peer_public_key) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    _ => {
+                        warn!(
+                            "Invalid peer key for WG SNI routing, falling back to direct: {}:{} -> {}:{}",
+                            parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                        );
+                        [0u8; 32] // Will trigger fallback to direct forwarding
+                    }
+                };
+
+                if peer_key != [0u8; 32] {
+                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
+                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                        debug!(
+                            "WG egress SNI routing via ipstack '{}': {}:{} -> {}:{} (domain match)",
+                            outbound_tag, parsed.src_ip, tcp_details.src_port,
+                            parsed.dst_ip, tcp_details.dst_port
+                        );
+                        stats.wg_sni_routed.fetch_add(1, Ordering::Relaxed);
+                        stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                        stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Fall through to direct forwarding if ipstack channel is full
+                    warn!(
+                        "IpStack channel full for WG SNI routing, using direct forwarding: {}:{} -> {}:{}",
+                        parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                    );
+                }
+            }
+        }
+
+        // === DIRECT WG-TO-WG FORWARDING (HIGH PERFORMANCE PATH) ===
         // Register chain session when Entry node forwards to peer tunnel
         if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
             // Entry node: registering chain session for traffic to peer tunnel
@@ -2082,7 +2334,7 @@ async fn forward_tcp_packet(
                     match tunnel.send(&processed.data).await {
                         Ok(()) => {
                             debug!(
-                                "Forwarded TCP to peer tunnel '{}': {}:{} -> {}:{} (flags={}, {} bytes)",
+                                "Forwarded TCP to peer tunnel '{}': {}:{} -> {}:{} (flags={}, {} bytes, direct)",
                                 outbound_tag,
                                 parsed.src_ip,
                                 tcp_details.src_port,
@@ -2091,6 +2343,7 @@ async fn forward_tcp_packet(
                                 tcp_details.flags_string(),
                                 parsed.total_len
                             );
+                            stats.wg_direct_forwarded.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(e) => {
                             warn!(
@@ -2112,7 +2365,7 @@ async fn forward_tcp_packet(
         {
             Ok(()) => {
                 debug!(
-                    "Forwarded TCP to WG egress '{}': {}:{} -> {}:{} (flags={}, {} bytes)",
+                    "Forwarded TCP to WG egress '{}': {}:{} -> {}:{} (flags={}, {} bytes, direct)",
                     outbound_tag,
                     parsed.src_ip,
                     tcp_details.src_port,
@@ -2121,6 +2374,7 @@ async fn forward_tcp_packet(
                     tcp_details.flags_string(),
                     parsed.total_len
                 );
+                stats.wg_direct_forwarded.fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 warn!(
@@ -2503,6 +2757,138 @@ async fn forward_udp_packet(
         || outbound_tag.starts_with("peer-")
         || wg_egress_manager.has_tunnel(outbound_tag);
 
+    if is_wg_egress {
+        // === SELECTIVE ROUTING FOR WG EGRESS (UDP) ===
+        // Check if this traffic needs domain-based routing (SNI extraction via ipstack).
+        // - Domain-matched traffic -> ipstack (30-80 Mbps, accurate domain routing)
+        // - IP/GeoIP-matched traffic -> direct forwarding (200+ Mbps, high performance)
+        let sni_config = get_sni_routing_config();
+        let needs_sni = needs_domain_routing(
+            processed.routing.matched_rule.as_ref(),
+            outbound_tag,
+            sni_config,
+        );
+
+        // If domain routing is needed, route through ipstack for QUIC SNI extraction
+        #[cfg(feature = "ipstack-tcp")]
+        if needs_sni && is_ipstack_enabled() {
+            if let Some(bridge) = IPSTACK_BRIDGE.get() {
+                use base64::engine::general_purpose::STANDARD as BASE64;
+                use base64::Engine;
+
+                let peer_key: [u8; 32] = match BASE64.decode(&processed.peer_public_key) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    _ => {
+                        warn!(
+                            "Invalid peer key for WG SNI routing, falling back to direct: {}:{} -> {}:{}",
+                            parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                        );
+                        [0u8; 32] // Will trigger fallback to direct forwarding
+                    }
+                };
+
+                if peer_key != [0u8; 32] {
+                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
+                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                        debug!(
+                            "WG egress SNI routing via ipstack '{}': {}:{} -> {}:{} (domain match, UDP)",
+                            outbound_tag, parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                        );
+                        stats.wg_sni_routed.fetch_add(1, Ordering::Relaxed);
+                        stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                        stats.udp_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Fall through to direct forwarding if ipstack channel is full
+                    warn!(
+                        "IpStack channel full for WG SNI routing, using direct forwarding: {}:{} -> {}:{} (UDP)",
+                        parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                    );
+                }
+            }
+        }
+
+        // === DIRECT WG-TO-WG FORWARDING (HIGH PERFORMANCE PATH) ===
+        // Register chain session when Entry node forwards to peer tunnel
+        if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
+            // Entry node: registering chain session for traffic to peer tunnel
+            session_tracker.register_chain(
+                five_tuple,
+                processed.peer_public_key.clone(),
+                processed.src_addr,
+                outbound_tag.clone(),
+                parsed.total_len as u64,
+                None, // Entry node: no source tunnel (traffic came from wg-ingress)
+                ChainRole::Entry,
+            );
+            debug!(
+                peer = %processed.peer_public_key,
+                outbound = %outbound_tag,
+                "[CHAIN-ENTRY] Registered Entry UDP session for chain traffic"
+            );
+        } else {
+            // Non-chain traffic: use regular registration
+            session_tracker.register(
+                five_tuple,
+                processed.peer_public_key.clone(),
+                processed.src_addr,
+                outbound_tag.clone(),
+                parsed.total_len as u64,
+            );
+        }
+
+        // For peer-* tunnels, first check PeerManager.wg_tunnels
+        // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
+        // not WgEgressManager. This fixes the "Tunnel not found" error for chain routing.
+        if outbound_tag.starts_with("peer-") {
+            if let Some(pm) = peer_manager {
+                if let Some(tunnel) = pm.get_wg_tunnel(outbound_tag) {
+                    match tunnel.send(&processed.data).await {
+                        Ok(()) => {
+                            debug!(
+                                "Forwarded UDP to peer tunnel '{}': {} -> {}:{} ({} bytes, direct)",
+                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
+                            );
+                            stats.wg_direct_forwarded.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to forward UDP to peer tunnel '{}': {} -> {}:{}, error: {}",
+                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, e
+                            );
+                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Forward through WireGuard egress tunnel (WgEgressManager)
+        match wg_egress_manager.send(outbound_tag, processed.data.clone()).await {
+            Ok(()) => {
+                debug!(
+                    "Forwarded UDP to WG egress '{}': {} -> {}:{} ({} bytes, direct)",
+                    outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
+                );
+                stats.wg_direct_forwarded.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to forward UDP to WG egress '{}': {} -> {}:{}, error: {}",
+                    outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, e
+                );
+                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+
+    // Non-WG egress: register session for reply routing
     // Register chain session when Entry node forwards to peer tunnel
     if outbound_tag.starts_with("peer-") && processed.routing.is_chain_packet {
         // Entry node: registering chain session for traffic to peer tunnel
@@ -2531,50 +2917,7 @@ async fn forward_udp_packet(
         );
     }
 
-    if is_wg_egress {
-        // For peer-* tunnels, first check PeerManager.wg_tunnels
-        // These tunnels are created by ConnectPeer IPC and stored in PeerManager,
-        // not WgEgressManager. This fixes the "Tunnel not found" error for chain routing.
-        if outbound_tag.starts_with("peer-") {
-            if let Some(pm) = peer_manager {
-                if let Some(tunnel) = pm.get_wg_tunnel(outbound_tag) {
-                    match tunnel.send(&processed.data).await {
-                        Ok(()) => {
-                            debug!(
-                                "Forwarded UDP to peer tunnel '{}': {} -> {}:{} ({} bytes)",
-                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to forward UDP to peer tunnel '{}': {} -> {}:{}, error: {}",
-                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, e
-                            );
-                            stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-
-        // Forward through WireGuard egress tunnel (WgEgressManager)
-        match wg_egress_manager.send(outbound_tag, processed.data.clone()).await {
-            Ok(()) => {
-                debug!(
-                    "Forwarded UDP to WG egress '{}': {} -> {}:{} ({} bytes)",
-                    outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to forward UDP to WG egress '{}': {} -> {}:{}, error: {}",
-                    outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, e
-                );
-                stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    } else if outbound_tag == "direct" || outbound_tag.starts_with("direct-") {
+    if outbound_tag == "direct" || outbound_tag.starts_with("direct-") {
         // === DIRECT UDP IPSTACK INTEGRATION (Phase 3) ===
         // Route direct UDP traffic through ipstack for FakeDNS support
         #[cfg(feature = "ipstack-tcp")]
@@ -4282,6 +4625,7 @@ pub fn get_proxy_udp_session_count() -> usize {
 pub async fn init_ipstack_bridge(
     rule_engine: Option<std::sync::Arc<crate::rules::engine::RuleEngine>>,
     #[cfg(feature = "fakedns")] fakedns_manager: Option<std::sync::Arc<crate::fakedns::FakeDnsManager>>,
+    outbound_manager: Option<std::sync::Arc<crate::outbound::OutboundManager>>,
 ) -> anyhow::Result<(mpsc::Receiver<(bytes::BytesMut, [u8; 32])>, Arc<IpStackSessionTracker>)> {
     use super::ipstack_bridge::configured_shard_count;
 
@@ -4299,6 +4643,12 @@ pub async fn init_ipstack_bridge(
     if let Some(fakedns) = fakedns_manager {
         bridge.set_fakedns_manager(fakedns);
         info!("FakeDNS manager configured for ipstack bridge");
+    }
+
+    // Set OutboundManager for proxy outbounds (VLESS, Shadowsocks, SOCKS5, etc.)
+    if let Some(manager) = outbound_manager {
+        bridge.set_outbound_manager(manager);
+        info!("OutboundManager configured for ipstack bridge proxy routing");
     }
 
     let reply_rx = bridge
@@ -4947,6 +5297,7 @@ mod tests {
             routing_mark: Some(mark.routing_mark),
             is_chain_packet: false,
             match_info: None,
+            matched_rule: None,
         };
 
         assert_eq!(dscp_update_value(&routing), Some(10));
@@ -4961,6 +5312,7 @@ mod tests {
             routing_mark: Some(mark.routing_mark),
             is_chain_packet: true,
             match_info: None,
+            matched_rule: None,
         };
 
         assert_eq!(dscp_update_value(&routing), Some(5));
@@ -4974,6 +5326,7 @@ mod tests {
             routing_mark: None,
             is_chain_packet: true,
             match_info: None,
+            matched_rule: None,
         };
 
         assert_eq!(dscp_update_value(&routing), Some(0));
@@ -4987,6 +5340,7 @@ mod tests {
             routing_mark: None,
             is_chain_packet: false,
             match_info: None,
+            matched_rule: None,
         };
 
         assert_eq!(dscp_update_value(&routing), Some(0));
@@ -5000,6 +5354,7 @@ mod tests {
             routing_mark: None,
             is_chain_packet: false,
             match_info: None,
+            matched_rule: None,
         };
 
         assert_eq!(dscp_update_value(&routing), None);

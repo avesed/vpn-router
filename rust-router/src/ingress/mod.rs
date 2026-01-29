@@ -91,6 +91,8 @@ pub use forwarder::{
     PeerTunnelProcessorStatsSnapshot, ReplyPacket, TcpDetails,
     // UDP stats helper functions
     get_udp_session_count, get_proxy_udp_session_count,
+    // SNI routing configuration
+    get_sni_routing_config, WgSniRoutingConfig,
 };
 pub use manager::{WgIngressManager, WgIngressStats};
 pub use processor::{IngressProcessor, RoutingDecision};

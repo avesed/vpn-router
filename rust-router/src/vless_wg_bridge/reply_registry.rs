@@ -6,10 +6,8 @@
 //! instead of the IngressForwarder.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 

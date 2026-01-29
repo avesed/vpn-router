@@ -80,7 +80,7 @@ use super::config::VlessInboundConfig;
 use super::error::{VlessInboundError, VlessInboundResult};
 use super::handler::{VlessConnection, VlessConnectionHandler};
 use crate::reality::{
-    RealityAcceptResult, RealityHandshakeResult, RealityServer, RealityServerStream,
+    RealityHandshakeResult, RealityServer, RealityServerStream,
 };
 
 #[cfg(feature = "transport-tls")]

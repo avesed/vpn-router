@@ -104,6 +104,7 @@ class EgressType(Enum):
     DIRECT = "direct"
     BLOCK = "block"
     PEER = "peer"
+    SHADOWSOCKS = "shadowsocks"
 
 
 class RuleType(Enum):
@@ -407,6 +408,41 @@ class DatabaseLoader:
 
         return outbounds
 
+    def load_shadowsocks_egress(self) -> List[OutboundConfig]:
+        """Load Shadowsocks egress (managed via IPC)"""
+        db = self._get_db()
+        if not db:
+            logger.warning("Database not available for Shadowsocks egress loading")
+            return []
+
+        outbounds = []
+        try:
+            egress_list = db.get_shadowsocks_egress_list(enabled_only=True)
+            for egress in egress_list:
+                tag = egress.get("tag")
+                if not tag:
+                    continue
+
+                server = egress.get("server", "")
+                server_port = egress.get("server_port")
+
+                # Validate port range if server_port is present
+                if server_port and not validate_port(server_port, tag):
+                    continue
+
+                outbounds.append(OutboundConfig(
+                    tag=tag,
+                    egress_type=EgressType.SHADOWSOCKS,
+                    enabled=True,
+                    # Shadowsocks uses server/port directly, not SOCKS5
+                    # These are stored for reference but actual connection is via IPC
+                ))
+            logger.info(f"Loaded {len(outbounds)} Shadowsocks egress")
+        except Exception as e:
+            logger.error(f"Failed to load Shadowsocks egress: {e}")
+
+        return outbounds
+
     def load_warp_egress(self) -> List[OutboundConfig]:
         """Load WARP egress (WireGuard only, MASQUE removed)"""
         db = self._get_db()
@@ -586,6 +622,7 @@ class DatabaseLoader:
         outbounds.extend(self.load_pia_profiles())
         outbounds.extend(self.load_custom_wireguard())
         outbounds.extend(self.load_v2ray_egress())
+        outbounds.extend(self.load_shadowsocks_egress())
         outbounds.extend(self.load_warp_egress())
         outbounds.extend(self.load_openvpn_egress())
         outbounds.extend(self.load_direct_egress())
@@ -639,6 +676,10 @@ class RustRouterConfigGenerator:
                 # WARP_MASQUE removed
                 valid_outbound_tags.add(ob.tag)
                 logger.debug(f"Marked SOCKS5 outbound '{ob.tag}' as valid (managed via IPC)")
+            elif ob.egress_type == EgressType.SHADOWSOCKS:
+                # Shadowsocks outbounds are managed via IPC
+                valid_outbound_tags.add(ob.tag)
+                logger.debug(f"Marked Shadowsocks outbound '{ob.tag}' as valid (managed via IPC)")
 
         # Add ECMP group tags to valid outbounds
         # Groups are managed via IPC (CreateEcmpGroup command) but rules can reference them
@@ -656,7 +697,7 @@ class RustRouterConfigGenerator:
         ipc_managed_tags = set()
         for ob in config.outbounds:
             if ob.egress_type in (EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG, EgressType.PEER,
-                                  EgressType.V2RAY):
+                                  EgressType.V2RAY, EgressType.SHADOWSOCKS):
                 ipc_managed_tags.add(ob.tag)
         # ECMP groups are also IPC-managed
         for group in config.ecmp_groups:
@@ -793,6 +834,12 @@ class RustRouterConfigGenerator:
             # SOCKS5-based outbounds are not yet supported in rust-router config
             # These will need to be added via IPC when that's implemented
             logger.warning(f"SOCKS5 outbound '{ob.tag}' not yet supported in rust-router, skipping")
+            return None
+
+        elif ob.egress_type == EgressType.SHADOWSOCKS:
+            # Shadowsocks outbounds are managed via IPC
+            # rust-router adds them dynamically via AddShadowsocksOutbound IPC command
+            logger.info(f"Skipping Shadowsocks outbound '{ob.tag}' in static config (managed via IPC)")
             return None
 
         elif ob.egress_type == EgressType.OPENVPN:
@@ -1149,11 +1196,12 @@ def run_tests() -> int:
         """Test EgressType enum"""
 
         def test_all_types(self):
-            # WARP_MASQUE removed - 8 types total
+            # WARP_MASQUE removed, SHADOWSOCKS added - 9 types total
             types = [EgressType.PIA, EgressType.CUSTOM, EgressType.WARP_WG,
                      EgressType.V2RAY, EgressType.OPENVPN,
-                     EgressType.DIRECT, EgressType.BLOCK, EgressType.PEER]
-            self.assertEqual(len(types), 8)
+                     EgressType.DIRECT, EgressType.BLOCK, EgressType.PEER,
+                     EgressType.SHADOWSOCKS]
+            self.assertEqual(len(types), 9)
 
     class TestRuleType(unittest.TestCase):
         """Test RuleType enum"""
@@ -1463,6 +1511,29 @@ def run_tests() -> int:
 
             self.assertEqual(len(outbounds), 1)
             self.assertEqual(outbounds[0].egress_type, EgressType.WARP_WG)
+
+        def test_database_loader_get_shadowsocks_egress(self):
+            """Test loading Shadowsocks egress from mock DB"""
+            from unittest.mock import MagicMock, patch
+
+            mock_db = MagicMock()
+            mock_db.get_shadowsocks_egress_list.return_value = [
+                {"tag": "ss-jp", "server": "jp.example.com", "server_port": 8388,
+                 "method": "2022-blake3-aes-256-gcm", "password": "secret", "enabled": True},
+                {"tag": "ss-us", "server": "us.example.com", "server_port": 8389,
+                 "method": "aes-256-gcm", "password": "pass", "enabled": True},
+            ]
+
+            loader = DatabaseLoader("/test/geoip.db", "/test/user.db")
+            loader._db = mock_db
+
+            with patch.object(loader, '_get_db', return_value=mock_db):
+                outbounds = loader.load_shadowsocks_egress()
+
+            self.assertEqual(len(outbounds), 2)
+            self.assertEqual(outbounds[0].tag, "ss-jp")
+            self.assertEqual(outbounds[0].egress_type, EgressType.SHADOWSOCKS)
+            self.assertEqual(outbounds[1].tag, "ss-us")
 
         def test_database_loader_get_rules(self):
             """Test loading routing rules from mock DB"""

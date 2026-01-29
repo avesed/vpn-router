@@ -43,17 +43,17 @@
 //!
 //! # Key Components
 //!
-//! - [`config`]: Configuration constants (socket limits, timeouts, buffer sizes)
-//! - [`error`]: Error types for bridge operations
-//! - [`port_allocator`]: Ephemeral port allocation with TIME_WAIT tracking
-//! - [`session`]: Session tracking with forward and reverse indices
+//! - [`crate::smoltcp_utils::config`]: Configuration constants (socket limits, timeouts, buffer sizes)
+//! - [`crate::smoltcp_utils::error`]: Error types for bridge operations
+//! - [`crate::smoltcp_utils::port_allocator`]: Ephemeral port allocation with TIME_WAIT tracking
+//! - [`session`]: VLESS-specific session tracking with forward and reverse indices
 //!
 //! # Usage
 //!
 //! ```ignore
 //! use rust_router::vless_wg_bridge::{
 //!     PortAllocator, SessionTracker, VlessConnectionId,
-//!     config, BridgeError,
+//!     BridgeError,
 //! };
 //!
 //! // Create port allocator
@@ -70,43 +70,39 @@
 //! let conn_id = VlessConnectionId::new(client_addr);
 //! ```
 //!
-//! # Phase 1 Implementation
+//! # Implementation Notes
 //!
-//! This is Phase 1 of the VLESS-WG Bridge implementation, providing:
-//! - Configuration constants
-//! - Error types
-//! - Port allocator with TIME_WAIT and RAII guards
-//! - Session tracking infrastructure
+//! This module shares common infrastructure with other smoltcp bridges via
+//! `crate::smoltcp_utils`. VLESS-specific components (session tracking, UDP framing,
+//! reply registry) are defined here.
 
 pub mod bridge;
-pub mod config;
-pub mod error;
-pub mod port_allocator;
 pub mod reply_registry;
 pub mod session;
-pub mod socket_guard;
 pub mod udp_frame;
 
-// Re-export commonly used types
-pub use config::{
+// Re-export from smoltcp_utils for API compatibility
+pub use crate::smoltcp_utils::{
+    // Config constants
     MAX_SESSIONS_PER_CLIENT, MAX_SOCKETS, MAX_TOTAL_SESSIONS, PORT_RANGE_END, PORT_RANGE_START,
     PORT_TIME_WAIT_SECS, TCP_IDLE_TIMEOUT_SECS, TCP_MSS, TCP_RX_BUFFER, TCP_TX_BUFFER,
     UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS, UDP_PACKET_META, UDP_RX_BUFFER, UDP_TX_BUFFER,
     WG_MTU, WG_REPLY_CHANNEL_SIZE,
+    // Error types
+    BridgeError, Result,
+    // Port allocator
+    PortAllocator, PortAllocatorConfig, PortGuard,
+    // Socket guards
+    TcpSocketGuard, UdpSocketGuard,
 };
 
-pub use error::{BridgeError, Result};
-
-pub use port_allocator::{PortAllocator, PortAllocatorConfig, PortGuard};
-
+// VLESS-specific session types
 pub use session::{
     SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig, UdpSession,
     VlessConnectionId,
 };
 
 pub use udp_frame::{UdpFrameAddress, VlessUdpCodec, VlessUdpFrame};
-
-pub use socket_guard::{TcpSocketGuard, UdpSocketGuard};
 
 pub use bridge::{
     BridgeStats, BridgeStatsSnapshot, RawUdpReply, RawUdpSessionKey, VlessUdpMode, VlessWgBridge,

@@ -64,6 +64,7 @@
 //! - [`reality`]: REALITY protocol configuration (TLS 1.3 camouflage)
 //! - [`transport`]: Transport layer abstraction (TCP, TLS, WebSocket)
 //! - [`ss_inbound`]: Shadowsocks inbound listener (server mode)
+//! - [`smoltcp_utils`]: Shared utilities for smoltcp-based bridges
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -89,6 +90,7 @@ pub mod rules;
 pub mod quic_inbound;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
+pub mod smoltcp_utils;
 pub mod sniff;
 #[cfg(feature = "shadowsocks")]
 pub mod ss_inbound;
@@ -188,6 +190,9 @@ pub use vless_wg_bridge::{
     SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig,
     UdpSession as BridgeUdpSession, VlessConnectionId, VlessWgBridge, WgReplyPacket,
 };
+// Note: smoltcp_utils provides shared utilities for building bridges.
+// The types from vless_wg_bridge are re-exported for backwards compatibility.
+// New code can use smoltcp_utils directly for fresh implementations.
 #[cfg(feature = "shadowsocks")]
 pub use shadowsocks::{
     ShadowsocksError, ShadowsocksMethod, ShadowsocksOutboundConfig, ShadowsocksOutboundInfo,

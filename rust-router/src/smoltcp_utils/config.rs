@@ -1,8 +1,8 @@
-//! Configuration constants for the VLESS-WG Bridge
+//! Configuration constants for smoltcp bridge utilities
 //!
 //! This module defines all the configuration constants used throughout the bridge
-//! implementation. These values are based on the design document and have been
-//! tuned for optimal performance with WireGuard tunnels.
+//! implementations. These values are tuned for optimal performance with WireGuard
+//! tunnels and can be adjusted based on deployment requirements.
 //!
 //! # Network Parameters
 //!
@@ -19,6 +19,17 @@
 //! - UDP default timeout: 30 seconds
 //! - UDP DNS timeout: 10 seconds (DNS queries should be fast)
 //! - Port TIME_WAIT: 60 seconds (RFC 793 recommends 2*MSL)
+//!
+//! # Memory Usage Estimation
+//!
+//! Memory usage can be estimated as:
+//! ```text
+//! max_sessions * (buffer_size * 3 + max_unack * 2) + 50MB base
+//! ```
+//!
+//! Example configurations:
+//! - Default (64KB buffer, 256KB unack, 10K sessions): ~7GB peak
+//! - Conservative (16KB buffer, 64KB unack, 2K sessions): ~300MB peak
 
 use std::time::Duration;
 
@@ -29,7 +40,7 @@ use std::time::Duration;
 /// Maximum number of smoltcp sockets
 ///
 /// Increased from the default 16 to support high-concurrency scenarios.
-/// Each VLESS connection creates one or more smoltcp sockets.
+/// Each connection creates one or more smoltcp sockets.
 pub const MAX_SOCKETS: usize = 1024;
 
 /// TCP Maximum Segment Size
@@ -125,7 +136,7 @@ pub const PORT_TIME_WAIT_SECS: u64 = 60;
 
 /// Maximum sessions per client
 ///
-/// Limits the number of concurrent sessions a single VLESS client can create.
+/// Limits the number of concurrent sessions a single client can create.
 /// This prevents a single client from exhausting resources.
 pub const MAX_SESSIONS_PER_CLIENT: usize = 100;
 
@@ -134,6 +145,17 @@ pub const MAX_SESSIONS_PER_CLIENT: usize = 100;
 /// Hard limit on the total number of concurrent sessions across all clients.
 /// This protects against resource exhaustion under heavy load.
 pub const MAX_TOTAL_SESSIONS: usize = 10000;
+
+/// Maximum session creation rate per client per second
+///
+/// Limits how fast a single client can create new sessions.
+/// This prevents CPU exhaustion from rapid session creation/destruction.
+pub const MAX_SESSIONS_PER_CLIENT_PER_SECOND: usize = 10;
+
+/// Rate limit window duration in seconds
+///
+/// The time window for rate limiting session creation.
+pub const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 
 /// WireGuard reply channel size
 ///

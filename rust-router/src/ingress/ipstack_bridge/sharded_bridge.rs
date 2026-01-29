@@ -61,15 +61,15 @@
 use super::config::*;
 use super::packet_channel::PacketChannel;
 use super::session_tracker::{FiveTuple, SessionTracker};
-use crate::outbound::{OutboundManager, OutboundStream};
-use crate::rules::engine::{ConnectionInfo, RuleEngine};
+use crate::outbound::{OutboundManager, OutboundStream, WgEgressBridge};
+use crate::rules::engine::RuleEngine;
+use dashmap::DashMap;
 use ahash::AHasher;
 use bytes::BytesMut;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -110,6 +110,13 @@ pub struct ShardedBridgeStats {
     pub http_host_extractions: AtomicU64,
     /// Connections re-routed based on domain rules (SNI/FakeDNS override)
     pub domain_reroutes: AtomicU64,
+    // WireGuard egress statistics
+    /// TCP connections forwarded via WgEgressBridge
+    pub wg_egress_tcp_connections: AtomicU64,
+    /// UDP sessions forwarded via WgEgressBridge
+    pub wg_egress_udp_sessions: AtomicU64,
+    /// WG egress forward failures
+    pub wg_egress_failures: AtomicU64,
 }
 
 impl ShardedBridgeStats {
@@ -135,6 +142,9 @@ impl ShardedBridgeStats {
             sni_extractions: AtomicU64::new(0),
             http_host_extractions: AtomicU64::new(0),
             domain_reroutes: AtomicU64::new(0),
+            wg_egress_tcp_connections: AtomicU64::new(0),
+            wg_egress_udp_sessions: AtomicU64::new(0),
+            wg_egress_failures: AtomicU64::new(0),
         }
     }
 
@@ -161,6 +171,9 @@ impl ShardedBridgeStats {
             sni_extractions: self.sni_extractions.load(Ordering::Relaxed),
             http_host_extractions: self.http_host_extractions.load(Ordering::Relaxed),
             domain_reroutes: self.domain_reroutes.load(Ordering::Relaxed),
+            wg_egress_tcp_connections: self.wg_egress_tcp_connections.load(Ordering::Relaxed),
+            wg_egress_udp_sessions: self.wg_egress_udp_sessions.load(Ordering::Relaxed),
+            wg_egress_failures: self.wg_egress_failures.load(Ordering::Relaxed),
         }
     }
 
@@ -183,6 +196,9 @@ impl ShardedBridgeStats {
         self.sni_extractions.store(0, Ordering::Relaxed);
         self.http_host_extractions.store(0, Ordering::Relaxed);
         self.domain_reroutes.store(0, Ordering::Relaxed);
+        self.wg_egress_tcp_connections.store(0, Ordering::Relaxed);
+        self.wg_egress_udp_sessions.store(0, Ordering::Relaxed);
+        self.wg_egress_failures.store(0, Ordering::Relaxed);
     }
 }
 
@@ -268,6 +284,13 @@ pub struct ShardedBridgeStatsSnapshot {
     pub http_host_extractions: u64,
     /// Connections re-routed based on domain rules (SNI/FakeDNS override)
     pub domain_reroutes: u64,
+    // WireGuard egress statistics
+    /// TCP connections forwarded via WgEgressBridge
+    pub wg_egress_tcp_connections: u64,
+    /// UDP sessions forwarded via WgEgressBridge
+    pub wg_egress_udp_sessions: u64,
+    /// WG egress forward failures
+    pub wg_egress_failures: u64,
 }
 
 impl ShardedBridgeStatsSnapshot {
@@ -343,6 +366,10 @@ pub struct ShardedIpStackBridge {
     /// FakeDNS manager for domain-based routing (shared across all shards)
     #[cfg(feature = "fakedns")]
     fakedns_manager: Option<Arc<FakeDnsManager>>,
+    /// WireGuard egress bridges, keyed by tunnel tag (e.g., "wg-pia-nyc", "wg-eg-custom")
+    /// When a connection's outbound_tag matches a WG bridge, traffic is forwarded
+    /// through the WG tunnel via smoltcp instead of TCP/UDP outbound
+    wg_egress_bridges: Arc<DashMap<String, Arc<WgEgressBridge>>>,
 }
 
 impl ShardedIpStackBridge {
@@ -391,6 +418,7 @@ impl ShardedIpStackBridge {
             rule_engine: None,
             #[cfg(feature = "fakedns")]
             fakedns_manager: None,
+            wg_egress_bridges: Arc::new(DashMap::new()),
         }
     }
 
@@ -430,6 +458,67 @@ impl ShardedIpStackBridge {
     #[cfg(feature = "fakedns")]
     pub fn fakedns_manager(&self) -> Option<&Arc<FakeDnsManager>> {
         self.fakedns_manager.as_ref()
+    }
+
+    /// Register a WireGuard egress bridge
+    ///
+    /// When a connection's outbound_tag matches the bridge's tag, traffic will be
+    /// forwarded through the WG tunnel via smoltcp instead of TCP/UDP outbound.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The outbound tag (e.g., "wg-pia-nyc", "wg-eg-custom")
+    /// * `bridge` - The WgEgressBridge instance
+    pub fn register_wg_egress_bridge(&self, tag: String, bridge: Arc<WgEgressBridge>) {
+        info!(tag = %tag, "Registering WG egress bridge");
+        self.wg_egress_bridges.insert(tag, bridge);
+    }
+
+    /// Unregister a WireGuard egress bridge
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The outbound tag to unregister
+    ///
+    /// # Returns
+    ///
+    /// The removed bridge if it existed
+    pub fn unregister_wg_egress_bridge(&self, tag: &str) -> Option<Arc<WgEgressBridge>> {
+        info!(tag = %tag, "Unregistering WG egress bridge");
+        self.wg_egress_bridges.remove(tag).map(|(_, v)| v)
+    }
+
+    /// Get a WireGuard egress bridge by tag
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The outbound tag to look up
+    ///
+    /// # Returns
+    ///
+    /// The bridge if it exists
+    pub fn get_wg_egress_bridge(&self, tag: &str) -> Option<Arc<WgEgressBridge>> {
+        self.wg_egress_bridges.get(tag).map(|v| Arc::clone(v.value()))
+    }
+
+    /// Get a reference to all WG egress bridges
+    pub fn wg_egress_bridges(&self) -> &Arc<DashMap<String, Arc<WgEgressBridge>>> {
+        &self.wg_egress_bridges
+    }
+
+    /// Check if an outbound tag refers to a WireGuard tunnel
+    ///
+    /// Returns true if the tag matches known WG tunnel prefixes:
+    /// - `wg-pia-*` (PIA WireGuard)
+    /// - `wg-eg-*` (Custom WireGuard egress)
+    /// - `wg-warp-*` (Cloudflare WARP)
+    /// - `wg-peer-*` (Peer node tunnels)
+    #[inline]
+    pub fn is_wg_outbound(tag: &str) -> bool {
+        tag.starts_with("wg-pia-")
+            || tag.starts_with("wg-eg-")
+            || tag.starts_with("wg-warp-")
+            || tag.starts_with("wg-peer-")
     }
 
     /// Create a new sharded bridge with default shard count
@@ -821,6 +910,7 @@ impl ShardedIpStackBridge {
             let rule_engine = self.rule_engine.clone();
             #[cfg(feature = "fakedns")]
             let fakedns_manager = self.fakedns_manager.clone();
+            let wg_egress_bridges = Arc::clone(&self.wg_egress_bridges);
             let accept_task = tokio::spawn(Self::accept_loop_task(
                 shard_id,
                 ip_stack,
@@ -832,6 +922,7 @@ impl ShardedIpStackBridge {
                 rule_engine,
                 #[cfg(feature = "fakedns")]
                 fakedns_manager,
+                wg_egress_bridges,
             ));
 
             // Update shard with task handles
@@ -982,6 +1073,7 @@ impl ShardedIpStackBridge {
         outbound_manager: Option<Arc<OutboundManager>>,
         rule_engine: Option<Arc<RuleEngine>>,
         #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
+        wg_egress_bridges: Arc<DashMap<String, Arc<WgEgressBridge>>>,
     ) {
         debug!(shard_id, "Accept loop task started");
 
@@ -998,6 +1090,7 @@ impl ShardedIpStackBridge {
                         rule_engine.clone(),
                         #[cfg(feature = "fakedns")]
                         fakedns_manager.clone(),
+                        Arc::clone(&wg_egress_bridges),
                     );
                 }
                 Err(e) => {
@@ -1023,6 +1116,7 @@ impl ShardedIpStackBridge {
         outbound_manager: Option<Arc<OutboundManager>>,
         rule_engine: Option<Arc<RuleEngine>>,
         #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
+        wg_egress_bridges: Arc<DashMap<String, Arc<WgEgressBridge>>>,
     ) {
         match stream {
             ipstack::IpStackStream::Tcp(tcp_stream) => {
@@ -1054,6 +1148,7 @@ impl ShardedIpStackBridge {
                     rule_engine,
                     #[cfg(feature = "fakedns")]
                     fakedns_manager,
+                    wg_egress_bridges,
                 ));
             }
             ipstack::IpStackStream::Udp(udp_stream) => {
@@ -1084,6 +1179,7 @@ impl ShardedIpStackBridge {
                     outbound_manager,
                     #[cfg(feature = "fakedns")]
                     fakedns_manager,
+                    wg_egress_bridges,
                 ));
             }
             ipstack::IpStackStream::UnknownTransport(unknown) => {
@@ -1103,8 +1199,9 @@ impl ShardedIpStackBridge {
     /// Handle a TCP connection from ipstack
     ///
     /// Routes the connection through the appropriate outbound based on:
-    /// 1. Domain-based rules (if domain was resolved via SNI/FakeDNS and rule_engine is set)
-    /// 2. IP-based rules from session tracker (fallback)
+    /// 1. WireGuard egress bridge (if outbound_tag matches a registered WG bridge)
+    /// 2. Domain-based rules (if domain was resolved via SNI/FakeDNS and rule_engine is set)
+    /// 3. IP-based rules from session tracker (fallback)
     async fn handle_tcp_connection(
         shard_id: usize,
         tcp_stream: ipstack::IpStackTcpStream,
@@ -1114,8 +1211,9 @@ impl ShardedIpStackBridge {
         global_stats: Arc<ShardedBridgeStats>,
         session_tracker: Arc<SessionTracker>,
         outbound_manager: Option<Arc<OutboundManager>>,
-        rule_engine: Option<Arc<RuleEngine>>,
+        _rule_engine: Option<Arc<RuleEngine>>,
         #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
+        wg_egress_bridges: Arc<DashMap<String, Arc<WgEgressBridge>>>,
     ) {
         // Wrap stream in BufReader for peek functionality (needed for SNI sniffing)
         // We do this early so we can use it for both DNS hijack and domain resolution
@@ -1260,7 +1358,7 @@ impl ShardedIpStackBridge {
 
         // For non-domain-routing builds, just use IP-based tag
         #[cfg(not(any(feature = "sni-sniffing", feature = "fakedns")))]
-        let (outbound_tag, routing_source) = (ip_based_tag, "ip");
+        let (outbound_tag, _routing_source) = (ip_based_tag, "ip");
 
         // Log for non-domain-routing case
         #[cfg(not(any(feature = "sni-sniffing", feature = "fakedns")))]
@@ -1288,6 +1386,60 @@ impl ShardedIpStackBridge {
             debug!(shard_id, local = %local_addr, peer = %peer_addr, "Blocking TCP connection");
             session_tracker.remove(&five_tuple);
             return;
+        }
+
+        // Check if this is a WireGuard egress outbound and use WgEgressBridge if available
+        if Self::is_wg_outbound(&outbound_tag) {
+            if let Some(wg_bridge) = wg_egress_bridges.get(&outbound_tag) {
+                debug!(
+                    shard_id,
+                    outbound = %outbound_tag,
+                    peer = %peer_addr,
+                    "Routing TCP via WgEgressBridge"
+                );
+
+                // Track WG egress connection
+                global_stats.wg_egress_tcp_connections.fetch_add(1, Ordering::Relaxed);
+
+                // Forward TCP stream through WG egress bridge
+                // Note: We need to pass the underlying tcp_stream, not the buffered one,
+                // since WgEgressBridge uses smoltcp internally
+                // However, if SNI was peeked, we need to use the buffered stream to preserve data
+                match wg_bridge.forward_tcp(buffered, peer_addr).await {
+                    Ok(()) => {
+                        debug!(
+                            shard_id,
+                            outbound = %outbound_tag,
+                            peer = %peer_addr,
+                            "WG egress TCP forward completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            shard_id,
+                            outbound = %outbound_tag,
+                            peer = %peer_addr,
+                            error = %e,
+                            "WG egress TCP forward failed"
+                        );
+                        shard_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                        global_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                        global_stats.wg_egress_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                // Clean up session
+                session_tracker.remove(&five_tuple);
+                return;
+            } else {
+                // WG outbound tag but no bridge registered - fall through to regular outbound handling
+                debug!(
+                    shard_id,
+                    outbound = %outbound_tag,
+                    peer = %peer_addr,
+                    "WG egress bridge not registered, falling back to outbound manager"
+                );
+            }
         }
 
         let connect_timeout = tcp_connect_timeout();
@@ -1441,8 +1593,9 @@ impl ShardedIpStackBridge {
 
     /// Handle a UDP stream from ipstack
     ///
-    /// Routes UDP traffic through the appropriate outbound based on
-    /// the outbound_tag stored in the session tracker.
+    /// Routes UDP traffic through the appropriate outbound based on:
+    /// 1. WireGuard egress bridge (if outbound_tag matches a registered WG bridge)
+    /// 2. Direct UDP (fallback)
     async fn handle_udp_stream(
         shard_id: usize,
         mut udp_stream: ipstack::IpStackUdpStream,
@@ -1451,8 +1604,9 @@ impl ShardedIpStackBridge {
         shard_stats: Arc<ShardStats>,
         global_stats: Arc<ShardedBridgeStats>,
         session_tracker: Arc<SessionTracker>,
-        outbound_manager: Option<Arc<OutboundManager>>,
+        _outbound_manager: Option<Arc<OutboundManager>>,
         #[cfg(feature = "fakedns")] fakedns_manager: Option<Arc<FakeDnsManager>>,
+        wg_egress_bridges: Arc<DashMap<String, Arc<WgEgressBridge>>>,
     ) {
         // DNS hijack for port 53
         #[cfg(feature = "fakedns")]
@@ -1539,7 +1693,56 @@ impl ShardedIpStackBridge {
             return;
         }
 
-        let connect_timeout = tcp_connect_timeout();
+        // Check if this is a WireGuard egress outbound and use WgEgressBridge if available
+        if Self::is_wg_outbound(&outbound_tag) {
+            if let Some(wg_bridge) = wg_egress_bridges.get(&outbound_tag) {
+                debug!(
+                    shard_id,
+                    outbound = %outbound_tag,
+                    peer = %peer_addr,
+                    "Routing UDP via WgEgressBridge"
+                );
+
+                // Track WG egress session
+                global_stats.wg_egress_udp_sessions.fetch_add(1, Ordering::Relaxed);
+
+                // Forward UDP stream through WG egress bridge
+                match wg_bridge.forward_udp(udp_stream, peer_addr).await {
+                    Ok(()) => {
+                        debug!(
+                            shard_id,
+                            outbound = %outbound_tag,
+                            peer = %peer_addr,
+                            "WG egress UDP forward completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            shard_id,
+                            outbound = %outbound_tag,
+                            peer = %peer_addr,
+                            error = %e,
+                            "WG egress UDP forward failed"
+                        );
+                        global_stats.wg_egress_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                // Clean up session
+                session_tracker.remove(&five_tuple);
+                return;
+            } else {
+                // WG outbound tag but no bridge registered - fall through to direct UDP
+                debug!(
+                    shard_id,
+                    outbound = %outbound_tag,
+                    peer = %peer_addr,
+                    "WG egress bridge not registered, falling back to direct UDP"
+                );
+            }
+        }
+
+        let _connect_timeout = tcp_connect_timeout();
 
         // Try to use OutboundManager UDP if available and outbound_tag is not "direct"
         // For simplicity in sharded bridge, fall back to direct for UDP (OutboundManager UDP is complex)

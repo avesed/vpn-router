@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256, Sha384};
 use crate::reality::auth::{derive_auth_key, encrypt_session_id, SessionId};
 use crate::reality::common::{
     CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
-    CONTENT_TYPE_HANDSHAKE, HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
-    HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, REALITY_AUTH_INFO,
+    CONTENT_TYPE_HANDSHAKE, REALITY_AUTH_INFO,
     TLS_RECORD_HEADER_SIZE, ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING,
 };
 use crate::reality::crypto::{
@@ -177,7 +176,7 @@ impl RealityClientConnection {
         };
         let cipher_suite_ids: Vec<u16> = cipher_suites.iter().map(|cs| cs.id()).collect();
 
-        let mut session_id_for_hello = [0u8; 32];
+        let session_id_for_hello = [0u8; 32];
         let mut client_hello = construct_client_hello(
             &client_random,
             &session_id_for_hello,
@@ -248,7 +247,7 @@ impl RealityClientConnection {
     /// Encrypt application data for sending
     pub fn encrypt(&mut self, plaintext: &[u8]) -> RealityResult<Vec<u8>> {
         let ConnectionState::Established {
-            cipher_suite,
+            cipher_suite: _,
             client_app_key,
             client_app_iv,
             write_seq,
@@ -291,7 +290,7 @@ impl RealityClientConnection {
     }
 
     /// Process ServerHello
-    fn process_server_hello(&mut self, result: &mut FeedResult) -> RealityResult<bool> {
+    fn process_server_hello(&mut self, _result: &mut FeedResult) -> RealityResult<bool> {
         if self.input_buffer.len() < TLS_RECORD_HEADER_SIZE {
             return Ok(false);
         }
@@ -307,7 +306,7 @@ impl RealityClientConnection {
         let ConnectionState::AwaitingServerHello {
             client_hello_bytes,
             client_private_key,
-            auth_key,
+            auth_key: _,
         } = std::mem::replace(&mut self.state, ConnectionState::Closed)
         else {
             unreachable!()
@@ -397,7 +396,7 @@ impl RealityClientConnection {
             client_handshake_traffic_secret,
             server_handshake_traffic_secret,
             master_secret,
-            mut transcript_bytes,
+            transcript_bytes,
             mut handshake_seq,
             mut accumulated_plaintext,
             mut messages_found,
@@ -431,7 +430,7 @@ impl RealityClientConnection {
         // Parse handshake messages
         let mut offset = prev_len;
         while offset + 4 <= accumulated_plaintext.len() && messages_found < 4 {
-            let msg_type = accumulated_plaintext[offset];
+            let _msg_type = accumulated_plaintext[offset];
             let msg_len = u32::from_be_bytes([
                 0,
                 accumulated_plaintext[offset + 1],

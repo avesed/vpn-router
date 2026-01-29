@@ -54,12 +54,10 @@ use dashmap::DashMap;
 use smoltcp::iface::SocketHandle;
 use tracing::{debug, trace};
 
-use super::config::{
-    MAX_SESSIONS_PER_CLIENT, MAX_TOTAL_SESSIONS, TCP_IDLE_TIMEOUT_SECS, UDP_DEFAULT_TIMEOUT_SECS,
-    UDP_DNS_TIMEOUT_SECS,
+use crate::smoltcp_utils::{
+    BridgeError, PortAllocator, PortGuard, Result, MAX_SESSIONS_PER_CLIENT, MAX_TOTAL_SESSIONS,
+    TCP_IDLE_TIMEOUT_SECS, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS,
 };
-use super::error::{BridgeError, Result};
-use super::port_allocator::PortAllocator;
 
 // =============================================================================
 // Connection Identification
@@ -441,7 +439,7 @@ impl SessionTracker {
     ///
     /// - `Some(PortGuard)` if a port was successfully allocated
     /// - `None` if all ports are in use or in TIME_WAIT
-    pub fn allocate_port(&self) -> Option<super::port_allocator::PortGuard<'_>> {
+    pub fn allocate_port(&self) -> Option<PortGuard<'_>> {
         self.port_allocator.allocate()
     }
 

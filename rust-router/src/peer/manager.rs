@@ -64,7 +64,6 @@ use crate::tunnel::{
 };
 use crate::ingress::ReplyPacket;
 use tokio::sync::mpsc;
-use std::sync::atomic::Ordering;
 
 /// Extract port from endpoint string (e.g., "10.1.1.206:36201" -> Some(36201))
 fn extract_port_from_endpoint(endpoint: &str) -> Option<u16> {

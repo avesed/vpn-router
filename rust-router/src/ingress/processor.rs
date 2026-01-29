@@ -74,7 +74,7 @@ use super::error::IngressError;
 use crate::chain::dscp::{get_dscp, DscpError, IPV4_MIN_HEADER_LEN, IPV6_MIN_HEADER_LEN};
 use crate::chain::ChainManager;
 use crate::ipc::ChainRole;
-use crate::rules::engine::{ConnectionInfo, MatchResult, RuleEngine};
+use crate::rules::engine::{ConnectionInfo, MatchResult, MatchedRule, RuleEngine};
 use crate::rules::fwmark::ChainMark;
 
 /// IP protocol numbers
@@ -114,6 +114,13 @@ pub struct RoutingDecision {
 
     /// Information about the match (for logging/debugging)
     pub match_info: Option<String>,
+
+    /// The matched rule type (Domain, GeoIP, Rule)
+    ///
+    /// Used for selective routing decisions - domain-matched WG traffic
+    /// may need SNI extraction via ipstack, while IP-matched traffic
+    /// can use direct high-performance forwarding.
+    pub matched_rule: Option<MatchedRule>,
 }
 
 impl RoutingDecision {
@@ -126,6 +133,7 @@ impl RoutingDecision {
             routing_mark: None,
             is_chain_packet: false,
             match_info: Some("default".to_string()),
+            matched_rule: None,
         }
     }
 
@@ -137,12 +145,15 @@ impl RoutingDecision {
             .and_then(ChainMark::from_routing_mark)
             .map(|mark| mark.dscp_value);
 
+        let match_info = result.matched_rule.as_ref().map(|r| r.to_string());
+
         Self {
             outbound: result.outbound,
             dscp_mark,
             routing_mark: result.routing_mark,
             is_chain_packet: false,
-            match_info: result.matched_rule.map(|r| r.to_string()),
+            match_info,
+            matched_rule: result.matched_rule,
         }
     }
 
@@ -155,6 +166,7 @@ impl RoutingDecision {
             routing_mark: Some(mark.routing_mark),
             is_chain_packet: true,
             match_info: Some(format!("dscp:{}", mark.dscp_value)),
+            matched_rule: None,
         }
     }
 
@@ -168,6 +180,17 @@ impl RoutingDecision {
     #[must_use]
     pub fn has_routing_mark(&self) -> bool {
         self.routing_mark.is_some()
+    }
+
+    /// Check if this decision was based on a domain match
+    ///
+    /// Returns true if the routing decision was made based on a domain rule
+    /// (domain:, domain_suffix:, domain_keyword:, domain_regex:).
+    /// This is used for selective routing - domain-matched traffic may need
+    /// SNI extraction via ipstack for accurate routing.
+    #[must_use]
+    pub fn is_domain_match(&self) -> bool {
+        matches!(self.matched_rule, Some(MatchedRule::Domain(_)))
     }
 }
 
@@ -314,6 +337,7 @@ impl IngressProcessor {
                                 routing_mark: None,
                                 is_chain_packet: true,
                                 match_info: Some(format!("dscp:{} terminal", chain_mark.dscp_value)),
+                                matched_rule: None,
                             });
                         }
 
@@ -330,6 +354,7 @@ impl IngressProcessor {
                             routing_mark: None,
                             is_chain_packet: true,
                             match_info: Some(format!("dscp:{} terminal-config-missing", dscp)),
+                            matched_rule: None,
                         });
                     } else if my_role == Some(ChainRole::Entry) || my_role == Some(ChainRole::Relay) {
                         // Entry/Relay node: forward to next hop's peer tunnel
@@ -348,6 +373,7 @@ impl IngressProcessor {
                                 routing_mark: Some(chain_mark.routing_mark),
                                 is_chain_packet: true,
                                 match_info: Some(format!("dscp:{} {:?}", chain_mark.dscp_value, my_role)),
+                                matched_rule: None,
                             });
                         }
 
@@ -365,6 +391,7 @@ impl IngressProcessor {
                             routing_mark: None,
                             is_chain_packet: true,
                             match_info: Some(format!("dscp:{} next-hop-missing", dscp)),
+                            matched_rule: None,
                         });
                     } else {
                         // Role is None - this node is not part of the chain
@@ -380,6 +407,7 @@ impl IngressProcessor {
                             routing_mark: None,
                             is_chain_packet: true,
                             match_info: Some(format!("dscp:{} no-role", dscp)),
+                            matched_rule: None,
                         });
                     }
                 }
@@ -398,6 +426,7 @@ impl IngressProcessor {
                     routing_mark: None,
                     is_chain_packet: true,
                     match_info: Some(format!("dscp:{} no-chain-manager", dscp)),
+                    matched_rule: None,
                 });
             }
 
@@ -416,6 +445,7 @@ impl IngressProcessor {
                 routing_mark: None,
                 is_chain_packet: true,
                 match_info: Some(format!("dscp:{} unregistered", dscp)),
+                matched_rule: None,
             });
         }
 
@@ -474,6 +504,7 @@ impl IngressProcessor {
                         routing_mark: Some(chain_mark.routing_mark),
                         is_chain_packet: true,
                         match_info: Some(format!("chain:{} entry", chain_tag)),
+                        matched_rule: None,
                     });
                 }
 

@@ -45,6 +45,7 @@ pub mod socks5_common;
 pub mod socks5_udp;
 mod traits;
 pub mod vless;
+pub mod wg_egress_bridge;
 pub mod wireguard;
 
 pub use block::BlockOutbound;
@@ -60,6 +61,9 @@ pub use vless::{
 pub use traits::{
     DirectUdpHandle, HealthStatus, Outbound, OutboundConnection, OutboundExt, OutboundStream,
     PoolStatsInfo, ProxyServerInfo, Socks5UdpHandle, UdpOutboundHandle,
+};
+pub use wg_egress_bridge::{
+    ReplyKey, WgEgressBridge, WgEgressBridgeStats, WgEgressBridgeStatsSnapshot, WgReplyPacket,
 };
 pub use wireguard::{
     get_egress_interface_name, get_egress_type, get_interface_info, get_peer_routing_table,

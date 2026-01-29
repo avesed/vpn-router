@@ -5,8 +5,7 @@
 
 use crate::reality::common::{
     build_record_header, strip_content_type_slice, AEAD_TAG_SIZE, CONTENT_TYPE_ALERT,
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_PLAINTEXT_LEN,
-    TLS_RECORD_HEADER_SIZE, ALERT_LEVEL_WARNING, ALERT_DESC_CLOSE_NOTIFY,
+    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_PLAINTEXT_LEN, ALERT_LEVEL_WARNING, ALERT_DESC_CLOSE_NOTIFY,
 };
 use crate::reality::crypto::AeadKey;
 use crate::reality::error::{RealityError, RealityResult};
