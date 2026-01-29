@@ -122,14 +122,18 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl Clone for ConnectionGuard {
     fn clone(&self) -> Self {
         // Incrementing on clone to maintain correct count
-        self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         Self {
             stats: Arc::clone(&self.stats),
         }
@@ -140,10 +144,7 @@ impl Clone for ConnectionGuard {
 use shadowsocks::{
     config::ServerConfig,
     context::SharedContext,
-    relay::tcprelay::{
-        proxy_listener::ProxyListener,
-        proxy_stream::server::ProxyServerStream,
-    },
+    relay::tcprelay::{proxy_listener::ProxyListener, proxy_stream::server::ProxyServerStream},
 };
 
 /// Shadowsocks inbound listener
@@ -252,8 +253,12 @@ impl ShadowsocksInboundListener {
                 .map_err(|e| ShadowsocksInboundError::accept(e.to_string()))?;
 
             trace!(client = %client_addr, "Accepted Shadowsocks connection");
-            self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
-            self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_accepted
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .active_connections
+                .fetch_add(1, Ordering::Relaxed);
 
             // Perform handshake to get target address
             match stream.handshake().await {
@@ -269,7 +274,9 @@ impl ShadowsocksInboundListener {
                     return Ok(ShadowsocksConnection::new(stream, destination, client_addr));
                 }
                 Err(e) => {
-                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats
+                        .active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
                     self.stats.protocol_errors.fetch_add(1, Ordering::Relaxed);
 
                     warn!(
@@ -350,7 +357,9 @@ impl ShadowsocksInboundListener {
                 .map_err(|e| ShadowsocksInboundError::accept(e.to_string()))?;
 
             trace!(client = %client_addr, "Accepted Shadowsocks connection");
-            self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_accepted
+                .fetch_add(1, Ordering::Relaxed);
 
             // Create guard BEFORE handshake - it will clean up if handshake fails
             // Note: We don't increment here because ConnectionGuard::new does it
@@ -736,7 +745,10 @@ mod tests {
         assert!(json.contains("10000"));
 
         let deserialized: ShadowsocksInboundStatsSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.connections_accepted, snapshot.connections_accepted);
+        assert_eq!(
+            deserialized.connections_accepted,
+            snapshot.connections_accepted
+        );
     }
 
     #[tokio::test]
@@ -812,7 +824,10 @@ mod tests {
 
         let guard = ConnectionGuard::new(Arc::clone(&stats));
 
-        assert_eq!(guard.stats().connections_accepted.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            guard.stats().connections_accepted.load(Ordering::Relaxed),
+            10
+        );
         assert_eq!(guard.stats().active_connections.load(Ordering::Relaxed), 1);
     }
 

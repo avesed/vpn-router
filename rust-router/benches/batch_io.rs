@@ -35,7 +35,9 @@ mod linux_benchmarks {
         let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
 
         sender.set_nonblocking(true).expect("nonblocking sender");
-        receiver.set_nonblocking(true).expect("nonblocking receiver");
+        receiver
+            .set_nonblocking(true)
+            .expect("nonblocking receiver");
 
         let sender_addr = sender.local_addr().expect("sender addr");
         let receiver_addr = receiver.local_addr().expect("receiver addr");
@@ -68,13 +70,7 @@ mod linux_benchmarks {
         }
 
         group.bench_function("with_buffer_size", |b| {
-            b.iter(|| {
-                black_box(
-                    BatchConfig::new(64)
-                        .with_buffer_size(2048)
-                        .non_blocking(),
-                )
-            });
+            b.iter(|| black_box(BatchConfig::new(64).with_buffer_size(2048).non_blocking()));
         });
 
         group.finish();
@@ -152,7 +148,9 @@ mod linux_benchmarks {
                 |b, &size| {
                     let (sender, receiver, _, _) = create_socket_pair();
                     let fd = receiver.as_raw_fd();
-                    let config = BatchConfig::new(size).with_buffer_size(packet_size).non_blocking();
+                    let config = BatchConfig::new(size)
+                        .with_buffer_size(packet_size)
+                        .non_blocking();
                     let mut batch_receiver = BatchReceiver::new(fd, config);
 
                     let packet = generate_packet(packet_size);
@@ -238,8 +236,9 @@ mod linux_benchmarks {
                     let mut batch_sender = BatchSender::new(fd);
 
                     let packet = generate_packet(packet_size);
-                    let packets: Vec<(&[u8], SocketAddr)> =
-                        (0..size).map(|_| (packet.as_slice(), receiver_addr)).collect();
+                    let packets: Vec<(&[u8], SocketAddr)> = (0..size)
+                        .map(|_| (packet.as_slice(), receiver_addr))
+                        .collect();
 
                     b.iter(|| {
                         let result = batch_sender.send_batch(&packets);
@@ -441,8 +440,7 @@ mod fallback_benchmarks {
 mod buffer_pool_benchmarks {
     use super::*;
     use rust_router::io::{
-        LocalBufferCache, UdpBufferPool,
-        DEFAULT_LOCAL_CACHE_SIZE, DEFAULT_UDP_BUFFER_SIZE,
+        LocalBufferCache, UdpBufferPool, DEFAULT_LOCAL_CACHE_SIZE, DEFAULT_UDP_BUFFER_SIZE,
     };
     use std::sync::Arc;
 

@@ -98,7 +98,10 @@ mod inner {
         uri: Uri,
 
         /// HTTP client with HTTPS connector
-        client: Client<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>,
+        client: Client<
+            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+            Full<Bytes>,
+        >,
 
         /// Query timeout
         query_timeout: Duration,
@@ -178,9 +181,8 @@ mod inner {
             }
 
             // Create TLS config with webpki roots
-            let root_store = rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            );
+            let root_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let tls_config = rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
@@ -222,9 +224,9 @@ mod inner {
         /// Perform a `DoH` query using POST
         async fn query_post(&self, query: &Message) -> DnsResult<Message> {
             // Serialize the query
-            let query_bytes = query.to_vec().map_err(|e| {
-                DnsError::serialize(format!("failed to serialize DNS query: {e}"))
-            })?;
+            let query_bytes = query
+                .to_vec()
+                .map_err(|e| DnsError::serialize(format!("failed to serialize DNS query: {e}")))?;
 
             // Build HTTP request
             let request = Request::builder()
@@ -234,18 +236,13 @@ mod inner {
                 .header(header::ACCEPT, DOH_ACCEPT)
                 .header(header::CONTENT_LENGTH, query_bytes.len())
                 .body(Full::new(Bytes::from(query_bytes)))
-                .map_err(|e| {
-                    DnsError::internal(format!("failed to build DoH request: {e}"))
-                })?;
+                .map_err(|e| DnsError::internal(format!("failed to build DoH request: {e}")))?;
 
             // Send request with timeout
             let response = timeout(self.query_timeout, self.client.request(request))
                 .await
                 .map_err(|_| {
-                    DnsError::timeout(
-                        format!("DoH request to {}", self.uri),
-                        self.query_timeout,
-                    )
+                    DnsError::timeout(format!("DoH request to {}", self.uri), self.query_timeout)
                 })?
                 .map_err(|e| {
                     DnsError::upstream(&self.config.address, format!("DoH request failed: {e}"))
@@ -284,9 +281,8 @@ mod inner {
             }
 
             // Parse DNS response
-            let dns_response = Message::from_vec(&body_bytes).map_err(|e| {
-                DnsError::parse(format!("failed to parse DoH DNS response: {e}"))
-            })?;
+            let dns_response = Message::from_vec(&body_bytes)
+                .map_err(|e| DnsError::parse(format!("failed to parse DoH DNS response: {e}")))?;
 
             // Validate response matches query
             if !validate_response(query, &dns_response) {

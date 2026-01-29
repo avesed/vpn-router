@@ -74,20 +74,20 @@ pub mod chain;
 pub mod config;
 pub mod connection;
 pub mod dns;
-#[cfg(feature = "fakedns")]
-pub mod fakedns;
 pub mod ecmp;
 pub mod egress;
 pub mod error;
+#[cfg(feature = "fakedns")]
+pub mod fakedns;
 pub mod ingress;
 pub mod io;
 pub mod ipc;
 pub mod outbound;
 pub mod peer;
-pub mod reality;
-pub mod rules;
 #[cfg(feature = "transport-quic")]
 pub mod quic_inbound;
+pub mod reality;
+pub mod rules;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
 pub mod smoltcp_utils;
@@ -104,6 +104,10 @@ pub mod vless_wg_bridge;
 pub mod warp;
 
 // Re-export commonly used types at the crate root
+pub use chain::{
+    ChainError, ChainManager, DscpAllocator, DscpRoutingCallback, NoOpRoutingCallback,
+    PeerConnectivityCallback,
+};
 pub use config::{Config, ListenConfig, OutboundConfig, RuleConfig, RulesConfig};
 pub use connection::{
     ConnectionManager, ConnectionStats, ProcessResult, ReplyHandlerConfig, ReplyHandlerStats,
@@ -111,9 +115,24 @@ pub use connection::{
     UdpProcessorStatsSnapshot, UdpReplyHandler, UdpSession, UdpSessionConfig, UdpSessionKey,
     UdpSessionManager, UdpSessionSnapshot, UdpSessionStats, UdpSessionWrapper,
 };
+pub use dns::{
+    analyze_negative_response, dns_classes, extract_soa_minimum, get_negative_cache_ttl,
+    is_negative_response, record_types, BlockResponseType, BlockingConfig, CacheConfig, CacheEntry,
+    CacheKey, CacheStats, CacheStatsSnapshot, DnsCache, DnsConfig, DnsError, DnsResult, LogFormat,
+    LoggingConfig, NegativeAnalysis, NegativeCacheConfig, NegativeResponseType, RateLimitConfig,
+    TcpServerConfig, UpstreamConfig, UpstreamProtocol,
+};
+pub use egress::{
+    EgressError, EgressResult, EgressTunnelStatus, EgressTunnelType, WgEgressConfig,
+    WgEgressManager, WgEgressStats, WgReplyHandler,
+};
 pub use error::{
     ConfigError, ConnectionError, IpcError, OutboundError, RuleError, RustRouterError, TproxyError,
     UdpError,
+};
+pub use ingress::{
+    IngressError, IngressProcessor, RoutingDecision, WgIngressConfig, WgIngressManager,
+    WgIngressStats,
 };
 pub use ipc::{IpcClient, IpcCommand, IpcResponse, IpcServer};
 pub use outbound::{
@@ -123,6 +142,11 @@ pub use outbound::{
     OutboundManager, Socks5UdpHandle, UdpOutboundHandle, CUSTOM_PREFIX, INTERFACE_MAX_LEN,
     PEER_PREFIX, PIA_PREFIX, WARP_PREFIX,
 };
+pub use peer::{
+    validate_chain_tag, validate_dscp_value, validate_endpoint, validate_peer_tag,
+    validate_tunnel_ip, validate_wg_key, ValidationError, WG_KEY_LENGTH,
+};
+pub use reality::{RealityConfig, RealityError, RealityResult};
 pub use rules::{
     dscp_to_routing_mark, dscp_to_routing_table, is_dscp_terminal_table, is_ecmp_table,
     is_peer_table, is_relay_table, is_reserved_dscp, is_valid_dscp, routing_mark_to_dscp, tables,
@@ -138,52 +162,28 @@ pub use sniff::{
 pub use tproxy::{
     TproxyConnection, TproxyListener, TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo,
 };
-pub use peer::{
-    validate_chain_tag, validate_dscp_value, validate_endpoint, validate_peer_tag,
-    validate_tunnel_ip, validate_wg_key, ValidationError, WG_KEY_LENGTH,
+#[cfg(feature = "transport-tls")]
+pub use transport::TlsTransport;
+#[cfg(feature = "transport-ws")]
+pub use transport::WebSocketTransport;
+pub use transport::{
+    connect, TcpTransport, TlsConfig, Transport, TransportConfig, TransportError, TransportStream,
+    WebSocketConfig,
 };
-pub use ingress::{
-    IngressError, IngressProcessor, RoutingDecision, WgIngressConfig, WgIngressManager,
-    WgIngressStats,
-};
-pub use egress::{
-    EgressError, EgressResult, EgressTunnelStatus, EgressTunnelType, WgEgressConfig,
-    WgEgressManager, WgEgressStats, WgReplyHandler,
-};
-pub use chain::{
-    ChainError, ChainManager, DscpAllocator, DscpRoutingCallback, NoOpRoutingCallback,
-    PeerConnectivityCallback,
-};
-pub use dns::{
-    analyze_negative_response, dns_classes, extract_soa_minimum, get_negative_cache_ttl,
-    is_negative_response, record_types, BlockResponseType, BlockingConfig, CacheConfig, CacheEntry,
-    CacheKey, CacheStats, CacheStatsSnapshot, DnsCache, DnsConfig, DnsError, DnsResult, LogFormat,
-    LoggingConfig, NegativeAnalysis, NegativeCacheConfig, NegativeResponseType, RateLimitConfig,
-    TcpServerConfig, UpstreamConfig, UpstreamProtocol,
-};
-pub use vless::{
-    VlessAccount, VlessAccountManager, VlessAddons, VlessAddress, VlessCommand, VlessError,
-    VlessRequestHeader, VlessResponseHeader, VLESS_VERSION, XTLS_VISION_FLOW,
-};
-pub use reality::{RealityConfig, RealityError, RealityResult};
 pub use vision::{
     is_application_data, is_client_hello, is_server_hello, is_tls_traffic, is_valid_tls_version,
     parse_tls_record_header, StreamState, VisionError, VisionResult, VisionState, VisionStream,
     HANDSHAKE_CLIENT_HELLO, HANDSHAKE_SERVER_HELLO, TLS_APPLICATION_DATA, TLS_HANDSHAKE,
     TLS_RECORD_HEADER_SIZE,
 };
-pub use transport::{
-    connect, TcpTransport, TlsConfig, Transport, TransportConfig, TransportError, TransportStream,
-    WebSocketConfig,
+pub use vless::{
+    VlessAccount, VlessAccountManager, VlessAddons, VlessAddress, VlessCommand, VlessError,
+    VlessRequestHeader, VlessResponseHeader, VLESS_VERSION, XTLS_VISION_FLOW,
 };
-#[cfg(feature = "transport-tls")]
-pub use transport::TlsTransport;
-#[cfg(feature = "transport-ws")]
-pub use transport::WebSocketTransport;
 pub use vless_inbound::{
-    AuthenticatedUser, InboundTlsConfig, VlessConnection, VlessConnectionHandler,
-    VlessDestination, VlessInboundConfig, VlessInboundError, VlessInboundListener,
-    VlessInboundResult, VlessInboundStats, VlessUser,
+    AuthenticatedUser, InboundTlsConfig, VlessConnection, VlessConnectionHandler, VlessDestination,
+    VlessInboundConfig, VlessInboundError, VlessInboundListener, VlessInboundResult,
+    VlessInboundStats, VlessUser,
 };
 pub use vless_wg_bridge::{
     BridgeError, BridgeStats, BridgeStatsSnapshot, PortAllocator, PortAllocatorConfig, PortGuard,
@@ -193,12 +193,22 @@ pub use vless_wg_bridge::{
 // Note: smoltcp_utils provides shared utilities for building bridges.
 // The types from vless_wg_bridge are re-exported for backwards compatibility.
 // New code can use smoltcp_utils directly for fresh implementations.
+#[cfg(feature = "fakedns")]
+pub use fakedns::{
+    FakeDns, FakeDnsBuilder, FakeDnsCache, FakeDnsCacheStats, FakeDnsCacheStatsSnapshot,
+    FakeDnsConfig, FakeDnsError, FakeDnsManager, FakeDnsResult,
+};
+#[cfg(feature = "shadowsocks")]
+pub use outbound::{ShadowsocksOutbound, ShadowsocksStream};
+#[cfg(feature = "transport-quic")]
+pub use quic_inbound::{
+    ConnectionGuard as QuicConnectionGuardWrapper, QuicInboundConfig, QuicInboundConnection,
+    QuicInboundError, QuicInboundListener, QuicInboundResult, QuicInboundStatus,
+};
 #[cfg(feature = "shadowsocks")]
 pub use shadowsocks::{
     ShadowsocksError, ShadowsocksMethod, ShadowsocksOutboundConfig, ShadowsocksOutboundInfo,
 };
-#[cfg(feature = "shadowsocks")]
-pub use outbound::{ShadowsocksOutbound, ShadowsocksStream};
 #[cfg(feature = "shadowsocks")]
 pub use ss_inbound::{
     ConnectionStats as SsConnectionStats, ShadowsocksConnection, ShadowsocksDestination,
@@ -207,19 +217,9 @@ pub use ss_inbound::{
     ShadowsocksInboundStatus,
 };
 #[cfg(feature = "transport-quic")]
-pub use quic_inbound::{
-    ConnectionGuard as QuicConnectionGuardWrapper, QuicInboundConfig, QuicInboundConnection,
-    QuicInboundError, QuicInboundListener, QuicInboundResult, QuicInboundStatus,
-};
-#[cfg(feature = "transport-quic")]
 pub use transport::{
-    QuicConnection, QuicConnectionGuard, QuicInboundStats, QuicInboundStatsSnapshot,
-    QuicServerConfig, build_server_config, load_certs_from_pem, load_key_from_pem,
-};
-#[cfg(feature = "fakedns")]
-pub use fakedns::{
-    FakeDns, FakeDnsBuilder, FakeDnsCache, FakeDnsCacheStats, FakeDnsCacheStatsSnapshot,
-    FakeDnsConfig, FakeDnsError, FakeDnsManager, FakeDnsResult,
+    build_server_config, load_certs_from_pem, load_key_from_pem, QuicConnection,
+    QuicConnectionGuard, QuicInboundStats, QuicInboundStatsSnapshot, QuicServerConfig,
 };
 
 /// Crate version

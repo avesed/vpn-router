@@ -50,12 +50,12 @@ impl TproxyListener {
         let socket = create_tproxy_tcp_socket()?;
 
         // Bind to the listen address
-        socket.bind(&config.address.into()).map_err(|e| {
-            TproxyError::BindError {
+        socket
+            .bind(&config.address.into())
+            .map_err(|e| TproxyError::BindError {
                 addr: config.address,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Start listening with the configured backlog
         socket
@@ -64,8 +64,7 @@ impl TproxyListener {
 
         // Convert to tokio TcpListener
         // Safety: We own the socket and it's a valid listening socket
-        let std_listener =
-            unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
+        let std_listener = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
 
         let listener = TcpListener::from_std(std_listener)
             .map_err(|e| TproxyError::SocketCreation(e.to_string()))?;

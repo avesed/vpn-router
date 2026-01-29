@@ -23,8 +23,8 @@
 
 use rust_router::ipc::{
     DnsBlockStatsResponse, DnsCacheStatsResponse, DnsConfigResponse, DnsQueryLogEntry,
-    DnsQueryLogResponse, DnsQueryResponse, DnsStatsResponse, DnsUpstreamConfig,
-    DnsUpstreamInfo, DnsUpstreamStatusResponse, IpcCommand, IpcResponse,
+    DnsQueryLogResponse, DnsQueryResponse, DnsStatsResponse, DnsUpstreamConfig, DnsUpstreamInfo,
+    DnsUpstreamStatusResponse, IpcCommand, IpcResponse,
 };
 
 // ============================================================================
@@ -91,17 +91,17 @@ fn sample_upstream_info(tag: &str, healthy: bool) -> DnsUpstreamInfo {
 }
 
 /// Helper to create a sample DnsQueryLogEntry
-fn sample_query_log_entry(
-    domain: &str,
-    blocked: bool,
-    cached: bool,
-) -> DnsQueryLogEntry {
+fn sample_query_log_entry(domain: &str, blocked: bool, cached: bool) -> DnsQueryLogEntry {
     DnsQueryLogEntry {
         timestamp: 1704700000000,
         domain: domain.to_string(),
         qtype: 1,
         qtype_str: "A".to_string(),
-        upstream: if blocked { "".to_string() } else { "google".to_string() },
+        upstream: if blocked {
+            "".to_string()
+        } else {
+            "google".to_string()
+        },
         response_code: 0,
         rcode_str: "NOERROR".to_string(),
         latency_us: if cached { 50 } else { 1500 },
@@ -617,10 +617,7 @@ mod validation_tests {
             assert!(json.contains(match_type));
 
             let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-            if let IpcCommand::AddDnsRoute {
-                match_type: mt, ..
-            } = parsed
-            {
+            if let IpcCommand::AddDnsRoute { match_type: mt, .. } = parsed {
                 assert_eq!(mt, match_type);
             } else {
                 panic!("Expected AddDnsRoute command");
@@ -674,10 +671,7 @@ mod validation_tests {
         let config = DnsUpstreamConfig {
             address: "https://dns.cloudflare.com/dns-query".to_string(),
             protocol: "doh".to_string(),
-            bootstrap: vec![
-                "1.1.1.1:53".to_string(),
-                "8.8.8.8:53".to_string(),
-            ],
+            bootstrap: vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()],
             timeout_secs: Some(10),
         };
 
@@ -690,7 +684,13 @@ mod validation_tests {
     #[test]
     fn test_dns_query_types() {
         // Test various query types
-        let qtypes = [(1, "A"), (28, "AAAA"), (5, "CNAME"), (15, "MX"), (16, "TXT")];
+        let qtypes = [
+            (1, "A"),
+            (28, "AAAA"),
+            (5, "CNAME"),
+            (15, "MX"),
+            (16, "TXT"),
+        ];
 
         for (qtype, _name) in qtypes {
             let cmd = IpcCommand::DnsQuery {
@@ -709,7 +709,12 @@ mod validation_tests {
     #[test]
     fn test_dns_response_codes() {
         // Test various response codes in query response
-        let rcodes = [(0, "NOERROR"), (3, "NXDOMAIN"), (2, "SERVFAIL"), (5, "REFUSED")];
+        let rcodes = [
+            (0, "NOERROR"),
+            (3, "NXDOMAIN"),
+            (2, "SERVFAIL"),
+            (5, "REFUSED"),
+        ];
 
         for (rcode, _name) in rcodes {
             let response = DnsQueryResponse {
@@ -926,9 +931,7 @@ mod upstream_tests {
 
     #[test]
     fn test_upstream_status_empty() {
-        let status = DnsUpstreamStatusResponse {
-            upstreams: vec![],
-        };
+        let status = DnsUpstreamStatusResponse { upstreams: vec![] };
 
         let json = serde_json::to_string(&status).unwrap();
         let parsed: DnsUpstreamStatusResponse = serde_json::from_str(&json).unwrap();
@@ -1197,10 +1200,7 @@ mod query_logging_tests {
             domain: "example.com".to_string(),
             qtype: 1,
             response_code: 0,
-            answers: vec![
-                "93.184.216.34".to_string(),
-                "93.184.216.35".to_string(),
-            ],
+            answers: vec!["93.184.216.34".to_string(), "93.184.216.35".to_string()],
             latency_us: 1500,
             cached: false,
             blocked: false,
@@ -1251,7 +1251,8 @@ mod error_handling_tests {
     #[test]
     fn test_missing_required_field() {
         // AddDnsUpstream without tag
-        let invalid_json = r#"{"type":"add_dns_upstream","config":{"address":"8.8.8.8:53","protocol":"udp"}}"#;
+        let invalid_json =
+            r#"{"type":"add_dns_upstream","config":{"address":"8.8.8.8:53","protocol":"udp"}}"#;
         let result: Result<IpcCommand, _> = serde_json::from_str(invalid_json);
         assert!(result.is_err());
     }

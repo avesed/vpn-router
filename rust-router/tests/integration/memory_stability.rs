@@ -40,7 +40,7 @@ use rust_router::config::ConnectionConfig;
 use rust_router::connection::ConnectionManager;
 use rust_router::ipc::{IpcCommand, IpcHandler, IpcResponse};
 use rust_router::outbound::{BlockOutbound, DirectOutbound, OutboundManager};
-use rust_router::rules::{ConnectionInfo, RuleEngine, RuleType, RoutingSnapshotBuilder};
+use rust_router::rules::{ConnectionInfo, RoutingSnapshotBuilder, RuleEngine, RuleType};
 
 // ============================================================================
 // Constants
@@ -171,7 +171,11 @@ async fn test_outbound_add_remove_no_leak() {
         }
 
         // Verify all removed
-        assert!(manager.all().is_empty(), "Cycle {} not empty after removal", cycle);
+        assert!(
+            manager.all().is_empty(),
+            "Cycle {} not empty after removal",
+            cycle
+        );
     }
 
     // After all cycles, no outbounds should remain
@@ -244,7 +248,11 @@ async fn test_rule_engine_reload_no_leak() {
     builder
         .add_domain_rule(RuleType::DomainSuffix, "example.com", "direct")
         .unwrap();
-    let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+    let snapshot = builder
+        .default_outbound("direct")
+        .version(1)
+        .build()
+        .unwrap();
 
     let rule_engine = Arc::new(RuleEngine::new(snapshot));
 
@@ -255,7 +263,11 @@ async fn test_rule_engine_reload_no_leak() {
         new_builder
             .add_domain_rule(RuleType::DomainSuffix, "example.com", "direct")
             .unwrap()
-            .add_domain_rule(RuleType::Domain, &format!("test-{}.example.com", i), "proxy")
+            .add_domain_rule(
+                RuleType::Domain,
+                &format!("test-{}.example.com", i),
+                "proxy",
+            )
             .unwrap();
 
         let new_snapshot = new_builder
@@ -279,7 +291,11 @@ async fn test_rule_engine_match_no_leak() {
     // Add many rules
     for i in 0..1000 {
         builder
-            .add_domain_rule(RuleType::DomainSuffix, &format!("domain-{}.com", i), "direct")
+            .add_domain_rule(
+                RuleType::DomainSuffix,
+                &format!("domain-{}.com", i),
+                "direct",
+            )
             .unwrap();
     }
 
@@ -334,13 +350,17 @@ async fn test_ipc_error_response_no_leak() {
 
     // Error responses should not leak
     for i in 0..1_000 {
-        let _ = handler.handle(IpcCommand::GetOutbound {
-            tag: format!("nonexistent-{}", i),
-        }).await;
+        let _ = handler
+            .handle(IpcCommand::GetOutbound {
+                tag: format!("nonexistent-{}", i),
+            })
+            .await;
 
-        let _ = handler.handle(IpcCommand::RemoveOutbound {
-            tag: format!("nonexistent-{}", i),
-        }).await;
+        let _ = handler
+            .handle(IpcCommand::RemoveOutbound {
+                tag: format!("nonexistent-{}", i),
+            })
+            .await;
     }
 }
 
@@ -510,11 +530,21 @@ async fn test_extended_memory_stability() {
 
                 // Mix of operations
                 match worker_id % 5 {
-                    0 => { let _ = h.handle(IpcCommand::Ping).await; }
-                    1 => { let _ = h.handle(IpcCommand::Status).await; }
-                    2 => { let _ = h.handle(IpcCommand::GetStats).await; }
-                    3 => { let _ = h.handle(IpcCommand::GetPrometheusMetrics).await; }
-                    _ => { let _ = h.handle(IpcCommand::ListOutbounds).await; }
+                    0 => {
+                        let _ = h.handle(IpcCommand::Ping).await;
+                    }
+                    1 => {
+                        let _ = h.handle(IpcCommand::Status).await;
+                    }
+                    2 => {
+                        let _ = h.handle(IpcCommand::GetStats).await;
+                    }
+                    3 => {
+                        let _ = h.handle(IpcCommand::GetPrometheusMetrics).await;
+                    }
+                    _ => {
+                        let _ = h.handle(IpcCommand::ListOutbounds).await;
+                    }
                 }
 
                 // Relaxed ordering is sufficient for counters
@@ -566,7 +596,10 @@ async fn test_extended_memory_stability() {
     println!("\nExtended memory test complete:");
     println!("  Total operations: {}", total);
     println!("  Final RSS: {} KB", final_rss);
-    println!("  Memory growth: {} KB ({:.2} bytes/op)", memory_growth, growth_per_op);
+    println!(
+        "  Memory growth: {} KB ({:.2} bytes/op)",
+        memory_growth, growth_per_op
+    );
 
     // Should complete many operations without issues
     assert!(total > 100_000, "Too few operations: {}", total);
@@ -599,14 +632,25 @@ async fn test_rule_engine_memory_under_reloads() {
     let mut base_builder = RoutingSnapshotBuilder::new();
     for i in 0..RULE_COUNT {
         base_builder
-            .add_domain_rule(RuleType::DomainSuffix, &format!("domain-{}.example.com", i), "direct")
+            .add_domain_rule(
+                RuleType::DomainSuffix,
+                &format!("domain-{}.example.com", i),
+                "direct",
+            )
             .unwrap();
     }
-    let base_snapshot = base_builder.default_outbound("direct").version(1).build().unwrap();
+    let base_snapshot = base_builder
+        .default_outbound("direct")
+        .version(1)
+        .build()
+        .unwrap();
 
     let rule_engine = Arc::new(RuleEngine::new(base_snapshot));
 
-    println!("Starting rule engine memory test with {} rules...", RULE_COUNT);
+    println!(
+        "Starting rule engine memory test with {} rules...",
+        RULE_COUNT
+    );
     println!("Initial RSS: {} KB", initial_rss);
 
     let after_init_rss = get_rss_kb();
@@ -617,12 +661,20 @@ async fn test_rule_engine_memory_under_reloads() {
         let mut new_builder = RoutingSnapshotBuilder::new();
         for i in 0..RULE_COUNT {
             new_builder
-                .add_domain_rule(RuleType::DomainSuffix, &format!("domain-{}.example.com", i), "direct")
+                .add_domain_rule(
+                    RuleType::DomainSuffix,
+                    &format!("domain-{}.example.com", i),
+                    "direct",
+                )
                 .unwrap();
         }
         // Add variation
         new_builder
-            .add_domain_rule(RuleType::Domain, &format!("cycle-{}.test.com", cycle), "proxy")
+            .add_domain_rule(
+                RuleType::Domain,
+                &format!("cycle-{}.test.com", cycle),
+                "proxy",
+            )
             .unwrap();
 
         let new_snapshot = new_builder
@@ -644,7 +696,10 @@ async fn test_rule_engine_memory_under_reloads() {
 
     println!("Final config version: {}", version);
     println!("Final RSS: {} KB", final_rss);
-    println!("Memory growth from initialization: {} KB", final_rss as isize - after_init_rss as isize);
+    println!(
+        "Memory growth from initialization: {} KB",
+        final_rss as isize - after_init_rss as isize
+    );
 
     assert!(version >= 50);
 
@@ -762,7 +817,11 @@ async fn test_memory_budget_peak() {
     let mut builder = RoutingSnapshotBuilder::new();
     for i in 0..RULE_COUNT {
         builder
-            .add_domain_rule(RuleType::DomainSuffix, &format!("domain-{}.example.com", i), "direct")
+            .add_domain_rule(
+                RuleType::DomainSuffix,
+                &format!("domain-{}.example.com", i),
+                "direct",
+            )
             .unwrap();
     }
     let snapshot = builder.default_outbound("direct").build().unwrap();
@@ -784,7 +843,11 @@ async fn test_memory_budget_peak() {
     }
 
     let peak_rss = get_rss_kb();
-    println!("Peak RSS: {} KB ({:.1} MB)", peak_rss, peak_rss as f64 / 1024.0);
+    println!(
+        "Peak RSS: {} KB ({:.1} MB)",
+        peak_rss,
+        peak_rss as f64 / 1024.0
+    );
 
     #[cfg(target_os = "linux")]
     {

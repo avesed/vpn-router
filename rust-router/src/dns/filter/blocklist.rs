@@ -75,7 +75,11 @@ pub struct BlockReason {
 impl BlockReason {
     /// Create a new block reason
     #[must_use]
-    pub fn new(domain: impl Into<String>, matched_rule: impl Into<String>, rule_type: impl Into<String>) -> Self {
+    pub fn new(
+        domain: impl Into<String>,
+        matched_rule: impl Into<String>,
+        rule_type: impl Into<String>,
+    ) -> Self {
         Self {
             domain: domain.into(),
             matched_rule: matched_rule.into(),
@@ -173,7 +177,10 @@ impl MatcherWithPatterns {
         }
     }
 
-    fn new(matcher: DomainMatcher, patterns: std::collections::HashMap<String, (String, String)>) -> Self {
+    fn new(
+        matcher: DomainMatcher,
+        patterns: std::collections::HashMap<String, (String, String)>,
+    ) -> Self {
         Self { matcher, patterns }
     }
 
@@ -301,7 +308,8 @@ impl BlockFilter {
         let matcher_with_patterns = MatcherWithPatterns::new(matcher, patterns);
 
         // Atomic swap for hot reload
-        self.matcher.store(std::sync::Arc::new(matcher_with_patterns));
+        self.matcher
+            .store(std::sync::Arc::new(matcher_with_patterns));
 
         Ok(count)
     }
@@ -334,9 +342,7 @@ impl BlockFilter {
         let total_count = exact.len() + suffix.len() + keyword.len() + regex.len();
         if total_count > MAX_RULES {
             return Err(DnsError::config_field(
-                format!(
-                    "blocklist exceeds maximum size: {total_count} rules (max: {MAX_RULES})"
-                ),
+                format!("blocklist exceeds maximum size: {total_count} rules (max: {MAX_RULES})"),
                 "blocking.rules",
             ));
         }
@@ -361,7 +367,10 @@ impl BlockFilter {
             if domain.is_empty() || domain.starts_with('#') {
                 continue;
             }
-            let normalized = domain.to_ascii_lowercase().trim_start_matches('.').to_string();
+            let normalized = domain
+                .to_ascii_lowercase()
+                .trim_start_matches('.')
+                .to_string();
             builder = builder.add_suffix(&normalized, "blocked");
             patterns.insert(normalized, (domain.to_string(), "suffix".to_string()));
         }
@@ -383,10 +392,13 @@ impl BlockFilter {
             if pattern.is_empty() || pattern.starts_with('#') {
                 continue;
             }
-            builder = builder
-                .add_regex(pattern, "blocked")
-                .map_err(|e| DnsError::internal(format!("Invalid regex pattern '{pattern}': {e}")))?;
-            patterns.insert(pattern.to_string(), (pattern.to_string(), "regex".to_string()));
+            builder = builder.add_regex(pattern, "blocked").map_err(|e| {
+                DnsError::internal(format!("Invalid regex pattern '{pattern}': {e}"))
+            })?;
+            patterns.insert(
+                pattern.to_string(),
+                (pattern.to_string(), "regex".to_string()),
+            );
         }
 
         let matcher = builder
@@ -396,7 +408,8 @@ impl BlockFilter {
         let count = matcher.rule_count();
         let matcher_with_patterns = MatcherWithPatterns::new(matcher, patterns);
 
-        self.matcher.store(std::sync::Arc::new(matcher_with_patterns));
+        self.matcher
+            .store(std::sync::Arc::new(matcher_with_patterns));
 
         Ok(count)
     }
@@ -411,11 +424,10 @@ impl BlockFilter {
     /// * `new_matcher` - The new domain matcher to use
     pub fn reload(&self, new_matcher: DomainMatcher) {
         // When reloading with a raw matcher, we don't have pattern info
-        let matcher_with_patterns = MatcherWithPatterns::new(
-            new_matcher,
-            std::collections::HashMap::new(),
-        );
-        self.matcher.store(std::sync::Arc::new(matcher_with_patterns));
+        let matcher_with_patterns =
+            MatcherWithPatterns::new(new_matcher, std::collections::HashMap::new());
+        self.matcher
+            .store(std::sync::Arc::new(matcher_with_patterns));
     }
 
     /// Check if a domain is blocked
@@ -491,10 +503,9 @@ impl BlockFilter {
                     if normalized == *pattern || normalized.ends_with(&format!(".{pattern}")) {
                         return Some(BlockReason::new(domain, original, rule_type));
                     }
-                } else if rule_type == "keyword"
-                    && normalized.contains(pattern) {
-                        return Some(BlockReason::new(domain, original, rule_type));
-                    }
+                } else if rule_type == "keyword" && normalized.contains(pattern) {
+                    return Some(BlockReason::new(domain, original, rule_type));
+                }
             }
 
             // Fallback: return generic blocked reason
@@ -539,7 +550,8 @@ impl BlockFilter {
 
     /// Clear all blocking rules
     pub fn clear(&self) {
-        self.matcher.store(std::sync::Arc::new(MatcherWithPatterns::empty()));
+        self.matcher
+            .store(std::sync::Arc::new(MatcherWithPatterns::empty()));
     }
 
     /// Get the blocking configuration
@@ -810,7 +822,10 @@ mod tests {
         // Test that trailing dot (FQDN format) is handled correctly
         // DNS QNAME from hickory_proto includes a trailing dot, e.g., "ads.google.com."
         let filter = BlockFilter::new(BlockingConfig::default());
-        let domains = vec!["ads.google.com".to_string(), "googleadservices.com".to_string()];
+        let domains = vec![
+            "ads.google.com".to_string(),
+            "googleadservices.com".to_string(),
+        ];
         filter.load_from_domains(&domains).unwrap();
 
         // Without trailing dot (standard blocklist format)
@@ -839,12 +854,7 @@ mod tests {
         let filter = BlockFilter::new(BlockingConfig::default());
 
         filter
-            .load_with_types(
-                &["exact.example.com".to_string()],
-                &[],
-                &[],
-                &[],
-            )
+            .load_with_types(&["exact.example.com".to_string()], &[], &[], &[])
             .unwrap();
 
         assert!(filter.is_blocked("exact.example.com").is_some());
@@ -856,12 +866,7 @@ mod tests {
         let filter = BlockFilter::new(BlockingConfig::default());
 
         filter
-            .load_with_types(
-                &[],
-                &["suffix.com".to_string()],
-                &[],
-                &[],
-            )
+            .load_with_types(&[], &["suffix.com".to_string()], &[], &[])
             .unwrap();
 
         assert!(filter.is_blocked("suffix.com").is_some());
@@ -874,12 +879,7 @@ mod tests {
         let filter = BlockFilter::new(BlockingConfig::default());
 
         filter
-            .load_with_types(
-                &[],
-                &[],
-                &["tracking".to_string()],
-                &[],
-            )
+            .load_with_types(&[], &[], &["tracking".to_string()], &[])
             .unwrap();
 
         assert!(filter.is_blocked("tracking.example.com").is_some());
@@ -892,12 +892,7 @@ mod tests {
         let filter = BlockFilter::new(BlockingConfig::default());
 
         filter
-            .load_with_types(
-                &[],
-                &[],
-                &[],
-                &[r"^ads?\d*\.".to_string()],
-            )
+            .load_with_types(&[], &[], &[], &[r"^ads?\d*\.".to_string()])
             .unwrap();
 
         assert!(filter.is_blocked("ad.example.com").is_some());
@@ -931,12 +926,7 @@ mod tests {
     fn test_load_with_types_invalid_regex() {
         let filter = BlockFilter::new(BlockingConfig::default());
 
-        let result = filter.load_with_types(
-            &[],
-            &[],
-            &[],
-            &["[invalid".to_string()],
-        );
+        let result = filter.load_with_types(&[], &[], &[], &["[invalid".to_string()]);
 
         assert!(result.is_err());
     }
@@ -1149,9 +1139,7 @@ mod tests {
         let filter = Arc::new(BlockFilter::new(BlockingConfig::default()));
 
         // Load initial domains
-        let initial_domains: Vec<String> = (0..100)
-            .map(|i| format!("initial{}.com", i))
-            .collect();
+        let initial_domains: Vec<String> = (0..100).map(|i| format!("initial{}.com", i)).collect();
         filter.load_from_domains(&initial_domains).unwrap();
 
         // Spawn reader threads that continuously check domains
@@ -1179,9 +1167,8 @@ mod tests {
         let filter_clone = Arc::clone(&filter);
         let writer_handle = thread::spawn(move || {
             for i in 0..10 {
-                let reload_domains: Vec<String> = (0..100)
-                    .map(|j| format!("reload{}_{}.com", i, j))
-                    .collect();
+                let reload_domains: Vec<String> =
+                    (0..100).map(|j| format!("reload{}_{}.com", i, j)).collect();
                 filter_clone.load_from_domains(&reload_domains).unwrap();
             }
         });
@@ -1194,7 +1181,10 @@ mod tests {
 
         // Verify filter is still in consistent state
         let stats = filter.stats();
-        assert!(stats.total_queries > 0, "Expected some queries to be recorded");
+        assert!(
+            stats.total_queries > 0,
+            "Expected some queries to be recorded"
+        );
         assert!(filter.rule_count() > 0, "Expected some rules to be loaded");
     }
 
@@ -1272,7 +1262,11 @@ mod tests {
         let result = filter.load_from_domains(&domains);
         let elapsed = start.elapsed();
 
-        assert!(result.is_ok(), "Failed to load 100k domains: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to load 100k domains: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap(), 100_000);
 
         // Loading should complete in under 1 second

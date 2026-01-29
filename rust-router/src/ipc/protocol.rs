@@ -147,7 +147,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v2.1 Commands
     // ========================================================================
-
     /// Add a `WireGuard` outbound using `DirectOutbound` with `bind_interface`
     ///
     /// Creates a direct outbound bound to a `WireGuard` tunnel (e.g., wg-pia-us-east).
@@ -222,7 +221,6 @@ pub enum IpcCommand {
     // ========================================================================
     // UDP IPC Commands
     // ========================================================================
-
     /// Get UDP statistics (sessions, packets, worker pool stats).
     ///
     /// Returns comprehensive UDP statistics including session manager stats,
@@ -263,7 +261,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v3.0 - WireGuard Tunnel Management
     // ========================================================================
-
     /// Create a userspace `WireGuard` tunnel
     ///
     /// Creates a new `WireGuard` tunnel using boringtun.
@@ -301,7 +298,6 @@ pub enum IpcCommand {
     // ========================================================================
     // Ingress Peer Management
     // ========================================================================
-
     /// Add a peer to `WireGuard` ingress
     ///
     /// Adds a new client peer to the userspace `WireGuard` ingress.
@@ -337,7 +333,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v3.0 - ECMP Group Management
     // ========================================================================
-
     /// Create an ECMP (Equal-Cost Multi-Path) load balancing group
     ///
     /// Creates a new ECMP group for distributing traffic across multiple outbounds.
@@ -382,7 +377,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v3.2 - Peer Management
     // ========================================================================
-
     /// Generate offline pairing request code
     ///
     /// Generates a Base64-encoded pairing request for offline node pairing.
@@ -484,7 +478,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v3.2 - Chain Management
     // ========================================================================
-
     /// Create a multi-node routing chain
     ///
     /// Creates a new chain for multi-hop traffic routing with DSCP marking.
@@ -591,7 +584,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v3.2 - Two-Phase Commit Commands
     // ========================================================================
-
     /// Prepare chain route (validate only, no apply)
     ///
     /// Validates chain configuration on this node without applying rules.
@@ -628,7 +620,6 @@ pub enum IpcCommand {
     // ========================================================================
     // IPC Protocol v3.3 - DNS Commands
     // ========================================================================
-
     /// Get overall DNS statistics
     ///
     /// Returns comprehensive DNS statistics including cache, blocking, and upstream metrics.
@@ -770,7 +761,6 @@ pub enum IpcCommand {
     // ========================================================================
     // Speed Test Command
     // ========================================================================
-
     /// Run speed test through a specific outbound/tunnel
     ///
     /// Downloads a file through the specified outbound and measures speed.
@@ -789,7 +779,6 @@ pub enum IpcCommand {
     // ========================================================================
     // Peer API Forwarding
     // ========================================================================
-
     /// Forward an HTTP request to a peer node through its WireGuard tunnel
     ///
     /// This command allows Python to make API calls to peer nodes by forwarding
@@ -832,7 +821,6 @@ pub enum IpcCommand {
     // ========================================================================
     // VLESS Protocol Commands (v3.3)
     // ========================================================================
-
     /// Add a VLESS outbound
     ///
     /// Creates a new VLESS outbound with the specified configuration.
@@ -971,7 +959,6 @@ pub enum IpcCommand {
     // ========================================================================
     // Shadowsocks Protocol Commands
     // ========================================================================
-
     /// Add a Shadowsocks outbound
     ///
     /// Creates a new Shadowsocks client outbound for encrypted proxy connections.
@@ -1014,7 +1001,6 @@ pub enum IpcCommand {
     // ========================================================================
     // Shadowsocks Inbound Commands
     // ========================================================================
-
     /// Configure Shadowsocks inbound listener
     ///
     /// Sets up a Shadowsocks inbound listener that accepts connections from
@@ -1047,7 +1033,6 @@ pub enum IpcCommand {
     // ========================================================================
     // TCP Connection Statistics
     // ========================================================================
-
     /// Get TCP connection statistics
     ///
     /// Returns detailed TCP connection statistics for debugging, including:
@@ -1060,7 +1045,6 @@ pub enum IpcCommand {
     // ========================================================================
     // WireGuard SNI Routing Configuration
     // ========================================================================
-
     /// Set SNI routing for a specific WireGuard tunnel
     ///
     /// Enables or disables SNI-based domain routing for a specific WG egress tunnel.
@@ -1088,6 +1072,36 @@ pub enum IpcCommand {
         /// Whether to enable SNI routing globally
         enabled: bool,
     },
+
+    // ========================================================================
+    // Sharded VLESS-WG Bridge Commands (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+    /// Get sharded VLESS-WG bridge statistics
+    ///
+    /// Returns aggregated statistics across all shards including per-shard stats,
+    /// total events processed, WG packets sent/received, and session counts.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    GetShardedBridgeStats,
+
+    /// Get health status for a specific shard
+    ///
+    /// Returns detailed health information for a single shard including
+    /// event counts, WG packet stats, and cleanup stats.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    GetShardHealth {
+        /// Shard index (0-based)
+        shard_index: usize,
+    },
+
+    /// Get supervisor statistics
+    ///
+    /// Returns supervisor statistics including restart counts per shard,
+    /// circuit breaker trips, and health check counts.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    GetSupervisorStats,
 }
 
 /// Default connect timeout for SOCKS5 connections
@@ -1219,7 +1233,6 @@ pub enum IpcResponse {
     // ========================================================================
     // IPC Protocol v2.1 Response Types
     // ========================================================================
-
     /// Outbound health status response
     OutboundHealth(OutboundHealthResponse),
 
@@ -1235,7 +1248,6 @@ pub enum IpcResponse {
     // ========================================================================
     // UDP IPC Response Types
     // ========================================================================
-
     /// UDP statistics response
     UdpStats(UdpStatsResponse),
 
@@ -1254,7 +1266,6 @@ pub enum IpcResponse {
     // ========================================================================
     // IPC Protocol v3.2 Response Types
     // ========================================================================
-
     /// `WireGuard` tunnel status response
     WgTunnelStatus(WgTunnelStatus),
 
@@ -1300,7 +1311,6 @@ pub enum IpcResponse {
     // ========================================================================
     // IPC Protocol v3.3 - DNS Response Types
     // ========================================================================
-
     /// DNS overall statistics response
     DnsStats(DnsStatsResponse),
 
@@ -1334,7 +1344,6 @@ pub enum IpcResponse {
     // ========================================================================
     // VLESS Protocol Response Types (v3.3)
     // ========================================================================
-
     /// VLESS outbound info response
     VlessOutboundInfo(VlessOutboundInfoResponse),
 
@@ -1347,14 +1356,11 @@ pub enum IpcResponse {
     VlessInboundStatus(VlessInboundStatusResponse),
 
     /// VLESS user list response
-    VlessUserList {
-        users: Vec<VlessUserInfo>,
-    },
+    VlessUserList { users: Vec<VlessUserInfo> },
 
     // ========================================================================
     // Shadowsocks Protocol Responses
     // ========================================================================
-
     /// Shadowsocks outbound added successfully
     #[cfg(feature = "shadowsocks")]
     ShadowsocksOutboundAdded {
@@ -1379,14 +1385,12 @@ pub enum IpcResponse {
     // ========================================================================
     // TCP Connection Statistics Response
     // ========================================================================
-
     /// TCP connection statistics response
     TcpStats(TcpStatsResponse),
 
     // ========================================================================
     // WireGuard SNI Routing Configuration Responses
     // ========================================================================
-
     /// WireGuard SNI routing updated response
     WgSniRoutingUpdated(WgSniRoutingUpdatedResponse),
 
@@ -1395,6 +1399,21 @@ pub enum IpcResponse {
 
     /// Global WireGuard SNI routing updated response
     GlobalWgSniRoutingUpdated(GlobalWgSniRoutingUpdatedResponse),
+
+    // ========================================================================
+    // Sharded VLESS-WG Bridge Responses (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+    /// Sharded bridge statistics response
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    ShardedBridgeStats(ShardedBridgeStatsResponse),
+
+    /// Shard health response
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    ShardHealth(ShardHealthResponse),
+
+    /// Supervisor statistics response
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    SupervisorStats(SupervisorStatsResponse),
 
     /// Success response (for commands that don't return data)
     Success {
@@ -1867,8 +1886,7 @@ pub struct TcpStatsResponse {
 ///
 /// Defines the type of tunnel used for peer-to-peer connections.
 /// Use explicit renames for API compatibility with Python REST API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TunnelType {
     /// `WireGuard` tunnel (userspace via boringtun)
     /// Serializes as "wireguard" (not "`wire_guard`") for REST API compatibility
@@ -1879,7 +1897,6 @@ pub enum TunnelType {
     #[serde(rename = "xray")]
     Xray,
 }
-
 
 impl std::fmt::Display for TunnelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1967,7 +1984,6 @@ pub enum EcmpAlgorithm {
     /// Least connections
     LeastConnections,
 }
-
 
 /// ECMP group member configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2144,7 +2160,6 @@ pub enum PeerState {
     Failed,
 }
 
-
 impl std::fmt::Display for PeerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2231,7 +2246,6 @@ pub enum ChainState {
     Error,
 }
 
-
 impl std::fmt::Display for ChainState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2294,7 +2308,6 @@ pub enum PrepareStatus {
     /// Aborted (rolled back)
     Aborted,
 }
-
 
 /// Hop status in a chain
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3104,6 +3117,124 @@ pub struct GlobalWgSniRoutingUpdatedResponse {
     pub success: bool,
 }
 
+// ============================================================================
+// Sharded VLESS-WG Bridge Response Types (feature: sharded-vless-wg-bridge)
+// ============================================================================
+
+/// Per-shard statistics snapshot
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShardStatsSnapshot {
+    /// Total events processed
+    pub events_processed: u64,
+    /// WireGuard packets received
+    pub wg_packets_received: u64,
+    /// WireGuard packets sent
+    pub wg_packets_sent: u64,
+    /// WireGuard bytes received
+    pub wg_bytes_received: u64,
+    /// WireGuard bytes sent
+    pub wg_bytes_sent: u64,
+    /// WireGuard packets dropped
+    pub wg_packets_dropped: u64,
+    /// TCP sessions created
+    pub tcp_sessions_created: u64,
+    /// TCP sessions closed
+    pub tcp_sessions_closed: u64,
+    /// UDP sessions created
+    pub udp_sessions_created: u64,
+    /// UDP sessions closed
+    pub udp_sessions_closed: u64,
+    /// UDP datagrams sent
+    pub udp_datagrams_sent: u64,
+    /// UDP datagrams received
+    pub udp_datagrams_received: u64,
+    /// smoltcp poll count
+    pub poll_count: u64,
+}
+
+/// Aggregated statistics across all shards
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardedBridgeStatsResponse {
+    /// Number of shards
+    pub num_shards: usize,
+    /// Per-shard statistics
+    pub per_shard_stats: Vec<ShardStatsSnapshot>,
+    /// Total events processed across all shards
+    pub total_events_processed: u64,
+    /// Total WG packets received
+    pub total_wg_packets_received: u64,
+    /// Total WG packets sent
+    pub total_wg_packets_sent: u64,
+    /// Total WG bytes received
+    pub total_wg_bytes_received: u64,
+    /// Total WG bytes sent
+    pub total_wg_bytes_sent: u64,
+    /// Total WG packets dropped
+    pub total_wg_packets_dropped: u64,
+    /// Total TCP sessions created
+    pub total_tcp_sessions_created: u64,
+    /// Total TCP sessions closed
+    pub total_tcp_sessions_closed: u64,
+    /// Total UDP sessions created
+    pub total_udp_sessions_created: u64,
+    /// Total UDP sessions closed
+    pub total_udp_sessions_closed: u64,
+    /// Total UDP datagrams sent
+    pub total_udp_datagrams_sent: u64,
+    /// Total UDP datagrams received
+    pub total_udp_datagrams_received: u64,
+    /// Total smoltcp polls
+    pub total_poll_count: u64,
+    /// Active TCP sessions (created - closed)
+    pub active_tcp_sessions: u64,
+    /// Active UDP sessions (created - closed)
+    pub active_udp_sessions: u64,
+    /// Distribution skew (standard deviation of events per shard)
+    pub distribution_skew: f64,
+}
+
+/// Response for `GetShardHealth` command
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardHealthResponse {
+    /// Shard index
+    pub shard_index: usize,
+    /// Whether the shard is healthy (running)
+    pub healthy: bool,
+    /// Current shard statistics
+    pub stats: ShardStatsSnapshot,
+    /// Circuit breaker state (if supervised)
+    pub circuit_breaker_open: bool,
+    /// Consecutive failure count
+    pub failure_count: u32,
+    /// Total restarts for this shard
+    pub total_restarts: u64,
+}
+
+/// Response for `GetSupervisorStats` command
+#[cfg(feature = "sharded-vless-wg-bridge")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorStatsResponse {
+    /// Number of shards being supervised
+    pub num_shards: usize,
+    /// Restart counts per shard
+    pub restarts_per_shard: Vec<u64>,
+    /// Total restarts across all shards
+    pub total_restarts: u64,
+    /// Total circuit breaker trips
+    pub circuit_breaker_trips: u64,
+    /// Total panics detected
+    pub total_panics: u64,
+    /// Total crashes (non-panic errors)
+    pub total_crashes: u64,
+    /// Health check count
+    pub health_checks: u64,
+    /// Number of shards with circuit breaker open
+    pub shards_circuit_open: usize,
+}
+
 /// IPC error
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcError {
@@ -3251,7 +3382,13 @@ mod tests {
         // Deserialize back
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
         match parsed {
-            IpcCommand::TestMatch { domain, dest_ip, dest_port, protocol, sniffed_protocol } => {
+            IpcCommand::TestMatch {
+                domain,
+                dest_ip,
+                dest_port,
+                protocol,
+                sniffed_protocol,
+            } => {
                 assert_eq!(domain, Some("google.com".into()));
                 assert_eq!(dest_ip, Some("8.8.8.8".into()));
                 assert_eq!(dest_port, 443);
@@ -3592,7 +3729,11 @@ rust_router_connections_total 12345
         assert!(json.contains("8.8.8.8:443"));
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::GetUdpSession { client_addr, dest_addr } = parsed {
+        if let IpcCommand::GetUdpSession {
+            client_addr,
+            dest_addr,
+        } = parsed
+        {
             assert_eq!(client_addr, "192.168.1.100:12345");
             assert_eq!(dest_addr, "8.8.8.8:443");
         } else {
@@ -3676,7 +3817,10 @@ rust_router_connections_total 12345
             assert!(stats.udp_enabled);
             assert_eq!(stats.session_stats.session_count, 100);
             assert!(stats.worker_stats.is_some());
-            assert_eq!(stats.worker_stats.as_ref().unwrap().packets_processed, 10000);
+            assert_eq!(
+                stats.worker_stats.as_ref().unwrap().packets_processed,
+                10000
+            );
         } else {
             panic!("Expected UdpStats response");
         }
@@ -3685,20 +3829,18 @@ rust_router_connections_total 12345
     #[test]
     fn test_udp_sessions_response_serialization() {
         let resp = UdpSessionsResponse {
-            sessions: vec![
-                UdpSessionInfo {
-                    client_addr: "192.168.1.100:12345".into(),
-                    dest_addr: "8.8.8.8:443".into(),
-                    outbound: "direct".into(),
-                    routing_mark: None,
-                    sniffed_domain: Some("example.com".into()),
-                    bytes_sent: 1000,
-                    bytes_recv: 5000,
-                    packets_sent: 10,
-                    packets_recv: 50,
-                    age_secs: 30,
-                },
-            ],
+            sessions: vec![UdpSessionInfo {
+                client_addr: "192.168.1.100:12345".into(),
+                dest_addr: "8.8.8.8:443".into(),
+                outbound: "direct".into(),
+                routing_mark: None,
+                sniffed_domain: Some("example.com".into()),
+                bytes_sent: 1000,
+                bytes_recv: 5000,
+                packets_sent: 10,
+                packets_recv: 50,
+                age_secs: 30,
+            }],
             total_count: 100,
             truncated: true,
         };
@@ -3715,7 +3857,10 @@ rust_router_connections_total 12345
             assert_eq!(sessions.sessions.len(), 1);
             assert_eq!(sessions.total_count, 100);
             assert!(sessions.truncated);
-            assert_eq!(sessions.sessions[0].sniffed_domain, Some("example.com".into()));
+            assert_eq!(
+                sessions.sessions[0].sniffed_domain,
+                Some("example.com".into())
+            );
         } else {
             panic!("Expected UdpSessions response");
         }
@@ -4078,7 +4223,12 @@ rust_router_connections_total 12345
         assert!(json.contains("\"bidirectional\":true"));
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::GeneratePairRequest { local_tag, bidirectional, .. } = parsed {
+        if let IpcCommand::GeneratePairRequest {
+            local_tag,
+            bidirectional,
+            ..
+        } = parsed
+        {
             assert_eq!(local_tag, "local-node");
             assert!(bidirectional);
         } else {
@@ -4135,7 +4285,12 @@ rust_router_connections_total 12345
         assert!(json.contains("\"source_node\":\"entry-node\""));
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::PrepareChainRoute { chain_tag, source_node, .. } = parsed {
+        if let IpcCommand::PrepareChainRoute {
+            chain_tag,
+            source_node,
+            ..
+        } = parsed
+        {
             assert_eq!(chain_tag, "chain-1");
             assert_eq!(source_node, "entry-node");
         } else {
@@ -4283,7 +4438,9 @@ rust_router_connections_total 12345
         assert!(json.contains("\"drain_timeout_secs\":30"));
 
         // GetWgTunnelStatus
-        let cmd = IpcCommand::GetWgTunnelStatus { tag: "wg-test".into() };
+        let cmd = IpcCommand::GetWgTunnelStatus {
+            tag: "wg-test".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"get_wg_tunnel_status\""));
 
@@ -4296,17 +4453,23 @@ rust_router_connections_total 12345
     #[test]
     fn test_peer_commands_serialization() {
         // ConnectPeer
-        let cmd = IpcCommand::ConnectPeer { tag: "peer-1".into() };
+        let cmd = IpcCommand::ConnectPeer {
+            tag: "peer-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"connect_peer\""));
 
         // DisconnectPeer
-        let cmd = IpcCommand::DisconnectPeer { tag: "peer-1".into() };
+        let cmd = IpcCommand::DisconnectPeer {
+            tag: "peer-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"disconnect_peer\""));
 
         // GetPeerStatus
-        let cmd = IpcCommand::GetPeerStatus { tag: "peer-1".into() };
+        let cmd = IpcCommand::GetPeerStatus {
+            tag: "peer-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"get_peer_status\""));
 
@@ -4316,7 +4479,9 @@ rust_router_connections_total 12345
         assert!(json.contains("\"type\":\"list_peers\""));
 
         // RemovePeer
-        let cmd = IpcCommand::RemovePeer { tag: "peer-1".into() };
+        let cmd = IpcCommand::RemovePeer {
+            tag: "peer-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"remove_peer\""));
     }
@@ -4324,17 +4489,23 @@ rust_router_connections_total 12345
     #[test]
     fn test_chain_commands_serialization() {
         // ActivateChain
-        let cmd = IpcCommand::ActivateChain { tag: "chain-1".into() };
+        let cmd = IpcCommand::ActivateChain {
+            tag: "chain-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"activate_chain\""));
 
         // DeactivateChain
-        let cmd = IpcCommand::DeactivateChain { tag: "chain-1".into() };
+        let cmd = IpcCommand::DeactivateChain {
+            tag: "chain-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"deactivate_chain\""));
 
         // GetChainStatus
-        let cmd = IpcCommand::GetChainStatus { tag: "chain-1".into() };
+        let cmd = IpcCommand::GetChainStatus {
+            tag: "chain-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"get_chain_status\""));
 
@@ -4344,7 +4515,9 @@ rust_router_connections_total 12345
         assert!(json.contains("\"type\":\"list_chains\""));
 
         // GetChainRole
-        let cmd = IpcCommand::GetChainRole { chain_tag: "chain-1".into() };
+        let cmd = IpcCommand::GetChainRole {
+            chain_tag: "chain-1".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"get_chain_role\""));
 
@@ -4533,7 +4706,9 @@ rust_router_connections_total 12345
         }
 
         // With pattern
-        let cmd = IpcCommand::FlushDnsCache { pattern: Some("*.google.com".into()) };
+        let cmd = IpcCommand::FlushDnsCache {
+            pattern: Some("*.google.com".into()),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"pattern\":\"*.google.com\""));
 
@@ -4596,7 +4771,9 @@ rust_router_connections_total 12345
 
     #[test]
     fn test_remove_dns_upstream_command_serialization() {
-        let cmd = IpcCommand::RemoveDnsUpstream { tag: "google".into() };
+        let cmd = IpcCommand::RemoveDnsUpstream {
+            tag: "google".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"remove_dns_upstream\""));
         assert!(json.contains("\"tag\":\"google\""));
@@ -4624,7 +4801,9 @@ rust_router_connections_total 12345
         }
 
         // Specific upstream
-        let cmd = IpcCommand::GetDnsUpstreamStatus { tag: Some("google".into()) };
+        let cmd = IpcCommand::GetDnsUpstreamStatus {
+            tag: Some("google".into()),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"tag\":\"google\""));
 
@@ -4650,7 +4829,12 @@ rust_router_connections_total 12345
         assert!(json.contains("\"upstream_tag\":\"google\""));
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::AddDnsRoute { pattern, match_type, upstream_tag } = parsed {
+        if let IpcCommand::AddDnsRoute {
+            pattern,
+            match_type,
+            upstream_tag,
+        } = parsed
+        {
             assert_eq!(pattern, "google.com");
             assert_eq!(match_type, "suffix");
             assert_eq!(upstream_tag, "google");
@@ -4661,7 +4845,9 @@ rust_router_connections_total 12345
 
     #[test]
     fn test_remove_dns_route_command_serialization() {
-        let cmd = IpcCommand::RemoveDnsRoute { pattern: "google.com".into() };
+        let cmd = IpcCommand::RemoveDnsRoute {
+            pattern: "google.com".into(),
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"remove_dns_route\""));
         assert!(json.contains("\"pattern\":\"google.com\""));
@@ -4676,7 +4862,10 @@ rust_router_connections_total 12345
 
     #[test]
     fn test_get_dns_query_log_command_serialization() {
-        let cmd = IpcCommand::GetDnsQueryLog { limit: 50, offset: 10 };
+        let cmd = IpcCommand::GetDnsQueryLog {
+            limit: 50,
+            offset: 10,
+        };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"type\":\"get_dns_query_log\""));
         assert!(json.contains("\"limit\":50"));
@@ -4695,7 +4884,7 @@ rust_router_connections_total 12345
         let parsed: IpcCommand = serde_json::from_str(json_default).unwrap();
         if let IpcCommand::GetDnsQueryLog { limit, offset } = parsed {
             assert_eq!(limit, 100); // default
-            assert_eq!(offset, 0);  // default
+            assert_eq!(offset, 0); // default
         } else {
             panic!("Expected GetDnsQueryLog command");
         }
@@ -4715,7 +4904,12 @@ rust_router_connections_total 12345
         assert!(json.contains("\"upstream\":\"google\""));
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::DnsQuery { domain, qtype, upstream } = parsed {
+        if let IpcCommand::DnsQuery {
+            domain,
+            qtype,
+            upstream,
+        } = parsed
+        {
             assert_eq!(domain, "example.com");
             assert_eq!(qtype, Some(1));
             assert_eq!(upstream, Some("google".into()));
@@ -4731,7 +4925,12 @@ rust_router_connections_total 12345
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::DnsQuery { domain, qtype, upstream } = parsed {
+        if let IpcCommand::DnsQuery {
+            domain,
+            qtype,
+            upstream,
+        } = parsed
+        {
             assert_eq!(domain, "example.com");
             assert!(qtype.is_none());
             assert!(upstream.is_none());
@@ -5058,7 +5257,15 @@ rust_router_connections_total 12345
         // Deserialize back
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
         match parsed {
-            IpcCommand::AddVlessOutbound { tag, server_address, server_port, uuid, flow, transport, .. } => {
+            IpcCommand::AddVlessOutbound {
+                tag,
+                server_address,
+                server_port,
+                uuid,
+                flow,
+                transport,
+                ..
+            } => {
                 assert_eq!(tag, "vless-jp");
                 assert_eq!(server_address, "jp.example.com");
                 assert_eq!(server_port, 443);
@@ -5076,7 +5283,13 @@ rust_router_connections_total 12345
         let json = r#"{"type":"add_vless_outbound","tag":"vless-test","server_address":"test.com","server_port":443,"uuid":"test-uuid"}"#;
         let parsed: IpcCommand = serde_json::from_str(json).unwrap();
         match parsed {
-            IpcCommand::AddVlessOutbound { tag, transport, flow, tls_skip_verify, .. } => {
+            IpcCommand::AddVlessOutbound {
+                tag,
+                transport,
+                flow,
+                tls_skip_verify,
+                ..
+            } => {
                 assert_eq!(tag, "vless-test");
                 assert_eq!(transport, "tcp"); // default
                 assert_eq!(flow, ""); // default empty
@@ -5150,7 +5363,13 @@ rust_router_connections_total 12345
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
         match parsed {
-            IpcCommand::ConfigureVlessInbound { listen, users, tls_cert_path, fallback, .. } => {
+            IpcCommand::ConfigureVlessInbound {
+                listen,
+                users,
+                tls_cert_path,
+                fallback,
+                ..
+            } => {
                 assert_eq!(listen, "0.0.0.0:443");
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].uuid, "uuid-1");
@@ -5166,13 +5385,11 @@ rust_router_connections_total 12345
     fn test_configure_vless_inbound_with_reality() {
         let cmd = IpcCommand::ConfigureVlessInbound {
             listen: "0.0.0.0:443".into(),
-            users: vec![
-                VlessUserConfig {
-                    uuid: "uuid-1".into(),
-                    email: Some("user1@example.com".into()),
-                    flow: Some("xtls-rprx-vision".into()),
-                },
-            ],
+            users: vec![VlessUserConfig {
+                uuid: "uuid-1".into(),
+                email: Some("user1@example.com".into()),
+                flow: Some("xtls-rprx-vision".into()),
+            }],
             tls_cert_path: None,
             tls_key_path: None,
             fallback: None,
@@ -5191,7 +5408,12 @@ rust_router_connections_total 12345
 
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
         match parsed {
-            IpcCommand::ConfigureVlessInbound { reality_private_key, reality_short_ids, reality_dest, .. } => {
+            IpcCommand::ConfigureVlessInbound {
+                reality_private_key,
+                reality_short_ids,
+                reality_dest,
+                ..
+            } => {
                 assert!(reality_private_key.is_some());
                 assert!(reality_short_ids.is_some());
                 assert_eq!(reality_dest, Some("www.google.com:443".into()));
@@ -5478,7 +5700,11 @@ rust_router_connections_total 12345
 
         // Parse back
         let parsed: IpcCommand = serde_json::from_str(&json).unwrap();
-        if let IpcCommand::SetWgSniRouting { tunnel_tag, enabled } = parsed {
+        if let IpcCommand::SetWgSniRouting {
+            tunnel_tag,
+            enabled,
+        } = parsed
+        {
             assert_eq!(tunnel_tag, "wg-pia-nyc");
             assert!(enabled);
         } else {

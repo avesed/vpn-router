@@ -55,7 +55,9 @@ use std::sync::{Arc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::chain::allocator::{DscpAllocator, DscpAllocatorError};
-use crate::chain::two_phase::{ChainNetworkClient, NoOpNetworkClient, TwoPhaseCommit, TwoPhaseError};
+use crate::chain::two_phase::{
+    ChainNetworkClient, NoOpNetworkClient, TwoPhaseCommit, TwoPhaseError,
+};
 use crate::ipc::{ChainConfig, ChainRole, ChainState, ChainStatus, HopStatus, TunnelType};
 use crate::peer::validation::{validate_chain_tag, validate_description};
 
@@ -208,7 +210,9 @@ impl From<DscpAllocatorError> for ChainError {
 impl From<TwoPhaseError> for ChainError {
     fn from(err: TwoPhaseError) -> Self {
         match err {
-            TwoPhaseError::PrepareFailed { node, reason } => ChainError::PrepareFailed(node, reason),
+            TwoPhaseError::PrepareFailed { node, reason } => {
+                ChainError::PrepareFailed(node, reason)
+            }
             TwoPhaseError::CommitFailed { node, reason } => ChainError::CommitFailed(node, reason),
             TwoPhaseError::Timeout { node, phase } => {
                 ChainError::PrepareFailed(node, format!("Timeout during {phase}"))
@@ -602,7 +606,9 @@ impl ChainManager {
                 return Err(ChainError::CannotRemoveActiveChain("active".to_string()));
             }
             ChainState::Activating => {
-                return Err(ChainError::CannotRemoveActiveChain("activating".to_string()));
+                return Err(ChainError::CannotRemoveActiveChain(
+                    "activating".to_string(),
+                ));
             }
         }
 
@@ -754,8 +760,7 @@ impl ChainManager {
     /// Returns appropriate `ChainError` variant for validation failures.
     fn validate_chain(&self, config: &ChainConfig) -> Result<(), ChainError> {
         // Validate tag
-        validate_chain_tag(&config.tag)
-            .map_err(|e| ChainError::InvalidTag(e.to_string()))?;
+        validate_chain_tag(&config.tag).map_err(|e| ChainError::InvalidTag(e.to_string()))?;
 
         // Validate description
         validate_description(&config.description)
@@ -805,7 +810,11 @@ impl ChainManager {
         }
 
         // Check that there is exactly one terminal node (the last one)
-        let terminal_count = config.hops.iter().filter(|h| h.role == ChainRole::Terminal).count();
+        let terminal_count = config
+            .hops
+            .iter()
+            .filter(|h| h.role == ChainRole::Terminal)
+            .count();
         if terminal_count == 0 {
             return Err(ChainError::NoTerminal);
         }
@@ -818,9 +827,10 @@ impl ChainManager {
         // The last hop must be terminal
         if let Some(last) = config.hops.last() {
             if last.role != ChainRole::Terminal {
-                return Err(ChainError::InvalidHopSequence(
-                    format!("Last hop '{}' must have Terminal role, got {:?}", last.node_tag, last.role),
-                ));
+                return Err(ChainError::InvalidHopSequence(format!(
+                    "Last hop '{}' must have Terminal role, got {:?}",
+                    last.node_tag, last.role
+                )));
             }
         }
 
@@ -828,18 +838,20 @@ impl ChainManager {
         if config.hops.len() > 1 {
             if let Some(first) = config.hops.first() {
                 if first.role != ChainRole::Entry {
-                    return Err(ChainError::InvalidHopSequence(
-                        format!("First hop '{}' must have Entry role, got {:?}", first.node_tag, first.role),
-                    ));
+                    return Err(ChainError::InvalidHopSequence(format!(
+                        "First hop '{}' must have Entry role, got {:?}",
+                        first.node_tag, first.role
+                    )));
                 }
             }
 
             // Middle hops (if any) should be Relay
             for hop in config.hops.iter().skip(1).take(config.hops.len() - 2) {
                 if hop.role != ChainRole::Relay {
-                    return Err(ChainError::InvalidHopSequence(
-                        format!("Middle hop '{}' must have Relay role, got {:?}", hop.node_tag, hop.role),
-                    ));
+                    return Err(ChainError::InvalidHopSequence(format!(
+                        "Middle hop '{}' must have Relay role, got {:?}",
+                        hop.node_tag, hop.role
+                    )));
                 }
             }
         }
@@ -885,7 +897,9 @@ impl ChainManager {
             match chain.state {
                 ChainState::Inactive => {}
                 ChainState::Active => return Err(ChainError::AlreadyActive(tag.to_string())),
-                ChainState::Activating => return Err(ChainError::AlreadyActivating(tag.to_string())),
+                ChainState::Activating => {
+                    return Err(ChainError::AlreadyActivating(tag.to_string()))
+                }
                 ChainState::Error => {
                     // Can retry from error state
                 }
@@ -895,7 +909,9 @@ impl ChainManager {
             if let Ok(peer_callback_guard) = self.peer_callback.read() {
                 if let Some(callback) = peer_callback_guard.as_ref() {
                     for hop in &chain.config.hops {
-                        if hop.node_tag != self.local_node_tag && !callback.is_peer_connected(&hop.node_tag) {
+                        if hop.node_tag != self.local_node_tag
+                            && !callback.is_peer_connected(&hop.node_tag)
+                        {
                             return Err(ChainError::PeerNotConnected(hop.node_tag.clone()));
                         }
                     }
@@ -921,7 +937,10 @@ impl ChainManager {
 
         // Step 2: Transition to Activating state
         self.update_chain_state(tag, ChainState::Activating, None)?;
-        info!("Chain {} starting activation with DSCP {}", tag, allocated_dscp);
+        info!(
+            "Chain {} starting activation with DSCP {}",
+            tag, allocated_dscp
+        );
 
         // Step 3: Create 2PC coordinator
         let network_client = self
@@ -1157,7 +1176,9 @@ impl ChainManager {
             }
             ChainState::Activating => {
                 // Cannot interrupt activation (would race with 2PC)
-                return Err(ChainError::CannotRemoveActiveChain("activating".to_string()));
+                return Err(ChainError::CannotRemoveActiveChain(
+                    "activating".to_string(),
+                ));
             }
             ChainState::Inactive => {
                 // Already inactive - no-op
@@ -1264,10 +1285,7 @@ impl ChainManager {
 
     /// Get number of chains
     pub fn chain_count(&self) -> usize {
-        self.chains
-            .read()
-            .map(|chains| chains.len())
-            .unwrap_or(0)
+        self.chains.read().map(|chains| chains.len()).unwrap_or(0)
     }
 
     /// List all chains
@@ -1339,14 +1357,10 @@ impl ChainManager {
         if let Ok(mut chains) = self.chains.write() {
             for (tag, chain) in chains.iter_mut() {
                 if chain.state == ChainState::Activating {
-                    warn!(
-                        "Recovering orphaned chain '{}' from Activating state",
-                        tag
-                    );
+                    warn!("Recovering orphaned chain '{}' from Activating state", tag);
                     chain.state = ChainState::Error;
-                    chain.last_error = Some(
-                        "Recovery: chain was interrupted during activation".to_string(),
-                    );
+                    chain.last_error =
+                        Some("Recovery: chain was interrupted during activation".to_string());
                     recovered_count += 1;
                 }
             }
@@ -1675,7 +1689,9 @@ impl ChainManager {
         if current_state == ChainState::Active {
             // Check if routing is already set up
             let routing_registered = {
-                let callback_guard = self.routing_callback.read()
+                let callback_guard = self
+                    .routing_callback
+                    .read()
                     .map_err(|e| ChainError::LockError(e.to_string()))?;
                 if let Some(callback) = callback_guard.as_ref() {
                     callback.is_chain_registered(chain_tag)
@@ -1700,7 +1716,10 @@ impl ChainManager {
             self.setup_local_routing(chain_tag, &config, my_role)
                 .map_err(ChainError::RuleEngine)?;
 
-            debug!("COMMIT succeeded for chain {} (routing repaired)", chain_tag);
+            debug!(
+                "COMMIT succeeded for chain {} (routing repaired)",
+                chain_tag
+            );
             return Ok(());
         }
 
@@ -2635,15 +2654,9 @@ mod tests {
         assert!(ChainError::NotFound("test".to_string())
             .to_string()
             .contains("test"));
-        assert!(ChainError::DirectNotAllowed
-            .to_string()
-            .contains("direct"));
-        assert!(ChainError::XrayRelayNotAllowed
-            .to_string()
-            .contains("Xray"));
-        assert!(ChainError::TooManyHops(11)
-            .to_string()
-            .contains("11"));
+        assert!(ChainError::DirectNotAllowed.to_string().contains("direct"));
+        assert!(ChainError::XrayRelayNotAllowed.to_string().contains("Xray"));
+        assert!(ChainError::TooManyHops(11).to_string().contains("11"));
     }
 
     #[tokio::test]
@@ -2704,7 +2717,11 @@ mod tests {
         manager.create_chain(config2).await.unwrap();
 
         manager
-            .update_chain_state("error-chain", ChainState::Error, Some("Previous error".to_string()))
+            .update_chain_state(
+                "error-chain",
+                ChainState::Error,
+                Some("Previous error".to_string()),
+            )
             .unwrap();
 
         // Recover should find no orphaned chains

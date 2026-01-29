@@ -64,9 +64,7 @@ impl SniffResult {
     /// Get the domain name (SNI or HTTP Host)
     #[must_use]
     pub fn domain(&self) -> Option<&str> {
-        self.sni
-            .as_deref()
-            .or(self.http_host.as_deref())
+        self.sni.as_deref().or(self.http_host.as_deref())
     }
 
     /// Check if a domain was detected

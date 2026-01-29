@@ -181,9 +181,9 @@ impl WgIngressConfig {
             return Err(IngressError::invalid_config("private_key is required"));
         }
 
-        let key_bytes = BASE64
-            .decode(&self.private_key)
-            .map_err(|e| IngressError::invalid_config(format!("Invalid private key Base64: {e}")))?;
+        let key_bytes = BASE64.decode(&self.private_key).map_err(|e| {
+            IngressError::invalid_config(format!("Invalid private key Base64: {e}"))
+        })?;
 
         if key_bytes.len() != 32 {
             return Err(IngressError::invalid_config(format!(
@@ -210,7 +210,9 @@ impl WgIngressConfig {
 
         // Validate batch_size (must be 1-256)
         if self.batch_size == 0 {
-            return Err(IngressError::invalid_config("batch_size must be at least 1"));
+            return Err(IngressError::invalid_config(
+                "batch_size must be at least 1",
+            ));
         }
         if self.batch_size > 256 {
             return Err(IngressError::invalid_config(format!(
@@ -256,7 +258,10 @@ impl Default for WgIngressConfig {
     fn default() -> Self {
         Self {
             private_key: String::new(),
-            listen_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), DEFAULT_LISTEN_PORT),
+            listen_addr: SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                DEFAULT_LISTEN_PORT,
+            ),
             local_ip: IpAddr::V4(std::net::Ipv4Addr::new(10, 25, 0, 1)),
             allowed_subnet: "10.25.0.0/24".parse().unwrap(),
             mtu: DEFAULT_MTU,
@@ -410,9 +415,13 @@ impl WgIngressPeerConfig {
         let ip_str = allowed_ip.into();
         // If the IP doesn't have a prefix, add /32
         let ip_net = if ip_str.contains('/') {
-            ip_str.parse().unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
+            ip_str
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
         } else {
-            format!("{ip_str}/32").parse().unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
+            format!("{ip_str}/32")
+                .parse()
+                .unwrap_or_else(|_| "0.0.0.0/0".parse().unwrap())
         };
 
         Self {
@@ -474,9 +483,9 @@ impl WgIngressPeerConfig {
 
         // Validate preshared key if present
         if let Some(ref psk) = self.preshared_key {
-            let psk_bytes = BASE64
-                .decode(psk)
-                .map_err(|e| IngressError::invalid_config(format!("Invalid preshared key Base64: {e}")))?;
+            let psk_bytes = BASE64.decode(psk).map_err(|e| {
+                IngressError::invalid_config(format!("Invalid preshared key Base64: {e}"))
+            })?;
 
             if psk_bytes.len() != 32 {
                 return Err(IngressError::invalid_config(format!(
@@ -597,7 +606,10 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not in allowed_subnet"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not in allowed_subnet"));
     }
 
     #[test]
@@ -718,7 +730,8 @@ mod tests {
             .build();
 
         let json = serde_json::to_string(&config).expect("Should serialize");
-        let deserialized: WgIngressConfig = serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: WgIngressConfig =
+            serde_json::from_str(&json).expect("Should deserialize");
 
         assert_eq!(deserialized.private_key, config.private_key);
         assert_eq!(deserialized.listen_addr, config.listen_addr);
@@ -799,8 +812,8 @@ mod tests {
 
     #[test]
     fn test_peer_config_validate_invalid_psk() {
-        let peer = WgIngressPeerConfig::new(TEST_VALID_KEY, "10.25.0.2")
-            .with_preshared_key("invalid!!!");
+        let peer =
+            WgIngressPeerConfig::new(TEST_VALID_KEY, "10.25.0.2").with_preshared_key("invalid!!!");
         let result = peer.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("preshared key"));
@@ -825,11 +838,12 @@ mod tests {
 
     #[test]
     fn test_peer_config_serialization() {
-        let peer = WgIngressPeerConfig::new(TEST_VALID_KEY, "10.25.0.2")
-            .with_persistent_keepalive(30);
+        let peer =
+            WgIngressPeerConfig::new(TEST_VALID_KEY, "10.25.0.2").with_persistent_keepalive(30);
 
         let json = serde_json::to_string(&peer).expect("Should serialize");
-        let deserialized: WgIngressPeerConfig = serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: WgIngressPeerConfig =
+            serde_json::from_str(&json).expect("Should deserialize");
 
         assert_eq!(deserialized.public_key, peer.public_key);
         assert_eq!(deserialized.allowed_ips.len(), peer.allowed_ips.len());

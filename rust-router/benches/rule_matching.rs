@@ -98,7 +98,9 @@ fn build_routing_snapshot(rule_count: usize) -> rust_router::rules::RoutingSnaps
 
     // Add some chains
     for i in 0..5 {
-        builder.add_chain(&format!("chain-{}", i)).expect("valid chain");
+        builder
+            .add_chain(&format!("chain-{}", i))
+            .expect("valid chain");
     }
 
     builder
@@ -340,9 +342,7 @@ fn bench_udp_sessions(c: &mut Criterion) {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
         );
         b.iter(|| {
-            black_box(
-                manager.get_or_create(key, || UdpSession::new(key, "direct".to_string())),
-            )
+            black_box(manager.get_or_create(key, || UdpSession::new(key, "direct".to_string())))
         });
     });
 
@@ -438,8 +438,7 @@ fn bench_connection_info(c: &mut Criterion) {
     group.bench_function("with_dest_ip", |b| {
         b.iter(|| {
             black_box(
-                ConnectionInfo::new("tcp", 443)
-                    .with_dest_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+                ConnectionInfo::new("tcp", 443).with_dest_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             )
         });
     });

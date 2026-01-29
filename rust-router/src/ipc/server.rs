@@ -295,7 +295,10 @@ mod tests {
             Duration::from_millis(300),
         ));
 
-        Arc::new(IpcHandler::new_with_default_rules(connection_manager, outbound_manager))
+        Arc::new(IpcHandler::new_with_default_rules(
+            connection_manager,
+            outbound_manager,
+        ))
     }
 
     #[tokio::test]
@@ -315,9 +318,7 @@ mod tests {
         let shutdown_tx = server.shutdown_sender();
 
         // Start server in background
-        let server_handle = tokio::spawn(async move {
-            server.run().await
-        });
+        let server_handle = tokio::spawn(async move { server.run().await });
 
         // Wait for server to start
         tokio::time::sleep(Duration::from_millis(100)).await;

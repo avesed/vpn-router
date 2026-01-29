@@ -223,11 +223,8 @@ async fn handle_connection(
     stream.set_nodelay(true)?;
 
     // Perform SOCKS5 handshake with timeout
-    let handshake_result = tokio::time::timeout(
-        config.handshake_timeout,
-        socks5_handshake(&mut stream),
-    )
-    .await;
+    let handshake_result =
+        tokio::time::timeout(config.handshake_timeout, socks5_handshake(&mut stream)).await;
 
     let (domain, dest_addr) = match handshake_result {
         Ok(Ok(result)) => result,
@@ -276,7 +273,10 @@ async fn handle_connection(
                 Some(o) => o,
                 None => {
                     send_reply(&mut stream, REPLY_GENERAL_FAILURE, dest_addr).await?;
-                    return Err(io::Error::new(io::ErrorKind::NotFound, "No outbound available"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "No outbound available",
+                    ));
                 }
             }
         }
@@ -293,7 +293,10 @@ async fn handle_connection(
                 _ => REPLY_GENERAL_FAILURE,
             };
             send_reply(&mut stream, reply_code, dest_addr).await?;
-            return Err(io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                e.to_string(),
+            ));
         }
     };
 
@@ -309,7 +312,9 @@ async fn handle_connection(
     let bytes_recv = copy_result.upstream_to_client;
 
     stats.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
-    stats.bytes_received.fetch_add(bytes_recv, Ordering::Relaxed);
+    stats
+        .bytes_received
+        .fetch_add(bytes_recv, Ordering::Relaxed);
     stats.connections_completed.fetch_add(1, Ordering::Relaxed);
 
     debug!(
@@ -324,13 +329,14 @@ async fn handle_connection(
 }
 
 /// Perform SOCKS5 handshake, returns (optional domain, destination address)
-async fn socks5_handshake(
-    stream: &mut TcpStream,
-) -> Result<(Option<String>, SocketAddr), String> {
+async fn socks5_handshake(stream: &mut TcpStream) -> Result<(Option<String>, SocketAddr), String> {
     // ========== Phase 1: Auth negotiation ==========
     // Client: VER(1) NMETHODS(1) METHODS(1-255)
     let mut buf = [0u8; 258];
-    stream.read_exact(&mut buf[..2]).await.map_err(|e| format!("read auth header: {e}"))?;
+    stream
+        .read_exact(&mut buf[..2])
+        .await
+        .map_err(|e| format!("read auth header: {e}"))?;
 
     let version = buf[0];
     let nmethods = buf[1] as usize;
@@ -343,22 +349,34 @@ async fn socks5_handshake(
         return Err(format!("invalid nmethods: {nmethods}"));
     }
 
-    stream.read_exact(&mut buf[..nmethods]).await.map_err(|e| format!("read auth methods: {e}"))?;
+    stream
+        .read_exact(&mut buf[..nmethods])
+        .await
+        .map_err(|e| format!("read auth methods: {e}"))?;
 
     // Check if no-auth is offered
     let has_no_auth = buf[..nmethods].contains(&AUTH_METHOD_NONE);
     if !has_no_auth {
         // Reply with "no acceptable method"
-        stream.write_all(&[SOCKS5_VERSION, 0xFF]).await.map_err(|e| format!("write auth reject: {e}"))?;
+        stream
+            .write_all(&[SOCKS5_VERSION, 0xFF])
+            .await
+            .map_err(|e| format!("write auth reject: {e}"))?;
         return Err("no acceptable auth method".to_string());
     }
 
     // Reply with no-auth selected
-    stream.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.map_err(|e| format!("write auth reply: {e}"))?;
+    stream
+        .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+        .await
+        .map_err(|e| format!("write auth reply: {e}"))?;
 
     // ========== Phase 2: Request ==========
     // Client: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR(variable) DST.PORT(2)
-    stream.read_exact(&mut buf[..4]).await.map_err(|e| format!("read request header: {e}"))?;
+    stream
+        .read_exact(&mut buf[..4])
+        .await
+        .map_err(|e| format!("read request header: {e}"))?;
 
     let version = buf[0];
     let cmd = buf[1];
@@ -378,28 +396,42 @@ async fn socks5_handshake(
     // Parse destination address
     let (domain, dest_ip) = match atyp {
         ATYP_IPV4 => {
-            stream.read_exact(&mut buf[..4]).await.map_err(|e| format!("read ipv4 addr: {e}"))?;
+            stream
+                .read_exact(&mut buf[..4])
+                .await
+                .map_err(|e| format!("read ipv4 addr: {e}"))?;
             let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
             (None, IpAddr::V4(ip))
         }
         ATYP_DOMAIN => {
-            stream.read_exact(&mut buf[..1]).await.map_err(|e| format!("read domain len: {e}"))?;
+            stream
+                .read_exact(&mut buf[..1])
+                .await
+                .map_err(|e| format!("read domain len: {e}"))?;
             let domain_len = buf[0] as usize;
             if domain_len == 0 || domain_len > 255 {
                 send_reply_sync(stream, REPLY_ADDRESS_TYPE_NOT_SUPPORTED).await?;
                 return Err(format!("invalid domain length: {domain_len}"));
             }
-            stream.read_exact(&mut buf[..domain_len]).await.map_err(|e| format!("read domain: {e}"))?;
+            stream
+                .read_exact(&mut buf[..domain_len])
+                .await
+                .map_err(|e| format!("read domain: {e}"))?;
             let domain = String::from_utf8_lossy(&buf[..domain_len]).to_string();
-            
+
             // Resolve domain to IP for outbound connection
             // For now, use a placeholder IP - the outbound will resolve the domain
             // In practice, we pass the domain to the rule engine and outbound
-            let resolved_ip = resolve_domain(&domain).await.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            let resolved_ip = resolve_domain(&domain)
+                .await
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
             (Some(domain), resolved_ip)
         }
         ATYP_IPV6 => {
-            stream.read_exact(&mut buf[..16]).await.map_err(|e| format!("read ipv6 addr: {e}"))?;
+            stream
+                .read_exact(&mut buf[..16])
+                .await
+                .map_err(|e| format!("read ipv6 addr: {e}"))?;
             let ip = Ipv6Addr::new(
                 u16::from_be_bytes([buf[0], buf[1]]),
                 u16::from_be_bytes([buf[2], buf[3]]),
@@ -419,7 +451,10 @@ async fn socks5_handshake(
     };
 
     // Read port
-    stream.read_exact(&mut buf[..2]).await.map_err(|e| format!("read port: {e}"))?;
+    stream
+        .read_exact(&mut buf[..2])
+        .await
+        .map_err(|e| format!("read port: {e}"))?;
     let port = u16::from_be_bytes([buf[0], buf[1]]);
 
     let dest_addr = SocketAddr::new(dest_ip, port);
@@ -441,10 +476,17 @@ async fn send_reply_sync(stream: &mut TcpStream, reply: u8) -> Result<(), String
         reply,
         0x00, // RSV
         ATYP_IPV4,
-        0, 0, 0, 0, // BND.ADDR (0.0.0.0)
-        0, 0, // BND.PORT (0)
+        0,
+        0,
+        0,
+        0, // BND.ADDR (0.0.0.0)
+        0,
+        0, // BND.PORT (0)
     ];
-    stream.write_all(&reply_buf).await.map_err(|e| format!("write reply: {e}"))?;
+    stream
+        .write_all(&reply_buf)
+        .await
+        .map_err(|e| format!("write reply: {e}"))?;
     Ok(())
 }
 
@@ -473,7 +515,7 @@ async fn send_reply(stream: &mut TcpStream, reply: u8, bound_addr: SocketAddr) -
 /// Simple DNS resolution (placeholder - uses system resolver)
 async fn resolve_domain(domain: &str) -> Option<IpAddr> {
     use tokio::net::lookup_host;
-    
+
     let addr_with_port = format!("{domain}:0");
     match lookup_host(addr_with_port).await {
         Ok(mut addrs) => addrs.next().map(|a| a.ip()),

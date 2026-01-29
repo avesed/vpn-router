@@ -116,7 +116,8 @@ impl UdpSessionEntry {
     }
 
     fn last_activity_secs(&self) -> u64 {
-        self.last_activity.load(std::sync::atomic::Ordering::Relaxed)
+        self.last_activity
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -820,7 +821,9 @@ impl IngressSessionTracker {
                 if session.peer_endpoint != peer_endpoint {
                     tracing::info!(
                         "Peer endpoint changed for {}: {} -> {}",
-                        key, session.peer_endpoint, peer_endpoint
+                        key,
+                        session.peer_endpoint,
+                        peer_endpoint
                     );
                     session.peer_endpoint = peer_endpoint;
                 }
@@ -867,7 +870,9 @@ impl IngressSessionTracker {
                 if session.peer_endpoint != peer_endpoint && peer_endpoint.port() != 0 {
                     tracing::debug!(
                         "Chain session endpoint updated for {}: {} -> {}",
-                        key, session.peer_endpoint, peer_endpoint
+                        key,
+                        session.peer_endpoint,
+                        peer_endpoint
                     );
                     session.peer_endpoint = peer_endpoint;
                 }
@@ -936,7 +941,8 @@ impl IngressSessionTracker {
     /// Number of sessions removed.
     pub fn cleanup(&self) -> usize {
         let before = self.sessions.len();
-        self.sessions.retain(|_, session| !session.is_expired(self.session_ttl));
+        self.sessions
+            .retain(|_, session| !session.is_expired(self.session_ttl));
         before.saturating_sub(self.sessions.len())
     }
 
@@ -1196,7 +1202,7 @@ fn build_udp_reply_packet(
     packet[6..8].copy_from_slice(&[0x40, 0x00]); // Don't fragment flag
     packet[8] = 64; // TTL
     packet[9] = IPPROTO_UDP; // Protocol
-    // Checksum calculated below
+                             // Checksum calculated below
     packet[12..16].copy_from_slice(&src_ip.octets()); // Source IP
     packet[16..20].copy_from_slice(&dst_ip.octets()); // Dest IP
 
@@ -1235,7 +1241,7 @@ fn build_udp_reply_packet_v6(
 
     // IPv6 header (40 bytes)
     packet[0] = 0x60; // Version 6
-    // packet[1..4] = Traffic class + flow label (left as 0)
+                      // packet[1..4] = Traffic class + flow label (left as 0)
     packet[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes()); // Payload length
     packet[6] = IPPROTO_UDP; // Next header
     packet[7] = 64; // Hop limit
@@ -1320,7 +1326,7 @@ fn build_icmp_reply_packet(
     let icmp_start = 20;
     packet[icmp_start] = ICMP_ECHO_REPLY; // Type
     packet[icmp_start + 1] = 0; // Code
-    // Checksum calculated below
+                                // Checksum calculated below
     packet[icmp_start + 4..icmp_start + 6].copy_from_slice(&id.to_be_bytes());
     packet[icmp_start + 6..icmp_start + 8].copy_from_slice(&seq.to_be_bytes());
 
@@ -1468,18 +1474,12 @@ fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
 
     // Extract source IP (bytes 12-15)
     let src_ip = IpAddr::V4(Ipv4Addr::new(
-        packet[12],
-        packet[13],
-        packet[14],
-        packet[15],
+        packet[12], packet[13], packet[14], packet[15],
     ));
 
     // Extract destination IP (bytes 16-19)
     let dst_ip = IpAddr::V4(Ipv4Addr::new(
-        packet[16],
-        packet[17],
-        packet[18],
-        packet[19],
+        packet[16], packet[17], packet[18], packet[19],
     ));
 
     // Parse transport layer ports
@@ -1507,42 +1507,16 @@ fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
 
     // Extract source IP (bytes 8-23)
     let src_ip = IpAddr::V6(Ipv6Addr::from([
-        packet[8],
-        packet[9],
-        packet[10],
-        packet[11],
-        packet[12],
-        packet[13],
-        packet[14],
-        packet[15],
-        packet[16],
-        packet[17],
-        packet[18],
-        packet[19],
-        packet[20],
-        packet[21],
-        packet[22],
-        packet[23],
+        packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14],
+        packet[15], packet[16], packet[17], packet[18], packet[19], packet[20], packet[21],
+        packet[22], packet[23],
     ]));
 
     // Extract destination IP (bytes 24-39)
     let dst_ip = IpAddr::V6(Ipv6Addr::from([
-        packet[24],
-        packet[25],
-        packet[26],
-        packet[27],
-        packet[28],
-        packet[29],
-        packet[30],
-        packet[31],
-        packet[32],
-        packet[33],
-        packet[34],
-        packet[35],
-        packet[36],
-        packet[37],
-        packet[38],
-        packet[39],
+        packet[24], packet[25], packet[26], packet[27], packet[28], packet[29], packet[30],
+        packet[31], packet[32], packet[33], packet[34], packet[35], packet[36], packet[37],
+        packet[38], packet[39],
     ]));
 
     if matches!(protocol, IPPROTO_TCP | IPPROTO_UDP) && total_len < header_len + 4 {
@@ -1769,7 +1743,8 @@ pub async fn run_forwarding_loop(
             IPPROTO_TCP => {
                 stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
                 // Parse TCP header for connection tracking
-                if let Some(tcp_details) = parse_tcp_details(&processed.data, parsed.ip_header_len) {
+                if let Some(tcp_details) = parse_tcp_details(&processed.data, parsed.ip_header_len)
+                {
                     forward_tcp_packet(
                         &processed,
                         &parsed,
@@ -1833,9 +1808,7 @@ pub async fn run_forwarding_loop(
                 .unwrap_or_default()
                 .as_secs();
             let udp_before = UDP_SESSIONS.len();
-            UDP_SESSIONS.retain(|_, session| {
-                now_secs - session.last_activity_secs() <= 60
-            });
+            UDP_SESSIONS.retain(|_, session| now_secs - session.last_activity_secs() <= 60);
             let udp_removed = udp_before.saturating_sub(UDP_SESSIONS.len());
 
             // Clean up stale proxy UDP sessions (Shadowsocks, SOCKS5)
@@ -1925,7 +1898,10 @@ pub async fn run_reply_router_loop(
                             let dns_payload = &reply.packet[payload_offset..];
                             info!(
                                 "DNS response detected: {}:{} -> {} (payload {} bytes)",
-                                parsed.src_ip, src_port, parsed.dst_ip, dns_payload.len()
+                                parsed.src_ip,
+                                src_port,
+                                parsed.dst_ip,
+                                dns_payload.len()
                             );
                             let count = cache.parse_dns_response(dns_payload);
                             if count > 0 {
@@ -1937,14 +1913,16 @@ pub async fn run_reply_router_loop(
                     } else {
                         trace!(
                             "UDP reply from non-DNS port: {} (src_port={})",
-                            parsed.src_ip, src_port
+                            parsed.src_ip,
+                            src_port
                         );
                     }
                 }
             }
         } else {
             // Log once when dns_cache is None (should not happen if properly initialized)
-            static DNS_CACHE_WARN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static DNS_CACHE_WARN: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !DNS_CACHE_WARN.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 warn!("DNS cache not available in reply router");
             }
@@ -1953,7 +1931,9 @@ pub async fn run_reply_router_loop(
         // Handle ICMP separately (no ports) - these are rare, process inline
         if parsed.protocol == IPPROTO_ICMP || parsed.protocol == IPPROTO_ICMPV6 {
             // For ICMP, extract ID from the ICMP header and use it as port
-            if let Some((icmp_type, _, id, seq, _)) = parse_icmp_echo(&reply.packet, parsed.ip_header_len) {
+            if let Some((icmp_type, _, id, seq, _)) =
+                parse_icmp_echo(&reply.packet, parsed.ip_header_len)
+            {
                 // ICMP Echo Reply (type 0) - find session using ID
                 if icmp_type == ICMP_ECHO_REPLY {
                     let lookup_key = FiveTuple::new(
@@ -1965,16 +1945,26 @@ pub async fn run_reply_router_loop(
                     );
 
                     if let Some(session) = session_tracker.get(&lookup_key) {
-                        if ingress_manager.is_peer_ip_allowed(&session.peer_public_key, parsed.dst_ip) {
+                        if ingress_manager
+                            .is_peer_ip_allowed(&session.peer_public_key, parsed.dst_ip)
+                        {
                             match ingress_manager
-                                .send_to_peer(&session.peer_public_key, session.peer_endpoint, &reply.packet)
+                                .send_to_peer(
+                                    &session.peer_public_key,
+                                    session.peer_endpoint,
+                                    &reply.packet,
+                                )
                                 .await
                             {
                                 Ok(()) => {
                                     stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                                     info!(
                                         "ICMP reply sent to peer {}: {} -> {} (id={}, seq={})",
-                                        session.peer_public_key, parsed.src_ip, parsed.dst_ip, id, seq
+                                        session.peer_public_key,
+                                        parsed.src_ip,
+                                        parsed.dst_ip,
+                                        id,
+                                        seq
                                     );
                                 }
                                 Err(e) => {
@@ -1988,7 +1978,10 @@ pub async fn run_reply_router_loop(
                         }
                     } else {
                         stats.session_misses.fetch_add(1, Ordering::Relaxed);
-                        debug!("No session for ICMP reply: {} -> {} (id={})", parsed.src_ip, parsed.dst_ip, id);
+                        debug!(
+                            "No session for ICMP reply: {} -> {} (id={})",
+                            parsed.src_ip, parsed.dst_ip, id
+                        );
                     }
                 }
             }
@@ -2004,10 +1997,7 @@ pub async fn run_reply_router_loop(
                 );
             } else {
                 stats.unsupported_protocol.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    "Unsupported reply protocol {} dropped",
-                    parsed.protocol
-                );
+                debug!("Unsupported reply protocol {} dropped", parsed.protocol);
             }
             continue;
         }
@@ -2021,7 +2011,13 @@ pub async fn run_reply_router_loop(
             continue;
         };
 
-        let reply_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, parsed.protocol);
+        let reply_tuple = FiveTuple::new(
+            parsed.src_ip,
+            src_port,
+            parsed.dst_ip,
+            dst_port,
+            parsed.protocol,
+        );
         let lookup_key = reply_tuple.reverse();
 
         let Some(session) = session_tracker.get(&lookup_key) else {
@@ -2057,7 +2053,10 @@ pub async fn run_reply_router_loop(
 
                 // Use send_preserve_src to keep original target server IP
                 // This allows Entry node to match session by original five-tuple
-                match peer_manager.send_to_peer_tunnel_preserve_src(&source_tunnel, &reply.packet).await {
+                match peer_manager
+                    .send_to_peer_tunnel_preserve_src(&source_tunnel, &reply.packet)
+                    .await
+                {
                     Ok(()) => {
                         stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                         session_tracker.update_received(&lookup_key, reply.packet.len() as u64);
@@ -2117,7 +2116,9 @@ pub async fn run_reply_router_loop(
                     }
                     Err(_) => {
                         // Timeout - semaphore exhausted for too long, skip this packet
-                        warn!("Reply router semaphore timeout - dropping packet due to backpressure");
+                        warn!(
+                            "Reply router semaphore timeout - dropping packet due to backpressure"
+                        );
                         stats.send_errors.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -2139,16 +2140,16 @@ pub async fn run_reply_router_loop(
                 .await
             {
                 Ok(()) => {
-                    stats_clone.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+                    stats_clone
+                        .packets_forwarded
+                        .fetch_add(1, Ordering::Relaxed);
                     tracker_clone.update_received(&lookup_key, packet_len as u64);
                 }
                 Err(e) => {
                     stats_clone.send_errors.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "Failed to forward reply {} via peer {}: {}",
-                        reply_tuple,
-                        peer_public_key,
-                        e
+                        reply_tuple, peer_public_key, e
                     );
                 }
             }
@@ -2212,8 +2213,12 @@ async fn forward_tcp_packet(
                 Ok(member) => {
                     debug!(
                         "ECMP resolved '{}' -> '{}' for TCP {}:{} -> {}:{}",
-                        routing_outbound, member, parsed.src_ip, tcp_details.src_port,
-                        parsed.dst_ip, tcp_details.dst_port
+                        routing_outbound,
+                        member,
+                        parsed.src_ip,
+                        tcp_details.src_port,
+                        parsed.dst_ip,
+                        tcp_details.dst_port
                     );
                     member
                 }
@@ -2276,11 +2281,19 @@ async fn forward_tcp_packet(
 
                 if peer_key != [0u8; 32] {
                     let packet_data = bytes::BytesMut::from(&processed.data[..]);
-                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                    if bridge.try_inject_packet(
+                        packet_data,
+                        peer_key,
+                        processed.src_addr,
+                        outbound_tag,
+                    ) {
                         debug!(
                             "WG egress SNI routing via ipstack '{}': {}:{} -> {}:{} (domain match)",
-                            outbound_tag, parsed.src_ip, tcp_details.src_port,
-                            parsed.dst_ip, tcp_details.dst_port
+                            outbound_tag,
+                            parsed.src_ip,
+                            tcp_details.src_port,
+                            parsed.dst_ip,
+                            tcp_details.dst_port
                         );
                         stats.wg_sni_routed.fetch_add(1, Ordering::Relaxed);
                         stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
@@ -2410,22 +2423,23 @@ async fn forward_tcp_packet(
             use base64::engine::general_purpose::STANDARD as BASE64;
             use base64::Engine;
 
-            let peer_key: [u8; 32] = match BASE64.decode(&processed.peer_public_key) {
-                Ok(bytes) if bytes.len() == 32 => {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    arr
-                }
-                _ => {
-                    warn!(
+            let peer_key: [u8; 32] =
+                match BASE64.decode(&processed.peer_public_key) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    _ => {
+                        warn!(
                         "Invalid peer key for ipstack, dropping packet: {}:{} -> {}:{} (peer={})",
                         parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port,
                         &processed.peer_public_key[..8.min(processed.peer_public_key.len())]
                     );
-                    stats.forward_errors.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
+                        stats.forward_errors.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
 
             // Convert the processed packet to BytesMut for ipstack
             let packet_data = bytes::BytesMut::from(&processed.data[..]);
@@ -2441,7 +2455,10 @@ async fn forward_tcp_packet(
             if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
                 trace!(
                     "Routed TCP to ipstack: {}:{} -> {}:{}",
-                    parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
+                    parsed.src_ip,
+                    tcp_details.src_port,
+                    parsed.dst_ip,
+                    tcp_details.dst_port
                 );
                 stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                 stats.tcp_packets.fetch_add(1, Ordering::Relaxed);
@@ -2488,7 +2505,6 @@ async fn forward_tcp_packet(
     // - Out-of-order packet dropping causing data loss
     // - Fixed window size (65535) with no flow control
     // All TCP traffic now goes through IpStack which handles these correctly.
-
 }
 
 /// DNS hijacking statistics
@@ -2620,11 +2636,17 @@ async fn forward_udp_packet(
         let payload_offset = parsed.ip_header_len + 8; // IP header + 8 bytes UDP header
         if processed.data.len() > payload_offset {
             let dns_query = &processed.data[payload_offset..];
-            
-            DNS_HIJACK_STATS.queries_hijacked.fetch_add(1, Ordering::Relaxed);
+
+            DNS_HIJACK_STATS
+                .queries_hijacked
+                .fetch_add(1, Ordering::Relaxed);
             info!(
                 "DNS hijack: {}:{} -> {}:{} (query {} bytes)",
-                parsed.src_ip, src_port, parsed.dst_ip, dst_port, dns_query.len()
+                parsed.src_ip,
+                src_port,
+                parsed.dst_ip,
+                dst_port,
+                dns_query.len()
             );
 
             // Query the local DNS engine
@@ -2632,7 +2654,11 @@ async fn forward_udp_packet(
                 Ok(dns_response) => {
                     debug!(
                         "DNS hijack got response: {} bytes for {}:{} -> {}:{}",
-                        dns_response.len(), parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                        dns_response.len(),
+                        parsed.src_ip,
+                        src_port,
+                        parsed.dst_ip,
+                        dst_port
                     );
 
                     // Build reply packet: swap src/dst to send response back to client
@@ -2640,10 +2666,10 @@ async fn forward_udp_packet(
                     let reply_packet = match (parsed.dst_ip, parsed.src_ip) {
                         (IpAddr::V4(server_ip), IpAddr::V4(client_ip)) => {
                             build_udp_reply_packet(
-                                server_ip,    // Reply from: original DNS server IP
-                                dst_port,     // Reply from: port 53
-                                client_ip,    // Reply to: client IP
-                                src_port,     // Reply to: client's source port
+                                server_ip, // Reply from: original DNS server IP
+                                dst_port,  // Reply from: port 53
+                                client_ip, // Reply to: client IP
+                                src_port,  // Reply to: client's source port
                                 &dns_response,
                             )
                         }
@@ -2658,7 +2684,9 @@ async fn forward_udp_packet(
                         }
                         _ => {
                             warn!("DNS hijack: IP version mismatch, dropping");
-                            DNS_HIJACK_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+                            DNS_HIJACK_STATS
+                                .send_failures
+                                .fetch_add(1, Ordering::Relaxed);
                             return;
                         }
                     };
@@ -2667,7 +2695,11 @@ async fn forward_udp_packet(
                     if let Some(ref reply_tx) = direct_reply_tx {
                         // Register session so the reply router can find the peer
                         let five_tuple = FiveTuple::new(
-                            parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP
+                            parsed.src_ip,
+                            src_port,
+                            parsed.dst_ip,
+                            dst_port,
+                            IPPROTO_UDP,
                         );
                         session_tracker.register(
                             five_tuple,
@@ -2684,22 +2716,32 @@ async fn forward_udp_packet(
 
                         if let Err(e) = reply_tx.try_send(reply) {
                             warn!("DNS hijack: failed to send reply to router: {}", e);
-                            DNS_HIJACK_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+                            DNS_HIJACK_STATS
+                                .send_failures
+                                .fetch_add(1, Ordering::Relaxed);
                         } else {
                             info!(
                                 "DNS hijack: sent {} byte response to {}:{}",
-                                dns_response.len(), parsed.src_ip, src_port
+                                dns_response.len(),
+                                parsed.src_ip,
+                                src_port
                             );
-                            DNS_HIJACK_STATS.responses_sent.fetch_add(1, Ordering::Relaxed);
+                            DNS_HIJACK_STATS
+                                .responses_sent
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     } else {
                         warn!("DNS hijack: no reply channel available");
-                        DNS_HIJACK_STATS.send_failures.fetch_add(1, Ordering::Relaxed);
+                        DNS_HIJACK_STATS
+                            .send_failures
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
                     warn!("DNS hijack: query to local engine failed: {}", e);
-                    DNS_HIJACK_STATS.query_failures.fetch_add(1, Ordering::Relaxed);
+                    DNS_HIJACK_STATS
+                        .query_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     // Fall through to normal forwarding as fallback
                     // This allows DNS to still work if local engine is down
                 }
@@ -2712,7 +2754,13 @@ async fn forward_udp_packet(
     }
 
     // Create 5-tuple for session tracking
-    let five_tuple = FiveTuple::new(parsed.src_ip, src_port, parsed.dst_ip, dst_port, IPPROTO_UDP);
+    let five_tuple = FiveTuple::new(
+        parsed.src_ip,
+        src_port,
+        parsed.dst_ip,
+        dst_port,
+        IPPROTO_UDP,
+    );
 
     // Resolve ECMP group to member using five-tuple hash
     let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
@@ -2729,8 +2777,7 @@ async fn forward_udp_packet(
                 Ok(member) => {
                     debug!(
                         "ECMP resolved '{}' -> '{}' for UDP {}:{} -> {}:{}",
-                        routing_outbound, member, parsed.src_ip, src_port,
-                        parsed.dst_ip, dst_port
+                        routing_outbound, member, parsed.src_ip, src_port, parsed.dst_ip, dst_port
                     );
                     member
                 }
@@ -2793,7 +2840,12 @@ async fn forward_udp_packet(
 
                 if peer_key != [0u8; 32] {
                     let packet_data = bytes::BytesMut::from(&processed.data[..]);
-                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                    if bridge.try_inject_packet(
+                        packet_data,
+                        peer_key,
+                        processed.src_addr,
+                        outbound_tag,
+                    ) {
                         debug!(
                             "WG egress SNI routing via ipstack '{}': {}:{} -> {}:{} (domain match, UDP)",
                             outbound_tag, parsed.src_ip, src_port, parsed.dst_ip, dst_port
@@ -2851,7 +2903,11 @@ async fn forward_udp_packet(
                         Ok(()) => {
                             debug!(
                                 "Forwarded UDP to peer tunnel '{}': {} -> {}:{} ({} bytes, direct)",
-                                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port, parsed.total_len
+                                outbound_tag,
+                                parsed.src_ip,
+                                parsed.dst_ip,
+                                dst_port,
+                                parsed.total_len
                             );
                             stats.wg_direct_forwarded.fetch_add(1, Ordering::Relaxed);
                         }
@@ -2869,7 +2925,10 @@ async fn forward_udp_packet(
         }
 
         // Forward through WireGuard egress tunnel (WgEgressManager)
-        match wg_egress_manager.send(outbound_tag, processed.data.clone()).await {
+        match wg_egress_manager
+            .send(outbound_tag, processed.data.clone())
+            .await
+        {
             Ok(()) => {
                 debug!(
                     "Forwarded UDP to WG egress '{}': {} -> {}:{} ({} bytes, direct)",
@@ -2937,10 +2996,18 @@ async fn forward_udp_packet(
 
                 if peer_key != [0u8; 32] {
                     let packet_data = bytes::BytesMut::from(&processed.data[..]);
-                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                    if bridge.try_inject_packet(
+                        packet_data,
+                        peer_key,
+                        processed.src_addr,
+                        outbound_tag,
+                    ) {
                         trace!(
                             "Routed direct UDP to ipstack: {}:{} -> {}:{}",
-                            parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                            parsed.src_ip,
+                            src_port,
+                            parsed.dst_ip,
+                            dst_port
                         );
                         stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                         stats.udp_packets.fetch_add(1, Ordering::Relaxed);
@@ -2958,7 +3025,11 @@ async fn forward_udp_packet(
         // Extract UDP payload (skip IP header + UDP header)
         let payload_offset = parsed.ip_header_len + 8; // IP header + 8 bytes UDP header
         if processed.data.len() <= payload_offset {
-            warn!("UDP packet too short for payload: {} bytes, need > {}", processed.data.len(), payload_offset);
+            warn!(
+                "UDP packet too short for payload: {} bytes, need > {}",
+                processed.data.len(),
+                payload_offset
+            );
             stats.forward_errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -3010,7 +3081,10 @@ async fn forward_udp_packet(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to connect UDP via direct '{}' to {}: {}", outbound_tag, dst_addr, e);
+                    warn!(
+                        "Failed to connect UDP via direct '{}' to {}: {}",
+                        outbound_tag, dst_addr, e
+                    );
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -3056,7 +3130,10 @@ async fn forward_udp_packet(
     } else if outbound_tag == "block" || outbound_tag == "adblock" {
         // Block outbound - silently drop
         // (Note: This case is also handled in the main loop, but included here for completeness)
-        debug!("Dropping UDP packet (blocked): {} -> {}", parsed.src_ip, parsed.dst_ip);
+        debug!(
+            "Dropping UDP packet (blocked): {} -> {}",
+            parsed.src_ip, parsed.dst_ip
+        );
         stats.blocked_packets.fetch_add(1, Ordering::Relaxed);
     } else {
         // === UDP IPSTACK INTEGRATION (Phase 3) ===
@@ -3098,10 +3175,18 @@ async fn forward_udp_packet(
 
                     // Try to inject into ipstack (non-blocking)
                     // UDP packets can tolerate loss better than TCP, so we use try_inject
-                    if bridge.try_inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag) {
+                    if bridge.try_inject_packet(
+                        packet_data,
+                        peer_key,
+                        processed.src_addr,
+                        outbound_tag,
+                    ) {
                         trace!(
                             "Routed UDP to ipstack: {}:{} -> {}:{}",
-                            parsed.src_ip, src_port, parsed.dst_ip, dst_port
+                            parsed.src_ip,
+                            src_port,
+                            parsed.dst_ip,
+                            dst_port
                         );
                         stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                         stats.udp_packets.fetch_add(1, Ordering::Relaxed);
@@ -3127,7 +3212,10 @@ async fn forward_udp_packet(
 
             // Check if outbound supports UDP
             if !outbound.supports_udp() {
-                warn!("Outbound '{}' does not support UDP, dropping packet", outbound_tag);
+                warn!(
+                    "Outbound '{}' does not support UDP, dropping packet",
+                    outbound_tag
+                );
                 stats.forward_errors.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -3158,7 +3246,11 @@ async fn forward_udp_packet(
                     Ok(bytes_sent) => {
                         trace!(
                             "Forwarded UDP via existing proxy session '{}': {} -> {}:{} ({} bytes)",
-                            outbound_tag, client_ip, server_ip, server_port, bytes_sent
+                            outbound_tag,
+                            client_ip,
+                            server_ip,
+                            server_port,
+                            bytes_sent
                         );
                     }
                     Err(e) => {
@@ -3177,7 +3269,11 @@ async fn forward_udp_packet(
                     Ok(bytes_sent) => {
                         trace!(
                             "Forwarded UDP via existing session '{}': {} -> {}:{} ({} bytes)",
-                            outbound_tag, client_ip, server_ip, server_port, bytes_sent
+                            outbound_tag,
+                            client_ip,
+                            server_ip,
+                            server_port,
+                            bytes_sent
                         );
                     }
                     Err(e) => {
@@ -3252,12 +3348,16 @@ async fn forward_udp_packet(
                                                     .duration_since(std::time::UNIX_EPOCH)
                                                     .unwrap_or_default()
                                                     .as_secs();
-                                                if now_secs.saturating_sub(session_clone.last_activity_secs())
-                                                    > PROXY_UDP_IDLE_TIMEOUT_SECS
+                                                if now_secs.saturating_sub(
+                                                    session_clone.last_activity_secs(),
+                                                ) > PROXY_UDP_IDLE_TIMEOUT_SECS
                                                 {
                                                     PROXY_UDP_SESSIONS.remove(&ft);
                                                     stats_clone.record_completed(0, 0);
-                                                    debug!("Proxy UDP session (no reply) closed: {:?}", ft);
+                                                    debug!(
+                                                        "Proxy UDP session (no reply) closed: {:?}",
+                                                        ft
+                                                    );
                                                     break;
                                                 }
                                             }
@@ -3289,20 +3389,22 @@ async fn forward_udp_packet(
 
                             // Store session for reuse
                             let session = Arc::new(UdpSessionEntry::new(socket));
-                            
+
                             // Spawn reply listener (or cleanup task if no reply channel)
                             let session_clone = Arc::clone(&session);
                             let ft = five_tuple;
                             let outbound_stats_clone = Arc::clone(&outbound_stats);
-                            
+
                             if let Some(tx) = reply_tx {
                                 tokio::spawn(async move {
                                     let mut buf = vec![0u8; 65535];
                                     loop {
                                         match tokio::time::timeout(
                                             Duration::from_secs(30),
-                                            session_clone.socket.recv(&mut buf)
-                                        ).await {
+                                            session_clone.socket.recv(&mut buf),
+                                        )
+                                        .await
+                                        {
                                             Ok(Ok(n)) if n > 0 => {
                                                 session_clone.touch();
                                                 // Build UDP reply packet based on IP version
@@ -3382,7 +3484,7 @@ async fn forward_udp_packet(
                                     }
                                 });
                             }
-                            
+
                             UDP_SESSIONS.insert(five_tuple, session);
                         }
                         Err(e) => {
@@ -3393,14 +3495,19 @@ async fn forward_udp_packet(
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to connect UDP via '{}' to {}: {}", outbound_tag, dst_addr, e);
+                    warn!(
+                        "Failed to connect UDP via '{}' to {}: {}",
+                        outbound_tag, dst_addr, e
+                    );
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
                     // Note: No outbound_stats.record_error() here since connection wasn't established
                 }
             }
         } else {
-            warn!("Unknown outbound '{}', dropping UDP packet: {} -> {}:{}",
-                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port);
+            warn!(
+                "Unknown outbound '{}', dropping UDP packet: {} -> {}:{}",
+                outbound_tag, parsed.src_ip, parsed.dst_ip, dst_port
+            );
             stats.forward_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -3481,12 +3588,20 @@ fn spawn_direct_udp_reply_listener(
 
                     // Build complete IP packet for the reply
                     let reply_packet = match (server_ip, client_ip) {
-                        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                            build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
-                        }
-                        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                            build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
-                        }
+                        (IpAddr::V4(src), IpAddr::V4(dst)) => build_udp_reply_packet(
+                            src,
+                            server_port,
+                            dst,
+                            client_port,
+                            reply_payload,
+                        ),
+                        (IpAddr::V6(src), IpAddr::V6(dst)) => build_udp_reply_packet_v6(
+                            src,
+                            server_port,
+                            dst,
+                            client_port,
+                            reply_payload,
+                        ),
                         _ => {
                             warn!(
                                 "IP version mismatch in direct UDP reply: server={}, client={}",
@@ -3512,7 +3627,11 @@ fn spawn_direct_udp_reply_listener(
                     } else {
                         trace!(
                             "Direct UDP reply forwarded: {}:{} -> {}:{} ({} bytes)",
-                            server_ip, server_port, client_ip, client_port, n
+                            server_ip,
+                            server_port,
+                            client_ip,
+                            client_port,
+                            n
                         );
                     }
                 }
@@ -3533,7 +3652,10 @@ fn spawn_direct_udp_reply_listener(
                     if last_activity.elapsed() > Duration::from_secs(60) {
                         trace!(
                             "Direct UDP reply listener idle timeout: {}:{} -> {}:{}",
-                            client_ip, client_port, server_ip, server_port
+                            client_ip,
+                            client_port,
+                            server_ip,
+                            server_port
                         );
                         break;
                     }
@@ -3581,12 +3703,20 @@ fn spawn_direct_udp_reply_listener_raw(
 
                     // Build complete IP packet for the reply
                     let reply_packet = match (server_ip, client_ip) {
-                        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                            build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
-                        }
-                        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                            build_udp_reply_packet_v6(src, server_port, dst, client_port, reply_payload)
-                        }
+                        (IpAddr::V4(src), IpAddr::V4(dst)) => build_udp_reply_packet(
+                            src,
+                            server_port,
+                            dst,
+                            client_port,
+                            reply_payload,
+                        ),
+                        (IpAddr::V6(src), IpAddr::V6(dst)) => build_udp_reply_packet_v6(
+                            src,
+                            server_port,
+                            dst,
+                            client_port,
+                            reply_payload,
+                        ),
                         _ => {
                             warn!(
                                 "IP version mismatch in direct UDP reply: server={}, client={}",
@@ -3612,7 +3742,11 @@ fn spawn_direct_udp_reply_listener_raw(
                     } else {
                         trace!(
                             "Direct UDP reply (raw) forwarded: {}:{} -> {}:{} ({} bytes)",
-                            server_ip, server_port, client_ip, client_port, n
+                            server_ip,
+                            server_port,
+                            client_ip,
+                            client_port,
+                            n
                         );
                     }
                 }
@@ -3633,7 +3767,10 @@ fn spawn_direct_udp_reply_listener_raw(
                     if last_activity.elapsed() > Duration::from_secs(60) {
                         trace!(
                             "Direct UDP reply listener (raw) idle timeout: {}:{} -> {}:{}",
-                            client_ip, client_port, server_ip, server_port
+                            client_ip,
+                            client_port,
+                            server_ip,
+                            server_port
                         );
                         break;
                     }
@@ -3711,18 +3848,20 @@ fn spawn_proxy_udp_reply_listener(
 
                     // Build complete IP packet for the reply based on IP version
                     let reply_packet = match (server_ip, client_ip) {
-                        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                            build_udp_reply_packet(src, server_port, dst, client_port, reply_payload)
-                        }
-                        (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                            build_udp_reply_packet_v6(
-                                src,
-                                server_port,
-                                dst,
-                                client_port,
-                                reply_payload,
-                            )
-                        }
+                        (IpAddr::V4(src), IpAddr::V4(dst)) => build_udp_reply_packet(
+                            src,
+                            server_port,
+                            dst,
+                            client_port,
+                            reply_payload,
+                        ),
+                        (IpAddr::V6(src), IpAddr::V6(dst)) => build_udp_reply_packet_v6(
+                            src,
+                            server_port,
+                            dst,
+                            client_port,
+                            reply_payload,
+                        ),
                         _ => {
                             warn!(
                                 "IP version mismatch in proxy UDP reply: server={}, client={}",
@@ -3820,14 +3959,14 @@ fn spawn_proxy_udp_reply_listener(
 // ============================================================================
 
 /// Maximum TCP segment size for reading server responses
-/// 
+///
 /// This is set to fit within WireGuard's MTU after encryption:
 /// - WireGuard MTU: typically 1420 bytes
 /// - IP header: 20 bytes
 /// - TCP header: 20-60 bytes (with options)
 /// - WireGuard overhead: 32 bytes (transport header + auth tag)
 /// - Safety margin: additional bytes for IPv6, options, etc.
-/// 
+///
 /// Conservative value: 1420 - 20 (IP) - 60 (TCP max) - 32 (WG) - 8 (safety) = 1300
 // ============================================================================
 // ICMP Forwarding
@@ -3837,7 +3976,7 @@ fn spawn_proxy_udp_reply_listener(
 ///
 /// For ICMP Echo Request (ping), we send the request to the destination
 /// and wait for the Echo Reply, then forward it back to the client.
-/// 
+///
 /// If the destination is the gateway's local IP, we respond directly
 /// with an Echo Reply without forwarding.
 async fn forward_icmp_packet(
@@ -3859,7 +3998,9 @@ async fn forward_icmp_packet(
     };
 
     // Parse ICMP header
-    let Some((icmp_type, _icmp_code, id, seq, payload)) = parse_icmp_echo(&processed.data, parsed.ip_header_len) else {
+    let Some((icmp_type, _icmp_code, id, seq, payload)) =
+        parse_icmp_echo(&processed.data, parsed.ip_header_len)
+    else {
         debug!("Failed to parse ICMP packet");
         stats.forward_errors.fetch_add(1, Ordering::Relaxed);
         return;
@@ -3883,7 +4024,7 @@ async fn forward_icmp_packet(
                 "ICMP Echo Request to local gateway, sending reply: {} -> {} (id={}, seq={})",
                 dst_ip, src_ip, id, seq
             );
-            
+
             // Register session so reply router can find the peer
             // The reply packet has src=gateway, dst=client, so we register with
             // key = (client_ip, id, gateway_ip, 0, ICMP) to match the reply lookup
@@ -3901,10 +4042,10 @@ async fn forward_icmp_packet(
                 outbound_tag.to_string(),
                 parsed.total_len as u64,
             );
-            
+
             // Build Echo Reply directly
             let reply_packet = build_icmp_reply_packet(dst_ip, src_ip, id, seq, &payload);
-            
+
             if let Some(ref reply_tx) = direct_reply_tx {
                 if let Err(e) = reply_tx.try_send(ReplyPacket {
                     packet: reply_packet,
@@ -3977,7 +4118,9 @@ async fn forward_icmp_packet(
                 // Wait for reply with timeout
                 // Note: SOCK_DGRAM with IPPROTO_ICMP returns only ICMP data (no IP header)
                 let mut recv_buf = vec![0u8; 1500];
-                match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut recv_buf)).await {
+                match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut recv_buf))
+                    .await
+                {
                     Ok(Ok((n, _from))) => {
                         // Parse received ICMP reply (no IP header with SOCK_DGRAM)
                         if n >= 8 {
@@ -3994,8 +4137,8 @@ async fn forward_icmp_packet(
                                 let reply_packet = build_icmp_reply_packet(
                                     server_ip,
                                     client_ip,
-                                    id,   // Use original ID
-                                    seq,  // Use original seq
+                                    id,  // Use original ID
+                                    seq, // Use original seq
                                     &recv_payload,
                                 );
 
@@ -4207,7 +4350,10 @@ pub async fn run_peer_tunnel_processor_loop(
     ingress_manager: Arc<WgIngressManager>,
     peer_manager: Arc<PeerManager>,
 ) {
-    info!("Peer tunnel processor started (forward_tx: {}, reply routing enabled)", forward_tx.is_some());
+    info!(
+        "Peer tunnel processor started (forward_tx: {}, reply routing enabled)",
+        forward_tx.is_some()
+    );
 
     while let Some(reply) = packet_rx.recv().await {
         stats.packets_received.fetch_add(1, Ordering::Relaxed);
@@ -4223,8 +4369,12 @@ pub async fn run_peer_tunnel_processor_loop(
             let version = (packet[0] >> 4) & 0x0F;
             if version == 4 && packet.len() >= 20 {
                 // IPv4
-                let s_ip = IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
-                let d_ip = IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
+                let s_ip = IpAddr::V4(Ipv4Addr::new(
+                    packet[12], packet[13], packet[14], packet[15],
+                ));
+                let d_ip = IpAddr::V4(Ipv4Addr::new(
+                    packet[16], packet[17], packet[18], packet[19],
+                ));
                 let ihl = ((packet[0] & 0x0F) as usize) * 4;
                 let protocol = packet[9];
                 let dscp = (packet[1] >> 2) & 0x3F;
@@ -4237,8 +4387,10 @@ pub async fn run_peer_tunnel_processor_loop(
                         (0, 0)
                     }
                 } else if packet.len() >= ihl + 4 {
-                    (u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
-                     u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]))
+                    (
+                        u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                        u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
+                    )
                 } else {
                     (0, 0)
                 };
@@ -4262,17 +4414,33 @@ pub async fn run_peer_tunnel_processor_loop(
                         (0, 0)
                     }
                 } else if packet.len() >= 44 {
-                    (u16::from_be_bytes([packet[40], packet[41]]),
-                     u16::from_be_bytes([packet[42], packet[43]]))
+                    (
+                        u16::from_be_bytes([packet[40], packet[41]]),
+                        u16::from_be_bytes([packet[42], packet[43]]),
+                    )
                 } else {
                     (0, 0)
                 };
                 (s_ip, d_ip, sp, dp, protocol, dscp)
             } else {
-                (IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, 0, 0, 0)
+                (
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    0,
+                    0,
+                    0,
+                    0,
+                )
             }
         } else {
-            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, 0, 0, 0)
+            (
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+                0,
+                0,
+                0,
+            )
         };
 
         // Build 5-tuple for session tracking
@@ -4310,8 +4478,11 @@ pub async fn run_peer_tunnel_processor_loop(
                             .await
                         {
                             Ok(()) => {
-                                stats.entry_replies_forwarded.fetch_add(1, Ordering::Relaxed);
-                                session_tracker.update_received(&reversed_tuple, packet.len() as u64);
+                                stats
+                                    .entry_replies_forwarded
+                                    .fetch_add(1, Ordering::Relaxed);
+                                session_tracker
+                                    .update_received(&reversed_tuple, packet.len() as u64);
                             }
                             Err(e) => {
                                 stats.reply_send_errors.fetch_add(1, Ordering::Relaxed);
@@ -4338,14 +4509,23 @@ pub async fn run_peer_tunnel_processor_loop(
                             "[REPLY-RELAY] Routing return traffic to previous peer tunnel"
                         );
 
-                        match peer_manager.send_to_peer_tunnel(&source_tunnel, &packet).await {
+                        match peer_manager
+                            .send_to_peer_tunnel(&source_tunnel, &packet)
+                            .await
+                        {
                             Ok(()) => {
-                                stats.relay_replies_forwarded.fetch_add(1, Ordering::Relaxed);
-                                session_tracker.update_received(&reversed_tuple, packet.len() as u64);
+                                stats
+                                    .relay_replies_forwarded
+                                    .fetch_add(1, Ordering::Relaxed);
+                                session_tracker
+                                    .update_received(&reversed_tuple, packet.len() as u64);
                             }
                             Err(e) => {
                                 stats.reply_send_errors.fetch_add(1, Ordering::Relaxed);
-                                warn!("[REPLY-RELAY] Failed to send reply to tunnel {}: {}", source_tunnel, e);
+                                warn!(
+                                    "[REPLY-RELAY] Failed to send reply to tunnel {}: {}",
+                                    source_tunnel, e
+                                );
                             }
                         }
                         continue;
@@ -4353,7 +4533,9 @@ pub async fn run_peer_tunnel_processor_loop(
 
                     Some(ChainRole::Terminal) => {
                         // Terminal replies should go through reply_router, not here
-                        warn!("[REPLY-TERMINAL] Unexpected terminal reply in peer_tunnel_processor");
+                        warn!(
+                            "[REPLY-TERMINAL] Unexpected terminal reply in peer_tunnel_processor"
+                        );
                         continue;
                     }
 
@@ -4382,7 +4564,7 @@ pub async fn run_peer_tunnel_processor_loop(
                     "[TERMINAL-ROUTE] Got routing decision"
                 );
                 decision
-            },
+            }
             Err(e) => {
                 stats.routing_errors.fetch_add(1, Ordering::Relaxed);
                 warn!(
@@ -4426,8 +4608,7 @@ pub async fn run_peer_tunnel_processor_loop(
         if outbound_tag == "block" || outbound_tag == "adblock" {
             debug!(
                 "Peer tunnel processor: blocking packet from {} (reason: {})",
-                tunnel_tag,
-                outbound_tag
+                tunnel_tag, outbound_tag
             );
             continue;
         }
@@ -4453,7 +4634,9 @@ pub async fn run_peer_tunnel_processor_loop(
                     Some(tunnel_tag.clone()),
                     ChainRole::Relay,
                 );
-                stats.chain_sessions_registered.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .chain_sessions_registered
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(tunnel = %tunnel_tag, next_hop = %outbound_tag, "[CHAIN-SESSION] Registered Relay session");
             } else {
                 // Terminal node: forwarding to exit egress
@@ -4466,7 +4649,9 @@ pub async fn run_peer_tunnel_processor_loop(
                     Some(tunnel_tag.clone()),
                     ChainRole::Terminal,
                 );
-                stats.chain_sessions_registered.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .chain_sessions_registered
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(tunnel = %tunnel_tag, egress = %outbound_tag, "[CHAIN-SESSION] Registered Terminal session");
             }
             // === END CHAIN SESSION REGISTRATION ===
@@ -4624,9 +4809,14 @@ pub fn get_proxy_udp_session_count() -> usize {
 #[cfg(feature = "ipstack-tcp")]
 pub async fn init_ipstack_bridge(
     rule_engine: Option<std::sync::Arc<crate::rules::engine::RuleEngine>>,
-    #[cfg(feature = "fakedns")] fakedns_manager: Option<std::sync::Arc<crate::fakedns::FakeDnsManager>>,
+    #[cfg(feature = "fakedns")] fakedns_manager: Option<
+        std::sync::Arc<crate::fakedns::FakeDnsManager>,
+    >,
     outbound_manager: Option<std::sync::Arc<crate::outbound::OutboundManager>>,
-) -> anyhow::Result<(mpsc::Receiver<(bytes::BytesMut, [u8; 32])>, Arc<IpStackSessionTracker>)> {
+) -> anyhow::Result<(
+    mpsc::Receiver<(bytes::BytesMut, [u8; 32])>,
+    Arc<IpStackSessionTracker>,
+)> {
     use super::ipstack_bridge::configured_shard_count;
 
     let shard_count = configured_shard_count();
@@ -4662,7 +4852,10 @@ pub async fn init_ipstack_bridge(
         .set(Arc::new(bridge))
         .map_err(|_| anyhow::anyhow!("ShardedIpStackBridge already initialized"))?;
 
-    info!(shard_count, "ShardedIpStackBridge initialized with {} shards", shard_count);
+    info!(
+        shard_count,
+        "ShardedIpStackBridge initialized with {} shards", shard_count
+    );
     Ok((reply_rx, session_tracker))
 }
 
@@ -4906,7 +5099,9 @@ impl ParallelReplyRouter {
                 // Successfully queued for per-peer processing
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.stats.channel_full_drops.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .channel_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 // Don't log at trace level to avoid log spam under load
                 // The packet is dropped; TCP will retransmit if needed
             }
@@ -5015,7 +5210,9 @@ impl ParallelReplyRouter {
             .or_insert_with(|| {
                 let (tx, rx) = mpsc::channel(PEER_CHANNEL_BUFFER_SIZE);
                 self.spawn_peer_task(peer_key, rx);
-                self.stats.peer_tasks_spawned.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .peer_tasks_spawned
+                    .fetch_add(1, Ordering::Relaxed);
                 tx
             })
             .clone()
@@ -5213,23 +5410,47 @@ mod tests {
     #[test]
     fn test_five_tuple_protocol_name() {
         assert_eq!(
-            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IPPROTO_TCP)
-                .protocol_name(),
+            FiveTuple::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IPPROTO_TCP
+            )
+            .protocol_name(),
             "TCP"
         );
         assert_eq!(
-            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IPPROTO_UDP)
-                .protocol_name(),
+            FiveTuple::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IPPROTO_UDP
+            )
+            .protocol_name(),
             "UDP"
         );
         assert_eq!(
-            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IPPROTO_ICMP)
-                .protocol_name(),
+            FiveTuple::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IPPROTO_ICMP
+            )
+            .protocol_name(),
             "ICMP"
         );
         assert_eq!(
-            FiveTuple::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 99)
-                .protocol_name(),
+            FiveTuple::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                99
+            )
+            .protocol_name(),
             "Unknown"
         );
     }
@@ -5885,7 +6106,7 @@ mod tests {
         packet[0] = 0x60; // IPv6
         packet[4..6].copy_from_slice(&(8u16.to_be_bytes())); // Payload length (UDP header)
         packet[6] = IPPROTO_UDP; // Next Header
-        // Source IPv6 at bytes 8-23
+                                 // Source IPv6 at bytes 8-23
         packet[8..24].copy_from_slice(&[
             0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x02,
@@ -6101,7 +6322,7 @@ mod tests {
         packet[6..8].copy_from_slice(&[0x00, 0x00]); // Flags + Fragment offset
         packet[8] = 64; // TTL
         packet[9] = IPPROTO_UDP; // Protocol
-        // Checksum left as 0
+                                 // Checksum left as 0
         packet[12..16].copy_from_slice(&src_ip.octets()); // Source IP
         packet[16..20].copy_from_slice(&dst_ip.octets()); // Dest IP
 
@@ -6158,7 +6379,10 @@ mod tests {
         assert!(outbound.supports_udp());
 
         // Connect UDP
-        let handle = outbound.connect_udp(server_addr, Duration::from_secs(5)).await.unwrap();
+        let handle = outbound
+            .connect_udp(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(handle.dest_addr(), server_addr);
 
         // Send via handle
@@ -6223,7 +6447,10 @@ mod tests {
 
         // Verify it's specifically a Blocked error
         match result {
-            Err(UdpError::Blocked { tag, addr: blocked_addr }) => {
+            Err(UdpError::Blocked {
+                tag,
+                addr: blocked_addr,
+            }) => {
                 assert_eq!(tag, "block");
                 assert_eq!(blocked_addr, addr);
             }
@@ -6315,7 +6542,9 @@ mod tests {
         flags: u8,
         payload: &[u8],
     ) -> Vec<u8> {
-        build_tcp_packet_with_window(src_ip, src_port, dst_ip, dst_port, seq, ack, flags, 65535, payload)
+        build_tcp_packet_with_window(
+            src_ip, src_port, dst_ip, dst_port, seq, ack, flags, 65535, payload,
+        )
     }
 
     #[test]
@@ -6502,7 +6731,12 @@ mod tests {
 
         // All flags
         let details = TcpDetails {
-            flags: tcp_flags::SYN | tcp_flags::ACK | tcp_flags::FIN | tcp_flags::RST | tcp_flags::PSH | tcp_flags::URG,
+            flags: tcp_flags::SYN
+                | tcp_flags::ACK
+                | tcp_flags::FIN
+                | tcp_flags::RST
+                | tcp_flags::PSH
+                | tcp_flags::URG,
             ..details
         };
         assert_eq!(details.flags_string(), "SYN,ACK,FIN,RST,PSH,URG");

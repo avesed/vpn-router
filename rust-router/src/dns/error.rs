@@ -322,7 +322,11 @@ impl DnsError {
     /// let err = DnsError::upstream_rcode("8.8.8.8:53", "server failure", 2);
     /// assert!(err.to_string().contains("server failure"));
     /// ```
-    pub fn upstream_rcode(upstream: impl Into<String>, reason: impl Into<String>, rcode: u8) -> Self {
+    pub fn upstream_rcode(
+        upstream: impl Into<String>,
+        reason: impl Into<String>,
+        rcode: u8,
+    ) -> Self {
         Self::UpstreamError {
             upstream: upstream.into(),
             reason: reason.into(),
@@ -741,7 +745,10 @@ mod tests {
     #[test]
     fn test_upstream_error_with_rcode() {
         let err = DnsError::upstream_rcode("1.1.1.1:53", "server failure", 2);
-        assert!(matches!(err, DnsError::UpstreamError { rcode: Some(2), .. }));
+        assert!(matches!(
+            err,
+            DnsError::UpstreamError { rcode: Some(2), .. }
+        ));
     }
 
     #[test]
@@ -807,7 +814,13 @@ mod tests {
     #[test]
     fn test_invalid_query_error_with_id() {
         let err = DnsError::invalid_query_id("bad opcode", 0x1234);
-        assert!(matches!(err, DnsError::InvalidQuery { query_id: Some(0x1234), .. }));
+        assert!(matches!(
+            err,
+            DnsError::InvalidQuery {
+                query_id: Some(0x1234),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -852,11 +865,7 @@ mod tests {
         ];
 
         for err in recoverable {
-            assert!(
-                err.is_recoverable(),
-                "Expected {} to be recoverable",
-                err
-            );
+            assert!(err.is_recoverable(), "Expected {} to be recoverable", err);
         }
     }
 
@@ -964,7 +973,10 @@ mod tests {
             Some("test.com")
         );
         assert_eq!(DnsError::parse("err").domain(), None);
-        assert_eq!(DnsError::timeout("q", Duration::from_secs(1)).domain(), None);
+        assert_eq!(
+            DnsError::timeout("q", Duration::from_secs(1)).domain(),
+            None
+        );
     }
 
     #[test]
@@ -977,6 +989,9 @@ mod tests {
             DnsError::upstream_rcode("1.1.1.1:53", "err", 2).upstream_addr(),
             Some("1.1.1.1:53")
         );
-        assert_eq!(DnsError::timeout("q", Duration::from_secs(1)).upstream_addr(), None);
+        assert_eq!(
+            DnsError::timeout("q", Duration::from_secs(1)).upstream_addr(),
+            None
+        );
     }
 }

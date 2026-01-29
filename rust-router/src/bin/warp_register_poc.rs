@@ -137,7 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("   Account ID: {}", register_resp.id);
     println!("   Account type: {}", register_resp.account.account_type);
-    println!("   License key: {}...", &register_resp.account.license[..16]);
+    println!(
+        "   License key: {}...",
+        &register_resp.account.license[..16]
+    );
 
     // Step 4: Extract WireGuard config
     println!("\n4. Extracting WireGuard configuration...");

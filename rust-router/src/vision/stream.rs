@@ -116,7 +116,9 @@ impl StreamState {
     #[must_use]
     pub fn to_vision_state(&self) -> VisionState {
         match self {
-            Self::Inspecting | Self::AwaitServerHello | Self::AwaitAppData => VisionState::Inspecting,
+            Self::Inspecting | Self::AwaitServerHello | Self::AwaitAppData => {
+                VisionState::Inspecting
+            }
             Self::Passthrough => VisionState::Passthrough,
             Self::Encrypted => VisionState::Encrypted,
         }
@@ -369,7 +371,9 @@ impl<S: AsyncRead + Unpin> VisionStream<S> {
 
                 StreamState::AwaitServerHello => {
                     if !is_tls_traffic(available) {
-                        debug!("VisionStream: lost TLS structure after ClientHello, encrypted mode");
+                        debug!(
+                            "VisionStream: lost TLS structure after ClientHello, encrypted mode"
+                        );
                         self.state = StreamState::Encrypted;
                         return true;
                     }
@@ -408,7 +412,9 @@ impl<S: AsyncRead + Unpin> VisionStream<S> {
 
                 StreamState::AwaitAppData => {
                     if !is_tls_traffic(available) {
-                        debug!("VisionStream: lost TLS structure after ServerHello, encrypted mode");
+                        debug!(
+                            "VisionStream: lost TLS structure after ServerHello, encrypted mode"
+                        );
                         self.state = StreamState::Encrypted;
                         return true;
                     }
@@ -1184,8 +1190,16 @@ mod tests {
     async fn test_tls_with_oversized_record() {
         // TLS header claiming massive record size
         let data = vec![
-            TLS_HANDSHAKE, 0x03, 0x03, 0xFF, 0xFF, // Length > 16KB (invalid)
-            0x01, 0x02, 0x03, 0x04, 0x05,
+            TLS_HANDSHAKE,
+            0x03,
+            0x03,
+            0xFF,
+            0xFF, // Length > 16KB (invalid)
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+            0x05,
         ];
         let mock = MockStream::new(data);
         let mut vision = VisionStream::new(mock);

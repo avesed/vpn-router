@@ -4,8 +4,9 @@
 //! fragmentation for large plaintexts.
 
 use crate::reality::common::{
-    build_record_header, strip_content_type_slice, AEAD_TAG_SIZE, CONTENT_TYPE_ALERT,
-    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_PLAINTEXT_LEN, ALERT_LEVEL_WARNING, ALERT_DESC_CLOSE_NOTIFY,
+    build_record_header, strip_content_type_slice, AEAD_TAG_SIZE, ALERT_DESC_CLOSE_NOTIFY,
+    ALERT_LEVEL_WARNING, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
+    MAX_TLS_PLAINTEXT_LEN,
 };
 use crate::reality::crypto::AeadKey;
 use crate::reality::error::{RealityError, RealityResult};
@@ -54,7 +55,8 @@ impl<'a> RecordEncryptor<'a> {
             let ciphertext_len = inner.len() + AEAD_TAG_SIZE;
             let aad = build_record_header(CONTENT_TYPE_APPLICATION_DATA, ciphertext_len as u16);
 
-            self.key.seal_in_place(&mut inner, self.iv, *self.seq, &aad)?;
+            self.key
+                .seal_in_place(&mut inner, self.iv, *self.seq, &aad)?;
             *self.seq += 1;
 
             // Write record header + ciphertext
@@ -82,7 +84,8 @@ impl<'a> RecordEncryptor<'a> {
         let ciphertext_len = inner.len() + AEAD_TAG_SIZE;
         let aad = build_record_header(CONTENT_TYPE_APPLICATION_DATA, ciphertext_len as u16);
 
-        self.key.seal_in_place(&mut inner, self.iv, *self.seq, &aad)?;
+        self.key
+            .seal_in_place(&mut inner, self.iv, *self.seq, &aad)?;
         *self.seq += 1;
 
         ciphertext_buf.extend_from_slice(&aad);
@@ -94,12 +97,17 @@ impl<'a> RecordEncryptor<'a> {
     /// Encrypt a close_notify alert
     pub fn encrypt_close_notify(&mut self, ciphertext_buf: &mut Vec<u8>) -> RealityResult<()> {
         // Build alert: level (1) + description (1) + content_type
-        let mut inner = vec![ALERT_LEVEL_WARNING, ALERT_DESC_CLOSE_NOTIFY, CONTENT_TYPE_ALERT];
+        let mut inner = vec![
+            ALERT_LEVEL_WARNING,
+            ALERT_DESC_CLOSE_NOTIFY,
+            CONTENT_TYPE_ALERT,
+        ];
 
         let ciphertext_len = inner.len() + AEAD_TAG_SIZE;
         let aad = build_record_header(CONTENT_TYPE_APPLICATION_DATA, ciphertext_len as u16);
 
-        self.key.seal_in_place(&mut inner, self.iv, *self.seq, &aad)?;
+        self.key
+            .seal_in_place(&mut inner, self.iv, *self.seq, &aad)?;
         *self.seq += 1;
 
         ciphertext_buf.extend_from_slice(&aad);
@@ -146,7 +154,9 @@ impl<'a> RecordDecryptor<'a> {
         let aad = build_record_header(CONTENT_TYPE_APPLICATION_DATA, record_len);
 
         // Decrypt in-place
-        let plaintext = self.key.open_in_place(ciphertext, self.iv, *self.seq, &aad)?;
+        let plaintext = self
+            .key
+            .open_in_place(ciphertext, self.iv, *self.seq, &aad)?;
         *self.seq += 1;
 
         // Strip content type trailer
@@ -201,7 +211,9 @@ mod tests {
         // Encrypt
         {
             let mut encryptor = RecordEncryptor::new(&key, &iv, &mut write_seq);
-            encryptor.encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf).unwrap();
+            encryptor
+                .encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf)
+                .unwrap();
         }
 
         assert!(plaintext_buf.is_empty());
@@ -213,7 +225,9 @@ mod tests {
 
         let (content_type, decrypted) = {
             let mut decryptor = RecordDecryptor::new(&key, &iv, &mut read_seq);
-            let (ct, pt) = decryptor.decrypt_record_in_place(&mut ciphertext_payload, record_len).unwrap();
+            let (ct, pt) = decryptor
+                .decrypt_record_in_place(&mut ciphertext_payload, record_len)
+                .unwrap();
             (ct, pt.to_vec())
         };
 
@@ -236,7 +250,9 @@ mod tests {
         // Encrypt
         {
             let mut encryptor = RecordEncryptor::new(&key, &iv, &mut write_seq);
-            encryptor.encrypt_handshake(&handshake, &mut ciphertext_buf).unwrap();
+            encryptor
+                .encrypt_handshake(&handshake, &mut ciphertext_buf)
+                .unwrap();
         }
 
         // Decrypt
@@ -245,7 +261,9 @@ mod tests {
 
         let (content_type, decrypted) = {
             let mut decryptor = RecordDecryptor::new(&key, &iv, &mut read_seq);
-            let (ct, pt) = decryptor.decrypt_record_in_place(&mut ciphertext_payload, record_len).unwrap();
+            let (ct, pt) = decryptor
+                .decrypt_record_in_place(&mut ciphertext_payload, record_len)
+                .unwrap();
             (ct, pt.to_vec())
         };
 
@@ -267,7 +285,9 @@ mod tests {
         // Encrypt - should produce multiple records
         {
             let mut encryptor = RecordEncryptor::new(&key, &iv, &mut write_seq);
-            encryptor.encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf).unwrap();
+            encryptor
+                .encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf)
+                .unwrap();
         }
 
         // Should have encrypted all data
@@ -281,15 +301,18 @@ mod tests {
         let mut record_count = 0;
         let mut offset = 0;
         while offset + TLS_RECORD_HEADER_SIZE <= ciphertext_buf.len() {
-            let record_len = u16::from_be_bytes([
-                ciphertext_buf[offset + 3],
-                ciphertext_buf[offset + 4],
-            ]) as usize;
+            let record_len =
+                u16::from_be_bytes([ciphertext_buf[offset + 3], ciphertext_buf[offset + 4]])
+                    as usize;
             record_count += 1;
             offset += TLS_RECORD_HEADER_SIZE + record_len;
         }
 
-        assert!(record_count >= 2, "Expected multiple records, got {}", record_count);
+        assert!(
+            record_count >= 2,
+            "Expected multiple records, got {}",
+            record_count
+        );
     }
 
     #[test]
@@ -304,7 +327,9 @@ mod tests {
         for _ in 0..5 {
             let mut plaintext_buf = b"test".to_vec();
             let mut encryptor = RecordEncryptor::new(&key, &iv, &mut seq);
-            encryptor.encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf).unwrap();
+            encryptor
+                .encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf)
+                .unwrap();
         }
 
         assert_eq!(seq, 5);
@@ -331,7 +356,9 @@ mod tests {
 
         let (content_type, decrypted) = {
             let mut decryptor = RecordDecryptor::new(&key, &iv, &mut read_seq);
-            let (ct, pt) = decryptor.decrypt_record_in_place(&mut ciphertext_payload, record_len).unwrap();
+            let (ct, pt) = decryptor
+                .decrypt_record_in_place(&mut ciphertext_payload, record_len)
+                .unwrap();
             (ct, pt.to_vec())
         };
 
@@ -367,7 +394,9 @@ mod tests {
         // Encrypt with key1
         {
             let mut encryptor = RecordEncryptor::new(&key1, &iv, &mut write_seq);
-            encryptor.encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf).unwrap();
+            encryptor
+                .encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf)
+                .unwrap();
         }
 
         // Try to decrypt with key2 - should fail

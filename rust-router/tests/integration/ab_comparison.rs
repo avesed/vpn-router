@@ -92,8 +92,12 @@ impl MetricSummary {
         };
 
         // Use ceiling of (P * N) - 1 for standard nearest-rank percentile
-        let p95_idx = ((count as f64 * 0.95).ceil() as usize).saturating_sub(1).min(count - 1);
-        let p99_idx = ((count as f64 * 0.99).ceil() as usize).saturating_sub(1).min(count - 1);
+        let p95_idx = ((count as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(count - 1);
+        let p99_idx = ((count as f64 * 0.99).ceil() as usize)
+            .saturating_sub(1)
+            .min(count - 1);
 
         let variance: f64 = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / count as f64;
         let std_dev = variance.sqrt();
@@ -139,7 +143,10 @@ pub enum MetricCategory {
 impl MetricCategory {
     /// Returns true if higher values are better for this metric
     pub fn higher_is_better(&self) -> bool {
-        matches!(self, MetricCategory::Throughput | MetricCategory::ConnectionRate)
+        matches!(
+            self,
+            MetricCategory::Throughput | MetricCategory::ConnectionRate
+        )
     }
 }
 
@@ -305,7 +312,9 @@ pub struct MetricCollector {
 
 impl MetricCollector {
     pub fn new() -> Self {
-        MetricCollector { samples: Vec::new() }
+        MetricCollector {
+            samples: Vec::new(),
+        }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -501,14 +510,41 @@ impl ABTestReport {
 
 impl fmt::Display for ABTestReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "╔══════════════════════════════════════════════════════════════╗")?;
-        writeln!(f, "║              A/B Comparison Test Report                       ║")?;
-        writeln!(f, "╠══════════════════════════════════════════════════════════════╣")?;
-        writeln!(f, "║ Configuration:                                                ║")?;
-        writeln!(f, "║   Warmup iterations:   {:>6}                                 ║", self.config.warmup_iterations)?;
-        writeln!(f, "║   Measurement iters:   {:>6}                                 ║", self.config.measurement_iterations)?;
-        writeln!(f, "║   Concurrent workers:  {:>6}                                 ║", self.config.concurrent_workers)?;
-        writeln!(f, "╠══════════════════════════════════════════════════════════════╣")?;
+        writeln!(
+            f,
+            "╔══════════════════════════════════════════════════════════════╗"
+        )?;
+        writeln!(
+            f,
+            "║              A/B Comparison Test Report                       ║"
+        )?;
+        writeln!(
+            f,
+            "╠══════════════════════════════════════════════════════════════╣"
+        )?;
+        writeln!(
+            f,
+            "║ Configuration:                                                ║"
+        )?;
+        writeln!(
+            f,
+            "║   Warmup iterations:   {:>6}                                 ║",
+            self.config.warmup_iterations
+        )?;
+        writeln!(
+            f,
+            "║   Measurement iters:   {:>6}                                 ║",
+            self.config.measurement_iterations
+        )?;
+        writeln!(
+            f,
+            "║   Concurrent workers:  {:>6}                                 ║",
+            self.config.concurrent_workers
+        )?;
+        writeln!(
+            f,
+            "╠══════════════════════════════════════════════════════════════╣"
+        )?;
 
         for result in &self.results {
             writeln!(f)?;
@@ -516,18 +552,54 @@ impl fmt::Display for ABTestReport {
         }
 
         writeln!(f)?;
-        writeln!(f, "╠══════════════════════════════════════════════════════════════╣")?;
-        writeln!(f, "║ Summary:                                                      ║")?;
-        writeln!(f, "║   Total tests:         {:>6}                                 ║", self.summary.total_tests)?;
-        writeln!(f, "║   rust-router wins:    {:>6}                                 ║", self.summary.rust_router_wins)?;
-        writeln!(f, "║   sing-box wins:       {:>6}                                 ║", self.summary.singbox_wins)?;
-        writeln!(f, "║   Ties:                {:>6}                                 ║", self.summary.ties)?;
-        writeln!(f, "║   Failed targets:      {:>6}                                 ║", self.summary.failed_targets)?;
-        writeln!(f, "╠══════════════════════════════════════════════════════════════╣")?;
+        writeln!(
+            f,
+            "╠══════════════════════════════════════════════════════════════╣"
+        )?;
+        writeln!(
+            f,
+            "║ Summary:                                                      ║"
+        )?;
+        writeln!(
+            f,
+            "║   Total tests:         {:>6}                                 ║",
+            self.summary.total_tests
+        )?;
+        writeln!(
+            f,
+            "║   rust-router wins:    {:>6}                                 ║",
+            self.summary.rust_router_wins
+        )?;
+        writeln!(
+            f,
+            "║   sing-box wins:       {:>6}                                 ║",
+            self.summary.singbox_wins
+        )?;
+        writeln!(
+            f,
+            "║   Ties:                {:>6}                                 ║",
+            self.summary.ties
+        )?;
+        writeln!(
+            f,
+            "║   Failed targets:      {:>6}                                 ║",
+            self.summary.failed_targets
+        )?;
+        writeln!(
+            f,
+            "╠══════════════════════════════════════════════════════════════╣"
+        )?;
 
-        let status = if self.is_passing() { "PASS ✓" } else { "FAIL ✗" };
+        let status = if self.is_passing() {
+            "PASS ✓"
+        } else {
+            "FAIL ✗"
+        };
         writeln!(f, "║ Overall Result: {:>45} ║", status)?;
-        writeln!(f, "╚══════════════════════════════════════════════════════════════╝")
+        writeln!(
+            f,
+            "╚══════════════════════════════════════════════════════════════╝"
+        )
     }
 }
 
@@ -542,8 +614,8 @@ pub fn simulate_latency_test(router: RouterType, iterations: usize) -> MetricCol
     for i in 0..iterations {
         // Simulate realistic latency patterns
         let base_latency = match router {
-            RouterType::RustRouter => 50.0 + (i % 10) as f64,  // ~50-60μs
-            RouterType::SingBox => 80.0 + (i % 15) as f64,     // ~80-95μs
+            RouterType::RustRouter => 50.0 + (i % 10) as f64, // ~50-60μs
+            RouterType::SingBox => 80.0 + (i % 15) as f64,    // ~80-95μs
         };
 
         // Add some variance
@@ -558,8 +630,8 @@ pub fn simulate_latency_test(router: RouterType, iterations: usize) -> MetricCol
 pub fn simulate_throughput_test(router: RouterType, duration_secs: f64) -> f64 {
     // Simulate throughput in MB/s
     match router {
-        RouterType::RustRouter => 850.0 + (duration_secs * 10.0).sin() * 50.0,  // ~800-900 MB/s
-        RouterType::SingBox => 720.0 + (duration_secs * 10.0).sin() * 40.0,     // ~680-760 MB/s
+        RouterType::RustRouter => 850.0 + (duration_secs * 10.0).sin() * 50.0, // ~800-900 MB/s
+        RouterType::SingBox => 720.0 + (duration_secs * 10.0).sin() * 40.0,    // ~680-760 MB/s
     }
 }
 
@@ -567,8 +639,8 @@ pub fn simulate_throughput_test(router: RouterType, duration_secs: f64) -> f64 {
 pub fn simulate_connection_rate(router: RouterType, duration_secs: f64) -> f64 {
     // Simulate connections per second
     match router {
-        RouterType::RustRouter => 12500.0 + duration_secs * 100.0,  // ~12.5K/sec
-        RouterType::SingBox => 10200.0 + duration_secs * 80.0,      // ~10.2K/sec
+        RouterType::RustRouter => 12500.0 + duration_secs * 100.0, // ~12.5K/sec
+        RouterType::SingBox => 10200.0 + duration_secs * 80.0,     // ~10.2K/sec
     }
 }
 
@@ -603,12 +675,8 @@ mod tests {
         let rust = MetricSummary::from_samples(&vec![100.0, 110.0, 120.0]).unwrap();
         let singbox = MetricSummary::from_samples(&vec![80.0, 90.0, 100.0]).unwrap();
 
-        let result = ComparisonResult::new(
-            MetricCategory::Throughput,
-            "throughput_test",
-            rust,
-            singbox,
-        );
+        let result =
+            ComparisonResult::new(MetricCategory::Throughput, "throughput_test", rust, singbox);
 
         // rust-router has higher throughput, should win
         assert_eq!(result.winner, ComparisonWinner::RustRouter);
@@ -620,12 +688,7 @@ mod tests {
         let rust = MetricSummary::from_samples(&vec![50.0, 55.0, 60.0]).unwrap();
         let singbox = MetricSummary::from_samples(&vec![80.0, 85.0, 90.0]).unwrap();
 
-        let result = ComparisonResult::new(
-            MetricCategory::Latency,
-            "latency_test",
-            rust,
-            singbox,
-        );
+        let result = ComparisonResult::new(MetricCategory::Latency, "latency_test", rust, singbox);
 
         // rust-router has lower latency, should win
         assert_eq!(result.winner, ComparisonWinner::RustRouter);
@@ -637,12 +700,7 @@ mod tests {
         let rust = MetricSummary::from_samples(&vec![100.0, 101.0, 102.0]).unwrap();
         let singbox = MetricSummary::from_samples(&vec![100.0, 100.5, 101.0]).unwrap();
 
-        let result = ComparisonResult::new(
-            MetricCategory::Latency,
-            "tie_test",
-            rust,
-            singbox,
-        );
+        let result = ComparisonResult::new(MetricCategory::Latency, "tie_test", rust, singbox);
 
         // Within tolerance, should be a tie
         assert_eq!(result.winner, ComparisonWinner::Tie);
@@ -821,8 +879,10 @@ mod integration_tests {
         let mut report = ABTestReport::new(config.clone());
 
         // Test 1: Latency comparison
-        let rust_latency = simulate_latency_test(RouterType::RustRouter, config.measurement_iterations);
-        let singbox_latency = simulate_latency_test(RouterType::SingBox, config.measurement_iterations);
+        let rust_latency =
+            simulate_latency_test(RouterType::RustRouter, config.measurement_iterations);
+        let singbox_latency =
+            simulate_latency_test(RouterType::SingBox, config.measurement_iterations);
 
         report.add_result(ComparisonResult::new(
             MetricCategory::Latency,

@@ -114,7 +114,10 @@ pub enum TwoPhaseError {
 
     /// Invalid state transition
     #[error("Invalid state transition from {from} to {to}")]
-    InvalidTransition { from: TwoPhaseState, to: TwoPhaseState },
+    InvalidTransition {
+        from: TwoPhaseState,
+        to: TwoPhaseState,
+    },
 
     /// PREPARE failed
     #[error("PREPARE failed on {node}: {reason}")]
@@ -317,7 +320,10 @@ impl ForwardPeerNetworkClient {
         // Build request headers
         let mut headers = std::collections::HashMap::new();
         headers.insert("Content-Type".to_string(), "application/json".to_string());
-        headers.insert("X-Tunnel-Source-IP".to_string(), tunnel_local_ip.to_string());
+        headers.insert(
+            "X-Tunnel-Source-IP".to_string(),
+            tunnel_local_ip.to_string(),
+        );
         headers.insert("X-Tunnel-Peer-Tag".to_string(), self.local_node_tag.clone());
 
         // Create oneshot channel for response
@@ -344,7 +350,12 @@ impl ForwardPeerNetworkClient {
         let timeout_duration = Duration::from_secs(self.timeout_secs);
         let response = timeout(timeout_duration, response_rx)
             .await
-            .map_err(|_| format!("Request to peer '{}' timed out after {}s", node, self.timeout_secs))?
+            .map_err(|_| {
+                format!(
+                    "Request to peer '{}' timed out after {}s",
+                    node, self.timeout_secs
+                )
+            })?
             .map_err(|_| format!("Response channel closed for peer '{}'", node))?;
 
         // Check response
@@ -358,7 +369,9 @@ impl ForwardPeerNetworkClient {
             );
             Ok(body)
         } else {
-            let error = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             warn!(node = %node, error = %error, "2PC request failed");
             Err(error)
         }
@@ -486,7 +499,8 @@ impl MockNetworkClient {
 
     /// Set artificial delay for operations
     pub fn set_delay(&self, delay_ms: u64) {
-        self.delay_ms.store(delay_ms, std::sync::atomic::Ordering::SeqCst);
+        self.delay_ms
+            .store(delay_ms, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -725,7 +739,12 @@ impl TwoPhaseCommit {
         // Send PREPARE via network client
         let result = if let Some(client) = &self.network_client {
             let timeout_duration = Duration::from_secs(self.timeout_secs);
-            match timeout(timeout_duration, client.send_prepare(node_tag, &self.config)).await {
+            match timeout(
+                timeout_duration,
+                client.send_prepare(node_tag, &self.config),
+            )
+            .await
+            {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(reason)) => Err(TwoPhaseError::PrepareFailed {
                     node: node_tag.to_string(),
@@ -796,7 +815,8 @@ impl TwoPhaseCommit {
         if errors.is_empty() && self.all_prepared() {
             self.transaction_state = TwoPhaseState::Prepared;
         } else {
-            self.transaction_state = TwoPhaseState::Failed("Not all participants prepared".to_string());
+            self.transaction_state =
+                TwoPhaseState::Failed("Not all participants prepared".to_string());
         }
 
         errors
@@ -835,7 +855,12 @@ impl TwoPhaseCommit {
         // Send COMMIT via network client
         let result = if let Some(client) = &self.network_client {
             let timeout_duration = Duration::from_secs(self.timeout_secs);
-            match timeout(timeout_duration, client.send_commit(node_tag, &self.chain_tag)).await {
+            match timeout(
+                timeout_duration,
+                client.send_commit(node_tag, &self.chain_tag),
+            )
+            .await
+            {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(reason)) => Err(TwoPhaseError::CommitFailed {
                     node: node_tag.to_string(),
@@ -936,7 +961,12 @@ impl TwoPhaseCommit {
         // Send ABORT via network client
         let result = if let Some(client) = &self.network_client {
             let timeout_duration = Duration::from_secs(self.timeout_secs);
-            match timeout(timeout_duration, client.send_abort(node_tag, &self.chain_tag)).await {
+            match timeout(
+                timeout_duration,
+                client.send_abort(node_tag, &self.chain_tag),
+            )
+            .await
+            {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(reason)) => Err(TwoPhaseError::AbortFailed {
                     node: node_tag.to_string(),
@@ -999,7 +1029,11 @@ impl TwoPhaseCommit {
     }
 
     /// Record PREPARE failure for a participant
-    pub fn record_prepare_failure(&mut self, node_tag: &str, reason: String) -> Result<(), TwoPhaseError> {
+    pub fn record_prepare_failure(
+        &mut self,
+        node_tag: &str,
+        reason: String,
+    ) -> Result<(), TwoPhaseError> {
         let participant = self
             .participants
             .get_mut(node_tag)
@@ -1022,7 +1056,11 @@ impl TwoPhaseCommit {
     }
 
     /// Record COMMIT failure for a participant
-    pub fn record_commit_failure(&mut self, node_tag: &str, reason: String) -> Result<(), TwoPhaseError> {
+    pub fn record_commit_failure(
+        &mut self,
+        node_tag: &str,
+        reason: String,
+    ) -> Result<(), TwoPhaseError> {
         let participant = self
             .participants
             .get_mut(node_tag)
@@ -1094,12 +1132,9 @@ mod tests {
     #[test]
     fn test_coordinator_with_timeout() {
         let config = create_test_config();
-        let coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        )
-        .with_timeout(60);
+        let coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()])
+                .with_timeout(60);
 
         assert_eq!(coordinator.timeout_secs, 60);
     }
@@ -1108,12 +1143,9 @@ mod tests {
     fn test_coordinator_with_network_client() {
         let config = create_test_config();
         let client = Arc::new(NoOpNetworkClient);
-        let coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        )
-        .with_network_client(client);
+        let coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()])
+                .with_network_client(client);
 
         assert!(coordinator.network_client.is_some());
     }
@@ -1214,17 +1246,11 @@ mod tests {
     #[test]
     fn test_participant_not_found() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         let result = coordinator.record_prepare_success("nonexistent");
-        assert!(matches!(
-            result,
-            Err(TwoPhaseError::ParticipantNotFound(_))
-        ));
+        assert!(matches!(result, Err(TwoPhaseError::ParticipantNotFound(_))));
     }
 
     #[test]
@@ -1248,11 +1274,8 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_single_no_client() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         let result = coordinator.prepare("node-a").await;
         assert!(result.is_ok());
@@ -1265,12 +1288,9 @@ mod tests {
     async fn test_prepare_single_with_noop_client() {
         let config = create_test_config();
         let client = Arc::new(NoOpNetworkClient);
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        )
-        .with_network_client(client);
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()])
+                .with_network_client(client);
 
         let result = coordinator.prepare("node-a").await;
         assert!(result.is_ok());
@@ -1282,12 +1302,9 @@ mod tests {
         let mock = Arc::new(MockNetworkClient::new());
         mock.fail_prepare("node-a", "Connection refused");
 
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        )
-        .with_network_client(mock);
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()])
+                .with_network_client(mock);
 
         let result = coordinator.prepare("node-a").await;
         assert!(matches!(result, Err(TwoPhaseError::PrepareFailed { .. })));
@@ -1299,11 +1316,8 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_idempotent() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.prepare("node-a").await.unwrap();
         // Second prepare should succeed (already prepared)
@@ -1357,11 +1371,8 @@ mod tests {
     #[tokio::test]
     async fn test_commit_single_success() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.record_prepare_success("node-a").unwrap();
         let result = coordinator.commit("node-a").await;
@@ -1374,24 +1385,21 @@ mod tests {
     #[tokio::test]
     async fn test_commit_not_prepared() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         let result = coordinator.commit("node-a").await;
-        assert!(matches!(result, Err(TwoPhaseError::InvalidTransition { .. })));
+        assert!(matches!(
+            result,
+            Err(TwoPhaseError::InvalidTransition { .. })
+        ));
     }
 
     #[tokio::test]
     async fn test_commit_idempotent() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.record_prepare_success("node-a").unwrap();
         coordinator.commit("node-a").await.unwrap();
@@ -1407,12 +1415,9 @@ mod tests {
         let mock = Arc::new(MockNetworkClient::new());
         mock.fail_commit("node-a", "Commit failed");
 
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        )
-        .with_network_client(mock);
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()])
+                .with_network_client(mock);
 
         coordinator.record_prepare_success("node-a").unwrap();
         let result = coordinator.commit("node-a").await;
@@ -1487,11 +1492,8 @@ mod tests {
     #[tokio::test]
     async fn test_abort_single_success() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         let result = coordinator.abort("node-a").await;
         assert!(result.is_ok());
@@ -1503,25 +1505,22 @@ mod tests {
     #[tokio::test]
     async fn test_abort_already_committed() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.record_commit_success("node-a").unwrap();
         let result = coordinator.abort("node-a").await;
-        assert!(matches!(result, Err(TwoPhaseError::InvalidTransition { .. })));
+        assert!(matches!(
+            result,
+            Err(TwoPhaseError::InvalidTransition { .. })
+        ));
     }
 
     #[tokio::test]
     async fn test_abort_idempotent() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.abort("node-a").await.unwrap();
         // Second abort should succeed
@@ -1633,13 +1632,10 @@ mod tests {
         let mock = Arc::new(MockNetworkClient::new());
         mock.set_delay(2000); // 2 second delay
 
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        )
-        .with_timeout(1) // 1 second timeout
-        .with_network_client(mock);
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()])
+                .with_timeout(1) // 1 second timeout
+                .with_network_client(mock);
 
         let result = coordinator.prepare("node-a").await;
         assert!(matches!(result, Err(TwoPhaseError::Timeout { .. })));
@@ -1652,11 +1648,8 @@ mod tests {
     #[test]
     fn test_record_methods() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         // Test record_prepare_success
         coordinator.record_prepare_success("node-a").unwrap();
@@ -1703,11 +1696,8 @@ mod tests {
     #[test]
     fn test_record_abort() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.record_abort("node-a").unwrap();
         assert_eq!(
@@ -1723,26 +1713,23 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_after_committed() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.transaction_state = TwoPhaseState::Committed;
 
         let result = coordinator.prepare("node-a").await;
-        assert!(matches!(result, Err(TwoPhaseError::AlreadyFinalized { .. })));
+        assert!(matches!(
+            result,
+            Err(TwoPhaseError::AlreadyFinalized { .. })
+        ));
     }
 
     #[tokio::test]
     async fn test_prepare_all_after_aborted() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec!["node-a".to_string()],
-        );
+        let mut coordinator =
+            TwoPhaseCommit::new("test-chain".to_string(), config, vec!["node-a".to_string()]);
 
         coordinator.transaction_state = TwoPhaseState::Aborted;
 
@@ -1777,11 +1764,7 @@ mod tests {
     #[test]
     fn test_empty_participants() {
         let config = create_test_config();
-        let coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec![],
-        );
+        let coordinator = TwoPhaseCommit::new("test-chain".to_string(), config, vec![]);
 
         assert_eq!(coordinator.participant_count(), 0);
         assert!(coordinator.all_prepared()); // vacuously true
@@ -1792,11 +1775,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_all_empty() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec![],
-        );
+        let mut coordinator = TwoPhaseCommit::new("test-chain".to_string(), config, vec![]);
 
         let errors = coordinator.prepare_all().await;
         assert!(errors.is_empty());
@@ -1806,11 +1785,7 @@ mod tests {
     #[tokio::test]
     async fn test_commit_all_empty() {
         let config = create_test_config();
-        let mut coordinator = TwoPhaseCommit::new(
-            "test-chain".to_string(),
-            config,
-            vec![],
-        );
+        let mut coordinator = TwoPhaseCommit::new("test-chain".to_string(), config, vec![]);
 
         let errors = coordinator.commit_all().await;
         assert!(errors.is_empty());

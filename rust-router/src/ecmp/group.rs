@@ -123,7 +123,9 @@ pub enum EcmpGroupError {
     GroupExists(String),
 
     /// Invalid routing mark
-    #[error("Routing mark {0} is out of ECMP range ({ECMP_ROUTING_MARK_MIN}-{ECMP_ROUTING_MARK_MAX})")]
+    #[error(
+        "Routing mark {0} is out of ECMP range ({ECMP_ROUTING_MARK_MIN}-{ECMP_ROUTING_MARK_MAX})"
+    )]
     InvalidRoutingMark(u32),
 
     /// Invalid weight
@@ -131,7 +133,9 @@ pub enum EcmpGroupError {
     InvalidWeight(u32),
 
     /// No routing tables available
-    #[error("No routing tables available in range {ECMP_ROUTING_TABLE_MIN}-{ECMP_ROUTING_TABLE_MAX}")]
+    #[error(
+        "No routing tables available in range {ECMP_ROUTING_TABLE_MIN}-{ECMP_ROUTING_TABLE_MAX}"
+    )]
     NoRoutingTablesAvailable,
 
     /// Routing table already allocated
@@ -768,9 +772,8 @@ impl EcmpGroup {
         let now = Instant::now();
 
         // Remove expired entries (sliding TTL)
-        self.session_affinity_cache.retain(|_, entry| {
-            now.duration_since(entry.last_accessed) < self.session_affinity_ttl
-        });
+        self.session_affinity_cache
+            .retain(|_, entry| now.duration_since(entry.last_accessed) < self.session_affinity_ttl);
 
         // If still over limit, remove oldest entries by last_accessed time
         let current_len = self.session_affinity_cache.len();
@@ -909,7 +912,10 @@ impl EcmpGroup {
     #[must_use]
     pub fn is_member_healthy(&self, tag: &str) -> Option<bool> {
         let members = self.members.read();
-        members.iter().find(|m| m.config.tag == tag).map(|m| m.healthy)
+        members
+            .iter()
+            .find(|m| m.config.tag == tag)
+            .map(|m| m.healthy)
     }
 
     /// Add a new member to the group
@@ -1233,11 +1239,7 @@ impl EcmpGroupManager {
     /// Get all group statistics.
     #[must_use]
     pub fn all_stats(&self) -> Vec<EcmpGroupStats> {
-        self.groups
-            .read()
-            .values()
-            .map(|g| g.stats())
-            .collect()
+        self.groups.read().values().map(|g| g.stats()).collect()
     }
 
     /// Update member health across all groups.
@@ -1411,7 +1413,10 @@ mod tests {
         }
 
         // Heavy should be selected significantly more often
-        assert!(heavy_count > 70, "Heavy member should be selected more often");
+        assert!(
+            heavy_count > 70,
+            "Heavy member should be selected more often"
+        );
     }
 
     #[test]
@@ -2289,7 +2294,10 @@ mod tests {
             "142.250.185.143".parse().unwrap(), // Different CDN IP
         );
         let selected = group.select_by_dest_least_load(&key2).unwrap();
-        assert_eq!(selected, first, "Same client+domain should use cached member");
+        assert_eq!(
+            selected, first,
+            "Same client+domain should use cached member"
+        );
     }
 
     #[test]
@@ -2309,7 +2317,11 @@ mod tests {
         let mut selections: HashMap<String, usize> = HashMap::new();
         for i in 1..=10 {
             let client_ip: std::net::IpAddr = format!("10.0.0.{}", i).parse().unwrap();
-            let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+            let key = DestKey::new(
+                client_ip,
+                Some("youtube.com"),
+                "142.250.185.142".parse().unwrap(),
+            );
             let selected = group.select_by_dest_least_load(&key).unwrap();
             *selections.entry(selected.clone()).or_insert(0) += 1;
             // Simulate connection to the selected member
@@ -2321,8 +2333,16 @@ mod tests {
         // With proper least-load selection, distribution should be roughly equal
         let m1_count = *selections.get("m1").unwrap_or(&0);
         let m2_count = *selections.get("m2").unwrap_or(&0);
-        assert!(m1_count >= 3 && m1_count <= 7, "Should be roughly balanced: m1={}", m1_count);
-        assert!(m2_count >= 3 && m2_count <= 7, "Should be roughly balanced: m2={}", m2_count);
+        assert!(
+            m1_count >= 3 && m1_count <= 7,
+            "Should be roughly balanced: m1={}",
+            m1_count
+        );
+        assert!(
+            m2_count >= 3 && m2_count <= 7,
+            "Should be roughly balanced: m2={}",
+            m2_count
+        );
     }
 
     #[test]
@@ -2351,7 +2371,10 @@ mod tests {
 
         // Next request should select the other member
         let second = group.select_by_dest_least_load(&key).unwrap();
-        assert_ne!(second, first, "Should reselect when cached member is unhealthy");
+        assert_ne!(
+            second, first,
+            "Should reselect when cached member is unhealthy"
+        );
 
         // New selection should be cached
         let third = group.select_by_dest_least_load(&key).unwrap();
@@ -2373,8 +2396,13 @@ mod tests {
 
         // Add entries to cache
         for i in 1..=100 {
-            let client_ip: std::net::IpAddr = format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap();
-            let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+            let client_ip: std::net::IpAddr =
+                format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap();
+            let key = DestKey::new(
+                client_ip,
+                Some("youtube.com"),
+                "142.250.185.142".parse().unwrap(),
+            );
             let _ = group.select_by_dest_least_load(&key);
         }
 
@@ -2447,7 +2475,10 @@ mod tests {
 
         // Domain should be lowercase
         assert_eq!(session_key.destination, "youtube.com");
-        assert_eq!(session_key.source_ip, "10.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            session_key.source_ip,
+            "10.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 
     #[test]

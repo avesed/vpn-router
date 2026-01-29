@@ -408,19 +408,19 @@ impl RuleEngine {
     /// - The chain tag already exists
     pub fn add_chain(&self, tag: &str, dscp: u8) -> Result<(), RuleError> {
         let current = self.config.load();
-        
+
         // Clone the existing fwmark_router and add the new chain
         let mut fwmark_builder = FwmarkRouterBuilder::new();
-        
+
         // Copy existing chains
         for (existing_tag, chain_mark) in current.fwmark_router.chains() {
-            fwmark_builder = fwmark_builder
-                .add_chain_with_dscp(existing_tag, chain_mark.dscp_value)?;
+            fwmark_builder =
+                fwmark_builder.add_chain_with_dscp(existing_tag, chain_mark.dscp_value)?;
         }
-        
+
         // Add the new chain
         fwmark_builder = fwmark_builder.add_chain_with_dscp(tag, dscp)?;
-        
+
         // Build new snapshot with updated fwmark_router
         let new_snapshot = RoutingSnapshot {
             domain_matcher: current.domain_matcher.clone(),
@@ -430,7 +430,7 @@ impl RuleEngine {
             default_outbound: current.default_outbound.clone(),
             version: current.version + 1,
         };
-        
+
         self.config.store(Arc::new(new_snapshot));
         Ok(())
     }
@@ -446,12 +446,12 @@ impl RuleEngine {
     /// Returns `true` if the chain was found and removed, `false` otherwise.
     pub fn remove_chain(&self, tag: &str) -> bool {
         let current = self.config.load();
-        
+
         // Check if chain exists
         if current.fwmark_router.get_chain_mark(tag).is_none() {
             return false;
         }
-        
+
         // Rebuild fwmark_router without the removed chain using fold
         // Note: add_chain_with_dscp should never fail here since we're copying
         // existing valid chains (excluding the one being removed)
@@ -459,13 +459,16 @@ impl RuleEngine {
             .fwmark_router
             .chains()
             .filter(|(existing_tag, _)| *existing_tag != tag)
-            .fold(FwmarkRouterBuilder::new(), |builder, (chain_tag, chain_mark)| {
-                builder
-                    .add_chain_with_dscp(chain_tag, chain_mark.dscp_value)
-                    .expect("existing chain should have valid DSCP")
-            })
+            .fold(
+                FwmarkRouterBuilder::new(),
+                |builder, (chain_tag, chain_mark)| {
+                    builder
+                        .add_chain_with_dscp(chain_tag, chain_mark.dscp_value)
+                        .expect("existing chain should have valid DSCP")
+                },
+            )
             .build();
-        
+
         // Build new snapshot with updated fwmark_router
         let new_snapshot = RoutingSnapshot {
             domain_matcher: current.domain_matcher.clone(),
@@ -475,7 +478,7 @@ impl RuleEngine {
             default_outbound: current.default_outbound.clone(),
             version: current.version + 1,
         };
-        
+
         self.config.store(Arc::new(new_snapshot));
         true
     }
@@ -483,7 +486,11 @@ impl RuleEngine {
     /// Check if a chain exists in the current configuration.
     #[must_use]
     pub fn has_chain(&self, tag: &str) -> bool {
-        self.config.load().fwmark_router.get_chain_mark(tag).is_some()
+        self.config
+            .load()
+            .fwmark_router
+            .get_chain_mark(tag)
+            .is_some()
     }
 }
 
@@ -738,16 +745,16 @@ impl RoutingSnapshotBuilder {
     ) -> Result<&mut Self, RuleError> {
         match rule_type {
             RuleType::Domain => {
-                self.domain_builder = std::mem::take(&mut self.domain_builder)
-                    .add_exact(target, outbound);
+                self.domain_builder =
+                    std::mem::take(&mut self.domain_builder).add_exact(target, outbound);
             }
             RuleType::DomainSuffix => {
-                self.domain_builder = std::mem::take(&mut self.domain_builder)
-                    .add_suffix(target, outbound);
+                self.domain_builder =
+                    std::mem::take(&mut self.domain_builder).add_suffix(target, outbound);
             }
             RuleType::DomainKeyword => {
-                self.domain_builder = std::mem::take(&mut self.domain_builder)
-                    .add_keyword(target, outbound);
+                self.domain_builder =
+                    std::mem::take(&mut self.domain_builder).add_keyword(target, outbound);
             }
             RuleType::DomainRegex => {
                 self.domain_builder =
@@ -1416,7 +1423,11 @@ mod tests {
             .add_chain("my-chain")
             .unwrap();
 
-        let snapshot = builder.default_outbound("direct").version(5).build().unwrap();
+        let snapshot = builder
+            .default_outbound("direct")
+            .version(5)
+            .build()
+            .unwrap();
 
         let stats = snapshot.stats();
         assert_eq!(stats.domain_rules, 1);
@@ -1556,7 +1567,10 @@ mod tests {
         builder.add_chain_with_dscp("high-priority", 50).unwrap();
 
         let snapshot = builder.build().unwrap();
-        let mark = snapshot.fwmark_router.get_chain_mark("high-priority").unwrap();
+        let mark = snapshot
+            .fwmark_router
+            .get_chain_mark("high-priority")
+            .unwrap();
         assert_eq!(mark.dscp_value, 50);
     }
 

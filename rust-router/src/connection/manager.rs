@@ -99,17 +99,16 @@ impl ConnectionManager {
     ///
     /// Returns `ConnectionError::LimitReached` if the connection limit is hit
     /// and the semaphore has no available permits.
-    pub async fn handle_connection(
-        &self,
-        conn: TproxyConnection,
-    ) -> Result<(), ConnectionError> {
+    pub async fn handle_connection(&self, conn: TproxyConnection) -> Result<(), ConnectionError> {
         // Check if shutting down
         if self.shutting_down.load(Ordering::Relaxed) {
             return Err(ConnectionError::ShuttingDown);
         }
 
         // Try to acquire a permit
-        let permit = if let Ok(permit) = self.semaphore.clone().try_acquire_owned() { permit } else {
+        let permit = if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
+            permit
+        } else {
             self.stats.record_rejected();
             let current = self.max_connections - self.semaphore.available_permits();
             warn!(
@@ -118,7 +117,10 @@ impl ConnectionManager {
                 self.max_connections,
                 conn.client_addr()
             );
-            return Err(ConnectionError::limit_reached(current, self.max_connections));
+            return Err(ConnectionError::limit_reached(
+                current,
+                self.max_connections,
+            ));
         };
 
         // Record the accepted connection
@@ -225,7 +227,10 @@ impl ConnectionManager {
             debug!(
                 "Waiting for {} connections to drain ({:.1}s remaining)",
                 active,
-                self.drain_timeout.checked_sub(drain_start.elapsed()).unwrap_or(Duration::ZERO).as_secs_f64()
+                self.drain_timeout
+                    .checked_sub(drain_start.elapsed())
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs_f64()
             );
 
             tokio::time::sleep(check_interval).await;

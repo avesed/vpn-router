@@ -96,7 +96,10 @@ impl FakeDnsTcpServer {
                 continue;
             }
             if length > 65535 {
-                error!("FakeDNS TCP {} message too large: {} bytes", peer_addr, length);
+                error!(
+                    "FakeDNS TCP {} message too large: {} bytes",
+                    peer_addr, length
+                );
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     "DNS message exceeds maximum size",

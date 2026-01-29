@@ -193,7 +193,9 @@ impl InboundRealityConfig {
     pub fn validate(&self) -> VlessInboundResult<()> {
         // Validate private key is valid Base64
         if self.private_key.is_empty() {
-            return Err(VlessInboundError::invalid_config("REALITY private_key is empty"));
+            return Err(VlessInboundError::invalid_config(
+                "REALITY private_key is empty",
+            ));
         }
 
         let key_bytes = decode_base64_flexible(&self.private_key).map_err(|e| {
@@ -473,9 +475,10 @@ impl VlessInboundConfig {
     ///
     /// Returns error if REALITY is not configured or configuration is invalid.
     pub fn build_reality_server(&self) -> VlessInboundResult<crate::reality::RealityServer> {
-        let reality = self.reality.as_ref().ok_or_else(|| {
-            VlessInboundError::invalid_config("REALITY is not configured")
-        })?;
+        let reality = self
+            .reality
+            .as_ref()
+            .ok_or_else(|| VlessInboundError::invalid_config("REALITY is not configured"))?;
 
         let server_config = reality.build_server_config()?;
         Ok(crate::reality::RealityServer::new(server_config))
@@ -635,7 +638,10 @@ mod tests {
 
     #[test]
     fn test_vless_user_new() {
-        let user = VlessUser::new("550e8400-e29b-41d4-a716-446655440000", Some("test@example.com"));
+        let user = VlessUser::new(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("test@example.com"),
+        );
         assert_eq!(user.uuid, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(user.email, Some("test@example.com".to_string()));
         assert!(user.flow.is_none());
@@ -650,8 +656,10 @@ mod tests {
 
     #[test]
     fn test_vless_user_validate_valid() {
-        let user =
-            VlessUser::new("550e8400-e29b-41d4-a716-446655440000", Some("test@example.com"));
+        let user = VlessUser::new(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("test@example.com"),
+        );
         assert!(user.validate().is_ok());
     }
 
@@ -663,8 +671,10 @@ mod tests {
 
     #[test]
     fn test_vless_user_to_account() {
-        let user =
-            VlessUser::new("550e8400-e29b-41d4-a716-446655440000", Some("test@example.com"));
+        let user = VlessUser::new(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("test@example.com"),
+        );
         let account = user.to_account().unwrap();
         assert_eq!(account.email(), Some("test@example.com"));
     }

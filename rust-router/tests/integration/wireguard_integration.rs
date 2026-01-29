@@ -76,7 +76,12 @@ fn test_interface_name_uniqueness() {
 
     for tag in &tags {
         let name = get_egress_interface_name(tag, EgressType::Pia);
-        assert!(names.insert(name.clone()), "Duplicate name for {}: {}", tag, name);
+        assert!(
+            names.insert(name.clone()),
+            "Duplicate name for {}: {}",
+            tag,
+            name
+        );
     }
 }
 
@@ -173,11 +178,7 @@ fn test_routing_mark_range() {
     let valid_marks = [200, 300, 363, 400, 463];
 
     for mark in valid_marks {
-        assert!(
-            is_valid_routing_mark(mark),
-            "Mark {} should be valid",
-            mark
-        );
+        assert!(is_valid_routing_mark(mark), "Mark {} should be valid", mark);
     }
 }
 
@@ -187,11 +188,7 @@ fn test_routing_mark_dscp_range() {
     for dscp in 1..=63u32 {
         let mark = 300 + dscp;
         let is_dscp_mark = mark >= 300 && mark <= 363;
-        assert!(
-            is_dscp_mark,
-            "Mark {} should be in DSCP range",
-            mark
-        );
+        assert!(is_dscp_mark, "Mark {} should be in DSCP range", mark);
     }
 }
 
@@ -253,8 +250,7 @@ fn test_peer_routing_table_invalid_port() {
 fn test_parity_interface_name_pia() {
     // Test cases from Python implementation
     let test_cases = [
-        "us-east",
-        "uk-lond", // Short enough to not be truncated
+        "us-east", "uk-lond", // Short enough to not be truncated
     ];
 
     for tag in test_cases {

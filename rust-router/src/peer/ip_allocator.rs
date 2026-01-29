@@ -76,7 +76,7 @@ impl TunnelIpAllocator {
     pub fn new(subnet: &str) -> Self {
         let (network, prefix_len) = Self::parse_subnet(subnet).unwrap_or_else(|_| {
             // Fallback to default
-            
+
             Self::parse_subnet(DEFAULT_TUNNEL_SUBNET).unwrap()
         });
 

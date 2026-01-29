@@ -754,10 +754,22 @@ mod tests {
     #[test]
     fn test_python_parity_comprehensive() {
         // Short tags - used directly
-        assert_eq!(get_egress_interface_name("nyc", EgressType::Pia), "wg-pia-nyc");
-        assert_eq!(get_egress_interface_name("la", EgressType::Custom), "wg-eg-la");
-        assert_eq!(get_egress_interface_name("main", EgressType::Warp), "wg-warp-main");
-        assert_eq!(get_egress_interface_name("node1", EgressType::Peer), "wg-peer-node1");
+        assert_eq!(
+            get_egress_interface_name("nyc", EgressType::Pia),
+            "wg-pia-nyc"
+        );
+        assert_eq!(
+            get_egress_interface_name("la", EgressType::Custom),
+            "wg-eg-la"
+        );
+        assert_eq!(
+            get_egress_interface_name("main", EgressType::Warp),
+            "wg-warp-main"
+        );
+        assert_eq!(
+            get_egress_interface_name("node1", EgressType::Peer),
+            "wg-peer-node1"
+        );
 
         // Long tags - Python output verified:
         // get_egress_interface_name("us-new-york-city-east", is_pia=True) -> "wg-pia-cc74ff54"

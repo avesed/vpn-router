@@ -191,7 +191,9 @@ impl RealityConfig {
     pub fn validate(&self) -> RealityResult<()> {
         // Validate server name
         if self.server_name.is_empty() {
-            return Err(RealityError::invalid_server_name("server name cannot be empty"));
+            return Err(RealityError::invalid_server_name(
+                "server name cannot be empty",
+            ));
         }
 
         // Validate public key (should be 32 bytes when decoded)
@@ -211,7 +213,9 @@ impl RealityConfig {
         use base64::Engine;
 
         if self.public_key.is_empty() {
-            return Err(RealityError::invalid_public_key("public key cannot be empty"));
+            return Err(RealityError::invalid_public_key(
+                "public key cannot be empty",
+            ));
         }
 
         // Decode base64 and check length
@@ -252,8 +256,9 @@ impl RealityConfig {
 
     /// Validate the fingerprint value
     fn validate_fingerprint(&self) -> RealityResult<()> {
-        const VALID_FINGERPRINTS: &[&str] =
-            &["chrome", "firefox", "safari", "edge", "random", "ios", "android"];
+        const VALID_FINGERPRINTS: &[&str] = &[
+            "chrome", "firefox", "safari", "edge", "random", "ios", "android",
+        ];
 
         if !VALID_FINGERPRINTS.contains(&self.fingerprint.as_str()) {
             return Err(RealityError::invalid_fingerprint(format!(
@@ -370,7 +375,8 @@ mod tests {
     #[test]
     fn test_validate_wrong_length_public_key() {
         // This is valid base64 but only 16 bytes
-        let config = RealityConfig::new(TEST_SERVER_NAME, "AAAAAAAAAAAAAAAAAAAAAA==", TEST_SHORT_ID);
+        let config =
+            RealityConfig::new(TEST_SERVER_NAME, "AAAAAAAAAAAAAAAAAAAAAA==", TEST_SHORT_ID);
         let err = config.validate().unwrap_err();
         assert!(matches!(err, RealityError::InvalidPublicKey(_)));
         assert!(err.to_string().contains("expected 32 bytes"));
@@ -392,8 +398,7 @@ mod tests {
 
     #[test]
     fn test_validate_short_id_too_long() {
-        let config =
-            RealityConfig::new(TEST_SERVER_NAME, TEST_PUBLIC_KEY, "12345678901234567890");
+        let config = RealityConfig::new(TEST_SERVER_NAME, TEST_PUBLIC_KEY, "12345678901234567890");
         let err = config.validate().unwrap_err();
         assert!(matches!(err, RealityError::InvalidShortId(_)));
         assert!(err.to_string().contains("too long"));
@@ -409,11 +414,17 @@ mod tests {
 
     #[test]
     fn test_validate_all_fingerprints() {
-        let fingerprints = ["chrome", "firefox", "safari", "edge", "random", "ios", "android"];
+        let fingerprints = [
+            "chrome", "firefox", "safari", "edge", "random", "ios", "android",
+        ];
         for fp in fingerprints {
             let mut config = RealityConfig::new(TEST_SERVER_NAME, TEST_PUBLIC_KEY, TEST_SHORT_ID);
             config.set_fingerprint(fp);
-            assert!(config.validate().is_ok(), "fingerprint '{}' should be valid", fp);
+            assert!(
+                config.validate().is_ok(),
+                "fingerprint '{}' should be valid",
+                fp
+            );
         }
     }
 

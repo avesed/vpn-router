@@ -211,7 +211,7 @@ fn is_tls_port(port: u16) -> bool {
         | 636   // LDAPS
         | 989   // FTPS data
         | 990   // FTPS control
-        | 5061  // SIP over TLS
+        | 5061 // SIP over TLS
     )
 }
 
@@ -259,10 +259,7 @@ fn resolve_outbound_with_ecmp(
                         // DestHash: hash(source_ip + domain/dest_ip) for per-client session affinity
                         // Same client to same domain → same exit; different clients → load balanced
                         let dest_key = DestKey::new(client_addr.ip(), domain, original_dst.ip());
-                        debug!(
-                            "ECMP group '{}' using DestHash with key: {}",
-                            tag, dest_key
-                        );
+                        debug!("ECMP group '{}' using DestHash with key: {}", tag, dest_key);
                         group.select_by_dest(&dest_key)
                     }
                     LbAlgorithm::DestHashLeastLoad => {
@@ -298,10 +295,7 @@ fn resolve_outbound_with_ecmp(
                         if let Some(outbound) = outbound_manager.get(&member_tag) {
                             return Some((outbound, member_tag));
                         }
-                        warn!(
-                            "ECMP member '{}' not found in outbound_manager",
-                            member_tag
-                        );
+                        warn!("ECMP member '{}' not found in outbound_manager", member_tag);
                     }
                     Err(e) => {
                         warn!("ECMP group '{}' failed to select member: {}", tag, e);
@@ -335,7 +329,10 @@ pub fn spawn_tcp_handler(
 
         // Update stats
         if let Some(ref copy_result) = result.copy_result {
-            stats.record_completed(copy_result.client_to_upstream, copy_result.upstream_to_client);
+            stats.record_completed(
+                copy_result.client_to_upstream,
+                copy_result.upstream_to_client,
+            );
         } else {
             stats.record_error();
         }

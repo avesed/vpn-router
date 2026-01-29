@@ -325,7 +325,7 @@ impl TcpSocketGuard {
             let mut bridge = self.bridge.lock().await;
             bridge.tcp_close(handle);
             bridge.poll(); // Allow FIN to be sent
-            // Give time for FIN to be processed
+                           // Give time for FIN to be processed
             drop(bridge);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             // Now remove the socket

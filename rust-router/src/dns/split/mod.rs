@@ -66,9 +66,7 @@
 
 mod router;
 
-pub use router::{
-    DnsRouter, DnsRouterStats, DnsRouterStatsSnapshot, DomainMatchType, RouteInfo,
-};
+pub use router::{DnsRouter, DnsRouterStats, DnsRouterStatsSnapshot, DomainMatchType, RouteInfo};
 
 #[cfg(test)]
 mod tests {

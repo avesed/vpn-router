@@ -7,11 +7,11 @@
 //! - Cipher suite definitions
 
 mod aead;
+pub mod cipher_suite;
 mod keys;
 pub mod x25519;
-pub mod cipher_suite;
 
-pub use aead::{AeadKey, decrypt_handshake_message};
+pub use aead::{decrypt_handshake_message, AeadKey};
 pub use cipher_suite::{CipherSuite, HashAlgorithm, DEFAULT_CIPHER_SUITES};
 pub use keys::{
     compute_finished_verify_data, derive_application_secrets, derive_handshake_keys,

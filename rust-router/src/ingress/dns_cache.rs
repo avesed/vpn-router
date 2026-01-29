@@ -425,7 +425,12 @@ impl IpDomainCache {
 
             let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let _rclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
-            let ttl = u32::from_be_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+            let ttl = u32::from_be_bytes([
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
             let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
 
             offset += 10;
@@ -585,7 +590,9 @@ mod tests {
     #[test]
     fn test_cache_ipv6() {
         let cache = IpDomainCache::new(100, 300);
-        let ip = IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946));
+        let ip = IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946,
+        ));
 
         cache.insert(ip, "example.com".to_string(), 300);
         assert_eq!(cache.get(&ip), Some("example.com".to_string()));
@@ -608,8 +615,16 @@ mod tests {
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
 
-        cache.insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "a.com".to_string(), 300);
-        cache.insert(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), "b.com".to_string(), 300);
+        cache.insert(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            "a.com".to_string(),
+            300,
+        );
+        cache.insert(
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            "b.com".to_string(),
+            300,
+        );
 
         assert_eq!(cache.len(), 2);
         assert!(!cache.is_empty());
@@ -619,8 +634,16 @@ mod tests {
     fn test_cache_clear() {
         let cache = IpDomainCache::new(100, 300);
 
-        cache.insert(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), "a.com".to_string(), 300);
-        cache.insert(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), "b.com".to_string(), 300);
+        cache.insert(
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            "a.com".to_string(),
+            300,
+        );
+        cache.insert(
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            "b.com".to_string(),
+            300,
+        );
 
         cache.clear();
         assert!(cache.is_empty());
@@ -678,9 +701,8 @@ mod tests {
             0x00, 0x00, // NSCOUNT = 0
             0x00, 0x00, // ARCOUNT = 0
             // Question section
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,       // End of name
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00, // End of name
             0x00, 0x01, // QTYPE = A
             0x00, 0x01, // QCLASS = IN
             // Answer section

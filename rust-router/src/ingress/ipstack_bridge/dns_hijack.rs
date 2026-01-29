@@ -168,8 +168,8 @@ where
 #[cfg(feature = "fakedns")]
 fn process_dns_query(query_bytes: &[u8], fakedns: &FakeDnsManager) -> DnsHijackResult<Vec<u8>> {
     // Parse DNS query using hickory-proto
-    let query = Message::from_vec(query_bytes)
-        .map_err(|e| DnsHijackError::ParseError(e.to_string()))?;
+    let query =
+        Message::from_vec(query_bytes).map_err(|e| DnsHijackError::ParseError(e.to_string()))?;
 
     // Get the query question
     let question = query
@@ -198,22 +198,20 @@ fn process_dns_query(query_bytes: &[u8], fakedns: &FakeDnsManager) -> DnsHijackR
 
     // Build response based on query type
     let response = match qtype {
-        RecordType::A => {
-            match fakedns.map_domain_ipv4(&domain) {
-                Ok((fake_ip, ttl)) => {
-                    trace!(domain = %domain, ip = %fake_ip, ttl = ?ttl, "Allocated fake IP");
-                    build_a_response(&query, fake_ip, ttl)
-                }
-                Err(FakeDnsError::PoolExhausted) => {
-                    warn!(domain = %domain, "FakeDNS pool exhausted, returning SERVFAIL");
-                    build_servfail_response(&query)
-                }
-                Err(e) => {
-                    warn!(domain = %domain, error = %e, "FakeDNS error, returning SERVFAIL");
-                    build_servfail_response(&query)
-                }
+        RecordType::A => match fakedns.map_domain_ipv4(&domain) {
+            Ok((fake_ip, ttl)) => {
+                trace!(domain = %domain, ip = %fake_ip, ttl = ?ttl, "Allocated fake IP");
+                build_a_response(&query, fake_ip, ttl)
             }
-        }
+            Err(FakeDnsError::PoolExhausted) => {
+                warn!(domain = %domain, "FakeDNS pool exhausted, returning SERVFAIL");
+                build_servfail_response(&query)
+            }
+            Err(e) => {
+                warn!(domain = %domain, error = %e, "FakeDNS error, returning SERVFAIL");
+                build_servfail_response(&query)
+            }
+        },
         RecordType::AAAA => {
             // Return empty response for AAAA to force IPv4
             // This ensures clients fall back to A records

@@ -202,7 +202,10 @@ impl TcpConnectionTracker {
         }
 
         // Check per-IP limit
-        let entry = self.connections.entry(ip).or_insert_with(|| AtomicUsize::new(0));
+        let entry = self
+            .connections
+            .entry(ip)
+            .or_insert_with(|| AtomicUsize::new(0));
         let current_ip = entry.load(Ordering::SeqCst);
 
         if current_ip >= self.max_per_ip {
@@ -294,7 +297,8 @@ impl TcpConnectionTracker {
 
     /// Clean up IPs with zero connections
     pub fn cleanup_empty(&self) {
-        self.connections.retain(|_, count| count.load(Ordering::SeqCst) > 0);
+        self.connections
+            .retain(|_, count| count.load(Ordering::SeqCst) > 0);
     }
 }
 
@@ -429,13 +433,13 @@ impl TcpDnsServer {
         handler: Arc<DnsHandler>,
         config: TcpServerConfig,
     ) -> DnsResult<Self> {
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            DnsError::network_io(format!("failed to bind TCP socket to {addr}"), e)
-        })?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| DnsError::network_io(format!("failed to bind TCP socket to {addr}"), e))?;
 
-        let local_addr = listener.local_addr().map_err(|e| {
-            DnsError::network_io("failed to get local address".to_string(), e)
-        })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| DnsError::network_io("failed to get local address".to_string(), e))?;
 
         info!(addr = %local_addr, "TCP DNS server bound");
 
@@ -548,12 +552,16 @@ impl TcpDnsServer {
 
         // Check connection limits
         if !self.tracker.try_acquire(ip) {
-            self.stats.connections_rejected.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_rejected
+                .fetch_add(1, Ordering::Relaxed);
             debug!(peer = %peer_addr, "Connection rejected: limit exceeded");
             return;
         }
 
-        self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .connections_accepted
+            .fetch_add(1, Ordering::Relaxed);
 
         // Spawn handler task
         let handler = Arc::clone(&self.handler);
@@ -564,7 +572,9 @@ impl TcpDnsServer {
         tokio::spawn(async move {
             let _guard = ConnectionGuard { tracker, ip };
 
-            if let Err(e) = Self::handle_connection_inner(stream, peer_addr, handler, stats, config).await {
+            if let Err(e) =
+                Self::handle_connection_inner(stream, peer_addr, handler, stats, config).await
+            {
                 debug!(peer = %peer_addr, error = %e, "Connection error");
             }
         });
@@ -611,7 +621,9 @@ impl TcpDnsServer {
                 }
             };
 
-            stats.bytes_received.fetch_add(message.len() as u64 + 2, Ordering::Relaxed);
+            stats
+                .bytes_received
+                .fetch_add(message.len() as u64 + 2, Ordering::Relaxed);
 
             // Process query with timeout
             let response = timeout(
@@ -649,7 +661,9 @@ impl TcpDnsServer {
             match write_result {
                 Ok(Ok(())) => {
                     stats.queries_processed.fetch_add(1, Ordering::Relaxed);
-                    stats.bytes_sent.fetch_add(response_data.len() as u64 + 2, Ordering::Relaxed);
+                    stats
+                        .bytes_sent
+                        .fetch_add(response_data.len() as u64 + 2, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => {
                     stats.write_errors.fetch_add(1, Ordering::Relaxed);
@@ -675,7 +689,10 @@ impl TcpDnsServer {
                 return Err(DnsError::network("connection closed".to_string()));
             }
             Err(e) => {
-                return Err(DnsError::network_io("failed to read length prefix".to_string(), e));
+                return Err(DnsError::network_io(
+                    "failed to read length prefix".to_string(),
+                    e,
+                ));
             }
         }
 
@@ -696,9 +713,10 @@ impl TcpDnsServer {
 
         // Read message body
         let mut message = vec![0u8; len];
-        stream.read_exact(&mut message).await.map_err(|e| {
-            DnsError::network_io("failed to read message body".to_string(), e)
-        })?;
+        stream
+            .read_exact(&mut message)
+            .await
+            .map_err(|e| DnsError::network_io("failed to read message body".to_string(), e))?;
 
         Ok(message)
     }
@@ -715,18 +733,21 @@ impl TcpDnsServer {
 
         // Write length prefix
         let len_bytes = (message.len() as u16).to_be_bytes();
-        stream.write_all(&len_bytes).await.map_err(|e| {
-            DnsError::network_io("failed to write length prefix".to_string(), e)
-        })?;
+        stream
+            .write_all(&len_bytes)
+            .await
+            .map_err(|e| DnsError::network_io("failed to write length prefix".to_string(), e))?;
 
         // Write message body
-        stream.write_all(message).await.map_err(|e| {
-            DnsError::network_io("failed to write message body".to_string(), e)
-        })?;
+        stream
+            .write_all(message)
+            .await
+            .map_err(|e| DnsError::network_io("failed to write message body".to_string(), e))?;
 
-        stream.flush().await.map_err(|e| {
-            DnsError::network_io("failed to flush".to_string(), e)
-        })?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| DnsError::network_io("failed to flush".to_string(), e))?;
 
         Ok(())
     }
@@ -776,10 +797,8 @@ mod tests {
         ];
 
         query.extend_from_slice(&[
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, b'c', b'o', b'm',
-            0x00,
-            0x00, 0x01, // A
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, // A
             0x00, 0x01, // IN
         ]);
 
@@ -915,9 +934,8 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         let server_clone = Arc::clone(&server);
-        let handle = tokio::spawn(async move {
-            server_clone.run_until_shutdown(shutdown_rx).await
-        });
+        let handle =
+            tokio::spawn(async move { server_clone.run_until_shutdown(shutdown_rx).await });
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1065,7 +1083,9 @@ mod tests {
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let data = vec![0xAB; 100];
-            TcpDnsServer::write_dns_message(&mut stream, &data).await.unwrap();
+            TcpDnsServer::write_dns_message(&mut stream, &data)
+                .await
+                .unwrap();
         });
 
         // Reader

@@ -302,8 +302,12 @@ impl IpStackBridge {
         // Session is registered BEFORE send to ensure reply routing works immediately
         // The outbound_tag is stored in the session for later use by handle_tcp_connection
         if let Some(ref ft) = five_tuple {
-            self.session_tracker
-                .register_forward_only(peer_key, peer_endpoint, ft.clone(), outbound_tag.to_string());
+            self.session_tracker.register_forward_only(
+                peer_key,
+                peer_endpoint,
+                ft.clone(),
+                outbound_tag.to_string(),
+            );
         }
 
         // Try to send the packet
@@ -347,8 +351,12 @@ impl IpStackBridge {
         // Register with session tracker for reply routing (forward-only, no reverse index)
         // The outbound_tag is stored in the session for later use by handle_tcp_connection
         if let Some(ref ft) = five_tuple {
-            self.session_tracker
-                .register_forward_only(peer_key, peer_endpoint, ft.clone(), outbound_tag.to_string());
+            self.session_tracker.register_forward_only(
+                peer_key,
+                peer_endpoint,
+                ft.clone(),
+                outbound_tag.to_string(),
+            );
         }
 
         // Try to send the packet
@@ -629,7 +637,10 @@ impl IpStackBridge {
                     "Cleaned up idle sessions"
                 );
             } else {
-                trace!(active = session_tracker.total_sessions(), "Cleanup cycle completed");
+                trace!(
+                    active = session_tracker.total_sessions(),
+                    "Cleanup cycle completed"
+                );
             }
         }
 
@@ -800,11 +811,10 @@ impl IpStackBridge {
                 let local_addr = tcp_stream.local_addr();
                 let peer_addr = tcp_stream.peer_addr();
 
-                debug!(
-                    "TCP connection accepted: {} -> {}",
-                    local_addr, peer_addr
-                );
-                stats.tcp_connections_accepted.fetch_add(1, Ordering::Relaxed);
+                debug!("TCP connection accepted: {} -> {}", local_addr, peer_addr);
+                stats
+                    .tcp_connections_accepted
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Spawn a task to handle the TCP connection
                 tokio::spawn(Self::handle_tcp_connection(
@@ -822,10 +832,7 @@ impl IpStackBridge {
                 let local_addr = udp_stream.local_addr();
                 let peer_addr = udp_stream.peer_addr();
 
-                debug!(
-                    "UDP stream accepted: {} -> {}",
-                    local_addr, peer_addr
-                );
+                debug!("UDP stream accepted: {} -> {}", local_addr, peer_addr);
                 stats.udp_packets_forwarded.fetch_add(1, Ordering::Relaxed);
 
                 // Spawn a task to handle the UDP stream
@@ -899,15 +906,11 @@ impl IpStackBridge {
             use tokio::io::AsyncBufReadExt;
 
             // Peek first packet for SNI/HTTP sniffing (with timeout)
-            let first_packet: Option<Vec<u8>> = match tokio::time::timeout(
-                sni_peek_timeout(),
-                buffered.fill_buf(),
-            )
-            .await
-            {
-                Ok(Ok(data)) if !data.is_empty() => Some(data.to_vec()),
-                _ => None,
-            };
+            let first_packet: Option<Vec<u8>> =
+                match tokio::time::timeout(sni_peek_timeout(), buffered.fill_buf()).await {
+                    Ok(Ok(data)) if !data.is_empty() => Some(data.to_vec()),
+                    _ => None,
+                };
 
             resolve_domain(
                 peer_addr.ip(),
@@ -984,10 +987,7 @@ impl IpStackBridge {
                 if let Some(outbound) = manager.get(&outbound_tag) {
                     match outbound.connect(peer_addr, connect_timeout).await {
                         Ok(conn) => {
-                            debug!(
-                                "Connected via outbound '{}' to {}",
-                                outbound_tag, peer_addr
-                            );
+                            debug!("Connected via outbound '{}' to {}", outbound_tag, peer_addr);
                             Some(conn.into_outbound_stream())
                         }
                         Err(e) => {
@@ -1019,52 +1019,51 @@ impl IpStackBridge {
         };
 
         // If no OutboundStream from manager, use direct TCP connection
-        let mut outbound_stream = match outbound_stream {
-            Some(stream) => stream,
-            None => {
-                // Direct TCP connection
-                let outbound = match tokio::time::timeout(
-                    connect_timeout,
-                    TcpStream::connect(peer_addr),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(e)) => {
-                        warn!("Failed to connect directly to {}: {}", peer_addr, e);
-                        stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                        session_tracker.remove(&five_tuple);
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("Connection timeout to {}", peer_addr);
-                        stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                        session_tracker.remove(&five_tuple);
-                        return;
-                    }
-                };
+        let mut outbound_stream =
+            match outbound_stream {
+                Some(stream) => stream,
+                None => {
+                    // Direct TCP connection
+                    let outbound =
+                        match tokio::time::timeout(connect_timeout, TcpStream::connect(peer_addr))
+                            .await
+                        {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(e)) => {
+                                warn!("Failed to connect directly to {}: {}", peer_addr, e);
+                                stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                                session_tracker.remove(&five_tuple);
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("Connection timeout to {}", peer_addr);
+                                stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                                session_tracker.remove(&five_tuple);
+                                return;
+                            }
+                        };
 
-                // Set TCP_NODELAY to reduce latency (disable Nagle's algorithm)
-                if let Err(e) = outbound.set_nodelay(true) {
-                    debug!("Failed to set TCP_NODELAY: {}", e);
+                    // Set TCP_NODELAY to reduce latency (disable Nagle's algorithm)
+                    if let Err(e) = outbound.set_nodelay(true) {
+                        debug!("Failed to set TCP_NODELAY: {}", e);
+                    }
+
+                    // Set larger socket buffer sizes for better throughput
+                    {
+                        use socket2::SockRef;
+                        let sock_ref = SockRef::from(&outbound);
+                        if let Err(e) = sock_ref.set_recv_buffer_size(TCP_SOCKET_BUFFER_SIZE) {
+                            debug!("Failed to set SO_RCVBUF: {}", e);
+                        }
+                        if let Err(e) = sock_ref.set_send_buffer_size(TCP_SOCKET_BUFFER_SIZE) {
+                            debug!("Failed to set SO_SNDBUF: {}", e);
+                        }
+                    }
+
+                    debug!("Connected directly to {}", peer_addr);
+                    OutboundStream::tcp(outbound)
                 }
-
-                // Set larger socket buffer sizes for better throughput
-                {
-                    use socket2::SockRef;
-                    let sock_ref = SockRef::from(&outbound);
-                    if let Err(e) = sock_ref.set_recv_buffer_size(TCP_SOCKET_BUFFER_SIZE) {
-                        debug!("Failed to set SO_RCVBUF: {}", e);
-                    }
-                    if let Err(e) = sock_ref.set_send_buffer_size(TCP_SOCKET_BUFFER_SIZE) {
-                        debug!("Failed to set SO_SNDBUF: {}", e);
-                    }
-                }
-
-                debug!("Connected directly to {}", peer_addr);
-                OutboundStream::tcp(outbound)
-            }
-        };
+            };
 
         // Bridge the streams using tokio's copy_bidirectional_with_sizes
         // Using configurable buffers (default 64KB) instead of default 8KB for better
@@ -1422,7 +1421,10 @@ impl IpStackBridge {
         let five_tuple = FiveTuple::udp(local_addr, peer_addr);
         session_tracker.remove(&five_tuple);
 
-        debug!("UDP stream closed: {} -> {} (via {})", local_addr, peer_addr, outbound_tag);
+        debug!(
+            "UDP stream closed: {} -> {} (via {})",
+            local_addr, peer_addr, outbound_tag
+        );
     }
 
     /// Stop the bridge
@@ -1624,7 +1626,10 @@ mod tests {
     #[tokio::test]
     async fn test_stats_snapshot() {
         let bridge = IpStackBridge::new();
-        bridge.stats.packets_received.fetch_add(10, Ordering::Relaxed);
+        bridge
+            .stats
+            .packets_received
+            .fetch_add(10, Ordering::Relaxed);
         bridge.stats.packets_sent.fetch_add(5, Ordering::Relaxed);
         bridge
             .stats
@@ -1650,8 +1655,14 @@ mod tests {
     #[tokio::test]
     async fn test_stats_reset() {
         let bridge = IpStackBridge::new();
-        bridge.stats.packets_received.fetch_add(10, Ordering::Relaxed);
-        bridge.stats.reply_backpressure.fetch_add(5, Ordering::Relaxed);
+        bridge
+            .stats
+            .packets_received
+            .fetch_add(10, Ordering::Relaxed);
+        bridge
+            .stats
+            .reply_backpressure
+            .fetch_add(5, Ordering::Relaxed);
         bridge.stats.reply_drops.fetch_add(2, Ordering::Relaxed);
         bridge.stats.reset();
 

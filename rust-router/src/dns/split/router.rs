@@ -97,7 +97,11 @@ pub struct RouteInfo {
 impl RouteInfo {
     /// Create a new route info
     #[must_use]
-    pub fn new(pattern: impl Into<String>, match_type: DomainMatchType, upstream_tag: impl Into<String>) -> Self {
+    pub fn new(
+        pattern: impl Into<String>,
+        match_type: DomainMatchType,
+        upstream_tag: impl Into<String>,
+    ) -> Self {
         Self {
             pattern: pattern.into(),
             match_type,
@@ -166,7 +170,11 @@ impl DnsRouterStats {
             routes_evaluated: self.routes_evaluated.load(Ordering::Relaxed),
             default_fallbacks: self.default_fallbacks.load(Ordering::Relaxed),
             rule_count: self.rule_count.load(Ordering::Relaxed),
-            last_reload: if last_reload == 0 { None } else { Some(last_reload) },
+            last_reload: if last_reload == 0 {
+                None
+            } else {
+                Some(last_reload)
+            },
         }
     }
 }
@@ -486,7 +494,11 @@ impl DnsRouter {
         // Check size limit
         if !routes.contains_key(pattern) && routes.len() >= MAX_ROUTES {
             return Err(DnsError::config_field(
-                format!("routing rules exceed maximum: {} (max: {})", routes.len() + 1, MAX_ROUTES),
+                format!(
+                    "routing rules exceed maximum: {} (max: {})",
+                    routes.len() + 1,
+                    MAX_ROUTES
+                ),
                 "dns.split.routes",
             ));
         }
@@ -613,7 +625,11 @@ impl DnsRouter {
         // Check size limit
         if route_list.len() > MAX_ROUTES {
             return Err(DnsError::config_field(
-                format!("routing rules exceed maximum: {} (max: {})", route_list.len(), MAX_ROUTES),
+                format!(
+                    "routing rules exceed maximum: {} (max: {})",
+                    route_list.len(),
+                    MAX_ROUTES
+                ),
                 "dns.split.routes",
             ));
         }
@@ -640,10 +656,7 @@ impl DnsRouter {
     }
 
     /// Internal: Rebuild the domain matcher from routes
-    fn rebuild_matcher(
-        &self,
-        routes: HashMap<String, (DomainMatchType, String)>,
-    ) -> DnsResult<()> {
+    fn rebuild_matcher(&self, routes: HashMap<String, (DomainMatchType, String)>) -> DnsResult<()> {
         let mut builder = DomainMatcherBuilder::new();
 
         for (pattern, (match_type, upstream_tag)) in &routes {
@@ -926,7 +939,10 @@ mod tests {
             .build()
             .unwrap();
         let mut new_routes = HashMap::new();
-        new_routes.insert("new.com".to_string(), (DomainMatchType::Suffix, "new".to_string()));
+        new_routes.insert(
+            "new.com".to_string(),
+            (DomainMatchType::Suffix, "new".to_string()),
+        );
 
         router.reload_rules(new_matcher, new_routes).unwrap();
 
@@ -1037,7 +1053,11 @@ mod tests {
             for i in 0..10 {
                 let routes: Vec<RouteInfo> = (0..100)
                     .map(|j| {
-                        RouteInfo::new(format!("reload{}_{}.com", i, j), DomainMatchType::Suffix, "reload")
+                        RouteInfo::new(
+                            format!("reload{}_{}.com", i, j),
+                            DomainMatchType::Suffix,
+                            "reload",
+                        )
                     })
                     .collect();
                 r.load_routes(&routes).unwrap();
@@ -1055,12 +1075,20 @@ mod tests {
         let router = DnsRouter::new("default".to_string());
 
         // First load
-        let routes1 = vec![RouteInfo::new("first.com", DomainMatchType::Suffix, "first")];
+        let routes1 = vec![RouteInfo::new(
+            "first.com",
+            DomainMatchType::Suffix,
+            "first",
+        )];
         router.load_routes(&routes1).unwrap();
         assert_eq!(router.route_to_tag("first.com"), "first");
 
         // Second load (replaces)
-        let routes2 = vec![RouteInfo::new("second.com", DomainMatchType::Suffix, "second")];
+        let routes2 = vec![RouteInfo::new(
+            "second.com",
+            DomainMatchType::Suffix,
+            "second",
+        )];
         router.load_routes(&routes2).unwrap();
 
         // First rule should be gone
@@ -1553,11 +1581,8 @@ mod tests {
 
         // Fill up to exactly MAX_ROUTES
         for i in 0..MAX_ROUTES {
-            let result = router.add_route(
-                &format!("domain{}.com", i),
-                DomainMatchType::Suffix,
-                "bulk",
-            );
+            let result =
+                router.add_route(&format!("domain{}.com", i), DomainMatchType::Suffix, "bulk");
             assert!(
                 result.is_ok(),
                 "Failed to add route {} of {}: {:?}",
@@ -1596,7 +1621,11 @@ mod tests {
         // Fill to MAX_ROUTES
         for i in 0..MAX_ROUTES {
             router
-                .add_route(&format!("domain{}.com", i), DomainMatchType::Suffix, "original")
+                .add_route(
+                    &format!("domain{}.com", i),
+                    DomainMatchType::Suffix,
+                    "original",
+                )
                 .unwrap();
         }
 

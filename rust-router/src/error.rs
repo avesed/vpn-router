@@ -431,7 +431,6 @@ pub enum UdpError {
     NotReady,
 
     // === SOCKS5 UDP ASSOCIATE Errors ===
-
     /// SOCKS5 UDP association failed
     #[error("SOCKS5 UDP association failed: {reason}")]
     Socks5UdpAssociationFailed { reason: String },
@@ -482,9 +481,7 @@ impl UdpError {
             Self::Socks5FragmentedPacket { .. } => false,    // Not supported
             Self::IoError(e) => matches!(
                 e.kind(),
-                io::ErrorKind::Interrupted
-                    | io::ErrorKind::WouldBlock
-                    | io::ErrorKind::TimedOut
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ),
         }
     }
@@ -686,10 +683,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("CAP_NET_ADMIN"));
 
-        let err = OutboundError::connection_failed(
-            "127.0.0.1:80".parse().unwrap(),
-            "connection refused",
-        );
+        let err =
+            OutboundError::connection_failed("127.0.0.1:80".parse().unwrap(), "connection refused");
         let msg = err.to_string();
         assert!(msg.contains("127.0.0.1:80"));
         assert!(msg.contains("connection refused"));

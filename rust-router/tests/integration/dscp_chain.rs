@@ -66,11 +66,7 @@ fn test_table_to_dscp_mapping() {
     // Tables 301-363 map back to DSCP 1-63
     for table in (tables::DSCP_TERMINAL_MIN + 1)..=tables::DSCP_TERMINAL_MAX {
         let mark = ChainMark::from_routing_table(table);
-        assert!(
-            mark.is_some(),
-            "Table {} should map to valid DSCP",
-            table
-        );
+        assert!(mark.is_some(), "Table {} should map to valid DSCP", table);
         let expected_dscp = (table - tables::DSCP_TERMINAL_MIN) as u8;
         assert_eq!(
             mark.unwrap().dscp_value,
@@ -145,10 +141,7 @@ fn test_mark_range_validation() {
         ChainMark::from_routing_mark(ENTRY_ROUTING_MARK_BASE + 64).is_none(),
         "DSCP 64 invalid"
     );
-    assert!(
-        ChainMark::from_routing_mark(0x200).is_none(),
-        "Wrong base"
-    );
+    assert!(ChainMark::from_routing_mark(0x200).is_none(), "Wrong base");
 }
 
 // ============================================================================
@@ -505,7 +498,12 @@ fn test_chain_routing_multiple() {
         .unwrap()
         .build();
 
-    let chains = [("us-west", 1), ("us-east", 2), ("eu-london", 10), ("asia-tokyo", 20)];
+    let chains = [
+        ("us-west", 1),
+        ("us-east", 2),
+        ("eu-london", 10),
+        ("asia-tokyo", 20),
+    ];
 
     for (tag, dscp) in &chains {
         let mark = router.get_chain_mark(tag).expect("Chain should exist");
@@ -539,11 +537,7 @@ fn test_reserved_dscp_detection() {
     let non_reserved = [1, 5, 7, 9, 11, 15, 50, 63];
 
     for dscp in reserved {
-        assert!(
-            is_reserved_dscp(dscp),
-            "DSCP {} should be reserved",
-            dscp
-        );
+        assert!(is_reserved_dscp(dscp), "DSCP {} should be reserved", dscp);
     }
 
     for dscp in non_reserved {

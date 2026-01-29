@@ -17,9 +17,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::reality::common::{
-    REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE,
-    REALITY_NONCE_SIZE, REALITY_SALT_SIZE, REALITY_SESSION_ID_PLAINTEXT_SIZE,
-    REALITY_SESSION_ID_SIZE, REALITY_SHORT_ID_SIZE,
+    REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE, REALITY_NONCE_SIZE, REALITY_SALT_SIZE,
+    REALITY_SESSION_ID_PLAINTEXT_SIZE, REALITY_SESSION_ID_SIZE, REALITY_SHORT_ID_SIZE,
 };
 use crate::reality::crypto::perform_ecdh;
 use crate::reality::error::{RealityError, RealityResult};
@@ -95,7 +94,8 @@ impl SessionId {
         let mut version = [0u8; 3];
         version.copy_from_slice(&plaintext[0..3]);
 
-        let timestamp = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
+        let timestamp =
+            u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
 
         let mut short_id = [0u8; REALITY_SHORT_ID_SIZE];
         short_id.copy_from_slice(&plaintext[8..16]);
@@ -493,15 +493,21 @@ mod tests {
         let session_id = SessionId::with_timestamp([1, 8, 1], now, [0xAB; 8]);
 
         // Current timestamp should be valid
-        assert!(session_id.validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS).is_ok());
+        assert!(session_id
+            .validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS)
+            .is_ok());
 
         // 30 seconds ago should be valid
         let past = SessionId::with_timestamp([1, 8, 1], now - 30, [0xAB; 8]);
-        assert!(past.validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS).is_ok());
+        assert!(past
+            .validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS)
+            .is_ok());
 
         // 30 seconds in future should be valid
         let future = SessionId::with_timestamp([1, 8, 1], now + 30, [0xAB; 8]);
-        assert!(future.validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS).is_ok());
+        assert!(future
+            .validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS)
+            .is_ok());
     }
 
     #[test]
@@ -510,11 +516,15 @@ mod tests {
 
         // 2 minutes ago should fail (default is 60 seconds)
         let old = SessionId::with_timestamp([1, 8, 1], now.saturating_sub(120), [0xAB; 8]);
-        assert!(old.validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS).is_err());
+        assert!(old
+            .validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS)
+            .is_err());
 
         // 2 minutes in future should fail
         let future = SessionId::with_timestamp([1, 8, 1], now + 120, [0xAB; 8]);
-        assert!(future.validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS).is_err());
+        assert!(future
+            .validate_timestamp(REALITY_DEFAULT_MAX_TIME_DIFF_MS)
+            .is_err());
     }
 
     #[test]
@@ -522,11 +532,7 @@ mod tests {
         let short_id = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
         let session_id = SessionId::new([1, 8, 1], short_id);
 
-        let allowed = vec![
-            [0xAA; 8],
-            short_id,
-            [0xBB; 8],
-        ];
+        let allowed = vec![[0xAA; 8], short_id, [0xBB; 8]];
 
         // Should pass - short_id is in allowed list
         assert!(session_id.validate_short_id(&allowed).is_ok());
@@ -571,9 +577,13 @@ mod tests {
         let plaintext = session_id.to_plaintext();
 
         // Derive auth key from client's perspective
-        let shared_secret =
-            perform_ecdh(&client_keypair.private_key_bytes(), server_keypair.public_key().as_bytes()).unwrap();
-        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+        let shared_secret = perform_ecdh(
+            &client_keypair.private_key_bytes(),
+            server_keypair.public_key().as_bytes(),
+        )
+        .unwrap();
+        let auth_key =
+            derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
 
         // Encrypt session ID
         let nonce = &client_random[20..32];
@@ -607,9 +617,13 @@ mod tests {
         let session_id = SessionId::new([1, 8, 1], short_id);
         let plaintext = session_id.to_plaintext();
 
-        let shared_secret =
-            perform_ecdh(&client_keypair.private_key_bytes(), server_keypair.public_key().as_bytes()).unwrap();
-        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+        let shared_secret = perform_ecdh(
+            &client_keypair.private_key_bytes(),
+            server_keypair.public_key().as_bytes(),
+        )
+        .unwrap();
+        let auth_key =
+            derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
 
         let nonce = &client_random[20..32];
         let aad = b"client hello";

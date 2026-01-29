@@ -31,9 +31,7 @@ use rust_router::ipc::{
     decode_message, encode_message, ErrorCode, IngressStatsResponse, IpcCommand, IpcError,
     IpcResponse,
 };
-use rust_router::rules::{
-    ConnectionInfo, RuleEngine, RuleType, RoutingSnapshotBuilder,
-};
+use rust_router::rules::{ConnectionInfo, RoutingSnapshotBuilder, RuleEngine, RuleType};
 
 // ============================================================================
 // E2E Connection Path Tests
@@ -128,14 +126,15 @@ mod e2e_connection {
         );
 
         // IPv4 connection
-        let conn_v4 = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let conn_v4 =
+            ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let result_v4 = engine.match_connection(&conn_v4);
         assert_eq!(result_v4.outbound, "direct");
 
         // IPv6 connection
-        let conn_v6 = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)));
+        let conn_v6 = ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888,
+        )));
         let result_v6 = engine.match_connection(&conn_v6);
         assert_eq!(result_v6.outbound, "direct");
     }
@@ -152,14 +151,13 @@ mod e2e_connection {
         );
 
         // DNS query (UDP 53)
-        let dns_conn = ConnectionInfo::new("udp", 53)
-            .with_dest_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let dns_conn =
+            ConnectionInfo::new("udp", 53).with_dest_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let result = engine.match_connection(&dns_conn);
         assert_eq!(result.outbound, "direct");
 
         // QUIC connection (UDP 443)
-        let quic_conn = ConnectionInfo::new("udp", 443)
-            .with_domain("www.google.com");
+        let quic_conn = ConnectionInfo::new("udp", 443).with_domain("www.google.com");
         let result = engine.match_connection(&quic_conn);
         assert_eq!(result.outbound, "direct");
     }
@@ -343,8 +341,8 @@ mod e2e_rule_matching {
         );
 
         // Connection without domain
-        let conn = ConnectionInfo::new("tcp", 443)
-            .with_dest_ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        let conn =
+            ConnectionInfo::new("tcp", 443).with_dest_ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
         let result = engine.match_connection(&conn);
         assert_eq!(result.outbound, "direct");
     }
@@ -366,8 +364,12 @@ mod e2e_ipc {
             IpcCommand::GetStats,
             IpcCommand::GetIngressStats,
             IpcCommand::ListOutbounds,
-            IpcCommand::Shutdown { drain_timeout_secs: Some(30) },
-            IpcCommand::Shutdown { drain_timeout_secs: None },
+            IpcCommand::Shutdown {
+                drain_timeout_secs: Some(30),
+            },
+            IpcCommand::Shutdown {
+                drain_timeout_secs: None,
+            },
         ];
 
         for cmd in commands {
@@ -657,10 +659,10 @@ mod e2e_error_handling {
 
         // Various edge case inputs
         let edge_cases = vec![
-            ("", 0),                    // Empty protocol, port 0
-            ("tcp", 0),                 // Port 0
-            ("unknown", 443),           // Unknown protocol
-            ("TCP", 443),               // Uppercase protocol
+            ("", 0),          // Empty protocol, port 0
+            ("tcp", 0),       // Port 0
+            ("unknown", 443), // Unknown protocol
+            ("TCP", 443),     // Uppercase protocol
         ];
 
         for (protocol, port) in edge_cases {
@@ -702,8 +704,8 @@ mod e2e_error_handling {
 
         // All connections should go to default
         for i in 0..100 {
-            let conn = ConnectionInfo::new("tcp", 443)
-                .with_domain(&format!("test{}.example.com", i));
+            let conn =
+                ConnectionInfo::new("tcp", 443).with_domain(&format!("test{}.example.com", i));
             let result = engine.match_connection(&conn);
             assert_eq!(result.outbound, "fallback");
         }

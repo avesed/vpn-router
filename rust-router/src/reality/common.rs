@@ -430,7 +430,10 @@ mod tests {
     fn test_constants() {
         // Verify size relationships
         assert!(MAX_TLS_CIPHERTEXT_LEN > MAX_TLS_PLAINTEXT_LEN);
-        assert_eq!(TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE + MAX_TLS_CIPHERTEXT_LEN);
+        assert_eq!(
+            TLS_MAX_RECORD_SIZE,
+            TLS_RECORD_HEADER_SIZE + MAX_TLS_CIPHERTEXT_LEN
+        );
         assert_eq!(REALITY_SALT_SIZE + REALITY_NONCE_SIZE, 32); // From ClientHello.Random
     }
 }

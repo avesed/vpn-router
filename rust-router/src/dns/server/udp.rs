@@ -54,8 +54,8 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, error, info, trace, warn};
 
-use hickory_proto::serialize::binary::BinDecodable;
 use hickory_proto::op::Message;
+use hickory_proto::serialize::binary::BinDecodable;
 
 use super::handler::{DnsHandler, MAX_UDP_RESPONSE_SIZE_NO_EDNS};
 use crate::dns::error::{DnsError, DnsResult};
@@ -280,13 +280,13 @@ impl UdpDnsServer {
     /// # }
     /// ```
     pub async fn bind(addr: SocketAddr, handler: Arc<DnsHandler>) -> DnsResult<Self> {
-        let socket = UdpSocket::bind(addr).await.map_err(|e| {
-            DnsError::network_io(format!("failed to bind UDP socket to {addr}"), e)
-        })?;
+        let socket = UdpSocket::bind(addr)
+            .await
+            .map_err(|e| DnsError::network_io(format!("failed to bind UDP socket to {addr}"), e))?;
 
-        let local_addr = socket.local_addr().map_err(|e| {
-            DnsError::network_io("failed to get local address".to_string(), e)
-        })?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| DnsError::network_io("failed to get local address".to_string(), e))?;
 
         info!(addr = %local_addr, "UDP DNS server bound");
 
@@ -308,9 +308,9 @@ impl UdpDnsServer {
     ///
     /// Useful for testing or when the socket is created externally.
     pub fn from_socket(socket: UdpSocket, handler: Arc<DnsHandler>) -> DnsResult<Self> {
-        let local_addr = socket.local_addr().map_err(|e| {
-            DnsError::network_io("failed to get local address".to_string(), e)
-        })?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| DnsError::network_io("failed to get local address".to_string(), e))?;
 
         let buffer_pool = BufferPoolConfig::new(DEFAULT_BUFFER_POOL_SIZE, MAX_UDP_MESSAGE_SIZE)
             .with_prewarm(DEFAULT_BUFFER_POOL_SIZE / 4)
@@ -456,7 +456,9 @@ impl UdpDnsServer {
         };
 
         self.stats.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_received.fetch_add(len as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_received
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         trace!(src = %src, len = len, "Received UDP DNS packet");
 
@@ -470,7 +472,9 @@ impl UdpDnsServer {
                 Ok(sent) => {
                     self.stats.record_send_success();
                     self.stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                    self.stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                    self.stats
+                        .bytes_sent
+                        .fetch_add(sent as u64, Ordering::Relaxed);
                     trace!(dst = %src, len = sent, "Sent UDP DNS response");
                 }
                 Err(e) => {
@@ -498,7 +502,9 @@ impl UdpDnsServer {
         let parsed_query = Message::from_bytes(query).ok();
         let client_buffer_size = parsed_query
             .as_ref()
-            .map_or(MAX_UDP_RESPONSE_SIZE_NO_EDNS, |q| self.handler.get_client_buffer_size(q));
+            .map_or(MAX_UDP_RESPONSE_SIZE_NO_EDNS, |q| {
+                self.handler.get_client_buffer_size(q)
+            });
 
         match self.handler.handle_query(src, query).await {
             Ok(response) => {
@@ -523,9 +529,14 @@ impl UdpDnsServer {
             Err(e) => {
                 // Track specific error types
                 if e.is_rate_limited() {
-                    self.stats.rate_limit_rejections.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .rate_limit_rejections
+                        .fetch_add(1, Ordering::Relaxed);
                     debug!(src = %src, "Query rate limited");
-                } else if matches!(e, DnsError::ParseError { .. } | DnsError::InvalidQuery { .. }) {
+                } else if matches!(
+                    e,
+                    DnsError::ParseError { .. } | DnsError::InvalidQuery { .. }
+                ) {
                     self.stats.parse_errors.fetch_add(1, Ordering::Relaxed);
                     debug!(src = %src, error = %e, "Query parse error");
                 } else {
@@ -659,10 +670,8 @@ mod tests {
         // Question section: example.com
         query.extend_from_slice(&[
             0x07, // length: 7
-            b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            0x03, // length: 3
-            b'c', b'o', b'm',
-            0x00, // end of name
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, // length: 3
+            b'c', b'o', b'm', 0x00, // end of name
             0x00, 0x01, // QTYPE: A
             0x00, 0x01, // QCLASS: IN
         ]);
@@ -780,9 +789,8 @@ mod tests {
 
         // Spawn server
         let server_clone = Arc::clone(&server);
-        let handle = tokio::spawn(async move {
-            server_clone.run_until_shutdown(shutdown_rx).await
-        });
+        let handle =
+            tokio::spawn(async move { server_clone.run_until_shutdown(shutdown_rx).await });
 
         // Give it time to start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -791,11 +799,7 @@ mod tests {
         shutdown_tx.send(()).unwrap();
 
         // Wait for server to stop
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
 
         assert!(result.is_ok(), "Server should have stopped");
     }
@@ -818,9 +822,7 @@ mod tests {
 
         // Spawn server to handle one packet
         let server_clone = Arc::clone(&server);
-        let handle = tokio::spawn(async move {
-            server_clone.handle_one_packet().await
-        });
+        let handle = tokio::spawn(async move { server_clone.handle_one_packet().await });
 
         // Receive response
         let mut response_buf = vec![0u8; MAX_UDP_MESSAGE_SIZE];
@@ -855,16 +857,10 @@ mod tests {
 
         // Handle packet
         let server_clone = Arc::clone(&server);
-        let handle = tokio::spawn(async move {
-            server_clone.handle_one_packet().await
-        });
+        let handle = tokio::spawn(async move { server_clone.handle_one_packet().await });
 
         // Wait for handling
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), handle).await;
 
         // Stats should show parse error
         let stats = server.stats().snapshot();
@@ -961,11 +957,7 @@ mod tests {
 
     #[test]
     fn test_is_fatal_error_rate_limit() {
-        let dns_err = DnsError::rate_limit(
-            "127.0.0.1:1234".parse().unwrap(),
-            100,
-            50,
-        );
+        let dns_err = DnsError::rate_limit("127.0.0.1:1234".parse().unwrap(), 100, 50);
         assert!(!UdpDnsServer::is_fatal_error(&dns_err));
     }
 

@@ -111,25 +111,24 @@ pub use error::{RealityError, RealityResult};
 
 // Constants
 pub use common::{
-    AEAD_TAG_SIZE, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
-    MAX_TLS_CIPHERTEXT_LEN, MAX_TLS_PLAINTEXT_LEN, NONCE_SIZE, REALITY_AUTH_INFO,
-    REALITY_DEFAULT_MAX_TIME_DIFF_MS, REALITY_SHORT_ID_SIZE, TLS_MAX_RECORD_SIZE,
-    TLS_RECORD_HEADER_SIZE,
+    AEAD_TAG_SIZE, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE, MAX_TLS_CIPHERTEXT_LEN,
+    MAX_TLS_PLAINTEXT_LEN, NONCE_SIZE, REALITY_AUTH_INFO, REALITY_DEFAULT_MAX_TIME_DIFF_MS,
+    REALITY_SHORT_ID_SIZE, TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
 };
 
 // Crypto primitives
 pub use crypto::{
-    AeadKey, CipherSuite, DEFAULT_CIPHER_SUITES, Tls13HandshakeKeys,
     compute_finished_verify_data, derive_application_secrets, derive_handshake_keys,
-    derive_traffic_keys, generate_keypair, perform_ecdh, X25519KeyPair, X25519PublicKey,
+    derive_traffic_keys, generate_keypair, perform_ecdh, AeadKey, CipherSuite, Tls13HandshakeKeys,
+    X25519KeyPair, X25519PublicKey, DEFAULT_CIPHER_SUITES,
 };
 
 // TLS message handling
 pub use tls::{
     construct_certificate, construct_certificate_verify, construct_client_hello,
     construct_encrypted_extensions, construct_finished, construct_server_hello,
-    extract_server_cipher_suite, extract_server_public_key, write_record_header,
-    RecordDecryptor, RecordEncryptor, DEFAULT_ALPN_PROTOCOLS,
+    extract_server_cipher_suite, extract_server_public_key, write_record_header, RecordDecryptor,
+    RecordEncryptor, DEFAULT_ALPN_PROTOCOLS,
 };
 
 // HMAC certificate generation
@@ -137,8 +136,8 @@ pub use certificate::{generate_hmac_certificate, HmacCertificate};
 
 // Authentication
 pub use auth::{
-    current_timestamp, decode_short_id, decrypt_session_id, derive_auth_key,
-    encrypt_session_id, validate_auth, SessionId,
+    current_timestamp, decode_short_id, decrypt_session_id, derive_auth_key, encrypt_session_id,
+    validate_auth, SessionId,
 };
 
 // Client connection
@@ -249,11 +248,8 @@ mod tests {
     #[test]
     fn test_client_exports() {
         // Test client config
-        let config = RealityClientConfig::new(
-            [0x42u8; 32],
-            [0xABu8; 8],
-            "www.google.com".to_string(),
-        );
+        let config =
+            RealityClientConfig::new([0x42u8; 32], [0xABu8; 8], "www.google.com".to_string());
 
         assert_eq!(config.server_name, "www.google.com");
 

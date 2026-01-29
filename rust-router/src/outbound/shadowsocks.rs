@@ -87,8 +87,7 @@ use shadowsocks::{
     context::{Context as SsContext, SharedContext},
     net::TcpStream as SsTcpStream,
     relay::{
-        socks5::Address as SsAddress,
-        tcprelay::ProxyClientStream,
+        socks5::Address as SsAddress, tcprelay::ProxyClientStream,
         udprelay::proxy_socket::ProxySocket,
     },
     ServerAddr,
@@ -255,10 +254,7 @@ pub struct ShadowsocksUdpHandle {
 #[cfg(feature = "shadowsocks")]
 impl ShadowsocksUdpHandle {
     /// Create a new Shadowsocks UDP handle
-    fn new(
-        socket: Arc<ProxySocket<shadowsocks::net::UdpSocket>>,
-        dest_addr: SocketAddr,
-    ) -> Self {
+    fn new(socket: Arc<ProxySocket<shadowsocks::net::UdpSocket>>, dest_addr: SocketAddr) -> Self {
         Self {
             socket,
             dest_addr,
@@ -314,10 +310,7 @@ impl ShadowsocksUdpHandle {
             .map_err(|e| UdpError::RecvError(e.to_string()))?;
 
         self.packets_received.fetch_add(1, Ordering::Relaxed);
-        trace!(
-            bytes = n,
-            "Shadowsocks UDP recv"
-        );
+        trace!(bytes = n, "Shadowsocks UDP recv");
         Ok(n)
     }
 
@@ -609,7 +602,10 @@ impl ShadowsocksOutbound {
             .map_err(|e| {
                 OutboundError::connection_failed(
                     addr,
-                    format!("Failed to resolve server address {}: {}", server_addr_str, e),
+                    format!(
+                        "Failed to resolve server address {}: {}",
+                        server_addr_str, e
+                    ),
                 )
             })?
             .next()
@@ -646,8 +642,12 @@ impl ShadowsocksOutbound {
             let ss_addr = Self::socket_addr_to_ss_address(addr);
 
             // Create ProxyClientStream over the QUIC stream
-            let proxy_stream =
-                ProxyClientStream::from_stream(self.ss_context.clone(), quic_stream, &self.ss_config, ss_addr);
+            let proxy_stream = ProxyClientStream::from_stream(
+                self.ss_context.clone(),
+                quic_stream,
+                &self.ss_config,
+                ss_addr,
+            );
 
             Ok::<_, crate::transport::TransportError>(proxy_stream)
         })
@@ -792,10 +792,7 @@ impl Outbound for ShadowsocksOutbound {
         match connect_result {
             Ok(Ok(proxy_socket)) => {
                 self.update_health(true);
-                debug!(
-                    "Shadowsocks UDP socket to {} via {} ready",
-                    addr, self.tag
-                );
+                debug!("Shadowsocks UDP socket to {} via {} ready", addr, self.tag);
 
                 // Create the handle
                 let handle = ShadowsocksUdpHandle::new(Arc::new(proxy_socket), addr);
@@ -821,7 +818,10 @@ impl Outbound for ShadowsocksOutbound {
                 );
                 Err(UdpError::IoError(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("Shadowsocks UDP connection timed out after {}s", connect_timeout.as_secs()),
+                    format!(
+                        "Shadowsocks UDP connection timed out after {}s",
+                        connect_timeout.as_secs()
+                    ),
                 )))
             }
         }

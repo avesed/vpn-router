@@ -214,7 +214,12 @@ impl FakeDnsCache {
     /// Insert or update a domain -> IPv4 mapping
     ///
     /// Returns the previous entry if one existed.
-    pub fn insert_ipv4(&self, domain: String, ipv4: Ipv4Addr, ttl: Duration) -> Option<DomainEntry> {
+    pub fn insert_ipv4(
+        &self,
+        domain: String,
+        ipv4: Ipv4Addr,
+        ttl: Duration,
+    ) -> Option<DomainEntry> {
         self.stats.allocations.fetch_add(1, Ordering::Relaxed);
 
         // Insert into IP -> domain map
@@ -326,7 +331,9 @@ impl FakeDnsCache {
         });
 
         if removed > 0 {
-            self.stats.evictions.fetch_add(removed as u64, Ordering::Relaxed);
+            self.stats
+                .evictions
+                .fetch_add(removed as u64, Ordering::Relaxed);
         }
 
         removed
@@ -388,7 +395,8 @@ mod tests {
 
     #[test]
     fn test_domain_entry_refresh() {
-        let mut entry = DomainEntry::new_ipv4(Ipv4Addr::new(10, 0, 0, 1), Duration::from_millis(10));
+        let mut entry =
+            DomainEntry::new_ipv4(Ipv4Addr::new(10, 0, 0, 1), Duration::from_millis(10));
         std::thread::sleep(Duration::from_millis(20));
         assert!(entry.is_expired());
 
@@ -429,10 +437,7 @@ mod tests {
 
         let entry = cache.get_domain("example.com").unwrap();
         assert_eq!(entry.ipv4, Some(Ipv4Addr::new(198, 18, 0, 1)));
-        assert_eq!(
-            entry.ipv6,
-            Some(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))
-        );
+        assert_eq!(entry.ipv6, Some(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)));
 
         // Both IPs should resolve to the domain
         let domain4 = cache

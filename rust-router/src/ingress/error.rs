@@ -344,11 +344,7 @@ mod tests {
         ];
 
         for err in recoverable {
-            assert!(
-                err.is_recoverable(),
-                "Expected {} to be recoverable",
-                err
-            );
+            assert!(err.is_recoverable(), "Expected {} to be recoverable", err);
         }
     }
 

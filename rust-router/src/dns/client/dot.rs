@@ -120,20 +120,13 @@ mod inner {
             tcp_stream.set_nodelay(true).ok();
 
             // Perform TLS handshake
-            let tls_connect = self.tls_connector.connect(self.server_name.clone(), tcp_stream);
+            let tls_connect = self
+                .tls_connector
+                .connect(self.server_name.clone(), tcp_stream);
             let tls_stream = timeout(self.connect_timeout, tls_connect)
                 .await
-                .map_err(|_| {
-                    DnsError::timeout(
-                        "TLS handshake",
-                        self.connect_timeout,
-                    )
-                })?
-                .map_err(|e| {
-                    DnsError::network(format!(
-                        "TLS handshake failed: {e}"
-                    ))
-                })?;
+                .map_err(|_| DnsError::timeout("TLS handshake", self.connect_timeout))?
+                .map_err(|e| DnsError::network(format!("TLS handshake failed: {e}")))?;
 
             Ok(tls_stream)
         }
@@ -308,10 +301,8 @@ mod inner {
             let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
             // Create server name for TLS SNI
-            let server_name_tls: ServerName<'static> = server_name
-                .clone()
-                .try_into()
-                .map_err(|_| {
+            let server_name_tls: ServerName<'static> =
+                server_name.clone().try_into().map_err(|_| {
                     DnsError::config_field(
                         format!("invalid server name for SNI: {server_name}"),
                         "upstream.address",
@@ -325,9 +316,12 @@ mod inner {
                 tls_connector,
                 connect_timeout,
             );
-            let pool = Pool::builder(manager).max_size(pool_size).build().map_err(|e| {
-                DnsError::config(format!("failed to create DoT connection pool: {e}"))
-            })?;
+            let pool = Pool::builder(manager)
+                .max_size(pool_size)
+                .build()
+                .map_err(|e| {
+                    DnsError::config(format!("failed to create DoT connection pool: {e}"))
+                })?;
 
             let query_timeout = Duration::from_secs(config.timeout_secs.max(1));
             let health = Arc::new(HealthChecker::new(&health_config));
@@ -416,9 +410,8 @@ mod inner {
 
         /// Create TLS configuration with secure defaults
         fn create_tls_config() -> DnsResult<ClientConfig> {
-            let root_store = rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            );
+            let root_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
             let config = ClientConfig::builder()
                 .with_root_certificates(root_store)
@@ -457,9 +450,9 @@ mod inner {
             query: &Message,
         ) -> DnsResult<Message> {
             // Serialize the query
-            let query_bytes = query.to_vec().map_err(|e| {
-                DnsError::serialize(format!("failed to serialize DNS query: {e}"))
-            })?;
+            let query_bytes = query
+                .to_vec()
+                .map_err(|e| DnsError::serialize(format!("failed to serialize DNS query: {e}")))?;
 
             // Check message size
             if query_bytes.len() > MAX_TCP_MESSAGE_SIZE {
@@ -520,7 +513,10 @@ mod inner {
                 })?
                 .map_err(|e| {
                     DnsError::network_io(
-                        format!("failed to read DoT response length from {}", self.server_name),
+                        format!(
+                            "failed to read DoT response length from {}",
+                            self.server_name
+                        ),
                         e,
                     )
                 })?;
@@ -555,9 +551,8 @@ mod inner {
                 })?;
 
             // Parse the response
-            let response = Message::from_vec(&response_buf).map_err(|e| {
-                DnsError::parse(format!("failed to parse DoT DNS response: {e}"))
-            })?;
+            let response = Message::from_vec(&response_buf)
+                .map_err(|e| DnsError::parse(format!("failed to parse DoT DNS response: {e}")))?;
 
             // Validate response matches query
             if !validate_response(query, &response) {
@@ -903,13 +898,8 @@ mod tests {
             .with_failure_threshold(5)
             .with_success_threshold(2);
 
-        let client = DotClient::with_full_config(
-            config,
-            4,
-            Duration::from_secs(15),
-            health_config,
-        )
-        .unwrap();
+        let client =
+            DotClient::with_full_config(config, 4, Duration::from_secs(15), health_config).unwrap();
 
         let health = client.health();
         assert_eq!(health.failure_threshold(), 5);

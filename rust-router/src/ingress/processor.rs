@@ -303,7 +303,9 @@ impl IngressProcessor {
                 )));
             }
             Err(e) => {
-                return Err(IngressError::processing(format!("DSCP extraction failed: {e}")));
+                return Err(IngressError::processing(format!(
+                    "DSCP extraction failed: {e}"
+                )));
             }
         };
 
@@ -336,7 +338,10 @@ impl IngressProcessor {
                                 dscp_mark: Some(0),
                                 routing_mark: None,
                                 is_chain_packet: true,
-                                match_info: Some(format!("dscp:{} terminal", chain_mark.dscp_value)),
+                                match_info: Some(format!(
+                                    "dscp:{} terminal",
+                                    chain_mark.dscp_value
+                                )),
                                 matched_rule: None,
                             });
                         }
@@ -356,9 +361,11 @@ impl IngressProcessor {
                             match_info: Some(format!("dscp:{} terminal-config-missing", dscp)),
                             matched_rule: None,
                         });
-                    } else if my_role == Some(ChainRole::Entry) || my_role == Some(ChainRole::Relay) {
+                    } else if my_role == Some(ChainRole::Entry) || my_role == Some(ChainRole::Relay)
+                    {
                         // Entry/Relay node: forward to next hop's peer tunnel
-                        if let Some(next_hop_tunnel) = chain_manager.get_next_hop_tunnel(chain_tag) {
+                        if let Some(next_hop_tunnel) = chain_manager.get_next_hop_tunnel(chain_tag)
+                        {
                             trace!(
                                 peer = src_peer,
                                 dscp = dscp,
@@ -372,7 +379,10 @@ impl IngressProcessor {
                                 dscp_mark: Some(dscp), // Preserve DSCP for next hop
                                 routing_mark: Some(chain_mark.routing_mark),
                                 is_chain_packet: true,
-                                match_info: Some(format!("dscp:{} {:?}", chain_mark.dscp_value, my_role)),
+                                match_info: Some(format!(
+                                    "dscp:{} {:?}",
+                                    chain_mark.dscp_value, my_role
+                                )),
                                 matched_rule: None,
                             });
                         }
@@ -472,10 +482,7 @@ impl IngressProcessor {
 
         // Check if this is a chain route (entry node with DSCP=0 matching a chain rule)
         // The rule engine returns the chain tag as outbound with a routing_mark
-        if let Some(chain_mark) = result
-            .routing_mark
-            .and_then(ChainMark::from_routing_mark)
-        {
+        if let Some(chain_mark) = result.routing_mark.and_then(ChainMark::from_routing_mark) {
             debug!(
                 peer = src_peer,
                 outbound = %result.outbound,
@@ -592,13 +599,11 @@ impl IngressProcessor {
         let (dest_port, protocol_str) = if packet.len() >= header_len + 4 {
             match protocol {
                 IPPROTO_TCP => {
-                    let port =
-                        u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
+                    let port = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
                     (port, "tcp")
                 }
                 IPPROTO_UDP => {
-                    let port =
-                        u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
+                    let port = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
                     (port, "udp")
                 }
                 IPPROTO_ICMP => (0, "icmp"),
@@ -649,64 +654,33 @@ impl IngressProcessor {
         }
 
         let (protocol, header_len, total_len) =
-            super::forwarder::parse_ipv6_transport_header(packet)
-                .ok_or_else(|| IngressError::invalid_packet("IPv6 extension header parsing failed"))?;
+            super::forwarder::parse_ipv6_transport_header(packet).ok_or_else(|| {
+                IngressError::invalid_packet("IPv6 extension header parsing failed")
+            })?;
 
         // Extract source IP (bytes 8-23)
         let src_ip = Ipv6Addr::from([
-            packet[8],
-            packet[9],
-            packet[10],
-            packet[11],
-            packet[12],
-            packet[13],
-            packet[14],
-            packet[15],
-            packet[16],
-            packet[17],
-            packet[18],
-            packet[19],
-            packet[20],
-            packet[21],
-            packet[22],
-            packet[23],
+            packet[8], packet[9], packet[10], packet[11], packet[12], packet[13], packet[14],
+            packet[15], packet[16], packet[17], packet[18], packet[19], packet[20], packet[21],
+            packet[22], packet[23],
         ]);
 
         // Extract destination IP (bytes 24-39)
         let dest_ip = Ipv6Addr::from([
-            packet[24],
-            packet[25],
-            packet[26],
-            packet[27],
-            packet[28],
-            packet[29],
-            packet[30],
-            packet[31],
-            packet[32],
-            packet[33],
-            packet[34],
-            packet[35],
-            packet[36],
-            packet[37],
-            packet[38],
-            packet[39],
+            packet[24], packet[25], packet[26], packet[27], packet[28], packet[29], packet[30],
+            packet[31], packet[32], packet[33], packet[34], packet[35], packet[36], packet[37],
+            packet[38], packet[39],
         ]);
 
         // Extract ports for TCP/UDP (after IPv6 header)
         let (dest_port, protocol_str) = if total_len >= header_len + 4 {
             match protocol {
                 IPPROTO_TCP => {
-                    let port = u16::from_be_bytes([
-                        packet[header_len + 2],
-                        packet[header_len + 3],
-                    ]);
+                    let port = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
                     (port, "tcp")
                 }
                 IPPROTO_UDP => {
-                    let port = u16::from_be_bytes([
-                        packet[header_len + 2],
-                        packet[header_len + 3],
-                    ]);
+                    let port = u16::from_be_bytes([packet[header_len + 2], packet[header_len + 3]]);
                     (port, "udp")
                 }
                 IPPROTO_ICMPV6 => (0, "icmpv6"),
@@ -797,11 +771,18 @@ mod tests {
         let dst_ip: Ipv4Addr = dst.parse().unwrap();
 
         let packet = vec![
-            0x45, 0x00, // Version=4, IHL=5, TOS=0
-            0x00, 0x28, // Total Length = 40 (20 IP + 20 TCP)
-            0x00, 0x00, 0x40, 0x00, // ID, Flags, Fragment
-            0x40, 0x06, // TTL=64, Protocol=TCP
-            0x00, 0x00, // Checksum (placeholder)
+            0x45,
+            0x00, // Version=4, IHL=5, TOS=0
+            0x00,
+            0x28, // Total Length = 40 (20 IP + 20 TCP)
+            0x00,
+            0x00,
+            0x40,
+            0x00, // ID, Flags, Fragment
+            0x40,
+            0x06, // TTL=64, Protocol=TCP
+            0x00,
+            0x00, // Checksum (placeholder)
             src_ip.octets()[0],
             src_ip.octets()[1],
             src_ip.octets()[2],
@@ -811,15 +792,26 @@ mod tests {
             dst_ip.octets()[2],
             dst_ip.octets()[3],
             // TCP header (20 bytes)
-            0x12, 0x34, // Source port (4660)
+            0x12,
+            0x34, // Source port (4660)
             (dst_port >> 8) as u8,
             (dst_port & 0xFF) as u8,
-            0x00, 0x00, 0x00, 0x01, // Seq number
-            0x00, 0x00, 0x00, 0x00, // Ack number
-            0x50, 0x02, // Data offset, flags (SYN)
-            0xFF, 0xFF, // Window
-            0x00, 0x00, // Checksum
-            0x00, 0x00, // Urgent pointer
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Seq number
+            0x00,
+            0x00,
+            0x00,
+            0x00, // Ack number
+            0x50,
+            0x02, // Data offset, flags (SYN)
+            0xFF,
+            0xFF, // Window
+            0x00,
+            0x00, // Checksum
+            0x00,
+            0x00, // Urgent pointer
         ];
 
         packet
@@ -831,11 +823,18 @@ mod tests {
         let dst_ip: Ipv4Addr = dst.parse().unwrap();
 
         vec![
-            0x45, 0x00, // Version=4, IHL=5, TOS=0
-            0x00, 0x1C, // Total Length = 28 (20 IP + 8 UDP)
-            0x00, 0x00, 0x40, 0x00, // ID, Flags, Fragment
-            0x40, 0x11, // TTL=64, Protocol=UDP
-            0x00, 0x00, // Checksum (placeholder)
+            0x45,
+            0x00, // Version=4, IHL=5, TOS=0
+            0x00,
+            0x1C, // Total Length = 28 (20 IP + 8 UDP)
+            0x00,
+            0x00,
+            0x40,
+            0x00, // ID, Flags, Fragment
+            0x40,
+            0x11, // TTL=64, Protocol=UDP
+            0x00,
+            0x00, // Checksum (placeholder)
             src_ip.octets()[0],
             src_ip.octets()[1],
             src_ip.octets()[2],
@@ -845,11 +844,14 @@ mod tests {
             dst_ip.octets()[2],
             dst_ip.octets()[3],
             // UDP header (8 bytes)
-            0x12, 0x34, // Source port (4660)
+            0x12,
+            0x34, // Source port (4660)
             (dst_port >> 8) as u8,
             (dst_port & 0xFF) as u8,
-            0x00, 0x08, // Length
-            0x00, 0x00, // Checksum
+            0x00,
+            0x08, // Length
+            0x00,
+            0x00, // Checksum
         ]
     }
 
@@ -869,15 +871,26 @@ mod tests {
 
         // TCP header (20 bytes)
         packet.extend_from_slice(&[
-            0x12, 0x34, // Source port (4660)
+            0x12,
+            0x34, // Source port (4660)
             (dst_port >> 8) as u8,
             (dst_port & 0xFF) as u8,
-            0x00, 0x00, 0x00, 0x01, // Seq number
-            0x00, 0x00, 0x00, 0x00, // Ack number
-            0x50, 0x02, // Data offset, flags (SYN)
-            0xFF, 0xFF, // Window
-            0x00, 0x00, // Checksum
-            0x00, 0x00, // Urgent pointer
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Seq number
+            0x00,
+            0x00,
+            0x00,
+            0x00, // Ack number
+            0x50,
+            0x02, // Data offset, flags (SYN)
+            0xFF,
+            0xFF, // Window
+            0x00,
+            0x00, // Checksum
+            0x00,
+            0x00, // Urgent pointer
         ]);
 
         packet
@@ -1061,7 +1074,10 @@ mod tests {
         assert!(decision.is_chain()); // Marked as chain packet even though blocked
         assert_eq!(decision.dscp_mark, Some(0)); // DSCP cleared
         assert!(
-            decision.match_info.as_ref().map_or(false, |info| info.contains("unregistered")),
+            decision
+                .match_info
+                .as_ref()
+                .map_or(false, |info| info.contains("unregistered")),
             "match_info should indicate unregistered DSCP: {:?}",
             decision.match_info
         );
@@ -1085,7 +1101,10 @@ mod tests {
         assert_eq!(decision.outbound, "block");
         assert!(decision.is_chain());
         assert!(
-            decision.match_info.as_ref().map_or(false, |info| info.contains("no-chain-manager")),
+            decision
+                .match_info
+                .as_ref()
+                .map_or(false, |info| info.contains("no-chain-manager")),
             "match_info should indicate no chain manager: {:?}",
             decision.match_info
         );
@@ -1378,11 +1397,18 @@ mod tests {
         let dst_ip: Ipv4Addr = "8.8.8.8".parse().unwrap();
 
         let packet = vec![
-            0x45, 0x00, // Version=4, IHL=5, TOS=0
-            0x00, 0x1C, // Total Length = 28
-            0x00, 0x00, 0x40, 0x00,
-            0x40, 0x01, // TTL=64, Protocol=ICMP
-            0x00, 0x00,
+            0x45,
+            0x00, // Version=4, IHL=5, TOS=0
+            0x00,
+            0x1C, // Total Length = 28
+            0x00,
+            0x00,
+            0x40,
+            0x00,
+            0x40,
+            0x01, // TTL=64, Protocol=ICMP
+            0x00,
+            0x00,
             src_ip.octets()[0],
             src_ip.octets()[1],
             src_ip.octets()[2],
@@ -1392,7 +1418,14 @@ mod tests {
             dst_ip.octets()[2],
             dst_ip.octets()[3],
             // ICMP data
-            0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+            0x08,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x01,
         ];
 
         let info = processor.extract_connection_info(&packet).unwrap();
@@ -1410,11 +1443,18 @@ mod tests {
         let dst_ip: Ipv4Addr = "8.8.8.8".parse().unwrap();
 
         let packet = vec![
-            0x45, 0x00,
-            0x00, 0x14, // Total Length = 20 (header only)
-            0x00, 0x00, 0x40, 0x00,
-            0x40, 0x06, // TCP protocol
-            0x00, 0x00,
+            0x45,
+            0x00,
+            0x00,
+            0x14, // Total Length = 20 (header only)
+            0x00,
+            0x00,
+            0x40,
+            0x00,
+            0x40,
+            0x06, // TCP protocol
+            0x00,
+            0x00,
             src_ip.octets()[0],
             src_ip.octets()[1],
             src_ip.octets()[2],

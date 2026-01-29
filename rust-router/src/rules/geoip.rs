@@ -136,11 +136,7 @@ pub struct GeoIpMatcher {
 
 impl std::fmt::Debug for GeoIpMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let loaded_countries = self
-            .country_cidrs
-            .read()
-            .map(|c| c.len())
-            .unwrap_or(0);
+        let loaded_countries = self.country_cidrs.read().map(|c| c.len()).unwrap_or(0);
 
         f.debug_struct("GeoIpMatcher")
             .field("cidr_rules", &self.cidr_rules.len())
@@ -354,25 +350,24 @@ impl GeoIpMatcher {
             .ok_or(RuleError::GeoIpNotConfigured)?;
 
         // Check if country is in catalog
-        if !self.available_countries.is_empty() && !self.available_countries.contains_key(country_code) {
+        if !self.available_countries.is_empty()
+            && !self.available_countries.contains_key(country_code)
+        {
             return Err(RuleError::UnknownCountry(country_code.to_string()));
         }
 
         // Load from file
         let file_path = geoip_dir.join(format!("{country_code}.json"));
-        let data = fs::read_to_string(&file_path).map_err(|e| {
-            RuleError::GeoIpLoadError(country_code.to_string(), e.to_string())
-        })?;
+        let data = fs::read_to_string(&file_path)
+            .map_err(|e| RuleError::GeoIpLoadError(country_code.to_string(), e.to_string()))?;
 
         // Parse JSON
-        let country_data: CountryData = serde_json::from_str(&data).map_err(|e| {
-            RuleError::GeoIpParseError(country_code.to_string(), e.to_string())
-        })?;
+        let country_data: CountryData = serde_json::from_str(&data)
+            .map_err(|e| RuleError::GeoIpParseError(country_code.to_string(), e.to_string()))?;
 
         // Parse CIDRs
-        let mut cidrs = Vec::with_capacity(
-            country_data.ipv4_ranges.len() + country_data.ipv6_ranges.len(),
-        );
+        let mut cidrs =
+            Vec::with_capacity(country_data.ipv4_ranges.len() + country_data.ipv6_ranges.len());
 
         for cidr_str in country_data
             .ipv4_ranges
@@ -478,10 +473,7 @@ impl GeoIpMatcher {
     /// Get the number of currently loaded countries
     #[must_use]
     pub fn loaded_country_count(&self) -> usize {
-        self.country_cidrs
-            .read()
-            .map(|c| c.len())
-            .unwrap_or(0)
+        self.country_cidrs.read().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Get the number of available countries in the catalog
@@ -566,13 +558,11 @@ impl GeoIpMatcherBuilder {
     /// ```
     pub fn load_catalog(mut self, path: impl AsRef<Path>) -> Result<Self, RuleError> {
         let path = path.as_ref();
-        let data = fs::read_to_string(path).map_err(|e| {
-            RuleError::GeoIpLoadError("catalog".to_string(), e.to_string())
-        })?;
+        let data = fs::read_to_string(path)
+            .map_err(|e| RuleError::GeoIpLoadError("catalog".to_string(), e.to_string()))?;
 
-        let catalog: GeoIpCatalog = serde_json::from_str(&data).map_err(|e| {
-            RuleError::GeoIpParseError("catalog".to_string(), e.to_string())
-        })?;
+        let catalog: GeoIpCatalog = serde_json::from_str(&data)
+            .map_err(|e| RuleError::GeoIpParseError("catalog".to_string(), e.to_string()))?;
 
         for country in catalog.countries {
             let code_lower = country.code.to_ascii_lowercase();
@@ -617,11 +607,7 @@ impl GeoIpMatcherBuilder {
     ///     .add_cidr("10.0.0.0/8", "direct")
     ///     .unwrap();
     /// ```
-    pub fn add_cidr(
-        mut self,
-        cidr: &str,
-        outbound: impl Into<String>,
-    ) -> Result<Self, RuleError> {
+    pub fn add_cidr(mut self, cidr: &str, outbound: impl Into<String>) -> Result<Self, RuleError> {
         let network: IpNet = cidr
             .parse()
             .map_err(|_| RuleError::InvalidCidr(cidr.to_string()))?;
@@ -1236,7 +1222,7 @@ mod tests {
         let matcher = GeoIpMatcher::builder()
             .geoip_dir(dir.path())
             // Don't load catalog - allow any country code
-            .add_country("fr", "fr-proxy")  // France file doesn't exist
+            .add_country("fr", "fr-proxy") // France file doesn't exist
             .unwrap()
             .build()
             .unwrap();

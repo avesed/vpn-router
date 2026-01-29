@@ -167,10 +167,7 @@ impl Transport for TcpTransport {
 
         // All addresses failed
         Err(last_error.unwrap_or_else(|| {
-            TransportError::connection_failed(
-                config.address_string(),
-                "no addresses to connect to",
-            )
+            TransportError::connection_failed(config.address_string(), "no addresses to connect to")
         }))
     }
 }

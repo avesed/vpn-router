@@ -95,10 +95,16 @@ impl AeadKey {
 
         let ciphertext = match self {
             Self::Aes128Gcm(cipher) => cipher
-                .encrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: buf, aad })
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    aes_gcm::aead::Payload { msg: buf, aad },
+                )
                 .map_err(|_| RealityError::protocol("AES-128-GCM encryption failed"))?,
             Self::Aes256Gcm(cipher) => cipher
-                .encrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: buf, aad })
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    aes_gcm::aead::Payload { msg: buf, aad },
+                )
                 .map_err(|_| RealityError::protocol("AES-256-GCM encryption failed"))?,
             Self::ChaCha20Poly1305(cipher) => cipher
                 .encrypt(
@@ -127,7 +133,13 @@ impl AeadKey {
     /// * `Ok(Vec<u8>)` - Ciphertext with appended auth tag
     /// * `Err` - Encryption failed
     #[inline]
-    pub fn seal(&self, plaintext: &[u8], iv: &[u8], seq: u64, aad: &[u8]) -> RealityResult<Vec<u8>> {
+    pub fn seal(
+        &self,
+        plaintext: &[u8],
+        iv: &[u8],
+        seq: u64,
+        aad: &[u8],
+    ) -> RealityResult<Vec<u8>> {
         let mut buf = plaintext.to_vec();
         self.seal_in_place(&mut buf, iv, seq, aad)?;
         Ok(buf)
@@ -160,10 +172,16 @@ impl AeadKey {
 
         let plaintext = match self {
             Self::Aes128Gcm(cipher) => cipher
-                .decrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: buf, aad })
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    aes_gcm::aead::Payload { msg: buf, aad },
+                )
                 .map_err(|_| RealityError::protocol("AES-128-GCM decryption failed"))?,
             Self::Aes256Gcm(cipher) => cipher
-                .decrypt(Nonce::from_slice(&nonce), aes_gcm::aead::Payload { msg: buf, aad })
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    aes_gcm::aead::Payload { msg: buf, aad },
+                )
                 .map_err(|_| RealityError::protocol("AES-256-GCM decryption failed"))?,
             Self::ChaCha20Poly1305(cipher) => cipher
                 .decrypt(
@@ -515,7 +533,9 @@ mod tests {
 
     #[test]
     fn test_nonce_construction() {
-        let iv = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b];
+        let iv = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+        ];
         let seq = 1u64;
 
         let nonce = AeadKey::make_nonce(&iv, seq).unwrap();

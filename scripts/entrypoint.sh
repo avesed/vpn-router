@@ -762,8 +762,8 @@ else:
     echo "[entrypoint] WARNING: No WireGuard private key found in database" >&2
   fi
 
-  # Start rust-router
-  "${RUST_ROUTER_BIN}" >> "${RUST_ROUTER_LOG}" 2>&1 &
+  # Start rust-router with backtrace enabled for debugging crashes
+  RUST_BACKTRACE=1 "${RUST_ROUTER_BIN}" >> "${RUST_ROUTER_LOG}" 2>&1 &
   RUST_ROUTER_PID=$!
 
   sleep 1

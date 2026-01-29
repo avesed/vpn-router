@@ -528,11 +528,15 @@ pub fn extract_server_cipher_suite(record: &[u8]) -> RealityResult<u16> {
     let cipher_suite_offset = 39 + session_id_len;
 
     if handshake.len() < cipher_suite_offset + 2 {
-        return Err(RealityError::protocol("ServerHello truncated at cipher suite"));
+        return Err(RealityError::protocol(
+            "ServerHello truncated at cipher suite",
+        ));
     }
 
-    let cipher_suite =
-        u16::from_be_bytes([handshake[cipher_suite_offset], handshake[cipher_suite_offset + 1]]);
+    let cipher_suite = u16::from_be_bytes([
+        handshake[cipher_suite_offset],
+        handshake[cipher_suite_offset + 1],
+    ]);
 
     Ok(cipher_suite)
 }
@@ -595,23 +599,31 @@ pub fn extract_client_public_key(client_hello: &[u8]) -> RealityResult<[u8; 32]>
 
     // Cipher suites length (2)
     if client_hello.len() < offset + 2 {
-        return Err(RealityError::protocol("ClientHello truncated at cipher suites"));
+        return Err(RealityError::protocol(
+            "ClientHello truncated at cipher suites",
+        ));
     }
-    let cipher_suites_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    let cipher_suites_len =
+        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
     offset += 2 + cipher_suites_len;
 
     // Compression methods length (1)
     if client_hello.len() < offset + 1 {
-        return Err(RealityError::protocol("ClientHello truncated at compression"));
+        return Err(RealityError::protocol(
+            "ClientHello truncated at compression",
+        ));
     }
     let compression_len = client_hello[offset] as usize;
     offset += 1 + compression_len;
 
     // Extensions length (2)
     if client_hello.len() < offset + 2 {
-        return Err(RealityError::protocol("ClientHello truncated at extensions length"));
+        return Err(RealityError::protocol(
+            "ClientHello truncated at extensions length",
+        ));
     }
-    let extensions_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    let extensions_len =
+        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
     offset += 2;
 
     if client_hello.len() < offset + extensions_len {
@@ -624,7 +636,8 @@ pub fn extract_client_public_key(client_hello: &[u8]) -> RealityResult<[u8; 32]>
     let mut ext_offset = 0;
     while ext_offset + 4 <= extensions.len() {
         let ext_type = u16::from_be_bytes([extensions[ext_offset], extensions[ext_offset + 1]]);
-        let ext_len = u16::from_be_bytes([extensions[ext_offset + 2], extensions[ext_offset + 3]]) as usize;
+        let ext_len =
+            u16::from_be_bytes([extensions[ext_offset + 2], extensions[ext_offset + 3]]) as usize;
 
         if ext_offset + 4 + ext_len > extensions.len() {
             break;
@@ -641,8 +654,11 @@ pub fn extract_client_public_key(client_hello: &[u8]) -> RealityResult<[u8; 32]>
                 // Parse key share entries
                 let mut entry_offset = 0;
                 while entry_offset + 4 <= entries.len() {
-                    let group = u16::from_be_bytes([entries[entry_offset], entries[entry_offset + 1]]);
-                    let key_len = u16::from_be_bytes([entries[entry_offset + 2], entries[entry_offset + 3]]) as usize;
+                    let group =
+                        u16::from_be_bytes([entries[entry_offset], entries[entry_offset + 1]]);
+                    let key_len =
+                        u16::from_be_bytes([entries[entry_offset + 2], entries[entry_offset + 3]])
+                            as usize;
 
                     if group == 0x001d && key_len == 32 && entries.len() >= entry_offset + 4 + 32 {
                         // X25519

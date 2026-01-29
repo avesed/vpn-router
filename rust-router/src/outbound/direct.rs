@@ -20,7 +20,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tracing::debug;
 
-use super::traits::{DirectUdpHandle, HealthStatus, Outbound, OutboundConnection, UdpOutboundHandle};
+use super::traits::{
+    DirectUdpHandle, HealthStatus, Outbound, OutboundConnection, UdpOutboundHandle,
+};
 use crate::config::OutboundConfig;
 use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
@@ -91,8 +93,9 @@ impl DirectOutbound {
 
     /// Create a socket with the configured options
     fn create_socket(&self) -> Result<Socket, OutboundError> {
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|e| OutboundError::connection_failed("0.0.0.0:0".parse().unwrap(), e.to_string()))?;
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
+            OutboundError::connection_failed("0.0.0.0:0".parse().unwrap(), e.to_string())
+        })?;
 
         // Set SO_BINDTODEVICE if interface is specified
         if let Some(ref interface) = self.config.bind_interface {
@@ -106,21 +109,21 @@ impl DirectOutbound {
 
         // Bind to specific address if specified
         if let Some(ref addr) = self.config.bind_address {
-            socket.bind(&(*addr).into()).map_err(|e| {
-                OutboundError::SocketOption {
+            socket
+                .bind(&(*addr).into())
+                .map_err(|e| OutboundError::SocketOption {
                     option: "bind".into(),
                     reason: format!("Failed to bind to {addr}: {e}"),
-                }
-            })?;
+                })?;
         }
 
         // Set non-blocking for tokio
-        socket.set_nonblocking(true).map_err(|e| {
-            OutboundError::SocketOption {
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| OutboundError::SocketOption {
                 option: "O_NONBLOCK".into(),
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Enable TCP keepalive to detect dead peers on long-lived connections
         // - time: 60s idle before first probe
@@ -129,12 +132,12 @@ impl DirectOutbound {
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(15));
 
-        socket.set_tcp_keepalive(&keepalive).map_err(|e| {
-            OutboundError::SocketOption {
+        socket
+            .set_tcp_keepalive(&keepalive)
+            .map_err(|e| OutboundError::SocketOption {
                 option: "TCP_KEEPALIVE".into(),
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         Ok(socket)
     }
@@ -269,9 +272,9 @@ impl DirectOutbound {
         }
 
         // Set non-blocking for tokio
-        socket.set_nonblocking(true).map_err(|e| {
-            UdpError::socket_option("O_NONBLOCK", e.to_string())
-        })?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| UdpError::socket_option("O_NONBLOCK", e.to_string()))?;
 
         Ok(socket)
     }
@@ -383,7 +386,9 @@ impl Outbound for DirectOutbound {
         // Wait for connection to complete with timeout
         let connect_result = timeout(connect_timeout, async {
             // Wait for socket to become writable (connection complete or failed)
-            stream.writable().await
+            stream
+                .writable()
+                .await
                 .map_err(|e| OutboundError::connection_failed(addr, e.to_string()))?;
 
             // Check for connection errors via SO_ERROR
@@ -392,7 +397,8 @@ impl Outbound for DirectOutbound {
                 Ok(None) => Ok(()),
                 Err(e) => Err(OutboundError::connection_failed(addr, e.to_string())),
             }
-        }).await;
+        })
+        .await;
 
         match connect_result {
             Ok(Ok(())) => {
@@ -615,7 +621,9 @@ mod tests {
         let server_addr = server.local_addr().unwrap();
 
         let outbound = DirectOutbound::simple("test");
-        let result = outbound.connect_udp(server_addr, Duration::from_secs(5)).await;
+        let result = outbound
+            .connect_udp(server_addr, Duration::from_secs(5))
+            .await;
 
         assert!(result.is_ok(), "Expected UDP connection to succeed");
 
@@ -651,7 +659,9 @@ mod tests {
 
         // Note: This will only actually set the mark if running as root
         // Without CAP_NET_ADMIN, the socket option will silently fail or error
-        let result = outbound.connect_udp(server_addr, Duration::from_secs(5)).await;
+        let result = outbound
+            .connect_udp(server_addr, Duration::from_secs(5))
+            .await;
 
         // Should succeed even without CAP_NET_ADMIN (mark just won't be set)
         // or fail with permission error

@@ -265,15 +265,22 @@ struct RegisteredPeer {
 }
 
 impl RegisteredPeer {
-    fn new(config: WgIngressPeerConfig, private_key: &StaticSecret, tunnel_index: u32) -> Result<Self, IngressError> {
+    fn new(
+        config: WgIngressPeerConfig,
+        private_key: &StaticSecret,
+        tunnel_index: u32,
+    ) -> Result<Self, IngressError> {
         // Parse peer public key
         let peer_public = decode_public_key(&config.public_key)
             .map_err(|e| IngressError::invalid_config(format!("Invalid peer public key: {e}")))?;
 
         // Parse preshared key if present
-        let psk = config.preshared_key.as_ref().map(|psk| {
-            decode_psk(psk)
-        }).transpose().map_err(|e| IngressError::invalid_config(format!("Invalid preshared key: {e}")))?;
+        let psk = config
+            .preshared_key
+            .as_ref()
+            .map(|psk| decode_psk(psk))
+            .transpose()
+            .map_err(|e| IngressError::invalid_config(format!("Invalid preshared key: {e}")))?;
 
         // Create boringtun tunnel for this peer
         let tunn = Tunn::new(
@@ -286,7 +293,8 @@ impl RegisteredPeer {
         );
 
         // Parse allowed IPs
-        let allowed_ips_parsed: Vec<IpNet> = config.allowed_ips
+        let allowed_ips_parsed: Vec<IpNet> = config
+            .allowed_ips
             .iter()
             .filter_map(|ip| ip.to_string().parse().ok())
             .collect();
@@ -317,25 +325,26 @@ impl RegisteredPeer {
     /// * `encrypted` - The encrypted packet data
     /// * `dst` - Buffer for decrypted output
     /// * `src_addr` - Source IP address of the packet sender (required for rate limiting under load)
-    fn decrypt(&self, encrypted: &[u8], dst: &mut [u8], src_addr: Option<IpAddr>) -> Option<DecryptedPacket> {
+    fn decrypt(
+        &self,
+        encrypted: &[u8],
+        dst: &mut [u8],
+        src_addr: Option<IpAddr>,
+    ) -> Option<DecryptedPacket> {
         let mut tunn_guard = self.tunn.lock();
         let tunn = tunn_guard.as_mut()?;
 
         match tunn.decapsulate(src_addr, encrypted, dst) {
-            TunnResult::WriteToTunnelV4(data, _) => {
-                Some(DecryptedPacket {
-                    data: data.to_vec(),
-                    needs_response: false,
-                    response: None,
-                })
-            }
-            TunnResult::WriteToTunnelV6(data, _) => {
-                Some(DecryptedPacket {
-                    data: data.to_vec(),
-                    needs_response: false,
-                    response: None,
-                })
-            }
+            TunnResult::WriteToTunnelV4(data, _) => Some(DecryptedPacket {
+                data: data.to_vec(),
+                needs_response: false,
+                response: None,
+            }),
+            TunnResult::WriteToTunnelV6(data, _) => Some(DecryptedPacket {
+                data: data.to_vec(),
+                needs_response: false,
+                response: None,
+            }),
             TunnResult::WriteToNetwork(response) => {
                 // Need to send a response (handshake response, etc.)
                 Some(DecryptedPacket {
@@ -688,7 +697,9 @@ impl WgIngressManager {
         };
 
         // Configure socket buffers for better performance
-        if let Err(e) = configure_socket_buffers(&socket, self.socket_recv_buffer, self.socket_send_buffer) {
+        if let Err(e) =
+            configure_socket_buffers(&socket, self.socket_recv_buffer, self.socket_send_buffer)
+        {
             warn!("Failed to configure socket buffers: {}", e);
         }
 
@@ -825,7 +836,8 @@ impl WgIngressManager {
         let registered_peer = RegisteredPeer::new(peer, &self.private_key, tunnel_index)?;
 
         // Insert peer (DashMap handles concurrent inserts safely)
-        self.peers.insert(public_key.clone(), Arc::new(registered_peer));
+        self.peers
+            .insert(public_key.clone(), Arc::new(registered_peer));
         self.stats.peer_count.fetch_add(1, Ordering::Relaxed);
 
         info!(public_key = %public_key, tunnel_index = tunnel_index, "Added peer to ingress");
@@ -948,13 +960,23 @@ impl WgIngressManager {
                 let p = entry.value();
                 IngressPeerListItem {
                     public_key,
-                    allowed_ips: p.config.allowed_ips.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(","),
+                    allowed_ips: p
+                        .config
+                        .allowed_ips
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
                     name: None, // Name is stored in database, not in WireGuard config
                     rx_bytes: p.rx_bytes.load(Ordering::Relaxed),
                     tx_bytes: p.tx_bytes.load(Ordering::Relaxed),
                     last_handshake: {
                         let ts = p.last_handshake.load(Ordering::Relaxed);
-                        if ts > 0 { Some(ts) } else { None }
+                        if ts > 0 {
+                            Some(ts)
+                        } else {
+                            None
+                        }
                     },
                 }
             })
@@ -986,9 +1008,9 @@ impl WgIngressManager {
     /// Check whether an IP is allowed for a specific peer
     #[must_use]
     pub fn is_peer_ip_allowed(&self, peer_public_key: &str, ip: IpAddr) -> bool {
-        self.peers
-            .get(peer_public_key)
-            .is_some_and(|entry| entry.value().is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip))
+        self.peers.get(peer_public_key).is_some_and(|entry| {
+            entry.value().is_source_ip_allowed(ip) && self.config.is_ip_allowed(ip)
+        })
     }
 
     /// Send a decrypted IP packet back to a `WireGuard` peer
@@ -999,16 +1021,13 @@ impl WgIngressManager {
         packet: &[u8],
     ) -> IngressResult<()> {
         // DashMap get returns a Ref guard, clone the Arc to release the lock immediately
-        let peer = self.peers
+        let peer = self
+            .peers
             .get(peer_public_key)
             .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| IngressError::peer_not_found(peer_public_key))?;
 
-        let socket = self
-            .socket
-            .read()
-            .clone()
-            .ok_or(IngressError::NotStarted)?;
+        let socket = self.socket.read().clone().ok_or(IngressError::NotStarted)?;
 
         let mut encrypted = vec![0u8; packet.len() + WG_TRANSPORT_OVERHEAD];
         let encapsulated = {
@@ -1026,7 +1045,8 @@ impl WgIngressManager {
                     .tx_bytes
                     .fetch_add(packet.len() as u64, Ordering::Relaxed);
                 self.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                peer.tx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                peer.tx_bytes
+                    .fetch_add(packet.len() as u64, Ordering::Relaxed);
                 peer.update_activity();
                 Ok(())
             }
@@ -1119,7 +1139,7 @@ impl WgIngressManager {
     ) {
         let mut recv_buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
         let mut decrypt_buf = vec![0u8; UDP_RECV_BUFFER_SIZE + WG_TRANSPORT_OVERHEAD];
-        
+
         // Timer interval for calling update_timers() on all peers (100ms per WireGuard spec)
         let mut timer_interval = tokio::time::interval(std::time::Duration::from_millis(100));
         timer_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1382,18 +1402,29 @@ impl WgIngressManager {
         decrypt_buf: &mut [u8],
     ) {
         // Update stats for received bytes (encrypted)
-        stats.rx_bytes.fetch_add(encrypted_data.len() as u64, Ordering::Relaxed);
+        stats
+            .rx_bytes
+            .fetch_add(encrypted_data.len() as u64, Ordering::Relaxed);
         stats.rx_packets.fetch_add(1, Ordering::Relaxed);
 
         // Try to identify peer and decrypt packet
         // For type 4 (transport data) packets, use O(1) receiver_index lookup
         // For handshakes (type 1, 2, 3), fallback to O(n) iteration
-        let (decrypted_data, peer_public_key, peer_ref) =
-            if let Some(result) = Self::identify_and_decrypt(peers, receiver_index_to_peer, encrypted_data, decrypt_buf, stats, src_addr.ip()) { result } else {
-                trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
-                stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
-                return;
-            };
+        let (decrypted_data, peer_public_key, peer_ref) = if let Some(result) =
+            Self::identify_and_decrypt(
+                peers,
+                receiver_index_to_peer,
+                encrypted_data,
+                decrypt_buf,
+                stats,
+                src_addr.ip(),
+            ) {
+            result
+        } else {
+            trace!(src_addr = %src_addr, "Failed to decrypt packet from any peer");
+            stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
 
         // Handle handshake responses (non-blocking)
         if let Some(ref response) = decrypted_data.response {
@@ -1410,7 +1441,10 @@ impl WgIngressManager {
                     // This is the index the client will use as `receiver` in type 4 packets
                     if response.len() >= 8 && response[0] == 2 {
                         let receiver_index = u32::from_le_bytes([
-                            response[4], response[5], response[6], response[7]
+                            response[4],
+                            response[5],
+                            response[6],
+                            response[7],
                         ]);
                         // Remove old index if this peer had a previous session
                         if let Some(old_index) = peer_ref.current_receiver_index.read().as_ref() {
@@ -1489,7 +1523,9 @@ impl WgIngressManager {
 
         // Update peer activity and endpoint
         peer_ref.update_activity_with_endpoint(src_addr);
-        peer_ref.rx_bytes.fetch_add(decrypted_data.data.len() as u64, Ordering::Relaxed);
+        peer_ref
+            .rx_bytes
+            .fetch_add(decrypted_data.data.len() as u64, Ordering::Relaxed);
 
         // Process decrypted packet through rule engine
         match processor.process(&decrypted_data.data, &peer_public_key) {
@@ -1544,7 +1580,11 @@ impl WgIngressManager {
         src_addr: IpAddr,
     ) -> Option<(DecryptedPacket, String, Arc<RegisteredPeer>)> {
         // Log packet type for debugging
-        let msg_type = if encrypted.len() >= 4 { encrypted[0] } else { 0 };
+        let msg_type = if encrypted.len() >= 4 {
+            encrypted[0]
+        } else {
+            0
+        };
         let type_name = match msg_type {
             1 => "handshake_init",
             2 => "handshake_resp",
@@ -1556,9 +1596,8 @@ impl WgIngressManager {
         // Fast path: type 4 (transport data) packets have receiver_index at bytes 4-7
         // Use O(1) lookup instead of iterating through all peers
         if msg_type == 4 && encrypted.len() >= 8 {
-            let receiver_index = u32::from_le_bytes([
-                encrypted[4], encrypted[5], encrypted[6], encrypted[7]
-            ]);
+            let receiver_index =
+                u32::from_le_bytes([encrypted[4], encrypted[5], encrypted[6], encrypted[7]]);
 
             if let Some(peer_ref) = receiver_index_to_peer.get(&receiver_index) {
                 let peer = Arc::clone(peer_ref.value());
@@ -1624,32 +1663,14 @@ impl WgIngressManager {
 
         match version {
             4 if packet.len() >= 20 => {
-                let ip = std::net::Ipv4Addr::new(
-                    packet[12],
-                    packet[13],
-                    packet[14],
-                    packet[15],
-                );
+                let ip = std::net::Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
                 Some(IpAddr::V4(ip))
             }
             6 if packet.len() >= 40 => {
                 let ip = std::net::Ipv6Addr::from([
-                    packet[8],
-                    packet[9],
-                    packet[10],
-                    packet[11],
-                    packet[12],
-                    packet[13],
-                    packet[14],
-                    packet[15],
-                    packet[16],
-                    packet[17],
-                    packet[18],
-                    packet[19],
-                    packet[20],
-                    packet[21],
-                    packet[22],
-                    packet[23],
+                    packet[8], packet[9], packet[10], packet[11], packet[12], packet[13],
+                    packet[14], packet[15], packet[16], packet[17], packet[18], packet[19],
+                    packet[20], packet[21], packet[22], packet[23],
                 ]);
                 Some(IpAddr::V6(ip))
             }
@@ -1690,7 +1711,11 @@ impl Drop for WgIngressManager {
 ///
 /// Note: The actual buffer size may be doubled by the kernel (Linux)
 /// and may be capped by system limits.
-fn configure_socket_buffers(socket: &UdpSocket, recv_buf: usize, send_buf: usize) -> std::io::Result<()> {
+fn configure_socket_buffers(
+    socket: &UdpSocket,
+    recv_buf: usize,
+    send_buf: usize,
+) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     let fd = socket.as_raw_fd();
@@ -1713,7 +1738,10 @@ fn configure_socket_buffers(socket: &UdpSocket, recv_buf: usize, send_buf: usize
         )
     };
     if result != 0 {
-        warn!("Failed to set SO_RCVBUF: {}", std::io::Error::last_os_error());
+        warn!(
+            "Failed to set SO_RCVBUF: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     // Set send buffer size
@@ -1729,10 +1757,16 @@ fn configure_socket_buffers(socket: &UdpSocket, recv_buf: usize, send_buf: usize
         )
     };
     if result != 0 {
-        warn!("Failed to set SO_SNDBUF: {}", std::io::Error::last_os_error());
+        warn!(
+            "Failed to set SO_SNDBUF: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
-    debug!("Socket buffers configured: recv={}, send={}", recv_buf, send_buf);
+    debug!(
+        "Socket buffers configured: recv={}, send={}",
+        recv_buf, send_buf
+    );
     Ok(())
 }
 
@@ -1976,10 +2010,7 @@ mod tests {
 
         let result = manager.start().await;
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            IngressError::AlreadyStarted
-        ));
+        assert!(matches!(result.unwrap_err(), IngressError::AlreadyStarted));
 
         manager.stop().await.unwrap();
     }
@@ -2078,8 +2109,8 @@ mod tests {
     #[test]
     fn test_extract_source_ip_ipv4() {
         let packet = vec![
-            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00,
-            0x40, 0x06, 0x00, 0x00, 0x0a, 0x19, 0x00, 0x02, // Source: 10.25.0.2
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 0x0a, 0x19,
+            0x00, 0x02, // Source: 10.25.0.2
             0x08, 0x08, 0x08, 0x08, // Dest: 8.8.8.8
         ];
 
@@ -2089,18 +2120,16 @@ mod tests {
 
     #[test]
     fn test_extract_source_ip_ipv6() {
-        let mut packet = vec![
-            0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x40,
-        ];
+        let mut packet = vec![0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3a, 0x40];
         // Source IPv6
         packet.extend_from_slice(&[
-            0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
         ]);
         // Dest IPv6
         packet.extend_from_slice(&[
-            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88,
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x88, 0x88,
         ]);
 
         let ip = WgIngressManager::extract_source_ip(&packet);
@@ -2347,7 +2376,9 @@ mod tests {
         // Source IPv6 (16 bytes)
         packet.extend_from_slice(&[0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         // Dest IPv6 (16 bytes)
-        packet.extend_from_slice(&[0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88]);
+        packet.extend_from_slice(&[
+            0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
+        ]);
 
         // Initially DSCP should be 0
         assert_eq!(get_dscp(&packet).unwrap(), 0);
@@ -2380,7 +2411,10 @@ mod tests {
         let new_checksum = u16::from_be_bytes([packet[10], packet[11]]);
 
         // Checksum should be different after DSCP change
-        assert_ne!(original_checksum, new_checksum, "Checksum should be recalculated after DSCP change");
+        assert_ne!(
+            original_checksum, new_checksum,
+            "Checksum should be recalculated after DSCP change"
+        );
     }
 
     #[test]
@@ -2391,11 +2425,7 @@ mod tests {
         let mut packet = vec![
             0x45, 0x01, // Version=4, IHL=5, TOS=0x01 (ECN=01)
             0x00, 0x14, // Total Length
-            0x00, 0x00, 0x00, 0x00,
-            0x40, 0x06,
-            0x00, 0x00,
-            10, 25, 0, 2,
-            8, 8, 8, 8,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 25, 0, 2, 8, 8, 8, 8,
         ];
 
         // Set DSCP to 20 - should preserve ECN bits
@@ -2413,8 +2443,8 @@ mod tests {
         use crate::chain::dscp::set_dscp;
 
         let mut packet = vec![
-            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00,
-            0x40, 0x06, 0x00, 0x00, 10, 25, 0, 2, 8, 8, 8, 8,
+            0x45, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 25, 0, 2,
+            8, 8, 8, 8,
         ];
 
         // DSCP value 64 is out of range (max is 63)
@@ -2460,8 +2490,12 @@ mod tests {
         use crate::rules::RuleType;
 
         let mut builder = RoutingSnapshotBuilder::new();
-        builder.add_geoip_rule(RuleType::IpCidr, "192.168.0.0/16", "private").unwrap();
-        builder.add_geoip_rule(RuleType::IpCidr, "10.0.0.0/8", "vpn").unwrap();
+        builder
+            .add_geoip_rule(RuleType::IpCidr, "192.168.0.0/16", "private")
+            .unwrap();
+        builder
+            .add_geoip_rule(RuleType::IpCidr, "10.0.0.0/8", "vpn")
+            .unwrap();
         let snapshot = builder.default_outbound("direct").build().unwrap();
         let engine = Arc::new(RuleEngine::new(snapshot));
         let processor = IngressProcessor::new(engine);
@@ -2478,7 +2512,10 @@ mod tests {
         ];
         packet.extend_from_slice(&src_ip.octets());
         packet.extend_from_slice(&private_dst.octets());
-        packet.extend_from_slice(&[0x12, 0x34, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
+        packet.extend_from_slice(&[
+            0x12, 0x34, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02,
+            0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        ]);
 
         let decision = processor.process(&packet, "test").unwrap();
         assert_eq!(decision.outbound, "private");
@@ -2520,17 +2557,20 @@ mod tests {
         assert_eq!(decision.outbound, "http");
 
         // Test port 443
-        base_packet[22] = 0x01; base_packet[23] = 0xbb; // port 443
+        base_packet[22] = 0x01;
+        base_packet[23] = 0xbb; // port 443
         let decision = processor.process(&base_packet, "test").unwrap();
         assert_eq!(decision.outbound, "https");
 
         // Test port 22
-        base_packet[22] = 0x00; base_packet[23] = 0x16; // port 22
+        base_packet[22] = 0x00;
+        base_packet[23] = 0x16; // port 22
         let decision = processor.process(&base_packet, "test").unwrap();
         assert_eq!(decision.outbound, "ssh");
 
         // Test unmatched port -> default
-        base_packet[22] = 0x1f; base_packet[23] = 0x90; // port 8080
+        base_packet[22] = 0x1f;
+        base_packet[23] = 0x90; // port 8080
         let decision = processor.process(&base_packet, "test").unwrap();
         assert_eq!(decision.outbound, "direct");
     }
@@ -2540,7 +2580,9 @@ mod tests {
         use crate::rules::RuleType;
 
         let mut builder = RoutingSnapshotBuilder::new();
-        builder.add_geoip_rule(RuleType::IpCidr, "8.8.0.0/16", "google").unwrap();
+        builder
+            .add_geoip_rule(RuleType::IpCidr, "8.8.0.0/16", "google")
+            .unwrap();
         let snapshot = builder.default_outbound("fallback").build().unwrap();
         let engine = Arc::new(RuleEngine::new(snapshot));
         let processor = IngressProcessor::new(engine);
@@ -2554,7 +2596,10 @@ mod tests {
         ];
         packet.extend_from_slice(&src_ip.octets());
         packet.extend_from_slice(&google_dst.octets());
-        packet.extend_from_slice(&[0x12, 0x34, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
+        packet.extend_from_slice(&[
+            0x12, 0x34, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02,
+            0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        ]);
 
         // Should match CIDR rule
         let decision = processor.process(&packet, "test").unwrap();
@@ -2579,7 +2624,8 @@ mod tests {
 
         // UDP packet to port 53
         let mut packet = vec![
-            0x45, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, // UDP protocol
+            0x45, 0x00, 0x00, 0x1C, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00,
+            0x00, // UDP protocol
         ];
         packet.extend_from_slice(&src_ip.octets());
         packet.extend_from_slice(&dst_ip.octets());
@@ -2595,8 +2641,12 @@ mod tests {
 
         // Create rules where order matters
         let mut builder = RoutingSnapshotBuilder::new();
-        builder.add_geoip_rule(RuleType::IpCidr, "8.8.8.8/32", "specific").unwrap();
-        builder.add_geoip_rule(RuleType::IpCidr, "8.8.0.0/16", "general").unwrap();
+        builder
+            .add_geoip_rule(RuleType::IpCidr, "8.8.8.8/32", "specific")
+            .unwrap();
+        builder
+            .add_geoip_rule(RuleType::IpCidr, "8.8.0.0/16", "general")
+            .unwrap();
         let snapshot = builder.default_outbound("direct").build().unwrap();
         let engine = Arc::new(RuleEngine::new(snapshot));
         let processor = IngressProcessor::new(engine);
@@ -2610,7 +2660,10 @@ mod tests {
         ];
         packet.extend_from_slice(&src_ip.octets());
         packet.extend_from_slice(&specific_dst.octets());
-        packet.extend_from_slice(&[0x12, 0x34, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]);
+        packet.extend_from_slice(&[
+            0x12, 0x34, 0x01, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02,
+            0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        ]);
 
         // Exact match wins
         let decision = processor.process(&packet, "test").unwrap();

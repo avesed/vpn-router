@@ -27,11 +27,7 @@ use std::net::IpAddr;
 
 // Import rule engine types from rust_router
 // Note: These imports assume the rule engine module is exported in lib.rs
-use rust_router::rules::{
-    domain::DomainMatcher,
-    geoip::GeoIpMatcher,
-    fwmark::FwmarkRouter,
-};
+use rust_router::rules::{domain::DomainMatcher, fwmark::FwmarkRouter, geoip::GeoIpMatcher};
 
 /// Test vectors file structure
 #[derive(Debug, Deserialize)]
@@ -114,11 +110,12 @@ impl ParityResult {
 
 /// Load test vectors from the JSON file
 fn load_test_vectors() -> TestVectors {
-    let vectors_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rule_test_vectors.json");
-    let content = fs::read_to_string(vectors_path)
-        .expect("Failed to read test vectors file");
-    serde_json::from_str(&content)
-        .expect("Failed to parse test vectors JSON")
+    let vectors_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rule_test_vectors.json"
+    );
+    let content = fs::read_to_string(vectors_path).expect("Failed to read test vectors file");
+    serde_json::from_str(&content).expect("Failed to parse test vectors JSON")
 }
 
 /// Run a single test case for domain matching
@@ -205,7 +202,10 @@ fn run_port_test(case: &TestCase) -> Option<String> {
 /// Run a single test case for protocol matching
 fn run_protocol_test(case: &TestCase) -> Option<String> {
     let input_proto = case.input.protocol.to_lowercase();
-    let sniffed_proto = case.input.sniffed_protocol.as_ref()
+    let sniffed_proto = case
+        .input
+        .sniffed_protocol
+        .as_ref()
         .map(|s| s.to_lowercase());
 
     for rule in &case.rules {
@@ -233,9 +233,12 @@ fn run_test_case(case: &TestCase) -> (bool, String) {
     let expected_outbound = &case.expected.outbound;
 
     // Determine what types of rules we have
-    let has_domain_rules = case.rules.iter().any(|r|
-        matches!(r.rule_type.as_str(), "domain" | "domain_suffix" | "domain_keyword" | "domain_regex")
-    );
+    let has_domain_rules = case.rules.iter().any(|r| {
+        matches!(
+            r.rule_type.as_str(),
+            "domain" | "domain_suffix" | "domain_keyword" | "domain_regex"
+        )
+    });
     let has_ip_rules = case.rules.iter().any(|r| r.rule_type == "ip_cidr");
     let has_port_rules = case.rules.iter().any(|r| r.rule_type == "port");
     let has_protocol_rules = case.rules.iter().any(|r| r.rule_type == "protocol");
@@ -303,13 +306,16 @@ fn test_rule_matching_parity() {
 
     // Categories to skip (not yet implemented or not applicable)
     let skip_categories = [
-        "combined_rules",     // Combined rules need more complex handling
-        "combined_complex",   // Complex combined rules
+        "combined_rules",   // Combined rules need more complex handling
+        "combined_complex", // Complex combined rules
     ];
 
     for case in &vectors.test_cases {
         // Skip certain categories that need special handling
-        if skip_categories.iter().any(|&cat| case.category.starts_with(cat)) {
+        if skip_categories
+            .iter()
+            .any(|&cat| case.category.starts_with(cat))
+        {
             result.skipped += 1;
             continue;
         }
@@ -320,11 +326,9 @@ fn test_rule_matching_parity() {
             result.passed += 1;
         } else {
             result.failed += 1;
-            result.failures.push((
-                case.id.clone(),
-                case.expected.outbound.clone(),
-                actual,
-            ));
+            result
+                .failures
+                .push((case.id.clone(), case.expected.outbound.clone(), actual));
         }
     }
 
@@ -337,7 +341,10 @@ fn test_rule_matching_parity() {
 
     // Print first 10 failures for debugging
     if !result.failures.is_empty() {
-        println!("First {} failures:", std::cmp::min(10, result.failures.len()));
+        println!(
+            "First {} failures:",
+            std::cmp::min(10, result.failures.len())
+        );
         for (id, expected, actual) in result.failures.iter().take(10) {
             println!("  {}: expected '{}', got '{}'", id, expected, actual);
         }
@@ -365,7 +372,9 @@ fn test_rule_matching_parity() {
 #[test]
 fn test_domain_exact_parity() {
     let vectors = load_test_vectors();
-    let domain_exact_cases: Vec<_> = vectors.test_cases.iter()
+    let domain_exact_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("domain_exact"))
         .collect();
 
@@ -381,8 +390,10 @@ fn test_domain_exact_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -394,7 +405,9 @@ fn test_domain_exact_parity() {
 #[test]
 fn test_domain_suffix_parity() {
     let vectors = load_test_vectors();
-    let suffix_cases: Vec<_> = vectors.test_cases.iter()
+    let suffix_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("domain_suffix"))
         .collect();
 
@@ -410,8 +423,10 @@ fn test_domain_suffix_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -423,7 +438,9 @@ fn test_domain_suffix_parity() {
 #[test]
 fn test_geoip_cidr_parity() {
     let vectors = load_test_vectors();
-    let cidr_cases: Vec<_> = vectors.test_cases.iter()
+    let cidr_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("geoip_cidr") || c.category.starts_with("cidr_"))
         .collect();
 
@@ -439,8 +456,10 @@ fn test_geoip_cidr_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -452,7 +471,9 @@ fn test_geoip_cidr_parity() {
 #[test]
 fn test_port_parity() {
     let vectors = load_test_vectors();
-    let port_cases: Vec<_> = vectors.test_cases.iter()
+    let port_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("port_"))
         .collect();
 
@@ -468,8 +489,10 @@ fn test_port_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -481,7 +504,9 @@ fn test_port_parity() {
 #[test]
 fn test_fwmark_router_parity() {
     let vectors = load_test_vectors();
-    let chain_cases: Vec<_> = vectors.test_cases.iter()
+    let chain_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("chain_"))
         .collect();
 
@@ -499,8 +524,10 @@ fn test_fwmark_router_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -512,7 +539,9 @@ fn test_fwmark_router_parity() {
 #[test]
 fn test_negative_parity() {
     let vectors = load_test_vectors();
-    let negative_cases: Vec<_> = vectors.test_cases.iter()
+    let negative_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("negative_"))
         .collect();
 
@@ -528,8 +557,10 @@ fn test_negative_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -541,7 +572,9 @@ fn test_negative_parity() {
 #[test]
 fn test_stress_parity() {
     let vectors = load_test_vectors();
-    let stress_cases: Vec<_> = vectors.test_cases.iter()
+    let stress_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("stress_"))
         .collect();
 
@@ -557,8 +590,10 @@ fn test_stress_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 
@@ -570,7 +605,9 @@ fn test_stress_parity() {
 #[test]
 fn test_international_domains_parity() {
     let vectors = load_test_vectors();
-    let intl_cases: Vec<_> = vectors.test_cases.iter()
+    let intl_cases: Vec<_> = vectors
+        .test_cases
+        .iter()
         .filter(|c| c.category.starts_with("international_"))
         .collect();
 
@@ -586,8 +623,10 @@ fn test_international_domains_parity() {
             passed += 1;
         } else {
             failed += 1;
-            println!("  FAIL {}: expected '{}', got '{}'",
-                case.id, case.expected.outbound, actual);
+            println!(
+                "  FAIL {}: expected '{}', got '{}'",
+                case.id, case.expected.outbound, actual
+            );
         }
     }
 

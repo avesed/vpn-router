@@ -461,10 +461,20 @@ mod tests {
 
     #[test]
     fn test_protocol_is_encrypted() {
-        assert!(!matches!(UpstreamProtocol::Udp, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq)));
-        assert!(!matches!(UpstreamProtocol::Tcp, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq)));
-        assert!(matches!(UpstreamProtocol::Doh, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq)));
-        assert!(matches!(UpstreamProtocol::Dot, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq)));
-        assert!(matches!(UpstreamProtocol::Doq, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq)));
+        assert!(
+            !matches!(UpstreamProtocol::Udp, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq))
+        );
+        assert!(
+            !matches!(UpstreamProtocol::Tcp, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq))
+        );
+        assert!(
+            matches!(UpstreamProtocol::Doh, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq))
+        );
+        assert!(
+            matches!(UpstreamProtocol::Dot, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq))
+        );
+        assert!(
+            matches!(UpstreamProtocol::Doq, p if matches!(p, UpstreamProtocol::Doh | UpstreamProtocol::Dot | UpstreamProtocol::Doq))
+        );
     }
 }

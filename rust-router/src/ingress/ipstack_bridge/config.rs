@@ -517,7 +517,10 @@ mod tests {
         // SNI peek timeout should be reasonable
         assert!(SNI_PEEK_TIMEOUT_MS >= 10);
         assert!(SNI_PEEK_TIMEOUT_MS <= 200);
-        assert_eq!(sni_peek_timeout(), Duration::from_millis(SNI_PEEK_TIMEOUT_MS));
+        assert_eq!(
+            sni_peek_timeout(),
+            Duration::from_millis(SNI_PEEK_TIMEOUT_MS)
+        );
     }
 
     #[test]
@@ -562,7 +565,7 @@ mod tests {
         let max = configured_max_unack();
         assert!(max >= 16 * 1024); // Minimum 16KB (ipstack default)
         assert!(max <= 16384 * 1024); // Maximum 16MB
-        // Default is 256KB
+                                      // Default is 256KB
         assert_eq!(max, MAX_UNACK_DEFAULT_KB * 1024);
     }
 }

@@ -214,7 +214,11 @@ mod tests {
         let result = outbound.connect_udp(addr, Duration::from_secs(1)).await;
 
         assert!(result.is_err());
-        if let Err(UdpError::Blocked { tag, addr: blocked_addr }) = result {
+        if let Err(UdpError::Blocked {
+            tag,
+            addr: blocked_addr,
+        }) = result
+        {
             assert_eq!(tag, "test-block-udp");
             assert_eq!(blocked_addr, addr);
         } else {

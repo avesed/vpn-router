@@ -28,13 +28,21 @@ mod batch_io;
 
 pub use buffer::{BufferStats, IoBuffer, DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
 pub use buffer_pool::{
-    BufferPoolConfig, BufferPoolStats, BufferPoolStatsSnapshot, PooledBuffer, UdpBufferPool,
-    DEFAULT_POOL_CAPACITY, DEFAULT_UDP_BUFFER_SIZE,
+    BufferPoolConfig,
+    BufferPoolStats,
+    BufferPoolStatsSnapshot,
     // PERF-4 FIX: Per-worker local buffer cache
-    LocalBufferCache, LocalBufferCacheStats, LocalPooledBuffer,
-    DEFAULT_LOCAL_CACHE_SIZE, MAX_LOCAL_CACHE_SIZE,
+    LocalBufferCache,
+    LocalBufferCacheStats,
+    LocalPooledBuffer,
+    PooledBuffer,
     // PERF-4 FIX: Generic buffer trait for recv_pooled
     UdpBuffer,
+    UdpBufferPool,
+    DEFAULT_LOCAL_CACHE_SIZE,
+    DEFAULT_POOL_CAPACITY,
+    DEFAULT_UDP_BUFFER_SIZE,
+    MAX_LOCAL_CACHE_SIZE,
 };
 pub use copy::{bidirectional_copy, bidirectional_copy_with_buffer, CopyResult};
 

@@ -84,32 +84,57 @@ pub use config::WgIngressConfig;
 pub use dns_cache::{IpDomainCache, IpDomainCacheStats, IpDomainCacheStatsSnapshot};
 pub use error::IngressError;
 pub use forwarder::{
-    parse_ip_packet, parse_tcp_details, run_forwarding_loop, run_reply_router_loop,
-    spawn_forwarding_task, spawn_reply_router, spawn_peer_tunnel_processor, tcp_flags,
-    FiveTuple, ForwardingStats, ForwardingStatsSnapshot, IngressReplyStats, IngressReplyStatsSnapshot,
-    IngressSessionTracker, ParsedPacket, PeerSession, PeerTunnelProcessorStats,
-    PeerTunnelProcessorStatsSnapshot, ReplyPacket, TcpDetails,
-    // UDP stats helper functions
-    get_udp_session_count, get_proxy_udp_session_count,
+    get_proxy_udp_session_count,
     // SNI routing configuration
-    get_sni_routing_config, WgSniRoutingConfig,
+    get_sni_routing_config,
+    // UDP stats helper functions
+    get_udp_session_count,
+    parse_ip_packet,
+    parse_tcp_details,
+    run_forwarding_loop,
+    run_reply_router_loop,
+    spawn_forwarding_task,
+    spawn_peer_tunnel_processor,
+    spawn_reply_router,
+    tcp_flags,
+    FiveTuple,
+    ForwardingStats,
+    ForwardingStatsSnapshot,
+    IngressReplyStats,
+    IngressReplyStatsSnapshot,
+    IngressSessionTracker,
+    ParsedPacket,
+    PeerSession,
+    PeerTunnelProcessorStats,
+    PeerTunnelProcessorStatsSnapshot,
+    ReplyPacket,
+    TcpDetails,
+    WgSniRoutingConfig,
 };
 pub use manager::{WgIngressManager, WgIngressStats};
 pub use processor::{IngressProcessor, RoutingDecision};
-pub use socks5_server::{Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot};
+pub use socks5_server::{
+    Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot,
+};
 
 // IpStack bridge (feature-gated)
 // Note: Uses ShardedIpStackBridge internally for parallel processing across CPU cores.
 // The sharded bridge distributes packets using 5-tuple hashing for consistent session routing.
 #[cfg(feature = "ipstack-tcp")]
-pub use ipstack_bridge::{
-    // Sharded bridge types (primary)
-    ShardedIpStackBridge, ShardedBridgeStats, ShardedBridgeStatsSnapshot, ShardedDiagnosticSnapshot,
-    // Single-instance bridge types (kept for compatibility)
-    DiagnosticSnapshot as IpStackDiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot,
+pub use forwarder::{
+    get_ipstack_diagnostics, get_ipstack_stats, init_ipstack_bridge, is_ipstack_enabled,
+    set_ipstack_enabled, spawn_ipstack_reply_router,
 };
 #[cfg(feature = "ipstack-tcp")]
-pub use forwarder::{
-    init_ipstack_bridge, is_ipstack_enabled, set_ipstack_enabled,
-    get_ipstack_stats, get_ipstack_diagnostics, spawn_ipstack_reply_router,
+pub use ipstack_bridge::{
+    // Single-instance bridge types (kept for compatibility)
+    DiagnosticSnapshot as IpStackDiagnosticSnapshot,
+    IpStackBridge,
+    IpStackBridgeStats,
+    IpStackBridgeStatsSnapshot,
+    ShardedBridgeStats,
+    ShardedBridgeStatsSnapshot,
+    ShardedDiagnosticSnapshot,
+    // Sharded bridge types (primary)
+    ShardedIpStackBridge,
 };

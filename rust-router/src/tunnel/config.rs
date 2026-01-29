@@ -574,7 +574,9 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid peer public key Base64"));
+        assert!(result
+            .unwrap_err()
+            .contains("Invalid peer public key Base64"));
     }
 
     #[test]
@@ -587,7 +589,9 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Peer public key must be 32 bytes"));
+        assert!(result
+            .unwrap_err()
+            .contains("Peer public key must be 32 bytes"));
     }
 
     #[test]
@@ -843,10 +847,7 @@ mod tests {
         update.apply_to(&mut config);
 
         assert_eq!(config.endpoint, Some("1.2.3.4:51820".to_string()));
-        assert_eq!(
-            config.allowed_ips,
-            vec!["10.0.0.0/8", "192.168.0.0/16"]
-        );
+        assert_eq!(config.allowed_ips, vec!["10.0.0.0/8", "192.168.0.0/16"]);
         assert_eq!(config.persistent_keepalive, Some(60));
         assert_eq!(config.preshared_key, Some("psk-base64".to_string()));
     }
@@ -866,7 +867,10 @@ mod tests {
         // Nothing should change
         assert_eq!(config.endpoint, original_config.endpoint);
         assert_eq!(config.allowed_ips, original_config.allowed_ips);
-        assert_eq!(config.persistent_keepalive, original_config.persistent_keepalive);
+        assert_eq!(
+            config.persistent_keepalive,
+            original_config.persistent_keepalive
+        );
     }
 
     #[test]

@@ -40,8 +40,8 @@ use tracing_subscriber::EnvFilter;
 use rust_router::chain::ChainManager;
 use rust_router::config::{load_config_with_env, Config};
 use rust_router::connection::{
-    run_accept_loop, ConnectionManager, UdpPacketProcessor, UdpProcessorConfig,
-    UdpSessionConfig, UdpSessionManager,
+    run_accept_loop, ConnectionManager, UdpPacketProcessor, UdpProcessorConfig, UdpSessionConfig,
+    UdpSessionManager,
 };
 use rust_router::dns::cache::DnsCache;
 use rust_router::dns::client::UpstreamPool;
@@ -60,8 +60,10 @@ use rust_router::ingress::WgIngressConfig;
 use rust_router::ipc::{DnsEngine, IpcHandler, IpcServer};
 use rust_router::outbound::{OutboundManager, OutboundManagerBuilder};
 use rust_router::peer::manager::PeerManager;
-use rust_router::rules::{RuleEngine, RuleEngineRoutingCallback, RoutingSnapshotBuilder};
-use rust_router::tproxy::{has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig};
+use rust_router::rules::{RoutingSnapshotBuilder, RuleEngine, RuleEngineRoutingCallback};
+use rust_router::tproxy::{
+    has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig,
+};
 
 // IpStack bridge for TCP handling (feature-gated)
 #[cfg(feature = "ipstack-tcp")]
@@ -211,7 +213,7 @@ fn init_logging(config: &Config) {
     } else {
         subscriber.init();
     }
-    
+
     // Log effective configuration
     if std::env::var("RUST_LOG").is_ok() {
         info!("Log level from RUST_LOG environment variable");
@@ -284,13 +286,14 @@ impl UserspaceWgConfig {
 
         let wg_private_key = std::env::var("RUST_ROUTER_WG_PRIVATE_KEY").ok();
 
-        let wg_subnet = std::env::var("RUST_ROUTER_WG_SUBNET")
-            .unwrap_or_else(|_| "10.25.0.0/24".to_string());
+        let wg_subnet =
+            std::env::var("RUST_ROUTER_WG_SUBNET").unwrap_or_else(|_| "10.25.0.0/24".to_string());
 
-        let node_tag = std::env::var("RUST_ROUTER_NODE_TAG")
-            .unwrap_or_else(|_| hostname::get()
+        let node_tag = std::env::var("RUST_ROUTER_NODE_TAG").unwrap_or_else(|_| {
+            hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "local-node".to_string()));
+                .unwrap_or_else(|_| "local-node".to_string())
+        });
 
         // Default local IP is .1 in the subnet
         let wg_local_ip = std::env::var("RUST_ROUTER_WG_LOCAL_IP")
@@ -354,8 +357,13 @@ async fn main() -> Result<()> {
     }
 
     // Load configuration
-    let config = load_config_with_env(&args.config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load configuration from {:?}: {}", args.config_path, e))?;
+    let config = load_config_with_env(&args.config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load configuration from {:?}: {}",
+            args.config_path,
+            e
+        )
+    })?;
 
     // Handle check-config
     if args.check_config {
@@ -405,8 +413,10 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
     let tproxy_listener: Option<TproxyListener> = if tproxy_enabled {
         info!("TPROXY listener enabled (RUST_ROUTER_TPROXY_ENABLED=true)");
-        Some(TproxyListener::bind(&config.listen)
-            .map_err(|e| anyhow::anyhow!("Failed to create TPROXY listener: {}", e))?)
+        Some(
+            TproxyListener::bind(&config.listen)
+                .map_err(|e| anyhow::anyhow!("Failed to create TPROXY listener: {}", e))?,
+        )
     } else {
         debug!("TPROXY listener disabled (set RUST_ROUTER_TPROXY_ENABLED=true to enable)");
         None
@@ -484,11 +494,17 @@ async fn main() -> Result<()> {
 
     // Create PeerManager (always created for IPC support)
     let peer_manager = Arc::new(PeerManager::new(userspace_wg_config.node_tag.clone()));
-    debug!("Created PeerManager with node tag: {}", userspace_wg_config.node_tag);
+    debug!(
+        "Created PeerManager with node tag: {}",
+        userspace_wg_config.node_tag
+    );
 
     // Create ChainManager (always created for IPC support)
     let chain_manager = Arc::new(ChainManager::new(userspace_wg_config.node_tag.clone()));
-    debug!("Created ChainManager with node tag: {}", userspace_wg_config.node_tag);
+    debug!(
+        "Created ChainManager with node tag: {}",
+        userspace_wg_config.node_tag
+    );
 
     // Wire up the routing callback so chains register with FwmarkRouter
     let routing_callback = Arc::new(RuleEngineRoutingCallback::new(Arc::clone(&rule_engine)));
@@ -511,10 +527,12 @@ async fn main() -> Result<()> {
     // The reply handler forwards decrypted packets back to the ingress reply router
     // For peer tunnels (peer-*), packets go to the peer tunnel processor for chain routing
     // For VLESS sessions, packets go to the VlessReplyRegistry first
-    let reply_router_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
-        Arc::new(parking_lot::RwLock::new(None));
-    let peer_tunnel_tx: Arc<parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>> =
-        Arc::new(parking_lot::RwLock::new(None));
+    let reply_router_tx: Arc<
+        parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>,
+    > = Arc::new(parking_lot::RwLock::new(None));
+    let peer_tunnel_tx: Arc<
+        parking_lot::RwLock<Option<tokio::sync::mpsc::Sender<rust_router::ingress::ReplyPacket>>>,
+    > = Arc::new(parking_lot::RwLock::new(None));
     let reply_stats = Arc::new(rust_router::ingress::IngressReplyStats::default());
     let forwarding_stats = Arc::new(rust_router::ingress::ForwardingStats::default());
     let peer_tunnel_stats = Arc::new(rust_router::ingress::PeerTunnelProcessorStats::default());
@@ -523,14 +541,32 @@ async fn main() -> Result<()> {
     let vless_reply_registry = Arc::new(rust_router::vless_wg_bridge::VlessReplyRegistry::new());
     debug!("Created VlessReplyRegistry for VLESS-WG bridge reply routing");
 
+    // Create sharded bridge reply registry for routing WG replies to ShardedVlessWgBridge instances
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    let sharded_bridge_reply_registry =
+        Arc::new(rust_router::vless_wg_bridge::ShardedBridgeReplyRegistry::new());
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    debug!("Created ShardedBridgeReplyRegistry for sharded bridge reply routing");
+
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
         let reply_router_tx = Arc::clone(&reply_router_tx);
         let peer_tunnel_tx = Arc::clone(&peer_tunnel_tx);
         let reply_stats = Arc::clone(&reply_stats);
         let peer_tunnel_stats = Arc::clone(&peer_tunnel_stats);
         let vless_registry = Arc::clone(&vless_reply_registry);
+        #[cfg(feature = "sharded-vless-wg-bridge")]
+        let sharded_registry = Arc::clone(&sharded_bridge_reply_registry);
         move |packet, tunnel_tag: String| {
-            // First, try to route to VLESS sessions (Layer 4 TCP inbound -> Layer 3 WG outbound)
+            // First, try to route to sharded bridges (feature-gated)
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            {
+                if sharded_registry.try_route(&tunnel_tag, &packet) {
+                    // Successfully routed to a sharded bridge
+                    return;
+                }
+            }
+
+            // Then, try to route to VLESS sessions (Layer 4 TCP inbound -> Layer 3 WG outbound)
             // This handles replies from WG tunnels used by VlessWgBridge
             if vless_registry.try_route(&tunnel_tag, &packet) {
                 // Successfully routed to a VLESS session
@@ -546,35 +582,46 @@ async fn main() -> Result<()> {
 
                 let maybe_tx = peer_tunnel_tx.read().clone();
                 if let Some(tx) = maybe_tx {
-                    match tx.try_send(rust_router::ingress::ReplyPacket { packet, tunnel_tag: tunnel_tag.clone() }) {
+                    match tx.try_send(rust_router::ingress::ReplyPacket {
+                        packet,
+                        tunnel_tag: tunnel_tag.clone(),
+                    }) {
                         Ok(()) => {
                             // Peer tunnel packet successfully routed to processor
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            warn!("Peer tunnel processor queue full; dropping packet from '{}'", tunnel_tag);
+                            warn!(
+                                "Peer tunnel processor queue full; dropping packet from '{}'",
+                                tunnel_tag
+                            );
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("Peer tunnel processor unavailable; dropping packet from '{}'", tunnel_tag);
+                            warn!(
+                                "Peer tunnel processor unavailable; dropping packet from '{}'",
+                                tunnel_tag
+                            );
                         }
                     }
                 } else {
-                    debug!("Peer tunnel processor not ready; dropping packet from '{}'", tunnel_tag);
+                    debug!(
+                        "Peer tunnel processor not ready; dropping packet from '{}'",
+                        tunnel_tag
+                    );
                 }
                 return;
             }
 
             // Regular egress tunnel replies go to the reply router
-            reply_stats
-                .packets_received
-                .fetch_add(1, Ordering::Relaxed);
+            reply_stats.packets_received.fetch_add(1, Ordering::Relaxed);
 
             let maybe_tx = reply_router_tx.read().clone();
             if let Some(tx) = maybe_tx {
-                match tx.try_send(rust_router::ingress::ReplyPacket { packet, tunnel_tag: tunnel_tag.clone() }) {
+                match tx.try_send(rust_router::ingress::ReplyPacket {
+                    packet,
+                    tunnel_tag: tunnel_tag.clone(),
+                }) {
                     Ok(()) => {
-                        reply_stats
-                            .packets_enqueued
-                            .fetch_add(1, Ordering::Relaxed);
+                        reply_stats.packets_enqueued.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(reply)) => {
                         reply_stats.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -608,14 +655,21 @@ async fn main() -> Result<()> {
     debug!("Created WgEgressManager");
 
     // Create WireGuard ingress manager (only if userspace mode is enabled and configured)
-    let wg_ingress_manager: Option<Arc<WgIngressManager>> = if userspace_wg_config.can_enable_userspace_wg() {
+    let wg_ingress_manager: Option<Arc<WgIngressManager>> = if userspace_wg_config
+        .can_enable_userspace_wg()
+    {
         let private_key = userspace_wg_config.wg_private_key.as_ref().unwrap();
         let listen_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             userspace_wg_config.wg_listen_port,
         );
-        let allowed_subnet: ipnet::IpNet = userspace_wg_config.wg_subnet.parse()
-            .map_err(|e| anyhow::anyhow!("Invalid WG subnet '{}': {}", userspace_wg_config.wg_subnet, e))?;
+        let allowed_subnet: ipnet::IpNet = userspace_wg_config.wg_subnet.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "Invalid WG subnet '{}': {}",
+                userspace_wg_config.wg_subnet,
+                e
+            )
+        })?;
 
         let wg_ingress_config = WgIngressConfig::builder()
             .private_key(private_key)
@@ -642,9 +696,7 @@ async fn main() -> Result<()> {
         }
     } else {
         if userspace_wg_config.userspace_wg {
-            warn!(
-                "Userspace WireGuard requested but RUST_ROUTER_WG_PRIVATE_KEY not set"
-            );
+            warn!("Userspace WireGuard requested but RUST_ROUTER_WG_PRIVATE_KEY not set");
         }
         None
     };
@@ -672,7 +724,10 @@ async fn main() -> Result<()> {
     // Wire up managers to IPC handler
     let mut ipc_handler = ipc_handler
         .with_peer_manager(Arc::clone(&peer_manager))
-        .with_chain_manager(Arc::clone(&chain_manager), userspace_wg_config.node_tag.clone())
+        .with_chain_manager(
+            Arc::clone(&chain_manager),
+            userspace_wg_config.node_tag.clone(),
+        )
         .with_ecmp_group_manager(Arc::clone(&ecmp_group_manager))
         .with_wg_egress_manager(Arc::clone(&wg_egress_manager))
         .with_vless_reply_registry(Arc::clone(&vless_reply_registry));
@@ -680,10 +735,8 @@ async fn main() -> Result<()> {
     // Add WireGuard ingress manager if available
     if let Some(ref ingress_mgr) = wg_ingress_manager {
         ipc_handler = ipc_handler.with_wg_ingress_manager(Arc::clone(ingress_mgr));
-        ipc_handler = ipc_handler.with_ingress_stats(
-            Arc::clone(&forwarding_stats),
-            Arc::clone(&reply_stats),
-        );
+        ipc_handler =
+            ipc_handler.with_ingress_stats(Arc::clone(&forwarding_stats), Arc::clone(&reply_stats));
     }
 
     // ========================================================================
@@ -692,9 +745,21 @@ async fn main() -> Result<()> {
 
     // Create DNS configuration from environment variables with default upstream servers
     let dns_config = DnsConfig::from_env()
-        .with_upstream(UpstreamConfig::new("cloudflare", "1.1.1.1:53", UpstreamProtocol::Udp))
-        .with_upstream(UpstreamConfig::new("cloudflare-backup", "1.0.0.1:53", UpstreamProtocol::Udp))
-        .with_upstream(UpstreamConfig::new("google", "8.8.8.8:53", UpstreamProtocol::Udp))
+        .with_upstream(UpstreamConfig::new(
+            "cloudflare",
+            "1.1.1.1:53",
+            UpstreamProtocol::Udp,
+        ))
+        .with_upstream(UpstreamConfig::new(
+            "cloudflare-backup",
+            "1.0.0.1:53",
+            UpstreamProtocol::Udp,
+        ))
+        .with_upstream(UpstreamConfig::new(
+            "google",
+            "8.8.8.8:53",
+            UpstreamProtocol::Udp,
+        ))
         .with_cache(CacheConfig::default())
         .with_blocking(BlockingConfig::default())
         .with_rate_limit(RateLimitConfig::default());
@@ -714,11 +779,17 @@ async fn main() -> Result<()> {
     for upstream_config in &dns_config.upstreams {
         match rust_router::dns::client::UdpClient::new(upstream_config.clone()) {
             Ok(client) => {
-                info!("Created DNS upstream: {} ({})", upstream_config.tag, upstream_config.address);
+                info!(
+                    "Created DNS upstream: {} ({})",
+                    upstream_config.tag, upstream_config.address
+                );
                 upstreams.push(Box::new(client));
             }
             Err(e) => {
-                warn!("Failed to create DNS upstream {}: {}", upstream_config.tag, e);
+                warn!(
+                    "Failed to create DNS upstream {}: {}",
+                    upstream_config.tag, e
+                );
             }
         }
     }
@@ -746,6 +817,14 @@ async fn main() -> Result<()> {
     let ipc_handler = ipc_handler.with_dns_engine(Arc::clone(&dns_engine));
 
     let ipc_handler = Arc::new(ipc_handler);
+
+    // Set sharded bridge reply registry (feature-gated)
+    // Must be done after Arc wrapping since set_sharded_bridge_reply_registry takes &self
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    {
+        ipc_handler.set_sharded_bridge_reply_registry(Arc::clone(&sharded_bridge_reply_registry));
+        debug!("Set ShardedBridgeReplyRegistry on IpcHandler");
+    }
 
     info!(
         "IPC handler configured with managers (peer={}, chain={}, ecmp={}, wg_ingress={}, wg_egress={}) and DNS engine",
@@ -832,11 +911,16 @@ async fn main() -> Result<()> {
     // ========================================================================
     // SOCKS5 Inbound Server (for Xray integration)
     // ========================================================================
-    let socks5_server_handle: Option<tokio::task::JoinHandle<()>> = if userspace_wg_config.socks5_inbound_enabled {
+    let socks5_server_handle: Option<tokio::task::JoinHandle<()>> = if userspace_wg_config
+        .socks5_inbound_enabled
+    {
         use rust_router::ingress::{Socks5Server, Socks5ServerConfig};
 
         let socks5_config = Socks5ServerConfig {
-            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), userspace_wg_config.socks5_inbound_port),
+            listen_addr: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                userspace_wg_config.socks5_inbound_port,
+            ),
             ..Default::default()
         };
 
@@ -889,11 +973,9 @@ async fn main() -> Result<()> {
             // Take the packet receiver and spawn forwarding task
             if let Some(packet_rx) = ingress_mgr.take_packet_receiver().await {
                 // Note: TcpConnectionManager removed - TCP now handled by IpStack bridge
-                let session_tracker = Arc::new(
-                    rust_router::ingress::IngressSessionTracker::new(
-                        std::time::Duration::from_secs(300), // 5 minute session TTL
-                    ),
-                );
+                let session_tracker = Arc::new(rust_router::ingress::IngressSessionTracker::new(
+                    std::time::Duration::from_secs(300), // 5 minute session TTL
+                ));
                 // Clone session_tracker for IPC handler before it's moved to forwarding task
                 let session_tracker_for_ipc = Arc::clone(&session_tracker);
                 let fwd_stats = Arc::clone(&forwarding_stats);
@@ -907,7 +989,9 @@ async fn main() -> Result<()> {
                 info!("IP-domain cache enabled for WireGuard ingress routing");
 
                 // Set DNS cache on the processor for domain lookups
-                ingress_mgr.processor().set_dns_cache(Arc::clone(&dns_cache));
+                ingress_mgr
+                    .processor()
+                    .set_dns_cache(Arc::clone(&dns_cache));
 
                 // Increased capacity to handle high throughput (was 8192)
                 let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(16384);
@@ -928,7 +1012,9 @@ async fn main() -> Result<()> {
                 // This enables ipstack bridge to hijack DNS queries and map domains to fake IPs,
                 // allowing domain-based routing for TCP connections
                 #[cfg(feature = "fakedns")]
-                let fakedns_manager: Option<Arc<rust_router::fakedns::FakeDnsManager>> = {
+                let fakedns_manager: Option<
+                    Arc<rust_router::fakedns::FakeDnsManager>,
+                > = {
                     use rust_router::fakedns::{FakeDnsConfig, FakeDnsManager};
 
                     let config = FakeDnsConfig::new()
@@ -949,9 +1035,15 @@ async fn main() -> Result<()> {
                     let ipstack_rule_engine = Some(Arc::clone(&rule_engine));
                     let ipstack_outbound_manager = Some(Arc::clone(&outbound_manager));
                     #[cfg(feature = "fakedns")]
-                    let init_result = init_ipstack_bridge(ipstack_rule_engine, fakedns_manager.clone(), ipstack_outbound_manager).await;
+                    let init_result = init_ipstack_bridge(
+                        ipstack_rule_engine,
+                        fakedns_manager.clone(),
+                        ipstack_outbound_manager,
+                    )
+                    .await;
                     #[cfg(not(feature = "fakedns"))]
-                    let init_result = init_ipstack_bridge(ipstack_rule_engine, ipstack_outbound_manager).await;
+                    let init_result =
+                        init_ipstack_bridge(ipstack_rule_engine, ipstack_outbound_manager).await;
 
                     match init_result {
                         Ok((ipstack_reply_rx, ipstack_session_tracker)) => {
@@ -987,8 +1079,8 @@ async fn main() -> Result<()> {
                     Arc::clone(&peer_tunnel_stats),
                     forward_tx, // Forward non-WG egress (direct/SOCKS) to main forwarding loop
                     Arc::clone(&session_tracker), // Session tracker for reply routing
-                    Arc::clone(ingress_mgr),      // Ingress manager for Entry node replies
-                    Arc::clone(&peer_manager),    // Peer manager for Relay node replies
+                    Arc::clone(ingress_mgr), // Ingress manager for Entry node replies
+                    Arc::clone(&peer_manager), // Peer manager for Relay node replies
                 );
                 info!("Peer tunnel processor started for chain routing (with reply path support)");
 
@@ -1013,11 +1105,13 @@ async fn main() -> Result<()> {
                 peer_tunnel_task_handle = Some(peer_tunnel_handle);
                 info!("Ingress packet forwarding task started");
                 forwarding_task_handle = Some(forward_handle);
-                
+
                 // Set session tracker on IPC handler for active connection count reporting
                 ipc_handler.set_ingress_session_tracker(session_tracker_for_ipc);
             } else {
-                warn!("Failed to take packet receiver from WireGuard ingress - forwarding disabled");
+                warn!(
+                    "Failed to take packet receiver from WireGuard ingress - forwarding disabled"
+                );
             }
         }
     } else {
@@ -1060,10 +1154,7 @@ async fn main() -> Result<()> {
 
     // Stop IPC server
     let _ = ipc_shutdown.send(());
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ipc_handle,
-    ).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ipc_handle).await;
 
     // ========================================================================
     // Shutdown DNS servers
@@ -1075,13 +1166,11 @@ async fn main() -> Result<()> {
     let _ = dns_tcp_shutdown_tx.send(());
 
     // Wait for DNS servers to shut down
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        async {
-            let _ = dns_udp_handle.await;
-            let _ = dns_tcp_handle.await;
-        },
-    ).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = dns_udp_handle.await;
+        let _ = dns_tcp_handle.await;
+    })
+    .await;
 
     info!("DNS servers shutdown complete");
 
@@ -1112,11 +1201,7 @@ async fn main() -> Result<()> {
     *reply_router_tx.write() = None;
     if let Some(handle) = reply_task_handle {
         info!("Waiting for reply router task to complete...");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         info!("Reply router task shutdown complete");
     }
 
@@ -1124,11 +1209,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "ipstack-tcp")]
     if let Some(handle) = ipstack_reply_task_handle {
         info!("Waiting for IpStack reply router task to complete...");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         info!("IpStack reply router task shutdown complete");
     }
 
@@ -1136,22 +1217,14 @@ async fn main() -> Result<()> {
     *peer_tunnel_tx.write() = None;
     if let Some(handle) = peer_tunnel_task_handle {
         info!("Waiting for peer tunnel processor task to complete...");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         info!("Peer tunnel processor task shutdown complete");
     }
 
     // Shutdown forwarding task (after ingress stops, the channel will close)
     if let Some(handle) = forwarding_task_handle {
         info!("Waiting for forwarding task to complete...");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            handle,
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         info!("Forwarding task shutdown complete");
     }
 

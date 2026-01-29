@@ -277,10 +277,7 @@ impl UpstreamPool {
     }
 
     fn healthy_count_internal(&self, upstreams: &[UpstreamEntry]) -> usize {
-        upstreams
-            .iter()
-            .filter(|e| e.upstream.is_healthy())
-            .count()
+        upstreams.iter().filter(|e| e.upstream.is_healthy()).count()
     }
 
     /// Get the selection strategy
@@ -308,11 +305,12 @@ impl UpstreamPool {
     /// # Returns
     ///
     /// Reference to the upstream if found, None otherwise.
-    pub fn get_by_tag(&self, tag: &str) -> Option<impl std::ops::Deref<Target = dyn DnsUpstream> + '_> {
+    pub fn get_by_tag(
+        &self,
+        tag: &str,
+    ) -> Option<impl std::ops::Deref<Target = dyn DnsUpstream> + '_> {
         let upstreams = self.upstreams.read();
-        let index = upstreams
-            .iter()
-            .position(|e| e.upstream.tag() == tag)?;
+        let index = upstreams.iter().position(|e| e.upstream.tag() == tag)?;
 
         // Use a guard to safely return a reference
         Some(UpstreamRef {
@@ -324,7 +322,10 @@ impl UpstreamPool {
     /// List all upstream tags
     pub fn tags(&self) -> Vec<String> {
         let upstreams = self.upstreams.read();
-        upstreams.iter().map(|e| e.upstream.tag().to_string()).collect()
+        upstreams
+            .iter()
+            .map(|e| e.upstream.tag().to_string())
+            .collect()
     }
 
     /// List healthy upstream tags
@@ -486,9 +487,7 @@ impl UpstreamPool {
 
         // All upstreams failed
         self.stats.record_failure();
-        Err(last_error.unwrap_or_else(|| {
-            DnsError::no_upstream("all upstreams failed")
-        }))
+        Err(last_error.unwrap_or_else(|| DnsError::no_upstream("all upstreams failed")))
     }
 
     /// Query a specific upstream by tag
@@ -537,9 +536,7 @@ impl UpstreamPool {
                 healthy_indices[rng.gen_range(0..healthy_indices.len())]
             }
             SelectionStrategy::FirstAvailable => healthy_indices[0],
-            SelectionStrategy::Weighted => {
-                self.select_weighted(healthy_indices)
-            }
+            SelectionStrategy::Weighted => self.select_weighted(healthy_indices),
         }
     }
 
@@ -1190,12 +1187,14 @@ mod tests {
         use std::time::Instant;
 
         // Create a pool with multiple upstreams
-        let pool = Arc::new(UpstreamPool::builder()
-            .add_upstream(create_mock("upstream1"))
-            .add_upstream(create_mock("upstream2"))
-            .add_upstream(create_mock("upstream3"))
-            .strategy(SelectionStrategy::RoundRobin)
-            .build());
+        let pool = Arc::new(
+            UpstreamPool::builder()
+                .add_upstream(create_mock("upstream1"))
+                .add_upstream(create_mock("upstream2"))
+                .add_upstream(create_mock("upstream3"))
+                .strategy(SelectionStrategy::RoundRobin)
+                .build(),
+        );
 
         let num_concurrent = 50;
         let mut handles = Vec::with_capacity(num_concurrent);

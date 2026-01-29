@@ -493,7 +493,8 @@ HwYDVR0jBBgwFoAUHSw86X0pO16Fimg2rwu9TbSKuE0wDwYDVR0TAQH/BAUwAwEB
 /zAKBggqhkjOPQQDAgNJADBGAiEAlBG5Mg/0+lwJG6NXRBaYyAwPrXmfsdn4Xu4M
 DlV6WPACIQDfEQFhvHY+GwxJtD4VwLr9wLomdF8bx8nyE69ttA3QVg==
 -----END CERTIFICATE-----
-".to_string()
+"
+        .to_string()
     }
 
     // Helper function to generate a private key PEM for testing
@@ -504,7 +505,8 @@ MHcCAQEEINqlpC+I/zCwt3mMtoL76ZRT/gjmCAQ2K0RoeR0RpTJmoAoGCCqGSM49
 AwEHoUQDQgAEagF+5oJUcQbdVlZHrul79Q2YEOmrlQ+g17D0eJleahEVQbsdFdex
 B/Prtn/Bu/4OavpI7c3oBrnNBEugJv8odQ==
 -----END EC PRIVATE KEY-----
-".to_string()
+"
+        .to_string()
     }
 
     fn make_valid_config() -> QuicInboundConfig {

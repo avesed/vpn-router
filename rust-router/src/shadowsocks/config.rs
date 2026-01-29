@@ -701,8 +701,7 @@ mod tests {
 
     #[test]
     fn test_config_with_udp() {
-        let config =
-            ShadowsocksOutboundConfig::new("server.com", 443, "pass").with_udp(true);
+        let config = ShadowsocksOutboundConfig::new("server.com", 443, "pass").with_udp(true);
         assert!(config.udp);
     }
 
@@ -841,8 +840,7 @@ mod tests {
     #[cfg(feature = "transport-quic")]
     #[test]
     fn test_transport_quic_with_sni() {
-        let transport =
-            ShadowsocksTransport::quic_default().with_sni("custom-sni.example.com");
+        let transport = ShadowsocksTransport::quic_default().with_sni("custom-sni.example.com");
 
         if let ShadowsocksTransport::Quic { sni, .. } = transport {
             assert_eq!(sni, Some("custom-sni.example.com".to_string()));
@@ -940,8 +938,7 @@ mod tests {
     #[cfg(feature = "transport-quic")]
     #[test]
     fn test_config_with_quic() {
-        let config = ShadowsocksOutboundConfig::new("ss.example.com", 8388, "password")
-            .with_quic();
+        let config = ShadowsocksOutboundConfig::new("ss.example.com", 8388, "password").with_quic();
         assert!(config.is_quic());
         assert!(!config.is_tcp());
     }

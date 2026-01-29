@@ -186,7 +186,8 @@ impl DomainMatcher {
                 // Valid suffix match if:
                 // 1. Pattern matches the entire reversed domain, OR
                 // 2. Pattern ends at a dot boundary (the character after the match is a dot or end)
-                if match_end == reversed.len() || reversed.as_bytes().get(match_end) == Some(&b'.') {
+                if match_end == reversed.len() || reversed.as_bytes().get(match_end) == Some(&b'.')
+                {
                     // Also verify exact pattern length match to avoid partial matches
                     if pattern.len() == mat.len() {
                         return Some(&self.suffix_outbounds[mat.pattern().as_usize()]);
@@ -469,10 +470,8 @@ impl DomainMatcherBuilder {
     ///     .unwrap();
     /// ```
     pub fn build(self) -> Result<DomainMatcher, RuleError> {
-        let rule_count = self.exact.len()
-            + self.suffix.len()
-            + self.keyword.len()
-            + self.regex.len();
+        let rule_count =
+            self.exact.len() + self.suffix.len() + self.keyword.len() + self.regex.len();
 
         // Build exact domain map
         let exact_domains: HashMap<String, String> = self.exact.into_iter().collect();
@@ -488,8 +487,7 @@ impl DomainMatcherBuilder {
             for (suffix, outbound) in self.suffix {
                 // Reverse the suffix and add leading dot
                 // "google.com" -> ".moc.elgoog"
-                let reversed: String =
-                    format!(".{}", suffix.chars().rev().collect::<String>());
+                let reversed: String = format!(".{}", suffix.chars().rev().collect::<String>());
                 reversed_patterns.push(reversed.clone());
                 patterns.push(reversed);
                 outbounds.push(outbound);
@@ -699,10 +697,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(
-            matcher.match_domain("www.google.com"),
-            Some("google-proxy")
-        );
+        assert_eq!(matcher.match_domain("www.google.com"), Some("google-proxy"));
         assert_eq!(matcher.match_domain("m.facebook.com"), Some("fb-proxy"));
         assert_eq!(matcher.match_domain("api.twitter.com"), Some("tw-proxy"));
         assert_eq!(matcher.match_domain("example.com"), None);
@@ -764,10 +759,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(
-            matcher.match_domain("www.google.com"),
-            Some("google-proxy")
-        );
+        assert_eq!(matcher.match_domain("www.google.com"), Some("google-proxy"));
         assert_eq!(matcher.match_domain("m.facebook.com"), Some("fb-proxy"));
     }
 
@@ -831,10 +823,7 @@ mod tests {
             .unwrap();
 
         // Exact should win
-        assert_eq!(
-            matcher.match_domain("example.com"),
-            Some("exact-outbound")
-        );
+        assert_eq!(matcher.match_domain("example.com"), Some("exact-outbound"));
         // But subdomain should use suffix
         assert_eq!(
             matcher.match_domain("www.example.com"),
@@ -851,10 +840,7 @@ mod tests {
             .unwrap();
 
         // Suffix should win for exact suffix match
-        assert_eq!(
-            matcher.match_domain("example.com"),
-            Some("suffix-outbound")
-        );
+        assert_eq!(matcher.match_domain("example.com"), Some("suffix-outbound"));
         assert_eq!(
             matcher.match_domain("www.example.com"),
             Some("suffix-outbound")
@@ -947,10 +933,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(matcher.match_domain("example-test.com"), Some("direct"));
-        assert_eq!(
-            matcher.match_domain("www.test-domain.com"),
-            Some("proxy")
-        );
+        assert_eq!(matcher.match_domain("www.test-domain.com"), Some("proxy"));
     }
 
     #[test]

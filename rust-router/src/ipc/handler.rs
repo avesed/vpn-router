@@ -2,10 +2,10 @@
 //!
 //! This module processes IPC commands and generates responses.
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
@@ -21,33 +21,37 @@ use super::protocol::{
     PrometheusMetricsResponse, RuleStatsResponse, ServerCapabilities, ServerStatus,
     Socks5PoolStats, TcpStatsResponse, TunnelType, UdpProcessorInfo, UdpSessionInfo,
     UdpSessionResponse, UdpSessionStatsInfo, UdpSessionsResponse, UdpStatsResponse,
-    UdpWorkerPoolInfo, UdpWorkerStatsResponse, VlessInboundStatusResponse, VlessOutboundInfoResponse,
-    VlessUserConfig, VlessUserInfo, VlessWgBridgeStats, WgSniRoutingConfigResponse,
-    WgSniRoutingUpdatedResponse, WgTunnelListResponse, WgTunnelStatus,
+    UdpWorkerPoolInfo, UdpWorkerStatsResponse, VlessInboundStatusResponse,
+    VlessOutboundInfoResponse, VlessUserConfig, VlessUserInfo, VlessWgBridgeStats,
+    WgSniRoutingConfigResponse, WgSniRoutingUpdatedResponse, WgTunnelListResponse, WgTunnelStatus,
 };
 use crate::chain::ChainManager;
+use crate::config::{load_config_with_env, OutboundConfig};
+use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::dns::cache::DnsCache;
 use crate::dns::client::UpstreamPool;
 use crate::dns::filter::BlockFilter;
 use crate::dns::log::QueryLogger;
 use crate::dns::split::{DnsRouter, DomainMatchType};
 use crate::dns::DnsConfig;
-use crate::config::{load_config_with_env, OutboundConfig};
-use crate::connection::{ConnectionManager, UdpSessionKey, UdpSessionManager};
 use crate::ecmp::group::EcmpGroupManager;
 use crate::egress::manager::WgEgressManager;
 use crate::ingress::manager::WgIngressManager;
-use crate::ingress::{ForwardingStats, IngressReplyStats, IngressSessionTracker, get_sni_routing_config};
+use crate::ingress::{
+    get_sni_routing_config, ForwardingStats, IngressReplyStats, IngressSessionTracker,
+};
+use crate::io::bidirectional_copy;
 use crate::io::UdpBufferPool;
+use crate::outbound::vless::{TlsSettings, VlessConfig, VlessOutbound, VlessTransportConfig};
 use crate::outbound::{Outbound, OutboundManager};
 use crate::peer::manager::PeerManager;
 use crate::peer::pairing::PairRequestConfig;
-use crate::rules::{ConnectionInfo, RuleEngine, RoutingSnapshotBuilder};
+use crate::rules::{ConnectionInfo, RoutingSnapshotBuilder, RuleEngine};
 use crate::tproxy::UdpWorkerPool;
-use crate::outbound::vless::{VlessConfig, VlessOutbound, VlessTransportConfig, TlsSettings};
-use crate::vless_inbound::{VlessInboundConfig, VlessInboundListener, VlessUser as VlessInboundUser};
 use crate::vless::{VlessAccount, VlessAccountManager};
-use crate::io::bidirectional_copy;
+use crate::vless_inbound::{
+    VlessInboundConfig, VlessInboundListener, VlessUser as VlessInboundUser,
+};
 
 /// DNS engine component holder
 ///
@@ -160,7 +164,6 @@ pub struct IpcHandler {
     // ========================================================================
     // UDP Components (Optional)
     // ========================================================================
-
     /// Whether UDP is enabled
     udp_enabled: bool,
 
@@ -176,7 +179,6 @@ pub struct IpcHandler {
     // ========================================================================
     // Chain Management Components
     // ========================================================================
-
     /// Chain manager for multi-hop routing
     chain_manager: Option<Arc<ChainManager>>,
 
@@ -186,7 +188,6 @@ pub struct IpcHandler {
     // ========================================================================
     // Additional Manager Components
     // ========================================================================
-
     /// Peer manager for multi-node connections
     peer_manager: Option<Arc<PeerManager>>,
 
@@ -212,14 +213,12 @@ pub struct IpcHandler {
     // ========================================================================
     // DNS Engine Components
     // ========================================================================
-
     /// DNS engine for DNS query handling
     dns_engine: Option<Arc<DnsEngine>>,
 
     // ========================================================================
     // VLESS Components
     // ========================================================================
-
     /// VLESS inbound listener (wrapped in RwLock for dynamic updates)
     vless_inbound: RwLock<Option<Arc<VlessInboundListener>>>,
 
@@ -240,9 +239,34 @@ pub struct IpcHandler {
     vless_reply_registry: Option<Arc<crate::vless_wg_bridge::VlessReplyRegistry>>,
 
     // ========================================================================
+    // Sharded VLESS-WG Bridge Components (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+    /// Sharded VLESS-WG bridges per WG tunnel (tag -> bridge)
+    /// Each WG tunnel gets its own ShardedVlessWgBridge for parallel processing
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    sharded_bridges: RwLock<std::collections::HashMap<String, Arc<crate::vless_wg_bridge::ShardedVlessWgBridge>>>,
+
+    /// Reply channel senders per WG tunnel for routing WG replies to sharded bridges
+    /// Maps tunnel tag -> mpsc::Sender<bytes::Bytes>
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    sharded_bridge_reply_txs: RwLock<std::collections::HashMap<String, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+
+    /// Shared registry for WgReplyHandler to route packets to sharded bridges
+    /// This is set after handler creation via set_sharded_bridge_reply_registry()
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    sharded_bridge_reply_registry: RwLock<Option<Arc<crate::vless_wg_bridge::ShardedBridgeReplyRegistry>>>,
+
+    /// Legacy single sharded bridge (for backward compatibility)
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    sharded_bridge: RwLock<Option<Arc<crate::vless_wg_bridge::ShardedVlessWgBridge>>>,
+
+    /// Shard supervisor for monitoring and recovery
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    shard_supervisor: RwLock<Option<Arc<parking_lot::Mutex<crate::vless_wg_bridge::ShardSupervisor>>>>,
+
+    // ========================================================================
     // Shadowsocks Components
     // ========================================================================
-
     /// Shadowsocks inbound listener (wrapped in RwLock for dynamic updates)
     #[cfg(feature = "shadowsocks")]
     ss_inbound: RwLock<Option<Arc<crate::ss_inbound::ShadowsocksInboundListener>>>,
@@ -304,6 +328,16 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridges: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_registry: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            shard_supervisor: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -360,6 +394,16 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridges: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_registry: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            shard_supervisor: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -415,6 +459,16 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridges: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_registry: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            shard_supervisor: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -473,6 +527,16 @@ impl IpcHandler {
             vless_active_connections: AtomicU64::new(0),
             vless_inbound_task: RwLock::new(None),
             vless_reply_registry: None,
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridges: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_txs: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge_reply_registry: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            sharded_bridge: RwLock::new(None),
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            shard_supervisor: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -491,7 +555,11 @@ impl IpcHandler {
     /// Set the chain manager after construction
     ///
     /// This allows adding chain management capability to an existing handler.
-    pub fn with_chain_manager(mut self, chain_manager: Arc<ChainManager>, local_node_tag: String) -> Self {
+    pub fn with_chain_manager(
+        mut self,
+        chain_manager: Arc<ChainManager>,
+        local_node_tag: String,
+    ) -> Self {
         self.chain_manager = Some(chain_manager);
         self.local_node_tag = local_node_tag;
         self
@@ -533,10 +601,7 @@ impl IpcHandler {
     }
 
     /// Set ingress session tracker after construction for active connection count
-    pub fn with_ingress_session_tracker(
-        self,
-        session_tracker: Arc<IngressSessionTracker>,
-    ) -> Self {
+    pub fn with_ingress_session_tracker(self, session_tracker: Arc<IngressSessionTracker>) -> Self {
         *self.ingress_session_tracker.write() = Some(session_tracker);
         self
     }
@@ -581,10 +646,208 @@ impl IpcHandler {
     }
 
     /// Get a reference to the VLESS reply registry (if available)
-    pub fn vless_reply_registry(
-        &self,
-    ) -> Option<&Arc<crate::vless_wg_bridge::VlessReplyRegistry>> {
+    pub fn vless_reply_registry(&self) -> Option<&Arc<crate::vless_wg_bridge::VlessReplyRegistry>> {
         self.vless_reply_registry.as_ref()
+    }
+
+    /// Set the sharded VLESS-WG bridge after construction
+    ///
+    /// This enables sharded parallel processing for VLESS-WG bridging.
+    /// Only available when `sharded-vless-wg-bridge` feature is enabled.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn with_sharded_bridge(
+        self,
+        bridge: Arc<crate::vless_wg_bridge::ShardedVlessWgBridge>,
+    ) -> Self {
+        *self.sharded_bridge.write() = Some(bridge);
+        self
+    }
+
+    /// Set the sharded bridge on an already-created handler (via Arc)
+    ///
+    /// This is needed because the bridge may be created after the handler is wrapped in Arc.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn set_sharded_bridge(&self, bridge: Arc<crate::vless_wg_bridge::ShardedVlessWgBridge>) {
+        *self.sharded_bridge.write() = Some(bridge);
+    }
+
+    /// Get a reference to the sharded VLESS-WG bridge (if available)
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn sharded_bridge(
+        &self,
+    ) -> Option<Arc<crate::vless_wg_bridge::ShardedVlessWgBridge>> {
+        self.sharded_bridge.read().clone()
+    }
+
+    /// Set the shard supervisor after construction
+    ///
+    /// This enables shard monitoring and automatic recovery.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn with_shard_supervisor(
+        self,
+        supervisor: Arc<parking_lot::Mutex<crate::vless_wg_bridge::ShardSupervisor>>,
+    ) -> Self {
+        *self.shard_supervisor.write() = Some(supervisor);
+        self
+    }
+
+    /// Set the shard supervisor on an already-created handler (via Arc)
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn set_shard_supervisor(
+        &self,
+        supervisor: Arc<parking_lot::Mutex<crate::vless_wg_bridge::ShardSupervisor>>,
+    ) {
+        *self.shard_supervisor.write() = Some(supervisor);
+    }
+
+    /// Get a reference to the shard supervisor (if available)
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn shard_supervisor(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<crate::vless_wg_bridge::ShardSupervisor>>> {
+        self.shard_supervisor.read().clone()
+    }
+
+    // ========================================================================
+    // Per-Tunnel Sharded Bridge Management (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+
+    /// Create and register a sharded bridge for a WireGuard tunnel
+    ///
+    /// This creates a `ShardedVlessWgBridge` for the specified tunnel with a dedicated
+    /// reply channel. The bridge is stored in the per-tunnel map for later retrieval.
+    ///
+    /// # Arguments
+    ///
+    /// * `tunnel_tag` - The tag of the WireGuard tunnel
+    /// * `wg_tx` - Channel sender for sending packets to the WireGuard tunnel
+    ///
+    /// # Returns
+    ///
+    /// The channel sender for routing WG replies to this bridge's shards.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub async fn create_sharded_bridge_for_tunnel(
+        &self,
+        tunnel_tag: String,
+        wg_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    ) -> tokio::sync::mpsc::Sender<bytes::Bytes> {
+        use crate::vless_wg_bridge::{ShardedBridgeConfig, ShardedVlessWgBridge};
+
+        // Create reply channel for this tunnel
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+
+        // Create the sharded bridge with configuration from environment
+        let config = ShardedBridgeConfig::from_env();
+        let bridge = ShardedVlessWgBridge::new(config, reply_rx, wg_tx).await;
+        let bridge = Arc::new(bridge);
+
+        info!(
+            "Created ShardedVlessWgBridge for tunnel '{}' with {} shards",
+            tunnel_tag,
+            bridge.num_shards()
+        );
+
+        // Store the bridge and reply sender
+        {
+            let mut bridges = self.sharded_bridges.write();
+            bridges.insert(tunnel_tag.clone(), bridge);
+        }
+        {
+            let mut reply_txs = self.sharded_bridge_reply_txs.write();
+            reply_txs.insert(tunnel_tag.clone(), reply_tx.clone());
+        }
+
+        // Also register with the shared reply registry so WgReplyHandler can route packets
+        if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
+            registry.register(tunnel_tag, reply_tx.clone());
+        }
+
+        reply_tx
+    }
+
+    /// Get a sharded bridge for a specific WireGuard tunnel
+    ///
+    /// Returns `Some(Arc<ShardedVlessWgBridge>)` if a bridge exists for the tunnel,
+    /// `None` otherwise.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn get_sharded_bridge_for_tunnel(
+        &self,
+        tunnel_tag: &str,
+    ) -> Option<Arc<crate::vless_wg_bridge::ShardedVlessWgBridge>> {
+        self.sharded_bridges.read().get(tunnel_tag).cloned()
+    }
+
+    /// Get the reply channel sender for a specific WireGuard tunnel
+    ///
+    /// This is used by the WgReplyHandler to route replies to the appropriate
+    /// sharded bridge.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn get_sharded_bridge_reply_tx(
+        &self,
+        tunnel_tag: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<bytes::Bytes>> {
+        self.sharded_bridge_reply_txs.read().get(tunnel_tag).cloned()
+    }
+
+    /// Remove a sharded bridge for a WireGuard tunnel
+    ///
+    /// This should be called when a WireGuard tunnel is removed to clean up
+    /// the associated sharded bridge and its resources.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub async fn remove_sharded_bridge_for_tunnel(&self, tunnel_tag: &str) {
+        // Unregister from shared reply registry first
+        if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
+            registry.unregister(tunnel_tag);
+        }
+
+        // Remove the reply sender to stop routing new replies
+        {
+            let mut reply_txs = self.sharded_bridge_reply_txs.write();
+            reply_txs.remove(tunnel_tag);
+        }
+
+        // Remove and shutdown the bridge
+        let bridge = {
+            let mut bridges = self.sharded_bridges.write();
+            bridges.remove(tunnel_tag)
+        };
+
+        if let Some(bridge) = bridge {
+            info!("Shutting down ShardedVlessWgBridge for tunnel '{}'", tunnel_tag);
+            bridge.shutdown().await;
+        }
+    }
+
+    /// Check if a sharded bridge exists for a tunnel
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn has_sharded_bridge_for_tunnel(&self, tunnel_tag: &str) -> bool {
+        self.sharded_bridges.read().contains_key(tunnel_tag)
+    }
+
+    /// List all tunnel tags that have sharded bridges
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn list_sharded_bridge_tunnels(&self) -> Vec<String> {
+        self.sharded_bridges.read().keys().cloned().collect()
+    }
+
+    /// Set the sharded bridge reply registry
+    ///
+    /// This registry is used by the WgReplyHandler to route packets to the
+    /// correct sharded bridge based on tunnel tag.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn set_sharded_bridge_reply_registry(
+        &self,
+        registry: Arc<crate::vless_wg_bridge::ShardedBridgeReplyRegistry>,
+    ) {
+        *self.sharded_bridge_reply_registry.write() = Some(registry);
+    }
+
+    /// Get the sharded bridge reply registry
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub fn sharded_bridge_reply_registry(
+        &self,
+    ) -> Option<Arc<crate::vless_wg_bridge::ShardedBridgeReplyRegistry>> {
+        self.sharded_bridge_reply_registry.read().clone()
     }
 
     /// Create a new IPC handler with a default (empty) rule engine
@@ -650,10 +913,7 @@ impl IpcHandler {
 
         // Allow WireGuard-prefixed tags that may be added later via IPC
         // These prefixes match the forwarder's is_wg_egress check
-        if tag.starts_with("wg-")
-            || tag.starts_with("pia-")
-            || tag.starts_with("peer-")
-        {
+        if tag.starts_with("wg-") || tag.starts_with("pia-") || tag.starts_with("peer-") {
             return true;
         }
 
@@ -793,43 +1053,36 @@ impl IpcHandler {
             IpcCommand::CreateWgTunnel { tag, config } => {
                 self.handle_create_wg_tunnel(tag, config).await
             }
-            IpcCommand::RemoveWgTunnel { tag, drain_timeout_secs } => {
-                self.handle_remove_wg_tunnel(&tag, drain_timeout_secs).await
-            }
-            IpcCommand::GetWgTunnelStatus { tag } => {
-                self.handle_get_wg_tunnel_status(&tag)
-            }
-            IpcCommand::ListWgTunnels => {
-                self.handle_list_wg_tunnels()
-            }
+            IpcCommand::RemoveWgTunnel {
+                tag,
+                drain_timeout_secs,
+            } => self.handle_remove_wg_tunnel(&tag, drain_timeout_secs).await,
+            IpcCommand::GetWgTunnelStatus { tag } => self.handle_get_wg_tunnel_status(&tag),
+            IpcCommand::ListWgTunnels => self.handle_list_wg_tunnels(),
 
             // Ingress Peer Management
-            IpcCommand::AddIngressPeer { public_key, allowed_ips, name, preshared_key } => {
-                self.handle_add_ingress_peer(public_key, allowed_ips, name, preshared_key).await
+            IpcCommand::AddIngressPeer {
+                public_key,
+                allowed_ips,
+                name,
+                preshared_key,
+            } => {
+                self.handle_add_ingress_peer(public_key, allowed_ips, name, preshared_key)
+                    .await
             }
             IpcCommand::RemoveIngressPeer { public_key } => {
                 self.handle_remove_ingress_peer(public_key).await
             }
-            IpcCommand::ListIngressPeers => {
-                self.handle_list_ingress_peers()
-            }
-            IpcCommand::GetIngressStats => {
-                self.handle_get_ingress_stats()
-            }
+            IpcCommand::ListIngressPeers => self.handle_list_ingress_peers(),
+            IpcCommand::GetIngressStats => self.handle_get_ingress_stats(),
 
             // ECMP Group Management
             IpcCommand::CreateEcmpGroup { tag, config } => {
                 self.handle_create_ecmp_group(tag, config)
             }
-            IpcCommand::RemoveEcmpGroup { tag } => {
-                self.handle_remove_ecmp_group(&tag)
-            }
-            IpcCommand::GetEcmpGroupStatus { tag } => {
-                self.handle_get_ecmp_group_status(&tag)
-            }
-            IpcCommand::ListEcmpGroups => {
-                self.handle_list_ecmp_groups()
-            }
+            IpcCommand::RemoveEcmpGroup { tag } => self.handle_remove_ecmp_group(&tag),
+            IpcCommand::GetEcmpGroupStatus { tag } => self.handle_get_ecmp_group_status(&tag),
+            IpcCommand::ListEcmpGroups => self.handle_list_ecmp_groups(),
             IpcCommand::UpdateEcmpGroupMembers { tag, members } => {
                 self.handle_update_ecmp_group_members(&tag, members)
             }
@@ -842,16 +1095,14 @@ impl IpcHandler {
                 local_api_port,
                 bidirectional,
                 tunnel_type,
-            } => {
-                self.handle_generate_pair_request(
-                    local_tag,
-                    local_description,
-                    local_endpoint,
-                    local_api_port,
-                    bidirectional,
-                    tunnel_type,
-                )
-            }
+            } => self.handle_generate_pair_request(
+                local_tag,
+                local_description,
+                local_endpoint,
+                local_api_port,
+                bidirectional,
+                tunnel_type,
+            ),
             IpcCommand::ImportPairRequest {
                 code,
                 local_tag,
@@ -865,142 +1116,151 @@ impl IpcHandler {
                     local_description,
                     local_endpoint,
                     local_api_port,
-                ).await
+                )
+                .await
             }
-            IpcCommand::CompleteHandshake { code } => {
-                self.handle_complete_handshake(code).await
-            }
-            IpcCommand::AddPeer { config } => {
-                self.handle_add_peer(config).await
-            }
-            IpcCommand::ConnectPeer { tag } => {
-                self.handle_connect_peer(&tag).await
-            }
-            IpcCommand::DisconnectPeer { tag } => {
-                self.handle_disconnect_peer(&tag).await
-            }
-            IpcCommand::GetPeerStatus { tag } => {
-                self.handle_get_peer_status(&tag)
-            }
-            IpcCommand::GetPeerTunnelHealth { tag } => {
-                self.handle_get_peer_tunnel_health(&tag)
-            }
-            IpcCommand::ListPeers => {
-                self.handle_list_peers()
-            }
-            IpcCommand::RemovePeer { tag } => {
-                self.handle_remove_peer(&tag).await
-            }
+            IpcCommand::CompleteHandshake { code } => self.handle_complete_handshake(code).await,
+            IpcCommand::AddPeer { config } => self.handle_add_peer(config).await,
+            IpcCommand::ConnectPeer { tag } => self.handle_connect_peer(&tag).await,
+            IpcCommand::DisconnectPeer { tag } => self.handle_disconnect_peer(&tag).await,
+            IpcCommand::GetPeerStatus { tag } => self.handle_get_peer_status(&tag),
+            IpcCommand::GetPeerTunnelHealth { tag } => self.handle_get_peer_tunnel_health(&tag),
+            IpcCommand::ListPeers => self.handle_list_peers(),
+            IpcCommand::RemovePeer { tag } => self.handle_remove_peer(&tag).await,
 
             // ================================================================
             // Chain Management Command Handlers
             // ================================================================
-            IpcCommand::CreateChain { tag, config } => {
-                self.handle_create_chain(tag, config).await
-            }
-            IpcCommand::RemoveChain { tag } => {
-                self.handle_remove_chain(&tag).await
-            }
-            IpcCommand::ActivateChain { tag } => {
-                self.handle_activate_chain(&tag).await
-            }
-            IpcCommand::DeactivateChain { tag } => {
-                self.handle_deactivate_chain(&tag).await
-            }
-            IpcCommand::GetChainStatus { tag } => {
-                self.handle_get_chain_status(&tag)
-            }
-            IpcCommand::ListChains => {
-                self.handle_list_chains()
-            }
-            IpcCommand::GetChainRole { chain_tag } => {
-                self.handle_get_chain_role(&chain_tag)
-            }
-            IpcCommand::DiagnoseChain { tag } => {
-                self.handle_diagnose_chain(&tag)
-            }
-            IpcCommand::UpdateChainState { tag, state, last_error } => {
-                self.handle_update_chain_state(&tag, state, last_error)
-            }
-            IpcCommand::UpdateChain { tag, hops, exit_egress, description, allow_transitive } => {
-                self.handle_update_chain(tag, hops, exit_egress, description, allow_transitive).await
+            IpcCommand::CreateChain { tag, config } => self.handle_create_chain(tag, config).await,
+            IpcCommand::RemoveChain { tag } => self.handle_remove_chain(&tag).await,
+            IpcCommand::ActivateChain { tag } => self.handle_activate_chain(&tag).await,
+            IpcCommand::DeactivateChain { tag } => self.handle_deactivate_chain(&tag).await,
+            IpcCommand::GetChainStatus { tag } => self.handle_get_chain_status(&tag),
+            IpcCommand::ListChains => self.handle_list_chains(),
+            IpcCommand::GetChainRole { chain_tag } => self.handle_get_chain_role(&chain_tag),
+            IpcCommand::DiagnoseChain { tag } => self.handle_diagnose_chain(&tag),
+            IpcCommand::UpdateChainState {
+                tag,
+                state,
+                last_error,
+            } => self.handle_update_chain_state(&tag, state, last_error),
+            IpcCommand::UpdateChain {
+                tag,
+                hops,
+                exit_egress,
+                description,
+                allow_transitive,
+            } => {
+                self.handle_update_chain(tag, hops, exit_egress, description, allow_transitive)
+                    .await
             }
 
             // ================================================================
             // Two-Phase Commit Command Handlers
             // ================================================================
-            IpcCommand::PrepareChainRoute { chain_tag, config, source_node } => {
-                self.handle_prepare_chain_route(&chain_tag, config, &source_node).await
+            IpcCommand::PrepareChainRoute {
+                chain_tag,
+                config,
+                source_node,
+            } => {
+                self.handle_prepare_chain_route(&chain_tag, config, &source_node)
+                    .await
             }
-            IpcCommand::CommitChainRoute { chain_tag, source_node } => {
-                self.handle_commit_chain_route(&chain_tag, &source_node).await
+            IpcCommand::CommitChainRoute {
+                chain_tag,
+                source_node,
+            } => {
+                self.handle_commit_chain_route(&chain_tag, &source_node)
+                    .await
             }
-            IpcCommand::AbortChainRoute { chain_tag, source_node } => {
-                self.handle_abort_chain_route(&chain_tag, &source_node).await
+            IpcCommand::AbortChainRoute {
+                chain_tag,
+                source_node,
+            } => {
+                self.handle_abort_chain_route(&chain_tag, &source_node)
+                    .await
             }
 
             // ================================================================
             // DNS Command Handlers
             // ================================================================
-            IpcCommand::GetDnsStats => {
-                self.handle_get_dns_stats()
-            }
-            IpcCommand::GetDnsCacheStats => {
-                self.handle_get_dns_cache_stats()
-            }
-            IpcCommand::FlushDnsCache { pattern } => {
-                self.handle_flush_dns_cache(pattern)
-            }
-            IpcCommand::GetDnsBlockStats => {
-                self.handle_get_dns_block_stats()
-            }
-            IpcCommand::ReloadDnsBlocklist => {
-                self.handle_reload_dns_blocklist()
-            }
+            IpcCommand::GetDnsStats => self.handle_get_dns_stats(),
+            IpcCommand::GetDnsCacheStats => self.handle_get_dns_cache_stats(),
+            IpcCommand::FlushDnsCache { pattern } => self.handle_flush_dns_cache(pattern),
+            IpcCommand::GetDnsBlockStats => self.handle_get_dns_block_stats(),
+            IpcCommand::ReloadDnsBlocklist => self.handle_reload_dns_blocklist(),
             IpcCommand::AddDnsUpstream { tag, config } => {
                 self.handle_add_dns_upstream(tag, config).await
             }
-            IpcCommand::RemoveDnsUpstream { tag } => {
-                self.handle_remove_dns_upstream(&tag).await
-            }
-            IpcCommand::GetDnsUpstreamStatus { tag } => {
-                self.handle_get_dns_upstream_status(tag)
-            }
-            IpcCommand::AddDnsRoute { pattern, match_type, upstream_tag } => {
-                self.handle_add_dns_route(pattern, match_type, upstream_tag)
-            }
-            IpcCommand::RemoveDnsRoute { pattern } => {
-                self.handle_remove_dns_route(&pattern)
-            }
+            IpcCommand::RemoveDnsUpstream { tag } => self.handle_remove_dns_upstream(&tag).await,
+            IpcCommand::GetDnsUpstreamStatus { tag } => self.handle_get_dns_upstream_status(tag),
+            IpcCommand::AddDnsRoute {
+                pattern,
+                match_type,
+                upstream_tag,
+            } => self.handle_add_dns_route(pattern, match_type, upstream_tag),
+            IpcCommand::RemoveDnsRoute { pattern } => self.handle_remove_dns_route(&pattern),
             IpcCommand::GetDnsQueryLog { limit, offset } => {
                 self.handle_get_dns_query_log(limit, offset)
             }
-            IpcCommand::DnsQuery { domain, qtype, upstream } => {
-                self.handle_dns_query(&domain, qtype, upstream).await
-            }
-            IpcCommand::GetDnsConfig => {
-                self.handle_get_dns_config()
-            }
+            IpcCommand::DnsQuery {
+                domain,
+                qtype,
+                upstream,
+            } => self.handle_dns_query(&domain, qtype, upstream).await,
+            IpcCommand::GetDnsConfig => self.handle_get_dns_config(),
 
             // ================================================================
             // WARP Registration Command Handler
             // ================================================================
-            IpcCommand::RegisterWarp { tag, name, warp_plus_license } => {
-                self.handle_register_warp(tag, name, warp_plus_license).await
+            IpcCommand::RegisterWarp {
+                tag,
+                name,
+                warp_plus_license,
+            } => {
+                self.handle_register_warp(tag, name, warp_plus_license)
+                    .await
             }
 
             // ================================================================
             // Speed Test Command Handler
             // ================================================================
-            IpcCommand::SpeedTest { tag, size_bytes, timeout_secs } => {
-                self.handle_speed_test(tag, size_bytes, timeout_secs).await
-            }
+            IpcCommand::SpeedTest {
+                tag,
+                size_bytes,
+                timeout_secs,
+            } => self.handle_speed_test(tag, size_bytes, timeout_secs).await,
 
             // ================================================================
             // Peer API Forwarding Command Handler
             // ================================================================
-            IpcCommand::ForwardPeerRequest { peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, tunnel_local_ip, headers } => {
-                self.handle_forward_peer_request(peer_tag, method, path, body, timeout_secs, endpoint, tunnel_type, api_port, tunnel_ip, tunnel_local_ip, headers).await
+            IpcCommand::ForwardPeerRequest {
+                peer_tag,
+                method,
+                path,
+                body,
+                timeout_secs,
+                endpoint,
+                tunnel_type,
+                api_port,
+                tunnel_ip,
+                tunnel_local_ip,
+                headers,
+            } => {
+                self.handle_forward_peer_request(
+                    peer_tag,
+                    method,
+                    path,
+                    body,
+                    timeout_secs,
+                    endpoint,
+                    tunnel_type,
+                    api_port,
+                    tunnel_ip,
+                    tunnel_local_ip,
+                    headers,
+                )
+                .await
             }
 
             // ================================================================
@@ -1029,41 +1289,47 @@ impl IpcHandler {
                     tls_skip_verify,
                     ws_path,
                     ws_host,
-                ).await
+                )
+                .await
             }
-            IpcCommand::RemoveVlessOutbound { tag } => {
-                self.handle_remove_vless_outbound(&tag)
-            }
-            IpcCommand::ListVlessOutbounds => {
-                self.handle_list_vless_outbounds()
-            }
-            IpcCommand::GetVlessOutbound { tag } => {
-                self.handle_get_vless_outbound(&tag)
-            }
+            IpcCommand::RemoveVlessOutbound { tag } => self.handle_remove_vless_outbound(&tag),
+            IpcCommand::ListVlessOutbounds => self.handle_list_vless_outbounds(),
+            IpcCommand::GetVlessOutbound { tag } => self.handle_get_vless_outbound(&tag),
             IpcCommand::ConfigureVlessInbound {
-                listen, users, tls_cert_path, tls_key_path, fallback, udp_enabled,
-                reality_private_key, reality_short_ids, reality_dest, reality_server_names, reality_max_time_diff_ms
+                listen,
+                users,
+                tls_cert_path,
+                tls_key_path,
+                fallback,
+                udp_enabled,
+                reality_private_key,
+                reality_short_ids,
+                reality_dest,
+                reality_server_names,
+                reality_max_time_diff_ms,
             } => {
                 self.handle_configure_vless_inbound(
-                    listen, users, tls_cert_path, tls_key_path, fallback, udp_enabled,
-                    reality_private_key, reality_short_ids, reality_dest, reality_server_names, reality_max_time_diff_ms
-                ).await
+                    listen,
+                    users,
+                    tls_cert_path,
+                    tls_key_path,
+                    fallback,
+                    udp_enabled,
+                    reality_private_key,
+                    reality_short_ids,
+                    reality_dest,
+                    reality_server_names,
+                    reality_max_time_diff_ms,
+                )
+                .await
             }
             IpcCommand::AddVlessUser { uuid, email, flow } => {
                 self.handle_add_vless_user(uuid, email, flow)
             }
-            IpcCommand::RemoveVlessUser { uuid } => {
-                self.handle_remove_vless_user(&uuid)
-            }
-            IpcCommand::ListVlessUsers => {
-                self.handle_list_vless_users()
-            }
-            IpcCommand::GetVlessInboundStatus => {
-                self.handle_get_vless_inbound_status()
-            }
-            IpcCommand::StopVlessInbound => {
-                self.handle_stop_vless_inbound()
-            }
+            IpcCommand::RemoveVlessUser { uuid } => self.handle_remove_vless_user(&uuid),
+            IpcCommand::ListVlessUsers => self.handle_list_vless_users(),
+            IpcCommand::GetVlessInboundStatus => self.handle_get_vless_inbound_status(),
+            IpcCommand::StopVlessInbound => self.handle_stop_vless_inbound(),
 
             // Shadowsocks commands
             #[cfg(feature = "shadowsocks")]
@@ -1074,17 +1340,20 @@ impl IpcHandler {
                 method,
                 password,
                 udp,
-            } => {
-                self.handle_add_shadowsocks_outbound(tag, server, server_port, method, password, udp)
-            }
+            } => self.handle_add_shadowsocks_outbound(
+                tag,
+                server,
+                server_port,
+                method,
+                password,
+                udp,
+            ),
             #[cfg(feature = "shadowsocks")]
             IpcCommand::RemoveShadowsocksOutbound { tag } => {
                 self.handle_remove_shadowsocks_outbound(&tag)
             }
             #[cfg(feature = "shadowsocks")]
-            IpcCommand::ListShadowsocksOutbounds => {
-                self.handle_list_shadowsocks_outbounds()
-            }
+            IpcCommand::ListShadowsocksOutbounds => self.handle_list_shadowsocks_outbounds(),
             #[cfg(feature = "shadowsocks")]
             IpcCommand::GetShadowsocksOutbound { tag } => {
                 self.handle_get_shadowsocks_outbound(&tag)
@@ -1098,29 +1367,39 @@ impl IpcHandler {
                 password,
                 udp_enabled,
             } => {
-                self.handle_configure_shadowsocks_inbound(&listen, &method, &password, udp_enabled).await
+                self.handle_configure_shadowsocks_inbound(&listen, &method, &password, udp_enabled)
+                    .await
             }
             #[cfg(feature = "shadowsocks")]
-            IpcCommand::GetShadowsocksInboundStatus => {
-                self.handle_get_shadowsocks_inbound_status()
-            }
+            IpcCommand::GetShadowsocksInboundStatus => self.handle_get_shadowsocks_inbound_status(),
             #[cfg(feature = "shadowsocks")]
-            IpcCommand::StopShadowsocksInbound => {
-                self.handle_stop_shadowsocks_inbound()
-            }
+            IpcCommand::StopShadowsocksInbound => self.handle_stop_shadowsocks_inbound(),
 
             // ================================================================
             // WireGuard SNI Routing Configuration Command Handlers
             // ================================================================
-            IpcCommand::SetWgSniRouting { tunnel_tag, enabled } => {
-                self.handle_set_wg_sni_routing(tunnel_tag, enabled)
-            }
-            IpcCommand::GetWgSniRoutingConfig => {
-                self.handle_get_wg_sni_routing_config()
-            }
+            IpcCommand::SetWgSniRouting {
+                tunnel_tag,
+                enabled,
+            } => self.handle_set_wg_sni_routing(tunnel_tag, enabled),
+            IpcCommand::GetWgSniRoutingConfig => self.handle_get_wg_sni_routing_config(),
             IpcCommand::SetGlobalWgSniRouting { enabled } => {
                 self.handle_set_global_wg_sni_routing(enabled)
             }
+
+            // ================================================================
+            // Sharded VLESS-WG Bridge Command Handlers (feature: sharded-vless-wg-bridge)
+            // ================================================================
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            IpcCommand::GetShardedBridgeStats => self.handle_get_sharded_bridge_stats(),
+
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            IpcCommand::GetShardHealth { shard_index } => {
+                self.handle_get_shard_health(shard_index)
+            }
+
+            #[cfg(feature = "sharded-vless-wg-bridge")]
+            IpcCommand::GetSupervisorStats => self.handle_get_supervisor_stats(),
         }
     }
 
@@ -1191,14 +1470,15 @@ impl IpcHandler {
 
             // Add the outbound directly based on type
             use crate::config::OutboundType;
-            let outbound: Box<dyn super::super::outbound::Outbound> = match outbound_config.outbound_type {
-                OutboundType::Direct => {
-                    Box::new(crate::outbound::DirectOutbound::new(outbound_config.clone()))
-                }
-                OutboundType::Block => {
-                    Box::new(crate::outbound::BlockOutbound::from_config(outbound_config))
-                }
-            };
+            let outbound: Box<dyn super::super::outbound::Outbound> =
+                match outbound_config.outbound_type {
+                    OutboundType::Direct => Box::new(crate::outbound::DirectOutbound::new(
+                        outbound_config.clone(),
+                    )),
+                    OutboundType::Block => {
+                        Box::new(crate::outbound::BlockOutbound::from_config(outbound_config))
+                    }
+                };
             self.outbound_manager.add(outbound);
         }
 
@@ -1222,12 +1502,8 @@ impl IpcHandler {
         // Create and add outbound based on type
         use crate::config::OutboundType;
         let outbound: Box<dyn super::super::outbound::Outbound> = match config.outbound_type {
-            OutboundType::Direct => {
-                Box::new(crate::outbound::DirectOutbound::new(config.clone()))
-            }
-            OutboundType::Block => {
-                Box::new(crate::outbound::BlockOutbound::from_config(&config))
-            }
+            OutboundType::Direct => Box::new(crate::outbound::DirectOutbound::new(config.clone())),
+            OutboundType::Block => Box::new(crate::outbound::BlockOutbound::from_config(&config)),
         };
         self.outbound_manager.add(outbound);
 
@@ -1238,10 +1514,7 @@ impl IpcHandler {
     /// Handle remove outbound command
     fn handle_remove_outbound(&self, tag: &str) -> IpcResponse {
         if !self.outbound_manager.contains(tag) {
-            return IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Outbound '{tag}' not found"),
-            );
+            return IpcResponse::error(ErrorCode::NotFound, format!("Outbound '{tag}' not found"));
         }
 
         // Check if outbound has active connections
@@ -1266,10 +1539,7 @@ impl IpcHandler {
         // Note: Current implementation doesn't support runtime enable/disable
         // This would require modifying the Outbound trait
         if !self.outbound_manager.contains(tag) {
-            return IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Outbound '{tag}' not found"),
-            );
+            return IpcResponse::error(ErrorCode::NotFound, format!("Outbound '{tag}' not found"));
         }
 
         let action = if enable { "enabled" } else { "disabled" };
@@ -1330,7 +1600,11 @@ impl IpcHandler {
                         tag: status.tag.clone(),
                         outbound_type: "wireguard".to_string(),
                         enabled: status.connected,
-                        health: if status.connected { "healthy".to_string() } else { "unhealthy".to_string() },
+                        health: if status.connected {
+                            "healthy".to_string()
+                        } else {
+                            "unhealthy".to_string()
+                        },
                         active_connections: 0,
                         total_connections: status.stats.tx_packets,
                         bind_interface: None,
@@ -1381,14 +1655,15 @@ impl IpcHandler {
         };
 
         // Convert sniffed protocol
-        let sniffed_static: Option<&'static str> = sniffed_protocol.as_ref().map(|s| {
-            match s.to_lowercase().as_str() {
-                "tls" => "tls",
-                "http" => "http",
-                "quic" => "quic",
-                _ => "unknown",
-            }
-        });
+        let sniffed_static: Option<&'static str> =
+            sniffed_protocol
+                .as_ref()
+                .map(|s| match s.to_lowercase().as_str() {
+                    "tls" => "tls",
+                    "http" => "http",
+                    "quic" => "quic",
+                    _ => "unknown",
+                });
 
         // Build ConnectionInfo for rule matching
         let conn = ConnectionInfo {
@@ -1492,9 +1767,7 @@ impl IpcHandler {
             info!("Would load rules from: {} (not yet implemented)", path);
         }
 
-        IpcResponse::success_with_message(format!(
-            "Rules reloaded (version {new_version})"
-        ))
+        IpcResponse::success_with_message(format!("Rules reloaded (version {new_version})"))
     }
 
     /// Handle add SOCKS5 outbound command
@@ -1829,8 +2102,10 @@ impl IpcHandler {
             // geoip rules go to geoip_matcher (CIDR), etc.
             let result = match rule_type {
                 // Domain rules → domain_matcher (Aho-Corasick)
-                RuleType::Domain | RuleType::DomainSuffix |
-                RuleType::DomainKeyword | RuleType::DomainRegex => {
+                RuleType::Domain
+                | RuleType::DomainSuffix
+                | RuleType::DomainKeyword
+                | RuleType::DomainRegex => {
                     builder.add_domain_rule(rule_type, &rule_cfg.target, &rule_cfg.outbound)
                 }
                 // GeoIP/IpCidr rules → geoip_matcher (CIDR)
@@ -1838,9 +2113,7 @@ impl IpcHandler {
                     builder.add_geoip_rule(rule_type, &rule_cfg.target, &rule_cfg.outbound)
                 }
                 // Port rules → CompiledRuleSet
-                RuleType::Port => {
-                    builder.add_port_rule(&rule_cfg.target, &rule_cfg.outbound)
-                }
+                RuleType::Port => builder.add_port_rule(&rule_cfg.target, &rule_cfg.outbound),
                 // Protocol rules → CompiledRuleSet
                 RuleType::Protocol => {
                     builder.add_protocol_rule(&rule_cfg.target, &rule_cfg.outbound)
@@ -1917,10 +2190,7 @@ impl IpcHandler {
 
         // Validate outbound exists (check both managers + WG prefixes)
         if !self.is_valid_outbound_tag(&tag) {
-            return IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Outbound '{tag}' not found"),
-            );
+            return IpcResponse::error(ErrorCode::NotFound, format!("Outbound '{tag}' not found"));
         }
 
         // Load current routing config
@@ -2038,7 +2308,12 @@ impl IpcHandler {
             "Total number of connections accepted",
             "counter",
         );
-        write_metric_value(&mut output, "rust_router_connections_total", None, stats.total_accepted);
+        write_metric_value(
+            &mut output,
+            "rust_router_connections_total",
+            None,
+            stats.total_accepted,
+        );
 
         write_metric_header(
             &mut output,
@@ -2046,7 +2321,12 @@ impl IpcHandler {
             "Currently active connections",
             "gauge",
         );
-        write_metric_value(&mut output, "rust_router_connections_active", None, stats.active);
+        write_metric_value(
+            &mut output,
+            "rust_router_connections_active",
+            None,
+            stats.active,
+        );
 
         write_metric_header(
             &mut output,
@@ -2054,7 +2334,12 @@ impl IpcHandler {
             "Total connections completed successfully",
             "counter",
         );
-        write_metric_value(&mut output, "rust_router_connections_completed_total", None, stats.completed);
+        write_metric_value(
+            &mut output,
+            "rust_router_connections_completed_total",
+            None,
+            stats.completed,
+        );
 
         write_metric_header(
             &mut output,
@@ -2062,7 +2347,12 @@ impl IpcHandler {
             "Total connections that errored",
             "counter",
         );
-        write_metric_value(&mut output, "rust_router_connections_errored_total", None, stats.errored);
+        write_metric_value(
+            &mut output,
+            "rust_router_connections_errored_total",
+            None,
+            stats.errored,
+        );
 
         write_metric_header(
             &mut output,
@@ -2070,7 +2360,12 @@ impl IpcHandler {
             "Total bytes received (client to upstream)",
             "counter",
         );
-        write_metric_value(&mut output, "rust_router_bytes_rx_total", None, stats.bytes_rx);
+        write_metric_value(
+            &mut output,
+            "rust_router_bytes_rx_total",
+            None,
+            stats.bytes_rx,
+        );
 
         write_metric_header(
             &mut output,
@@ -2078,7 +2373,12 @@ impl IpcHandler {
             "Total bytes transmitted (upstream to client)",
             "counter",
         );
-        write_metric_value(&mut output, "rust_router_bytes_tx_total", None, stats.bytes_tx);
+        write_metric_value(
+            &mut output,
+            "rust_router_bytes_tx_total",
+            None,
+            stats.bytes_tx,
+        );
 
         // === Per-Outbound Metrics ===
         let outbounds = self.outbound_manager.all();
@@ -2233,7 +2533,12 @@ impl IpcHandler {
             "Number of port rules",
             "gauge",
         );
-        write_metric_value(&mut output, "rust_router_rules_port_count", None, port_rules);
+        write_metric_value(
+            &mut output,
+            "rust_router_rules_port_count",
+            None,
+            port_rules,
+        );
 
         write_metric_header(
             &mut output,
@@ -2241,7 +2546,12 @@ impl IpcHandler {
             "Number of protocol rules",
             "gauge",
         );
-        write_metric_value(&mut output, "rust_router_rules_protocol_count", None, protocol_rules);
+        write_metric_value(
+            &mut output,
+            "rust_router_rules_protocol_count",
+            None,
+            protocol_rules,
+        );
 
         write_metric_header(
             &mut output,
@@ -2266,7 +2576,8 @@ impl IpcHandler {
             &mut output,
             "rust_router_config_version",
             None,
-            self.config_version.load(std::sync::atomic::Ordering::Relaxed),
+            self.config_version
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
 
         // === SOCKS5 Connection Pool Metrics ===
@@ -2604,9 +2915,7 @@ impl IpcHandler {
     /// Note: TCP is now handled by IpStack bridge, so manual TCP stats are always 0.
     /// Use GetIpstackStats for TCP connection stats.
     fn handle_get_tcp_stats(&self) -> IpcResponse {
-        use crate::ingress::{
-            get_udp_session_count, get_proxy_udp_session_count,
-        };
+        use crate::ingress::{get_proxy_udp_session_count, get_udp_session_count};
 
         // TCP stats are now 0 - TCP is handled by IpStack bridge
         // Use GetIpstackStats command for TCP connection statistics
@@ -2644,10 +2953,7 @@ impl IpcHandler {
     /// Creates a new chain with the given configuration.
     async fn handle_create_chain(&self, tag: String, config: ChainConfig) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         // Ensure the config tag matches the command tag
@@ -2665,10 +2971,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to create chain '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -2678,10 +2981,7 @@ impl IpcHandler {
     /// Removes an existing chain.
     async fn handle_remove_chain(&self, tag: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         match chain_manager.remove_chain(tag).await {
@@ -2691,10 +2991,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to remove chain '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -2704,10 +3001,7 @@ impl IpcHandler {
     /// Activates a chain using Two-Phase Commit protocol.
     async fn handle_activate_chain(&self, tag: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         match chain_manager.activate_chain(tag).await {
@@ -2717,10 +3011,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to activate chain '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -2730,10 +3021,7 @@ impl IpcHandler {
     /// Deactivates an active chain.
     async fn handle_deactivate_chain(&self, tag: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         match chain_manager.deactivate_chain(tag).await {
@@ -2743,10 +3031,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to deactivate chain '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -2756,18 +3041,12 @@ impl IpcHandler {
     /// Returns status information for a specific chain.
     fn handle_get_chain_status(&self, tag: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         match chain_manager.get_chain_status(tag) {
             Some(status) => IpcResponse::ChainStatus(status),
-            None => IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Chain '{tag}' not found"),
-            ),
+            None => IpcResponse::error(ErrorCode::NotFound, format!("Chain '{tag}' not found")),
         }
     }
 
@@ -2788,10 +3067,7 @@ impl IpcHandler {
     /// Returns the local node's role in a specific chain.
     fn handle_get_chain_role(&self, chain_tag: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         if !chain_manager.chain_exists(chain_tag) {
@@ -2962,25 +3238,17 @@ impl IpcHandler {
         last_error: Option<String>,
     ) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         match chain_manager.update_chain_state(tag, state, last_error) {
             Ok(()) => {
                 debug!("Updated chain '{}' state to {:?}", tag, state);
-                IpcResponse::success_with_message(format!(
-                    "Chain '{tag}' state updated to {state}"
-                ))
+                IpcResponse::success_with_message(format!("Chain '{tag}' state updated to {state}"))
             }
             Err(e) => {
                 warn!("Failed to update chain '{}' state: {}", tag, e);
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -2997,20 +3265,14 @@ impl IpcHandler {
         allow_transitive: Option<bool>,
     ) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
         // Get current chain status to check state and merge with updates
         let current_status = match chain_manager.get_chain_status(&tag) {
             Some(status) => status,
             None => {
-                return IpcResponse::error(
-                    ErrorCode::NotFound,
-                    format!("Chain '{tag}' not found"),
-                );
+                return IpcResponse::error(ErrorCode::NotFound, format!("Chain '{tag}' not found"));
             }
         };
 
@@ -3018,7 +3280,10 @@ impl IpcHandler {
         if current_status.state != ChainState::Inactive {
             return IpcResponse::error(
                 ErrorCode::OperationFailed,
-                format!("Chain '{}' must be inactive to update (current state: {})", tag, current_status.state),
+                format!(
+                    "Chain '{}' must be inactive to update (current state: {})",
+                    tag, current_status.state
+                ),
             );
         }
 
@@ -3051,10 +3316,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to update chain '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -3081,7 +3343,10 @@ impl IpcHandler {
             });
         };
 
-        match chain_manager.handle_prepare_request(chain_tag, config, source_node).await {
+        match chain_manager
+            .handle_prepare_request(chain_tag, config, source_node)
+            .await
+        {
             Ok(()) => {
                 debug!(
                     "PREPARE succeeded for chain '{}' from node '{}'",
@@ -3111,19 +3376,15 @@ impl IpcHandler {
     ///
     /// Applies routing rules after all nodes have been prepared.
     /// Called by the coordinator to commit remote nodes.
-    async fn handle_commit_chain_route(
-        &self,
-        chain_tag: &str,
-        source_node: &str,
-    ) -> IpcResponse {
+    async fn handle_commit_chain_route(&self, chain_tag: &str, source_node: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
-        match chain_manager.handle_commit_request(chain_tag, source_node).await {
+        match chain_manager
+            .handle_commit_request(chain_tag, source_node)
+            .await
+        {
             Ok(()) => {
                 info!(
                     "COMMIT succeeded for chain '{}' from node '{}'",
@@ -3136,10 +3397,7 @@ impl IpcHandler {
                     "COMMIT failed for chain '{}' from node '{}': {}",
                     chain_tag, source_node, e
                 );
-                IpcResponse::error(
-                    Self::chain_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::chain_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -3148,19 +3406,15 @@ impl IpcHandler {
     ///
     /// Rolls back prepared state when 2PC fails.
     /// Called by the coordinator to abort remote nodes.
-    async fn handle_abort_chain_route(
-        &self,
-        chain_tag: &str,
-        source_node: &str,
-    ) -> IpcResponse {
+    async fn handle_abort_chain_route(&self, chain_tag: &str, source_node: &str) -> IpcResponse {
         let Some(chain_manager) = &self.chain_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Chain manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Chain manager not available");
         };
 
-        match chain_manager.handle_abort_request(chain_tag, source_node).await {
+        match chain_manager
+            .handle_abort_request(chain_tag, source_node)
+            .await
+        {
             Ok(()) => {
                 info!(
                     "ABORT handled for chain '{}' from node '{}'",
@@ -3204,9 +3458,7 @@ impl IpcHandler {
         // Convert IPC config to egress config
         let mut egress_config = crate::egress::config::WgEgressConfig::new(
             &tag,
-            crate::egress::config::EgressTunnelType::Custom {
-                name: tag.clone(),
-            },
+            crate::egress::config::EgressTunnelType::Custom { name: tag.clone() },
             config.private_key.clone(),
             config.peer_public_key.clone(),
             &config.peer_endpoint,
@@ -3233,10 +3485,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to create WireGuard tunnel '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::egress_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::egress_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -3256,7 +3505,8 @@ impl IpcHandler {
             );
         };
 
-        let drain_timeout = drain_timeout_secs.map(|s| std::time::Duration::from_secs(u64::from(s)));
+        let drain_timeout =
+            drain_timeout_secs.map(|s| std::time::Duration::from_secs(u64::from(s)));
 
         match egress_manager.remove_tunnel(tag, drain_timeout).await {
             Ok(()) => {
@@ -3265,10 +3515,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to remove WireGuard tunnel '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::egress_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::egress_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -3410,7 +3657,10 @@ impl IpcHandler {
                     error = %e,
                     "Failed to add ingress peer"
                 );
-                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to add peer: {e}"))
+                IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to add peer: {e}"),
+                )
             }
         }
     }
@@ -3437,7 +3687,10 @@ impl IpcHandler {
                     error = %e,
                     "Failed to remove ingress peer"
                 );
-                IpcResponse::error(ErrorCode::OperationFailed, format!("Failed to remove peer: {e}"))
+                IpcResponse::error(
+                    ErrorCode::OperationFailed,
+                    format!("Failed to remove peer: {e}"),
+                )
             }
         }
     }
@@ -3480,7 +3733,10 @@ impl IpcHandler {
             .wg_ingress_manager
             .as_ref()
             .map(|manager| manager.state().to_string());
-        let manager_stats = self.wg_ingress_manager.as_ref().map(|manager| manager.stats());
+        let manager_stats = self
+            .wg_ingress_manager
+            .as_ref()
+            .map(|manager| manager.stats());
         let forwarding_stats = if ingress_enabled {
             self.ingress_forwarding_stats
                 .as_ref()
@@ -3541,11 +3797,17 @@ impl IpcHandler {
         let algorithm = match config.algorithm {
             super::protocol::EcmpAlgorithm::RoundRobin => crate::ecmp::lb::LbAlgorithm::RoundRobin,
             super::protocol::EcmpAlgorithm::Random => crate::ecmp::lb::LbAlgorithm::Random,
-            super::protocol::EcmpAlgorithm::SourceHash => crate::ecmp::lb::LbAlgorithm::FiveTupleHash,
+            super::protocol::EcmpAlgorithm::SourceHash => {
+                crate::ecmp::lb::LbAlgorithm::FiveTupleHash
+            }
             super::protocol::EcmpAlgorithm::DestHash => crate::ecmp::lb::LbAlgorithm::DestHash,
-            super::protocol::EcmpAlgorithm::DestHashLeastLoad => crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad,
+            super::protocol::EcmpAlgorithm::DestHashLeastLoad => {
+                crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad
+            }
             super::protocol::EcmpAlgorithm::Weighted => crate::ecmp::lb::LbAlgorithm::Weighted,
-            super::protocol::EcmpAlgorithm::LeastConnections => crate::ecmp::lb::LbAlgorithm::LeastConnections,
+            super::protocol::EcmpAlgorithm::LeastConnections => {
+                crate::ecmp::lb::LbAlgorithm::LeastConnections
+            }
         };
 
         let internal_config = crate::ecmp::group::EcmpGroupConfig {
@@ -3565,10 +3827,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to create ECMP group '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::ecmp_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::ecmp_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -3591,10 +3850,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to remove ECMP group '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::ecmp_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::ecmp_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -3614,13 +3870,25 @@ impl IpcHandler {
             Some(group) => {
                 let config = group.config();
                 let algorithm = match config.algorithm {
-                    crate::ecmp::lb::LbAlgorithm::RoundRobin => super::protocol::EcmpAlgorithm::RoundRobin,
+                    crate::ecmp::lb::LbAlgorithm::RoundRobin => {
+                        super::protocol::EcmpAlgorithm::RoundRobin
+                    }
                     crate::ecmp::lb::LbAlgorithm::Random => super::protocol::EcmpAlgorithm::Random,
-                    crate::ecmp::lb::LbAlgorithm::FiveTupleHash => super::protocol::EcmpAlgorithm::SourceHash,
-                    crate::ecmp::lb::LbAlgorithm::DestHash => super::protocol::EcmpAlgorithm::DestHash,
-                    crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => super::protocol::EcmpAlgorithm::DestHashLeastLoad,
-                    crate::ecmp::lb::LbAlgorithm::Weighted => super::protocol::EcmpAlgorithm::Weighted,
-                    crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
+                    crate::ecmp::lb::LbAlgorithm::FiveTupleHash => {
+                        super::protocol::EcmpAlgorithm::SourceHash
+                    }
+                    crate::ecmp::lb::LbAlgorithm::DestHash => {
+                        super::protocol::EcmpAlgorithm::DestHash
+                    }
+                    crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => {
+                        super::protocol::EcmpAlgorithm::DestHashLeastLoad
+                    }
+                    crate::ecmp::lb::LbAlgorithm::Weighted => {
+                        super::protocol::EcmpAlgorithm::Weighted
+                    }
+                    crate::ecmp::lb::LbAlgorithm::LeastConnections => {
+                        super::protocol::EcmpAlgorithm::LeastConnections
+                    }
                 };
 
                 // Use runtime member_stats() instead of static config.members
@@ -3655,10 +3923,9 @@ impl IpcHandler {
 
                 IpcResponse::EcmpGroupStatus(status)
             }
-            None => IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("ECMP group '{tag}' not found"),
-            ),
+            None => {
+                IpcResponse::error(ErrorCode::NotFound, format!("ECMP group '{tag}' not found"))
+            }
         }
     }
 
@@ -3677,13 +3944,27 @@ impl IpcHandler {
                 ecmp_manager.get_group(tag).map(|group| {
                     let config = group.config();
                     let algorithm = match config.algorithm {
-                        crate::ecmp::lb::LbAlgorithm::RoundRobin => super::protocol::EcmpAlgorithm::RoundRobin,
-                        crate::ecmp::lb::LbAlgorithm::Random => super::protocol::EcmpAlgorithm::Random,
-                        crate::ecmp::lb::LbAlgorithm::FiveTupleHash => super::protocol::EcmpAlgorithm::SourceHash,
-                        crate::ecmp::lb::LbAlgorithm::DestHash => super::protocol::EcmpAlgorithm::DestHash,
-                        crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => super::protocol::EcmpAlgorithm::DestHashLeastLoad,
-                        crate::ecmp::lb::LbAlgorithm::Weighted => super::protocol::EcmpAlgorithm::Weighted,
-                        crate::ecmp::lb::LbAlgorithm::LeastConnections => super::protocol::EcmpAlgorithm::LeastConnections,
+                        crate::ecmp::lb::LbAlgorithm::RoundRobin => {
+                            super::protocol::EcmpAlgorithm::RoundRobin
+                        }
+                        crate::ecmp::lb::LbAlgorithm::Random => {
+                            super::protocol::EcmpAlgorithm::Random
+                        }
+                        crate::ecmp::lb::LbAlgorithm::FiveTupleHash => {
+                            super::protocol::EcmpAlgorithm::SourceHash
+                        }
+                        crate::ecmp::lb::LbAlgorithm::DestHash => {
+                            super::protocol::EcmpAlgorithm::DestHash
+                        }
+                        crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => {
+                            super::protocol::EcmpAlgorithm::DestHashLeastLoad
+                        }
+                        crate::ecmp::lb::LbAlgorithm::Weighted => {
+                            super::protocol::EcmpAlgorithm::Weighted
+                        }
+                        crate::ecmp::lb::LbAlgorithm::LeastConnections => {
+                            super::protocol::EcmpAlgorithm::LeastConnections
+                        }
                     };
 
                     // Use runtime member_stats() instead of static config.members
@@ -3756,22 +4037,23 @@ impl IpcHandler {
         // Remove all current members
         for member_tag in current_members {
             if let Err(e) = group.remove_member(&member_tag) {
-                warn!("Failed to remove member '{}' from group '{}': {}", member_tag, tag, e);
+                warn!(
+                    "Failed to remove member '{}' from group '{}': {}",
+                    member_tag, tag, e
+                );
             }
         }
 
         // Add new members
         for member in members {
-            let ecmp_member = crate::ecmp::group::EcmpMember::with_weight(
-                member.outbound.clone(),
-                member.weight,
-            );
+            let ecmp_member =
+                crate::ecmp::group::EcmpMember::with_weight(member.outbound.clone(), member.weight);
             if let Err(e) = group.add_member(ecmp_member) {
-                warn!("Failed to add member '{}' to group '{}': {}", member.outbound, tag, e);
-                return IpcResponse::error(
-                    Self::ecmp_error_to_code(&e),
-                    e.to_string(),
+                warn!(
+                    "Failed to add member '{}' to group '{}': {}",
+                    member.outbound, tag, e
                 );
+                return IpcResponse::error(Self::ecmp_error_to_code(&e), e.to_string());
             }
         }
 
@@ -3796,10 +4078,7 @@ impl IpcHandler {
         tunnel_type: super::protocol::TunnelType,
     ) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         let config = PairRequestConfig {
@@ -3851,10 +4130,7 @@ impl IpcHandler {
         local_api_port: u16,
     ) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         let local_config = PairRequestConfig {
@@ -3903,10 +4179,7 @@ impl IpcHandler {
     /// Completes the pairing handshake with a response code.
     async fn handle_complete_handshake(&self, code: String) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         match peer_manager.complete_handshake(&code).await {
@@ -3946,10 +4219,7 @@ impl IpcHandler {
     /// - Synchronizing peers between nodes
     async fn handle_add_peer(&self, config: PeerConfig) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         let tag = config.tag.clone();
@@ -3973,10 +4243,7 @@ impl IpcHandler {
     /// `peer-{tag}` naming convention.
     async fn handle_connect_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         // Use PeerManager.connect() for both WireGuard and Xray peers
@@ -4011,10 +4278,7 @@ impl IpcHandler {
     /// This properly cleans up the WireGuard tunnel and releases the UDP socket.
     async fn handle_disconnect_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         // Use PeerManager's disconnect() for all peer types
@@ -4026,10 +4290,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to disconnect from peer '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::peer_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::peer_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -4039,18 +4300,12 @@ impl IpcHandler {
     /// Returns status information for a specific peer.
     fn handle_get_peer_status(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         match peer_manager.get_peer_status(tag) {
             Some(status) => IpcResponse::PeerStatus(status),
-            None => IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Peer '{tag}' not found"),
-            ),
+            None => IpcResponse::error(ErrorCode::NotFound, format!("Peer '{tag}' not found")),
         }
     }
 
@@ -4059,10 +4314,7 @@ impl IpcHandler {
     /// Returns health information for a peer's tunnel.
     fn handle_get_peer_tunnel_health(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         // For now, return the peer status which includes health-related fields
@@ -4072,10 +4324,7 @@ impl IpcHandler {
                 // Return peer status - includes last_handshake and other health indicators
                 IpcResponse::PeerStatus(status)
             }
-            None => IpcResponse::error(
-                ErrorCode::NotFound,
-                format!("Peer '{tag}' not found"),
-            ),
+            None => IpcResponse::error(ErrorCode::NotFound, format!("Peer '{tag}' not found")),
         }
     }
 
@@ -4098,10 +4347,7 @@ impl IpcHandler {
     /// Also removes the egress tunnel to release bound UDP ports.
     async fn handle_remove_peer(&self, tag: &str) -> IpcResponse {
         let Some(peer_manager) = &self.peer_manager else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "Peer manager not available",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "Peer manager not available");
         };
 
         // Get peer config to check tunnel type before removal
@@ -4113,10 +4359,16 @@ impl IpcHandler {
                 if let Some(wg_egress_manager) = &self.wg_egress_manager {
                     let peer_tunnel_tag = format!("peer-{}", tag);
                     if wg_egress_manager.has_tunnel(&peer_tunnel_tag) {
-                        if let Err(e) = wg_egress_manager.remove_tunnel(&peer_tunnel_tag, None).await {
+                        if let Err(e) = wg_egress_manager
+                            .remove_tunnel(&peer_tunnel_tag, None)
+                            .await
+                        {
                             warn!("Failed to remove peer tunnel '{}': {}", peer_tunnel_tag, e);
                         } else {
-                            info!("Removed peer tunnel '{}' (releasing UDP port)", peer_tunnel_tag);
+                            info!(
+                                "Removed peer tunnel '{}' (releasing UDP port)",
+                                peer_tunnel_tag
+                            );
                         }
                     }
                 }
@@ -4130,10 +4382,7 @@ impl IpcHandler {
             }
             Err(e) => {
                 warn!("Failed to remove peer '{}': {}", tag, e);
-                IpcResponse::error(
-                    Self::peer_error_to_code(&e),
-                    e.to_string(),
-                )
+                IpcResponse::error(Self::peer_error_to_code(&e), e.to_string())
             }
         }
     }
@@ -4179,7 +4428,9 @@ impl IpcHandler {
         use crate::peer::manager::PeerError;
         match err {
             PeerError::NotFound(_) | PeerError::PendingRequestNotFound(_) => ErrorCode::NotFound,
-            PeerError::AlreadyExists(_) | PeerError::AlreadyConnected(_) => ErrorCode::AlreadyExists,
+            PeerError::AlreadyExists(_) | PeerError::AlreadyConnected(_) => {
+                ErrorCode::AlreadyExists
+            }
             PeerError::NotConnected(_) | PeerError::NotConfigured(_) => ErrorCode::OperationFailed,
             PeerError::Validation(_) | PeerError::PairingMismatch { .. } => {
                 ErrorCode::InvalidParameters
@@ -4241,10 +4492,7 @@ impl IpcHandler {
     /// Returns comprehensive DNS statistics including cache, blocking, and upstream metrics.
     fn handle_get_dns_stats(&self) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         let cache_stats = dns_engine.cache().stats_snapshot();
@@ -4276,10 +4524,7 @@ impl IpcHandler {
     /// Returns detailed cache statistics.
     fn handle_get_dns_cache_stats(&self) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         let stats = dns_engine.cache().stats_snapshot();
@@ -4312,15 +4557,15 @@ impl IpcHandler {
     /// Flushes cache entries matching the optional pattern.
     fn handle_flush_dns_cache(&self, pattern: Option<String>) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         let flushed = if let Some(p) = pattern {
             let count = dns_engine.cache().flush(Some(&p));
-            info!("Flushed {} DNS cache entries matching pattern: {}", count, p);
+            info!(
+                "Flushed {} DNS cache entries matching pattern: {}",
+                count, p
+            );
             format!("Flushed {count} entries matching '{p}'")
         } else {
             let count = dns_engine.cache().flush(None);
@@ -4336,10 +4581,7 @@ impl IpcHandler {
     /// Returns DNS blocking/filtering statistics.
     fn handle_get_dns_block_stats(&self) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         let stats = dns_engine.block_filter().stats();
@@ -4372,17 +4614,18 @@ impl IpcHandler {
     /// Reads from /etc/sing-box/rulesets/__adblock_combined__.json by default.
     fn handle_reload_dns_blocklist(&self) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         // Path to the combined adblock ruleset file (generated by api_server)
-        let blocklist_path = std::path::Path::new("/etc/sing-box/rulesets/__adblock_combined__.json");
-        
+        let blocklist_path =
+            std::path::Path::new("/etc/sing-box/rulesets/__adblock_combined__.json");
+
         if !blocklist_path.exists() {
-            info!("DNS blocklist file not found: {:?}, clearing blocklist", blocklist_path);
+            info!(
+                "DNS blocklist file not found: {:?}, clearing blocklist",
+                blocklist_path
+            );
             // Clear the blocklist if file doesn't exist
             dns_engine.block_filter().clear();
             return IpcResponse::success_with_message("Blocklist cleared (no file found)");
@@ -4412,7 +4655,7 @@ impl IpcHandler {
 
         // Extract domain_suffix from rules array
         let mut domains: Vec<String> = Vec::new();
-        
+
         if let Some(rules) = json_value.get("rules").and_then(|r| r.as_array()) {
             for rule in rules {
                 // Handle domain_suffix
@@ -4446,12 +4689,10 @@ impl IpcHandler {
                     loaded
                 ))
             }
-            Err(e) => {
-                IpcResponse::error(
-                    ErrorCode::InternalError,
-                    format!("Failed to load blocklist: {e}"),
-                )
-            }
+            Err(e) => IpcResponse::error(
+                ErrorCode::InternalError,
+                format!("Failed to load blocklist: {e}"),
+            ),
         }
     }
 
@@ -4464,10 +4705,7 @@ impl IpcHandler {
         config: super::protocol::DnsUpstreamConfig,
     ) -> IpcResponse {
         let Some(_dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         // Validate protocol
@@ -4476,7 +4714,10 @@ impl IpcHandler {
             _ => {
                 return IpcResponse::error(
                     ErrorCode::InvalidParameters,
-                    format!("Invalid protocol '{}': must be udp, tcp, doh, or dot", config.protocol),
+                    format!(
+                        "Invalid protocol '{}': must be udp, tcp, doh, or dot",
+                        config.protocol
+                    ),
                 );
             }
         };
@@ -4503,10 +4744,7 @@ impl IpcHandler {
     /// Removes an upstream DNS server by tag.
     async fn handle_remove_dns_upstream(&self, tag: &str) -> IpcResponse {
         let Some(_dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         info!("Remove upstream request: tag={}", tag);
@@ -4523,10 +4761,7 @@ impl IpcHandler {
     /// Returns status information for upstream servers.
     fn handle_get_dns_upstream_status(&self, tag: Option<String>) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         let upstream_pool = dns_engine.upstream_pool();
@@ -4542,7 +4777,7 @@ impl IpcHandler {
                 address: u.address,
                 protocol: u.protocol.to_string(),
                 healthy: u.healthy,
-                total_queries: 0,     // Pool stats are aggregate, not per-upstream
+                total_queries: 0, // Pool stats are aggregate, not per-upstream
                 failed_queries: 0,
                 avg_latency_us: 0,
                 last_success: None,
@@ -4572,10 +4807,7 @@ impl IpcHandler {
         upstream_tag: String,
     ) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         // Parse match type
@@ -4617,10 +4849,7 @@ impl IpcHandler {
     /// Removes a DNS routing rule by pattern.
     fn handle_remove_dns_route(&self, pattern: &str) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         match dns_engine.router().remove_route(pattern) {
@@ -4629,10 +4858,7 @@ impl IpcHandler {
                     info!("Removed DNS route: {}", pattern);
                     IpcResponse::success_with_message(format!("Route '{pattern}' removed"))
                 } else {
-                    IpcResponse::error(
-                        ErrorCode::NotFound,
-                        format!("Route '{pattern}' not found"),
-                    )
+                    IpcResponse::error(ErrorCode::NotFound, format!("Route '{pattern}' not found"))
                 }
             }
             Err(e) => {
@@ -4647,10 +4873,7 @@ impl IpcHandler {
     /// Returns recent DNS query log entries with pagination.
     fn handle_get_dns_query_log(&self, limit: usize, offset: usize) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         // Note: QueryLogger is write-only by design (batch writes to file)
@@ -4677,10 +4900,7 @@ impl IpcHandler {
         upstream: Option<String>,
     ) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         use hickory_proto::op::{Message, Query};
@@ -4742,7 +4962,11 @@ impl IpcHandler {
                 let answers: Vec<String> = response
                     .answers()
                     .iter()
-                    .map(|r| r.data().map(std::string::ToString::to_string).unwrap_or_default())
+                    .map(|r| {
+                        r.data()
+                            .map(std::string::ToString::to_string)
+                            .unwrap_or_default()
+                    })
                     .collect();
 
                 IpcResponse::DnsQueryResult(DnsQueryResponse {
@@ -4779,10 +5003,7 @@ impl IpcHandler {
     /// Returns the current DNS engine configuration.
     fn handle_get_dns_config(&self) -> IpcResponse {
         let Some(dns_engine) = &self.dns_engine else {
-            return IpcResponse::error(
-                ErrorCode::OperationFailed,
-                "DNS engine not enabled",
-            );
+            return IpcResponse::error(ErrorCode::OperationFailed, "DNS engine not enabled");
         };
 
         let config = dns_engine.config();
@@ -4812,14 +5033,23 @@ impl IpcHandler {
         available_features.insert("flush_dns_cache".to_string(), "available".to_string());
         available_features.insert("get_dns_block_stats".to_string(), "available".to_string());
         available_features.insert("reload_dns_blocklist".to_string(), "available".to_string());
-        available_features.insert("get_dns_upstream_status".to_string(), "available".to_string());
+        available_features.insert(
+            "get_dns_upstream_status".to_string(),
+            "available".to_string(),
+        );
         available_features.insert("add_dns_route".to_string(), "available".to_string());
         available_features.insert("remove_dns_route".to_string(), "available".to_string());
         available_features.insert("dns_query".to_string(), "available".to_string());
         available_features.insert("get_dns_config".to_string(), "available".to_string());
         // Partially/not implemented features
-        available_features.insert("add_dns_upstream".to_string(), "not_implemented".to_string());
-        available_features.insert("remove_dns_upstream".to_string(), "not_implemented".to_string());
+        available_features.insert(
+            "add_dns_upstream".to_string(),
+            "not_implemented".to_string(),
+        );
+        available_features.insert(
+            "remove_dns_upstream".to_string(),
+            "not_implemented".to_string(),
+        );
         available_features.insert("get_dns_query_log".to_string(), "partial".to_string());
 
         IpcResponse::DnsConfig(DnsConfigResponse {
@@ -4850,8 +5080,8 @@ impl IpcHandler {
         name: Option<String>,
         warp_plus_license: Option<String>,
     ) -> IpcResponse {
-        use crate::warp::register::register_device;
         use super::protocol::WarpRegistrationResponse;
+        use crate::warp::register::register_device;
 
         info!("Registering WARP device: tag={}, name={:?}", tag, name);
 
@@ -4876,9 +5106,9 @@ impl IpcHandler {
 
                 // Provide appropriate error code based on error type
                 let error_code = if e.is_recoverable() {
-                    ErrorCode::OperationFailed  // Recoverable errors (rate limit, network)
+                    ErrorCode::OperationFailed // Recoverable errors (rate limit, network)
                 } else {
-                    ErrorCode::InvalidParameters  // Invalid input
+                    ErrorCode::InvalidParameters // Invalid input
                 };
 
                 IpcResponse::error(error_code, format!("WARP registration failed: {}", e))
@@ -4897,7 +5127,10 @@ impl IpcHandler {
     ) -> IpcResponse {
         use super::protocol::SpeedTestResponse;
 
-        info!("Starting speed test for '{}' (size={}B, timeout={}s)", tag, size_bytes, timeout_secs);
+        info!(
+            "Starting speed test for '{}' (size={}B, timeout={}s)",
+            tag, size_bytes, timeout_secs
+        );
         let start = Instant::now();
         let test_url = format!("https://speed.cloudflare.com/__down?bytes={}", size_bytes);
 
@@ -4931,7 +5164,8 @@ impl IpcHandler {
         // For WireGuard tunnels, we need to use the tunnel's socket
         let result = if tunnel_found {
             if let Some(ref wg_manager) = self.wg_egress_manager {
-                self.speed_test_via_wg_tunnel(wg_manager, &tag, &test_url, timeout_secs).await
+                self.speed_test_via_wg_tunnel(wg_manager, &tag, &test_url, timeout_secs)
+                    .await
             } else {
                 Err("WireGuard manager not available".to_string())
             }
@@ -4947,9 +5181,18 @@ impl IpcHandler {
                         let member_tag = &members[0];
                         if let Some(ref wg_manager) = self.wg_egress_manager {
                             if wg_manager.has_tunnel(member_tag) {
-                                self.speed_test_via_wg_tunnel(wg_manager, member_tag, &test_url, timeout_secs).await
+                                self.speed_test_via_wg_tunnel(
+                                    wg_manager,
+                                    member_tag,
+                                    &test_url,
+                                    timeout_secs,
+                                )
+                                .await
                             } else {
-                                Err(format!("ECMP member '{}' is not a WireGuard tunnel", member_tag))
+                                Err(format!(
+                                    "ECMP member '{}' is not a WireGuard tunnel",
+                                    member_tag
+                                ))
                             }
                         } else {
                             Err("WireGuard manager not available".to_string())
@@ -4965,7 +5208,8 @@ impl IpcHandler {
             // Regular outbound (VLESS, Shadowsocks, Direct, SOCKS5, etc.)
             // Use TCP-based speed test via Outbound::connect()
             if let Some(outbound) = self.outbound_manager.get(&tag) {
-                self.speed_test_via_outbound(outbound, size_bytes, timeout_secs).await
+                self.speed_test_via_outbound(outbound, size_bytes, timeout_secs)
+                    .await
             } else {
                 Err(format!("Outbound '{}' not found", tag))
             }
@@ -4982,8 +5226,10 @@ impl IpcHandler {
                     0.0
                 };
 
-                info!("Speed test completed for '{}': {:.2} Mbps ({} bytes in {}ms)", 
-                    tag, speed_mbps, bytes, duration_ms);
+                info!(
+                    "Speed test completed for '{}': {:.2} Mbps ({} bytes in {}ms)",
+                    tag, speed_mbps, bytes, duration_ms
+                );
 
                 IpcResponse::SpeedTestResult(SpeedTestResponse {
                     success: true,
@@ -5017,20 +5263,18 @@ impl IpcHandler {
         url: &str,
         timeout_secs: u64,
     ) -> Result<u64, String> {
+        use http_body_util::BodyExt;
         use std::time::Duration;
         use tokio::time::timeout;
-        use http_body_util::BodyExt;
 
         // Install the default CryptoProvider (ring) for rustls 0.23+
         // This is idempotent - safe to call multiple times
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Parse URL
-        let uri: hyper::Uri = url.parse()
-            .map_err(|e| format!("Invalid URL: {}", e))?;
+        let uri: hyper::Uri = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
 
-        let host = uri.host()
-            .ok_or_else(|| "URL missing host".to_string())?;
+        let host = uri.host().ok_or_else(|| "URL missing host".to_string())?;
         let port = uri.port_u16().unwrap_or(443);
         let addr = format!("{}:{}", host, port);
 
@@ -5040,7 +5284,8 @@ impl IpcHandler {
             .map_err(|e| format!("DNS lookup failed: {}", e))?
             .collect();
 
-        let socket_addr = socket_addrs.first()
+        let socket_addr = socket_addrs
+            .first()
             .ok_or_else(|| "DNS lookup returned no addresses".to_string())?;
 
         // Connect with TLS
@@ -5057,7 +5302,8 @@ impl IpcHandler {
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| format!("Invalid server name: {}", e))?;
 
-        let tls_stream = connector.connect(server_name, tcp_stream)
+        let tls_stream = connector
+            .connect(server_name, tcp_stream)
             .await
             .map_err(|e| format!("TLS handshake failed: {}", e))?;
 
@@ -5075,9 +5321,7 @@ impl IpcHandler {
         });
 
         // Build request
-        let path = uri.path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
+        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let req = hyper::Request::builder()
             .method("GET")
@@ -5089,13 +5333,10 @@ impl IpcHandler {
             .map_err(|e| format!("Failed to build request: {}", e))?;
 
         // Send request with timeout
-        let response = timeout(
-            Duration::from_secs(timeout_secs),
-            sender.send_request(req)
-        )
-        .await
-        .map_err(|_| "Request timed out".to_string())?
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        let response = timeout(Duration::from_secs(timeout_secs), sender.send_request(req))
+            .await
+            .map_err(|_| "Request timed out".to_string())?
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
 
         if !response.status().is_success() {
             return Err(format!("HTTP error: {}", response.status()));
@@ -5103,7 +5344,8 @@ impl IpcHandler {
 
         // Read response body and count bytes
         let body = response.into_body();
-        let bytes = body.collect()
+        let bytes = body
+            .collect()
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?
             .to_bytes();
@@ -5153,10 +5395,10 @@ impl IpcHandler {
         size_bytes: u64,
         timeout_secs: u64,
     ) -> Result<u64, String> {
-        use std::time::Duration;
-        use tokio::time::timeout;
         use http_body_util::BodyExt;
+        use std::time::Duration;
         use tokio::net::lookup_host;
+        use tokio::time::timeout;
 
         let host = "speed.cloudflare.com";
         let port = 443;
@@ -5165,17 +5407,20 @@ impl IpcHandler {
         let target_addr = lookup_host(format!("{}:{}", host, port))
             .await
             .map_err(|e| format!("DNS lookup failed for {}: {}", host, e))?
-            .find(|addr| addr.is_ipv4())  // Prefer IPv4
+            .find(|addr| addr.is_ipv4()) // Prefer IPv4
             .ok_or_else(|| format!("No IPv4 address found for {}", host))?;
 
         let tag = outbound.tag().to_string();
-        info!("Speed test via outbound '{}' starting (size={}B, target={})", tag, size_bytes, target_addr);
+        info!(
+            "Speed test via outbound '{}' starting (size={}B, target={})",
+            tag, size_bytes, target_addr
+        );
 
         // Connect via outbound with timeout
         let connect_timeout = Duration::from_secs(10.min(timeout_secs));
         let connection = timeout(
             connect_timeout,
-            outbound.connect(target_addr, connect_timeout)
+            outbound.connect(target_addr, connect_timeout),
         )
         .await
         .map_err(|_| format!("Connection to {} timed out", host))?
@@ -5193,7 +5438,8 @@ impl IpcHandler {
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| format!("Invalid server name: {}", e))?;
 
-        let tls_stream = connector.connect(server_name, stream)
+        let tls_stream = connector
+            .connect(server_name, stream)
             .await
             .map_err(|e| format!("TLS handshake failed: {}", e))?;
 
@@ -5224,13 +5470,10 @@ impl IpcHandler {
             .map_err(|e| format!("Failed to build request: {}", e))?;
 
         // Send request with timeout
-        let response = timeout(
-            Duration::from_secs(timeout_secs),
-            sender.send_request(req)
-        )
-        .await
-        .map_err(|_| "Request timed out".to_string())?
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        let response = timeout(Duration::from_secs(timeout_secs), sender.send_request(req))
+            .await
+            .map_err(|_| "Request timed out".to_string())?
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
 
         if !response.status().is_success() {
             return Err(format!("HTTP error: {}", response.status()));
@@ -5238,12 +5481,17 @@ impl IpcHandler {
 
         // Read response body and count bytes
         let body = response.into_body();
-        let bytes = body.collect()
+        let bytes = body
+            .collect()
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?
             .to_bytes();
 
-        info!("Speed test via outbound '{}' downloaded {} bytes", tag, bytes.len());
+        info!(
+            "Speed test via outbound '{}' downloaded {} bytes",
+            tag,
+            bytes.len()
+        );
         Ok(bytes.len() as u64)
     }
 
@@ -5267,7 +5515,8 @@ impl IpcHandler {
 
     /// Validate HTTP method (allow-list)
     fn validate_http_method(method: &str) -> Result<(), String> {
-        const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+        const ALLOWED_METHODS: &[&str] =
+            &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
         let upper = method.to_uppercase();
         if ALLOWED_METHODS.contains(&upper.as_str()) {
             Ok(())
@@ -5318,8 +5567,11 @@ impl IpcHandler {
     fn validate_path_allowlist(path: &str) -> Result<(), String> {
         // Extract base path (before query string)
         let base_path = path.split('?').next().unwrap_or(path);
-        
-        if Self::ALLOWED_PEER_API_PATHS.iter().any(|&allowed| base_path == allowed) {
+
+        if Self::ALLOWED_PEER_API_PATHS
+            .iter()
+            .any(|&allowed| base_path == allowed)
+        {
             Ok(())
         } else {
             Err(format!(
@@ -5342,7 +5594,7 @@ impl IpcHandler {
             }
             return Err(format!("Invalid IPv6 endpoint format: {}", endpoint));
         }
-        
+
         // Handle IPv4 or hostname: host:port
         // Find the last colon (for port), but be careful with IPv6 without brackets
         if let Some(colon_pos) = endpoint.rfind(':') {
@@ -5358,7 +5610,7 @@ impl IpcHandler {
             }
             return Ok(before_colon.to_string());
         }
-        
+
         // No port specified, return the whole string as host
         Ok(endpoint.to_string())
     }
@@ -5476,18 +5728,21 @@ impl IpcHandler {
             // - tunnel type is "wireguard"
             // - we have both local and remote tunnel IPs
             // - peer manager is available (needed to get the tunnel)
-            let (use_wg, wg_local, wg_remote) = if ttype == "wireguard" && tunnel_ip.is_some() && tunnel_local_ip.is_some() {
-                // Parse the IPs
-                let remote: Option<std::net::Ipv4Addr> = tunnel_ip.as_ref().and_then(|s| s.parse().ok());
-                let local: Option<std::net::Ipv4Addr> = tunnel_local_ip.as_ref().and_then(|s| s.parse().ok());
-                if let (Some(l), Some(r)) = (local, remote) {
-                    (true, Some(l), Some(r))
+            let (use_wg, wg_local, wg_remote) =
+                if ttype == "wireguard" && tunnel_ip.is_some() && tunnel_local_ip.is_some() {
+                    // Parse the IPs
+                    let remote: Option<std::net::Ipv4Addr> =
+                        tunnel_ip.as_ref().and_then(|s| s.parse().ok());
+                    let local: Option<std::net::Ipv4Addr> =
+                        tunnel_local_ip.as_ref().and_then(|s| s.parse().ok());
+                    if let (Some(l), Some(r)) = (local, remote) {
+                        (true, Some(l), Some(r))
+                    } else {
+                        (false, None, None)
+                    }
                 } else {
                     (false, None, None)
-                }
-            } else {
-                (false, None, None)
-            };
+                };
 
             debug!(
                 peer = %peer_tag,
@@ -5512,7 +5767,9 @@ impl IpcHandler {
                     success: false,
                     status_code: 0,
                     body: String::new(),
-                    error: Some("No inline config provided and peer manager not available".to_string()),
+                    error: Some(
+                        "No inline config provided and peer manager not available".to_string(),
+                    ),
                 });
             };
 
@@ -5521,7 +5778,10 @@ impl IpcHandler {
                     success: false,
                     status_code: 0,
                     body: String::new(),
-                    error: Some(format!("Peer '{}' not found in PeerManager and no inline config provided", peer_tag)),
+                    error: Some(format!(
+                        "Peer '{}' not found in PeerManager and no inline config provided",
+                        peer_tag
+                    )),
                 });
             };
 
@@ -5557,19 +5817,39 @@ impl IpcHandler {
                 TunnelType::WireGuard => {
                     // For WireGuard peers, prefer tunnel IP when available
                     // and route through the WireGuard tunnel using smoltcp
-                    let (url, use_wg, wg_local, wg_remote) = if let (Some(ref local_ip), Some(ref remote_ip)) =
-                        (&config.tunnel_local_ip, &config.tunnel_remote_ip)
-                    {
-                        // Parse IPs for WireGuard tunnel routing
-                        let local: Option<std::net::Ipv4Addr> = local_ip.parse().ok();
-                        let remote: Option<std::net::Ipv4Addr> = remote_ip.parse().ok();
+                    let (url, use_wg, wg_local, wg_remote) =
+                        if let (Some(ref local_ip), Some(ref remote_ip)) =
+                            (&config.tunnel_local_ip, &config.tunnel_remote_ip)
+                        {
+                            // Parse IPs for WireGuard tunnel routing
+                            let local: Option<std::net::Ipv4Addr> = local_ip.parse().ok();
+                            let remote: Option<std::net::Ipv4Addr> = remote_ip.parse().ok();
 
-                        if let (Some(l), Some(r)) = (local, remote) {
-                            // Use tunnel IPs and route through WireGuard
-                            let url = format!("http://{}:{}{}", remote_ip, config.api_port, path);
-                            (url, true, Some(l), Some(r))
+                            if let (Some(l), Some(r)) = (local, remote) {
+                                // Use tunnel IPs and route through WireGuard
+                                let url =
+                                    format!("http://{}:{}{}", remote_ip, config.api_port, path);
+                                (url, true, Some(l), Some(r))
+                            } else {
+                                // IP parsing failed, fallback to public endpoint
+                                let host = match Self::parse_endpoint_host(&config.endpoint) {
+                                    Ok(h) => h,
+                                    Err(e) => {
+                                        return IpcResponse::PeerRequestResult(
+                                            PeerRequestResponse {
+                                                success: false,
+                                                status_code: 0,
+                                                body: String::new(),
+                                                error: Some(e),
+                                            },
+                                        );
+                                    }
+                                };
+                                let url = format!("http://{}:{}{}", host, config.api_port, path);
+                                (url, false, None, None)
+                            }
                         } else {
-                            // IP parsing failed, fallback to public endpoint
+                            // No tunnel IPs configured, fallback to public endpoint
                             let host = match Self::parse_endpoint_host(&config.endpoint) {
                                 Ok(h) => h,
                                 Err(e) => {
@@ -5583,23 +5863,7 @@ impl IpcHandler {
                             };
                             let url = format!("http://{}:{}{}", host, config.api_port, path);
                             (url, false, None, None)
-                        }
-                    } else {
-                        // No tunnel IPs configured, fallback to public endpoint
-                        let host = match Self::parse_endpoint_host(&config.endpoint) {
-                            Ok(h) => h,
-                            Err(e) => {
-                                return IpcResponse::PeerRequestResult(PeerRequestResponse {
-                                    success: false,
-                                    status_code: 0,
-                                    body: String::new(),
-                                    error: Some(e),
-                                });
-                            }
                         };
-                        let url = format!("http://{}:{}{}", host, config.api_port, path);
-                        (url, false, None, None)
-                    };
 
                     RoutingDecision {
                         target_url: url,
@@ -5724,9 +5988,12 @@ impl IpcHandler {
         use tokio::time::timeout as tokio_timeout;
 
         // Get the SOCKS5 outbound for this peer
-        let outbound = peer_manager
-            .get_xray_outbound(peer_tag)
-            .ok_or_else(|| format!("Xray outbound for peer '{}' not found or not connected", peer_tag))?;
+        let outbound = peer_manager.get_xray_outbound(peer_tag).ok_or_else(|| {
+            format!(
+                "Xray outbound for peer '{}' not found or not connected",
+                peer_tag
+            )
+        })?;
 
         // Parse the URL to get host, port, and path
         let uri: hyper::Uri = url
@@ -5885,8 +6152,11 @@ impl IpcHandler {
         if let Some(headers) = custom_headers {
             for (name, value) in headers {
                 // Validate header name and value to prevent injection
-                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    && !value.contains('\r') && !value.contains('\n')
+                if name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    && !value.contains('\r')
+                    && !value.contains('\n')
                 {
                     request.push_str(&format!("{}: {}\r\n", name, value));
                 }
@@ -6033,10 +6303,7 @@ impl IpcHandler {
         debug!(source_ip = %tunnel_local_ip, "Added X-Tunnel-Source-IP header");
 
         // Auto-inject tunnel peer tag header for authentication
-        request_headers.insert(
-            "X-Tunnel-Peer-Tag".to_string(),
-            peer_tag.to_string(),
-        );
+        request_headers.insert("X-Tunnel-Peer-Tag".to_string(), peer_tag.to_string());
         debug!(peer_tag = %peer_tag, "Added X-Tunnel-Peer-Tag header");
 
         // Create oneshot channel for the response
@@ -6054,17 +6321,24 @@ impl IpcHandler {
         };
 
         // Send the request through the unified pump
-        request_sender
-            .send(outbound_request)
-            .await
-            .map_err(|_| format!("Failed to send request to TCP proxy for peer '{}'", peer_tag))?;
+        request_sender.send(outbound_request).await.map_err(|_| {
+            format!(
+                "Failed to send request to TCP proxy for peer '{}'",
+                peer_tag
+            )
+        })?;
 
         debug!(peer = %peer_tag, "Request sent to unified pump, waiting for response");
 
         // Wait for response with timeout
         let response = tokio::time::timeout(timeout, response_rx)
             .await
-            .map_err(|_| format!("Request to peer '{}' timed out after {:?}", peer_tag, timeout))?
+            .map_err(|_| {
+                format!(
+                    "Request to peer '{}' timed out after {:?}",
+                    peer_tag, timeout
+                )
+            })?
             .map_err(|_| format!("Response channel closed for peer '{}'", peer_tag))?;
 
         // Check response
@@ -6079,7 +6353,9 @@ impl IpcHandler {
             );
             Ok((status_code, body))
         } else {
-            let error = response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error = response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             warn!(peer = %peer_tag, error = %error, "WireGuard tunnel request failed");
             Err(format!("WireGuard tunnel request failed: {}", error))
         }
@@ -6155,7 +6431,9 @@ impl IpcHandler {
         let transport_config = match transport.as_str() {
             "tcp" => VlessTransportConfig::Tcp,
             "tls" => VlessTransportConfig::Tls {
-                server_name: tls_server_name.clone().unwrap_or_else(|| server_address.clone()),
+                server_name: tls_server_name
+                    .clone()
+                    .unwrap_or_else(|| server_address.clone()),
                 alpn: vec!["h2".to_string(), "http/1.1".to_string()],
                 skip_verify: tls_skip_verify,
             },
@@ -6170,7 +6448,9 @@ impl IpcHandler {
                 host: ws_host.clone(),
                 headers: vec![],
                 tls: Some(TlsSettings {
-                    server_name: tls_server_name.clone().unwrap_or_else(|| server_address.clone()),
+                    server_name: tls_server_name
+                        .clone()
+                        .unwrap_or_else(|| server_address.clone()),
                     alpn: vec!["h2".to_string(), "http/1.1".to_string()],
                     skip_verify: tls_skip_verify,
                 }),
@@ -6231,7 +6511,10 @@ impl IpcHandler {
         if outbound.outbound_type() != "vless" {
             return IpcResponse::error(
                 ErrorCode::InvalidParameters,
-                format!("Outbound '{tag}' is not a VLESS outbound (type: {})", outbound.outbound_type()),
+                format!(
+                    "Outbound '{tag}' is not a VLESS outbound (type: {})",
+                    outbound.outbound_type()
+                ),
             );
         }
 
@@ -6255,10 +6538,14 @@ impl IpcHandler {
             if outbound.outbound_type() == "vless" {
                 // Get server info (address contains host:port)
                 let server_info = outbound.proxy_server_info();
-                let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+                let address_str = server_info
+                    .as_ref()
+                    .map(|s| s.address.clone())
+                    .unwrap_or_default();
 
                 // Parse address into host and port
-                let (server_address, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
+                let (server_address, server_port) = if let Some(colon_pos) = address_str.rfind(':')
+                {
                     let host = address_str[..colon_pos].to_string();
                     let port = address_str[colon_pos + 1..].parse().unwrap_or(0);
                     (host, port)
@@ -6271,7 +6558,7 @@ impl IpcHandler {
                     server_address,
                     server_port,
                     uuid: "***".to_string(), // Hidden for security in list view
-                    flow: String::new(), // Not available through trait
+                    flow: String::new(),     // Not available through trait
                     transport: outbound.transport_type().unwrap_or("unknown").to_string(),
                     enabled: outbound.is_enabled(),
                     health_status: outbound.health_status().to_string(),
@@ -6299,13 +6586,19 @@ impl IpcHandler {
         if outbound.outbound_type() != "vless" {
             return IpcResponse::error(
                 ErrorCode::InvalidParameters,
-                format!("Outbound '{tag}' is not a VLESS outbound (type: {})", outbound.outbound_type()),
+                format!(
+                    "Outbound '{tag}' is not a VLESS outbound (type: {})",
+                    outbound.outbound_type()
+                ),
             );
         }
 
         // Get server info (address contains host:port)
         let server_info = outbound.proxy_server_info();
-        let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+        let address_str = server_info
+            .as_ref()
+            .map(|s| s.address.clone())
+            .unwrap_or_default();
 
         // Parse address into host and port
         let (server_address, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
@@ -6321,7 +6614,7 @@ impl IpcHandler {
             server_address,
             server_port,
             uuid: "***".to_string(), // Hidden for security
-            flow: String::new(), // Not available through trait
+            flow: String::new(),     // Not available through trait
             transport: outbound.transport_type().unwrap_or("unknown").to_string(),
             enabled: outbound.is_enabled(),
             health_status: outbound.health_status().to_string(),
@@ -6350,8 +6643,8 @@ impl IpcHandler {
         reality_server_names: Option<Vec<String>>,
         reality_max_time_diff_ms: Option<u64>,
     ) -> IpcResponse {
-        use std::net::SocketAddr;
         use crate::vless_inbound::InboundRealityConfig;
+        use std::net::SocketAddr;
 
         // Check if already running
         {
@@ -6444,8 +6737,7 @@ impl IpcHandler {
             if let (Some(cert_path), Some(key_path)) = (tls_cert_path, tls_key_path) {
                 use crate::vless_inbound::InboundTlsConfig;
                 config = config.with_tls(
-                    InboundTlsConfig::new(&cert_path, &key_path)
-                        .with_alpn(vec!["h2", "http/1.1"]),
+                    InboundTlsConfig::new(&cert_path, &key_path).with_alpn(vec!["h2", "http/1.1"]),
                 );
             }
         }
@@ -6508,6 +6800,12 @@ impl IpcHandler {
         let vless_reply_registry = self.vless_reply_registry.clone();
         let total_connections = Arc::new(AtomicU64::new(0));
         let active_connections = Arc::new(AtomicU64::new(0));
+
+        // Clone sharded bridges map for per-tunnel bridge lookup (feature-gated)
+        #[cfg(feature = "sharded-vless-wg-bridge")]
+        let sharded_bridges_map = Arc::new(parking_lot::RwLock::new(
+            self.sharded_bridges.read().clone(),
+        ));
 
         // Store references for statistics updates
         let total_conn_stat = Arc::clone(&total_connections);
@@ -6577,6 +6875,8 @@ impl IpcHandler {
                 let wg_mgr = wg_egress_manager.clone();
                 let reply_registry = vless_reply_registry.clone();
                 let active_conn = Arc::clone(&active_conn_stat);
+                #[cfg(feature = "sharded-vless-wg-bridge")]
+                let sharded_bridges = Arc::clone(&sharded_bridges_map);
 
                 // Spawn a task to handle this connection
                 tokio::spawn(async move {
@@ -6589,9 +6889,7 @@ impl IpcHandler {
                         crate::vless::VlessAddress::Ipv6(ip) => {
                             (Some(std::net::IpAddr::V6(*ip)), None)
                         }
-                        crate::vless::VlessAddress::Domain(d) => {
-                            (None, Some(d.clone()))
-                        }
+                        crate::vless::VlessAddress::Domain(d) => (None, Some(d.clone())),
                     };
 
                     // Route the connection using the rule engine
@@ -6601,7 +6899,7 @@ impl IpcHandler {
                         dest_port,
                         source_ip: Some(client_addr.ip()),
                         protocol: if is_udp_conn { "udp" } else { "tcp" },
-                        sniffed_protocol: None,  // VLESS doesn't do protocol sniffing
+                        sniffed_protocol: None, // VLESS doesn't do protocol sniffing
                     };
 
                     // Match against rules to determine outbound
@@ -6619,16 +6917,14 @@ impl IpcHandler {
                     } else if let Some(ref d) = domain {
                         // Resolve domain to IP address
                         match tokio::net::lookup_host(format!("{}:{}", d, dest_port)).await {
-                            Ok(mut addrs) => {
-                                match addrs.next() {
-                                    Some(addr) => addr,
-                                    None => {
-                                        warn!("No addresses found for domain {}", d);
-                                        active_conn.fetch_sub(1, Ordering::Relaxed);
-                                        return;
-                                    }
+                            Ok(mut addrs) => match addrs.next() {
+                                Some(addr) => addr,
+                                None => {
+                                    warn!("No addresses found for domain {}", d);
+                                    active_conn.fetch_sub(1, Ordering::Relaxed);
+                                    return;
                                 }
-                            }
+                            },
                             Err(e) => {
                                 warn!("Failed to resolve domain {}: {}", d, e);
                                 active_conn.fetch_sub(1, Ordering::Relaxed);
@@ -6692,7 +6988,8 @@ impl IpcHandler {
                         let wg_manager = wg_mgr.as_ref().unwrap();
 
                         // Get tunnel status to retrieve local IP
-                        let tunnel_status = match wg_manager.get_tunnel_status(&actual_outbound_tag) {
+                        let tunnel_status = match wg_manager.get_tunnel_status(&actual_outbound_tag)
+                        {
                             Some(status) => status,
                             None => {
                                 warn!(
@@ -6727,7 +7024,65 @@ impl IpcHandler {
                             }
                         };
 
-                        // Create bridge for this WireGuard tunnel
+                        info!(
+                            "VLESS routing {} {} -> {} via WireGuard tunnel '{}' (local_ip={})",
+                            if is_udp_conn { "UDP" } else { "TCP" },
+                            client_addr,
+                            destination,
+                            actual_outbound_tag,
+                            local_ip
+                        );
+
+                        // Handle the connection through the bridge (TCP or UDP)
+                        let client_stream = conn.into_stream();
+
+                        // Try to use sharded bridge if available (feature-gated)
+                        #[cfg(feature = "sharded-vless-wg-bridge")]
+                        {
+                            // Look up sharded bridge for this tunnel
+                            let maybe_sharded = sharded_bridges.read().get(&actual_outbound_tag).cloned();
+
+                            if let Some(sharded_bridge) = maybe_sharded {
+                                // Use sharded bridge for better parallelism
+                                if is_udp_conn {
+                                    match sharded_bridge.handle_udp_connection(client_stream, dest_addr).await {
+                                        Ok(stats) => {
+                                            info!(
+                                                "VLESS-WG UDP (sharded) connection closed: {} via {}, {} dgrams sent, {} dgrams recv",
+                                                client_addr, actual_outbound_tag,
+                                                stats.datagrams_sent, stats.datagrams_received
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "VLESS-WG UDP (sharded) error: {} via {}: {}",
+                                                client_addr, actual_outbound_tag, e
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    match sharded_bridge.handle_tcp_connection(client_stream, dest_addr).await {
+                                        Ok(stats) => {
+                                            info!(
+                                                "VLESS-WG TCP (sharded) connection closed: {} -> {} via {}, {} bytes up, {} bytes down",
+                                                client_addr, destination, actual_outbound_tag,
+                                                stats.bytes_sent, stats.bytes_received
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "VLESS-WG TCP (sharded) error: {} -> {} via {}: {}",
+                                                client_addr, destination, actual_outbound_tag, e
+                                            );
+                                        }
+                                    }
+                                }
+                                active_conn.fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+
+                        // Fallback: Create legacy bridge for this WireGuard tunnel
                         // Pass the reply registry so WgReplyHandler can route replies back
                         let bridge = crate::vless_wg_bridge::VlessWgBridge::with_registry(
                             Arc::clone(wg_manager),
@@ -6736,18 +7091,18 @@ impl IpcHandler {
                             reply_registry,
                         );
 
-                        info!(
-                            "VLESS routing {} {} -> {} via WireGuard tunnel '{}' (local_ip={})",
-                            if is_udp_conn { "UDP" } else { "TCP" },
-                            client_addr, destination, actual_outbound_tag, local_ip
-                        );
-
-                        // Handle the connection through the bridge (TCP or UDP)
-                        let client_stream = conn.into_stream();
                         if is_udp_conn {
                             // Handle UDP connection (VLESS UDP frames over TCP)
                             // Pass destination from VLESS header - UDP frames are [Length][Payload] only
-                            match bridge.handle_udp_connection(client_addr, client_stream, dest_addr.ip(), dest_port).await {
+                            match bridge
+                                .handle_udp_connection(
+                                    client_addr,
+                                    client_stream,
+                                    dest_addr.ip(),
+                                    dest_port,
+                                )
+                                .await
+                            {
                                 Ok(()) => {
                                     info!(
                                         "VLESS-WG UDP bridge connection closed: {} via {}",
@@ -6763,7 +7118,15 @@ impl IpcHandler {
                             }
                         } else {
                             // Handle TCP connection
-                            match bridge.handle_tcp_connection(client_addr, client_stream, dest_addr.ip(), dest_port).await {
+                            match bridge
+                                .handle_tcp_connection(
+                                    client_addr,
+                                    client_stream,
+                                    dest_addr.ip(),
+                                    dest_port,
+                                )
+                                .await
+                            {
                                 Ok(()) => {
                                     info!(
                                         "VLESS-WG TCP bridge connection closed: {} -> {} via {}",
@@ -6783,10 +7146,7 @@ impl IpcHandler {
                         let outbound = match outbound_manager.get(&actual_outbound_tag) {
                             Some(o) => o,
                             None => {
-                                warn!(
-                                    "Outbound '{}' not found, using direct",
-                                    actual_outbound_tag
-                                );
+                                warn!("Outbound '{}' not found, using direct", actual_outbound_tag);
                                 match outbound_manager.get("direct") {
                                     Some(o) => o,
                                     None => {
@@ -6798,17 +7158,18 @@ impl IpcHandler {
                             }
                         };
 
-                        let upstream = match outbound.connect(dest_addr, Duration::from_secs(30)).await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to connect to {} via {}: {}",
-                                    destination, actual_outbound_tag, e
-                                );
-                                active_conn.fetch_sub(1, Ordering::Relaxed);
-                                return;
-                            }
-                        };
+                        let upstream =
+                            match outbound.connect(dest_addr, Duration::from_secs(30)).await {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to connect to {} via {}: {}",
+                                        destination, actual_outbound_tag, e
+                                    );
+                                    active_conn.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            };
 
                         info!(
                             "VLESS proxying {} -> {} via TCP outbound '{}'",
@@ -7049,10 +7410,7 @@ impl IpcHandler {
             info!("VLESS inbound listener stopped");
             IpcResponse::success_with_message("VLESS inbound stopped")
         } else {
-            IpcResponse::error(
-                ErrorCode::NotFound,
-                "VLESS inbound is not running",
-            )
+            IpcResponse::error(ErrorCode::NotFound, "VLESS inbound is not running")
         }
     }
 
@@ -7167,7 +7525,10 @@ impl IpcHandler {
             if outbound.outbound_type() == "shadowsocks" {
                 // Get server info
                 let server_info = outbound.proxy_server_info();
-                let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+                let address_str = server_info
+                    .as_ref()
+                    .map(|s| s.address.clone())
+                    .unwrap_or_default();
 
                 // Parse address into host and port
                 let (server, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
@@ -7221,7 +7582,10 @@ impl IpcHandler {
 
         // Get server info
         let server_info = outbound.proxy_server_info();
-        let address_str = server_info.as_ref().map(|s| s.address.clone()).unwrap_or_default();
+        let address_str = server_info
+            .as_ref()
+            .map(|s| s.address.clone())
+            .unwrap_or_default();
 
         // Parse address into host and port
         let (server, server_port) = if let Some(colon_pos) = address_str.rfind(':') {
@@ -7295,10 +7659,7 @@ impl IpcHandler {
 
         // Validate password
         if password.is_empty() {
-            return IpcResponse::error(
-                ErrorCode::InvalidParameters,
-                "Password cannot be empty",
-            );
+            return IpcResponse::error(ErrorCode::InvalidParameters, "Password cannot be empty");
         }
 
         info!(
@@ -7334,7 +7695,11 @@ impl IpcHandler {
         };
 
         // Clone config for UDP relay before storing
-        let udp_config = if udp_enabled { Some(config.clone()) } else { None };
+        let udp_config = if udp_enabled {
+            Some(config.clone())
+        } else {
+            None
+        };
 
         // Store the configuration for status queries
         {
@@ -7355,6 +7720,12 @@ impl IpcHandler {
         let wg_egress_manager = self.wg_egress_manager.clone();
         let vless_reply_registry = self.vless_reply_registry.clone();
         let listener_clone = Arc::clone(&listener);
+
+        // Clone sharded bridges map for per-tunnel bridge lookup (feature-gated)
+        #[cfg(feature = "sharded-vless-wg-bridge")]
+        let sharded_bridges_map = Arc::new(parking_lot::RwLock::new(
+            self.sharded_bridges.read().clone(),
+        ));
 
         // Start the accept loop in a background task with full routing support
         let accept_task = tokio::spawn(async move {
@@ -7378,6 +7749,8 @@ impl IpcHandler {
                         let ecmp_mgr = ecmp_group_manager.clone();
                         let wg_mgr = wg_egress_manager.clone();
                         let reply_registry = vless_reply_registry.clone();
+                        #[cfg(feature = "sharded-vless-wg-bridge")]
+                        let sharded_bridges = Arc::clone(&sharded_bridges_map);
 
                         // Spawn a task to handle this connection
                         tokio::spawn(async move {
@@ -7418,7 +7791,8 @@ impl IpcHandler {
                             let dest_addr: std::net::SocketAddr = if let Some(ip) = dest_ip {
                                 std::net::SocketAddr::new(ip, dest_port)
                             } else if let Some(ref d) = domain {
-                                match tokio::net::lookup_host(format!("{}:{}", d, dest_port)).await {
+                                match tokio::net::lookup_host(format!("{}:{}", d, dest_port)).await
+                                {
                                     Ok(mut addrs) => match addrs.next() {
                                         Some(addr) => addr,
                                         None => {
@@ -7441,7 +7815,9 @@ impl IpcHandler {
                                 if let Some(ref ecmp_manager) = ecmp_mgr {
                                     if ecmp_manager.has_group(&outbound_tag) {
                                         if let Some(group) = ecmp_manager.get_group(&outbound_tag) {
-                                            use crate::ecmp::{FiveTuple, Protocol as EcmpProtocol};
+                                            use crate::ecmp::{
+                                                FiveTuple, Protocol as EcmpProtocol,
+                                            };
                                             let five_tuple = FiveTuple::new(
                                                 client_addr.ip(),
                                                 dest_addr.ip(),
@@ -7458,7 +7834,10 @@ impl IpcHandler {
                                                     member_tag
                                                 }
                                                 Err(e) => {
-                                                    warn!("ECMP selection failed: {}, using direct", e);
+                                                    warn!(
+                                                        "ECMP selection failed: {}, using direct",
+                                                        e
+                                                    );
                                                     "direct".to_string()
                                                 }
                                             }
@@ -7484,16 +7863,17 @@ impl IpcHandler {
                                 let wg_manager = wg_mgr.as_ref().unwrap();
 
                                 // Get tunnel status for local IP
-                                let tunnel_status = match wg_manager.get_tunnel_status(&actual_outbound_tag) {
-                                    Some(status) => status,
-                                    None => {
-                                        warn!(
-                                            "WireGuard tunnel '{}' not found for SS {} -> {}",
-                                            actual_outbound_tag, client_addr, destination
-                                        );
-                                        return;
-                                    }
-                                };
+                                let tunnel_status =
+                                    match wg_manager.get_tunnel_status(&actual_outbound_tag) {
+                                        Some(status) => status,
+                                        None => {
+                                            warn!(
+                                                "WireGuard tunnel '{}' not found for SS {} -> {}",
+                                                actual_outbound_tag, client_addr, destination
+                                            );
+                                            return;
+                                        }
+                                    };
 
                                 // Parse local IP
                                 let local_ip: std::net::IpAddr = match tunnel_status.local_ip {
@@ -7505,7 +7885,10 @@ impl IpcHandler {
                                         }
                                     },
                                     None => {
-                                        warn!("WireGuard tunnel '{}' has no local IP", actual_outbound_tag);
+                                        warn!(
+                                            "WireGuard tunnel '{}' has no local IP",
+                                            actual_outbound_tag
+                                        );
                                         return;
                                     }
                                 };
@@ -7515,7 +7898,36 @@ impl IpcHandler {
                                     client_addr, destination, actual_outbound_tag, local_ip
                                 );
 
-                                // Use smoltcp bridge for WG tunnel (TCP only for now)
+                                let client_stream = conn.into_stream();
+
+                                // Try to use sharded bridge if available (feature-gated)
+                                #[cfg(feature = "sharded-vless-wg-bridge")]
+                                {
+                                    // Look up sharded bridge for this tunnel
+                                    let maybe_sharded = sharded_bridges.read().get(&actual_outbound_tag).cloned();
+
+                                    if let Some(sharded_bridge) = maybe_sharded {
+                                        // Use sharded bridge for better parallelism
+                                        match sharded_bridge.handle_tcp_connection(client_stream, dest_addr).await {
+                                            Ok(stats) => {
+                                                info!(
+                                                    "Shadowsocks-WG (sharded) connection closed: {} -> {} via {}, {} bytes up, {} bytes down",
+                                                    client_addr, destination, actual_outbound_tag,
+                                                    stats.bytes_sent, stats.bytes_received
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Shadowsocks-WG (sharded) error: {} -> {} via {}: {}",
+                                                    client_addr, destination, actual_outbound_tag, e
+                                                );
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // Fallback: Use smoltcp bridge for WG tunnel (TCP only for now)
                                 // Create bridge with reply registry for proper WG reply routing
                                 let bridge = crate::vless_wg_bridge::VlessWgBridge::with_registry(
                                     Arc::clone(wg_manager),
@@ -7524,8 +7936,15 @@ impl IpcHandler {
                                     reply_registry.clone(),
                                 );
 
-                                let client_stream = conn.into_stream();
-                                match bridge.handle_tcp_connection(client_addr, client_stream, dest_addr.ip(), dest_addr.port()).await {
+                                match bridge
+                                    .handle_tcp_connection(
+                                        client_addr,
+                                        client_stream,
+                                        dest_addr.ip(),
+                                        dest_addr.port(),
+                                    )
+                                    .await
+                                {
                                     Ok(()) => {
                                         info!(
                                             "Shadowsocks-WG connection closed: {} -> {} via {}",
@@ -7544,7 +7963,10 @@ impl IpcHandler {
                                 let outbound = match outbound_mgr.get(&actual_outbound_tag) {
                                     Some(o) => o,
                                     None => {
-                                        warn!("Outbound '{}' not found, using direct", actual_outbound_tag);
+                                        warn!(
+                                            "Outbound '{}' not found, using direct",
+                                            actual_outbound_tag
+                                        );
                                         match outbound_mgr.get("direct") {
                                             Some(o) => o,
                                             None => {
@@ -7556,7 +7978,10 @@ impl IpcHandler {
                                 };
 
                                 // Connect to upstream
-                                let upstream = match outbound.connect(dest_addr, Duration::from_secs(30)).await {
+                                let upstream = match outbound
+                                    .connect(dest_addr, Duration::from_secs(30))
+                                    .await
+                                {
                                     Ok(conn) => conn,
                                     Err(e) => {
                                         warn!(
@@ -7577,7 +8002,9 @@ impl IpcHandler {
                                 let mut upstream_stream = upstream.into_stream();
 
                                 // Relay traffic bidirectionally
-                                match bidirectional_copy(&mut client_stream, &mut upstream_stream).await {
+                                match bidirectional_copy(&mut client_stream, &mut upstream_stream)
+                                    .await
+                                {
                                     Ok(result) => {
                                         info!(
                                             "Shadowsocks connection closed: {} -> {}, {} up / {} down bytes",
@@ -7643,14 +8070,18 @@ impl IpcHandler {
                     let udp_ecmp_mgr = self.ecmp_group_manager.clone();
 
                     // Map of WG tunnel tag -> VlessWgBridge for UDP
-                    use std::collections::HashMap;
                     use parking_lot::RwLock as SyncRwLock;
-                    let wg_bridges: Arc<SyncRwLock<HashMap<String, Arc<crate::vless_wg_bridge::VlessWgBridge>>>> =
-                        Arc::new(SyncRwLock::new(HashMap::new()));
+                    use std::collections::HashMap;
+                    let wg_bridges: Arc<
+                        SyncRwLock<HashMap<String, Arc<crate::vless_wg_bridge::VlessWgBridge>>>,
+                    > = Arc::new(SyncRwLock::new(HashMap::new()));
                     let wg_bridges_for_poll = Arc::clone(&wg_bridges);
 
                     let udp_task = tokio::spawn(async move {
-                        info!("Shadowsocks UDP relay started on {}", udp_relay_clone.listen_addr());
+                        info!(
+                            "Shadowsocks UDP relay started on {}",
+                            udp_relay_clone.listen_addr()
+                        );
 
                         // Run the UDP relay with packet handler
                         let rule_engine_ref = Arc::clone(&udp_rule_engine_task);
@@ -7873,9 +8304,15 @@ impl IpcHandler {
                             poll_interval.tick().await;
 
                             // Poll all bridges
-                            let bridges_snapshot: Vec<(String, Arc<crate::vless_wg_bridge::VlessWgBridge>)> = {
+                            let bridges_snapshot: Vec<(
+                                String,
+                                Arc<crate::vless_wg_bridge::VlessWgBridge>,
+                            )> = {
                                 let bridges = wg_bridges_for_poll.read();
-                                bridges.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect()
+                                bridges
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                                    .collect()
                             };
 
                             for (tag, bridge) in bridges_snapshot {
@@ -7891,11 +8328,14 @@ impl IpcHandler {
                                         std::net::SocketAddr::new(reply.source_ip, reply.source_port)
                                     );
 
-                                    if let Err(e) = udp_relay_for_reply.send_reply(
-                                        reply.session_key.client_addr,
-                                        &source_dest,
-                                        &reply.payload,
-                                    ).await {
+                                    if let Err(e) = udp_relay_for_reply
+                                        .send_reply(
+                                            reply.session_key.client_addr,
+                                            &source_dest,
+                                            &reply.payload,
+                                        )
+                                        .await
+                                    {
                                         warn!(
                                             "Failed to send SS UDP reply to {}: {}",
                                             reply.session_key.client_addr, e
@@ -7903,7 +8343,10 @@ impl IpcHandler {
                                     } else {
                                         trace!(
                                             "Sent SS UDP reply: {} -> {} ({} bytes)",
-                                            std::net::SocketAddr::new(reply.source_ip, reply.source_port),
+                                            std::net::SocketAddr::new(
+                                                reply.source_ip,
+                                                reply.source_port
+                                            ),
                                             reply.session_key.client_addr,
                                             reply.payload.len()
                                         );
@@ -8135,6 +8578,231 @@ impl IpcHandler {
             success: true,
         })
     }
+
+    // ========================================================================
+    // Sharded VLESS-WG Bridge Handlers (feature: sharded-vless-wg-bridge)
+    // ========================================================================
+
+    /// Handle GetShardedBridgeStats command
+    ///
+    /// Returns aggregated statistics across all shards.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    fn handle_get_sharded_bridge_stats(&self) -> IpcResponse {
+        use super::protocol::{ShardStatsSnapshot, ShardedBridgeStatsResponse};
+
+        let bridge_guard = self.sharded_bridge.read();
+        match &*bridge_guard {
+            Some(bridge) => {
+                let stats = bridge.stats();
+                let per_shard = &stats.per_shard_stats;
+                let num_shards = per_shard.len();
+
+                // Convert internal stats to IPC stats
+                let per_shard_stats: Vec<ShardStatsSnapshot> = per_shard
+                    .iter()
+                    .map(|s| ShardStatsSnapshot {
+                        events_processed: s.events_processed,
+                        wg_packets_received: s.wg_packets_received,
+                        wg_packets_sent: s.wg_packets_sent,
+                        wg_bytes_received: s.wg_bytes_received,
+                        wg_bytes_sent: s.wg_bytes_sent,
+                        wg_packets_dropped: s.wg_packets_dropped,
+                        tcp_sessions_created: s.tcp_sessions_created,
+                        tcp_sessions_closed: s.tcp_sessions_closed,
+                        udp_sessions_created: s.udp_sessions_created,
+                        udp_sessions_closed: s.udp_sessions_closed,
+                        udp_datagrams_sent: s.udp_datagrams_sent,
+                        udp_datagrams_received: s.udp_datagrams_received,
+                        poll_count: s.poll_count,
+                    })
+                    .collect();
+
+                // Compute totals
+                let total_events_processed: u64 =
+                    per_shard_stats.iter().map(|s| s.events_processed).sum();
+                let total_wg_packets_received: u64 =
+                    per_shard_stats.iter().map(|s| s.wg_packets_received).sum();
+                let total_wg_packets_sent: u64 =
+                    per_shard_stats.iter().map(|s| s.wg_packets_sent).sum();
+                let total_wg_bytes_received: u64 =
+                    per_shard_stats.iter().map(|s| s.wg_bytes_received).sum();
+                let total_wg_bytes_sent: u64 =
+                    per_shard_stats.iter().map(|s| s.wg_bytes_sent).sum();
+                let total_wg_packets_dropped: u64 =
+                    per_shard_stats.iter().map(|s| s.wg_packets_dropped).sum();
+                let total_tcp_sessions_created: u64 =
+                    per_shard_stats.iter().map(|s| s.tcp_sessions_created).sum();
+                let total_tcp_sessions_closed: u64 =
+                    per_shard_stats.iter().map(|s| s.tcp_sessions_closed).sum();
+                let total_udp_sessions_created: u64 =
+                    per_shard_stats.iter().map(|s| s.udp_sessions_created).sum();
+                let total_udp_sessions_closed: u64 =
+                    per_shard_stats.iter().map(|s| s.udp_sessions_closed).sum();
+                let total_udp_datagrams_sent: u64 =
+                    per_shard_stats.iter().map(|s| s.udp_datagrams_sent).sum();
+                let total_udp_datagrams_received: u64 = per_shard_stats
+                    .iter()
+                    .map(|s| s.udp_datagrams_received)
+                    .sum();
+                let total_poll_count: u64 = per_shard_stats.iter().map(|s| s.poll_count).sum();
+
+                // Compute active sessions
+                let active_tcp_sessions =
+                    total_tcp_sessions_created.saturating_sub(total_tcp_sessions_closed);
+                let active_udp_sessions =
+                    total_udp_sessions_created.saturating_sub(total_udp_sessions_closed);
+
+                // Compute distribution skew (standard deviation of events per shard)
+                let mean = if num_shards > 0 {
+                    total_events_processed as f64 / num_shards as f64
+                } else {
+                    0.0
+                };
+                let variance = if num_shards > 0 {
+                    per_shard_stats
+                        .iter()
+                        .map(|s| (s.events_processed as f64 - mean).powi(2))
+                        .sum::<f64>()
+                        / num_shards as f64
+                } else {
+                    0.0
+                };
+                let distribution_skew = variance.sqrt();
+
+                IpcResponse::ShardedBridgeStats(ShardedBridgeStatsResponse {
+                    num_shards,
+                    per_shard_stats,
+                    total_events_processed,
+                    total_wg_packets_received,
+                    total_wg_packets_sent,
+                    total_wg_bytes_received,
+                    total_wg_bytes_sent,
+                    total_wg_packets_dropped,
+                    total_tcp_sessions_created,
+                    total_tcp_sessions_closed,
+                    total_udp_sessions_created,
+                    total_udp_sessions_closed,
+                    total_udp_datagrams_sent,
+                    total_udp_datagrams_received,
+                    total_poll_count,
+                    active_tcp_sessions,
+                    active_udp_sessions,
+                    distribution_skew,
+                })
+            }
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                "Sharded VLESS-WG bridge is not configured",
+            ),
+        }
+    }
+
+    /// Handle GetShardHealth command
+    ///
+    /// Returns health status for a specific shard.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    fn handle_get_shard_health(&self, shard_index: usize) -> IpcResponse {
+        use super::protocol::{ShardHealthResponse, ShardStatsSnapshot};
+
+        let bridge_guard = self.sharded_bridge.read();
+        match &*bridge_guard {
+            Some(bridge) => {
+                let stats = bridge.stats();
+                let per_shard = &stats.per_shard_stats;
+
+                if shard_index >= per_shard.len() {
+                    return IpcResponse::error(
+                        ErrorCode::InvalidParameters,
+                        format!(
+                            "Shard index {} out of range (0-{})",
+                            shard_index,
+                            per_shard.len().saturating_sub(1)
+                        ),
+                    );
+                }
+
+                let shard_stats = &per_shard[shard_index];
+                let stats_snapshot = ShardStatsSnapshot {
+                    events_processed: shard_stats.events_processed,
+                    wg_packets_received: shard_stats.wg_packets_received,
+                    wg_packets_sent: shard_stats.wg_packets_sent,
+                    wg_bytes_received: shard_stats.wg_bytes_received,
+                    wg_bytes_sent: shard_stats.wg_bytes_sent,
+                    wg_packets_dropped: shard_stats.wg_packets_dropped,
+                    tcp_sessions_created: shard_stats.tcp_sessions_created,
+                    tcp_sessions_closed: shard_stats.tcp_sessions_closed,
+                    udp_sessions_created: shard_stats.udp_sessions_created,
+                    udp_sessions_closed: shard_stats.udp_sessions_closed,
+                    udp_datagrams_sent: shard_stats.udp_datagrams_sent,
+                    udp_datagrams_received: shard_stats.udp_datagrams_received,
+                    poll_count: shard_stats.poll_count,
+                };
+
+                // Get supervisor stats if available
+                let (circuit_breaker_open, failure_count, total_restarts) = {
+                    let supervisor_guard = self.shard_supervisor.read();
+                    match &*supervisor_guard {
+                        Some(supervisor) => {
+                            let sup = supervisor.lock();
+                            let stats = sup.stats();
+                            let restarts = stats.restarts.get(shard_index).copied().unwrap_or(0);
+                            // Circuit breaker is open if any shards have it open
+                            // (we don't track per-shard circuit breaker state in current impl)
+                            let circuit_open = stats.shards_circuit_open > 0;
+                            // Failure count not tracked per-shard, use 0
+                            let failures = 0u32;
+                            (circuit_open, failures, restarts)
+                        }
+                        None => (false, 0, 0),
+                    }
+                };
+
+                IpcResponse::ShardHealth(ShardHealthResponse {
+                    shard_index,
+                    healthy: !circuit_breaker_open && failure_count == 0,
+                    stats: stats_snapshot,
+                    circuit_breaker_open,
+                    failure_count,
+                    total_restarts,
+                })
+            }
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                "Sharded VLESS-WG bridge is not configured",
+            ),
+        }
+    }
+
+    /// Handle GetSupervisorStats command
+    ///
+    /// Returns supervisor statistics including restart counts and circuit breaker trips.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    fn handle_get_supervisor_stats(&self) -> IpcResponse {
+        use super::protocol::SupervisorStatsResponse;
+
+        let supervisor_guard = self.shard_supervisor.read();
+        match &*supervisor_guard {
+            Some(supervisor) => {
+                let sup = supervisor.lock();
+                let stats = sup.stats();
+
+                IpcResponse::SupervisorStats(SupervisorStatsResponse {
+                    num_shards: stats.restarts.len(),
+                    restarts_per_shard: stats.restarts.clone(),
+                    total_restarts: stats.total_restarts(),
+                    circuit_breaker_trips: stats.circuit_breaker_trips,
+                    total_panics: stats.total_panics,
+                    total_crashes: stats.total_crashes,
+                    health_checks: stats.health_checks,
+                    shards_circuit_open: stats.shards_circuit_open,
+                })
+            }
+            None => IpcResponse::error(
+                ErrorCode::NotFound,
+                "Shard supervisor is not configured",
+            ),
+        }
+    }
 }
 
 /// Write a metric header (HELP and TYPE lines)
@@ -8145,7 +8813,12 @@ fn write_metric_header(output: &mut String, name: &str, help: &str, metric_type:
 }
 
 /// Write a metric value with optional labels
-fn write_metric_value(output: &mut String, name: &str, labels: Option<&[(&str, &str)]>, value: u64) {
+fn write_metric_value(
+    output: &mut String,
+    name: &str,
+    labels: Option<&[(&str, &str)]>,
+    value: u64,
+) {
     use std::fmt::Write;
     if let Some(labels) = labels {
         let label_str: String = labels
@@ -8182,9 +8855,7 @@ fn chrono_lite_format(secs: u64) -> String {
     let month = (day_of_year / 30).min(11) + 1;
     let day = (day_of_year % 30) + 1;
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{secs:02}Z")
 }
 
 #[cfg(test)]
@@ -8242,7 +8913,11 @@ mod tests {
             .add_chain("us-chain")
             .unwrap();
 
-        let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+        let snapshot = builder
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
         let rule_engine = Arc::new(RuleEngine::new(snapshot));
 
         IpcHandler::new(connection_manager, outbound_manager, rule_engine)
@@ -8271,17 +8946,13 @@ mod tests {
         let allowed_subnet: IpNet = "10.25.0.0/24".parse().unwrap();
         let ingress_config = WgIngressConfig::builder()
             .private_key(TEST_VALID_KEY)
-            .listen_addr(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                36100,
-            ))
+            .listen_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 36100))
             .local_ip("10.25.0.1".parse().unwrap())
             .allowed_subnet(allowed_subnet)
             .build();
 
-        let ingress_manager = Arc::new(
-            WgIngressManager::new(ingress_config, Arc::clone(&rule_engine)).unwrap(),
-        );
+        let ingress_manager =
+            Arc::new(WgIngressManager::new(ingress_config, Arc::clone(&rule_engine)).unwrap());
 
         let forwarding_stats = Arc::new(ForwardingStats::default());
         let reply_stats = Arc::new(IngressReplyStats::default());
@@ -8308,7 +8979,10 @@ mod tests {
         if let IpcResponse::Status(status) = response {
             assert!(!status.version.is_empty());
             // uptime_secs is u64, always >= 0, just verify it's reasonable
-            assert!(status.uptime_secs < 86400, "Uptime should be less than 1 day in tests");
+            assert!(
+                status.uptime_secs < 86400,
+                "Uptime should be less than 1 day in tests"
+            );
             assert!(!status.shutting_down);
         } else {
             panic!("Expected Status response");
@@ -8502,7 +9176,11 @@ mod tests {
                 pool_max_size: 8,
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         // Verify it was added
         let list_response = handler.handle(IpcCommand::ListOutbounds).await;
@@ -8571,9 +9249,7 @@ mod tests {
         let handler = create_test_handler();
 
         // Get pool stats when no SOCKS5 outbounds exist
-        let response = handler
-            .handle(IpcCommand::GetPoolStats { tag: None })
-            .await;
+        let response = handler.handle(IpcCommand::GetPoolStats { tag: None }).await;
 
         if let IpcResponse::PoolStats(stats) = response {
             assert!(stats.pools.is_empty());
@@ -8600,9 +9276,7 @@ mod tests {
             .await;
 
         // Get pool stats for all SOCKS5 outbounds
-        let response = handler
-            .handle(IpcCommand::GetPoolStats { tag: None })
-            .await;
+        let response = handler.handle(IpcCommand::GetPoolStats { tag: None }).await;
 
         if let IpcResponse::PoolStats(stats) = response {
             assert_eq!(stats.pools.len(), 1);
@@ -8671,7 +9345,11 @@ mod tests {
                 routing_table: Some(100),
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         // Verify it was added
         let list_response = handler.handle(IpcCommand::ListOutbounds).await;
@@ -8769,7 +9447,11 @@ mod tests {
                 default_outbound: "direct".into(),
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         if let IpcResponse::UpdateRoutingResult(result) = response {
             assert!(result.success);
@@ -9008,7 +9690,11 @@ mod tests {
                 default_outbound: "direct".into(),
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         if let IpcResponse::UpdateRoutingResult(result) = response {
             assert!(result.success);
@@ -9059,7 +9745,11 @@ mod tests {
                 config,
             })
             .await;
-        assert!(!create_response.is_error(), "Failed to create chain: {:?}", create_response);
+        assert!(
+            !create_response.is_error(),
+            "Failed to create chain: {:?}",
+            create_response
+        );
 
         // Activate the chain (required for it to be a valid outbound)
         let activate_response = handler
@@ -9067,7 +9757,11 @@ mod tests {
                 tag: "my-chain".into(),
             })
             .await;
-        assert!(!activate_response.is_error(), "Failed to activate chain: {:?}", activate_response);
+        assert!(
+            !activate_response.is_error(),
+            "Failed to activate chain: {:?}",
+            activate_response
+        );
 
         // Now update routing rules with the chain as outbound
         let response = handler
@@ -9075,14 +9769,18 @@ mod tests {
                 rules: vec![RuleConfig {
                     rule_type: "domain".into(),
                     target: "chain-routed.com".into(),
-                    outbound: "my-chain".into(),  // Use active chain as outbound
+                    outbound: "my-chain".into(), // Use active chain as outbound
                     priority: 0,
                     enabled: true,
                 }],
                 default_outbound: "direct".into(),
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         if let IpcResponse::UpdateRoutingResult(result) = response {
             assert!(result.success);
@@ -9102,7 +9800,11 @@ mod tests {
                 tag: "proxy".into(),
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         // Verify the default was changed via GetRuleStats
         let stats_response = handler.handle(IpcCommand::GetRuleStats).await;
@@ -9126,7 +9828,11 @@ mod tests {
                 config,
             })
             .await;
-        assert!(!create_response.is_error(), "Failed to create chain: {:?}", create_response);
+        assert!(
+            !create_response.is_error(),
+            "Failed to create chain: {:?}",
+            create_response
+        );
 
         // Activate the chain (required for it to be a valid outbound)
         let activate_response = handler
@@ -9134,7 +9840,11 @@ mod tests {
                 tag: "default-chain".into(),
             })
             .await;
-        assert!(!activate_response.is_error(), "Failed to activate chain: {:?}", activate_response);
+        assert!(
+            !activate_response.is_error(),
+            "Failed to activate chain: {:?}",
+            activate_response
+        );
 
         // Set chain as default outbound
         let response = handler
@@ -9142,7 +9852,11 @@ mod tests {
                 tag: "default-chain".into(),
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         // Verify the default was changed
         let stats_response = handler.handle(IpcCommand::GetRuleStats).await;
@@ -9166,7 +9880,11 @@ mod tests {
                 config,
             })
             .await;
-        assert!(!create_response.is_error(), "Failed to create chain: {:?}", create_response);
+        assert!(
+            !create_response.is_error(),
+            "Failed to create chain: {:?}",
+            create_response
+        );
 
         // Activate the chain (required for it to be a valid outbound)
         let activate_response = handler
@@ -9174,16 +9892,24 @@ mod tests {
                 tag: "route-default-chain".into(),
             })
             .await;
-        assert!(!activate_response.is_error(), "Failed to activate chain: {:?}", activate_response);
+        assert!(
+            !activate_response.is_error(),
+            "Failed to activate chain: {:?}",
+            activate_response
+        );
 
         // Update routing with chain as default outbound
         let response = handler
             .handle(IpcCommand::UpdateRouting {
                 rules: vec![],
-                default_outbound: "route-default-chain".into(),  // Active chain as default
+                default_outbound: "route-default-chain".into(), // Active chain as default
             })
             .await;
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
 
         if let IpcResponse::UpdateRoutingResult(result) = response {
             assert!(result.success);
@@ -9261,10 +9987,18 @@ mod tests {
             assert!(metrics.timestamp_ms > 0);
 
             // Check core metrics are present
-            assert!(metrics.metrics_text.contains("rust_router_connections_total"));
-            assert!(metrics.metrics_text.contains("rust_router_connections_active"));
-            assert!(metrics.metrics_text.contains("rust_router_connections_completed_total"));
-            assert!(metrics.metrics_text.contains("rust_router_connections_errored_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_connections_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_connections_active"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_connections_completed_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_connections_errored_total"));
             assert!(metrics.metrics_text.contains("rust_router_bytes_rx_total"));
             assert!(metrics.metrics_text.contains("rust_router_bytes_tx_total"));
 
@@ -9273,8 +10007,12 @@ mod tests {
             assert!(metrics.metrics_text.contains("rust_router_info"));
 
             // Check rule metrics
-            assert!(metrics.metrics_text.contains("rust_router_rules_domain_count"));
-            assert!(metrics.metrics_text.contains("rust_router_rules_geoip_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_domain_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_geoip_count"));
             assert!(metrics.metrics_text.contains("rust_router_config_version"));
         } else {
             panic!("Expected PrometheusMetrics response, got: {:?}", response);
@@ -9288,11 +10026,21 @@ mod tests {
 
         if let IpcResponse::PrometheusMetrics(metrics) = response {
             // Check outbound metrics with labels
-            assert!(metrics.metrics_text.contains("rust_router_outbound_connections_total"));
-            assert!(metrics.metrics_text.contains("rust_router_outbound_connections_active"));
-            assert!(metrics.metrics_text.contains("rust_router_outbound_bytes_rx_total"));
-            assert!(metrics.metrics_text.contains("rust_router_outbound_bytes_tx_total"));
-            assert!(metrics.metrics_text.contains("rust_router_outbound_errors_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_outbound_connections_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_outbound_connections_active"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_outbound_bytes_rx_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_outbound_bytes_tx_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_outbound_errors_total"));
             assert!(metrics.metrics_text.contains("rust_router_outbound_health"));
 
             // Check the "direct" outbound is labeled
@@ -9309,11 +10057,21 @@ mod tests {
 
         if let IpcResponse::PrometheusMetrics(metrics) = response {
             // Check HELP and TYPE comments are present
-            assert!(metrics.metrics_text.contains("# HELP rust_router_connections_total"));
-            assert!(metrics.metrics_text.contains("# TYPE rust_router_connections_total counter"));
-            assert!(metrics.metrics_text.contains("# HELP rust_router_connections_active"));
-            assert!(metrics.metrics_text.contains("# TYPE rust_router_connections_active gauge"));
-            assert!(metrics.metrics_text.contains("# TYPE rust_router_info gauge"));
+            assert!(metrics
+                .metrics_text
+                .contains("# HELP rust_router_connections_total"));
+            assert!(metrics
+                .metrics_text
+                .contains("# TYPE rust_router_connections_total counter"));
+            assert!(metrics
+                .metrics_text
+                .contains("# HELP rust_router_connections_active"));
+            assert!(metrics
+                .metrics_text
+                .contains("# TYPE rust_router_connections_active gauge"));
+            assert!(metrics
+                .metrics_text
+                .contains("# TYPE rust_router_info gauge"));
         } else {
             panic!("Expected PrometheusMetrics response");
         }
@@ -9326,17 +10084,32 @@ mod tests {
 
         if let IpcResponse::PrometheusMetrics(metrics) = response {
             // Check rule metrics are present
-            assert!(metrics.metrics_text.contains("rust_router_rules_domain_count"));
-            assert!(metrics.metrics_text.contains("rust_router_rules_geoip_count"));
-            assert!(metrics.metrics_text.contains("rust_router_rules_port_count"));
-            assert!(metrics.metrics_text.contains("rust_router_rules_protocol_count"));
-            assert!(metrics.metrics_text.contains("rust_router_rules_chain_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_domain_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_geoip_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_port_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_protocol_count"));
+            assert!(metrics
+                .metrics_text
+                .contains("rust_router_rules_chain_count"));
 
             // The test handler has rules, so counts should be > 0 in output
             // Just verify the lines are there with numeric values
             let lines: Vec<&str> = metrics.metrics_text.lines().collect();
-            let domain_count_line = lines.iter().find(|l| l.starts_with("rust_router_rules_domain_count "));
-            assert!(domain_count_line.is_some(), "Domain count metric line should exist");
+            let domain_count_line = lines
+                .iter()
+                .find(|l| l.starts_with("rust_router_rules_domain_count "));
+            assert!(
+                domain_count_line.is_some(),
+                "Domain count metric line should exist"
+            );
         } else {
             panic!("Expected PrometheusMetrics response");
         }
@@ -9386,10 +10159,7 @@ mod tests {
         assert_eq!(escape_label_value("with\nnewline"), "with\\nnewline");
 
         // Test combined
-        assert_eq!(
-            escape_label_value("a\"b\\c\nd"),
-            "a\\\"b\\\\c\\nd"
-        );
+        assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
     #[test]
@@ -9591,10 +10361,16 @@ mod tests {
     #[tokio::test]
     async fn test_get_ingress_stats_populated() {
         let (handler, forwarding_stats, reply_stats) = create_test_handler_with_ingress_stats();
-        forwarding_stats.packets_forwarded.fetch_add(3, Ordering::Relaxed);
-        forwarding_stats.bytes_forwarded.fetch_add(512, Ordering::Relaxed);
+        forwarding_stats
+            .packets_forwarded
+            .fetch_add(3, Ordering::Relaxed);
+        forwarding_stats
+            .bytes_forwarded
+            .fetch_add(512, Ordering::Relaxed);
         reply_stats.packets_received.fetch_add(2, Ordering::Relaxed);
-        reply_stats.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+        reply_stats
+            .packets_forwarded
+            .fetch_add(1, Ordering::Relaxed);
 
         let response = handler.handle(IpcCommand::GetIngressStats).await;
 
@@ -9662,7 +10438,9 @@ mod tests {
     fn create_test_handler_with_chain_manager() -> IpcHandler {
         let outbound_manager = Arc::new(OutboundManager::new());
         outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple("direct")));
-        outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple("pia-us-east")));
+        outbound_manager.add(Box::new(crate::outbound::DirectOutbound::simple(
+            "pia-us-east",
+        )));
 
         let conn_config = ConnectionConfig::default();
         let connection_manager = Arc::new(ConnectionManager::new(
@@ -9730,7 +10508,11 @@ mod tests {
             })
             .await;
 
-        assert!(!response.is_error(), "Expected success, got: {:?}", response);
+        assert!(
+            !response.is_error(),
+            "Expected success, got: {:?}",
+            response
+        );
     }
 
     #[tokio::test]
@@ -9861,7 +10643,10 @@ mod tests {
 
         if let IpcResponse::ChainStatus(status) = response {
             assert_eq!(status.tag, "test-chain-6");
-            assert!(matches!(status.state, crate::ipc::protocol::ChainState::Inactive));
+            assert!(matches!(
+                status.state,
+                crate::ipc::protocol::ChainState::Inactive
+            ));
             assert!(status.dscp_value >= 1 && status.dscp_value <= 63);
         } else {
             panic!("Expected ChainStatus response");
@@ -10158,7 +10943,10 @@ mod tests {
             .await;
 
         if let IpcResponse::ChainStatus(status) = response {
-            assert!(matches!(status.state, crate::ipc::protocol::ChainState::Error));
+            assert!(matches!(
+                status.state,
+                crate::ipc::protocol::ChainState::Error
+            ));
             assert_eq!(status.last_error, Some("Test error".to_string()));
         } else {
             panic!("Expected ChainStatus response");

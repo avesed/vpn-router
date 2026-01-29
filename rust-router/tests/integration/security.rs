@@ -25,8 +25,7 @@ use std::time::Duration;
 
 use rust_router::ipc::{decode_message, encode_message, IpcCommand};
 use rust_router::rules::{
-    ConnectionInfo, DomainMatcherBuilder, RuleEngine, RuleType,
-    RoutingSnapshotBuilder,
+    ConnectionInfo, DomainMatcherBuilder, RoutingSnapshotBuilder, RuleEngine, RuleType,
 };
 
 // ============================================================================
@@ -63,7 +62,10 @@ mod input_validation {
         assert!(result.is_none());
 
         // Test with max subdomain components
-        let many_subdomains = (0..128).map(|i| format!("sub{}", i)).collect::<Vec<_>>().join(".");
+        let many_subdomains = (0..128)
+            .map(|i| format!("sub{}", i))
+            .collect::<Vec<_>>()
+            .join(".");
         let result = matcher.match_domain(&many_subdomains);
         assert!(result.is_none());
     }
@@ -108,7 +110,7 @@ mod input_validation {
     #[test]
     fn test_punycode_domains() {
         let matcher = DomainMatcherBuilder::new()
-            .add_suffix("xn--n3h.com", "emoji")  // 😀.com in punycode
+            .add_suffix("xn--n3h.com", "emoji") // 😀.com in punycode
             .build()
             .expect("build failed");
 
@@ -208,8 +210,8 @@ mod boundary_checks {
     #[test]
     fn test_ip_boundaries() {
         // All zeros (unspecified)
-        let conn = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        let conn =
+            ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
         assert!(conn.dest_ip.is_some());
 
         // All ones (broadcast)
@@ -218,26 +220,21 @@ mod boundary_checks {
         assert!(conn.dest_ip.is_some());
 
         // Loopback
-        let conn = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let conn = ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(conn.dest_ip.is_some());
 
         // IPv6 loopback
-        let conn = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let conn = ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
         assert!(conn.dest_ip.is_some());
 
         // IPv6 all zeros
-        let conn = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        let conn = ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
         assert!(conn.dest_ip.is_some());
 
         // IPv6 max address
-        let conn = ConnectionInfo::new("tcp", 80)
-            .with_dest_ip(IpAddr::V6(Ipv6Addr::new(
-                0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-                0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-            )));
+        let conn = ConnectionInfo::new("tcp", 80).with_dest_ip(IpAddr::V6(Ipv6Addr::new(
+            0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+        )));
         assert!(conn.dest_ip.is_some());
     }
 
@@ -255,10 +252,7 @@ mod boundary_checks {
             );
         }
 
-        let snapshot = builder
-            .default_outbound("direct")
-            .version(1)
-            .build();
+        let snapshot = builder.default_outbound("direct").version(1).build();
 
         assert!(snapshot.is_ok(), "Should handle 10k rules");
     }
@@ -353,11 +347,11 @@ mod ipc_security {
     fn test_ipc_control_characters() {
         // Test various control character injections
         let control_chars = [
-            "\x00",  // Null
-            "\x01",  // Start of heading
-            "\x07",  // Bell
-            "\x1b",  // Escape
-            "\r\n",  // CRLF
+            "\x00", // Null
+            "\x01", // Start of heading
+            "\x07", // Bell
+            "\x1b", // Escape
+            "\r\n", // CRLF
         ];
 
         for ctrl in control_chars {
@@ -394,7 +388,9 @@ mod ipc_security {
         }
 
         // Test Shutdown separately due to struct variant
-        let shutdown_cmd = IpcCommand::Shutdown { drain_timeout_secs: Some(30) };
+        let shutdown_cmd = IpcCommand::Shutdown {
+            drain_timeout_secs: Some(30),
+        };
         let encoded = encode_message(&shutdown_cmd).expect("encode Shutdown failed");
         let decoded: IpcCommand = decode_message(&encoded[4..]).expect("decode Shutdown failed");
         match decoded {
@@ -493,8 +489,8 @@ mod dos_resistance {
     /// Test concurrent matching doesn't deadlock
     #[test]
     fn test_no_deadlock_under_load() {
-        use std::thread;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
 
         let engine = Arc::new(RuleEngine::new(
             RoutingSnapshotBuilder::new()
@@ -513,8 +509,7 @@ mod dos_resistance {
                 let stop = Arc::clone(&stop);
                 thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        let conn = ConnectionInfo::new("tcp", 443)
-                            .with_domain("test.example.com");
+                        let conn = ConnectionInfo::new("tcp", 443).with_domain("test.example.com");
                         let _ = engine.match_connection(&conn);
                     }
                 })

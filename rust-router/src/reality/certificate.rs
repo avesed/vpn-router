@@ -43,8 +43,8 @@ impl RemoteKeyPair for HmacSigningKey {
 
     fn sign(&self, _msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
         // Ignore the TBS data - compute HMAC-SHA512(auth_key, public_key)
-        let mut mac = HmacSha512::new_from_slice(&self.auth_key)
-            .expect("HMAC can take key of any size");
+        let mut mac =
+            HmacSha512::new_from_slice(&self.auth_key).expect("HMAC can take key of any size");
         mac.update(&self.public_key);
         let result = mac.finalize();
         // HMAC-SHA512 produces 64 bytes, which matches Ed25519 signature size
@@ -107,9 +107,11 @@ pub fn generate_hmac_certificate(
     let mut params = rcgen::CertificateParams::default();
 
     // Set hostname as SAN
-    let san = rcgen::SanType::DnsName(hostname.try_into().map_err(|_| {
-        RealityError::config("Invalid hostname for certificate".to_string())
-    })?);
+    let san = rcgen::SanType::DnsName(
+        hostname
+            .try_into()
+            .map_err(|_| RealityError::config("Invalid hostname for certificate".to_string()))?,
+    );
     params.subject_alt_names = vec![san];
 
     // Empty distinguished name (minimal certificate)
@@ -119,9 +121,9 @@ pub fn generate_hmac_certificate(
     params.serial_number = Some(rcgen::SerialNumber::from(vec![0u8]));
 
     // Generate self-signed certificate with HMAC as signature
-    let cert = params.self_signed(&key_pair).map_err(|e| {
-        RealityError::config(format!("Failed to create HMAC certificate: {}", e))
-    })?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| RealityError::config(format!("Failed to create HMAC certificate: {}", e)))?;
 
     let der = cert.der().to_vec();
 
@@ -184,8 +186,8 @@ mod tests {
         let cert = generate_hmac_certificate(&auth_key, "test.example.com").unwrap();
 
         // Find where the signature should be
-        let sig_offset = find_signature_offset(&cert.der)
-            .expect("Should find signature offset in certificate");
+        let sig_offset =
+            find_signature_offset(&cert.der).expect("Should find signature offset in certificate");
 
         // Compute what the HMAC should be
         let mut mac = HmacSha512::new_from_slice(&auth_key).unwrap();
@@ -212,8 +214,7 @@ mod tests {
 
         // Different Ed25519 keys (random generation)
         assert_ne!(
-            cert1.public_key,
-            cert2.public_key,
+            cert1.public_key, cert2.public_key,
             "Each call should generate a new random keypair"
         );
 
@@ -228,13 +229,19 @@ mod tests {
         let mut mac1 = HmacSha512::new_from_slice(&auth_key).unwrap();
         mac1.update(&cert1.public_key);
         let expected1 = mac1.finalize().into_bytes();
-        assert_eq!(&cert1.der[sig_offset1..sig_offset1 + 64], expected1.as_slice());
+        assert_eq!(
+            &cert1.der[sig_offset1..sig_offset1 + 64],
+            expected1.as_slice()
+        );
 
         // Verify HMAC for cert2
         let mut mac2 = HmacSha512::new_from_slice(&auth_key).unwrap();
         mac2.update(&cert2.public_key);
         let expected2 = mac2.finalize().into_bytes();
-        assert_eq!(&cert2.der[sig_offset2..sig_offset2 + 64], expected2.as_slice());
+        assert_eq!(
+            &cert2.der[sig_offset2..sig_offset2 + 64],
+            expected2.as_slice()
+        );
     }
 
     #[test]

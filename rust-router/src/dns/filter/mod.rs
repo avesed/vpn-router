@@ -71,7 +71,7 @@ pub use response::BlockedResponseBuilder;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::{BlockingConfig, BlockResponseType};
+    use crate::dns::{BlockResponseType, BlockingConfig};
 
     #[test]
     fn test_module_exports() {

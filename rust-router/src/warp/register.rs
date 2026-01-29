@@ -32,7 +32,10 @@ pub fn generate_keypair() -> Result<(String, String)> {
 }
 
 /// Register a new WARP device with Cloudflare
-pub async fn register_device(tag: String, warp_plus_license: Option<String>) -> Result<WarpRegistration> {
+pub async fn register_device(
+    tag: String,
+    warp_plus_license: Option<String>,
+) -> Result<WarpRegistration> {
     info!("Registering WARP device with tag: {}", tag);
 
     // Step 1: Generate keypair
@@ -72,10 +75,7 @@ pub async fn register_device(tag: String, warp_plus_license: Option<String>) -> 
     }
 
     info!("WARP registration successful: {}", tag);
-    Ok(WarpRegistration {
-        tag,
-        ..config
-    })
+    Ok(WarpRegistration { tag, ..config })
 }
 
 /// Validate WARP+ license key format
@@ -253,7 +253,11 @@ fn extract_config(resp: &RegisterResponse, private_key: &str) -> Result<WarpRegi
 }
 
 /// Upgrade account to WARP+
-async fn upgrade_to_plus(account_id: &str, license_key: &str, warp_plus_license: &str) -> Result<()> {
+async fn upgrade_to_plus(
+    account_id: &str,
+    license_key: &str,
+    warp_plus_license: &str,
+) -> Result<()> {
     debug!("Upgrading account {} to WARP+", account_id);
 
     // Install rustls crypto provider if not already installed

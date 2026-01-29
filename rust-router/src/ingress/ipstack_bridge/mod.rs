@@ -73,11 +73,16 @@ mod sharded_bridge;
 #[cfg(all(feature = "ipstack-tcp", feature = "fakedns"))]
 pub mod dns_hijack;
 
-#[cfg(all(feature = "ipstack-tcp", any(feature = "sni-sniffing", feature = "fakedns")))]
+#[cfg(all(
+    feature = "ipstack-tcp",
+    any(feature = "sni-sniffing", feature = "fakedns")
+))]
 pub mod domain_resolver;
 
 #[cfg(feature = "ipstack-tcp")]
-pub use bridge::{DiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot};
+pub use bridge::{
+    DiagnosticSnapshot, IpStackBridge, IpStackBridgeStats, IpStackBridgeStatsSnapshot,
+};
 #[cfg(feature = "ipstack-tcp")]
 pub use config::*;
 #[cfg(feature = "ipstack-tcp")]

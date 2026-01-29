@@ -188,9 +188,9 @@ impl UdpClient {
     /// This method sends a query and waits for a response without retries.
     async fn query_once(&self, query: &Message) -> DnsResult<Message> {
         // Serialize the query
-        let query_bytes = query.to_vec().map_err(|e| {
-            DnsError::serialize(format!("failed to serialize DNS query: {e}"))
-        })?;
+        let query_bytes = query
+            .to_vec()
+            .map_err(|e| DnsError::serialize(format!("failed to serialize DNS query: {e}")))?;
 
         // Check message size
         if query_bytes.len() > MAX_UDP_MESSAGE_SIZE {
@@ -202,17 +202,20 @@ impl UdpClient {
         }
 
         // Create a new UDP socket bound to any available port
-        let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-            DnsError::network_io("failed to bind UDP socket", e)
-        })?;
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| DnsError::network_io("failed to bind UDP socket", e))?;
 
         // Send the query
-        socket.send_to(&query_bytes, self.server_addr).await.map_err(|e| {
-            DnsError::network_io(
-                format!("failed to send UDP query to {}", self.server_addr),
-                e,
-            )
-        })?;
+        socket
+            .send_to(&query_bytes, self.server_addr)
+            .await
+            .map_err(|e| {
+                DnsError::network_io(
+                    format!("failed to send UDP query to {}", self.server_addr),
+                    e,
+                )
+            })?;
 
         // Wait for response with timeout
         let mut recv_buf = vec![0u8; UDP_RECV_BUFFER_SIZE];
@@ -224,14 +227,16 @@ impl UdpClient {
                 if src != self.server_addr {
                     return Err(DnsError::upstream(
                         &self.config.address,
-                        format!("response from unexpected source: {} (expected {})", src, self.server_addr),
+                        format!(
+                            "response from unexpected source: {} (expected {})",
+                            src, self.server_addr
+                        ),
                     ));
                 }
 
                 // Parse the response
-                let response = Message::from_vec(&recv_buf[..len]).map_err(|e| {
-                    DnsError::parse(format!("failed to parse DNS response: {e}"))
-                })?;
+                let response = Message::from_vec(&recv_buf[..len])
+                    .map_err(|e| DnsError::parse(format!("failed to parse DNS response: {e}")))?;
 
                 // Validate response matches query
                 if !validate_response(query, &response) {
@@ -243,18 +248,14 @@ impl UdpClient {
 
                 Ok(response)
             }
-            Ok(Err(e)) => {
-                Err(DnsError::network_io(
-                    format!("failed to receive UDP response from {}", self.server_addr),
-                    e,
-                ))
-            }
-            Err(_) => {
-                Err(DnsError::timeout(
-                    format!("UDP query to {}", self.server_addr),
-                    self.timeout,
-                ))
-            }
+            Ok(Err(e)) => Err(DnsError::network_io(
+                format!("failed to receive UDP response from {}", self.server_addr),
+                e,
+            )),
+            Err(_) => Err(DnsError::timeout(
+                format!("UDP query to {}", self.server_addr),
+                self.timeout,
+            )),
         }
     }
 }

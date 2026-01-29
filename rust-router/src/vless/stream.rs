@@ -101,7 +101,10 @@ impl VlessStream {
         // Check version (1 byte)
         let version = data[0];
         if version != VLESS_VERSION {
-            warn!("Invalid VLESS response version: {} (expected {})", version, VLESS_VERSION);
+            warn!(
+                "Invalid VLESS response version: {} (expected {})",
+                version, VLESS_VERSION
+            );
             return Err(VlessError::InvalidVersion(version));
         }
 
@@ -121,7 +124,8 @@ impl VlessStream {
 
         trace!(
             "Consumed VLESS response header: version={}, addons_len={}",
-            version, addons_len
+            version,
+            addons_len
         );
 
         Ok(total_header_len)

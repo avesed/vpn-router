@@ -63,9 +63,9 @@ use super::packet_channel::PacketChannel;
 use super::session_tracker::{FiveTuple, SessionTracker};
 use crate::outbound::{OutboundManager, OutboundStream, WgEgressBridge};
 use crate::rules::engine::RuleEngine;
-use dashmap::DashMap;
 use ahash::AHasher;
 use bytes::BytesMut;
+use dashmap::DashMap;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -498,7 +498,9 @@ impl ShardedIpStackBridge {
     ///
     /// The bridge if it exists
     pub fn get_wg_egress_bridge(&self, tag: &str) -> Option<Arc<WgEgressBridge>> {
-        self.wg_egress_bridges.get(tag).map(|v| Arc::clone(v.value()))
+        self.wg_egress_bridges
+            .get(tag)
+            .map(|v| Arc::clone(v.value()))
     }
 
     /// Get a reference to all WG egress bridges
@@ -584,7 +586,12 @@ impl ShardedIpStackBridge {
         if let Some(ref ft) = five_tuple {
             if self
                 .session_tracker
-                .register_forward_only(peer_key, peer_endpoint, ft.clone(), outbound_tag.to_string())
+                .register_forward_only(
+                    peer_key,
+                    peer_endpoint,
+                    ft.clone(),
+                    outbound_tag.to_string(),
+                )
                 .is_none()
             {
                 warn!("Session limit reached, dropping packet");
@@ -606,7 +613,10 @@ impl ShardedIpStackBridge {
                 if let Some(ref ft) = five_tuple {
                     self.session_tracker.remove(ft);
                 }
-                Err(anyhow::anyhow!("packet channel closed for shard {}", shard_idx))
+                Err(anyhow::anyhow!(
+                    "packet channel closed for shard {}",
+                    shard_idx
+                ))
             }
         }
     }
@@ -645,7 +655,12 @@ impl ShardedIpStackBridge {
         if let Some(ref ft) = five_tuple {
             if self
                 .session_tracker
-                .register_forward_only(peer_key, peer_endpoint, ft.clone(), outbound_tag.to_string())
+                .register_forward_only(
+                    peer_key,
+                    peer_endpoint,
+                    ft.clone(),
+                    outbound_tag.to_string(),
+                )
                 .is_none()
             {
                 warn!("Session limit reached, dropping packet");
@@ -837,10 +852,9 @@ impl ShardedIpStackBridge {
         }
 
         // Take the packet receivers
-        let packet_rxs = self
-            .packet_rxs
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("packet_rxs already taken (bridge was already started)"))?;
+        let packet_rxs = self.packet_rxs.take().ok_or_else(|| {
+            anyhow::anyhow!("packet_rxs already taken (bridge was already started)")
+        })?;
 
         info!(
             shard_count = self.shard_count,
@@ -956,11 +970,7 @@ impl ShardedIpStackBridge {
         while running.load(Ordering::SeqCst) {
             match packet_rx.recv().await {
                 Some(packet) => {
-                    trace!(
-                        shard_id,
-                        len = packet.len(),
-                        "Forwarding packet to ipstack"
-                    );
+                    trace!(shard_id, len = packet.len(), "Forwarding packet to ipstack");
                     if let Err(e) = ipstack_tx.send(packet).await {
                         warn!(shard_id, error = %e, "Failed to send packet to ipstack");
                         break;
@@ -1030,7 +1040,9 @@ impl ShardedIpStackBridge {
                                         Ok(Err(_)) => break, // Channel closed
                                         Err(_) => {
                                             // Timeout - drop packet, TCP will retransmit
-                                            global_stats.reply_drops.fetch_add(1, Ordering::Relaxed);
+                                            global_stats
+                                                .reply_drops
+                                                .fetch_add(1, Ordering::Relaxed);
                                             debug!(
                                                 shard_id,
                                                 "Reply channel timeout, packet dropped (TCP will retransmit)"
@@ -1053,7 +1065,10 @@ impl ShardedIpStackBridge {
                     }
                 }
                 None => {
-                    debug!(shard_id, "ipstack output channel closed, stopping reply router");
+                    debug!(
+                        shard_id,
+                        "ipstack output channel closed, stopping reply router"
+                    );
                     break;
                 }
             }
@@ -1228,7 +1243,9 @@ impl ShardedIpStackBridge {
 
                 match handle_tcp_dns_query(&mut buffered, fakedns.as_ref()).await {
                     Ok(()) => {
-                        global_stats.dns_queries_hijacked.fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .dns_queries_hijacked
+                            .fetch_add(1, Ordering::Relaxed);
                         trace!(shard_id, "TCP DNS query hijacked via FakeDNS");
                     }
                     Err(e) => {
@@ -1248,15 +1265,11 @@ impl ShardedIpStackBridge {
             use tokio::io::AsyncBufReadExt;
 
             // Peek first packet for SNI/HTTP sniffing (with timeout)
-            let first_packet: Option<Vec<u8>> = match tokio::time::timeout(
-                sni_peek_timeout(),
-                buffered.fill_buf(),
-            )
-            .await
-            {
-                Ok(Ok(data)) if !data.is_empty() => Some(data.to_vec()),
-                _ => None,
-            };
+            let first_packet: Option<Vec<u8>> =
+                match tokio::time::timeout(sni_peek_timeout(), buffered.fill_buf()).await {
+                    Ok(Ok(data)) if !data.is_empty() => Some(data.to_vec()),
+                    _ => None,
+                };
 
             resolve_domain(
                 peer_addr.ip(),
@@ -1278,9 +1291,7 @@ impl ShardedIpStackBridge {
                     .fetch_add(1, Ordering::Relaxed);
             }
             DomainSource::TlsSni => {
-                global_stats
-                    .sni_extractions
-                    .fetch_add(1, Ordering::Relaxed);
+                global_stats.sni_extractions.fetch_add(1, Ordering::Relaxed);
             }
             DomainSource::HttpHost => {
                 global_stats
@@ -1399,7 +1410,9 @@ impl ShardedIpStackBridge {
                 );
 
                 // Track WG egress connection
-                global_stats.wg_egress_tcp_connections.fetch_add(1, Ordering::Relaxed);
+                global_stats
+                    .wg_egress_tcp_connections
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Forward TCP stream through WG egress bridge
                 // Note: We need to pass the underlying tcp_stream, not the buffered one,
@@ -1422,9 +1435,15 @@ impl ShardedIpStackBridge {
                             error = %e,
                             "WG egress TCP forward failed"
                         );
-                        shard_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                        global_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                        global_stats.wg_egress_failures.fetch_add(1, Ordering::Relaxed);
+                        shard_stats
+                            .tcp_connections_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .tcp_connections_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .wg_egress_failures
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
@@ -1466,8 +1485,12 @@ impl ShardedIpStackBridge {
                                 error = %e,
                                 "Failed to connect via outbound"
                             );
-                            shard_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                            global_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                            shard_stats
+                                .tcp_connections_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            global_stats
+                                .tcp_connections_failed
+                                .fetch_add(1, Ordering::Relaxed);
                             session_tracker.remove(&five_tuple);
                             return;
                         }
@@ -1507,15 +1530,23 @@ impl ShardedIpStackBridge {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(e)) => {
                         warn!(shard_id, peer = %peer_addr, error = %e, "Failed to connect directly");
-                        shard_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                        global_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                        shard_stats
+                            .tcp_connections_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .tcp_connections_failed
+                            .fetch_add(1, Ordering::Relaxed);
                         session_tracker.remove(&five_tuple);
                         return;
                     }
                     Err(_) => {
                         warn!(shard_id, peer = %peer_addr, "Connection timeout");
-                        shard_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
-                        global_stats.tcp_connections_failed.fetch_add(1, Ordering::Relaxed);
+                        shard_stats
+                            .tcp_connections_failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .tcp_connections_failed
+                            .fetch_add(1, Ordering::Relaxed);
                         session_tracker.remove(&five_tuple);
                         return;
                     }
@@ -1559,10 +1590,18 @@ impl ShardedIpStackBridge {
         .await
         {
             Ok((to_outbound, from_outbound)) => {
-                shard_stats.bytes_to_outbound.fetch_add(to_outbound, Ordering::Relaxed);
-                shard_stats.bytes_from_outbound.fetch_add(from_outbound, Ordering::Relaxed);
-                global_stats.bytes_to_outbound.fetch_add(to_outbound, Ordering::Relaxed);
-                global_stats.bytes_from_outbound.fetch_add(from_outbound, Ordering::Relaxed);
+                shard_stats
+                    .bytes_to_outbound
+                    .fetch_add(to_outbound, Ordering::Relaxed);
+                shard_stats
+                    .bytes_from_outbound
+                    .fetch_add(from_outbound, Ordering::Relaxed);
+                global_stats
+                    .bytes_to_outbound
+                    .fetch_add(to_outbound, Ordering::Relaxed);
+                global_stats
+                    .bytes_from_outbound
+                    .fetch_add(from_outbound, Ordering::Relaxed);
                 debug!(
                     shard_id,
                     local = %local_addr,
@@ -1616,7 +1655,9 @@ impl ShardedIpStackBridge {
 
                 match handle_udp_dns_query(&mut udp_stream, fakedns.as_ref()).await {
                     Ok(()) => {
-                        global_stats.dns_queries_hijacked.fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .dns_queries_hijacked
+                            .fetch_add(1, Ordering::Relaxed);
                         trace!(shard_id, "UDP DNS query hijacked via FakeDNS");
                     }
                     Err(e) => {
@@ -1704,7 +1745,9 @@ impl ShardedIpStackBridge {
                 );
 
                 // Track WG egress session
-                global_stats.wg_egress_udp_sessions.fetch_add(1, Ordering::Relaxed);
+                global_stats
+                    .wg_egress_udp_sessions
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Forward UDP stream through WG egress bridge
                 match wg_bridge.forward_udp(udp_stream, peer_addr).await {
@@ -1724,7 +1767,9 @@ impl ShardedIpStackBridge {
                             error = %e,
                             "WG egress UDP forward failed"
                         );
-                        global_stats.wg_egress_failures.fetch_add(1, Ordering::Relaxed);
+                        global_stats
+                            .wg_egress_failures
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
@@ -2168,7 +2213,9 @@ mod tests {
         let peer_key = [0u8; 32];
         let peer_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 51820);
 
-        let result = bridge.inject_packet(BytesMut::from(&packet[..]), peer_key, peer_endpoint).await;
+        let result = bridge
+            .inject_packet(BytesMut::from(&packet[..]), peer_key, peer_endpoint)
+            .await;
         assert!(result.is_ok());
 
         let stats = bridge.stats.snapshot();
@@ -2188,7 +2235,8 @@ mod tests {
         let peer_key = [0u8; 32];
         let peer_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 51820);
 
-        let success = bridge.try_inject_packet(BytesMut::from(&packet[..]), peer_key, peer_endpoint);
+        let success =
+            bridge.try_inject_packet(BytesMut::from(&packet[..]), peer_key, peer_endpoint);
         assert!(success);
 
         let stats = bridge.stats.snapshot();
@@ -2434,11 +2482,11 @@ mod tests {
     // Helper function to create a test IPv6 TCP packet without extension headers
     fn create_test_ipv6_tcp_packet(src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut packet = vec![0u8; 60]; // 40 byte IPv6 header + 20 byte TCP header
-        // IPv6 header
+                                        // IPv6 header
         packet[0] = 0x60; // Version 6
         packet[6] = 6; // Next Header: TCP
         packet[7] = 64; // Hop Limit
-        // Source IP: 2001:db8::1 (simplified)
+                        // Source IP: 2001:db8::1 (simplified)
         packet[8..24].copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
@@ -2457,11 +2505,11 @@ mod tests {
     // Helper function to create IPv6 TCP packet with Hop-by-Hop extension header
     fn create_test_ipv6_tcp_with_hop_by_hop(src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut packet = vec![0u8; 68]; // 40 byte IPv6 + 8 byte ext header + 20 byte TCP
-        // IPv6 header
+                                        // IPv6 header
         packet[0] = 0x60; // Version 6
         packet[6] = 0; // Next Header: Hop-by-Hop Options
         packet[7] = 64; // Hop Limit
-        // Source IP: 2001:db8::1
+                        // Source IP: 2001:db8::1
         packet[8..24].copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
@@ -2474,9 +2522,9 @@ mod tests {
         // Hop-by-Hop Options header (8 bytes min)
         packet[40] = 6; // Next Header: TCP
         packet[41] = 0; // Hdr Ext Len: 0 (means 8 bytes total)
-        // Padding to fill 8 bytes
+                        // Padding to fill 8 bytes
         packet[42..48].copy_from_slice(&[0x01, 0x04, 0x00, 0x00, 0x00, 0x00]); // PadN option
-        // TCP header
+                                                                               // TCP header
         packet[48..50].copy_from_slice(&src_port.to_be_bytes());
         packet[50..52].copy_from_slice(&dst_port.to_be_bytes());
         packet
@@ -2485,11 +2533,11 @@ mod tests {
     // Helper function to create IPv6 TCP packet with Fragment extension header
     fn create_test_ipv6_tcp_with_fragment(src_port: u16, dst_port: u16) -> Vec<u8> {
         let mut packet = vec![0u8; 68]; // 40 byte IPv6 + 8 byte fragment header + 20 byte TCP
-        // IPv6 header
+                                        // IPv6 header
         packet[0] = 0x60; // Version 6
         packet[6] = 44; // Next Header: Fragment
         packet[7] = 64; // Hop Limit
-        // Source IP: 2001:db8::1
+                        // Source IP: 2001:db8::1
         packet[8..24].copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
@@ -2504,7 +2552,7 @@ mod tests {
         packet[41] = 0; // Reserved
         packet[42..44].copy_from_slice(&[0x00, 0x00]); // Fragment Offset + M flag
         packet[44..48].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]); // Identification
-        // TCP header
+                                                                   // TCP header
         packet[48..50].copy_from_slice(&src_port.to_be_bytes());
         packet[50..52].copy_from_slice(&dst_port.to_be_bytes());
         packet
@@ -2552,7 +2600,7 @@ mod tests {
         let mut packet = vec![0u8; 44];
         packet[0] = 0x60; // Version 6
         packet[6] = 59; // Next Header: No Next Header
-        // Fill addresses
+                        // Fill addresses
         packet[8..24].copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,
@@ -2573,7 +2621,7 @@ mod tests {
         let mut packet = vec![0u8; 42]; // Only 2 bytes after fixed header
         packet[0] = 0x60; // Version 6
         packet[6] = 0; // Next Header: Hop-by-Hop Options
-        // Fill addresses
+                       // Fill addresses
         packet[8..24].copy_from_slice(&[
             0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01,

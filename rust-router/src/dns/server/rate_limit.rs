@@ -302,7 +302,11 @@ impl DnsRateLimiter {
     /// );
     /// ```
     #[must_use]
-    pub fn with_limits(config: &RateLimitConfig, max_clients: usize, cleanup_interval_secs: u64) -> Self {
+    pub fn with_limits(
+        config: &RateLimitConfig,
+        max_clients: usize,
+        cleanup_interval_secs: u64,
+    ) -> Self {
         // Create quota from config
         // NonZeroU32 requires the value to be at least 1
         let qps = NonZeroU32::new(config.qps_per_client.max(1)).expect("qps must be at least 1");
@@ -697,7 +701,11 @@ mod tests {
         }
 
         // Should have allowed the burst amount
-        assert!(allowed >= 10, "Expected at least 10 allowed, got {}", allowed);
+        assert!(
+            allowed >= 10,
+            "Expected at least 10 allowed, got {}",
+            allowed
+        );
     }
 
     #[test]

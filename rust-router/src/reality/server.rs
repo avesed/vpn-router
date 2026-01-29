@@ -414,11 +414,8 @@ where
                     }
                 };
 
-                let mut decryptor = RecordDecryptor::new(
-                    &client_key,
-                    &client_iv,
-                    &mut self.read_seq,
-                );
+                let mut decryptor =
+                    RecordDecryptor::new(&client_key, &client_iv, &mut self.read_seq);
 
                 match decryptor.decrypt_record_in_place(&mut ciphertext, record_len as u16) {
                     Ok((content_type, plaintext)) => {
@@ -476,11 +473,7 @@ where
         };
 
         {
-            let mut encryptor = RecordEncryptor::new(
-                &server_key,
-                &server_iv,
-                &mut self.write_seq,
-            );
+            let mut encryptor = RecordEncryptor::new(&server_key, &server_iv, &mut self.write_seq);
             if let Err(e) = encryptor.encrypt_app_data(&mut plaintext_buf, &mut ciphertext_buf) {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -541,7 +534,8 @@ impl RealityServer {
     /// For example, "www.google.com:443" returns "www.google.com"
     fn dest_hostname(&self) -> String {
         // Strip port from dest (e.g., "www.google.com:443" -> "www.google.com")
-        self.config.dest
+        self.config
+            .dest
             .rsplit_once(':')
             .map(|(host, _port)| host.to_string())
             .unwrap_or_else(|| self.config.dest.clone())
@@ -592,7 +586,8 @@ impl RealityServer {
 
         // Validate REALITY authentication
         let normalized_short_ids = self.config.normalized_short_ids();
-        let client_hello_aad = self.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+        let client_hello_aad =
+            self.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
 
         match validate_auth(
             &parsed.client_random,
@@ -703,8 +698,10 @@ impl RealityServer {
         let server_ephemeral_public = server_keypair.public_key_bytes();
 
         // 2. Compute ECDH shared secret for TLS key derivation
-        let tls_shared_secret =
-            perform_ecdh(&server_keypair.private_key_bytes(), &parsed.client_public_key)?;
+        let tls_shared_secret = perform_ecdh(
+            &server_keypair.private_key_bytes(),
+            &parsed.client_public_key,
+        )?;
 
         // 3. Use default cipher suite (AES_128_GCM_SHA256)
         let cipher_suite = DEFAULT_SERVER_CIPHER_SUITE;
@@ -733,8 +730,12 @@ impl RealityServer {
         let server_random: [u8; 32] = crate::reality::crypto::x25519::random_bytes();
         let session_id_echo = parsed.encrypted_session_id.to_vec(); // Echo back client's session ID
 
-        let server_hello =
-            construct_server_hello(&server_random, &session_id_echo, cipher_suite.id(), &server_ephemeral_public)?;
+        let server_hello = construct_server_hello(
+            &server_random,
+            &session_id_echo,
+            cipher_suite.id(),
+            &server_ephemeral_public,
+        )?;
 
         // 5. Compute transcript hash (ClientHello || ServerHello)
         let server_hello_hash = match cipher_suite.hash_algorithm() {
@@ -753,7 +754,8 @@ impl RealityServer {
         };
 
         // 6. Derive handshake keys
-        let hs_keys = derive_handshake_keys(cipher_suite, &tls_shared_secret, &[], &server_hello_hash)?;
+        let hs_keys =
+            derive_handshake_keys(cipher_suite, &tls_shared_secret, &[], &server_hello_hash)?;
 
         // 7. Derive server handshake traffic keys
         let (server_hs_key_bytes, server_hs_iv) =
@@ -788,7 +790,8 @@ impl RealityServer {
             }
         };
 
-        let certificate_verify = construct_certificate_verify(&hmac_cert.signing_key, &cert_verify_hash)?;
+        let certificate_verify =
+            construct_certificate_verify(&hmac_cert.signing_key, &cert_verify_hash)?;
 
         // Build transcript including CertificateVerify for Finished verify_data
         let mut transcript_for_finished = transcript_for_cert_verify;
@@ -926,7 +929,8 @@ impl RealityServer {
                 return Err(RealityError::protocol("Finished message too short"));
             }
 
-            let finished_len = u32::from_be_bytes([0, plaintext[1], plaintext[2], plaintext[3]]) as usize;
+            let finished_len =
+                u32::from_be_bytes([0, plaintext[1], plaintext[2], plaintext[3]]) as usize;
             if plaintext.len() < 4 + finished_len {
                 return Err(RealityError::protocol("Finished message truncated"));
             }
@@ -1106,9 +1110,10 @@ impl RealityServer {
             return true;
         }
 
-        self.config.server_names.iter().any(|allowed| {
-            allowed.eq_ignore_ascii_case(sni)
-        })
+        self.config
+            .server_names
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(sni))
     }
 
     /// Build ClientHello AAD with zeroed session ID
@@ -1140,14 +1145,12 @@ impl RealityServer {
         debug!(dest = %self.config.dest, "Proxying to fallback");
 
         // Connect to fallback destination
-        let mut fallback_stream = TcpStream::connect(&self.config.dest)
-            .await
-            .map_err(|e| {
-                RealityError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to connect to fallback {}: {}", self.config.dest, e),
-                ))
-            })?;
+        let mut fallback_stream = TcpStream::connect(&self.config.dest).await.map_err(|e| {
+            RealityError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Failed to connect to fallback {}: {}", self.config.dest, e),
+            ))
+        })?;
 
         // Forward the initial ClientHello
         fallback_stream.write_all(initial_data).await.map_err(|e| {
@@ -1215,23 +1218,31 @@ pub fn extract_client_sni(client_hello: &[u8]) -> RealityResult<String> {
 
     // Cipher suites length (2)
     if client_hello.len() < offset + 2 {
-        return Err(RealityError::protocol("ClientHello truncated at cipher suites"));
+        return Err(RealityError::protocol(
+            "ClientHello truncated at cipher suites",
+        ));
     }
-    let cipher_suites_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    let cipher_suites_len =
+        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
     offset += 2 + cipher_suites_len;
 
     // Compression methods length (1)
     if client_hello.len() < offset + 1 {
-        return Err(RealityError::protocol("ClientHello truncated at compression"));
+        return Err(RealityError::protocol(
+            "ClientHello truncated at compression",
+        ));
     }
     let compression_len = client_hello[offset] as usize;
     offset += 1 + compression_len;
 
     // Extensions length (2)
     if client_hello.len() < offset + 2 {
-        return Err(RealityError::protocol("ClientHello truncated at extensions length"));
+        return Err(RealityError::protocol(
+            "ClientHello truncated at extensions length",
+        ));
     }
-    let extensions_len = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
+    let extensions_len =
+        u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]) as usize;
     offset += 2;
 
     if client_hello.len() < offset + extensions_len {
@@ -1244,7 +1255,8 @@ pub fn extract_client_sni(client_hello: &[u8]) -> RealityResult<String> {
     let mut ext_offset = 0;
     while ext_offset + 4 <= extensions.len() {
         let ext_type = u16::from_be_bytes([extensions[ext_offset], extensions[ext_offset + 1]]);
-        let ext_len = u16::from_be_bytes([extensions[ext_offset + 2], extensions[ext_offset + 3]]) as usize;
+        let ext_len =
+            u16::from_be_bytes([extensions[ext_offset + 2], extensions[ext_offset + 3]]) as usize;
 
         if ext_offset + 4 + ext_len > extensions.len() {
             break;
@@ -1276,7 +1288,9 @@ pub fn extract_client_sni(client_hello: &[u8]) -> RealityResult<String> {
         ext_offset += 4 + ext_len;
     }
 
-    Err(RealityError::protocol("SNI extension not found in ClientHello"))
+    Err(RealityError::protocol(
+        "SNI extension not found in ClientHello",
+    ))
 }
 
 #[cfg(test)]
@@ -1457,8 +1471,8 @@ mod tests {
     fn test_normalized_short_ids() {
         let config = RealityServerConfig {
             short_ids: vec![
-                vec![0x12, 0x34],  // Shorter than 8 bytes
-                vec![0xAB; 8],     // Exactly 8 bytes
+                vec![0x12, 0x34], // Shorter than 8 bytes
+                vec![0xAB; 8],    // Exactly 8 bytes
             ],
             ..create_test_config()
         };
@@ -1530,7 +1544,8 @@ mod tests {
         )
         .unwrap();
 
-        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+        let auth_key =
+            derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
 
         // Create session ID
         let session_id = SessionId::new([1, 8, 1], short_id);
@@ -1553,7 +1568,8 @@ mod tests {
 
         // Encrypt session ID
         let nonce = &client_random[20..32];
-        let encrypted_session_id = encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
+        let encrypted_session_id =
+            encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
 
         // Put encrypted session ID back
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
@@ -1571,7 +1587,8 @@ mod tests {
 
         // Validate REALITY auth
         let normalized_short_ids = server.config.normalized_short_ids();
-        let client_hello_aad = server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+        let client_hello_aad =
+            server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
 
         let result = validate_auth(
             &parsed.client_random,
@@ -1619,7 +1636,8 @@ mod tests {
         )
         .unwrap();
 
-        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+        let auth_key =
+            derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
 
         let session_id = SessionId::new([1, 8, 1], short_id);
         let plaintext = session_id.to_plaintext();
@@ -1637,12 +1655,14 @@ mod tests {
         client_hello[39..71].fill(0);
 
         let nonce = &client_random[20..32];
-        let encrypted_session_id = encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
+        let encrypted_session_id =
+            encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
         let parsed = server.parse_client_hello(&client_hello).unwrap();
         let normalized_short_ids = server.config.normalized_short_ids();
-        let client_hello_aad = server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+        let client_hello_aad =
+            server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
 
         let result = validate_auth(
             &parsed.client_random,
@@ -1688,11 +1708,12 @@ mod tests {
         // Client uses WRONG public key for key exchange
         let shared_secret = perform_ecdh(
             &client_keypair.private_key_bytes(),
-            different_public_key.as_bytes(),  // Wrong key!
+            different_public_key.as_bytes(), // Wrong key!
         )
         .unwrap();
 
-        let auth_key = derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
+        let auth_key =
+            derive_auth_key(&shared_secret, &client_random[0..20], REALITY_AUTH_INFO).unwrap();
 
         let session_id = SessionId::new([1, 8, 1], short_id);
         let plaintext = session_id.to_plaintext();
@@ -1710,12 +1731,14 @@ mod tests {
         client_hello[39..71].fill(0);
 
         let nonce = &client_random[20..32];
-        let encrypted_session_id = encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
+        let encrypted_session_id =
+            encrypt_session_id(&plaintext, &auth_key, nonce, &client_hello).unwrap();
         client_hello[39..71].copy_from_slice(&encrypted_session_id);
 
         let parsed = server.parse_client_hello(&client_hello).unwrap();
         let normalized_short_ids = server.config.normalized_short_ids();
-        let client_hello_aad = server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
+        let client_hello_aad =
+            server.build_client_hello_aad(&client_hello, &parsed.encrypted_session_id);
 
         let result = validate_auth(
             &parsed.client_random,
@@ -1759,11 +1782,8 @@ mod tests {
 
         // Client config - needs server's public key
         let server_public_key = server_config.public_key();
-        let client_config = RealityClientConfig::new(
-            server_public_key,
-            short_id,
-            server_name.to_string(),
-        );
+        let client_config =
+            RealityClientConfig::new(server_public_key, short_id, server_name.to_string());
 
         // === Create duplex stream for testing ===
         let (client_stream, server_stream) = tokio::io::duplex(65536);
@@ -1776,9 +1796,7 @@ mod tests {
                     Ok(RealityHandshakeResult::Authenticated { stream, short_id }) => {
                         Ok((stream, short_id))
                     }
-                    Ok(RealityHandshakeResult::Fallback) => {
-                        Err("Unexpected fallback".to_string())
-                    }
+                    Ok(RealityHandshakeResult::Fallback) => Err("Unexpected fallback".to_string()),
                     Err(e) => Err(format!("Server handshake failed: {}", e)),
                 }
             }
@@ -1807,7 +1825,9 @@ mod tests {
                     return Err("Connection closed during handshake".to_string());
                 }
 
-                let result = conn.feed(&buf[..n]).map_err(|e| format!("feed failed: {}", e))?;
+                let result = conn
+                    .feed(&buf[..n])
+                    .map_err(|e| format!("feed failed: {}", e))?;
 
                 // Send client Finished if needed
                 if !result.to_send.is_empty() {
@@ -1839,24 +1859,41 @@ mod tests {
         // Client -> Server
         let client_message = b"Hello from client!";
         let encrypted = client_conn.encrypt(client_message).expect("encrypt failed");
-        client_transport.write_all(&encrypted).await.expect("write failed");
+        client_transport
+            .write_all(&encrypted)
+            .await
+            .expect("write failed");
 
         let mut received = vec![0u8; 1024];
-        let n = server_stream.read(&mut received).await.expect("read failed");
+        let n = server_stream
+            .read(&mut received)
+            .await
+            .expect("read failed");
         assert!(n > 0, "Should receive data");
         assert_eq!(&received[..n], client_message, "Message should match");
 
         // Server -> Client
         let server_message = b"Hello from server!";
-        server_stream.write_all(server_message).await.expect("server write failed");
+        server_stream
+            .write_all(server_message)
+            .await
+            .expect("server write failed");
 
         // Read the encrypted response on client side
         let mut response_buf = vec![0u8; 16384];
-        let n = client_transport.read(&mut response_buf).await.expect("client read failed");
+        let n = client_transport
+            .read(&mut response_buf)
+            .await
+            .expect("client read failed");
         assert!(n > 0, "Client should receive data");
 
-        let result = client_conn.feed(&response_buf[..n]).expect("client feed failed");
-        assert_eq!(result.app_data, server_message, "Server message should match");
+        let result = client_conn
+            .feed(&response_buf[..n])
+            .expect("client feed failed");
+        assert_eq!(
+            result.app_data, server_message,
+            "Server message should match"
+        );
 
         println!("✓ End-to-end REALITY handshake and data transfer successful!");
     }
@@ -1892,7 +1929,10 @@ mod tests {
         // Client sends ClientHello with wrong short_id
         let mut client_conn = RealityClientConnection::new(client_config);
         let client_hello = client_conn.start().expect("start failed");
-        client_stream.write_all(&client_hello).await.expect("write failed");
+        client_stream
+            .write_all(&client_hello)
+            .await
+            .expect("write failed");
         drop(client_stream); // Close to trigger server processing
 
         // Server should attempt fallback (which will fail since dest is unreachable)

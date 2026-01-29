@@ -55,12 +55,12 @@ pub use manager::{OutboundManager, OutboundManagerBuilder};
 pub use shadowsocks::{ShadowsocksOutbound, ShadowsocksStream};
 pub use socks5::{PoolStats, Socks5Config, Socks5Error, Socks5Outbound};
 pub use socks5_udp::{Socks5Auth, Socks5UdpAssociation, Socks5UdpError};
-pub use vless::{
-    TlsSettings, UuidInput, VlessConfig, VlessOutbound, VlessOutboundError, VlessTransportConfig,
-};
 pub use traits::{
     DirectUdpHandle, HealthStatus, Outbound, OutboundConnection, OutboundExt, OutboundStream,
     PoolStatsInfo, ProxyServerInfo, Socks5UdpHandle, UdpOutboundHandle,
+};
+pub use vless::{
+    TlsSettings, UuidInput, VlessConfig, VlessOutbound, VlessOutboundError, VlessTransportConfig,
 };
 pub use wg_egress_bridge::{
     ReplyKey, WgEgressBridge, WgEgressBridgeStats, WgEgressBridgeStatsSnapshot, WgReplyPacket,

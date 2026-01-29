@@ -56,9 +56,7 @@ use super::traits::{HealthStatus, Outbound, OutboundConnection, ProxyServerInfo}
 use crate::connection::OutboundStats;
 use crate::error::{OutboundError, UdpError};
 use crate::transport::{connect as transport_connect, TlsConfig, TransportConfig, WebSocketConfig};
-use crate::vless::{
-    VlessAddons, VlessAddress, VlessCommand, VlessRequestHeader, VlessStream,
-};
+use crate::vless::{VlessAddons, VlessAddress, VlessCommand, VlessRequestHeader, VlessStream};
 
 // ============================================================================
 // Configuration
@@ -429,7 +427,8 @@ impl VlessOutbound {
 
     /// Build transport configuration from VLESS config
     fn build_transport_config(&self) -> TransportConfig {
-        let mut transport = TransportConfig::tcp(&self.config.server_address, self.config.server_port);
+        let mut transport =
+            TransportConfig::tcp(&self.config.server_address, self.config.server_port);
 
         match &self.config.transport {
             VlessTransportConfig::Tcp => {
@@ -449,7 +448,12 @@ impl VlessOutbound {
                 }
                 transport = transport.with_tls(tls);
             }
-            VlessTransportConfig::WebSocket { path, host, headers, tls } => {
+            VlessTransportConfig::WebSocket {
+                path,
+                host,
+                headers,
+                tls,
+            } => {
                 let mut ws = WebSocketConfig::new(path);
                 if let Some(h) = host {
                     ws = ws.with_host(h);
@@ -513,9 +517,9 @@ impl VlessOutbound {
         );
 
         // Encode and send request
-        let encoded = request
-            .encode()
-            .map_err(|e| VlessOutboundError::ProtocolError(format!("failed to encode request: {e}")))?;
+        let encoded = request.encode().map_err(|e| {
+            VlessOutboundError::ProtocolError(format!("failed to encode request: {e}"))
+        })?;
 
         trace!(
             "Sending VLESS request header ({} bytes) for {}",
@@ -523,16 +527,14 @@ impl VlessOutbound {
             dest_addr
         );
 
-        stream
-            .write_all(&encoded)
-            .await
-            .map_err(|e| VlessOutboundError::HandshakeFailed(format!("failed to send request: {e}")))?;
+        stream.write_all(&encoded).await.map_err(|e| {
+            VlessOutboundError::HandshakeFailed(format!("failed to send request: {e}"))
+        })?;
 
         // Flush to ensure the request is sent
-        stream
-            .flush()
-            .await
-            .map_err(|e| VlessOutboundError::HandshakeFailed(format!("failed to flush request: {e}")))?;
+        stream.flush().await.map_err(|e| {
+            VlessOutboundError::HandshakeFailed(format!("failed to flush request: {e}"))
+        })?;
 
         debug!(
             "VLESS request header sent ({} bytes) for {}",
@@ -599,7 +601,8 @@ impl Outbound for VlessOutbound {
         };
 
         // Send VLESS request header (do NOT wait for response - deferred pattern)
-        let request_result = timeout(connect_timeout, self.send_vless_request(&mut stream, addr)).await;
+        let request_result =
+            timeout(connect_timeout, self.send_vless_request(&mut stream, addr)).await;
 
         match request_result {
             Ok(Ok(())) => {
@@ -733,12 +736,23 @@ mod tests {
     #[test]
     fn test_vless_config_tls() {
         let uuid = Uuid::new_v4();
-        let config = VlessConfig::tls("test-tls", "secure.example.com", 443, uuid, "secure.example.com");
+        let config = VlessConfig::tls(
+            "test-tls",
+            "secure.example.com",
+            443,
+            uuid,
+            "secure.example.com",
+        );
 
         assert_eq!(config.tag, "test-tls");
         assert!(matches!(config.transport, VlessTransportConfig::Tls { .. }));
 
-        if let VlessTransportConfig::Tls { server_name, alpn, skip_verify } = &config.transport {
+        if let VlessTransportConfig::Tls {
+            server_name,
+            alpn,
+            skip_verify,
+        } = &config.transport
+        {
             assert_eq!(server_name, "secure.example.com");
             assert!(alpn.is_empty());
             assert!(!skip_verify);
@@ -748,8 +762,8 @@ mod tests {
     #[test]
     fn test_vless_config_with_flow() {
         let uuid = Uuid::new_v4();
-        let config = VlessConfig::tcp("test", "proxy.example.com", 443, uuid)
-            .with_flow("xtls-rprx-vision");
+        let config =
+            VlessConfig::tcp("test", "proxy.example.com", 443, uuid).with_flow("xtls-rprx-vision");
 
         assert_eq!(config.flow, "xtls-rprx-vision");
         assert!(config.has_flow());
@@ -793,7 +807,12 @@ mod tests {
         let json = serde_json::to_string(&transport).unwrap();
         let deserialized: VlessTransportConfig = serde_json::from_str(&json).unwrap();
 
-        if let VlessTransportConfig::Tls { server_name, alpn, skip_verify } = deserialized {
+        if let VlessTransportConfig::Tls {
+            server_name,
+            alpn,
+            skip_verify,
+        } = deserialized
+        {
             assert_eq!(server_name, "example.com");
             assert_eq!(alpn, vec!["h2", "http/1.1"]);
             assert!(!skip_verify);
@@ -814,7 +833,13 @@ mod tests {
         let json = serde_json::to_string(&transport).unwrap();
         let deserialized: VlessTransportConfig = serde_json::from_str(&json).unwrap();
 
-        if let VlessTransportConfig::WebSocket { path, host, headers, tls } = deserialized {
+        if let VlessTransportConfig::WebSocket {
+            path,
+            host,
+            headers,
+            tls,
+        } = deserialized
+        {
             assert_eq!(path, "/ws");
             assert_eq!(host, Some("cdn.example.com".into()));
             assert_eq!(headers.len(), 1);
@@ -1206,7 +1231,9 @@ mod tests {
 
         // Start mock server
         let server = tokio::spawn(async move {
-            run_mock_vless_server(listener, uuid_bytes, 0).await.unwrap();
+            run_mock_vless_server(listener, uuid_bytes, 0)
+                .await
+                .unwrap();
         });
 
         // Create outbound with TCP transport (no TLS for testing)
@@ -1244,7 +1271,9 @@ mod tests {
 
         // Start mock server with invalid response version
         let server = tokio::spawn(async move {
-            run_mock_vless_server(listener, uuid_bytes, 1).await.unwrap(); // Invalid version 1
+            run_mock_vless_server(listener, uuid_bytes, 1)
+                .await
+                .unwrap(); // Invalid version 1
         });
 
         let config = VlessConfig {

@@ -516,10 +516,7 @@ impl QuicSniffer {
             }
 
             // Labels can contain alphanumeric and hyphens
-            if !label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-            {
+            if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return false;
             }
         }
@@ -916,7 +913,7 @@ mod tests {
             ext_len as u8, // Extension length
             (list_len >> 8) as u8,
             list_len as u8, // List length
-            0x00, // Name type (host_name)
+            0x00,           // Name type (host_name)
             (name_len >> 8) as u8,
             name_len as u8, // Name length
         ];

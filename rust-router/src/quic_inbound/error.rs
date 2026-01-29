@@ -185,9 +185,7 @@ impl From<QuicInboundError> for io::Error {
             | QuicInboundError::ShuttingDown => {
                 io::Error::new(io::ErrorKind::NotConnected, e.to_string())
             }
-            QuicInboundError::Transport(_) => {
-                io::Error::new(io::ErrorKind::Other, e.to_string())
-            }
+            QuicInboundError::Transport(_) => io::Error::new(io::ErrorKind::Other, e.to_string()),
         }
     }
 }

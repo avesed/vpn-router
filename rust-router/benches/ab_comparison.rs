@@ -17,7 +17,7 @@ use rust_router::connection::ConnectionManager;
 use rust_router::ipc::{decode_message, encode_message, IpcCommand, IpcHandler};
 use rust_router::outbound::{BlockOutbound, DirectOutbound, OutboundManager};
 use rust_router::rules::{
-    ConnectionInfo, DomainMatcher, DomainMatcherBuilder, RuleEngine, RoutingSnapshotBuilder,
+    ConnectionInfo, DomainMatcher, DomainMatcherBuilder, RoutingSnapshotBuilder, RuleEngine,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -328,7 +328,9 @@ fn bench_memory_allocation(c: &mut Criterion) {
             black_box(
                 ConnectionInfo::new("tcp", 443)
                     .with_domain("www.google.com")
-                    .with_dest_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(142, 250, 80, 46)))
+                    .with_dest_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        142, 250, 80, 46,
+                    )))
                     .with_source_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 100)))
                     .with_sniffed_protocol("tls"),
             )

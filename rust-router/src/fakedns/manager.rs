@@ -90,7 +90,10 @@ impl FakeDnsManager {
     /// # Errors
     /// Returns `FakeDnsError::Ipv6NotEnabled` if IPv6 is not configured.
     pub fn map_domain_ipv6(&self, domain: &str) -> FakeDnsResult<(Ipv6Addr, Duration)> {
-        let pool = self.ipv6_pool.as_ref().ok_or(FakeDnsError::Ipv6NotEnabled)?;
+        let pool = self
+            .ipv6_pool
+            .as_ref()
+            .ok_or(FakeDnsError::Ipv6NotEnabled)?;
 
         // Check cache first
         if let Some(entry) = self.cache.get_domain(domain) {
@@ -185,7 +188,8 @@ impl FakeDnsManager {
             if !self.cache.has_ipv6(&ip) {
                 // Ensure IPv4 is also allocated
                 let ipv4 = self.allocate_ipv4(domain)?;
-                self.cache.insert_dual(domain.to_string(), ipv4, ip, self.ttl);
+                self.cache
+                    .insert_dual(domain.to_string(), ipv4, ip, self.ttl);
                 return Ok(ip);
             }
 

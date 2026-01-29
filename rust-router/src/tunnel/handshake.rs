@@ -282,8 +282,7 @@ impl std::error::Error for HandshakeError {}
 /// Handshake state machine
 ///
 /// Tracks the current state of the handshake process.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum HandshakeState {
     /// No handshake in progress
     #[default]
@@ -314,7 +313,6 @@ pub enum HandshakeState {
     /// Tunnel is disconnecting
     Disconnecting,
 }
-
 
 impl HandshakeState {
     /// Check if handshake is complete
@@ -672,10 +670,9 @@ impl HandshakeTracker {
         }
 
         // Wait for completion with timeout
-        let wait_result = tokio::time::timeout(timeout, async {
-            rx.wait_for(|&completed| completed).await
-        })
-        .await;
+        let wait_result =
+            tokio::time::timeout(timeout, async { rx.wait_for(|&completed| completed).await })
+                .await;
 
         match wait_result {
             Ok(Ok(_)) => Ok(()),
@@ -869,7 +866,10 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        assert_eq!(format!("{}", HandshakeError::Timeout), "Handshake timed out");
+        assert_eq!(
+            format!("{}", HandshakeError::Timeout),
+            "Handshake timed out"
+        );
         assert_eq!(
             format!("{}", HandshakeError::InvalidResponse),
             "Invalid handshake response"

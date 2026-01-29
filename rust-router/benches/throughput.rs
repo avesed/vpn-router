@@ -20,9 +20,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rust_router::connection::{ConnectionStats, OutboundStats, StatsSnapshot};
 use rust_router::io::DEFAULT_BUFFER_SIZE;
-use rust_router::ipc::{
-    decode_message, encode_message, IpcCommand, IpcResponse, ServerStatus,
-};
+use rust_router::ipc::{decode_message, encode_message, IpcCommand, IpcResponse, ServerStatus};
 use rust_router::outbound::{BlockOutbound, DirectOutbound, OutboundManager};
 use rust_router::rules::ConnectionInfo;
 use std::collections::HashMap;
@@ -87,7 +85,8 @@ fn build_sample_prometheus_metrics(outbound_count: usize) -> String {
     output.push_str("rust_router_bytes_tx_total 9876543210\n");
 
     // Per-outbound metrics
-    output.push_str("# HELP rust_router_outbound_connections_total Total connections per outbound\n");
+    output
+        .push_str("# HELP rust_router_outbound_connections_total Total connections per outbound\n");
     output.push_str("# TYPE rust_router_outbound_connections_total counter\n");
     for i in 0..outbound_count {
         output.push_str(&format!(
@@ -465,13 +464,9 @@ fn bench_outbound_manager_lookup(c: &mut Criterion) {
         let manager = build_outbound_manager(*count);
 
         // Benchmark lookup of existing outbound
-        group.bench_with_input(
-            BenchmarkId::new("lookup_existing", count),
-            count,
-            |b, _| {
-                b.iter(|| black_box(manager.get("direct")));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("lookup_existing", count), count, |b, _| {
+            b.iter(|| black_box(manager.get("direct")));
+        });
 
         // Benchmark lookup of outbound in the middle
         let mid_tag = format!("proxy-{}", count / 2);
@@ -480,13 +475,9 @@ fn bench_outbound_manager_lookup(c: &mut Criterion) {
         });
 
         // Benchmark lookup of non-existing outbound
-        group.bench_with_input(
-            BenchmarkId::new("lookup_missing", count),
-            count,
-            |b, _| {
-                b.iter(|| black_box(manager.get("nonexistent")));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("lookup_missing", count), count, |b, _| {
+            b.iter(|| black_box(manager.get("nonexistent")));
+        });
 
         // Benchmark contains check
         group.bench_with_input(BenchmarkId::new("contains", count), count, |b, _| {

@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use rust_router::ipc::{decode_message, IpcCommand};
 use rust_router::rules::{
-    ConnectionInfo, DomainMatcherBuilder, RuleEngine, RuleType,
-    RoutingSnapshotBuilder,
+    ConnectionInfo, DomainMatcherBuilder, RoutingSnapshotBuilder, RuleEngine, RuleType,
 };
 
 // ============================================================================
@@ -42,7 +41,7 @@ mod network_chaos {
     #[test]
     fn test_connection_drop_mid_request() {
         // Simulate a partial message that gets "dropped"
-        let partial_message = b"{\"Ping\"";  // Incomplete JSON
+        let partial_message = b"{\"Ping\""; // Incomplete JSON
 
         // System should handle partial messages gracefully
         let result = decode_message::<IpcCommand>(partial_message);
@@ -85,8 +84,8 @@ mod network_chaos {
         let engine_clone = Arc::clone(&engine);
         let slow_reader = thread::spawn(move || {
             let snapshot = engine_clone.load();
-            thread::sleep(Duration::from_millis(100));  // "Slow" processing
-            let _ = snapshot.version;  // Use the snapshot
+            thread::sleep(Duration::from_millis(100)); // "Slow" processing
+            let _ = snapshot.version; // Use the snapshot
         });
 
         // Fast operations should not be blocked
@@ -95,7 +94,10 @@ mod network_chaos {
             let conn = ConnectionInfo::new("tcp", 443);
             let _ = engine.match_connection(&conn);
         }
-        assert!(start.elapsed() < Duration::from_millis(50), "Fast ops blocked by slow reader");
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "Fast ops blocked by slow reader"
+        );
 
         slow_reader.join().expect("Slow reader panicked");
     }
@@ -150,10 +152,7 @@ mod resource_exhaustion {
             );
         }
 
-        let result = builder
-            .default_outbound("direct")
-            .version(1)
-            .build();
+        let result = builder.default_outbound("direct").version(1).build();
 
         // Should complete without OOM
         assert!(result.is_ok(), "Failed to build large ruleset");
@@ -161,10 +160,9 @@ mod resource_exhaustion {
         let engine = RuleEngine::new(result.unwrap());
 
         // Verify it still works
-        let conn = ConnectionInfo::new("tcp", 443)
-            .with_domain("subdomain123.domain0.example.com");
+        let conn = ConnectionInfo::new("tcp", 443).with_domain("subdomain123.domain0.example.com");
         let result = engine.match_connection(&conn);
-        assert_eq!(result.outbound, "outbound3");  // 123 % 10 = 3
+        assert_eq!(result.outbound, "outbound3"); // 123 % 10 = 3
     }
 
     /// Test behavior with many concurrent operations
@@ -215,7 +213,10 @@ mod resource_exhaustion {
         }
 
         // Should have processed many operations
-        assert!(counter.load(Ordering::Relaxed) > 1000, "Too few operations completed");
+        assert!(
+            counter.load(Ordering::Relaxed) > 1000,
+            "Too few operations completed"
+        );
     }
 
     /// Test rapid allocation/deallocation cycles
@@ -318,11 +319,7 @@ mod recovery {
 
             // Alternate between different configurations
             if v % 2 == 0 {
-                let _ = builder.add_domain_rule(
-                    RuleType::DomainSuffix,
-                    "google.com",
-                    "proxy",
-                );
+                let _ = builder.add_domain_rule(RuleType::DomainSuffix, "google.com", "proxy");
             }
 
             let snapshot = builder
@@ -335,8 +332,7 @@ mod recovery {
         }
 
         // System should be stable after chaos
-        let conn = ConnectionInfo::new("tcp", 443)
-            .with_domain("test.google.com");
+        let conn = ConnectionInfo::new("tcp", 443).with_domain("test.google.com");
         let result = engine.match_connection(&conn);
 
         // Last version was 1001 (odd), so no google.com rule
@@ -605,21 +601,18 @@ mod error_injection {
         // Try to add potentially problematic rules (should be handled gracefully)
         let _ = builder.add_domain_rule(
             RuleType::DomainSuffix,
-            "",  // Empty domain
+            "", // Empty domain
             "proxy",
         );
 
         let _ = builder.add_domain_rule(
             RuleType::DomainKeyword,
             "normal",
-            "",  // Empty outbound
+            "", // Empty outbound
         );
 
         // Build should still succeed (or fail gracefully)
-        let result = builder
-            .default_outbound("direct")
-            .version(1)
-            .build();
+        let result = builder.default_outbound("direct").version(1).build();
 
         // Either it builds successfully or returns an error - no panic
         let _ = result;

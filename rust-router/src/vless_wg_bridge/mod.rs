@@ -77,23 +77,49 @@
 //! reply registry) are defined here.
 
 pub mod bridge;
+pub mod cleanup;
+pub mod event_channel;
+pub mod events;
 pub mod reply_registry;
 pub mod session;
+pub mod shard;
+pub mod sharded_bridge;
+pub mod sharded_reply_registry;
+pub mod supervisor;
+pub mod tcp_session;
 pub mod udp_frame;
+pub mod udp_session;
 
 // Re-export from smoltcp_utils for API compatibility
 pub use crate::smoltcp_utils::{
-    // Config constants
-    MAX_SESSIONS_PER_CLIENT, MAX_SOCKETS, MAX_TOTAL_SESSIONS, PORT_RANGE_END, PORT_RANGE_START,
-    PORT_TIME_WAIT_SECS, TCP_IDLE_TIMEOUT_SECS, TCP_MSS, TCP_RX_BUFFER, TCP_TX_BUFFER,
-    UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS, UDP_PACKET_META, UDP_RX_BUFFER, UDP_TX_BUFFER,
-    WG_MTU, WG_REPLY_CHANNEL_SIZE,
     // Error types
-    BridgeError, Result,
+    BridgeError,
     // Port allocator
-    PortAllocator, PortAllocatorConfig, PortGuard,
+    PortAllocator,
+    PortAllocatorConfig,
+    PortGuard,
+    Result,
     // Socket guards
-    TcpSocketGuard, UdpSocketGuard,
+    TcpSocketGuard,
+    UdpSocketGuard,
+    // Config constants
+    MAX_SESSIONS_PER_CLIENT,
+    MAX_SOCKETS,
+    MAX_TOTAL_SESSIONS,
+    PORT_RANGE_END,
+    PORT_RANGE_START,
+    PORT_TIME_WAIT_SECS,
+    TCP_IDLE_TIMEOUT_SECS,
+    TCP_MSS,
+    TCP_RX_BUFFER,
+    TCP_TX_BUFFER,
+    UDP_DEFAULT_TIMEOUT_SECS,
+    UDP_DNS_TIMEOUT_SECS,
+    UDP_PACKET_META,
+    UDP_RX_BUFFER,
+    UDP_TX_BUFFER,
+    WG_MTU,
+    WG_REPLY_CHANNEL_SIZE,
 };
 
 // VLESS-specific session types
@@ -110,3 +136,53 @@ pub use bridge::{
 };
 
 pub use reply_registry::{RegistryStatsSnapshot, VlessReplyKey, VlessReplyRegistry};
+
+// Event Bus types for the new architecture
+pub use events::{BridgeEvent, EventPriority, TcpReply, UdpReply, UdpSessionKey};
+
+// Event Channel for shard communication
+pub use event_channel::{
+    create_event_channel, EventChannelConfig, EventChannelStats, EventReceiver, EventSender,
+    SendError, TrySendError, HIGH_PRIORITY_CHANNEL_SIZE, NORMAL_PRIORITY_CHANNEL_SIZE,
+};
+
+// TCP Session State Machine for Event Bus architecture
+pub use tcp_session::{TcpSession as ShardTcpSession, TcpSessionState};
+
+// UDP Session for Event Bus architecture
+pub use udp_session::{
+    ShardUdpSession, UdpSessionStats, ACTIVITY_UPDATE_INTERVAL, ACTIVITY_UPDATE_TIME_SECS,
+    UDP_DEFAULT_TIMEOUT, UDP_DNS_TIMEOUT,
+};
+
+// SmoltcpShard for Event Bus architecture (Task 2.1)
+pub use shard::{
+    ShardConfig, ShardStats, SmoltcpShard, DEFAULT_POLL_INTERVAL, MAX_POLL_INTERVAL,
+    MIN_POLL_INTERVAL, SHARD_MAX_SOCKETS, WG_BATCH_SIZE, WG_BATCH_TIMEOUT_US,
+};
+
+// Cleanup configuration and statistics (Task 2.5)
+pub use cleanup::{
+    CleanupConfig, CleanupStats, CLEANUP_INTERVAL_SECS, TCP_IDLE_TIMEOUT_SECS as CLEANUP_TCP_TIMEOUT_SECS,
+    UDP_DEFAULT_TIMEOUT_SECS as CLEANUP_UDP_DEFAULT_TIMEOUT_SECS,
+    UDP_DNS_TIMEOUT_SECS as CLEANUP_UDP_DNS_TIMEOUT_SECS,
+};
+
+// Shard Supervisor for monitoring and recovery (Task 3.3)
+pub use supervisor::{
+    BoxedShardFactory, ShardFactory, ShardHealth, ShardSupervisor, SupervisorConfig, SupervisorStats,
+    DEFAULT_CIRCUIT_BREAKER_RESET_SECS, DEFAULT_MAX_CONSECUTIVE_FAILURES, DEFAULT_RESTART_DELAY_MS,
+    HEALTH_CHECK_INTERVAL_SECS,
+};
+
+// ShardedVlessWgBridge routing layer (Task 3.1) + Public API (Task 3.2)
+pub use sharded_bridge::{
+    AggregatedStats, AggregatedStatsSnapshot, ShardConfigTemplate, ShardKey, ShardStatsCollector,
+    ShardStatsSnapshot, ShardedBridgeConfig, ShardedVlessWgBridge, TcpConnectionStats,
+    TcpSessionKey, UdpConnectionStats, DEFAULT_SHARD_COUNT, MAX_SHARD_COUNT, MIN_SHARD_COUNT,
+};
+// Re-export RawUdpReply from sharded_bridge with an alias to avoid conflict
+pub use sharded_bridge::RawUdpReply as ShardedRawUdpReply;
+
+// Sharded bridge reply registry for WgReplyHandler integration
+pub use sharded_reply_registry::{ShardedBridgeReplyRegistry, ShardedRegistryStatsSnapshot};

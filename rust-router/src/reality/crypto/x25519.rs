@@ -5,7 +5,9 @@
 use rand::RngCore;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::reality::common::{X25519_PRIVATE_KEY_SIZE, X25519_PUBLIC_KEY_SIZE, X25519_SHARED_SECRET_SIZE};
+use crate::reality::common::{
+    X25519_PRIVATE_KEY_SIZE, X25519_PUBLIC_KEY_SIZE, X25519_SHARED_SECRET_SIZE,
+};
 use crate::reality::error::{RealityError, RealityResult};
 
 /// X25519 public key wrapper

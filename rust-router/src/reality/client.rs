@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256, Sha384};
 
 use crate::reality::auth::{derive_auth_key, encrypt_session_id, SessionId};
 use crate::reality::common::{
-    CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC,
-    CONTENT_TYPE_HANDSHAKE, REALITY_AUTH_INFO,
-    TLS_RECORD_HEADER_SIZE, ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING,
+    ALERT_DESC_CLOSE_NOTIFY, ALERT_LEVEL_WARNING, CONTENT_TYPE_ALERT,
+    CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_CHANGE_CIPHER_SPEC, CONTENT_TYPE_HANDSHAKE,
+    REALITY_AUTH_INFO, TLS_RECORD_HEADER_SIZE,
 };
 use crate::reality::crypto::{
     compute_finished_verify_data, decrypt_handshake_message, derive_application_secrets,
@@ -232,7 +232,9 @@ impl RealityClientConnection {
                 ConnectionState::ProcessingHandshake { .. } => {
                     self.process_encrypted_handshake(&mut result)?
                 }
-                ConnectionState::Established { .. } => self.process_application_data(&mut result)?,
+                ConnectionState::Established { .. } => {
+                    self.process_application_data(&mut result)?
+                }
                 ConnectionState::Closed => break,
             };
 
@@ -319,7 +321,10 @@ impl RealityClientConnection {
         let server_public_key = extract_server_public_key(&record)?;
         let cipher_suite_id = extract_server_cipher_suite(&record)?;
         let cipher_suite = CipherSuite::from_id(cipher_suite_id).ok_or_else(|| {
-            RealityError::protocol(format!("Unsupported cipher suite: 0x{:04x}", cipher_suite_id))
+            RealityError::protocol(format!(
+                "Unsupported cipher suite: 0x{:04x}",
+                cipher_suite_id
+            ))
         })?;
 
         // Compute ECDH shared secret for TLS
@@ -410,7 +415,11 @@ impl RealityClientConnection {
             derive_traffic_keys(&server_handshake_traffic_secret, cipher_suite)?;
 
         // Extract and decrypt record
-        let ciphertext: Vec<u8> = self.input_buffer.drain(..total_len).skip(TLS_RECORD_HEADER_SIZE).collect();
+        let ciphertext: Vec<u8> = self
+            .input_buffer
+            .drain(..total_len)
+            .skip(TLS_RECORD_HEADER_SIZE)
+            .collect();
 
         let plaintext = decrypt_handshake_message(
             cipher_suite,
@@ -478,8 +487,11 @@ impl RealityClientConnection {
         };
 
         // Send client Finished
-        let client_verify_data =
-            compute_finished_verify_data(cipher_suite, &client_handshake_traffic_secret, &handshake_hash)?;
+        let client_verify_data = compute_finished_verify_data(
+            cipher_suite,
+            &client_handshake_traffic_secret,
+            &handshake_hash,
+        )?;
         let client_finished = construct_finished(&client_verify_data)?;
 
         let (client_hs_key, client_hs_iv) =
@@ -487,7 +499,8 @@ impl RealityClientConnection {
         let client_hs_aead = AeadKey::new(cipher_suite, &client_hs_key)?;
 
         let mut client_hs_seq = 0u64;
-        let mut encryptor = RecordEncryptor::new(&client_hs_aead, &client_hs_iv, &mut client_hs_seq);
+        let mut encryptor =
+            RecordEncryptor::new(&client_hs_aead, &client_hs_iv, &mut client_hs_seq);
         encryptor.encrypt_handshake(&client_finished, &mut result.to_send)?;
 
         // Derive application traffic secrets
@@ -539,7 +552,11 @@ impl RealityClientConnection {
         };
 
         // Extract ciphertext
-        let mut ciphertext: Vec<u8> = self.input_buffer.drain(..total_len).skip(TLS_RECORD_HEADER_SIZE).collect();
+        let mut ciphertext: Vec<u8> = self
+            .input_buffer
+            .drain(..total_len)
+            .skip(TLS_RECORD_HEADER_SIZE)
+            .collect();
 
         // Decrypt
         let mut decryptor = RecordDecryptor::new(server_app_key, server_app_iv, read_seq);

@@ -60,7 +60,10 @@ impl HttpSniffResult {
     /// Check if any useful information was extracted
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.host.is_none() && self.method.is_none() && self.path.is_none() && self.version.is_none()
+        self.host.is_none()
+            && self.method.is_none()
+            && self.path.is_none()
+            && self.version.is_none()
     }
 }
 
@@ -559,7 +562,8 @@ mod tests {
 
     #[test]
     fn test_sniff_http_multiple_headers() {
-        let data = b"GET / HTTP/1.1\r\nUser-Agent: test\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+        let data =
+            b"GET / HTTP/1.1\r\nUser-Agent: test\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
         let result = sniff_http(data).expect("Should parse HTTP");
 
         assert_eq!(result.host, Some("example.com".to_string()));

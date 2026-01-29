@@ -156,7 +156,8 @@ impl UdpWorkerPoolStats {
     /// Record packet processing
     fn record_packet(&self, bytes: usize) {
         self.packets_processed.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Record worker started
@@ -306,7 +307,13 @@ impl UdpWorkerPool {
             ..Default::default()
         };
 
-        Self::with_config(config, pool_config, processor, rule_engine, outbound_manager)
+        Self::with_config(
+            config,
+            pool_config,
+            processor,
+            rule_engine,
+            outbound_manager,
+        )
     }
 
     /// Create worker pool with custom configuration and rule engine.
@@ -689,13 +696,7 @@ mod tests {
         let outbound_manager = Arc::new(OutboundManager::new());
         outbound_manager.add(Box::new(DirectOutbound::simple("direct")));
 
-        let result = UdpWorkerPool::new(
-            &config,
-            Some(2),
-            processor,
-            rule_engine,
-            outbound_manager,
-        );
+        let result = UdpWorkerPool::new(&config, Some(2), processor, rule_engine, outbound_manager);
 
         match result {
             Ok(_pool) => {

@@ -1380,8 +1380,7 @@ mod tests {
                 thread::spawn(move || {
                     let query =
                         create_query(&format!("concurrent{}.example.com.", i), RecordType::A);
-                    let response =
-                        create_response(&format!("concurrent{}.example.com.", i), 300);
+                    let response = create_response(&format!("concurrent{}.example.com.", i), 300);
 
                     cache.insert(&query, &response, "upstream-1");
                     let _ = cache.get(&query);
@@ -1607,7 +1606,10 @@ mod tests {
         // Entry should now be expired/missing
         // Note: The get() will check remaining_ttl() and return None if expired
         let result = cache.get(&query);
-        assert!(result.is_none(), "Entry with TTL=1 should expire after 1 second");
+        assert!(
+            result.is_none(),
+            "Entry with TTL=1 should expire after 1 second"
+        );
     }
 
     #[test]

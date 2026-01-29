@@ -271,7 +271,7 @@ impl UdpSessionConfig {
     #[must_use]
     pub fn high_throughput() -> Self {
         Self {
-            max_sessions: 262_144,                   // 256K sessions
+            max_sessions: 262_144,                  // 256K sessions
             idle_timeout: Duration::from_secs(120), // 2 minutes
             ttl: Duration::from_secs(300),          // 5 minutes
         }
@@ -432,8 +432,18 @@ impl std::fmt::Debug for UdpSessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpSessionManager")
             .field("session_count", &self.session_count())
-            .field("total_created", &self.total_created.load(std::sync::atomic::Ordering::Relaxed))
-            .field("total_evicted", &self.total_evicted.load(std::sync::atomic::Ordering::Relaxed))
+            .field(
+                "total_created",
+                &self
+                    .total_created
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "total_evicted",
+                &self
+                    .total_evicted
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -486,7 +496,10 @@ mod tests {
     }
 
     fn test_addr_v6(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), port)
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            port,
+        )
     }
 
     fn dest_addr() -> SocketAddr {
@@ -760,11 +773,7 @@ mod tests {
     #[test]
     fn test_manager_lru_eviction() {
         // Small cache to test eviction
-        let config = UdpSessionConfig::new(
-            10,
-            Duration::from_secs(300),
-            Duration::from_secs(600),
-        );
+        let config = UdpSessionConfig::new(10, Duration::from_secs(300), Duration::from_secs(600));
         let manager = UdpSessionManager::new(config);
 
         // Create 20 sessions (exceeds capacity)
@@ -782,11 +791,7 @@ mod tests {
 
     #[test]
     fn test_manager_stats() {
-        let config = UdpSessionConfig::new(
-            100,
-            Duration::from_secs(60),
-            Duration::from_secs(120),
-        );
+        let config = UdpSessionConfig::new(100, Duration::from_secs(60), Duration::from_secs(120));
         let manager = UdpSessionManager::new(config);
 
         let key = UdpSessionKey::new(test_addr_v4(12345), dest_addr());

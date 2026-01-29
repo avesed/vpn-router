@@ -37,7 +37,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
+};
 use smoltcp::time::Instant as SmoltcpInstant;
 use tracing::trace;
 
@@ -218,17 +220,23 @@ impl WgTunnelDevice {
 }
 
 impl Device for WgTunnelDevice {
-    type RxToken<'a> = WgRxToken where Self: 'a;
-    type TxToken<'a> = WgTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = WgRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = WgTxToken<'a>
+    where
+        Self: 'a;
 
-    fn receive(&mut self, _timestamp: SmoltcpInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmoltcpInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // Check if we have a packet to receive
         if let Some(packet) = self.queue.pop_rx() {
             trace!("Device receive: {} bytes", packet.len());
-            Some((
-                WgRxToken { packet },
-                WgTxToken { queue: &self.queue },
-            ))
+            Some((WgRxToken { packet }, WgTxToken { queue: &self.queue }))
         } else {
             None
         }

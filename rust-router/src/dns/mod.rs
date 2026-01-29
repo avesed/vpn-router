@@ -108,13 +108,19 @@ pub use client::DohClient;
 pub use client::DotClient;
 
 // Re-export filter types
-pub use filter::{BlockFilter, BlockFilterStats, BlockReason, BlockedResponseBuilder, CnameBlockReason, CnameDetector};
+pub use filter::{
+    BlockFilter, BlockFilterStats, BlockReason, BlockedResponseBuilder, CnameBlockReason,
+    CnameDetector,
+};
 
 // Re-export split types
 pub use split::{DnsRouter, DnsRouterStats, DnsRouterStatsSnapshot, DomainMatchType, RouteInfo};
 
 // Re-export log types
-pub use log::{LogRotator, LogStats, LogStatsSnapshot, QueryLogEntry, QueryLogger, RotationStats, RotationStatsSnapshot};
+pub use log::{
+    LogRotator, LogStats, LogStatsSnapshot, QueryLogEntry, QueryLogger, RotationStats,
+    RotationStatsSnapshot,
+};
 
 #[cfg(test)]
 mod tests {
@@ -146,13 +152,24 @@ mod tests {
     #[test]
     fn test_config_with_multiple_upstreams() {
         let config = DnsConfig::new()
-            .with_upstream(UpstreamConfig::new("google-udp", "8.8.8.8:53", UpstreamProtocol::Udp))
-            .with_upstream(UpstreamConfig::new("google-tcp", "8.8.8.8:53", UpstreamProtocol::Tcp))
             .with_upstream(UpstreamConfig::new(
-                "cloudflare-doh",
-                "https://cloudflare-dns.com/dns-query",
-                UpstreamProtocol::Doh,
-            ).with_bootstrap(vec!["1.1.1.1".to_string()]));
+                "google-udp",
+                "8.8.8.8:53",
+                UpstreamProtocol::Udp,
+            ))
+            .with_upstream(UpstreamConfig::new(
+                "google-tcp",
+                "8.8.8.8:53",
+                UpstreamProtocol::Tcp,
+            ))
+            .with_upstream(
+                UpstreamConfig::new(
+                    "cloudflare-doh",
+                    "https://cloudflare-dns.com/dns-query",
+                    UpstreamProtocol::Doh,
+                )
+                .with_bootstrap(vec!["1.1.1.1".to_string()]),
+            );
 
         assert_eq!(config.upstreams.len(), 3);
         assert!(config.validate().is_ok());
@@ -181,9 +198,15 @@ mod tests {
     #[test]
     fn test_config_serialization_roundtrip() {
         let config = DnsConfig::new()
-            .with_upstream(UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp))
+            .with_upstream(UpstreamConfig::new(
+                "test",
+                "8.8.8.8:53",
+                UpstreamProtocol::Udp,
+            ))
             .with_cache(CacheConfig::default().with_max_entries(5000))
-            .with_blocking(BlockingConfig::default().with_response_type(BlockResponseType::Nxdomain));
+            .with_blocking(
+                BlockingConfig::default().with_response_type(BlockResponseType::Nxdomain),
+            );
 
         let json = serde_json::to_string_pretty(&config).expect("serialize");
         let parsed: DnsConfig = serde_json::from_str(&json).expect("deserialize");
@@ -318,10 +341,7 @@ mod tests {
         let filter = BlockFilter::new(BlockingConfig::default());
 
         // Load some domains
-        let domains = vec![
-            "ads.example.com".to_string(),
-            "tracker.net".to_string(),
-        ];
+        let domains = vec!["ads.example.com".to_string(), "tracker.net".to_string()];
         let count = filter.load_from_domains(&domains).unwrap();
         assert_eq!(count, 2);
 
@@ -379,8 +399,12 @@ mod tests {
     #[test]
     fn test_split_router_basic_routing() {
         let router = DnsRouter::new("direct".to_string());
-        router.add_route("cn", DomainMatchType::Suffix, "china").unwrap();
-        router.add_route("google.com", DomainMatchType::Suffix, "google").unwrap();
+        router
+            .add_route("cn", DomainMatchType::Suffix, "china")
+            .unwrap();
+        router
+            .add_route("google.com", DomainMatchType::Suffix, "google")
+            .unwrap();
 
         assert_eq!(router.route_to_tag("baidu.cn"), "china");
         assert_eq!(router.route_to_tag("mail.google.com"), "google");
@@ -406,7 +430,9 @@ mod tests {
     #[test]
     fn test_split_router_stats() {
         let router = DnsRouter::new("default".to_string());
-        router.add_route("test.com", DomainMatchType::Suffix, "test").unwrap();
+        router
+            .add_route("test.com", DomainMatchType::Suffix, "test")
+            .unwrap();
 
         // Generate some stats
         let _ = router.route_to_tag("test.com"); // Match

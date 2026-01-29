@@ -327,9 +327,11 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
             });
         }
 
-        let port: u16 = port_part[1..].parse().map_err(|_| ValidationError::InvalidEndpoint {
-            message: format!("Invalid port number: {}", &port_part[1..]),
-        })?;
+        let port: u16 = port_part[1..]
+            .parse()
+            .map_err(|_| ValidationError::InvalidEndpoint {
+                message: format!("Invalid port number: {}", &port_part[1..]),
+            })?;
 
         if port == 0 {
             return Err(ValidationError::InvalidEndpoint {
@@ -341,17 +343,21 @@ pub fn validate_endpoint(endpoint: &str) -> Result<(), ValidationError> {
     }
 
     // Try to parse as hostname:port or IPv4:port
-    let colon_pos = endpoint.rfind(':').ok_or_else(|| ValidationError::InvalidEndpoint {
-        message: "Missing port separator".into(),
-    })?;
+    let colon_pos = endpoint
+        .rfind(':')
+        .ok_or_else(|| ValidationError::InvalidEndpoint {
+            message: "Missing port separator".into(),
+        })?;
 
     let host = &endpoint[..colon_pos];
     let port_str = &endpoint[colon_pos + 1..];
 
     // Validate port
-    let port: u16 = port_str.parse().map_err(|_| ValidationError::InvalidEndpoint {
-        message: format!("Invalid port number: {port_str}"),
-    })?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| ValidationError::InvalidEndpoint {
+            message: format!("Invalid port number: {port_str}"),
+        })?;
 
     if port == 0 {
         return Err(ValidationError::InvalidEndpoint {
@@ -426,9 +432,11 @@ pub fn validate_tunnel_ip(ip: &str) -> Result<(), ValidationError> {
     // Strip CIDR notation if present
     let ip_part = ip.split('/').next().unwrap_or(ip);
 
-    ip_part.parse::<IpAddr>().map_err(|e| ValidationError::InvalidTunnelIp {
-        message: e.to_string(),
-    })?;
+    ip_part
+        .parse::<IpAddr>()
+        .map_err(|e| ValidationError::InvalidTunnelIp {
+            message: e.to_string(),
+        })?;
 
     Ok(())
 }
@@ -511,8 +519,14 @@ mod tests {
 
     #[test]
     fn test_invalid_tag_start() {
-        assert_eq!(validate_peer_tag("-peer"), Err(ValidationError::InvalidTagStart));
-        assert_eq!(validate_peer_tag("_peer"), Err(ValidationError::InvalidTagStart));
+        assert_eq!(
+            validate_peer_tag("-peer"),
+            Err(ValidationError::InvalidTagStart)
+        );
+        assert_eq!(
+            validate_peer_tag("_peer"),
+            Err(ValidationError::InvalidTagStart)
+        );
     }
 
     #[test]

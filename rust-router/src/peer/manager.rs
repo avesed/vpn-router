@@ -46,6 +46,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::ingress::ReplyPacket;
 use crate::ipc::{ChainRole, PeerConfig, PeerState, PeerStatus, TunnelType};
 use crate::outbound::{Socks5Config, Socks5Outbound};
 use crate::peer::health::HealthChecker;
@@ -59,10 +60,9 @@ use crate::peer::validation::{
     validate_description, validate_endpoint, validate_peer_tag, validate_wg_key, ValidationError,
 };
 use crate::tunnel::{
-    derive_public_key, generate_private_key, SmoltcpBridge, SimpleTcpProxy, WgTunnel,
-    WgTunnelBuilder, WgTunnelConfig, OutboundHttpRequest, DEFAULT_WG_MTU,
+    derive_public_key, generate_private_key, OutboundHttpRequest, SimpleTcpProxy, SmoltcpBridge,
+    WgTunnel, WgTunnelBuilder, WgTunnelConfig, DEFAULT_WG_MTU,
 };
-use crate::ingress::ReplyPacket;
 use tokio::sync::mpsc;
 
 /// Extract port from endpoint string (e.g., "10.1.1.206:36201" -> Some(36201))
@@ -456,7 +456,10 @@ impl PeerManager {
     /// 5. Create `PairRequest` struct
     /// 6. Store pending request for later completion
     /// 7. Encode and return the pairing result with private key for persistence
-    pub fn generate_pair_request(&self, config: PairRequestConfig) -> Result<GeneratePairResult, PeerError> {
+    pub fn generate_pair_request(
+        &self,
+        config: PairRequestConfig,
+    ) -> Result<GeneratePairResult, PeerError> {
         // Validate input (no resources allocated yet, safe to return early)
         validate_peer_tag(&config.local_tag)?;
         validate_description(&config.local_description)?;
@@ -500,7 +503,9 @@ impl PeerManager {
         };
 
         // Allocate tunnel port - if this fails, release IPs
-        let tunnel_port = if let Ok(port) = self.tunnel_port_allocator.allocate() { port } else {
+        let tunnel_port = if let Ok(port) = self.tunnel_port_allocator.allocate() {
+            port
+        } else {
             // Release allocated IPs on port allocation failure
             if let Some(ip) = local_tunnel_ip {
                 self.tunnel_ip_allocator.release(ip);
@@ -610,9 +615,7 @@ impl PeerManager {
         Ok(GeneratePairResult {
             code,
             wg_local_private_key: local_private_key,
-            tunnel_local_ip: local_tunnel_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_default(),
+            tunnel_local_ip: local_tunnel_ip.map(|ip| ip.to_string()).unwrap_or_default(),
             tunnel_port,
         })
     }
@@ -694,22 +697,29 @@ impl PeerManager {
 
         // Use tunnel port from local_endpoint if provided, otherwise allocate
         // Python API pre-allocates the port to avoid conflicts with remote node's port
-        let tunnel_port = if let Some(port) = extract_port_from_endpoint(&local_config.local_endpoint) {
-            // Use the pre-allocated port from Python API
-            // Try to mark it as allocated in our allocator
-            if let Err(e) = self.tunnel_port_allocator.allocate_specific(port) {
-                warn!("Could not mark tunnel_port {} as allocated: {} (may already be allocated)", port, e);
-            }
-            port
-        } else {
-            // No port in endpoint, allocate one
-            self.tunnel_port_allocator
-                .allocate()
-                .map_err(|_| PeerError::PortExhausted)?
-        };
+        let tunnel_port =
+            if let Some(port) = extract_port_from_endpoint(&local_config.local_endpoint) {
+                // Use the pre-allocated port from Python API
+                // Try to mark it as allocated in our allocator
+                if let Err(e) = self.tunnel_port_allocator.allocate_specific(port) {
+                    warn!(
+                        "Could not mark tunnel_port {} as allocated: {} (may already be allocated)",
+                        port, e
+                    );
+                }
+                port
+            } else {
+                // No port in endpoint, allocate one
+                self.tunnel_port_allocator
+                    .allocate()
+                    .map_err(|_| PeerError::PortExhausted)?
+            };
 
         // Get remote's public key
-        let remote_public_key = request.wg_public_key.clone().ok_or(PeerError::MissingWgKey)?;
+        let remote_public_key = request
+            .wg_public_key
+            .clone()
+            .ok_or(PeerError::MissingWgKey)?;
 
         // Parse remote tunnel IP
         let remote_tunnel_ip = request
@@ -775,7 +785,10 @@ impl PeerManager {
             wg_public_key: Some(local_public_key),
             tunnel_local_ip: Some(local_tunnel_ip.to_string()),
             tunnel_remote_ip: remote_tunnel_ip.map(|ip| ip.to_string()),
-            tunnel_api_endpoint: Some(format!("{}:{}", local_tunnel_ip, local_config.local_api_port)),
+            tunnel_api_endpoint: Some(format!(
+                "{}:{}",
+                local_tunnel_ip, local_config.local_api_port
+            )),
             xray_uuid: None,
         };
 
@@ -843,7 +856,10 @@ impl PeerManager {
     /// 4. Create peer entry
     /// 5. Remove pending request
     /// 6. Return result with private key for database persistence
-    pub async fn complete_handshake(&self, code: &str) -> Result<CompleteHandshakeResult, PeerError> {
+    pub async fn complete_handshake(
+        &self,
+        code: &str,
+    ) -> Result<CompleteHandshakeResult, PeerError> {
         // Decode the pairing response
         let response = decode_pair_response(code)?;
 
@@ -859,7 +875,9 @@ impl PeerManager {
             pending_requests
                 .get(&response.request_node_tag)
                 .cloned()
-                .ok_or_else(|| PeerError::PendingRequestNotFound(response.request_node_tag.clone()))?
+                .ok_or_else(|| {
+                    PeerError::PendingRequestNotFound(response.request_node_tag.clone())
+                })?
         };
 
         // Verify this is the right request
@@ -871,7 +889,10 @@ impl PeerManager {
         }
 
         // Get remote's public key
-        let remote_public_key = response.wg_public_key.clone().ok_or(PeerError::MissingWgKey)?;
+        let remote_public_key = response
+            .wg_public_key
+            .clone()
+            .ok_or(PeerError::MissingWgKey)?;
 
         // Validate the key
         validate_wg_key(&remote_public_key)?;
@@ -972,7 +993,9 @@ impl PeerManager {
         // Get peer config
         let (config, current_state) = {
             let peers = self.peers.read();
-            let peer = peers.get(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+            let peer = peers
+                .get(tag)
+                .ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
             (peer.config.clone(), peer.state)
         };
 
@@ -1047,10 +1070,9 @@ impl PeerManager {
             .map_err(|e| PeerError::TunnelCreationFailed(e.to_string()))?;
 
         // Connect the tunnel (this starts the UDP socket and background tasks)
-        tunnel
-            .connect()
-            .await
-            .map_err(|e| PeerError::TunnelCreationFailed(format!("Failed to connect tunnel: {e}")))?;
+        tunnel.connect().await.map_err(|e| {
+            PeerError::TunnelCreationFailed(format!("Failed to connect tunnel: {e}"))
+        })?;
 
         // Store tunnel with peer- prefix
         let tunnel_arc: Arc<Box<dyn WgTunnel>> = Arc::new(tunnel);
@@ -1230,7 +1252,10 @@ impl PeerManager {
 
                 // Run the proxy (this blocks until shutdown or error)
                 // Pass outbound_rx for unified pump
-                if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx).await {
+                if let Err(e) = proxy
+                    .run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx)
+                    .await
+                {
                     warn!(tag = %tag_clone, "TCP proxy error: {}", e);
                 }
 
@@ -1301,7 +1326,9 @@ impl PeerManager {
         // Get current state
         let (config, current_state) = {
             let peers = self.peers.read();
-            let peer = peers.get(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+            let peer = peers
+                .get(tag)
+                .ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
             (peer.config.clone(), peer.state)
         };
 
@@ -1393,7 +1420,9 @@ impl PeerManager {
         // Get peer config
         let config = {
             let peers = self.peers.read();
-            let peer = peers.get(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+            let peer = peers
+                .get(tag)
+                .ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
             peer.config.clone()
         };
 
@@ -1408,7 +1437,10 @@ impl PeerManager {
         let tunnel_arc = {
             let wg_tunnels = self.wg_tunnels.read();
             wg_tunnels.get(&tunnel_tag).cloned().ok_or_else(|| {
-                PeerError::TunnelCreationFailed(format!("WireGuard tunnel '{}' not found", tunnel_tag))
+                PeerError::TunnelCreationFailed(format!(
+                    "WireGuard tunnel '{}' not found",
+                    tunnel_tag
+                ))
             })?
         };
 
@@ -1592,7 +1624,10 @@ impl PeerManager {
 
             // Run the proxy (this blocks until shutdown or error)
             // Pass outbound_rx for unified pump
-            if let Err(e) = proxy.run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx).await {
+            if let Err(e) = proxy
+                .run(bridge, tx_sender, rx_receiver, outbound_rx, shutdown_rx)
+                .await
+            {
                 warn!(tag = %tag_clone, "TCP proxy error: {}", e);
             }
 
@@ -1668,13 +1703,13 @@ impl PeerManager {
             .map(|(tag, peer)| {
                 // Tunnels are stored with peer- prefix
                 let tunnel_tag = format!("peer-{}", tag);
-                let (tx_bytes, rx_bytes, last_handshake) = if let Some(tunnel) = wg_tunnels.get(&tunnel_tag)
-                {
-                    let stats = tunnel.stats();
-                    (stats.tx_bytes, stats.rx_bytes, stats.last_handshake)
-                } else {
-                    (0, 0, None)
-                };
+                let (tx_bytes, rx_bytes, last_handshake) =
+                    if let Some(tunnel) = wg_tunnels.get(&tunnel_tag) {
+                        let stats = tunnel.stats();
+                        (stats.tx_bytes, stats.rx_bytes, stats.last_handshake)
+                    } else {
+                        (0, 0, None)
+                    };
 
                 PeerStatus {
                     tag: tag.clone(),
@@ -1710,7 +1745,9 @@ impl PeerManager {
         // Get peer config to release resources
         let config = {
             let peers = self.peers.read();
-            let peer = peers.get(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+            let peer = peers
+                .get(tag)
+                .ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
             peer.config.clone()
         };
 
@@ -1774,7 +1811,9 @@ impl PeerManager {
         role: ChainRole,
     ) -> Result<(), PeerError> {
         let peers = self.peers.read();
-        let peer = peers.get(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+        let peer = peers
+            .get(tag)
+            .ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
 
         // Xray tunnels cannot participate in relay chains (DSCP lost in SOCKS5)
         if peer.config.tunnel_type == TunnelType::Xray && role == ChainRole::Relay {
@@ -1921,18 +1960,23 @@ impl PeerManager {
     /// # Errors
     ///
     /// Returns error if the tunnel is not found or send fails.
-    pub async fn send_to_peer_tunnel(&self, tunnel_tag: &str, packet: &[u8]) -> Result<(), PeerError> {
+    pub async fn send_to_peer_tunnel(
+        &self,
+        tunnel_tag: &str,
+        packet: &[u8],
+    ) -> Result<(), PeerError> {
         let tunnel = {
             let wg_tunnels = self.wg_tunnels.read();
             wg_tunnels.get(tunnel_tag).cloned()
         };
 
         match tunnel {
-            Some(tunnel) => {
-                tunnel.send(packet).await.map_err(|e| {
-                    PeerError::TunnelCreationFailed(format!("Failed to send to tunnel {}: {}", tunnel_tag, e))
-                })
-            }
+            Some(tunnel) => tunnel.send(packet).await.map_err(|e| {
+                PeerError::TunnelCreationFailed(format!(
+                    "Failed to send to tunnel {}: {}",
+                    tunnel_tag, e
+                ))
+            }),
             None => {
                 // The tunnel might be managed by WgEgressManager, not PeerManager
                 // Log a warning but return an error that the caller can handle
@@ -1958,21 +2002,23 @@ impl PeerManager {
     /// # Errors
     ///
     /// Returns error if the tunnel is not found or send fails.
-    pub async fn send_to_peer_tunnel_preserve_src(&self, tunnel_tag: &str, packet: &[u8]) -> Result<(), PeerError> {
+    pub async fn send_to_peer_tunnel_preserve_src(
+        &self,
+        tunnel_tag: &str,
+        packet: &[u8],
+    ) -> Result<(), PeerError> {
         let tunnel = {
             let wg_tunnels = self.wg_tunnels.read();
             wg_tunnels.get(tunnel_tag).cloned()
         };
 
         match tunnel {
-            Some(tunnel) => {
-                tunnel.send_preserve_src(packet).await.map_err(|e| {
-                    PeerError::TunnelCreationFailed(format!(
-                        "Failed to send (preserve_src) to tunnel {}: {}",
-                        tunnel_tag, e
-                    ))
-                })
-            }
+            Some(tunnel) => tunnel.send_preserve_src(packet).await.map_err(|e| {
+                PeerError::TunnelCreationFailed(format!(
+                    "Failed to send (preserve_src) to tunnel {}: {}",
+                    tunnel_tag, e
+                ))
+            }),
             None => {
                 warn!(
                     tunnel = %tunnel_tag,
@@ -1992,7 +2038,10 @@ impl PeerManager {
     /// Get the number of connected peers
     pub fn connected_peer_count(&self) -> usize {
         let peers = self.peers.read();
-        peers.values().filter(|p| p.state == PeerState::Connected).count()
+        peers
+            .values()
+            .filter(|p| p.state == PeerState::Connected)
+            .count()
     }
 
     /// Get the total number of peers
@@ -2029,7 +2078,10 @@ impl PeerManager {
     /// # Returns
     ///
     /// The sender channel if the peer has an active TCP proxy, None otherwise
-    pub fn get_outbound_request_sender(&self, tag: &str) -> Option<mpsc::Sender<OutboundHttpRequest>> {
+    pub fn get_outbound_request_sender(
+        &self,
+        tag: &str,
+    ) -> Option<mpsc::Sender<OutboundHttpRequest>> {
         let outbound_txs = self.outbound_request_txs.read();
         outbound_txs.get(tag).cloned()
     }
@@ -2048,7 +2100,9 @@ impl PeerManager {
     /// Returns error if peer not found or already connected.
     pub fn set_connected_external(&self, tag: &str) -> Result<(), PeerError> {
         let mut peers = self.peers.write();
-        let peer = peers.get_mut(tag).ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
+        let peer = peers
+            .get_mut(tag)
+            .ok_or_else(|| PeerError::NotFound(tag.to_string()))?;
 
         if peer.state == PeerState::Connected {
             return Err(PeerError::AlreadyConnected(tag.to_string()));
@@ -2127,12 +2181,8 @@ mod tests {
 
     #[test]
     fn test_peer_manager_with_allocators() {
-        let manager = PeerManager::with_allocators(
-            "test-node".to_string(),
-            "10.100.100.0/24",
-            37200,
-            37299,
-        );
+        let manager =
+            PeerManager::with_allocators("test-node".to_string(), "10.100.100.0/24", 37200, 37299);
         assert_eq!(manager.local_node_tag(), "test-node");
     }
 
@@ -2167,11 +2217,16 @@ mod tests {
             tunnel_type: TunnelType::WireGuard,
         };
 
-        let result = manager.generate_pair_request(config).expect("Should generate request");
+        let result = manager
+            .generate_pair_request(config)
+            .expect("Should generate request");
 
         // Verify it's valid Base64
         assert!(!result.code.is_empty());
-        assert!(result.code.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+        assert!(result
+            .code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
 
         // Verify pending request was stored
         let pending = manager.pending_requests.read();
@@ -2191,12 +2246,16 @@ mod tests {
             tunnel_type: TunnelType::WireGuard,
         };
 
-        let result = manager.generate_pair_request(config).expect("Should generate request");
+        let result = manager
+            .generate_pair_request(config)
+            .expect("Should generate request");
         assert!(!result.code.is_empty());
 
         // Verify pending request has remote keys
         let pending = manager.pending_requests.read();
-        let request = pending.get("local-node").expect("Should have pending request");
+        let request = pending
+            .get("local-node")
+            .expect("Should have pending request");
         assert!(request.remote_private_key.is_some());
         assert!(request.remote_public_key.is_some());
         assert!(request.remote_tunnel_ip.is_some());
@@ -2264,13 +2323,19 @@ mod tests {
             bidirectional: false,
             tunnel_type: TunnelType::WireGuard,
         };
-        let response_result = node_b.import_pair_request(&request_code.code, local_config).await.unwrap();
+        let response_result = node_b
+            .import_pair_request(&request_code.code, local_config)
+            .await
+            .unwrap();
 
         // Node B should now have node-a as a peer
         assert!(node_b.peer_exists("node-a"));
 
         // Node A completes handshake
-        node_a.complete_handshake(&response_result.response_code).await.unwrap();
+        node_a
+            .complete_handshake(&response_result.response_code)
+            .await
+            .unwrap();
 
         // Node A should now have node-b as a peer
         assert!(node_a.peer_exists("node-b"));
@@ -2304,10 +2369,16 @@ mod tests {
             bidirectional: true,
             tunnel_type: TunnelType::WireGuard,
         };
-        let response_result = node_b.import_pair_request(&request_code.code, local_config).await.unwrap();
+        let response_result = node_b
+            .import_pair_request(&request_code.code, local_config)
+            .await
+            .unwrap();
 
         // Node A completes handshake
-        node_a.complete_handshake(&response_result.response_code).await.unwrap();
+        node_a
+            .complete_handshake(&response_result.response_code)
+            .await
+            .unwrap();
 
         // Both should have each other as peers
         assert!(node_a.peer_exists("node-b"));
@@ -2433,9 +2504,15 @@ mod tests {
         manager.add_peer_internal(config).unwrap();
 
         // WireGuard can be relay
-        assert!(manager.validate_tunnel_type_for_dscp("wg-peer", ChainRole::Relay).is_ok());
-        assert!(manager.validate_tunnel_type_for_dscp("wg-peer", ChainRole::Entry).is_ok());
-        assert!(manager.validate_tunnel_type_for_dscp("wg-peer", ChainRole::Terminal).is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("wg-peer", ChainRole::Relay)
+            .is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("wg-peer", ChainRole::Entry)
+            .is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("wg-peer", ChainRole::Terminal)
+            .is_ok());
     }
 
     #[test]
@@ -2469,8 +2546,12 @@ mod tests {
         ));
 
         // But can be entry or terminal
-        assert!(manager.validate_tunnel_type_for_dscp("xray-peer", ChainRole::Entry).is_ok());
-        assert!(manager.validate_tunnel_type_for_dscp("xray-peer", ChainRole::Terminal).is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("xray-peer", ChainRole::Entry)
+            .is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("xray-peer", ChainRole::Terminal)
+            .is_ok());
     }
 
     // =========================================================================
@@ -2575,7 +2656,10 @@ mod tests {
         };
         let result = manager.generate_pair_request(config3);
         assert!(
-            matches!(result, Err(PeerError::PortExhausted) | Err(PeerError::IpExhausted)),
+            matches!(
+                result,
+                Err(PeerError::PortExhausted) | Err(PeerError::IpExhausted)
+            ),
             "Expected resource exhaustion error, got: {:?}",
             result
         );
@@ -2751,7 +2835,11 @@ mod tests {
         assert_eq!(status.state, PeerState::Connecting);
 
         // Update to failed with error
-        manager.update_peer_state("peer-1", PeerState::Failed, Some("Connection timeout".to_string()));
+        manager.update_peer_state(
+            "peer-1",
+            PeerState::Failed,
+            Some("Connection timeout".to_string()),
+        );
         let status = manager.get_peer_status("peer-1").unwrap();
         assert_eq!(status.state, PeerState::Failed);
         assert_eq!(status.last_error, Some("Connection timeout".to_string()));
@@ -2848,10 +2936,15 @@ mod tests {
             bidirectional: false,
             tunnel_type: TunnelType::WireGuard,
         };
-        let response_result = node_b.import_pair_request(&request_code.code, local_config).await.unwrap();
+        let response_result = node_b
+            .import_pair_request(&request_code.code, local_config)
+            .await
+            .unwrap();
 
         // Different manager (no pending request) tries to complete
-        let result = manager.complete_handshake(&response_result.response_code).await;
+        let result = manager
+            .complete_handshake(&response_result.response_code)
+            .await;
         assert!(matches!(result, Err(PeerError::PendingRequestNotFound(_))));
     }
 
@@ -3081,7 +3174,11 @@ mod tests {
         manager.add_peer_internal(config).unwrap();
 
         // Set error
-        manager.update_peer_state("peer-1", PeerState::Failed, Some("Initial error".to_string()));
+        manager.update_peer_state(
+            "peer-1",
+            PeerState::Failed,
+            Some("Initial error".to_string()),
+        );
         let status = manager.get_peer_status("peer-1").unwrap();
         assert_eq!(status.last_error, Some("Initial error".to_string()));
 
@@ -3160,7 +3257,9 @@ mod tests {
         };
 
         // Should still generate (Xray uses different fields but request is similar)
-        let result = manager.generate_pair_request(config).expect("Should generate request");
+        let result = manager
+            .generate_pair_request(config)
+            .expect("Should generate request");
         assert!(!result.code.is_empty());
     }
 
@@ -3178,7 +3277,9 @@ mod tests {
                 bidirectional: false,
                 tunnel_type: TunnelType::WireGuard,
             };
-            manager.generate_pair_request(config).expect("Should generate request");
+            manager
+                .generate_pair_request(config)
+                .expect("Should generate request");
         }
 
         // Should have 3 pending requests
@@ -3269,9 +3370,15 @@ mod tests {
         manager.add_peer_internal(config).unwrap();
 
         // WireGuard can be used in all roles
-        assert!(manager.validate_tunnel_type_for_dscp("wg-peer", ChainRole::Entry).is_ok());
-        assert!(manager.validate_tunnel_type_for_dscp("wg-peer", ChainRole::Relay).is_ok());
-        assert!(manager.validate_tunnel_type_for_dscp("wg-peer", ChainRole::Terminal).is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("wg-peer", ChainRole::Entry)
+            .is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("wg-peer", ChainRole::Relay)
+            .is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("wg-peer", ChainRole::Terminal)
+            .is_ok());
     }
 
     #[test]
@@ -3299,9 +3406,15 @@ mod tests {
         manager.add_peer_internal(config).unwrap();
 
         // Xray can be Entry or Terminal, but NOT Relay
-        assert!(manager.validate_tunnel_type_for_dscp("xray-peer", ChainRole::Entry).is_ok());
-        assert!(manager.validate_tunnel_type_for_dscp("xray-peer", ChainRole::Relay).is_err());
-        assert!(manager.validate_tunnel_type_for_dscp("xray-peer", ChainRole::Terminal).is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("xray-peer", ChainRole::Entry)
+            .is_ok());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("xray-peer", ChainRole::Relay)
+            .is_err());
+        assert!(manager
+            .validate_tunnel_type_for_dscp("xray-peer", ChainRole::Terminal)
+            .is_ok());
     }
 
     // =========================================================================
@@ -3364,21 +3477,29 @@ mod tests {
         let initial_ips = manager.available_ips();
 
         // Generate a pairing request (allocates resources)
-        let result = manager.generate_pair_request(PairRequestConfig {
-            local_tag: "test-node".to_string(),
-            local_description: "Test Node".to_string(),
-            local_endpoint: "192.168.1.1:36200".to_string(),
-            local_api_port: 36000,
-            bidirectional: true, // This allocates 2 IPs
-            tunnel_type: TunnelType::WireGuard,
-        }).expect("Should generate pairing request");
+        let result = manager
+            .generate_pair_request(PairRequestConfig {
+                local_tag: "test-node".to_string(),
+                local_description: "Test Node".to_string(),
+                local_endpoint: "192.168.1.1:36200".to_string(),
+                local_api_port: 36000,
+                bidirectional: true, // This allocates 2 IPs
+                tunnel_type: TunnelType::WireGuard,
+            })
+            .expect("Should generate pairing request");
 
         // Verify resources were allocated
         let after_allocation_ports = manager.available_ports();
         let after_allocation_ips = manager.available_ips();
 
-        assert!(after_allocation_ports < initial_ports, "Port should be allocated");
-        assert!(after_allocation_ips < initial_ips, "IPs should be allocated");
+        assert!(
+            after_allocation_ports < initial_ports,
+            "Port should be allocated"
+        );
+        assert!(
+            after_allocation_ips < initial_ips,
+            "IPs should be allocated"
+        );
 
         // Remove the pending request by generating a new request for the same tag
         // (or we could cancel it if we had a cancel method)
@@ -3404,7 +3525,10 @@ mod tests {
         );
 
         // Exhaust the port pool
-        let _port = manager.tunnel_port_allocator.allocate().expect("First port");
+        let _port = manager
+            .tunnel_port_allocator
+            .allocate()
+            .expect("First port");
 
         // Track IP availability before attempting pairing
         let initial_ips = manager.available_ips();
@@ -3423,7 +3547,10 @@ mod tests {
 
         // Verify IPs were released (should be back to initial count)
         let after_failure_ips = manager.available_ips();
-        assert_eq!(initial_ips, after_failure_ips, "IPs should be released on port allocation failure");
+        assert_eq!(
+            initial_ips, after_failure_ips,
+            "IPs should be released on port allocation failure"
+        );
     }
 
     #[test]

@@ -34,14 +34,14 @@ pub struct Tls13HandshakeKeys {
 fn hkdf_extract(hash_alg: HashAlgorithm, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
     match hash_alg {
         HashAlgorithm::Sha256 => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(salt)
-                .expect("HMAC can take key of any size");
+            let mut mac =
+                Hmac::<Sha256>::new_from_slice(salt).expect("HMAC can take key of any size");
             mac.update(ikm);
             mac.finalize().into_bytes().to_vec()
         }
         HashAlgorithm::Sha384 => {
-            let mut mac = Hmac::<Sha384>::new_from_slice(salt)
-                .expect("HMAC can take key of any size");
+            let mut mac =
+                Hmac::<Sha384>::new_from_slice(salt).expect("HMAC can take key of any size");
             mac.update(ikm);
             mac.finalize().into_bytes().to_vec()
         }
@@ -73,16 +73,16 @@ fn hkdf_expand(
     for i in 1..=n {
         let block = match hash_alg {
             HashAlgorithm::Sha256 => {
-                let mut mac = Hmac::<Sha256>::new_from_slice(prk)
-                    .expect("HMAC can take key of any size");
+                let mut mac =
+                    Hmac::<Sha256>::new_from_slice(prk).expect("HMAC can take key of any size");
                 mac.update(&prev);
                 mac.update(info);
                 mac.update(&[i as u8]);
                 mac.finalize().into_bytes().to_vec()
             }
             HashAlgorithm::Sha384 => {
-                let mut mac = Hmac::<Sha384>::new_from_slice(prk)
-                    .expect("HMAC can take key of any size");
+                let mut mac =
+                    Hmac::<Sha384>::new_from_slice(prk).expect("HMAC can take key of any size");
                 mac.update(&prev);
                 mac.update(info);
                 mac.update(&[i as u8]);
@@ -301,8 +301,13 @@ pub fn derive_handshake_keys(
     )?;
 
     // 6. Derive-Secret(., "derived", "") from handshake_secret
-    let derived_secret_2 =
-        derive_secret(hash_alg, hash_len, &handshake_secret, b"derived", &empty_hash)?;
+    let derived_secret_2 = derive_secret(
+        hash_alg,
+        hash_len,
+        &handshake_secret,
+        b"derived",
+        &empty_hash,
+    )?;
 
     // 7. Master Secret = HKDF-Extract(salt=derived_secret, IKM=0)
     let master_secret = hkdf_extract(hash_alg, &derived_secret_2, &zero_salt);
@@ -473,8 +478,7 @@ mod tests {
     fn test_hkdf_expand_label_with_context() {
         let secret = vec![0x42u8; 32];
         let context = vec![0x11u8; 32];
-        let result =
-            hkdf_expand_label(HashAlgorithm::Sha256, &secret, b"finished", &context, 32);
+        let result = hkdf_expand_label(HashAlgorithm::Sha256, &secret, b"finished", &context, 32);
         assert!(result.is_ok());
         let output = result.unwrap();
         assert_eq!(output.len(), 32);
@@ -610,8 +614,10 @@ mod tests {
         let shared_secret = vec![0x42u8; 32];
         let server_hello_hash = vec![0x99u8; 32];
 
-        let keys1 = derive_handshake_keys(CS_SHA256, &shared_secret, &[], &server_hello_hash).unwrap();
-        let keys2 = derive_handshake_keys(CS_SHA256, &shared_secret, &[], &server_hello_hash).unwrap();
+        let keys1 =
+            derive_handshake_keys(CS_SHA256, &shared_secret, &[], &server_hello_hash).unwrap();
+        let keys2 =
+            derive_handshake_keys(CS_SHA256, &shared_secret, &[], &server_hello_hash).unwrap();
 
         assert_eq!(
             keys1.client_handshake_traffic_secret,

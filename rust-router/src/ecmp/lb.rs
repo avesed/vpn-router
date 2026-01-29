@@ -88,7 +88,6 @@ impl Protocol {
     }
 }
 
-
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -372,7 +371,6 @@ pub enum LbAlgorithm {
     /// Random: Random selection
     Random,
 }
-
 
 impl std::fmt::Display for LbAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -921,13 +919,15 @@ mod tests {
 
     #[test]
     fn test_five_tuple_from_connection_missing_src_ip() {
-        let tuple = FiveTuple::from_connection(None, Some("8.8.8.8".parse().unwrap()), 12345, 443, "tcp");
+        let tuple =
+            FiveTuple::from_connection(None, Some("8.8.8.8".parse().unwrap()), 12345, 443, "tcp");
         assert!(tuple.is_none());
     }
 
     #[test]
     fn test_five_tuple_from_connection_missing_dst_ip() {
-        let tuple = FiveTuple::from_connection(Some("10.0.0.1".parse().unwrap()), None, 12345, 443, "tcp");
+        let tuple =
+            FiveTuple::from_connection(Some("10.0.0.1".parse().unwrap()), None, 12345, 443, "tcp");
         assert!(tuple.is_none());
     }
 
@@ -1098,7 +1098,10 @@ mod tests {
         assert_eq!(LbAlgorithm::FiveTupleHash.to_string(), "five_tuple_hash");
         assert_eq!(LbAlgorithm::RoundRobin.to_string(), "round_robin");
         assert_eq!(LbAlgorithm::Weighted.to_string(), "weighted");
-        assert_eq!(LbAlgorithm::LeastConnections.to_string(), "least_connections");
+        assert_eq!(
+            LbAlgorithm::LeastConnections.to_string(),
+            "least_connections"
+        );
         assert_eq!(LbAlgorithm::Random.to_string(), "random");
     }
 
@@ -1292,7 +1295,9 @@ mod tests {
     fn test_least_connections_skips_unhealthy() {
         let lb = LoadBalancer::new(LbAlgorithm::LeastConnections);
         let members = vec![
-            LbMember::new(0).with_active_connections(1).with_healthy(false),
+            LbMember::new(0)
+                .with_active_connections(1)
+                .with_healthy(false),
             LbMember::new(1).with_active_connections(5),
             LbMember::new(2).with_active_connections(3),
         ];
@@ -1486,7 +1491,10 @@ mod tests {
         }
 
         // Member 1 should be selected approximately 3x more than member 0
-        assert!(counts[1] > counts[0], "Weighted member should be selected more often");
+        assert!(
+            counts[1] > counts[0],
+            "Weighted member should be selected more often"
+        );
     }
 
     #[test]
@@ -1535,9 +1543,21 @@ mod tests {
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // Same client + same domain with different CDN IPs should select the same member
-        let key1 = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
-        let key2 = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.143".parse().unwrap());
-        let key3 = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.144".parse().unwrap());
+        let key1 = DestKey::new(
+            client_ip,
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
+        let key2 = DestKey::new(
+            client_ip,
+            Some("youtube.com"),
+            "142.250.185.143".parse().unwrap(),
+        );
+        let key3 = DestKey::new(
+            client_ip,
+            Some("youtube.com"),
+            "142.250.185.144".parse().unwrap(),
+        );
 
         let idx1 = lb.select_by_dest(&members, &key1).unwrap();
         let idx2 = lb.select_by_dest(&members, &key2).unwrap();
@@ -1557,13 +1577,20 @@ mod tests {
         let mut selected = std::collections::HashSet::new();
         for i in 1..=20 {
             let client_ip: IpAddr = format!("10.0.0.{}", i).parse().unwrap();
-            let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+            let key = DestKey::new(
+                client_ip,
+                Some("youtube.com"),
+                "142.250.185.142".parse().unwrap(),
+            );
             let idx = lb.select_by_dest(&members, &key).unwrap();
             selected.insert(idx);
         }
 
         // Should distribute across multiple members (load balancing)
-        assert!(selected.len() > 1, "Different clients should distribute across members");
+        assert!(
+            selected.len() > 1,
+            "Different clients should distribute across members"
+        );
     }
 
     #[test]
@@ -1609,7 +1636,10 @@ mod tests {
         }
 
         // Should distribute across multiple members
-        assert!(selected.len() > 1, "Different domains should distribute across members");
+        assert!(
+            selected.len() > 1,
+            "Different domains should distribute across members"
+        );
     }
 
     #[test]
@@ -1622,7 +1652,11 @@ mod tests {
         ];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+        let key = DestKey::new(
+            client_ip,
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
 
         // Should always select member 1 (only healthy)
         for _ in 0..10 {
@@ -1640,7 +1674,11 @@ mod tests {
         ];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
-        let key = DestKey::new(client_ip, Some("youtube.com"), "142.250.185.142".parse().unwrap());
+        let key = DestKey::new(
+            client_ip,
+            Some("youtube.com"),
+            "142.250.185.142".parse().unwrap(),
+        );
         let result = lb.select_by_dest(&members, &key);
         assert!(matches!(result, Err(LbError::NoMembers)));
     }
@@ -1801,7 +1839,10 @@ mod tests {
         assert_eq!(err.to_string(), "Invalid weights: total weight is zero");
 
         let err = LbError::MissingFiveTuple;
-        assert_eq!(err.to_string(), "FiveTupleHash algorithm requires a five-tuple");
+        assert_eq!(
+            err.to_string(),
+            "FiveTupleHash algorithm requires a five-tuple"
+        );
 
         let err = LbError::Internal("test error".into());
         assert_eq!(err.to_string(), "Internal error: test error");

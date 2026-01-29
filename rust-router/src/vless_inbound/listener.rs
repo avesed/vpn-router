@@ -79,9 +79,7 @@ use tracing::{debug, error, info, trace, warn};
 use super::config::VlessInboundConfig;
 use super::error::{VlessInboundError, VlessInboundResult};
 use super::handler::{VlessConnection, VlessConnectionHandler};
-use crate::reality::{
-    RealityHandshakeResult, RealityServer, RealityServerStream,
-};
+use crate::reality::{RealityHandshakeResult, RealityServer, RealityServerStream};
 
 #[cfg(feature = "transport-tls")]
 use {
@@ -343,7 +341,6 @@ impl VlessInboundListener {
         reader: &mut BufReader<File>,
         path: &str,
     ) -> VlessInboundResult<PrivateKeyDer<'static>> {
-
         // Try PKCS#8 first
         for key_result in rustls_pemfile::pkcs8_private_keys(reader) {
             if let Ok(key) = key_result {
@@ -631,7 +628,9 @@ impl VlessInboundListener {
     ///
     /// The returned stream is a unified `VlessInboundStream` that can be either
     /// plain TCP or REALITY-encrypted, allowing callers to handle both cases uniformly.
-    pub async fn accept_auto(&self) -> VlessInboundResult<Option<VlessConnection<VlessInboundStream>>> {
+    pub async fn accept_auto(
+        &self,
+    ) -> VlessInboundResult<Option<VlessConnection<VlessInboundStream>>> {
         if !self.active {
             return Err(VlessInboundError::NotActive);
         }
@@ -707,7 +706,10 @@ impl VlessInboundListener {
             let unified_stream = VlessInboundStream::Tcp(tcp_stream);
 
             // Handle VLESS authentication
-            self.handler.handle(unified_stream, client_addr).await.map(Some)
+            self.handler
+                .handle(unified_stream, client_addr)
+                .await
+                .map(Some)
         }
     }
 

@@ -320,10 +320,7 @@ impl WgEgressManager {
             .map_err(EgressError::TunnelError)?;
 
         // Connect the tunnel
-        tunnel
-            .connect()
-            .await
-            .map_err(EgressError::TunnelError)?;
+        tunnel.connect().await.map_err(EgressError::TunnelError)?;
 
         // Create managed tunnel
         let mut managed = ManagedTunnel::new(tunnel, config);
@@ -439,11 +436,8 @@ impl WgEgressManager {
         };
 
         // Spawn the reply receiver task
-        let (shutdown_tx, reply_task) = Self::spawn_reply_receiver(
-            tag.clone(),
-            tunnel,
-            self.reply_handler.clone(),
-        );
+        let (shutdown_tx, reply_task) =
+            Self::spawn_reply_receiver(tag.clone(), tunnel, self.reply_handler.clone());
         managed.reply_shutdown_tx = Some(shutdown_tx);
         managed.reply_task = Some(reply_task);
 
@@ -854,7 +848,9 @@ impl WgEgressManager {
                 match tunnel.send(&packet).await {
                     Ok(()) => {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes_sent.fetch_add(packet_len as u64, Ordering::Relaxed);
+                        stats
+                            .bytes_sent
+                            .fetch_add(packet_len as u64, Ordering::Relaxed);
                         trace!(
                             "send_nowait: sent {} bytes through tunnel '{}'",
                             packet_len,
@@ -863,7 +859,10 @@ impl WgEgressManager {
                     }
                     Err(e) => {
                         stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!("send_nowait: failed to send through tunnel '{}': {}", tag_owned, e);
+                        warn!(
+                            "send_nowait: failed to send through tunnel '{}': {}",
+                            tag_owned, e
+                        );
                     }
                 }
             });
@@ -1237,7 +1236,9 @@ impl WgEgressManager {
             }
         }
 
-        self.stats.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
+        self.stats
+            .bytes_sent
+            .fetch_add(total_bytes, Ordering::Relaxed);
 
         debug!(
             "send_batch_linux: sent {} packets ({} bytes) through tunnel '{}', batch stats: ops={}, avg_per_batch={:.1}",
@@ -1464,8 +1465,7 @@ mod tests {
         assert!(json.contains("1000"));
         assert!(json.contains("2000"));
 
-        let deserialized: WgEgressStats =
-            serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: WgEgressStats = serde_json::from_str(&json).expect("Should deserialize");
         assert_eq!(deserialized.tunnel_count, stats.tunnel_count);
         assert_eq!(deserialized.total_tx_bytes, stats.total_tx_bytes);
     }
@@ -1508,7 +1508,10 @@ mod tests {
 
         let result = manager.remove_tunnel("nonexistent", None).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EgressError::TunnelNotFound(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EgressError::TunnelNotFound(_)
+        ));
     }
 
     // ========================================================================
@@ -1531,7 +1534,10 @@ mod tests {
 
         let result = manager.send("nonexistent", vec![1, 2, 3]).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EgressError::TunnelNotFound(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EgressError::TunnelNotFound(_)
+        ));
     }
 
     #[test]

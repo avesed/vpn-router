@@ -89,7 +89,11 @@ where
 
         while self.connection.is_handshaking() {
             // Read from transport
-            let n = self.inner.read(&mut buf).await.map_err(crate::reality::error::RealityError::Io)?;
+            let n = self
+                .inner
+                .read(&mut buf)
+                .await
+                .map_err(crate::reality::error::RealityError::Io)?;
             if n == 0 {
                 return Err(crate::reality::error::RealityError::handshake(
                     "Connection closed during handshake",
@@ -175,7 +179,8 @@ where
 
                             // Buffer remainder
                             if to_copy < result.app_data.len() {
-                                self.read_buffer.extend_from_slice(&result.app_data[to_copy..]);
+                                self.read_buffer
+                                    .extend_from_slice(&result.app_data[to_copy..]);
                                 self.read_offset = 0;
                             }
                         }
@@ -267,7 +272,11 @@ pub struct RealityConnector {
 
 impl RealityConnector {
     /// Create a new connector with required parameters
-    pub fn new(server_public_key: [u8; 32], short_id: [u8; 8], server_name: impl Into<String>) -> Self {
+    pub fn new(
+        server_public_key: [u8; 32],
+        short_id: [u8; 8],
+        server_name: impl Into<String>,
+    ) -> Self {
         Self {
             server_public_key,
             short_id,
@@ -299,11 +308,8 @@ impl RealityConnector {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        let config = RealityClientConfig::new(
-            self.server_public_key,
-            self.short_id,
-            self.server_name,
-        );
+        let config =
+            RealityClientConfig::new(self.server_public_key, self.short_id, self.server_name);
 
         let mut stream = RealityStream::new(transport, config).await?;
         stream.handshake().await?;

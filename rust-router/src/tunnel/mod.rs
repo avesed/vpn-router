@@ -94,10 +94,10 @@ pub mod userspace;
 
 // Re-export commonly used types
 pub use config::{WgPeerConfig, WgPeerInfo, WgPeerUpdate, WgTunnelConfig, WG_REKEY_INTERVAL_SECS};
+pub use handshake::{HandshakeConfig, HandshakeError, HandshakeState, HandshakeTracker};
 pub use traits::{
     BoxFuture, DecryptResult, WgTunnel, WgTunnelBuilder, WgTunnelError, WgTunnelStats,
 };
-pub use handshake::{HandshakeConfig, HandshakeError, HandshakeState, HandshakeTracker};
 pub use userspace::{
     derive_public_key, generate_private_key, validate_key, UserspaceWgTunnel, DEFAULT_MTU,
     MIN_BUFFER_SIZE, WG_HANDSHAKE_INIT_SIZE, WG_HANDSHAKE_RESPONSE_SIZE, WG_TRANSPORT_OVERHEAD,
@@ -110,10 +110,12 @@ pub use userspace::WG_OVERHEAD;
 // smoltcp integration exports
 pub use smoltcp_bridge::SmoltcpBridge;
 pub use smoltcp_device::{TunnelPacketQueue, WgTunnelDevice, DEFAULT_WG_MTU};
-pub use smoltcp_http_client::{HttpClientError, HttpResponse, SmoltcpHttpClient, TunnelAuthHeaders};
+pub use smoltcp_http_client::{
+    HttpClientError, HttpResponse, SmoltcpHttpClient, TunnelAuthHeaders,
+};
 
 // TCP proxy exports
 pub use simple_tcp_proxy::{
-    inject_tunnel_source_header, sanitize_header_value, SimpleTcpProxy, TcpProxyError,
-    TcpProxyStats, OutboundHttpRequest, OutboundHttpResponse, DEFAULT_API_PORT,
+    inject_tunnel_source_header, sanitize_header_value, OutboundHttpRequest, OutboundHttpResponse,
+    SimpleTcpProxy, TcpProxyError, TcpProxyStats, DEFAULT_API_PORT,
 };

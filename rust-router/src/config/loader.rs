@@ -34,9 +34,8 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
     let contents = std::fs::read_to_string(path)?;
 
     // Parse JSON
-    let config: Config = serde_json::from_str(&contents).map_err(|e| {
-        ConfigError::ParseError(format!("Failed to parse JSON: {e} at {path:?}"))
-    })?;
+    let config: Config = serde_json::from_str(&contents)
+        .map_err(|e| ConfigError::ParseError(format!("Failed to parse JSON: {e} at {path:?}")))?;
 
     // Validate configuration
     config.validate()?;
@@ -80,11 +79,9 @@ pub fn load_config_with_env(path: impl AsRef<Path>) -> Result<Config, ConfigErro
 
     // Override listen address
     if let Ok(addr) = std::env::var("RUST_ROUTER_LISTEN_ADDR") {
-        config.listen.address = addr.parse().map_err(|_| {
-            ConfigError::EnvError {
-                name: "RUST_ROUTER_LISTEN_ADDR".into(),
-                reason: format!("Invalid socket address: {addr}"),
-            }
+        config.listen.address = addr.parse().map_err(|_| ConfigError::EnvError {
+            name: "RUST_ROUTER_LISTEN_ADDR".into(),
+            reason: format!("Invalid socket address: {addr}"),
         })?;
         debug!("Listen address overridden to {}", config.listen.address);
     }

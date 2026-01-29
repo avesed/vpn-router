@@ -669,9 +669,10 @@ fn build_client_config(config: &QuicClientConfig) -> Result<quinn::ClientConfig,
     }
 
     // Create quinn crypto config from rustls config
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).map_err(|e| {
-        TransportError::TlsConfigError(format!("failed to create QUIC crypto config: {e}"))
-    })?;
+    let quic_crypto =
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).map_err(|e| {
+            TransportError::TlsConfigError(format!("failed to create QUIC crypto config: {e}"))
+        })?;
 
     // Configure transport settings
     let mut transport = quinn::TransportConfig::default();
@@ -861,7 +862,10 @@ impl QuicServerConfig {
     /// # Errors
     ///
     /// Returns `TransportError` if file reading fails
-    pub fn with_cert_file(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, TransportError> {
+    pub fn with_cert_file(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, TransportError> {
         let pem = std::fs::read(path.as_ref()).map_err(|e| {
             TransportError::TlsConfigError(format!("failed to read certificate file: {e}"))
         })?;
@@ -878,10 +882,12 @@ impl QuicServerConfig {
     /// # Errors
     ///
     /// Returns `TransportError` if file reading fails
-    pub fn with_key_file(mut self, path: impl AsRef<std::path::Path>) -> Result<Self, TransportError> {
-        let pem = std::fs::read(path.as_ref()).map_err(|e| {
-            TransportError::TlsConfigError(format!("failed to read key file: {e}"))
-        })?;
+    pub fn with_key_file(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, TransportError> {
+        let pem = std::fs::read(path.as_ref())
+            .map_err(|e| TransportError::TlsConfigError(format!("failed to read key file: {e}")))?;
         self.tls_key_pem = pem;
         Ok(self)
     }
@@ -974,7 +980,9 @@ pub fn load_certs_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, T
     let mut reader = BufReader::new(pem);
     let certs: Vec<CertificateDer<'static>> = certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| TransportError::TlsConfigError(format!("failed to parse PEM certificates: {e}")))?;
+        .map_err(|e| {
+            TransportError::TlsConfigError(format!("failed to parse PEM certificates: {e}"))
+        })?;
 
     if certs.is_empty() {
         return Err(TransportError::TlsConfigError(
@@ -997,7 +1005,7 @@ pub fn load_certs_from_pem(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, T
 ///
 /// Returns `TransportError` if parsing fails or no key found
 pub fn load_key_from_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TransportError> {
-    use rustls_pemfile::{pkcs8_private_keys, rsa_private_keys, ec_private_keys};
+    use rustls_pemfile::{ec_private_keys, pkcs8_private_keys, rsa_private_keys};
     use std::io::BufReader;
 
     let mut reader = BufReader::new(pem);
@@ -1042,7 +1050,9 @@ pub fn load_key_from_pem(pem: &[u8]) -> Result<PrivateKeyDer<'static>, Transport
 /// # Errors
 ///
 /// Returns `TransportError` if TLS configuration fails
-pub fn build_server_config(config: &QuicServerConfig) -> Result<quinn::ServerConfig, TransportError> {
+pub fn build_server_config(
+    config: &QuicServerConfig,
+) -> Result<quinn::ServerConfig, TransportError> {
     config.validate()?;
 
     // Parse certificates and key from PEM
@@ -1065,9 +1075,10 @@ pub fn build_server_config(config: &QuicServerConfig) -> Result<quinn::ServerCon
     }
 
     // Create quinn crypto config from rustls config
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).map_err(|e| {
-        TransportError::TlsConfigError(format!("failed to create QUIC crypto config: {e}"))
-    })?;
+    let quic_crypto =
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).map_err(|e| {
+            TransportError::TlsConfigError(format!("failed to create QUIC crypto config: {e}"))
+        })?;
 
     // Configure transport settings
     let mut transport = quinn::TransportConfig::default();
@@ -1156,7 +1167,10 @@ impl QuicInboundListener {
         })?;
 
         socket.set_nonblocking(true).map_err(|e| {
-            TransportError::socket_option("UDP_NONBLOCK", format!("failed to set non-blocking: {e}"))
+            TransportError::socket_option(
+                "UDP_NONBLOCK",
+                format!("failed to set non-blocking: {e}"),
+            )
         })?;
 
         // Create quinn endpoint with server config
@@ -1200,8 +1214,12 @@ impl QuicInboundListener {
             // Accept incoming connection
             let incoming = self.endpoint.accept().await?;
 
-            self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
-            self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_accepted
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .active_connections
+                .fetch_add(1, Ordering::Relaxed);
 
             let remote = incoming.remote_address();
 
@@ -1214,7 +1232,9 @@ impl QuicInboundListener {
             let conn = match incoming.await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats
+                        .active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
                     self.stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         remote = %remote,
@@ -1241,7 +1261,9 @@ impl QuicInboundListener {
                     return Some(QuicStream::new(send, recv, conn));
                 }
                 Err(e) => {
-                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats
+                        .active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
                     self.stats.stream_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         remote = %remote,
@@ -1267,15 +1289,21 @@ impl QuicInboundListener {
 
             let incoming = self.endpoint.accept().await?;
 
-            self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
-            self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_accepted
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .active_connections
+                .fetch_add(1, Ordering::Relaxed);
 
             let remote = incoming.remote_address();
 
             let conn = match incoming.await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    self.stats
+                        .active_connections
+                        .fetch_sub(1, Ordering::Relaxed);
                     self.stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         remote = %remote,
@@ -1410,7 +1438,9 @@ impl QuicConnection {
     /// Close the connection gracefully
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         self.connection.close(error_code, reason);
-        self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Get connection statistics
@@ -1425,7 +1455,9 @@ impl Drop for QuicConnection {
         // Decrement active connections if the connection is being dropped
         // without explicit close
         if self.connection.close_reason().is_none() {
-            self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+            self.stats
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -1538,13 +1570,17 @@ impl QuicConnectionGuard {
 
 impl Drop for QuicConnectionGuard {
     fn drop(&mut self) {
-        self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl Clone for QuicConnectionGuard {
     fn clone(&self) -> Self {
-        self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         Self {
             stats: Arc::clone(&self.stats),
         }
@@ -1750,7 +1786,10 @@ mod tests {
         assert!(config.tls_key_pem.is_empty());
         assert!(config.alpn_protocols.is_empty());
         assert_eq!(config.idle_timeout_secs, DEFAULT_SERVER_IDLE_TIMEOUT_SECS);
-        assert_eq!(config.max_concurrent_streams, DEFAULT_MAX_CONCURRENT_STREAMS);
+        assert_eq!(
+            config.max_concurrent_streams,
+            DEFAULT_MAX_CONCURRENT_STREAMS
+        );
     }
 
     #[test]
@@ -1788,8 +1827,7 @@ mod tests {
         init_crypto_provider();
         // Create a self-signed cert for testing
         let cert_pem = generate_test_cert_pem();
-        let config = QuicServerConfig::default()
-            .with_cert_pem(cert_pem);
+        let config = QuicServerConfig::default().with_cert_pem(cert_pem);
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("key"));
@@ -1928,7 +1966,10 @@ mod tests {
 
         let guard = QuicConnectionGuard::new(Arc::clone(&stats));
 
-        assert_eq!(guard.stats().connections_accepted.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            guard.stats().connections_accepted.load(Ordering::Relaxed),
+            10
+        );
         assert_eq!(guard.stats().active_connections.load(Ordering::Relaxed), 1);
     }
 
@@ -2029,7 +2070,8 @@ HwYDVR0jBBgwFoAUHSw86X0pO16Fimg2rwu9TbSKuE0wDwYDVR0TAQH/BAUwAwEB
 /zAKBggqhkjOPQQDAgNJADBGAiEAlBG5Mg/0+lwJG6NXRBaYyAwPrXmfsdn4Xu4M
 DlV6WPACIQDfEQFhvHY+GwxJtD4VwLr9wLomdF8bx8nyE69ttA3QVg==
 -----END CERTIFICATE-----
-".to_vec()
+"
+        .to_vec()
     }
 
     // Helper function to generate a private key PEM for testing
@@ -2040,6 +2082,7 @@ MHcCAQEEINqlpC+I/zCwt3mMtoL76ZRT/gjmCAQ2K0RoeR0RpTJmoAoGCCqGSM49
 AwEHoUQDQgAEagF+5oJUcQbdVlZHrul79Q2YEOmrlQ+g17D0eJleahEVQbsdFdex
 B/Prtn/Bu/4OavpI7c3oBrnNBEugJv8odQ==
 -----END EC PRIVATE KEY-----
-".to_vec()
+"
+        .to_vec()
     }
 }

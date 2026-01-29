@@ -179,7 +179,11 @@ impl CnameDetector {
     /// }
     /// ```
     #[must_use]
-    pub fn check_cname_chain(&self, response: &Message, block_filter: &BlockFilter) -> Option<CnameBlockReason> {
+    pub fn check_cname_chain(
+        &self,
+        response: &Message,
+        block_filter: &BlockFilter,
+    ) -> Option<CnameBlockReason> {
         if !block_filter.is_enabled() || block_filter.is_empty() {
             return None;
         }
@@ -207,7 +211,11 @@ impl CnameDetector {
 
             // Find CNAME record for current name
             let cname_target = cname_records.iter().find_map(|record| {
-                let record_name = record.name().to_string().trim_end_matches('.').to_ascii_lowercase();
+                let record_name = record
+                    .name()
+                    .to_string()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
                 let current_normalized = current_name.trim_end_matches('.').to_ascii_lowercase();
 
                 if record_name == current_normalized {
@@ -272,7 +280,11 @@ impl CnameDetector {
             return None;
         }
 
-        for (idx, target) in cname_targets.iter().take(self.max_depth as usize).enumerate() {
+        for (idx, target) in cname_targets
+            .iter()
+            .take(self.max_depth as usize)
+            .enumerate()
+        {
             let depth = (idx + 1) as u8;
             let target_normalized = target.trim_end_matches('.').to_ascii_lowercase();
 
@@ -391,7 +403,9 @@ mod tests {
     #[test]
     fn test_check_targets_no_blocked() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets = vec!["allowed1.com".to_string(), "allowed2.com".to_string()];
@@ -403,7 +417,9 @@ mod tests {
     #[test]
     fn test_check_targets_first_blocked() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets = vec!["blocked.com".to_string(), "allowed.com".to_string()];
@@ -420,7 +436,9 @@ mod tests {
     #[test]
     fn test_check_targets_deep_blocked() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets = vec![
@@ -440,7 +458,9 @@ mod tests {
     #[test]
     fn test_check_targets_respects_depth_limit() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(2);
         let targets = vec![
@@ -457,7 +477,9 @@ mod tests {
     #[test]
     fn test_check_targets_empty_list() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets: Vec<String> = Vec::new();
@@ -470,7 +492,9 @@ mod tests {
     fn test_check_targets_disabled_filter() {
         let config = BlockingConfig::default().disabled();
         let filter = BlockFilter::new(config);
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets = vec!["blocked.com".to_string()];
@@ -494,7 +518,9 @@ mod tests {
     #[test]
     fn test_check_targets_normalizes_trailing_dot() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets = vec!["blocked.com.".to_string()]; // Trailing dot
@@ -506,7 +532,9 @@ mod tests {
     #[test]
     fn test_check_targets_case_insensitive() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let targets = vec!["BLOCKED.COM".to_string()];
@@ -540,7 +568,9 @@ mod tests {
             record.set_record_type(RecordType::CNAME);
             record.set_dns_class(DNSClass::IN);
             record.set_ttl(300);
-            record.set_data(Some(RData::CNAME(hickory_proto::rr::rdata::CNAME(target_name))));
+            record.set_data(Some(RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                target_name,
+            ))));
             response.add_answer(record);
         }
 
@@ -550,7 +580,9 @@ mod tests {
     #[test]
     fn test_check_cname_chain_no_cnames() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
 
@@ -568,14 +600,13 @@ mod tests {
     #[test]
     fn test_check_cname_chain_blocked_first() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
 
-        let response = create_cname_response(
-            "example.com",
-            &[("example.com", "blocked.com")],
-        );
+        let response = create_cname_response("example.com", &[("example.com", "blocked.com")]);
 
         let result = detector.check_cname_chain(&response, &filter);
         assert!(result.is_some());
@@ -588,7 +619,9 @@ mod tests {
     #[test]
     fn test_check_cname_chain_blocked_deep() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["evil.adtech.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["evil.adtech.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
 
@@ -613,7 +646,9 @@ mod tests {
     #[test]
     fn test_check_cname_chain_not_blocked() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
 
@@ -632,7 +667,9 @@ mod tests {
     #[test]
     fn test_check_cname_chain_depth_limit() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(2); // Only check 2 levels
 
@@ -653,7 +690,9 @@ mod tests {
     #[test]
     fn test_check_cname_chain_empty_response() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
         let response = Message::new();
@@ -666,14 +705,13 @@ mod tests {
     fn test_check_cname_chain_disabled_filter() {
         let config = BlockingConfig::default().disabled();
         let filter = BlockFilter::new(config);
-        filter.load_from_domains(&["blocked.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["blocked.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
 
-        let response = create_cname_response(
-            "example.com",
-            &[("example.com", "blocked.com")],
-        );
+        let response = create_cname_response("example.com", &[("example.com", "blocked.com")]);
 
         let result = detector.check_cname_chain(&response, &filter);
         assert!(result.is_none());
@@ -682,7 +720,9 @@ mod tests {
     #[test]
     fn test_check_cname_chain_suffix_blocking() {
         let filter = BlockFilter::new(BlockingConfig::default());
-        filter.load_from_domains(&["adtech.com".to_string()]).unwrap();
+        filter
+            .load_from_domains(&["adtech.com".to_string()])
+            .unwrap();
 
         let detector = CnameDetector::new(5);
 

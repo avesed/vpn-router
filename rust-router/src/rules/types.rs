@@ -647,7 +647,10 @@ impl CompiledRuleSet {
     /// assert_eq!(outbound, "https-proxy");
     /// ```
     #[must_use]
-    pub fn match_connection(&self, conn: &crate::rules::engine::ConnectionInfo) -> Option<(u64, &str)> {
+    pub fn match_connection(
+        &self,
+        conn: &crate::rules::engine::ConnectionInfo,
+    ) -> Option<(u64, &str)> {
         for rule in &self.rules {
             if Self::connection_matches_rule(rule, conn) {
                 return Some((rule.id, &rule.outbound));
@@ -695,12 +698,7 @@ impl CompiledRuleSet {
     /// - Port/PortRange matching
     /// - Protocol matching
     /// - Exact domain matching
-    fn matches_rule(
-        rule: &Rule,
-        domain: Option<&str>,
-        _dest_ip: IpAddr,
-        dest_port: u16,
-    ) -> bool {
+    fn matches_rule(rule: &Rule, domain: Option<&str>, _dest_ip: IpAddr, dest_port: u16) -> bool {
         match rule.rule_type {
             RuleType::Port => {
                 // Parse and check port range
@@ -890,7 +888,12 @@ mod tests {
         assert!(rule.validate().is_err());
 
         // Valid regex
-        let rule = Rule::new(1, RuleType::DomainRegex, r".*\.google\.com$".into(), "proxy".into());
+        let rule = Rule::new(
+            1,
+            RuleType::DomainRegex,
+            r".*\.google\.com$".into(),
+            "proxy".into(),
+        );
         assert!(rule.validate().is_ok());
 
         // Invalid regex
@@ -898,7 +901,12 @@ mod tests {
         assert!(matches!(rule.validate(), Err(RuleError::InvalidRegex(_))));
 
         // Valid CIDR
-        let rule = Rule::new(1, RuleType::IpCidr, "192.168.0.0/16".into(), "direct".into());
+        let rule = Rule::new(
+            1,
+            RuleType::IpCidr,
+            "192.168.0.0/16".into(),
+            "direct".into(),
+        );
         assert!(rule.validate().is_ok());
 
         // Invalid CIDR
@@ -1059,9 +1067,14 @@ mod tests {
 
     #[test]
     fn test_rule_serialization() {
-        let rule = Rule::new(1, RuleType::DomainSuffix, ".google.com".into(), "proxy".into())
-            .with_priority(10)
-            .with_tag("test-tag");
+        let rule = Rule::new(
+            1,
+            RuleType::DomainSuffix,
+            ".google.com".into(),
+            "proxy".into(),
+        )
+        .with_priority(10)
+        .with_tag("test-tag");
 
         let json = serde_json::to_string_pretty(&rule).unwrap();
         assert!(json.contains("\"rule_type\": \"domain_suffix\""));
@@ -1113,9 +1126,12 @@ mod tests {
 
     #[test]
     fn test_match_by_priority_protocol() {
-        let rules = vec![
-            Rule::new(1, RuleType::Protocol, "tcp".into(), "tcp-handler".into()),
-        ];
+        let rules = vec![Rule::new(
+            1,
+            RuleType::Protocol,
+            "tcp".into(),
+            "tcp-handler".into(),
+        )];
 
         let ruleset = CompiledRuleSet::new(rules, "direct".into()).unwrap();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
@@ -1126,9 +1142,12 @@ mod tests {
 
     #[test]
     fn test_match_by_priority_exact_domain() {
-        let rules = vec![
-            Rule::new(1, RuleType::Domain, "example.com".into(), "proxy".into()),
-        ];
+        let rules = vec![Rule::new(
+            1,
+            RuleType::Domain,
+            "example.com".into(),
+            "proxy".into(),
+        )];
 
         let ruleset = CompiledRuleSet::new(rules, "direct".into()).unwrap();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();

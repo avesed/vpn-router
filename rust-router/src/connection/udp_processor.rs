@@ -133,8 +133,8 @@ fn cas_decrement(counter: &AtomicU32) -> bool {
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => return true,   // Successfully decremented
-            Err(_) => continue,     // Another thread modified, retry
+            Ok(_) => return true, // Successfully decremented
+            Err(_) => continue,   // Another thread modified, retry
         }
     }
 }
@@ -434,17 +434,22 @@ impl UdpPacketProcessor {
                         LbAlgorithm::DestHash => {
                             // DestHash: hash(source_ip + domain/dest_ip) for per-client session affinity
                             // Same client to same domain → same exit; different clients → load balanced
-                            let dest_key = DestKey::new(packet.client_addr.ip(), domain, packet.original_dst.ip());
-                            debug!(
-                                "ECMP group '{}' using DestHash with key: {}",
-                                tag, dest_key
+                            let dest_key = DestKey::new(
+                                packet.client_addr.ip(),
+                                domain,
+                                packet.original_dst.ip(),
                             );
+                            debug!("ECMP group '{}' using DestHash with key: {}", tag, dest_key);
                             group.select_by_dest(&dest_key)
                         }
                         LbAlgorithm::DestHashLeastLoad => {
                             // DestHashLeastLoad: session affinity + intelligent load balancing
                             // New sessions: select least loaded exit; existing: use cached selection
-                            let dest_key = DestKey::new(packet.client_addr.ip(), domain, packet.original_dst.ip());
+                            let dest_key = DestKey::new(
+                                packet.client_addr.ip(),
+                                domain,
+                                packet.original_dst.ip(),
+                            );
                             debug!(
                                 "ECMP group '{}' using DestHashLeastLoad with key: {}",
                                 tag, dest_key
@@ -474,10 +479,7 @@ impl UdpPacketProcessor {
                             if let Some(outbound) = outbound_manager.get(&member_tag) {
                                 return Some((outbound, member_tag));
                             }
-                            warn!(
-                                "ECMP member '{}' not found in outbound_manager",
-                                member_tag
-                            );
+                            warn!("ECMP member '{}' not found in outbound_manager", member_tag);
                         }
                         Err(e) => {
                             warn!("ECMP group '{}' failed to select member: {}", tag, e);
@@ -529,7 +531,10 @@ impl UdpPacketProcessor {
         }
 
         // Get or create counter for this IP
-        let entry = self.ip_session_counts.entry(source_ip).or_insert_with(|| AtomicU32::new(0));
+        let entry = self
+            .ip_session_counts
+            .entry(source_ip)
+            .or_insert_with(|| AtomicU32::new(0));
 
         // Try to increment atomically
         let current = entry.value().load(Ordering::Relaxed);
@@ -614,9 +619,8 @@ impl UdpPacketProcessor {
         let before_count = self.ip_session_counts.len();
 
         // Remove entries where count is 0
-        self.ip_session_counts.retain(|_ip, count| {
-            count.load(Ordering::Relaxed) > 0
-        });
+        self.ip_session_counts
+            .retain(|_ip, count| count.load(Ordering::Relaxed) > 0);
 
         let removed = before_count.saturating_sub(self.ip_session_counts.len());
         if removed > 0 {
@@ -684,16 +688,17 @@ impl UdpPacketProcessor {
                     "SEC-2: After cleanup, IP count {} still exceeds limit {}. \
                      {} active sessions blocking cleanup. Consider increasing max_tracked_ips \
                      or reducing session timeout.",
-                    after_count,
-                    self.config.max_tracked_ips,
-                    after_count
+                    after_count, self.config.max_tracked_ips, after_count
                 );
             } else if removed > 0 {
                 // Update last_cleanup time on successful cleanup
                 // P1 FIX: Use unwrap_or_else to recover from poisoned mutex.
                 // A poisoned mutex means a thread panicked while holding it,
                 // but the inner data (Instant) is still valid and usable.
-                let mut last = self.last_cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut last = self
+                    .last_cleanup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *last = Instant::now();
             }
         }
@@ -712,7 +717,10 @@ impl UdpPacketProcessor {
 
         // Update last_cleanup time
         // P1 FIX: Use unwrap_or_else to recover from poisoned mutex
-        let mut last = self.last_cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self
+            .last_cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *last = Instant::now();
 
         // Reset decrement counter
@@ -781,13 +789,17 @@ impl UdpPacketProcessor {
                 session.routing_info.outbound
             );
 
-            return self.forward_packet(packet, session, session_key, false).await;
+            return self
+                .forward_packet(packet, session, session_key, false)
+                .await;
         }
 
         // SEC-1 FIX: Check per-IP session rate limit before creating new session
         let source_ip = packet.client_addr.ip();
         if let Err((current, max)) = self.check_ip_session_limit(source_ip) {
-            self.stats.sessions_rate_limited.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .sessions_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
             warn!(
                 "Rate limit: {} has {} sessions (max {}), rejecting {} -> {}",
                 source_ip, current, max, packet.client_addr, packet.original_dst
@@ -820,9 +832,13 @@ impl UdpPacketProcessor {
         // Get outbound from manager with ECMP group resolution
         // This supports both direct outbounds and ECMP load balancing groups
         // Pass domain for DestHash algorithm (video streaming session affinity)
-        let (outbound, actual_outbound_tag) = if let Some(resolved) =
-            self.resolve_outbound_with_ecmp(&match_result.outbound, packet, sniffed_domain.as_deref(), outbound_manager)
-        {
+        let (outbound, actual_outbound_tag) = if let Some(resolved) = self
+            .resolve_outbound_with_ecmp(
+                &match_result.outbound,
+                packet,
+                sniffed_domain.as_deref(),
+                outbound_manager,
+            ) {
             resolved
         } else {
             warn!(
@@ -830,9 +846,12 @@ impl UdpPacketProcessor {
                 match_result.outbound
             );
             // Try to resolve the default outbound (which could also be an ECMP group)
-            if let Some(resolved) =
-                self.resolve_outbound_with_ecmp(&rule_engine.default_outbound(), packet, sniffed_domain.as_deref(), outbound_manager)
-            {
+            if let Some(resolved) = self.resolve_outbound_with_ecmp(
+                &rule_engine.default_outbound(),
+                packet,
+                sniffed_domain.as_deref(),
+                outbound_manager,
+            ) {
                 resolved
             } else {
                 // Counter drift fix: decrement counter since session won't be created
@@ -878,11 +897,7 @@ impl UdpPacketProcessor {
     /// # Returns
     ///
     /// `ProcessResult` indicating success, blocked, or failure.
-    pub async fn process(
-        &self,
-        packet: &UdpPacketInfo,
-        outbound: &dyn Outbound,
-    ) -> ProcessResult {
+    pub async fn process(&self, packet: &UdpPacketInfo, outbound: &dyn Outbound) -> ProcessResult {
         self.stats.packets_processed.fetch_add(1, Ordering::Relaxed);
 
         let session_key = UdpSessionKey::new(packet.client_addr, packet.original_dst);
@@ -897,13 +912,17 @@ impl UdpPacketProcessor {
                 packet.original_dst
             );
 
-            return self.forward_packet(packet, session, session_key, false).await;
+            return self
+                .forward_packet(packet, session, session_key, false)
+                .await;
         }
 
         // SEC-1 FIX: Check per-IP session rate limit before creating new session
         let source_ip = packet.client_addr.ip();
         if let Err((current, max)) = self.check_ip_session_limit(source_ip) {
-            self.stats.sessions_rate_limited.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .sessions_rate_limited
+                .fetch_add(1, Ordering::Relaxed);
             warn!(
                 "Rate limit: {} has {} sessions (max {}), rejecting {} -> {}",
                 source_ip, current, max, packet.client_addr, packet.original_dst
@@ -957,7 +976,9 @@ impl UdpPacketProcessor {
 
             let result = QuicSniffer::sniff(data);
             if let Some(ref sni) = result.server_name {
-                self.stats.quic_sni_extracted.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .quic_sni_extracted
+                    .fetch_add(1, Ordering::Relaxed);
                 trace!("Extracted QUIC SNI: {}", sni);
                 return Some(sni.clone());
             }
@@ -1044,7 +1065,8 @@ impl UdpPacketProcessor {
         self.stats.sessions_created.fetch_add(1, Ordering::Relaxed);
 
         // Forward the packet
-        self.forward_packet(packet, session, session_key, true).await
+        self.forward_packet(packet, session, session_key, true)
+            .await
     }
 
     /// Forward a packet through an existing or new session.
@@ -1148,7 +1170,9 @@ impl UdpPacketProcessor {
                 session.routing_info.outbound
             );
 
-            let _ = self.forward_packet(packet, session, session_key, false).await;
+            let _ = self
+                .forward_packet(packet, session, session_key, false)
+                .await;
             return;
         }
 
@@ -1168,9 +1192,7 @@ impl UdpPacketProcessor {
 
         debug!(
             "Processing standalone UDP packet {} -> {} (domain: {:?})",
-            packet.client_addr,
-            packet.original_dst,
-            routing_info.domain
+            packet.client_addr, packet.original_dst, routing_info.domain
         );
 
         let _ = self
@@ -1341,7 +1363,11 @@ mod tests {
             ProcessResult::Blocked { reason } => {
                 panic!("Unexpected block: {reason}");
             }
-            ProcessResult::RateLimited { source_ip, current_count, max_allowed } => {
+            ProcessResult::RateLimited {
+                source_ip,
+                current_count,
+                max_allowed,
+            } => {
                 panic!("Unexpected rate limit: {source_ip} has {current_count}/{max_allowed}");
             }
         }
@@ -1377,7 +1403,13 @@ mod tests {
         };
 
         let result1 = processor.process(&packet1, &outbound).await;
-        assert!(matches!(result1, ProcessResult::Forwarded { new_session: true, .. }));
+        assert!(matches!(
+            result1,
+            ProcessResult::Forwarded {
+                new_session: true,
+                ..
+            }
+        ));
 
         // Process second packet from same client
         let packet2 = UdpPacketInfo {
@@ -1401,10 +1433,10 @@ mod tests {
 
     #[test]
     fn test_session_wrapper() {
+        use crate::outbound::DirectUdpHandle;
         use std::net::SocketAddr;
         use tokio::net::UdpSocket;
         use tokio::runtime::Runtime;
-        use crate::outbound::DirectUdpHandle;
 
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
@@ -1431,10 +1463,10 @@ mod tests {
 
     #[test]
     fn test_session_wrapper_with_routing_info() {
+        use crate::outbound::DirectUdpHandle;
         use std::net::SocketAddr;
         use tokio::net::UdpSocket;
         use tokio::runtime::Runtime;
-        use crate::outbound::DirectUdpHandle;
 
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
@@ -1499,11 +1531,15 @@ mod tests {
         let ext_len = 2 + list_len; // list_length (2) + list
 
         let mut sni_extension = vec![
-            0x00, 0x00, // Extension type (SNI)
-            (ext_len >> 8) as u8, ext_len as u8, // Extension length
-            (list_len >> 8) as u8, list_len as u8, // List length
-            0x00, // Name type (host_name)
-            (name_len >> 8) as u8, name_len as u8, // Name length
+            0x00,
+            0x00, // Extension type (SNI)
+            (ext_len >> 8) as u8,
+            ext_len as u8, // Extension length
+            (list_len >> 8) as u8,
+            list_len as u8, // List length
+            0x00,           // Name type (host_name)
+            (name_len >> 8) as u8,
+            name_len as u8, // Name length
         ];
         sni_extension.extend_from_slice(name_bytes);
 
@@ -1583,7 +1619,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_with_rules_quic_sni_domain_match() {
         use crate::outbound::{DirectOutbound, OutboundManager};
-        use crate::rules::engine::{RuleEngine, RoutingSnapshotBuilder};
+        use crate::rules::engine::{RoutingSnapshotBuilder, RuleEngine};
         use crate::rules::RuleType;
 
         // Create a UDP server
@@ -1598,7 +1634,11 @@ mod tests {
         builder
             .add_domain_rule(RuleType::DomainSuffix, "example.com", "proxy")
             .unwrap();
-        let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+        let snapshot = builder
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
         let rule_engine = RuleEngine::new(snapshot);
 
         // Create outbound manager
@@ -1616,7 +1656,9 @@ mod tests {
             received_at: Instant::now(),
         };
 
-        let result = processor.process_with_rules(&packet, &rule_engine, &outbound_manager).await;
+        let result = processor
+            .process_with_rules(&packet, &rule_engine, &outbound_manager)
+            .await;
 
         match result {
             ProcessResult::Forwarded {
@@ -1636,7 +1678,11 @@ mod tests {
             ProcessResult::Blocked { reason } => {
                 panic!("Unexpected block: {reason}");
             }
-            ProcessResult::RateLimited { source_ip, current_count, max_allowed } => {
+            ProcessResult::RateLimited {
+                source_ip,
+                current_count,
+                max_allowed,
+            } => {
                 panic!("Unexpected rate limit: {source_ip} has {current_count}/{max_allowed}");
             }
         }
@@ -1651,9 +1697,9 @@ mod tests {
     #[tokio::test]
     async fn test_process_with_rules_dscp_routing_mark_propagation() {
         use crate::outbound::{DirectOutbound, OutboundManager};
-        use crate::rules::engine::{RuleEngine, RoutingSnapshotBuilder};
-        use crate::rules::RuleType;
+        use crate::rules::engine::{RoutingSnapshotBuilder, RuleEngine};
         use crate::rules::fwmark::ENTRY_ROUTING_MARK_BASE;
+        use crate::rules::RuleType;
 
         // Create a UDP server
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1671,7 +1717,11 @@ mod tests {
             .add_chain_with_dscp("my-chain", 5)
             .unwrap();
 
-        let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+        let snapshot = builder
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
         let rule_engine = RuleEngine::new(snapshot);
 
         // Create outbound manager with the chain outbound
@@ -1689,7 +1739,9 @@ mod tests {
             received_at: Instant::now(),
         };
 
-        let result = processor.process_with_rules(&packet, &rule_engine, &outbound_manager).await;
+        let result = processor
+            .process_with_rules(&packet, &rule_engine, &outbound_manager)
+            .await;
 
         match result {
             ProcessResult::Forwarded {
@@ -1704,11 +1756,11 @@ mod tests {
                 assert_eq!(sniffed_domain, Some("api.chain-test.com".to_string()));
 
                 // Verify that the session has the correct routing_mark from the chain
-                let session_key = crate::connection::udp::UdpSessionKey::new(
-                    packet.client_addr,
-                    server_addr,
-                );
-                let session = processor.get_handle(&session_key).expect("session should exist");
+                let session_key =
+                    crate::connection::udp::UdpSessionKey::new(packet.client_addr, server_addr);
+                let session = processor
+                    .get_handle(&session_key)
+                    .expect("session should exist");
 
                 // routing_mark should be ENTRY_ROUTING_MARK_BASE + dscp_value
                 // 0x300 (768) + 5 = 773
@@ -1728,7 +1780,11 @@ mod tests {
             ProcessResult::Blocked { reason } => {
                 panic!("Unexpected block: {reason}");
             }
-            ProcessResult::RateLimited { source_ip, current_count, max_allowed } => {
+            ProcessResult::RateLimited {
+                source_ip,
+                current_count,
+                max_allowed,
+            } => {
                 panic!("Unexpected rate limit: {source_ip} has {current_count}/{max_allowed}");
             }
         }
@@ -1737,7 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_with_rules_no_routing_mark_for_non_chain() {
         use crate::outbound::{DirectOutbound, OutboundManager};
-        use crate::rules::engine::{RuleEngine, RoutingSnapshotBuilder};
+        use crate::rules::engine::{RoutingSnapshotBuilder, RuleEngine};
         use crate::rules::RuleType;
 
         // Create a UDP server
@@ -1753,7 +1809,11 @@ mod tests {
             .unwrap();
         // No chain registered for "proxy"
 
-        let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+        let snapshot = builder
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
         let rule_engine = RuleEngine::new(snapshot);
 
         // Create outbound manager
@@ -1771,7 +1831,9 @@ mod tests {
             received_at: Instant::now(),
         };
 
-        let result = processor.process_with_rules(&packet, &rule_engine, &outbound_manager).await;
+        let result = processor
+            .process_with_rules(&packet, &rule_engine, &outbound_manager)
+            .await;
 
         match result {
             ProcessResult::Forwarded {
@@ -1784,16 +1846,15 @@ mod tests {
                 assert!(rule_matched);
 
                 // Verify that the session has NO routing_mark (not a chain)
-                let session_key = crate::connection::udp::UdpSessionKey::new(
-                    packet.client_addr,
-                    server_addr,
-                );
-                let session = processor.get_handle(&session_key).expect("session should exist");
+                let session_key =
+                    crate::connection::udp::UdpSessionKey::new(packet.client_addr, server_addr);
+                let session = processor
+                    .get_handle(&session_key)
+                    .expect("session should exist");
 
                 // routing_mark should be None for non-chain outbounds
                 assert_eq!(
-                    session.routing_info.routing_mark,
-                    None,
+                    session.routing_info.routing_mark, None,
                     "routing_mark should be None for non-chain outbound"
                 );
             }
@@ -1803,7 +1864,11 @@ mod tests {
             ProcessResult::Blocked { reason } => {
                 panic!("Unexpected block: {reason}");
             }
-            ProcessResult::RateLimited { source_ip, current_count, max_allowed } => {
+            ProcessResult::RateLimited {
+                source_ip,
+                current_count,
+                max_allowed,
+            } => {
                 panic!("Unexpected rate limit: {source_ip} has {current_count}/{max_allowed}");
             }
         }
@@ -1874,7 +1939,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_with_rules_outbound_not_found() {
         use crate::outbound::OutboundManager;
-        use crate::rules::engine::{RuleEngine, RoutingSnapshotBuilder};
+        use crate::rules::engine::{RoutingSnapshotBuilder, RuleEngine};
 
         let processor = UdpPacketProcessor::new_default();
 
@@ -1896,7 +1961,9 @@ mod tests {
             received_at: Instant::now(),
         };
 
-        let result = processor.process_with_rules(&packet, &rule_engine, &outbound_manager).await;
+        let result = processor
+            .process_with_rules(&packet, &rule_engine, &outbound_manager)
+            .await;
 
         match result {
             ProcessResult::Failed { error } => {
@@ -1909,7 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_with_rules_default_outbound() {
         use crate::outbound::{DirectOutbound, OutboundManager};
-        use crate::rules::engine::{RuleEngine, RoutingSnapshotBuilder};
+        use crate::rules::engine::{RoutingSnapshotBuilder, RuleEngine};
 
         // Create a UDP server
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1936,7 +2003,9 @@ mod tests {
             received_at: Instant::now(),
         };
 
-        let result = processor.process_with_rules(&packet, &rule_engine, &outbound_manager).await;
+        let result = processor
+            .process_with_rules(&packet, &rule_engine, &outbound_manager)
+            .await;
 
         match result {
             ProcessResult::Forwarded {
@@ -1955,7 +2024,11 @@ mod tests {
             ProcessResult::Blocked { reason } => {
                 panic!("Unexpected block: {reason}");
             }
-            ProcessResult::RateLimited { source_ip, current_count, max_allowed } => {
+            ProcessResult::RateLimited {
+                source_ip,
+                current_count,
+                max_allowed,
+            } => {
                 panic!("Unexpected rate limit: {source_ip} has {current_count}/{max_allowed}");
             }
         }
@@ -1969,7 +2042,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_with_rules_domain_match() {
         use crate::outbound::{DirectOutbound, OutboundManager};
-        use crate::rules::engine::{RuleEngine, RoutingSnapshotBuilder};
+        use crate::rules::engine::{RoutingSnapshotBuilder, RuleEngine};
         use crate::rules::RuleType;
 
         // Create a UDP server
@@ -1985,7 +2058,11 @@ mod tests {
         builder
             .add_domain_rule(RuleType::DomainSuffix, "google.com", "proxy")
             .unwrap();
-        let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+        let snapshot = builder
+            .default_outbound("direct")
+            .version(1)
+            .build()
+            .unwrap();
         let rule_engine = RuleEngine::new(snapshot);
 
         // Create outbound manager
@@ -2001,7 +2078,9 @@ mod tests {
             received_at: Instant::now(),
         };
 
-        let result = processor.process_with_rules(&packet, &rule_engine, &outbound_manager).await;
+        let result = processor
+            .process_with_rules(&packet, &rule_engine, &outbound_manager)
+            .await;
 
         match result {
             ProcessResult::Forwarded {
@@ -2021,7 +2100,11 @@ mod tests {
             ProcessResult::Blocked { reason } => {
                 panic!("Unexpected block: {reason}");
             }
-            ProcessResult::RateLimited { source_ip, current_count, max_allowed } => {
+            ProcessResult::RateLimited {
+                source_ip,
+                current_count,
+                max_allowed,
+            } => {
                 panic!("Unexpected rate limit: {source_ip} has {current_count}/{max_allowed}");
             }
         }
@@ -2075,15 +2158,27 @@ mod tests {
         };
 
         let result = processor.process(&packet, &outbound).await;
-        assert!(matches!(result, ProcessResult::Forwarded { new_session: true, .. }));
+        assert!(matches!(
+            result,
+            ProcessResult::Forwarded {
+                new_session: true,
+                ..
+            }
+        ));
 
         // Run pending tasks immediately after insert to ensure it's committed
         processor.handle_cache.run_pending_tasks();
 
         // Verify IP counter was incremented
         let count_after_create = processor.get_ip_session_count(source_ip);
-        assert_eq!(count_after_create, 1, "IP counter should be 1 after creating session");
-        assert!(processor.active_sessions() >= 1, "Should have at least 1 active session");
+        assert_eq!(
+            count_after_create, 1,
+            "IP counter should be 1 after creating session"
+        );
+        assert!(
+            processor.active_sessions() >= 1,
+            "Should have at least 1 active session"
+        );
 
         // Wait for TTL to expire (200ms + some buffer)
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2124,17 +2219,25 @@ mod tests {
         let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // Manually set the counter to 0 (simulating empty state)
-        processor.ip_session_counts.insert(source_ip, AtomicU32::new(0));
+        processor
+            .ip_session_counts
+            .insert(source_ip, AtomicU32::new(0));
 
         // Try to decrement - this should NOT cause underflow
         processor.decrement_ip_session_count(source_ip);
 
         // Verify counter is still 0 (not u32::MAX from underflow)
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 0, "Counter should stay at 0, not underflow to {}", count);
+        assert_eq!(
+            count, 0,
+            "Counter should stay at 0, not underflow to {}",
+            count
+        );
 
         // Now set it to 1 and decrement
-        processor.ip_session_counts.insert(source_ip, AtomicU32::new(1));
+        processor
+            .ip_session_counts
+            .insert(source_ip, AtomicU32::new(1));
         processor.decrement_ip_session_count(source_ip);
 
         // Should be 0 now
@@ -2168,7 +2271,9 @@ mod tests {
         let source_ip: IpAddr = "10.0.0.2".parse().unwrap();
 
         // Set initial count to 1000
-        processor.ip_session_counts.insert(source_ip, AtomicU32::new(1000));
+        processor
+            .ip_session_counts
+            .insert(source_ip, AtomicU32::new(1000));
 
         // Spawn 10 threads, each decrementing 100 times
         let threads: Vec<_> = (0..10)
@@ -2190,7 +2295,11 @@ mod tests {
 
         // Final count should be 0 (1000 - 10*100 = 0)
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 0, "Counter should be 0 after 1000 concurrent decrements, got {}", count);
+        assert_eq!(
+            count, 0,
+            "Counter should be 0 after 1000 concurrent decrements, got {}",
+            count
+        );
     }
 
     #[test]
@@ -2212,14 +2321,19 @@ mod tests {
         let source_ip: IpAddr = "10.0.0.3".parse().unwrap();
 
         // Manually set counter (shouldn't happen in practice when disabled)
-        processor.ip_session_counts.insert(source_ip, AtomicU32::new(5));
+        processor
+            .ip_session_counts
+            .insert(source_ip, AtomicU32::new(5));
 
         // Decrement should be no-op when rate limiting is disabled
         processor.decrement_ip_session_count(source_ip);
 
         // Counter should remain 5 (decrement was skipped)
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 5, "Counter should be unchanged when rate limiting is disabled");
+        assert_eq!(
+            count, 5,
+            "Counter should be unchanged when rate limiting is disabled"
+        );
     }
 
     #[tokio::test]
@@ -2255,7 +2369,13 @@ mod tests {
         };
 
         let result = processor.process(&packet, &outbound).await;
-        assert!(matches!(result, ProcessResult::Forwarded { new_session: true, .. }));
+        assert!(matches!(
+            result,
+            ProcessResult::Forwarded {
+                new_session: true,
+                ..
+            }
+        ));
 
         // Verify counter was incremented
         assert_eq!(processor.get_ip_session_count(source_ip), 1);
@@ -2346,7 +2466,8 @@ mod tests {
         // Create 3 sessions from the same IP
         let mut session_keys = Vec::new();
         for port in 40001..=40003 {
-            let client_addr: std::net::SocketAddr = format!("{}:{}", source_ip, port).parse().unwrap();
+            let client_addr: std::net::SocketAddr =
+                format!("{}:{}", source_ip, port).parse().unwrap();
             let packet = UdpPacketInfo {
                 data: Bytes::from_static(b"test"),
                 client_addr,
@@ -2355,7 +2476,13 @@ mod tests {
             };
 
             let result = processor.process(&packet, &outbound).await;
-            assert!(matches!(result, ProcessResult::Forwarded { new_session: true, .. }));
+            assert!(matches!(
+                result,
+                ProcessResult::Forwarded {
+                    new_session: true,
+                    ..
+                }
+            ));
 
             session_keys.push(UdpSessionKey::new(client_addr, server_addr));
         }
@@ -2368,21 +2495,33 @@ mod tests {
 
         // Counter should be 2 (NOT 1 from double-decrement)
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 2, "Counter should be 2 after single invalidate, got {} (double-decrement bug!)", count);
+        assert_eq!(
+            count, 2,
+            "Counter should be 2 after single invalidate, got {} (double-decrement bug!)",
+            count
+        );
 
         // Invalidate the second session
         processor.invalidate(&session_keys[1]);
 
         // Counter should be 1
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 1, "Counter should be 1 after second invalidate, got {}", count);
+        assert_eq!(
+            count, 1,
+            "Counter should be 1 after second invalidate, got {}",
+            count
+        );
 
         // Invalidate the third session
         processor.invalidate(&session_keys[2]);
 
         // Counter should be 0
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 0, "Counter should be 0 after all invalidates, got {}", count);
+        assert_eq!(
+            count, 0,
+            "Counter should be 0 after all invalidates, got {}",
+            count
+        );
     }
 
     /// REGRESSION TEST: Counter drift fix verification.
@@ -2428,11 +2567,16 @@ mod tests {
 
         // Counter should be 0 (decremented after failure), NOT 1
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 0, "Counter should be 0 after blocked session, got {} (counter drift bug!)", count);
+        assert_eq!(
+            count, 0,
+            "Counter should be 0 after blocked session, got {} (counter drift bug!)",
+            count
+        );
 
         // Try multiple failed creations
         for port in 50002..=50005 {
-            let client_addr: std::net::SocketAddr = format!("{}:{}", source_ip, port).parse().unwrap();
+            let client_addr: std::net::SocketAddr =
+                format!("{}:{}", source_ip, port).parse().unwrap();
             let packet = UdpPacketInfo {
                 data: Bytes::from_static(b"test"),
                 client_addr,
@@ -2445,7 +2589,11 @@ mod tests {
 
         // Counter should still be 0 (all failed creations should decrement)
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 0, "Counter should still be 0 after multiple failed sessions, got {} (counter drift bug!)", count);
+        assert_eq!(
+            count, 0,
+            "Counter should still be 0 after multiple failed sessions, got {} (counter drift bug!)",
+            count
+        );
     }
 
     // ========================================================================
@@ -2528,7 +2676,9 @@ mod tests {
         let source_ip: IpAddr = "10.0.0.102".parse().unwrap();
 
         // Pre-set counter to max
-        processor.ip_session_counts.insert(source_ip, AtomicU32::new(5));
+        processor
+            .ip_session_counts
+            .insert(source_ip, AtomicU32::new(5));
 
         // Next call should be rejected
         let result = processor.check_ip_session_limit(source_ip);
@@ -2620,8 +2770,16 @@ mod tests {
 
         // Counter should be exactly 100 (the limit)
         let count = processor.get_ip_session_count(source_ip);
-        assert_eq!(count, 100, "Counter should be exactly at limit (100), got {}", count);
-        assert_eq!(total_successes, 100, "Total successes should be 100, got {}", total_successes);
+        assert_eq!(
+            count, 100,
+            "Counter should be exactly at limit (100), got {}",
+            count
+        );
+        assert_eq!(
+            total_successes, 100,
+            "Total successes should be 100, got {}",
+            total_successes
+        );
     }
 
     #[test]
@@ -2681,7 +2839,16 @@ mod tests {
             received_at: Instant::now(),
         };
         let result1 = processor.process(&packet1, &outbound).await;
-        assert!(matches!(result1, ProcessResult::Forwarded { new_session: true, .. }), "First session should succeed");
+        assert!(
+            matches!(
+                result1,
+                ProcessResult::Forwarded {
+                    new_session: true,
+                    ..
+                }
+            ),
+            "First session should succeed"
+        );
 
         // Create second session (should succeed)
         let packet2 = UdpPacketInfo {
@@ -2691,7 +2858,16 @@ mod tests {
             received_at: Instant::now(),
         };
         let result2 = processor.process(&packet2, &outbound).await;
-        assert!(matches!(result2, ProcessResult::Forwarded { new_session: true, .. }), "Second session should succeed");
+        assert!(
+            matches!(
+                result2,
+                ProcessResult::Forwarded {
+                    new_session: true,
+                    ..
+                }
+            ),
+            "Second session should succeed"
+        );
 
         // Third session should be rate limited
         let packet3 = UdpPacketInfo {
@@ -2701,10 +2877,18 @@ mod tests {
             received_at: Instant::now(),
         };
         let result3 = processor.process(&packet3, &outbound).await;
-        assert!(matches!(result3, ProcessResult::RateLimited { .. }), "Third session should be rate limited, got {:?}", result3);
+        assert!(
+            matches!(result3, ProcessResult::RateLimited { .. }),
+            "Third session should be rate limited, got {:?}",
+            result3
+        );
 
         // Counter should be 2
-        assert_eq!(processor.get_ip_session_count(source_ip), 2, "Counter should be 2");
+        assert_eq!(
+            processor.get_ip_session_count(source_ip),
+            2,
+            "Counter should be 2"
+        );
     }
 
     #[test]
@@ -2791,9 +2975,15 @@ mod tests {
         let processor = UdpPacketProcessor::new(config);
 
         // Add some IPs with count 0 (simulating sessions that have all expired)
-        processor.ip_session_counts.insert("10.0.0.1".parse().unwrap(), AtomicU32::new(0));
-        processor.ip_session_counts.insert("10.0.0.2".parse().unwrap(), AtomicU32::new(0));
-        processor.ip_session_counts.insert("10.0.0.3".parse().unwrap(), AtomicU32::new(5)); // Active
+        processor
+            .ip_session_counts
+            .insert("10.0.0.1".parse().unwrap(), AtomicU32::new(0));
+        processor
+            .ip_session_counts
+            .insert("10.0.0.2".parse().unwrap(), AtomicU32::new(0));
+        processor
+            .ip_session_counts
+            .insert("10.0.0.3".parse().unwrap(), AtomicU32::new(5)); // Active
 
         assert_eq!(processor.tracked_source_ips(), 3);
 
@@ -2802,7 +2992,10 @@ mod tests {
 
         assert_eq!(removed, 2, "Should remove 2 zero-count entries");
         assert_eq!(processor.tracked_source_ips(), 1, "Should have 1 remaining");
-        assert_eq!(processor.get_ip_session_count("10.0.0.3".parse().unwrap()), 5);
+        assert_eq!(
+            processor.get_ip_session_count("10.0.0.3".parse().unwrap()),
+            5
+        );
     }
 
     #[test]
@@ -2822,13 +3015,22 @@ mod tests {
         let processor = UdpPacketProcessor::new(config);
 
         // Add an entry (shouldn't happen in practice, but test anyway)
-        processor.ip_session_counts.insert("10.0.0.1".parse().unwrap(), AtomicU32::new(0));
+        processor
+            .ip_session_counts
+            .insert("10.0.0.1".parse().unwrap(), AtomicU32::new(0));
 
         // Cleanup should return 0 (no-op)
         let removed = processor.cleanup_zero_count_ips();
 
-        assert_eq!(removed, 0, "Cleanup should be no-op when rate limiting disabled");
-        assert_eq!(processor.tracked_source_ips(), 1, "Entry should still exist");
+        assert_eq!(
+            removed, 0,
+            "Cleanup should be no-op when rate limiting disabled"
+        );
+        assert_eq!(
+            processor.tracked_source_ips(),
+            1,
+            "Entry should still exist"
+        );
     }
 
     #[test]
@@ -2851,7 +3053,7 @@ mod tests {
         for i in 0..100 {
             processor.ip_session_counts.insert(
                 format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap(),
-                AtomicU32::new(0)
+                AtomicU32::new(0),
             );
         }
 
@@ -2874,7 +3076,7 @@ mod tests {
             connect_timeout: Duration::from_secs(5),
             enable_quic_sniff: false,
             max_sessions_per_ip: 100,
-            max_tracked_ips: 50, // Low limit for testing
+            max_tracked_ips: 50,                         // Low limit for testing
             cleanup_interval: Duration::from_secs(3600), // Long interval
         };
 
@@ -2884,7 +3086,7 @@ mod tests {
         for i in 0..60 {
             processor.ip_session_counts.insert(
                 format!("10.0.{}.{}", i / 256, i % 256).parse().unwrap(),
-                AtomicU32::new(0)
+                AtomicU32::new(0),
             );
         }
 
@@ -2894,7 +3096,11 @@ mod tests {
         processor.maybe_cleanup();
 
         // All zero-count entries should be removed
-        assert_eq!(processor.tracked_source_ips(), 0, "All zero-count entries should be cleaned");
+        assert_eq!(
+            processor.tracked_source_ips(),
+            0,
+            "All zero-count entries should be cleaned"
+        );
     }
 
     #[test]
@@ -2914,18 +3120,36 @@ mod tests {
         let processor = UdpPacketProcessor::new(config);
 
         // Add mix of active and inactive entries
-        processor.ip_session_counts.insert("10.0.0.1".parse().unwrap(), AtomicU32::new(5)); // Active
-        processor.ip_session_counts.insert("10.0.0.2".parse().unwrap(), AtomicU32::new(0)); // Inactive
-        processor.ip_session_counts.insert("10.0.0.3".parse().unwrap(), AtomicU32::new(10)); // Active
-        processor.ip_session_counts.insert("10.0.0.4".parse().unwrap(), AtomicU32::new(0)); // Inactive
+        processor
+            .ip_session_counts
+            .insert("10.0.0.1".parse().unwrap(), AtomicU32::new(5)); // Active
+        processor
+            .ip_session_counts
+            .insert("10.0.0.2".parse().unwrap(), AtomicU32::new(0)); // Inactive
+        processor
+            .ip_session_counts
+            .insert("10.0.0.3".parse().unwrap(), AtomicU32::new(10)); // Active
+        processor
+            .ip_session_counts
+            .insert("10.0.0.4".parse().unwrap(), AtomicU32::new(0)); // Inactive
 
         // Force cleanup
         let removed = processor.force_cleanup();
 
         assert_eq!(removed, 2, "Should remove 2 zero-count entries");
-        assert_eq!(processor.tracked_source_ips(), 2, "Should keep 2 active entries");
-        assert_eq!(processor.get_ip_session_count("10.0.0.1".parse().unwrap()), 5);
-        assert_eq!(processor.get_ip_session_count("10.0.0.3".parse().unwrap()), 10);
+        assert_eq!(
+            processor.tracked_source_ips(),
+            2,
+            "Should keep 2 active entries"
+        );
+        assert_eq!(
+            processor.get_ip_session_count("10.0.0.1".parse().unwrap()),
+            5
+        );
+        assert_eq!(
+            processor.get_ip_session_count("10.0.0.3".parse().unwrap()),
+            10
+        );
     }
 
     #[test]
@@ -2952,7 +3176,10 @@ mod tests {
         let config = UdpProcessorConfig::default();
 
         assert_eq!(config.max_tracked_ips, DEFAULT_MAX_TRACKED_IPS);
-        assert_eq!(config.cleanup_interval, Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS));
+        assert_eq!(
+            config.cleanup_interval,
+            Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS)
+        );
     }
 
     #[test]
@@ -2978,13 +3205,21 @@ mod tests {
             processor.ip_session_counts.insert(ip, AtomicU32::new(0));
         }
 
-        assert_eq!(processor.tracked_source_ips(), 200, "Before cleanup: 200 entries");
+        assert_eq!(
+            processor.tracked_source_ips(),
+            200,
+            "Before cleanup: 200 entries"
+        );
 
         // maybe_cleanup should trigger (over capacity 200 > 100)
         processor.maybe_cleanup();
 
         // After cleanup, all zero-count entries should be gone
-        assert_eq!(processor.tracked_source_ips(), 0, "After cleanup: 0 entries");
+        assert_eq!(
+            processor.tracked_source_ips(),
+            0,
+            "After cleanup: 0 entries"
+        );
     }
 
     #[test]
@@ -3004,13 +3239,17 @@ mod tests {
         let processor = UdpPacketProcessor::new(config);
 
         // Add a zero-count entry
-        processor.ip_session_counts.insert("10.0.0.1".parse().unwrap(), AtomicU32::new(0));
+        processor
+            .ip_session_counts
+            .insert("10.0.0.1".parse().unwrap(), AtomicU32::new(0));
 
         // Wait for interval to pass
         std::thread::sleep(Duration::from_millis(20));
 
         // Set decrement counter high enough to trigger check
-        processor.decrement_counter.store(CLEANUP_CHECK_INTERVAL_DECREMENTS - 1, Ordering::Relaxed);
+        processor
+            .decrement_counter
+            .store(CLEANUP_CHECK_INTERVAL_DECREMENTS - 1, Ordering::Relaxed);
 
         // This decrement should trigger cleanup
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
@@ -3033,7 +3272,7 @@ mod tests {
             connect_timeout: Duration::from_secs(5),
             enable_quic_sniff: false,
             max_sessions_per_ip: 10,
-            max_tracked_ips: 3, // Very small for testing
+            max_tracked_ips: 3,                          // Very small for testing
             cleanup_interval: Duration::from_secs(3600), // Long interval, won't auto-clean
         };
 
@@ -3046,25 +3285,52 @@ mod tests {
         let ip4: IpAddr = "10.0.0.4".parse().unwrap(); // This should be rejected
 
         // Create sessions for first 3 IPs
-        assert!(processor.check_ip_session_limit(ip1).is_ok(), "IP1 should succeed");
-        assert!(processor.check_ip_session_limit(ip2).is_ok(), "IP2 should succeed");
-        assert!(processor.check_ip_session_limit(ip3).is_ok(), "IP3 should succeed");
+        assert!(
+            processor.check_ip_session_limit(ip1).is_ok(),
+            "IP1 should succeed"
+        );
+        assert!(
+            processor.check_ip_session_limit(ip2).is_ok(),
+            "IP2 should succeed"
+        );
+        assert!(
+            processor.check_ip_session_limit(ip3).is_ok(),
+            "IP3 should succeed"
+        );
 
         // Verify we're at capacity
-        assert_eq!(processor.tracked_source_ips(), 3, "Should have 3 tracked IPs");
+        assert_eq!(
+            processor.tracked_source_ips(),
+            3,
+            "Should have 3 tracked IPs"
+        );
 
         // Try to add a new IP - should be rejected
         let result = processor.check_ip_session_limit(ip4);
         assert!(result.is_err(), "IP4 should be rejected - at capacity");
-        assert_eq!(result.unwrap_err(), (0, 0), "Special (0,0) indicates IP capacity");
+        assert_eq!(
+            result.unwrap_err(),
+            (0, 0),
+            "Special (0,0) indicates IP capacity"
+        );
 
         // Verify no new entry was created
         assert_eq!(processor.tracked_source_ips(), 3, "Should still have 3 IPs");
-        assert!(!processor.ip_session_counts.contains_key(&ip4), "IP4 should not exist");
+        assert!(
+            !processor.ip_session_counts.contains_key(&ip4),
+            "IP4 should not exist"
+        );
 
         // Existing IPs should still be able to create sessions
-        assert!(processor.check_ip_session_limit(ip1).is_ok(), "Existing IP1 should still work");
-        assert_eq!(processor.get_ip_session_count(ip1), 2, "IP1 should have 2 sessions");
+        assert!(
+            processor.check_ip_session_limit(ip1).is_ok(),
+            "Existing IP1 should still work"
+        );
+        assert_eq!(
+            processor.get_ip_session_count(ip1),
+            2,
+            "IP1 should have 2 sessions"
+        );
     }
 
     #[test]
@@ -3100,7 +3366,10 @@ mod tests {
 
         // Now a new IP should be allowed
         let ip3: IpAddr = "10.0.0.3".parse().unwrap();
-        assert!(processor.check_ip_session_limit(ip3).is_ok(), "IP3 should now succeed");
+        assert!(
+            processor.check_ip_session_limit(ip3).is_ok(),
+            "IP3 should now succeed"
+        );
         assert_eq!(processor.tracked_source_ips(), 2, "Should have 2 IPs");
     }
 
@@ -3111,17 +3380,26 @@ mod tests {
 
         // Test normal decrement
         let counter = AtomicU32::new(5);
-        assert!(cas_decrement(&counter), "Should return true on successful decrement");
+        assert!(
+            cas_decrement(&counter),
+            "Should return true on successful decrement"
+        );
         assert_eq!(counter.load(Ordering::Relaxed), 4);
 
         // Test decrement to zero
         let counter = AtomicU32::new(1);
-        assert!(cas_decrement(&counter), "Should return true on decrement to 0");
+        assert!(
+            cas_decrement(&counter),
+            "Should return true on decrement to 0"
+        );
         assert_eq!(counter.load(Ordering::Relaxed), 0);
 
         // Test decrement when already zero
         let counter = AtomicU32::new(0);
-        assert!(!cas_decrement(&counter), "Should return false when already 0");
+        assert!(
+            !cas_decrement(&counter),
+            "Should return false when already 0"
+        );
         assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

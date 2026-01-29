@@ -280,11 +280,7 @@ impl WgEgressBridge {
     /// );
     /// ```
     #[must_use]
-    pub fn new(
-        tunnel_tag: String,
-        wg_egress: Arc<WgEgressManager>,
-        local_ip: Ipv4Addr,
-    ) -> Self {
+    pub fn new(tunnel_tag: String, wg_egress: Arc<WgEgressManager>, local_ip: Ipv4Addr) -> Self {
         let smoltcp = SmoltcpBridge::new(local_ip, WG_MTU);
         let port_allocator = PortAllocator::new();
 
@@ -939,9 +935,9 @@ impl WgEgressBridge {
 
         let smoltcp_dest = match dest_ip {
             IpAddr::V4(v4) => smoltcp::wire::IpEndpoint {
-                addr: smoltcp::wire::IpAddress::Ipv4(
-                    smoltcp::wire::Ipv4Address::from_bytes(&v4.octets()),
-                ),
+                addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(
+                    &v4.octets(),
+                )),
                 port: dest_port,
             },
             IpAddr::V6(_) => {
@@ -1102,10 +1098,10 @@ impl WgEgressBridge {
         // Reply packets have src=remote, dst=local, so we reverse for lookup
         let reply_key = ReplyKey::new(
             self.tunnel_tag.clone(),
-            dst_ip,      // local (destination of reply)
-            dst_port,    // local port
-            src_ip,      // remote (source of reply)
-            src_port,    // remote port
+            dst_ip,   // local (destination of reply)
+            dst_port, // local port
+            src_ip,   // remote (source of reply)
+            src_port, // remote port
         );
 
         if let Some(sender) = self.reply_channels.get(&reply_key) {
@@ -1169,10 +1165,7 @@ impl WgEgressBridge {
             tokio::time::sleep(poll_interval).await;
         }
 
-        debug!(
-            "Poll loop stopped for WgEgressBridge '{}'",
-            self.tunnel_tag
-        );
+        debug!("Poll loop stopped for WgEgressBridge '{}'", self.tunnel_tag);
     }
 }
 

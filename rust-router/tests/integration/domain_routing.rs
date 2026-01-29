@@ -27,7 +27,7 @@ use std::time::Duration;
 
 #[cfg(feature = "sni-sniffing")]
 mod tls_sniff {
-    use rust_router::sniff::{looks_like_tls, sniff_tls_sni, sniff_tls};
+    use rust_router::sniff::{looks_like_tls, sniff_tls, sniff_tls_sni};
 
     /// Create a minimal TLS ClientHello with the given SNI
     fn create_client_hello(sni: &str) -> Vec<u8> {
@@ -166,7 +166,7 @@ mod tls_sniff {
 
 #[cfg(feature = "sni-sniffing")]
 mod http_sniff {
-    use rust_router::sniff::{looks_like_http, sniff_http_host, sniff_http};
+    use rust_router::sniff::{looks_like_http, sniff_http, sniff_http_host};
 
     #[test]
     fn test_looks_like_http() {
@@ -406,10 +406,7 @@ mod fakedns {
                         let domain = format!("test{}-{}.example.com", i, j);
                         let (ip, _) = manager.map_domain_ipv4(&domain).unwrap();
                         assert!(manager.is_fake_ip(IpAddr::V4(ip)));
-                        assert_eq!(
-                            manager.map_ip_domain(IpAddr::V4(ip)),
-                            Some(domain)
-                        );
+                        assert_eq!(manager.map_ip_domain(IpAddr::V4(ip)), Some(domain));
                     }
                 })
             })
@@ -452,7 +449,7 @@ mod fakedns {
 mod domain_routing_integration {
     use super::*;
     use rust_router::fakedns::{FakeDnsConfig, FakeDnsManager};
-    use rust_router::sniff::{looks_like_http, sniff_tls_sni, sniff_http_host};
+    use rust_router::sniff::{looks_like_http, sniff_http_host, sniff_tls_sni};
     use std::sync::Arc;
 
     /// Test the full domain routing flow:

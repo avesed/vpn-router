@@ -174,52 +174,57 @@ mod parser_impl {
                     match parse_tls_extensions(ext_data) {
                         Ok((_, extensions)) => {
                             for ext in extensions {
-                            match ext {
-                                // SNI extension
-                                TlsExtension::SNI(sni_list) => {
-                                    for (sni_type, name_bytes) in sni_list {
-                                        // SNIType::HostName = 0
-                                        if sni_type == SNIType::HostName {
-                                            if let Ok(hostname) = std::str::from_utf8(name_bytes) {
-                                                // Validate hostname
-                                                if is_valid_hostname(hostname) {
-                                                    result.sni = Some(hostname.to_string());
-                                                    trace!("Found SNI: {}", hostname);
+                                match ext {
+                                    // SNI extension
+                                    TlsExtension::SNI(sni_list) => {
+                                        for (sni_type, name_bytes) in sni_list {
+                                            // SNIType::HostName = 0
+                                            if sni_type == SNIType::HostName {
+                                                if let Ok(hostname) =
+                                                    std::str::from_utf8(name_bytes)
+                                                {
+                                                    // Validate hostname
+                                                    if is_valid_hostname(hostname) {
+                                                        result.sni = Some(hostname.to_string());
+                                                        trace!("Found SNI: {}", hostname);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
 
-                                // ALPN extension
-                                TlsExtension::ALPN(protocols) => {
-                                    for proto_bytes in protocols {
-                                        if let Ok(proto) = std::str::from_utf8(proto_bytes) {
-                                            result.alpn.push(proto.to_string());
-                                            trace!("Found ALPN: {}", proto);
+                                    // ALPN extension
+                                    TlsExtension::ALPN(protocols) => {
+                                        for proto_bytes in protocols {
+                                            if let Ok(proto) = std::str::from_utf8(proto_bytes) {
+                                                result.alpn.push(proto.to_string());
+                                                trace!("Found ALPN: {}", proto);
+                                            }
                                         }
                                     }
-                                }
 
-                                // Encrypted Server Name (ESNI/ECH precursor)
-                                // This is the draft-ietf-tls-esni format
-                                TlsExtension::EncryptedServerName { .. } => {
-                                    result.has_ech = true;
-                                    trace!("Detected EncryptedServerName (ESNI)");
-                                }
-
-                                // ECH extension type 0xfe0d (65037)
-                                // tls-parser may not have explicit support, check Unknown
-                                TlsExtension::Unknown(ext_type, _) => {
-                                    // ECH extension type: 0xfe0d (65037) or 0xfe0a (65034 draft)
-                                    if ext_type.0 == 0xfe0d || ext_type.0 == 0xfe0a {
+                                    // Encrypted Server Name (ESNI/ECH precursor)
+                                    // This is the draft-ietf-tls-esni format
+                                    TlsExtension::EncryptedServerName { .. } => {
                                         result.has_ech = true;
-                                        trace!("Detected ECH extension (type 0x{:04x})", ext_type.0);
+                                        trace!("Detected EncryptedServerName (ESNI)");
                                     }
-                                }
 
-                                _ => {}
-                            }
+                                    // ECH extension type 0xfe0d (65037)
+                                    // tls-parser may not have explicit support, check Unknown
+                                    TlsExtension::Unknown(ext_type, _) => {
+                                        // ECH extension type: 0xfe0d (65037) or 0xfe0a (65034 draft)
+                                        if ext_type.0 == 0xfe0d || ext_type.0 == 0xfe0a {
+                                            result.has_ech = true;
+                                            trace!(
+                                                "Detected ECH extension (type 0x{:04x})",
+                                                ext_type.0
+                                            );
+                                        }
+                                    }
+
+                                    _ => {}
+                                }
                             }
                         }
                         Err(e) => {
@@ -718,7 +723,8 @@ mod tests {
 
     #[test]
     fn test_sniff_tls_with_alpn() {
-        let data = create_test_client_hello_with_extensions("example.com", &["h2", "http/1.1"], false);
+        let data =
+            create_test_client_hello_with_extensions("example.com", &["h2", "http/1.1"], false);
         let result = sniff_tls(&data).expect("Should parse TLS");
 
         assert_eq!(result.sni, Some("example.com".to_string()));

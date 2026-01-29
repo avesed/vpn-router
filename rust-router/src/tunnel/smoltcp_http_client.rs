@@ -138,8 +138,7 @@ impl HttpResponse {
     /// Get the Content-Length header value
     #[must_use]
     pub fn content_length(&self) -> Option<usize> {
-        self.header("content-length")
-            .and_then(|v| v.parse().ok())
+        self.header("content-length").and_then(|v| v.parse().ok())
     }
 }
 
@@ -333,7 +332,14 @@ impl SmoltcpHttpClient {
         );
 
         // Build the HTTP request
-        let request_bytes = Self::build_request(method, path, &remote_ip.to_string(), remote_port, headers, body);
+        let request_bytes = Self::build_request(
+            method,
+            path,
+            &remote_ip.to_string(),
+            remote_port,
+            headers,
+            body,
+        );
         trace!("HTTP request built: {} bytes", request_bytes.len());
 
         // Connect the socket
@@ -345,7 +351,9 @@ impl SmoltcpHttpClient {
             .await?;
 
         // Receive the response
-        let response_bytes = self.receive_response(handle, tx_sender, rx_receiver).await?;
+        let response_bytes = self
+            .receive_response(handle, tx_sender, rx_receiver)
+            .await?;
 
         // Parse the response
         Self::parse_response(&response_bytes)
@@ -415,7 +423,10 @@ impl SmoltcpHttpClient {
                     break;
                 }
                 TcpState::Closed | TcpState::TimeWait => {
-                    debug!("TCP connection failed: state={:?} after {} loops", state, loop_count);
+                    debug!(
+                        "TCP connection failed: state={:?} after {} loops",
+                        state, loop_count
+                    );
                     return Err(HttpClientError::ConnectionFailed(
                         "Connection closed during handshake".to_string(),
                     ));
@@ -637,7 +648,10 @@ impl SmoltcpHttpClient {
         let mut count = 0;
         while let Ok(packet) = rx_receiver.try_recv() {
             // Log packets received from tunnel
-            debug!("HTTP client: received {} byte packet from tunnel", packet.len());
+            debug!(
+                "HTTP client: received {} byte packet from tunnel",
+                packet.len()
+            );
             self.bridge.feed_rx_packet(packet);
             count += 1;
         }
@@ -652,10 +666,9 @@ impl SmoltcpHttpClient {
         tx_sender: &mpsc::Sender<Vec<u8>>,
     ) -> Result<(), HttpClientError> {
         for packet in self.bridge.drain_tx_packets() {
-            tx_sender
-                .send(packet)
-                .await
-                .map_err(|e| HttpClientError::TunnelError(format!("Failed to send packet: {}", e)))?;
+            tx_sender.send(packet).await.map_err(|e| {
+                HttpClientError::TunnelError(format!("Failed to send packet: {}", e))
+            })?;
         }
         Ok(())
     }
@@ -750,10 +763,7 @@ impl SmoltcpHttpClient {
     /// Removes carriage return (\r) and line feed (\n) characters that could
     /// be used to inject additional HTTP headers.
     fn sanitize_header_value(value: &str) -> String {
-        value
-            .chars()
-            .filter(|c| *c != '\r' && *c != '\n')
-            .collect()
+        value.chars().filter(|c| *c != '\r' && *c != '\n').collect()
     }
 
     /// Find the end of HTTP headers (double CRLF)
@@ -769,10 +779,7 @@ impl SmoltcpHttpClient {
         for line in headers.lines() {
             let lower = line.to_lowercase();
             if lower.starts_with("content-length:") {
-                return line
-                    .split(':')
-                    .nth(1)
-                    .and_then(|v| v.trim().parse().ok());
+                return line.split(':').nth(1).and_then(|v| v.trim().parse().ok());
             }
         }
         None
@@ -791,9 +798,9 @@ impl SmoltcpHttpClient {
 
         // Parse status line
         let mut lines = headers_str.lines();
-        let status_line = lines.next().ok_or_else(|| {
-            HttpClientError::InvalidResponse("Empty response".to_string())
-        })?;
+        let status_line = lines
+            .next()
+            .ok_or_else(|| HttpClientError::InvalidResponse("Empty response".to_string()))?;
 
         let status_code = Self::parse_status_line(status_line)?;
 
@@ -909,7 +916,10 @@ mod tests {
             .with_auth_signature("abc123");
 
         let headers = auth.to_headers();
-        assert_eq!(headers.get("X-Tunnel-Source-IP"), Some(&"10.200.200.2".to_string()));
+        assert_eq!(
+            headers.get("X-Tunnel-Source-IP"),
+            Some(&"10.200.200.2".to_string())
+        );
         assert_eq!(headers.get("X-Tunnel-Peer-Tag"), Some(&"dev".to_string()));
         assert_eq!(headers.get("X-Tunnel-Auth"), Some(&"abc123".to_string()));
     }
@@ -974,9 +984,18 @@ mod tests {
 
     #[test]
     fn test_parse_status_line() {
-        assert_eq!(SmoltcpHttpClient::parse_status_line("HTTP/1.1 200 OK").unwrap(), 200);
-        assert_eq!(SmoltcpHttpClient::parse_status_line("HTTP/1.0 404 Not Found").unwrap(), 404);
-        assert_eq!(SmoltcpHttpClient::parse_status_line("HTTP/1.1 500 Internal Server Error").unwrap(), 500);
+        assert_eq!(
+            SmoltcpHttpClient::parse_status_line("HTTP/1.1 200 OK").unwrap(),
+            200
+        );
+        assert_eq!(
+            SmoltcpHttpClient::parse_status_line("HTTP/1.0 404 Not Found").unwrap(),
+            404
+        );
+        assert_eq!(
+            SmoltcpHttpClient::parse_status_line("HTTP/1.1 500 Internal Server Error").unwrap(),
+            500
+        );
     }
 
     #[test]
@@ -988,7 +1007,8 @@ mod tests {
 
     #[test]
     fn test_parse_response() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
         let parsed = SmoltcpHttpClient::parse_response(response).unwrap();
 
         assert_eq!(parsed.status_code, 200);

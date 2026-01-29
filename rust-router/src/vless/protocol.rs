@@ -230,8 +230,8 @@ impl VlessAddress {
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         match self {
-            Self::Ipv4(_) => 1 + 4,  // type + 4 bytes
-            Self::Ipv6(_) => 1 + 16, // type + 16 bytes
+            Self::Ipv4(_) => 1 + 4,             // type + 4 bytes
+            Self::Ipv6(_) => 1 + 16,            // type + 16 bytes
             Self::Domain(d) => 1 + 1 + d.len(), // type + length + string
         }
     }
@@ -274,12 +274,7 @@ pub struct VlessRequestHeader {
 impl VlessRequestHeader {
     /// Create a new request header
     #[must_use]
-    pub fn new(
-        uuid: [u8; 16],
-        command: VlessCommand,
-        address: VlessAddress,
-        port: u16,
-    ) -> Self {
+    pub fn new(uuid: [u8; 16], command: VlessCommand, address: VlessAddress, port: u16) -> Self {
         Self {
             version: VLESS_VERSION,
             uuid,
@@ -409,7 +404,7 @@ impl VlessRequestHeader {
             + 1  // command
             + 2  // port
             + 1  // address type
-            + address_bytes.len();  // address
+            + address_bytes.len(); // address
 
         let mut buf = Vec::with_capacity(size);
 
@@ -445,7 +440,7 @@ impl VlessRequestHeader {
         + self.addons.encoded_len()  // addons
         + 1  // command
         + 2  // port
-        + self.address.encoded_len()  // address type + address
+        + self.address.encoded_len() // address type + address
     }
 }
 
@@ -667,13 +662,8 @@ mod tests {
         let uuid = [1u8; 16];
         let addons = VlessAddons::with_xtls_vision();
         let addr = VlessAddress::domain("example.com");
-        let header = VlessRequestHeader::with_addons(
-            uuid,
-            addons.clone(),
-            VlessCommand::Tcp,
-            addr,
-            443,
-        );
+        let header =
+            VlessRequestHeader::with_addons(uuid, addons.clone(), VlessCommand::Tcp, addr, 443);
 
         assert!(header.addons.is_xtls_vision());
     }
@@ -748,7 +738,7 @@ mod tests {
             0, // No addons
             1, // TCP command
             0, 80, // Port 80
-            1,    // IPv4
+            1,  // IPv4
             127, 0, 0, 1, // Address
         ];
         let mut cursor = Cursor::new(data);
@@ -760,11 +750,11 @@ mod tests {
     async fn test_request_header_invalid_command() {
         let data = vec![
             0, // Version
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // UUID
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // UUID
             0,    // No addons
             0x05, // Invalid command
             0, 80, // Port 80
-            1,    // IPv4
+            1,  // IPv4
             127, 0, 0, 1, // Address
         ];
         let mut cursor = Cursor::new(data);
@@ -776,10 +766,10 @@ mod tests {
     async fn test_request_header_invalid_address_type() {
         let data = vec![
             0, // Version
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // UUID
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // UUID
             0,    // No addons
             0x01, // TCP
-            0, 80, // Port 80
+            0, 80,   // Port 80
             0x05, // Invalid address type
         ];
         let mut cursor = Cursor::new(data);
@@ -791,10 +781,10 @@ mod tests {
     async fn test_request_header_empty_domain() {
         let data = vec![
             0, // Version
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // UUID
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // UUID
             0,    // No addons
             0x01, // TCP
-            0, 80, // Port 80
+            0, 80,   // Port 80
             0x02, // Domain
             0,    // Empty domain length
         ];

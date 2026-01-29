@@ -37,9 +37,8 @@
 use std::sync::Arc;
 
 use rust_router::chain::{
-    ChainError, ChainManager, DscpAllocator, DscpAllocatorError,
+    get_dscp, set_dscp, ChainError, ChainManager, DscpAllocator, DscpAllocatorError, DscpError,
     DscpRoutingCallback, NoOpRoutingCallback, PeerConnectivityCallback,
-    get_dscp, set_dscp, DscpError,
 };
 use rust_router::ipc::{ChainConfig, ChainHop, ChainRole, ChainState, TunnelType};
 
@@ -121,7 +120,7 @@ fn create_single_hop_config(tag: &str, dscp: u8) -> ChainConfig {
 fn create_ipv4_packet(dscp: u8) -> Vec<u8> {
     let tos = dscp << 2;
     let mut packet = vec![
-        0x45, tos,  // Version=4, IHL=5, TOS
+        0x45, tos, // Version=4, IHL=5, TOS
         0x00, 0x14, // Total Length = 20
         0x00, 0x00, 0x00, 0x00, // ID, Flags, Fragment
         0x40, 0x01, // TTL=64, Protocol=ICMP
@@ -146,11 +145,10 @@ fn create_ipv6_packet(dscp: u8) -> Vec<u8> {
         0x00, 0x00, // Payload Length
         0x3a, 0x40, // Next Header=ICMPv6, Hop Limit
         // Source IPv6 (16 bytes)
-        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        // Dest IPv6 (16 bytes)
-        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, // Dest IPv6 (16 bytes)
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x02,
     ]
 }
 
@@ -208,7 +206,8 @@ impl TrackingRoutingCallback {
     }
 
     fn set_fail_setup(&self, fail: bool) {
-        self.fail_setup.store(fail, std::sync::atomic::Ordering::SeqCst);
+        self.fail_setup
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn setup_count(&self) -> usize {
@@ -269,7 +268,10 @@ impl MockPeerConnectivity {
     }
 
     fn set_connected(&self, peer: &str) {
-        self.connected_peers.lock().unwrap().insert(peer.to_string());
+        self.connected_peers
+            .lock()
+            .unwrap()
+            .insert(peer.to_string());
     }
 
     #[allow(dead_code)]
@@ -989,7 +991,10 @@ fn test_allocator_manual_reserve() {
     assert!(allocator.is_allocated(42));
 
     let result = allocator.reserve(42);
-    assert!(matches!(result, Err(DscpAllocatorError::AlreadyAllocated(42))));
+    assert!(matches!(
+        result,
+        Err(DscpAllocatorError::AlreadyAllocated(42))
+    ));
 }
 
 #[test]
@@ -1023,8 +1028,8 @@ fn test_allocator_reserved_qos_values() {
     let allocator = DscpAllocator::new();
 
     // Standard QoS values should be reserved
-    assert!(allocator.is_reserved(0));  // BE
-    assert!(allocator.is_reserved(8));  // CS1
+    assert!(allocator.is_reserved(0)); // BE
+    assert!(allocator.is_reserved(8)); // CS1
     assert!(allocator.is_reserved(46)); // EF
 
     // Non-standard values should not be reserved
@@ -1431,7 +1436,10 @@ async fn test_remove_active_chain_fails() {
     manager.activate_chain("active-remove").await.unwrap();
 
     let result = manager.remove_chain("active-remove").await;
-    assert!(matches!(result, Err(ChainError::CannotRemoveActiveChain(_))));
+    assert!(matches!(
+        result,
+        Err(ChainError::CannotRemoveActiveChain(_))
+    ));
 }
 
 #[tokio::test]
@@ -1512,9 +1520,7 @@ async fn test_handle_commit_request_success() {
         .unwrap();
 
     // Then commit
-    let result = manager
-        .handle_commit_request("commit-test", "node-a")
-        .await;
+    let result = manager.handle_commit_request("commit-test", "node-a").await;
     assert!(result.is_ok());
 
     let status = manager.get_chain_status("commit-test").unwrap();
@@ -1542,9 +1548,7 @@ async fn test_handle_abort_request_after_prepare() {
         .await
         .unwrap();
 
-    let result = manager
-        .handle_abort_request("abort-test", "node-a")
-        .await;
+    let result = manager.handle_abort_request("abort-test", "node-a").await;
     assert!(result.is_ok());
 
     // Chain should be removed
@@ -1556,9 +1560,7 @@ async fn test_handle_abort_request_nonexistent() {
     let manager = ChainManager::new("node-b".to_string());
 
     // Should succeed silently for nonexistent chain
-    let result = manager
-        .handle_abort_request("nonexistent", "node-a")
-        .await;
+    let result = manager.handle_abort_request("nonexistent", "node-a").await;
     assert!(result.is_ok());
 }
 
@@ -1713,8 +1715,7 @@ async fn test_multi_hop_chain_isolation() {
 
     // Each chain should have independent DSCP
     let chains = manager.list_chains();
-    let dscp_values: std::collections::HashSet<u8> =
-        chains.iter().map(|c| c.dscp_value).collect();
+    let dscp_values: std::collections::HashSet<u8> = chains.iter().map(|c| c.dscp_value).collect();
     assert_eq!(dscp_values.len(), 5);
 }
 
@@ -1727,28 +1728,18 @@ fn test_chain_error_display() {
     assert!(ChainError::NotFound("test".to_string())
         .to_string()
         .contains("test"));
-    assert!(ChainError::DirectNotAllowed
-        .to_string()
-        .contains("direct"));
-    assert!(ChainError::XrayRelayNotAllowed
-        .to_string()
-        .contains("Xray"));
+    assert!(ChainError::DirectNotAllowed.to_string().contains("direct"));
+    assert!(ChainError::XrayRelayNotAllowed.to_string().contains("Xray"));
     assert!(ChainError::TooManyHops(11).to_string().contains("11"));
-    assert!(ChainError::DscpExhausted
-        .to_string()
-        .contains("available"));
+    assert!(ChainError::DscpExhausted.to_string().contains("available"));
 }
 
 #[test]
 fn test_dscp_error_display() {
     assert!(DscpError::EmptyPacket.to_string().contains("Empty"));
-    assert!(DscpError::PacketTooShort(5, 20)
-        .to_string()
-        .contains("5"));
+    assert!(DscpError::PacketTooShort(5, 20).to_string().contains("5"));
     assert!(DscpError::InvalidIpVersion(7).to_string().contains("7"));
-    assert!(DscpError::InvalidDscpValue(64)
-        .to_string()
-        .contains("64"));
+    assert!(DscpError::InvalidDscpValue(64).to_string().contains("64"));
 }
 
 #[test]
@@ -1759,9 +1750,7 @@ fn test_allocator_error_display() {
     assert!(DscpAllocatorError::AlreadyAllocated(42)
         .to_string()
         .contains("42"));
-    assert!(DscpAllocatorError::Reserved(46)
-        .to_string()
-        .contains("46"));
+    assert!(DscpAllocatorError::Reserved(46).to_string().contains("46"));
     assert!(DscpAllocatorError::OutOfRange(64)
         .to_string()
         .contains("64"));
@@ -1957,7 +1946,8 @@ async fn test_dscp_exhaustion() {
     let result = manager.create_chain(config).await;
     assert!(
         matches!(result, Err(ChainError::DscpExhausted)),
-        "Expected DscpExhausted error on second attempt, got {:?}", result
+        "Expected DscpExhausted error on second attempt, got {:?}",
+        result
     );
 }
 
@@ -1978,9 +1968,7 @@ async fn test_concurrent_chain_activation() {
 
     for _ in 0..5 {
         let mgr = manager.clone();
-        set.spawn(async move {
-            mgr.activate_chain("concurrent-activate").await
-        });
+        set.spawn(async move { mgr.activate_chain("concurrent-activate").await });
     }
 
     let mut success_count = 0;
@@ -2099,15 +2087,24 @@ async fn test_3_node_chain_e2e_lifecycle() {
 
     // All should be in Inactive state (waiting for COMMIT)
     assert_eq!(
-        entry_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        entry_manager
+            .get_chain_status("e2e-3node-chain")
+            .unwrap()
+            .state,
         ChainState::Inactive
     );
     assert_eq!(
-        relay_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        relay_manager
+            .get_chain_status("e2e-3node-chain")
+            .unwrap()
+            .state,
         ChainState::Inactive
     );
     assert_eq!(
-        terminal_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        terminal_manager
+            .get_chain_status("e2e-3node-chain")
+            .unwrap()
+            .state,
         ChainState::Inactive
     );
 
@@ -2129,15 +2126,24 @@ async fn test_3_node_chain_e2e_lifecycle() {
 
     // All should now be Active
     assert_eq!(
-        entry_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        entry_manager
+            .get_chain_status("e2e-3node-chain")
+            .unwrap()
+            .state,
         ChainState::Active
     );
     assert_eq!(
-        relay_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        relay_manager
+            .get_chain_status("e2e-3node-chain")
+            .unwrap()
+            .state,
         ChainState::Active
     );
     assert_eq!(
-        terminal_manager.get_chain_status("e2e-3node-chain").unwrap().state,
+        terminal_manager
+            .get_chain_status("e2e-3node-chain")
+            .unwrap()
+            .state,
         ChainState::Active
     );
 
@@ -2188,7 +2194,10 @@ async fn test_3_node_chain_abort_flow() {
         .expect("Terminal should accept ABORT");
 
     // Entry removes its own chain
-    entry_manager.remove_chain("abort-3node-chain").await.unwrap();
+    entry_manager
+        .remove_chain("abort-3node-chain")
+        .await
+        .unwrap();
 
     // All chains should be removed
     assert!(!entry_manager.chain_exists("abort-3node-chain"));
@@ -2336,7 +2345,11 @@ async fn test_xray_terminal_allowed_in_chain() {
     };
 
     let result = manager.create_chain(config).await;
-    assert!(result.is_ok(), "Xray terminal should be allowed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Xray terminal should be allowed: {:?}",
+        result
+    );
 }
 
 /// Test that multiple Xray relays are all rejected
@@ -2418,7 +2431,11 @@ async fn test_valid_egress_tags_accepted() {
         config.exit_egress = egress.to_string();
 
         let result = manager.create_chain(config).await;
-        assert!(result.is_ok(), "Valid egress '{}' should be accepted", egress);
+        assert!(
+            result.is_ok(),
+            "Valid egress '{}' should be accepted",
+            egress
+        );
     }
 }
 
@@ -2452,11 +2469,14 @@ async fn test_transitive_mode_skips_validation() {
         ],
         rules: vec![],
         exit_egress: "unknown-remote-egress".to_string(), // Would fail validation normally
-        allow_transitive: true, // Skip validation
+        allow_transitive: true,                           // Skip validation
     };
 
     let result = manager.create_chain(config).await;
-    assert!(result.is_ok(), "Transitive mode should skip egress validation");
+    assert!(
+        result.is_ok(),
+        "Transitive mode should skip egress validation"
+    );
 
     let retrieved = manager.get_chain_config("transitive-skip").unwrap();
     assert!(retrieved.allow_transitive);
@@ -2544,7 +2564,9 @@ async fn test_chain_status_my_role_all_positions() {
     let terminal_manager = ChainManager::new("node-c".to_string());
     terminal_manager.create_chain(config).await.unwrap();
 
-    let terminal_status = terminal_manager.get_chain_status("role-status-test").unwrap();
+    let terminal_status = terminal_manager
+        .get_chain_status("role-status-test")
+        .unwrap();
     assert_eq!(terminal_status.my_role, Some(ChainRole::Terminal));
 }
 
@@ -2594,7 +2616,10 @@ async fn test_chain_activation_succeeds_with_connected_peer() {
     manager.create_chain(config).await.unwrap();
 
     let result = manager.activate_chain("connected-peer-chain").await;
-    assert!(result.is_ok(), "Activation should succeed when peer connected");
+    assert!(
+        result.is_ok(),
+        "Activation should succeed when peer connected"
+    );
 
     let status = manager.get_chain_status("connected-peer-chain").unwrap();
     assert_eq!(status.state, ChainState::Active);

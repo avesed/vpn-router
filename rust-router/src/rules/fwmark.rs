@@ -227,9 +227,7 @@ impl ChainMark {
     /// ```
     #[must_use]
     pub fn from_routing_mark(mark: u32) -> Option<Self> {
-        if mark <= ENTRY_ROUTING_MARK_BASE
-            || mark > ENTRY_ROUTING_MARK_BASE + u32::from(DSCP_MAX)
-        {
+        if mark <= ENTRY_ROUTING_MARK_BASE || mark > ENTRY_ROUTING_MARK_BASE + u32::from(DSCP_MAX) {
             return None;
         }
         let dscp_value = (mark - ENTRY_ROUTING_MARK_BASE) as u8;
@@ -585,11 +583,7 @@ impl FwmarkRouterBuilder {
     /// let mark = router.get_chain_mark("high-priority").unwrap();
     /// assert_eq!(mark.dscp_value, 50);
     /// ```
-    pub fn add_chain_with_dscp(
-        self,
-        tag: impl Into<String>,
-        dscp: u8,
-    ) -> Result<Self, RuleError> {
+    pub fn add_chain_with_dscp(self, tag: impl Into<String>, dscp: u8) -> Result<Self, RuleError> {
         let tag = tag.into();
 
         // Check for duplicate tag
@@ -611,13 +605,8 @@ impl FwmarkRouterBuilder {
     }
 
     /// Internal helper to add a chain with a validated DSCP value.
-    fn add_chain_with_dscp_internal(
-        mut self,
-        tag: String,
-        dscp: u8,
-    ) -> Result<Self, RuleError> {
-        let chain_mark =
-            ChainMark::from_dscp(dscp).ok_or(RuleError::DscpOutOfRange(dscp))?;
+    fn add_chain_with_dscp_internal(mut self, tag: String, dscp: u8) -> Result<Self, RuleError> {
+        let chain_mark = ChainMark::from_dscp(dscp).ok_or(RuleError::DscpOutOfRange(dscp))?;
 
         self.used_dscp.insert(dscp);
         self.chains.insert(tag, chain_mark);

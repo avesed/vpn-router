@@ -646,13 +646,19 @@ impl SessionTracker {
 
     /// Get a TCP session by key
     #[must_use]
-    pub fn get_tcp(&self, key: &SessionKey) -> Option<dashmap::mapref::one::Ref<'_, SessionKey, TcpSession>> {
+    pub fn get_tcp(
+        &self,
+        key: &SessionKey,
+    ) -> Option<dashmap::mapref::one::Ref<'_, SessionKey, TcpSession>> {
         self.tcp_sessions.get(key)
     }
 
     /// Get a UDP session by key
     #[must_use]
-    pub fn get_udp(&self, key: &SessionKey) -> Option<dashmap::mapref::one::Ref<'_, SessionKey, UdpSession>> {
+    pub fn get_udp(
+        &self,
+        key: &SessionKey,
+    ) -> Option<dashmap::mapref::one::Ref<'_, SessionKey, UdpSession>> {
         self.udp_sessions.get(key)
     }
 
@@ -957,7 +963,9 @@ mod tests {
         let handle = mock_socket_handle(0);
         let key = make_session_key(50000, 80);
 
-        tracker.register_tcp(connection_id.clone(), handle, key.clone()).unwrap();
+        tracker
+            .register_tcp(connection_id.clone(), handle, key.clone())
+            .unwrap();
         assert_eq!(tracker.tcp_count(), 1);
 
         let removed = tracker.remove_tcp(&key);
@@ -977,7 +985,9 @@ mod tests {
         let key = make_session_key(50000, 80);
 
         // First registration should succeed
-        tracker.register_tcp(connection_id.clone(), handle1, key.clone()).unwrap();
+        tracker
+            .register_tcp(connection_id.clone(), handle1, key.clone())
+            .unwrap();
 
         // Duplicate should fail
         let result = tracker.register_tcp(connection_id, handle2, key);
@@ -994,10 +1004,15 @@ mod tests {
         for i in 0..MAX_SESSIONS_PER_CLIENT {
             let handle = mock_socket_handle(i as usize);
             let key = make_session_key(50000 + i as u16, 80);
-            tracker.register_tcp(connection_id.clone(), handle, key).unwrap();
+            tracker
+                .register_tcp(connection_id.clone(), handle, key)
+                .unwrap();
         }
 
-        assert_eq!(tracker.client_count(&connection_id), MAX_SESSIONS_PER_CLIENT);
+        assert_eq!(
+            tracker.client_count(&connection_id),
+            MAX_SESSIONS_PER_CLIENT
+        );
 
         // Next should fail
         let handle = mock_socket_handle(MAX_SESSIONS_PER_CLIENT);

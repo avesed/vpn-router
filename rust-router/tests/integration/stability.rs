@@ -64,7 +64,7 @@ use rust_router::config::ConnectionConfig;
 use rust_router::connection::ConnectionManager;
 use rust_router::ipc::{IpcCommand, IpcHandler, IpcResponse};
 use rust_router::outbound::{BlockOutbound, DirectOutbound, OutboundManager};
-use rust_router::rules::{RuleEngine, RuleType, RoutingSnapshotBuilder};
+use rust_router::rules::{RoutingSnapshotBuilder, RuleEngine, RuleType};
 
 // ============================================================================
 // Test Helpers
@@ -112,7 +112,11 @@ fn create_reload_test_handler() -> (IpcHandler, Arc<RuleEngine>) {
     builder
         .add_domain_rule(RuleType::DomainSuffix, "example.com", "direct")
         .unwrap();
-    let snapshot = builder.default_outbound("direct").version(1).build().unwrap();
+    let snapshot = builder
+        .default_outbound("direct")
+        .version(1)
+        .build()
+        .unwrap();
     let rule_engine = Arc::new(RuleEngine::new(snapshot));
 
     let handler = IpcHandler::new(
@@ -241,7 +245,10 @@ async fn test_ipc_high_frequency_status() {
     let elapsed = start.elapsed();
     let per_op = elapsed.as_nanos() / count as u128;
 
-    println!("IPC Status: {} ops in {:?}, {} ns/op", count, elapsed, per_op);
+    println!(
+        "IPC Status: {} ops in {:?}, {} ns/op",
+        count, elapsed, per_op
+    );
 
     // Should be < 10μs per status
     assert!(per_op < 10_000, "IPC status too slow: {} ns", per_op);
@@ -262,7 +269,10 @@ async fn test_ipc_high_frequency_stats() {
     let elapsed = start.elapsed();
     let per_op = elapsed.as_nanos() / count as u128;
 
-    println!("IPC GetStats: {} ops in {:?}, {} ns/op", count, elapsed, per_op);
+    println!(
+        "IPC GetStats: {} ops in {:?}, {} ns/op",
+        count, elapsed, per_op
+    );
 
     // Should be < 10μs per GetStats
     assert!(per_op < 10_000, "IPC GetStats too slow: {} ns", per_op);
@@ -289,7 +299,11 @@ async fn test_ipc_high_frequency_ingress_stats() {
     );
 
     // Should be < 10μs per GetIngressStats
-    assert!(per_op < 10_000, "IPC GetIngressStats too slow: {} ns", per_op);
+    assert!(
+        per_op < 10_000,
+        "IPC GetIngressStats too slow: {} ns",
+        per_op
+    );
 }
 
 #[tokio::test]
@@ -396,7 +410,9 @@ async fn test_ipc_mixed_read_write() {
 async fn test_hot_reload_single() {
     let (handler, _rule_engine) = create_reload_test_handler();
 
-    let response = handler.handle(IpcCommand::ReloadRules { config_path: None }).await;
+    let response = handler
+        .handle(IpcCommand::ReloadRules { config_path: None })
+        .await;
 
     assert!(!response.is_error(), "Reload failed: {:?}", response);
 }
@@ -409,14 +425,19 @@ async fn test_hot_reload_repeated() {
 
     // Repeated reloads
     for i in 0..100 {
-        let response = handler.handle(IpcCommand::ReloadRules { config_path: None }).await;
+        let response = handler
+            .handle(IpcCommand::ReloadRules { config_path: None })
+            .await;
         assert!(!response.is_error(), "Reload {} failed: {:?}", i, response);
     }
 
     let elapsed = start.elapsed();
     let per_reload = elapsed.as_micros() / 100;
 
-    println!("Hot reload: 100 reloads in {:?}, {} μs/reload", elapsed, per_reload);
+    println!(
+        "Hot reload: 100 reloads in {:?}, {} μs/reload",
+        elapsed, per_reload
+    );
 
     // Target: < 1ms per reload
     assert!(per_reload < 1000, "Reload too slow: {} μs", per_reload);
@@ -452,7 +473,9 @@ async fn test_hot_reload_concurrent_with_queries() {
 
         handles.push(tokio::spawn(async move {
             for _ in 0..20 {
-                let response = h.handle(IpcCommand::ReloadRules { config_path: None }).await;
+                let response = h
+                    .handle(IpcCommand::ReloadRules { config_path: None })
+                    .await;
                 if response.is_error() {
                     err.fetch_add(1, Ordering::Relaxed);
                 }
@@ -483,7 +506,9 @@ async fn test_hot_reload_version_increment() {
     };
 
     // Reload
-    handler.handle(IpcCommand::ReloadRules { config_path: None }).await;
+    handler
+        .handle(IpcCommand::ReloadRules { config_path: None })
+        .await;
 
     // Version should increment
     let response = handler.handle(IpcCommand::GetRuleStats).await;
@@ -530,7 +555,11 @@ async fn test_outbound_health_with_changes() {
     };
 
     // Remove an outbound
-    handler.handle(IpcCommand::RemoveOutbound { tag: "proxy-3".into() }).await;
+    handler
+        .handle(IpcCommand::RemoveOutbound {
+            tag: "proxy-3".into(),
+        })
+        .await;
 
     // Health should reflect removal
     let response = handler.handle(IpcCommand::GetOutboundHealth).await;
@@ -602,9 +631,11 @@ async fn test_recovery_after_many_errors() {
 
     // Generate many errors
     for i in 0..100 {
-        let _ = handler.handle(IpcCommand::GetOutbound {
-            tag: format!("nonexistent-{}", i)
-        }).await;
+        let _ = handler
+            .handle(IpcCommand::GetOutbound {
+                tag: format!("nonexistent-{}", i),
+            })
+            .await;
     }
 
     // Should still work correctly
@@ -628,9 +659,11 @@ async fn test_concurrent_error_recovery() {
         let h = Arc::clone(&handler);
         handles.push(tokio::spawn(async move {
             for _ in 0..50 {
-                let _ = h.handle(IpcCommand::RemoveOutbound {
-                    tag: "nonexistent".into()
-                }).await;
+                let _ = h
+                    .handle(IpcCommand::RemoveOutbound {
+                        tag: "nonexistent".into(),
+                    })
+                    .await;
             }
         }));
     }
@@ -728,7 +761,10 @@ async fn test_extended_ipc_stress() {
     println!("  Duration: {:?}", elapsed);
     println!("  Successful ops: {}", total_success);
     println!("  Errors: {}", total_errors);
-    println!("  Ops/sec: {:.0}", total_success as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Ops/sec: {:.0}",
+        total_success as f64 / elapsed.as_secs_f64()
+    );
 
     assert_eq!(total_errors, 0, "Had errors during stress test");
     assert!(total_success > 100_000, "Too few operations completed");
@@ -801,7 +837,9 @@ async fn test_hot_reload_under_sustained_load() {
                     break;
                 }
 
-                let response = h.handle(IpcCommand::ReloadRules { config_path: None }).await;
+                let response = h
+                    .handle(IpcCommand::ReloadRules { config_path: None })
+                    .await;
                 if response.is_error() {
                     errors.fetch_add(1, Ordering::Relaxed);
                 } else {

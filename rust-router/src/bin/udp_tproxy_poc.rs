@@ -237,10 +237,7 @@ fn create_reply_socket(bind_addr: SocketAddr) -> Result<std::net::UdpSocket> {
 type SessionMap = Arc<RwLock<HashMap<(SocketAddr, SocketAddr), UdpSession>>>;
 
 /// Handle incoming TPROXY UDP packets
-async fn handle_udp_packets(
-    socket: UdpSocket,
-    sessions: SessionMap,
-) -> Result<()> {
+async fn handle_udp_packets(socket: UdpSocket, sessions: SessionMap) -> Result<()> {
     let fd = socket.as_raw_fd();
     let mut buf = vec![0u8; UDP_BUFFER_SIZE];
 
@@ -284,11 +281,9 @@ async fn handle_udp_packets(
                     let original_dst = dst;
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_upstream_replies(
-                            sessions_clone,
-                            client_addr,
-                            original_dst,
-                        ).await {
+                        if let Err(e) =
+                            handle_upstream_replies(sessions_clone, client_addr, original_dst).await
+                        {
                             debug!("Upstream reply handler ended: {}", e);
                         }
                     });
@@ -346,12 +341,17 @@ async fn handle_upstream_replies(
         // Read from upstream in the session
         let recv_result: Option<io::Result<usize>> = {
             let sessions_read = sessions.read().await;
-            sessions_read.get(&session_key).map(|session| session.upstream_socket.try_recv(&mut buf))
+            sessions_read
+                .get(&session_key)
+                .map(|session| session.upstream_socket.try_recv(&mut buf))
         };
 
         match recv_result {
             Some(Ok(n)) => {
-                debug!("Upstream reply: {} <- {} ({} bytes)", client_addr, original_dst, n);
+                debug!(
+                    "Upstream reply: {} <- {} ({} bytes)",
+                    client_addr, original_dst, n
+                );
 
                 // Send reply to client from original destination address
                 if let Err(e) = reply_socket.send_to(&buf[..n], client_addr).await {
@@ -468,9 +468,8 @@ async fn main() -> Result<()> {
     info!("TPROXY UDP listener ready on {}", listen_addr);
 
     // Convert to tokio UdpSocket
-    let socket = UdpSocket::from_std(unsafe {
-        std::net::UdpSocket::from_raw_fd(socket.into_raw_fd())
-    })?;
+    let socket =
+        UdpSocket::from_std(unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) })?;
 
     // Session manager
     let sessions: SessionMap = Arc::new(RwLock::new(HashMap::new()));

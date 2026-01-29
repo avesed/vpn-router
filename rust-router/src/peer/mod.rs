@@ -39,7 +39,7 @@ pub use manager::{PeerError, PeerManager};
 
 // Re-export pairing types and functions
 pub use pairing::{
-    decode_pair_request, encode_pair_request, decode_pair_response, encode_pair_response,
+    decode_pair_request, decode_pair_response, encode_pair_request, encode_pair_response,
     PairRequest, PairRequestConfig, PairResponse, PairingError,
 };
 

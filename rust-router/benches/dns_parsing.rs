@@ -192,9 +192,7 @@ fn generate_nxdomain_response() -> Vec<u8> {
     let mname = Name::from_ascii("ns1.example.com").expect("valid name");
     let rname = Name::from_ascii("hostmaster.example.com").expect("valid name");
     let soa = hickory_proto::rr::rdata::SOA::new(
-        mname,
-        rname,
-        2024010101, // serial
+        mname, rname, 2024010101, // serial
         3600,       // refresh
         1800,       // retry
         604800,     // expire
@@ -464,17 +462,11 @@ fn bench_message_access(c: &mut Criterion) {
     let response = generate_response_with_records();
     let parsed = Message::from_vec(&response).expect("parse response");
 
-    group.bench_function("get_id", |b| {
-        b.iter(|| black_box(parsed.id()))
-    });
+    group.bench_function("get_id", |b| b.iter(|| black_box(parsed.id())));
 
-    group.bench_function("get_queries", |b| {
-        b.iter(|| black_box(parsed.queries()))
-    });
+    group.bench_function("get_queries", |b| b.iter(|| black_box(parsed.queries())));
 
-    group.bench_function("get_answers", |b| {
-        b.iter(|| black_box(parsed.answers()))
-    });
+    group.bench_function("get_answers", |b| b.iter(|| black_box(parsed.answers())));
 
     group.bench_function("iterate_answers", |b| {
         b.iter(|| {
@@ -505,8 +497,8 @@ fn bench_name_operations(c: &mut Criterion) {
 
     group.bench_function("parse_long_name", |b| {
         b.iter(|| {
-            let name =
-                Name::from_ascii(black_box("very.long.subdomain.chain.example.com")).expect("valid name");
+            let name = Name::from_ascii(black_box("very.long.subdomain.chain.example.com"))
+                .expect("valid name");
             black_box(name)
         })
     });

@@ -123,10 +123,8 @@ impl ShadowsocksInboundConfig {
         // Validate password length for AEAD 2022 ciphers
         if self.method.is_aead_2022() {
             // AEAD 2022 requires Base64-encoded keys
-            let decoded = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &self.password,
-            );
+            let decoded =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &self.password);
 
             match decoded {
                 Ok(key) => {
@@ -169,14 +167,18 @@ impl ShadowsocksInboundConfig {
 
         self.validate()?;
 
-        let cipher_kind = self.method.to_cipher_kind().map_err(|e| {
-            ShadowsocksInboundError::Shadowsocks(e)
-        })?;
+        let cipher_kind = self
+            .method
+            .to_cipher_kind()
+            .map_err(|e| ShadowsocksInboundError::Shadowsocks(e))?;
 
         let server_addr = ServerAddr::SocketAddr(self.listen);
 
         ServerConfig::new(server_addr, self.password.clone(), cipher_kind).map_err(|e| {
-            ShadowsocksInboundError::invalid_config(format!("failed to create server config: {}", e))
+            ShadowsocksInboundError::invalid_config(format!(
+                "failed to create server config: {}",
+                e
+            ))
         })
     }
 
@@ -254,10 +256,8 @@ mod tests {
 
     #[test]
     fn test_config_new() {
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            "test-password",
-        );
+        let config =
+            ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), "test-password");
 
         assert!(config.enabled);
         assert_eq!(config.listen.port(), 8388);
@@ -268,13 +268,11 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            "test-password",
-        )
-        .with_method(ShadowsocksMethod::Aes256Gcm)
-        .with_udp(true)
-        .with_enabled(false);
+        let config =
+            ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), "test-password")
+                .with_method(ShadowsocksMethod::Aes256Gcm)
+                .with_udp(true)
+                .with_enabled(false);
 
         assert!(!config.enabled);
         assert_eq!(config.method, ShadowsocksMethod::Aes256Gcm);
@@ -294,11 +292,9 @@ mod tests {
     #[test]
     fn test_config_validate_legacy_aead() {
         // Legacy AEAD accepts plaintext passwords
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            "my-plain-password",
-        )
-        .with_method(ShadowsocksMethod::Aes256Gcm);
+        let config =
+            ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), "my-plain-password")
+                .with_method(ShadowsocksMethod::Aes256Gcm);
 
         assert!(config.validate().is_ok());
     }
@@ -306,27 +302,19 @@ mod tests {
     #[test]
     fn test_config_validate_aead_2022_valid() {
         // AEAD 2022 requires Base64-encoded 32-byte key
-        let key = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &[0u8; 32],
-        );
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 32]);
 
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            key,
-        )
-        .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
+        let config = ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), key)
+            .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_config_validate_aead_2022_invalid_base64() {
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            "not-base64!!!",
-        )
-        .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
+        let config =
+            ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), "not-base64!!!")
+                .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
 
         assert!(config.validate().is_err());
     }
@@ -334,16 +322,10 @@ mod tests {
     #[test]
     fn test_config_validate_aead_2022_wrong_key_length() {
         // Only 16 bytes, but AES-256 needs 32
-        let key = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &[0u8; 16],
-        );
+        let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 16]);
 
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            key,
-        )
-        .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
+        let config = ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), key)
+            .with_method(ShadowsocksMethod::Aead2022Blake3Aes256Gcm);
 
         assert!(config.validate().is_err());
     }
@@ -358,12 +340,10 @@ mod tests {
 
     #[test]
     fn test_config_serialization() {
-        let config = ShadowsocksInboundConfig::new(
-            "0.0.0.0:8388".parse().unwrap(),
-            "secret-password",
-        )
-        .with_method(ShadowsocksMethod::Aes256Gcm)
-        .with_udp(true);
+        let config =
+            ShadowsocksInboundConfig::new("0.0.0.0:8388".parse().unwrap(), "secret-password")
+                .with_method(ShadowsocksMethod::Aes256Gcm)
+                .with_udp(true);
 
         let json = serde_json::to_string_pretty(&config).unwrap();
         assert!(json.contains("secret-password"));

@@ -97,7 +97,10 @@ impl fmt::Display for Socks5Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidVersion { expected, actual } => {
-                write!(f, "Invalid SOCKS version: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "Invalid SOCKS version: expected {expected}, got {actual}"
+                )
             }
             Self::NoAcceptableMethod => write!(f, "No acceptable authentication method"),
             Self::AuthFailed => write!(f, "SOCKS5 authentication failed"),
@@ -393,8 +396,9 @@ impl Socks5ConnectionManager {
 
         // Convert to TcpStream
         let std_stream: std::net::TcpStream = socket.into();
-        let stream = TcpStream::from_std(std_stream)
-            .map_err(|e| Socks5Error::ConnectionError(format!("TcpStream conversion failed: {e}")))?;
+        let stream = TcpStream::from_std(std_stream).map_err(|e| {
+            Socks5Error::ConnectionError(format!("TcpStream conversion failed: {e}"))
+        })?;
 
         // Wait for connection with timeout
         let result = timeout(self.connect_timeout, async {
@@ -418,7 +422,7 @@ impl Socks5ConnectionManager {
                     tracing::warn!("Failed to set TCP_NODELAY for SOCKS5: {}", e);
                 }
                 Ok(stream)
-            },
+            }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Socks5Error::HandshakeTimeout),
         }
@@ -445,10 +449,9 @@ impl Socks5ConnectionManager {
 
         // Read server response
         let mut response = [0u8; 2];
-        stream
-            .read_exact(&mut response)
-            .await
-            .map_err(|e| Socks5Error::ConnectionError(format!("read method response failed: {e}")))?;
+        stream.read_exact(&mut response).await.map_err(|e| {
+            Socks5Error::ConnectionError(format!("read method response failed: {e}"))
+        })?;
 
         trace!("SOCKS5 method response: {:?}", response);
 
@@ -483,10 +486,7 @@ impl Socks5ConnectionManager {
             .stream_mut()
             .ok_or_else(|| Socks5Error::ConnectionError("stream already taken".into()))?;
 
-        let (username, password) = self
-            .auth
-            .as_ref()
-            .ok_or(Socks5Error::AuthFailed)?;
+        let (username, password) = self.auth.as_ref().ok_or(Socks5Error::AuthFailed)?;
 
         // Validate lengths
         if username.len() > 255 {
@@ -668,76 +668,74 @@ async fn read_connect_reply(stream: &mut TcpStream) -> Result<SocketAddr, Socks5
     }
 
     // Read bound address based on ATYP
-    let bound_addr = match header[3] {
-        ATYP_IPV4 => {
-            let mut addr = [0u8; 4];
-            stream
-                .read_exact(&mut addr)
-                .await
-                .map_err(|e| Socks5Error::ConnectionError(format!("read IPv4 addr failed: {e}")))?;
+    let bound_addr =
+        match header[3] {
+            ATYP_IPV4 => {
+                let mut addr = [0u8; 4];
+                stream.read_exact(&mut addr).await.map_err(|e| {
+                    Socks5Error::ConnectionError(format!("read IPv4 addr failed: {e}"))
+                })?;
 
-            let mut port = [0u8; 2];
-            stream
-                .read_exact(&mut port)
-                .await
-                .map_err(|e| Socks5Error::ConnectionError(format!("read port failed: {e}")))?;
+                let mut port = [0u8; 2];
+                stream
+                    .read_exact(&mut port)
+                    .await
+                    .map_err(|e| Socks5Error::ConnectionError(format!("read port failed: {e}")))?;
 
-            SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(addr),
-                u16::from_be_bytes(port),
-            ))
-        }
-        ATYP_IPV6 => {
-            let mut addr = [0u8; 16];
-            stream
-                .read_exact(&mut addr)
-                .await
-                .map_err(|e| Socks5Error::ConnectionError(format!("read IPv6 addr failed: {e}")))?;
+                SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::from(addr),
+                    u16::from_be_bytes(port),
+                ))
+            }
+            ATYP_IPV6 => {
+                let mut addr = [0u8; 16];
+                stream.read_exact(&mut addr).await.map_err(|e| {
+                    Socks5Error::ConnectionError(format!("read IPv6 addr failed: {e}"))
+                })?;
 
-            let mut port = [0u8; 2];
-            stream
-                .read_exact(&mut port)
-                .await
-                .map_err(|e| Socks5Error::ConnectionError(format!("read port failed: {e}")))?;
+                let mut port = [0u8; 2];
+                stream
+                    .read_exact(&mut port)
+                    .await
+                    .map_err(|e| Socks5Error::ConnectionError(format!("read port failed: {e}")))?;
 
-            SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(addr),
-                u16::from_be_bytes(port),
-                0,
-                0,
-            ))
-        }
-        ATYP_DOMAIN => {
-            // Read domain length
-            let mut len = [0u8; 1];
-            stream
-                .read_exact(&mut len)
-                .await
-                .map_err(|e| Socks5Error::ConnectionError(format!("read domain len failed: {e}")))?;
+                SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::from(addr),
+                    u16::from_be_bytes(port),
+                    0,
+                    0,
+                ))
+            }
+            ATYP_DOMAIN => {
+                // Read domain length
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await.map_err(|e| {
+                    Socks5Error::ConnectionError(format!("read domain len failed: {e}"))
+                })?;
 
-            // Read domain name (we don't use it, just skip)
-            let mut domain = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut domain).await.map_err(|e| {
-                Socks5Error::ConnectionError(format!("read domain failed: {e}"))
-            })?;
+                // Read domain name (we don't use it, just skip)
+                let mut domain = vec![0u8; len[0] as usize];
+                stream.read_exact(&mut domain).await.map_err(|e| {
+                    Socks5Error::ConnectionError(format!("read domain failed: {e}"))
+                })?;
 
-            // Read port
-            let mut port = [0u8; 2];
-            stream
-                .read_exact(&mut port)
-                .await
-                .map_err(|e| Socks5Error::ConnectionError(format!("read port failed: {e}")))?;
+                // Read port
+                let mut port = [0u8; 2];
+                stream
+                    .read_exact(&mut port)
+                    .await
+                    .map_err(|e| Socks5Error::ConnectionError(format!("read port failed: {e}")))?;
 
-            // Return placeholder address since we can't resolve domain here
-            SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::UNSPECIFIED,
-                u16::from_be_bytes(port),
-            ))
-        }
-        other => {
-            return Err(Socks5Error::InvalidAddressType(other));
-        }
-    };
+                // Return placeholder address since we can't resolve domain here
+                SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::UNSPECIFIED,
+                    u16::from_be_bytes(port),
+                ))
+            }
+            other => {
+                return Err(Socks5Error::InvalidAddressType(other));
+            }
+        };
 
     trace!("SOCKS5 bound address: {}", bound_addr);
     Ok(bound_addr)
@@ -890,8 +888,7 @@ impl Outbound for Socks5Outbound {
         };
 
         // Perform CONNECT to destination
-        let connect_result =
-            timeout(connect_timeout, self.socks5_connect(&mut conn, addr)).await;
+        let connect_result = timeout(connect_timeout, self.socks5_connect(&mut conn, addr)).await;
 
         match connect_result {
             Ok(Ok(())) => {
@@ -907,7 +904,10 @@ impl Outbound for Socks5Outbound {
                     Some(s) => s,
                     None => {
                         self.stats.record_error();
-                        return Err(OutboundError::connection_failed(addr, "stream already taken"));
+                        return Err(OutboundError::connection_failed(
+                            addr,
+                            "stream already taken",
+                        ));
                     }
                 };
 
@@ -1003,15 +1003,12 @@ impl Outbound for Socks5Outbound {
         };
 
         // Establish UDP ASSOCIATE
-        let association = Socks5UdpAssociation::establish(
-            self.config.socks5_addr,
-            auth,
-            connect_timeout,
-        )
-        .await
-        .map_err(|e| UdpError::Socks5UdpAssociationFailed {
-            reason: e.to_string(),
-        })?;
+        let association =
+            Socks5UdpAssociation::establish(self.config.socks5_addr, auth, connect_timeout)
+                .await
+                .map_err(|e| UdpError::Socks5UdpAssociationFailed {
+                    reason: e.to_string(),
+                })?;
 
         debug!(
             "SOCKS5 UDP association established for {} via {} (relay: {})",
@@ -1138,7 +1135,9 @@ mod tests {
     #[test]
     fn test_socks5_error_no_acceptable_method() {
         let err = Socks5Error::NoAcceptableMethod;
-        assert!(err.to_string().contains("No acceptable authentication method"));
+        assert!(err
+            .to_string()
+            .contains("No acceptable authentication method"));
     }
 
     #[test]
@@ -1291,15 +1290,15 @@ mod tests {
         // VER | CMD | RSV | ATYP | IP (4 bytes) | PORT (2 bytes)
         assert_eq!(request.len(), 10);
         assert_eq!(request[0], SOCKS5_VERSION); // Version
-        assert_eq!(request[1], CMD_CONNECT);     // CONNECT
-        assert_eq!(request[2], 0x00);            // Reserved
-        assert_eq!(request[3], ATYP_IPV4);       // IPv4
-        assert_eq!(request[4], 192);             // IP byte 1
-        assert_eq!(request[5], 168);             // IP byte 2
-        assert_eq!(request[6], 1);               // IP byte 3
-        assert_eq!(request[7], 1);               // IP byte 4
-        assert_eq!(request[8], 0x1F);            // Port high byte (8080 >> 8)
-        assert_eq!(request[9], 0x90);            // Port low byte (8080 & 0xFF)
+        assert_eq!(request[1], CMD_CONNECT); // CONNECT
+        assert_eq!(request[2], 0x00); // Reserved
+        assert_eq!(request[3], ATYP_IPV4); // IPv4
+        assert_eq!(request[4], 192); // IP byte 1
+        assert_eq!(request[5], 168); // IP byte 2
+        assert_eq!(request[6], 1); // IP byte 3
+        assert_eq!(request[7], 1); // IP byte 4
+        assert_eq!(request[8], 0x1F); // Port high byte (8080 >> 8)
+        assert_eq!(request[9], 0x90); // Port low byte (8080 & 0xFF)
     }
 
     #[test]
@@ -1317,9 +1316,9 @@ mod tests {
         for i in 4..19 {
             assert_eq!(request[i], 0);
         }
-        assert_eq!(request[19], 1);              // Last byte of ::1
-        assert_eq!(request[20], 0x01);           // Port high byte (443 >> 8)
-        assert_eq!(request[21], 0xBB);           // Port low byte (443 & 0xFF)
+        assert_eq!(request[19], 1); // Last byte of ::1
+        assert_eq!(request[20], 0x01); // Port high byte (443 >> 8)
+        assert_eq!(request[21], 0xBB); // Port low byte (443 & 0xFF)
     }
 
     #[test]
@@ -1440,8 +1439,7 @@ mod tests {
     async fn test_health_status_transitions() {
         // We can't create actual outbound without a server, but we can test
         // the health transition logic pattern
-        let health: std::sync::RwLock<HealthStatus> =
-            std::sync::RwLock::new(HealthStatus::Unknown);
+        let health: std::sync::RwLock<HealthStatus> = std::sync::RwLock::new(HealthStatus::Unknown);
 
         // Simulate update_health pattern
         {
@@ -1515,7 +1513,10 @@ mod tests {
 
         if require_auth {
             // Reply with password auth required
-            socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_PASSWORD]).await.unwrap();
+            socket
+                .write_all(&[SOCKS5_VERSION, AUTH_METHOD_PASSWORD])
+                .await
+                .unwrap();
 
             // Read auth request
             let mut auth_buf = [0u8; 2];
@@ -1530,10 +1531,16 @@ mod tests {
             socket.read_exact(&mut password).await.unwrap();
 
             // Reply with auth success
-            socket.write_all(&[AUTH_PASSWORD_VERSION, 0x00]).await.unwrap();
+            socket
+                .write_all(&[AUTH_PASSWORD_VERSION, 0x00])
+                .await
+                .unwrap();
         } else {
             // Reply with no auth
-            socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+            socket
+                .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+                .await
+                .unwrap();
         }
 
         // Read CONNECT request
@@ -1559,8 +1566,12 @@ mod tests {
             reply_code,
             0x00,
             ATYP_IPV4,
-            0, 0, 0, 0, // Bound address
-            0, 0,       // Bound port
+            0,
+            0,
+            0,
+            0, // Bound address
+            0,
+            0, // Bound port
         ];
         socket.write_all(&reply).await.unwrap();
     }
@@ -1810,7 +1821,10 @@ mod tests {
         socket.read_exact(&mut methods).await.unwrap();
 
         // Reply with no auth
-        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+        socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+            .await
+            .unwrap();
 
         // Read CONNECT request header: VER | CMD | RSV | ATYP
         let mut connect_buf = [0u8; 4];
@@ -1848,11 +1862,7 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
-            run_mock_socks5_server_with_domain_reply(
-                listener,
-                b"proxy.example.com",
-                8080,
-            ).await;
+            run_mock_socks5_server_with_domain_reply(listener, b"proxy.example.com", 8080).await;
         });
 
         let config = Socks5Config::new("test-domain", server_addr).with_pool_size(1);
@@ -1862,7 +1872,10 @@ mod tests {
         let result = outbound.connect(dest, Duration::from_secs(5)).await;
 
         // Connection should succeed - domain BND.ADDR is valid
-        assert!(result.is_ok(), "Domain BND.ADDR should be parsed successfully");
+        assert!(
+            result.is_ok(),
+            "Domain BND.ADDR should be parsed successfully"
+        );
         let conn = result.unwrap();
         assert_eq!(conn.remote_addr(), dest);
 
@@ -1925,7 +1938,8 @@ mod tests {
                 listener,
                 b"relay.us-east-1.socks.example.com",
                 1080,
-            ).await;
+            )
+            .await;
         });
 
         let config = Socks5Config::new("test-domain-fqdn", server_addr).with_pool_size(1);
@@ -1995,7 +2009,10 @@ mod tests {
         let nmethods = header[1] as usize;
         let mut methods = vec![0u8; nmethods];
         socket.read_exact(&mut methods).await.unwrap();
-        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+        socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+            .await
+            .unwrap();
 
         // CONNECT request
         let mut connect_buf = [0u8; 4];
@@ -2028,11 +2045,8 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
-            run_mock_socks5_server_with_ipv6_reply(
-                listener,
-                "2001:db8::1".parse().unwrap(),
-                8080,
-            ).await;
+            run_mock_socks5_server_with_ipv6_reply(listener, "2001:db8::1".parse().unwrap(), 8080)
+                .await;
         });
 
         let config = Socks5Config::new("test-ipv6", server_addr).with_pool_size(1);
@@ -2053,11 +2067,7 @@ mod tests {
         let server_addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
-            run_mock_socks5_server_with_ipv6_reply(
-                listener,
-                Ipv6Addr::LOCALHOST,
-                1080,
-            ).await;
+            run_mock_socks5_server_with_ipv6_reply(listener, Ipv6Addr::LOCALHOST, 1080).await;
         });
 
         let config = Socks5Config::new("test-ipv6-lo", server_addr).with_pool_size(1);
@@ -2084,7 +2094,10 @@ mod tests {
         let nmethods = header[1] as usize;
         let mut methods = vec![0u8; nmethods];
         socket.read_exact(&mut methods).await.unwrap();
-        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.unwrap();
+        socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+            .await
+            .unwrap();
 
         // CONNECT request
         let mut connect_buf = [0u8; 4];

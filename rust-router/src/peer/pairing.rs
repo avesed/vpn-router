@@ -205,7 +205,8 @@ pub struct PairResponse {
 /// ```
 pub fn encode_pair_request(request: &PairRequest) -> Result<String, PairingError> {
     // Serialize to JSON
-    let json = serde_json::to_string(request).map_err(|e| PairingError::JsonError(e.to_string()))?;
+    let json =
+        serde_json::to_string(request).map_err(|e| PairingError::JsonError(e.to_string()))?;
 
     // Check size limit
     if json.len() > MAX_PAIRING_CODE_SIZE {
@@ -447,7 +448,8 @@ mod tests {
         assert!(json.contains("\"type\":\"pair_request\""));
 
         // Test deserialization
-        let decoded: PairRequest = serde_json::from_str(&json).expect("Deserialization should succeed");
+        let decoded: PairRequest =
+            serde_json::from_str(&json).expect("Deserialization should succeed");
         assert_eq!(decoded.node_tag, "test-node");
         assert_eq!(decoded.version, PAIRING_PROTOCOL_VERSION);
         assert_eq!(decoded.message_type, "pair_request");
@@ -476,7 +478,8 @@ mod tests {
         // Verify type field is serialized correctly
         assert!(json.contains("\"type\":\"pair_response\""));
 
-        let decoded: PairResponse = serde_json::from_str(&json).expect("Deserialization should succeed");
+        let decoded: PairResponse =
+            serde_json::from_str(&json).expect("Deserialization should succeed");
         assert_eq!(decoded.node_tag, "response-node");
         assert_eq!(decoded.request_node_tag, "request-node");
         assert_eq!(decoded.message_type, "pair_response");
@@ -542,7 +545,9 @@ mod tests {
         let encoded = encode_pair_request(&request).expect("Encoding should succeed");
 
         // Verify it's valid Base64
-        assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
 
         // Decode
         let decoded = decode_pair_request(&encoded).expect("Decoding should succeed");

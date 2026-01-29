@@ -287,9 +287,9 @@ impl TcpClient {
         query: &Message,
     ) -> DnsResult<Message> {
         // Serialize the query
-        let query_bytes = query.to_vec().map_err(|e| {
-            DnsError::serialize(format!("failed to serialize DNS query: {e}"))
-        })?;
+        let query_bytes = query
+            .to_vec()
+            .map_err(|e| DnsError::serialize(format!("failed to serialize DNS query: {e}")))?;
 
         // Check message size
         if query_bytes.len() > MAX_TCP_MESSAGE_SIZE {
@@ -334,7 +334,10 @@ impl TcpClient {
             })?
             .map_err(|e| {
                 DnsError::network_io(
-                    format!("failed to read TCP response length from {}", self.server_addr),
+                    format!(
+                        "failed to read TCP response length from {}",
+                        self.server_addr
+                    ),
                     e,
                 )
             })?;
@@ -369,9 +372,8 @@ impl TcpClient {
             })?;
 
         // Parse the response
-        let response = Message::from_vec(&response_buf).map_err(|e| {
-            DnsError::parse(format!("failed to parse TCP DNS response: {e}"))
-        })?;
+        let response = Message::from_vec(&response_buf)
+            .map_err(|e| DnsError::parse(format!("failed to parse TCP DNS response: {e}")))?;
 
         // Validate response matches query
         if !validate_response(query, &response) {
@@ -684,13 +686,8 @@ mod tests {
             .with_failure_threshold(5)
             .with_success_threshold(2);
 
-        let client = TcpClient::with_full_config(
-            config,
-            4,
-            Duration::from_secs(10),
-            health_config,
-        )
-        .unwrap();
+        let client =
+            TcpClient::with_full_config(config, 4, Duration::from_secs(10), health_config).unwrap();
 
         let health = client.health();
         assert_eq!(health.failure_threshold(), 5);

@@ -541,8 +541,12 @@ impl UserspaceWgTunnel {
         });
 
         // Create or use provided buffer pool (H1 fix)
-        let buffer_pool = buffer_pool
-            .unwrap_or_else(|| Arc::new(UdpBufferPool::new(BUFFER_POOL_CAPACITY, UDP_RECV_BUFFER_SIZE)));
+        let buffer_pool = buffer_pool.unwrap_or_else(|| {
+            Arc::new(UdpBufferPool::new(
+                BUFFER_POOL_CAPACITY,
+                UDP_RECV_BUFFER_SIZE,
+            ))
+        });
 
         // Set tag (use default if None)
         let tunnel_tag = tag.unwrap_or_else(|| DEFAULT_TUNNEL_TAG.to_string());
@@ -626,10 +630,7 @@ impl UserspaceWgTunnel {
             .await
             .map_err(|e| WgTunnelError::IoError(format!("Failed to bind UDP socket: {e}")))?;
 
-        let actual_port = socket
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(listen_port);
+        let actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(listen_port);
         debug!("Bound UDP socket to port {}", actual_port);
 
         // Do NOT call socket.connect()
@@ -733,7 +734,9 @@ impl UserspaceWgTunnel {
         let mut rx = self.handshake_rx.clone();
         let result = tokio::time::timeout(timeout, async {
             loop {
-                rx.changed().await.map_err(|_| WgTunnelError::NotConnected)?;
+                rx.changed()
+                    .await
+                    .map_err(|_| WgTunnelError::NotConnected)?;
                 if *rx.borrow() {
                     return Ok(());
                 }
@@ -860,7 +863,9 @@ impl UserspaceWgTunnel {
         }
 
         // Check if SNAT is needed (tunnel has a local_ip configured)
-        let packet_to_send: std::borrow::Cow<'_, [u8]> = if let Some(ref local_ip_str) = self.config.local_ip {
+        let packet_to_send: std::borrow::Cow<'_, [u8]> = if let Some(ref local_ip_str) =
+            self.config.local_ip
+        {
             // Parse the tunnel's local IP (strip CIDR suffix like /32 if present)
             if let Some(tunnel_ip) = parse_ip_strip_cidr(local_ip_str) {
                 // Extract full connection tuple for NAT tracking
@@ -886,7 +891,10 @@ impl UserspaceWgTunnel {
                                 });
                                 let removed = before.saturating_sub(self.shared.nat_table.len());
                                 if removed > 0 {
-                                    debug!("NAT table at capacity, cleaned {} expired entries", removed);
+                                    debug!(
+                                        "NAT table at capacity, cleaned {} expired entries",
+                                        removed
+                                    );
                                 }
                                 // If still at capacity after cleanup, log warning but still insert
                                 // (will evict on next cleanup cycle)
@@ -897,16 +905,25 @@ impl UserspaceWgTunnel {
                                     );
                                 }
                             }
-                            
-                            self.shared.nat_table.insert(nat_key, NatEntry {
-                                original_src_ip: tuple.src_ip,
-                                created_at: Instant::now(),
-                            });
-                            
+
+                            self.shared.nat_table.insert(
+                                nat_key,
+                                NatEntry {
+                                    original_src_ip: tuple.src_ip,
+                                    created_at: Instant::now(),
+                                },
+                            );
+
                             trace!(
                                 "Tunnel {} SNAT: {} -> {} (proto={}, {}:{} -> {}:{})",
-                                self.tag, tuple.src_ip, tunnel_ip, tuple.protocol,
-                                tuple.src_ip, tuple.src_port, tuple.dst_ip, tuple.dst_port
+                                self.tag,
+                                tuple.src_ip,
+                                tunnel_ip,
+                                tuple.protocol,
+                                tuple.src_ip,
+                                tuple.src_port,
+                                tuple.dst_ip,
+                                tuple.dst_port
                             );
                             std::borrow::Cow::Owned(rewritten)
                         } else {
@@ -949,14 +966,13 @@ impl UserspaceWgTunnel {
         // WG_TRANSPORT_OVERHEAD (32 bytes) includes the Poly1305 tag (16 bytes)
         // Buffer must be at least WG_HANDSHAKE_INIT_SIZE (148 bytes) to hold handshake
         // messages that boringtun may generate during rekey
-        let mut dst = vec![0u8; (packet_to_send.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
+        let mut dst =
+            vec![0u8; (packet_to_send.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
 
         // Encapsulate packet
         let result = {
             let mut tunn_guard = self.shared.tunn.lock();
-            let tunn = tunn_guard
-                .as_mut()
-                .ok_or(WgTunnelError::NotConnected)?;
+            let tunn = tunn_guard.as_mut().ok_or(WgTunnelError::NotConnected)?;
             tunn.encapsulate(&packet_to_send, &mut dst)
         };
 
@@ -971,7 +987,9 @@ impl UserspaceWgTunnel {
             };
             trace!(
                 "Tunnel {} encapsulate result: {} for {} byte packet",
-                self.tag, result_type, packet_to_send.len()
+                self.tag,
+                result_type,
+                packet_to_send.len()
             );
         }
 
@@ -979,9 +997,12 @@ impl UserspaceWgTunnel {
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
                 // Use send_to() instead of send() for unconnected socket
-                socket.send_to(encrypted, self.peer_addr_parsed).await.map_err(|e| {
-                    WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
-                })?;
+                socket
+                    .send_to(encrypted, self.peer_addr_parsed)
+                    .await
+                    .map_err(|e| {
+                        WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
+                    })?;
 
                 // Update stats
                 self.shared
@@ -990,12 +1011,21 @@ impl UserspaceWgTunnel {
                     .fetch_add(packet_to_send.len() as u64, Ordering::Relaxed);
                 self.shared.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
 
-                trace!("Sent {} bytes through tunnel {} to {:?}", packet_to_send.len(), self.tag, self.peer_addr_parsed);
+                trace!(
+                    "Sent {} bytes through tunnel {} to {:?}",
+                    packet_to_send.len(),
+                    self.tag,
+                    self.peer_addr_parsed
+                );
                 Ok(())
             }
             TunnResult::Done => {
                 // Packet was queued, may need handshake first
-                warn!("Tunnel {} packet queued (handshake may be in progress), {} bytes", self.tag, packet_to_send.len());
+                warn!(
+                    "Tunnel {} packet queued (handshake may be in progress), {} bytes",
+                    self.tag,
+                    packet_to_send.len()
+                );
                 Ok(())
             }
             TunnResult::Err(e) => {
@@ -1054,9 +1084,7 @@ impl UserspaceWgTunnel {
         // Encapsulate packet
         let result = {
             let mut tunn_guard = self.shared.tunn.lock();
-            let tunn = tunn_guard
-                .as_mut()
-                .ok_or(WgTunnelError::NotConnected)?;
+            let tunn = tunn_guard.as_mut().ok_or(WgTunnelError::NotConnected)?;
             tunn.encapsulate(packet, &mut dst)
         };
 
@@ -1070,16 +1098,21 @@ impl UserspaceWgTunnel {
             };
             trace!(
                 "Tunnel {} send_preserve_src encapsulate: {} for {} byte packet",
-                self.tag, result_type, packet.len()
+                self.tag,
+                result_type,
+                packet.len()
             );
         }
 
         // Process result
         match result {
             TunnResult::WriteToNetwork(encrypted) => {
-                socket.send_to(encrypted, self.peer_addr_parsed).await.map_err(|e| {
-                    WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
-                })?;
+                socket
+                    .send_to(encrypted, self.peer_addr_parsed)
+                    .await
+                    .map_err(|e| {
+                        WgTunnelError::IoError(format!("Failed to send encrypted packet: {e}"))
+                    })?;
 
                 // Update stats
                 self.shared
@@ -1090,14 +1123,17 @@ impl UserspaceWgTunnel {
 
                 trace!(
                     "Sent {} bytes (preserved src) through tunnel {} to {:?}",
-                    packet.len(), self.tag, self.peer_addr_parsed
+                    packet.len(),
+                    self.tag,
+                    self.peer_addr_parsed
                 );
                 Ok(())
             }
             TunnResult::Done => {
                 warn!(
                     "Tunnel {} packet queued (handshake in progress), {} bytes",
-                    self.tag, packet.len()
+                    self.tag,
+                    packet.len()
                 );
                 Ok(())
             }
@@ -1146,16 +1182,18 @@ impl UserspaceWgTunnel {
         // Get a mutable reference to the receiver
         let packet = {
             let mut rx_guard = self.recv_rx.lock().await;
-            let rx = rx_guard
-                .as_mut()
-                .ok_or(WgTunnelError::NotConnected)?;
+            let rx = rx_guard.as_mut().ok_or(WgTunnelError::NotConnected)?;
             rx.recv().await
         };
 
         match packet {
             Some(data) => {
                 // Log received packets at trace level (hot path - debug is too expensive)
-                trace!("Tunnel {} recv(): got {} bytes from channel", self.tag, data.len());
+                trace!(
+                    "Tunnel {} recv(): got {} bytes from channel",
+                    self.tag,
+                    data.len()
+                );
                 Ok(data)
             }
             None => {
@@ -1212,18 +1250,19 @@ impl UserspaceWgTunnel {
         // Format handshake initiation
         let result = {
             let mut tunn_guard = self.shared.tunn.lock();
-            let tunn = tunn_guard
-                .as_mut()
-                .ok_or(WgTunnelError::NotConnected)?;
+            let tunn = tunn_guard.as_mut().ok_or(WgTunnelError::NotConnected)?;
             tunn.format_handshake_initiation(&mut dst, true)
         };
 
         match result {
             TunnResult::WriteToNetwork(handshake) => {
                 // Use send_to() for unconnected socket
-                socket.send_to(handshake, self.peer_addr_parsed).await.map_err(|e| {
-                    WgTunnelError::IoError(format!("Failed to send handshake: {e}"))
-                })?;
+                socket
+                    .send_to(handshake, self.peer_addr_parsed)
+                    .await
+                    .map_err(|e| {
+                        WgTunnelError::IoError(format!("Failed to send handshake: {e}"))
+                    })?;
                 debug!("Sent handshake initiation");
                 Ok(())
             }
@@ -1258,7 +1297,15 @@ impl UserspaceWgTunnel {
 
         // Spawn combined background task (pass peer_addr for send_to() calls)
         tokio::spawn(async move {
-            run_background_task(socket, shutdown_rx, shared, buffer_pool, peer_addr, tag_for_task).await;
+            run_background_task(
+                socket,
+                shutdown_rx,
+                shared,
+                buffer_pool,
+                peer_addr,
+                tag_for_task,
+            )
+            .await;
         })
     }
 
@@ -1312,7 +1359,10 @@ impl UserspaceWgTunnel {
             )
         };
         if result != 0 {
-            warn!("Failed to set SO_RCVBUF: {}", std::io::Error::last_os_error());
+            warn!(
+                "Failed to set SO_RCVBUF: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         // Set send buffer size
@@ -1336,10 +1386,16 @@ impl UserspaceWgTunnel {
             )
         };
         if result != 0 {
-            warn!("Failed to set SO_SNDBUF: {}", std::io::Error::last_os_error());
+            warn!(
+                "Failed to set SO_SNDBUF: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
-        debug!("Socket buffers configured: recv={}, send={}", recv_buf, send_buf);
+        debug!(
+            "Socket buffers configured: recv={}, send={}",
+            recv_buf, send_buf
+        );
         Ok(())
     }
 }
@@ -1350,7 +1406,7 @@ async fn run_background_task(
     mut shutdown_rx: oneshot::Receiver<()>,
     shared: Arc<TunnelShared>,
     buffer_pool: Arc<UdpBufferPool>,
-    peer_addr: SocketAddr,  // peer address for send_to()
+    peer_addr: SocketAddr,       // peer address for send_to()
     tunnel_tag_for_task: String, // tag for debug logging
 ) {
     let mut timer_interval = interval(Duration::from_millis(TIMER_TICK_MS));
@@ -1609,7 +1665,7 @@ fn extract_protocol_and_src_port(packet: &[u8]) -> Option<(u8, u16)> {
             }
             let protocol = packet[9];
             let ihl = (packet[0] & 0x0f) as usize * 4;
-            
+
             match protocol {
                 6 | 17 => {
                     // TCP or UDP: src port is first 2 bytes after IP header
@@ -1635,7 +1691,7 @@ fn extract_protocol_and_src_port(packet: &[u8]) -> Option<(u8, u16)> {
                 return None;
             }
             let protocol = packet[6]; // Next Header
-            
+
             match protocol {
                 6 | 17 => {
                     // TCP or UDP: src port is first 2 bytes after IPv6 header
@@ -1675,7 +1731,7 @@ fn extract_protocol_and_dst_port(packet: &[u8]) -> Option<(u8, u16)> {
             }
             let protocol = packet[9];
             let ihl = (packet[0] & 0x0f) as usize * 4;
-            
+
             match protocol {
                 6 | 17 => {
                     // TCP or UDP: dst port is bytes 2-3 after IP header
@@ -1701,7 +1757,7 @@ fn extract_protocol_and_dst_port(packet: &[u8]) -> Option<(u8, u16)> {
                 return None;
             }
             let protocol = packet[6];
-            
+
             match protocol {
                 6 | 17 => {
                     // TCP or UDP: dst port is bytes 2-3 after IPv6 header
@@ -1754,11 +1810,11 @@ fn extract_connection_tuple(packet: &[u8]) -> Option<ConnectionTuple> {
             if ihl < 20 || packet.len() < ihl {
                 return None;
             }
-            
+
             let protocol = packet[9];
             let src_ip = IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&packet[12..16]).ok()?));
             let dst_ip = IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&packet[16..20]).ok()?));
-            
+
             let (src_port, dst_port) = match protocol {
                 6 | 17 => {
                     // TCP or UDP
@@ -1779,8 +1835,14 @@ fn extract_connection_tuple(packet: &[u8]) -> Option<ConnectionTuple> {
                 }
                 _ => (0, 0),
             };
-            
-            Some(ConnectionTuple { protocol, src_ip, src_port, dst_ip, dst_port })
+
+            Some(ConnectionTuple {
+                protocol,
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+            })
         }
         6 => {
             if packet.len() < 40 {
@@ -1789,7 +1851,7 @@ fn extract_connection_tuple(packet: &[u8]) -> Option<ConnectionTuple> {
             let protocol = packet[6]; // Next Header (simplified, doesn't handle extension headers)
             let src_ip = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?));
             let dst_ip = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?));
-            
+
             let (src_port, dst_port) = match protocol {
                 6 | 17 => {
                     // TCP or UDP
@@ -1810,8 +1872,14 @@ fn extract_connection_tuple(packet: &[u8]) -> Option<ConnectionTuple> {
                 }
                 _ => (0, 0),
             };
-            
-            Some(ConnectionTuple { protocol, src_ip, src_port, dst_ip, dst_port })
+
+            Some(ConnectionTuple {
+                protocol,
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+            })
         }
         _ => None,
     }
@@ -1842,35 +1910,35 @@ fn rewrite_source_ip(packet: &[u8], new_src_ip: IpAddr) -> Option<Vec<u8>> {
             // Get old source IP for checksum delta
             let old_src: [u8; 4] = modified[12..16].try_into().ok()?;
             let new_src = new_ip.octets();
-            
+
             // Rewrite source IP at bytes 12-15
             modified[12..16].copy_from_slice(&new_src);
-            
+
             // Update IP header checksum
             update_ipv4_checksum(&mut modified, &old_src, &new_src);
-            
+
             // Update transport layer checksum (TCP/UDP use pseudo-header)
             let protocol = modified[9];
             let ihl = (modified[0] & 0x0f) as usize * 4;
             update_transport_checksum(&mut modified, ihl, protocol, &old_src, &new_src, true);
-            
+
             Some(modified)
         }
         (6, IpAddr::V6(new_ip)) => {
             if modified.len() < 40 {
                 return None;
             }
-            // Get old source IP for checksum delta  
+            // Get old source IP for checksum delta
             let old_src: [u8; 16] = modified[8..24].try_into().ok()?;
             let new_src = new_ip.octets();
-            
+
             // Rewrite source IP at bytes 8-23
             modified[8..24].copy_from_slice(&new_src);
-            
+
             // Update transport layer checksum
             let protocol = modified[6];
             update_transport_checksum_v6(&mut modified, 40, protocol, &old_src, &new_src, true);
-            
+
             Some(modified)
         }
         _ => None, // Version mismatch
@@ -1894,18 +1962,18 @@ fn rewrite_dest_ip(packet: &[u8], new_dst_ip: IpAddr) -> Option<Vec<u8>> {
             // Get old dest IP for checksum delta
             let old_dst: [u8; 4] = modified[16..20].try_into().ok()?;
             let new_dst = new_ip.octets();
-            
+
             // Rewrite dest IP at bytes 16-19
             modified[16..20].copy_from_slice(&new_dst);
-            
+
             // Update IP header checksum
             update_ipv4_checksum(&mut modified, &old_dst, &new_dst);
-            
+
             // Update transport layer checksum
             let protocol = modified[9];
             let ihl = (modified[0] & 0x0f) as usize * 4;
             update_transport_checksum(&mut modified, ihl, protocol, &old_dst, &new_dst, false);
-            
+
             Some(modified)
         }
         (6, IpAddr::V6(new_ip)) => {
@@ -1915,14 +1983,14 @@ fn rewrite_dest_ip(packet: &[u8], new_dst_ip: IpAddr) -> Option<Vec<u8>> {
             // Get old dest IP
             let old_dst: [u8; 16] = modified[24..40].try_into().ok()?;
             let new_dst = new_ip.octets();
-            
+
             // Rewrite dest IP at bytes 24-39
             modified[24..40].copy_from_slice(&new_dst);
-            
+
             // Update transport layer checksum
             let protocol = modified[6];
             update_transport_checksum_v6(&mut modified, 40, protocol, &old_dst, &new_dst, false);
-            
+
             Some(modified)
         }
         _ => None,
@@ -1935,27 +2003,27 @@ fn update_ipv4_checksum(packet: &mut [u8], old_bytes: &[u8; 4], new_bytes: &[u8;
     if packet.len() < 20 {
         return;
     }
-    
+
     // Get current checksum
     let old_check = u16::from_be_bytes([packet[10], packet[11]]);
-    
+
     // Calculate checksum delta using one's complement arithmetic
     let mut delta: i32 = 0;
-    
+
     // Subtract old values, add new values (in 16-bit chunks)
     delta -= u16::from_be_bytes([old_bytes[0], old_bytes[1]]) as i32;
     delta -= u16::from_be_bytes([old_bytes[2], old_bytes[3]]) as i32;
     delta += u16::from_be_bytes([new_bytes[0], new_bytes[1]]) as i32;
     delta += u16::from_be_bytes([new_bytes[2], new_bytes[3]]) as i32;
-    
+
     // Apply delta to old checksum (using one's complement)
     let mut new_check = (!old_check as i32) + delta;
-    
+
     // Fold carry bits
     while new_check >> 16 != 0 {
         new_check = (new_check & 0xffff) + (new_check >> 16);
     }
-    
+
     let new_check = !new_check as u16;
     packet[10..12].copy_from_slice(&new_check.to_be_bytes());
 }
@@ -1971,37 +2039,41 @@ fn update_transport_checksum(
     _is_source: bool,
 ) {
     let check_offset = match protocol {
-        6 => ihl + 16,  // TCP checksum at offset 16 in TCP header
-        17 => ihl + 6,  // UDP checksum at offset 6 in UDP header
-        _ => return,    // No checksum update for other protocols
+        6 => ihl + 16, // TCP checksum at offset 16 in TCP header
+        17 => ihl + 6, // UDP checksum at offset 6 in UDP header
+        _ => return,   // No checksum update for other protocols
     };
-    
+
     if packet.len() < check_offset + 2 {
         return;
     }
-    
+
     let old_check = u16::from_be_bytes([packet[check_offset], packet[check_offset + 1]]);
-    
+
     // UDP checksum of 0 means "no checksum" - don't update it
     if protocol == 17 && old_check == 0 {
         return;
     }
-    
+
     // Calculate delta
     let mut delta: i32 = 0;
     delta -= u16::from_be_bytes([old_bytes[0], old_bytes[1]]) as i32;
     delta -= u16::from_be_bytes([old_bytes[2], old_bytes[3]]) as i32;
     delta += u16::from_be_bytes([new_bytes[0], new_bytes[1]]) as i32;
     delta += u16::from_be_bytes([new_bytes[2], new_bytes[3]]) as i32;
-    
+
     let mut new_check = (!old_check as i32) + delta;
     while new_check >> 16 != 0 {
         new_check = (new_check & 0xffff) + (new_check >> 16);
     }
-    
+
     let new_check = !new_check as u16;
     // Handle the special case where checksum becomes 0 for UDP
-    let final_check = if protocol == 17 && new_check == 0 { 0xffff } else { new_check };
+    let final_check = if protocol == 17 && new_check == 0 {
+        0xffff
+    } else {
+        new_check
+    };
     packet[check_offset..check_offset + 2].copy_from_slice(&final_check.to_be_bytes());
 }
 
@@ -2015,32 +2087,36 @@ fn update_transport_checksum_v6(
     _is_source: bool,
 ) {
     let check_offset = match protocol {
-        6 => header_len + 16,   // TCP
-        17 => header_len + 6,   // UDP
-        58 => header_len + 2,   // ICMPv6
+        6 => header_len + 16, // TCP
+        17 => header_len + 6, // UDP
+        58 => header_len + 2, // ICMPv6
         _ => return,
     };
-    
+
     if packet.len() < check_offset + 2 {
         return;
     }
-    
+
     let old_check = u16::from_be_bytes([packet[check_offset], packet[check_offset + 1]]);
-    
+
     // Calculate delta for 16-byte address
     let mut delta: i32 = 0;
     for i in 0..8 {
         delta -= u16::from_be_bytes([old_bytes[i * 2], old_bytes[i * 2 + 1]]) as i32;
         delta += u16::from_be_bytes([new_bytes[i * 2], new_bytes[i * 2 + 1]]) as i32;
     }
-    
+
     let mut new_check = (!old_check as i32) + delta;
     while new_check >> 16 != 0 {
         new_check = (new_check & 0xffff) + (new_check >> 16);
     }
-    
+
     let new_check = !new_check as u16;
-    let final_check = if protocol == 17 && new_check == 0 { 0xffff } else { new_check };
+    let final_check = if protocol == 17 && new_check == 0 {
+        0xffff
+    } else {
+        new_check
+    };
     packet[check_offset..check_offset + 2].copy_from_slice(&final_check.to_be_bytes());
 }
 
@@ -2058,13 +2134,13 @@ async fn handle_decapsulate_result(
     result: TunnResult<'_>,
     socket: &Arc<UdpSocket>,
     shared: &Arc<TunnelShared>,
-    peer_addr: SocketAddr,  // peer address for send_to()
+    peer_addr: SocketAddr, // peer address for send_to()
 ) {
     match result {
         TunnResult::WriteToTunnelV4(data, _addr) => {
             // Decrypted IPv4 packet ready
             let mut packet = data.to_vec();
-            
+
             // Perform DNAT if NAT table has an entry for this packet
             // Response packet has swapped src/dst compared to outgoing
             // Outgoing: (proto, dst_ip, dst_port, src_port) -> original_src_ip
@@ -2072,22 +2148,26 @@ async fn handle_decapsulate_result(
             if let Some(tuple) = extract_connection_tuple(&packet) {
                 let nat_key = NatKey {
                     protocol: tuple.protocol,
-                    remote_ip: tuple.src_ip,      // Was dst_ip on outgoing
-                    remote_port: tuple.src_port,  // Was dst_port on outgoing
-                    local_port: tuple.dst_port,   // Was src_port on outgoing
+                    remote_ip: tuple.src_ip,     // Was dst_ip on outgoing
+                    remote_port: tuple.src_port, // Was dst_port on outgoing
+                    local_port: tuple.dst_port,  // Was src_port on outgoing
                 };
                 if let Some(entry) = shared.nat_table.get(&nat_key) {
                     // Check if entry is still valid (not expired)
                     if entry.created_at.elapsed() < NAT_ENTRY_TIMEOUT {
                         let original_src_ip = entry.original_src_ip;
                         drop(entry); // Release DashMap ref before await
-                        
+
                         // Rewrite destination IP back to original client IP
                         if let Some(rewritten) = rewrite_dest_ip(&packet, original_src_ip) {
                             debug!(
                                 "DNAT: {} -> {} (proto={}, {}:{} -> local:{})",
-                                tuple.dst_ip, original_src_ip, tuple.protocol,
-                                tuple.src_ip, tuple.src_port, tuple.dst_port
+                                tuple.dst_ip,
+                                original_src_ip,
+                                tuple.protocol,
+                                tuple.src_ip,
+                                tuple.src_port,
+                                tuple.dst_port
                             );
                             packet = rewritten;
                         }
@@ -2098,17 +2178,14 @@ async fn handle_decapsulate_result(
                     }
                 }
             }
-            
+
             let packet_len = packet.len();
 
             // C3 fix: Validate source IP against allowed_ips
             if let Some(src_ip) = extract_source_ip(&packet) {
                 let allowed_ips = shared.allowed_ips.read().await;
                 if !is_ip_allowed(src_ip, &allowed_ips) {
-                    warn!(
-                        "Dropped IPv4 packet from {} - not in allowed_ips",
-                        src_ip
-                    );
+                    warn!("Dropped IPv4 packet from {} - not in allowed_ips", src_ip);
                     shared.stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -2120,7 +2197,10 @@ async fn handle_decapsulate_result(
             }
 
             // Update stats
-            shared.stats.rx_bytes.fetch_add(packet_len as u64, Ordering::Relaxed);
+            shared
+                .stats
+                .rx_bytes
+                .fetch_add(packet_len as u64, Ordering::Relaxed);
             shared.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
 
             // Send to receiver channel
@@ -2137,16 +2217,18 @@ async fn handle_decapsulate_result(
                 warn!("recv_tx is None - packet dropped (tunnel may not be connected)");
             }
 
-            debug!("Decrypted IPv4 packet: {} bytes (stats: rx_bytes={}, rx_packets={})",
+            debug!(
+                "Decrypted IPv4 packet: {} bytes (stats: rx_bytes={}, rx_packets={})",
                 packet_len,
                 shared.stats.rx_bytes.load(Ordering::Relaxed),
-                shared.stats.rx_packets.load(Ordering::Relaxed));
+                shared.stats.rx_packets.load(Ordering::Relaxed)
+            );
         }
 
         TunnResult::WriteToTunnelV6(data, _addr) => {
             // Decrypted IPv6 packet ready
             let mut packet = data.to_vec();
-            
+
             // Perform DNAT if NAT table has an entry for this packet
             if let Some(tuple) = extract_connection_tuple(&packet) {
                 let nat_key = NatKey {
@@ -2159,12 +2241,16 @@ async fn handle_decapsulate_result(
                     if entry.created_at.elapsed() < NAT_ENTRY_TIMEOUT {
                         let original_src_ip = entry.original_src_ip;
                         drop(entry);
-                        
+
                         if let Some(rewritten) = rewrite_dest_ip(&packet, original_src_ip) {
                             debug!(
                                 "DNAT (v6): {} -> {} (proto={}, {}:{} -> local:{})",
-                                tuple.dst_ip, original_src_ip, tuple.protocol,
-                                tuple.src_ip, tuple.src_port, tuple.dst_port
+                                tuple.dst_ip,
+                                original_src_ip,
+                                tuple.protocol,
+                                tuple.src_ip,
+                                tuple.src_port,
+                                tuple.dst_port
                             );
                             packet = rewritten;
                         }
@@ -2174,17 +2260,14 @@ async fn handle_decapsulate_result(
                     }
                 }
             }
-            
+
             let packet_len = packet.len();
 
             // C3 fix: Validate source IP against allowed_ips
             if let Some(src_ip) = extract_source_ip(&packet) {
                 let allowed_ips = shared.allowed_ips.read().await;
                 if !is_ip_allowed(src_ip, &allowed_ips) {
-                    warn!(
-                        "Dropped IPv6 packet from {} - not in allowed_ips",
-                        src_ip
-                    );
+                    warn!("Dropped IPv6 packet from {} - not in allowed_ips", src_ip);
                     shared.stats.invalid_packets.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -2196,7 +2279,10 @@ async fn handle_decapsulate_result(
             }
 
             // Update stats
-            shared.stats.rx_bytes.fetch_add(packet_len as u64, Ordering::Relaxed);
+            shared
+                .stats
+                .rx_bytes
+                .fetch_add(packet_len as u64, Ordering::Relaxed);
             shared.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
 
             // Send to receiver channel
@@ -2216,7 +2302,11 @@ async fn handle_decapsulate_result(
             if let Err(e) = socket.send_to(response, peer_addr).await {
                 warn!("Failed to send response: {}", e);
             } else {
-                info!("Sent WG response ({} bytes) to {}", response.len(), peer_addr);
+                info!(
+                    "Sent WG response ({} bytes) to {}",
+                    response.len(),
+                    peer_addr
+                );
 
                 // Update handshake timestamp
                 let now = SystemTime::now()
@@ -2224,7 +2314,10 @@ async fn handle_decapsulate_result(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 shared.stats.last_handshake.store(now, Ordering::Relaxed);
-                shared.stats.last_handshake_valid.store(true, Ordering::Relaxed);
+                shared
+                    .stats
+                    .last_handshake_valid
+                    .store(true, Ordering::Relaxed);
                 shared.stats.handshake_count.fetch_add(1, Ordering::Relaxed);
 
                 // H3 fix: Signal handshake completion
@@ -2243,7 +2336,9 @@ async fn handle_decapsulate_result(
             while continue_processing {
                 let additional_result = {
                     let mut tunn_guard = shared.tunn.lock();
-                    tunn_guard.as_mut().map(|tunn| tunn.decapsulate(None, &[], &mut cont_buf))
+                    tunn_guard
+                        .as_mut()
+                        .map(|tunn| tunn.decapsulate(None, &[], &mut cont_buf))
                 };
 
                 match additional_result {
@@ -2339,7 +2434,12 @@ impl WgTunnel for UserspaceWgTunnel {
     }
 
     fn stats(&self) -> WgTunnelStats {
-        let last_handshake = if self.shared.stats.last_handshake_valid.load(Ordering::Relaxed) {
+        let last_handshake = if self
+            .shared
+            .stats
+            .last_handshake_valid
+            .load(Ordering::Relaxed)
+        {
             Some(self.shared.stats.last_handshake.load(Ordering::Relaxed))
         } else {
             None
@@ -2380,11 +2480,20 @@ impl WgTunnel for UserspaceWgTunnel {
     /// The returned socket should not be used for direct send/receive operations
     /// without proper `WireGuard` encryption/decryption handling.
     fn socket(&self) -> Option<Arc<UdpSocket>> {
-        self.shared.socket.try_read().ok().and_then(|guard| guard.clone())
+        self.shared
+            .socket
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     fn last_handshake(&self) -> Option<u64> {
-        if self.shared.stats.last_handshake_valid.load(Ordering::Relaxed) {
+        if self
+            .shared
+            .stats
+            .last_handshake_valid
+            .load(Ordering::Relaxed)
+        {
             Some(self.shared.stats.last_handshake.load(Ordering::Relaxed))
         } else {
             None
@@ -2422,10 +2531,7 @@ impl WgTunnel for UserspaceWgTunnel {
         Box::pin(async move {
             // Validate that the public key matches our configured peer
             let peer_state_guard = self.shared.peer_state.try_read().ok();
-            let peer_state = peer_state_guard
-                .as_ref()
-                .and_then(|g| g.as_ref())
-                .cloned();
+            let peer_state = peer_state_guard.as_ref().and_then(|g| g.as_ref()).cloned();
 
             match peer_state {
                 Some(state) if state.public_key == public_key => {
@@ -2496,20 +2602,14 @@ impl WgTunnel for UserspaceWgTunnel {
         // Decapsulate packet
         let result = {
             let mut tunn_guard = self.shared.tunn.lock();
-            let tunn = tunn_guard
-                .as_mut()
-                .ok_or(WgTunnelError::NotConnected)?;
+            let tunn = tunn_guard.as_mut().ok_or(WgTunnelError::NotConnected)?;
             tunn.decapsulate(None, encrypted, &mut dst)
         };
 
         // Process result
         match result {
-            TunnResult::WriteToTunnelV4(data, _addr) => {
-                Ok((data.to_vec(), peer_public_key))
-            }
-            TunnResult::WriteToTunnelV6(data, _addr) => {
-                Ok((data.to_vec(), peer_public_key))
-            }
+            TunnResult::WriteToTunnelV4(data, _addr) => Ok((data.to_vec(), peer_public_key)),
+            TunnResult::WriteToTunnelV6(data, _addr) => Ok((data.to_vec(), peer_public_key)),
             TunnResult::WriteToNetwork(_) => {
                 // This typically means we need to send a handshake response
                 // For direct decrypt, this is unexpected - we should handle it
@@ -2517,16 +2617,12 @@ impl WgTunnel for UserspaceWgTunnel {
                     "Received handshake packet; use recv() for normal operation".into(),
                 ))
             }
-            TunnResult::Done => {
-                Err(WgTunnelError::DecryptionError(
-                    "No data to decrypt (packet was empty or already processed)".into(),
-                ))
-            }
-            TunnResult::Err(e) => {
-                Err(WgTunnelError::DecryptionError(format!(
-                    "Decapsulation failed: {e:?}"
-                )))
-            }
+            TunnResult::Done => Err(WgTunnelError::DecryptionError(
+                "No data to decrypt (packet was empty or already processed)".into(),
+            )),
+            TunnResult::Err(e) => Err(WgTunnelError::DecryptionError(format!(
+                "Decapsulation failed: {e:?}"
+            ))),
         }
     }
 
@@ -2546,33 +2642,28 @@ impl WgTunnel for UserspaceWgTunnel {
         // Allocate buffer for encrypted packet
         // Buffer must be at least WG_HANDSHAKE_INIT_SIZE (148 bytes) to hold handshake
         // messages that boringtun may generate during rekey
-        let mut dst = vec![0u8; (payload.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
+        let mut dst =
+            vec![0u8; (payload.len() + WG_TRANSPORT_OVERHEAD).max(WG_HANDSHAKE_INIT_SIZE)];
 
         // Encapsulate packet
         let result = {
             let mut tunn_guard = self.shared.tunn.lock();
-            let tunn = tunn_guard
-                .as_mut()
-                .ok_or(WgTunnelError::NotConnected)?;
+            let tunn = tunn_guard.as_mut().ok_or(WgTunnelError::NotConnected)?;
             tunn.encapsulate(payload, &mut dst)
         };
 
         // Process result
         match result {
-            TunnResult::WriteToNetwork(encrypted) => {
-                Ok(encrypted.to_vec())
-            }
+            TunnResult::WriteToNetwork(encrypted) => Ok(encrypted.to_vec()),
             TunnResult::Done => {
                 // Packet was queued for later (handshake not complete)
                 Err(WgTunnelError::EncryptionError(
                     "Handshake not complete; packet queued but not encrypted".into(),
                 ))
             }
-            TunnResult::Err(e) => {
-                Err(WgTunnelError::EncryptionError(format!(
-                    "Encapsulation failed: {e:?}"
-                )))
-            }
+            TunnResult::Err(e) => Err(WgTunnelError::EncryptionError(format!(
+                "Encapsulation failed: {e:?}"
+            ))),
             _ => {
                 // WriteToTunnelV4/V6 shouldn't happen for encapsulate
                 Err(WgTunnelError::EncryptionError(
@@ -3158,7 +3249,7 @@ mod tests {
         // Minimal IPv6 packet with source IP 2001:db8::1
         let mut packet = vec![0u8; 40];
         packet[0] = 0x60; // Version 6
-        // Source IP at bytes 8-23: 2001:0db8:0000:0000:0000:0000:0000:0001
+                          // Source IP at bytes 8-23: 2001:0db8:0000:0000:0000:0000:0000:0001
         packet[8..10].copy_from_slice(&[0x20, 0x01]);
         packet[10..12].copy_from_slice(&[0x0d, 0xb8]);
         packet[22..24].copy_from_slice(&[0x00, 0x01]);
@@ -3358,10 +3449,7 @@ mod tests {
         let peers = tunnel.list_peers();
         assert_eq!(peers.len(), 1);
         assert!(peers[0].endpoint.is_some());
-        assert_eq!(
-            peers[0].endpoint.unwrap().to_string(),
-            "192.168.1.1:51820"
-        );
+        assert_eq!(peers[0].endpoint.unwrap().to_string(), "192.168.1.1:51820");
     }
 
     #[test]
@@ -3476,7 +3564,7 @@ mod tests {
         // Should fail with PeerNotFound, not NotConnected
         match result {
             Err(WgTunnelError::PeerNotFound(_)) => (), // Expected
-            Err(WgTunnelError::NotConnected) => (), // Also acceptable (no actual Tunn)
+            Err(WgTunnelError::NotConnected) => (),    // Also acceptable (no actual Tunn)
             _ => panic!("Expected PeerNotFound or NotConnected error"),
         }
     }
@@ -3818,11 +3906,7 @@ mod tests {
 
     #[test]
     fn test_peer_state_inner_update_handshake() {
-        let state = PeerStateInner::new(
-            "test-public-key".to_string(),
-            None,
-            vec![],
-        );
+        let state = PeerStateInner::new("test-public-key".to_string(), None, vec![]);
 
         // Initially no handshake
         assert!(!state.last_handshake_valid.load(Ordering::Relaxed));
@@ -3838,11 +3922,7 @@ mod tests {
 
     #[test]
     fn test_peer_state_inner_to_peer_info_with_handshake() {
-        let state = PeerStateInner::new(
-            "test-public-key".to_string(),
-            None,
-            vec![],
-        );
+        let state = PeerStateInner::new("test-public-key".to_string(), None, vec![]);
 
         // Update handshake to make it "recent"
         state.update_handshake();

@@ -77,7 +77,10 @@ impl OutboundManager {
 
     /// Get all outbounds
     pub fn all(&self) -> Vec<Arc<dyn Outbound>> {
-        self.outbounds.iter().map(|r| Arc::clone(r.value())).collect()
+        self.outbounds
+            .iter()
+            .map(|r| Arc::clone(r.value()))
+            .collect()
     }
 
     /// Get all enabled outbounds

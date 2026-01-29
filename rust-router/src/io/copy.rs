@@ -76,7 +76,10 @@ impl TransferState {
         loop {
             // If there's data in the buffer, try to write it
             if self.pos < self.cap {
-                let n = match writer.as_mut().poll_write(cx, &self.buf[self.pos..self.cap]) {
+                let n = match writer
+                    .as_mut()
+                    .poll_write(cx, &self.buf[self.pos..self.cap])
+                {
                     Poll::Ready(Ok(0)) => {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
@@ -159,30 +162,32 @@ where
         let this = &mut *self;
 
         // Poll A -> B direction
-        let a_to_b_done = match this
-            .a_to_b
-            .poll_transfer(cx, Pin::new(&mut this.a), Pin::new(&mut this.b))
-        {
-            Poll::Ready(Ok(())) => true,
-            Poll::Ready(Err(e)) => {
-                debug!("A->B transfer error: {}", e);
-                true
-            }
-            Poll::Pending => false,
-        };
+        let a_to_b_done =
+            match this
+                .a_to_b
+                .poll_transfer(cx, Pin::new(&mut this.a), Pin::new(&mut this.b))
+            {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(e)) => {
+                    debug!("A->B transfer error: {}", e);
+                    true
+                }
+                Poll::Pending => false,
+            };
 
         // Poll B -> A direction
-        let b_to_a_done = match this
-            .b_to_a
-            .poll_transfer(cx, Pin::new(&mut this.b), Pin::new(&mut this.a))
-        {
-            Poll::Ready(Ok(())) => true,
-            Poll::Ready(Err(e)) => {
-                debug!("B->A transfer error: {}", e);
-                true
-            }
-            Poll::Pending => false,
-        };
+        let b_to_a_done =
+            match this
+                .b_to_a
+                .poll_transfer(cx, Pin::new(&mut this.b), Pin::new(&mut this.a))
+            {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(e)) => {
+                    debug!("B->A transfer error: {}", e);
+                    true
+                }
+                Poll::Pending => false,
+            };
 
         if a_to_b_done && b_to_a_done {
             Poll::Ready(Ok(CopyResult {

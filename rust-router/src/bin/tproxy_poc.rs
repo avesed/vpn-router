@@ -145,14 +145,19 @@ async fn handle_connection(client_stream: TcpStream, client_addr: SocketAddr) ->
 
     // Connect to the original destination
     // In a real implementation, this would go through the routing engine
-    let upstream = TcpStream::connect(original_dst)
-        .await
-        .with_context(|| format!("Failed to connect to original destination: {}", original_dst))?;
+    let upstream = TcpStream::connect(original_dst).await.with_context(|| {
+        format!(
+            "Failed to connect to original destination: {}",
+            original_dst
+        )
+    })?;
 
     info!(
         "Connected to upstream: {} (from {})",
         original_dst,
-        upstream.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap())
+        upstream
+            .local_addr()
+            .unwrap_or_else(|_| "unknown".parse().unwrap())
     );
 
     // Split streams for bidirectional copy
@@ -167,7 +172,10 @@ async fn handle_connection(client_stream: TcpStream, client_addr: SocketAddr) ->
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 {
-                debug!("Client closed connection (read {} bytes total)", total_bytes);
+                debug!(
+                    "Client closed connection (read {} bytes total)",
+                    total_bytes
+                );
                 break;
             }
             upstream_write.write_all(&buf[..n]).await?;
@@ -183,7 +191,10 @@ async fn handle_connection(client_stream: TcpStream, client_addr: SocketAddr) ->
         loop {
             let n = upstream_read.read(&mut buf).await?;
             if n == 0 {
-                debug!("Upstream closed connection (read {} bytes total)", total_bytes);
+                debug!(
+                    "Upstream closed connection (read {} bytes total)",
+                    total_bytes
+                );
                 break;
             }
             client_write.write_all(&buf[..n]).await?;
@@ -281,9 +292,8 @@ async fn main() -> Result<()> {
     info!("Waiting for TPROXY-redirected connections...");
 
     // Convert to tokio TcpListener
-    let listener = TcpListener::from_std(unsafe {
-        std::net::TcpListener::from_raw_fd(socket.into_raw_fd())
-    })?;
+    let listener =
+        TcpListener::from_std(unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) })?;
 
     // Accept loop
     loop {

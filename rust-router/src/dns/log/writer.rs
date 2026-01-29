@@ -876,7 +876,9 @@ impl QueryLogger {
                 trace!("Flush sync command sent, waiting for confirmation");
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                return Err(DnsError::internal("Log channel full, cannot send flush command"));
+                return Err(DnsError::internal(
+                    "Log channel full, cannot send flush command",
+                ));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Err(DnsError::internal("Log channel closed"));
@@ -889,7 +891,9 @@ impl QueryLogger {
             Ok(Ok(success)) => Ok(success),
             Ok(Err(_)) => {
                 // Sender was dropped without sending a response
-                Err(DnsError::internal("Flush confirmation channel closed unexpectedly"))
+                Err(DnsError::internal(
+                    "Flush confirmation channel closed unexpectedly",
+                ))
             }
             Err(_) => {
                 // Timeout
@@ -980,7 +984,8 @@ impl QueryLogger {
             config.format, config.path
         );
 
-        let mut rotator = LogRotator::new(config.path.clone(), config.rotation_days, config.max_files);
+        let mut rotator =
+            LogRotator::new(config.path.clone(), config.rotation_days, config.max_files);
 
         // Open log file
         let file_result = Self::open_log_file(&config.path).await;
@@ -1021,8 +1026,14 @@ impl QueryLogger {
                     let success = if batch.is_empty() {
                         true // No entries to flush, consider it successful
                     } else {
-                        Self::write_batch_with_result(&mut file, &batch, &config.format, &stats, &mut rotator)
-                            .await
+                        Self::write_batch_with_result(
+                            &mut file,
+                            &batch,
+                            &config.format,
+                            &stats,
+                            &mut rotator,
+                        )
+                        .await
                     };
                     batch.clear();
 
@@ -1104,7 +1115,10 @@ impl QueryLogger {
 
         // Validate file name doesn't contain traversal characters
         let file_name_str = file_name.to_string_lossy();
-        if file_name_str.contains("..") || file_name_str.contains('/') || file_name_str.contains('\\') {
+        if file_name_str.contains("..")
+            || file_name_str.contains('/')
+            || file_name_str.contains('\\')
+        {
             return Err(DnsError::config(format!(
                 "Log file name contains invalid characters: {file_name:?}"
             )));
@@ -1187,9 +1201,9 @@ impl QueryLogger {
         // Ensure parent directory exists
         if let Some(parent) = validated_path.parent() {
             if !parent.exists() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| DnsError::internal(format!("Failed to create log directory: {e}")))?;
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    DnsError::internal(format!("Failed to create log directory: {e}"))
+                })?;
             }
         }
 
@@ -1406,12 +1420,30 @@ mod tests {
 
     #[test]
     fn test_query_log_entry_rcode_str() {
-        assert_eq!(QueryLogEntry::new("", 1).with_response_code(0).rcode_str(), "NOERROR");
-        assert_eq!(QueryLogEntry::new("", 1).with_response_code(1).rcode_str(), "FORMERR");
-        assert_eq!(QueryLogEntry::new("", 1).with_response_code(2).rcode_str(), "SERVFAIL");
-        assert_eq!(QueryLogEntry::new("", 1).with_response_code(3).rcode_str(), "NXDOMAIN");
-        assert_eq!(QueryLogEntry::new("", 1).with_response_code(5).rcode_str(), "REFUSED");
-        assert_eq!(QueryLogEntry::new("", 1).with_response_code(99).rcode_str(), "OTHER");
+        assert_eq!(
+            QueryLogEntry::new("", 1).with_response_code(0).rcode_str(),
+            "NOERROR"
+        );
+        assert_eq!(
+            QueryLogEntry::new("", 1).with_response_code(1).rcode_str(),
+            "FORMERR"
+        );
+        assert_eq!(
+            QueryLogEntry::new("", 1).with_response_code(2).rcode_str(),
+            "SERVFAIL"
+        );
+        assert_eq!(
+            QueryLogEntry::new("", 1).with_response_code(3).rcode_str(),
+            "NXDOMAIN"
+        );
+        assert_eq!(
+            QueryLogEntry::new("", 1).with_response_code(5).rcode_str(),
+            "REFUSED"
+        );
+        assert_eq!(
+            QueryLogEntry::new("", 1).with_response_code(99).rcode_str(),
+            "OTHER"
+        );
     }
 
     #[test]
@@ -1463,8 +1495,7 @@ mod tests {
     #[test]
     fn test_query_log_entry_to_tsv_escaping() {
         // Test that control characters are properly escaped, not replaced
-        let entry = QueryLogEntry::new("test\tdomain.com", 1)
-            .with_upstream("up\nstream");
+        let entry = QueryLogEntry::new("test\tdomain.com", 1).with_upstream("up\nstream");
         let tsv = entry.to_tsv();
         // Field separators should be actual tabs, but domain should have escaped tab
         assert_eq!(tsv.matches('\t').count(), 7); // Only field separators
@@ -1475,8 +1506,8 @@ mod tests {
     #[test]
     fn test_query_log_entry_to_tsv_escaping_comprehensive() {
         // Test all control characters
-        let entry = QueryLogEntry::new("dom\tain\nwith\rcontrol", 1)
-            .with_upstream("up\t\n\rstream");
+        let entry =
+            QueryLogEntry::new("dom\tain\nwith\rcontrol", 1).with_upstream("up\t\n\rstream");
         let tsv = entry.to_tsv();
 
         // Verify escaping
@@ -1495,8 +1526,8 @@ mod tests {
     #[test]
     fn test_query_log_entry_to_tsv_backslash_escaping() {
         // Test that backslashes are also escaped to prevent ambiguity
-        let entry = QueryLogEntry::new("domain\\with\\backslash", 1)
-            .with_upstream("upstream\\test");
+        let entry =
+            QueryLogEntry::new("domain\\with\\backslash", 1).with_upstream("upstream\\test");
         let tsv = entry.to_tsv();
 
         // Backslashes should be escaped
@@ -1518,9 +1549,18 @@ mod tests {
     fn test_escape_tsv_field() {
         assert_eq!(QueryLogEntry::escape_tsv_field("normal"), "normal");
         assert_eq!(QueryLogEntry::escape_tsv_field("with\ttab"), "with\\ttab");
-        assert_eq!(QueryLogEntry::escape_tsv_field("with\nnewline"), "with\\nnewline");
-        assert_eq!(QueryLogEntry::escape_tsv_field("with\rcarriage"), "with\\rcarriage");
-        assert_eq!(QueryLogEntry::escape_tsv_field("with\\backslash"), "with\\\\backslash");
+        assert_eq!(
+            QueryLogEntry::escape_tsv_field("with\nnewline"),
+            "with\\nnewline"
+        );
+        assert_eq!(
+            QueryLogEntry::escape_tsv_field("with\rcarriage"),
+            "with\\rcarriage"
+        );
+        assert_eq!(
+            QueryLogEntry::escape_tsv_field("with\\backslash"),
+            "with\\\\backslash"
+        );
         assert_eq!(
             QueryLogEntry::escape_tsv_field("all\t\n\r\\chars"),
             "all\\t\\n\\r\\\\chars"
@@ -1553,8 +1593,7 @@ mod tests {
 
     #[test]
     fn test_query_log_entry_binary_unicode() {
-        let entry = QueryLogEntry::new("example.com", 1)
-            .with_upstream("cloudflare");
+        let entry = QueryLogEntry::new("example.com", 1).with_upstream("cloudflare");
         let binary = entry.to_binary().expect("serialize");
         let decoded = QueryLogEntry::from_binary(&binary).expect("deserialize");
         assert_eq!(entry, decoded);
@@ -1570,7 +1609,11 @@ mod tests {
         }
         let elapsed = start.elapsed();
         // Should complete in under 100ms for 10K entries
-        assert!(elapsed.as_millis() < 100, "Entry creation too slow: {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() < 100,
+            "Entry creation too slow: {:?}",
+            elapsed
+        );
     }
 
     // ========================================================================
@@ -2046,8 +2089,7 @@ mod tests {
 
         let logger = QueryLogger::new(config).expect("Failed to create logger");
 
-        let entry = QueryLogEntry::new("test\"domain\\.com", 1)
-            .with_upstream("up\\stream");
+        let entry = QueryLogEntry::new("test\"domain\\.com", 1).with_upstream("up\\stream");
         logger.log(entry);
 
         logger.flush();
@@ -2151,7 +2193,11 @@ mod tests {
     fn test_validate_log_path_nonexistent_parent() {
         let temp_dir = TempDir::new().unwrap();
         // Path with non-existent parent - should still be validated safely
-        let log_path = temp_dir.path().join("nonexistent").join("subdir").join("file.log");
+        let log_path = temp_dir
+            .path()
+            .join("nonexistent")
+            .join("subdir")
+            .join("file.log");
 
         let result = QueryLogger::validate_log_path(&log_path);
         // Should succeed since there's no traversal
@@ -2385,7 +2431,10 @@ mod tests {
     #[test]
     fn test_sanitize_domain_direct() {
         // Test the internal sanitize_domain function directly
-        assert_eq!(QueryLogEntry::sanitize_domain("normal.com".to_string()), "normal.com");
+        assert_eq!(
+            QueryLogEntry::sanitize_domain("normal.com".to_string()),
+            "normal.com"
+        );
 
         let long_domain = "a".repeat(300);
         let sanitized = QueryLogEntry::sanitize_domain(long_domain);

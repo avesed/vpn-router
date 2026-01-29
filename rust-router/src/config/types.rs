@@ -302,7 +302,6 @@ pub enum OutboundType {
 
     /// Block/drop connection
     Block,
-
     // Future: Socks5, Shadowsocks, etc.
 }
 

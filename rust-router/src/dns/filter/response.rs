@@ -460,7 +460,12 @@ mod tests {
     fn test_nxdomain_any_query_type() {
         let builder = BlockedResponseBuilder::new(BlockResponseType::Nxdomain);
 
-        for qtype in [RecordType::A, RecordType::AAAA, RecordType::MX, RecordType::TXT] {
+        for qtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::MX,
+            RecordType::TXT,
+        ] {
             let query = create_query("blocked.example.com", qtype);
             let response = builder.build_response(&query);
 
@@ -490,7 +495,12 @@ mod tests {
     fn test_refused_any_query_type() {
         let builder = BlockedResponseBuilder::new(BlockResponseType::Refused);
 
-        for qtype in [RecordType::A, RecordType::AAAA, RecordType::MX, RecordType::TXT] {
+        for qtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::MX,
+            RecordType::TXT,
+        ] {
             let query = create_query("blocked.example.com", qtype);
             let response = builder.build_response(&query);
 

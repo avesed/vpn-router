@@ -502,7 +502,9 @@ impl SimpleTcpProxy {
                             // Abort the connection that took over the listen socket
                             let socket = bridge.get_tcp_socket_mut(listen_handle);
                             socket.abort();
-                            self.stats.connections_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.stats
+                                .connections_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             debug!(
                                 "New connection from {} on port {}",
@@ -511,15 +513,24 @@ impl SimpleTcpProxy {
 
                             // The listening socket becomes the connection socket
                             // We need to create a new listening socket
-                            match self.accept_connection(&mut bridge, listen_handle, source_ip).await {
+                            match self
+                                .accept_connection(&mut bridge, listen_handle, source_ip)
+                                .await
+                            {
                                 Ok(conn) => {
-                                    self.stats.connections_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    self.stats.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.stats
+                                        .connections_accepted
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.stats
+                                        .active_connections
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     connections.insert(conn.handle, conn);
                                 }
                                 Err(e) => {
                                     warn!("Failed to accept connection: {}", e);
-                                    self.stats.connections_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.stats
+                                        .connections_failed
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
                         }
@@ -527,15 +538,15 @@ impl SimpleTcpProxy {
                         // Create a new listening socket to replace the one that became a connection
                         // This must happen regardless of whether accept succeeded, since the old socket
                         // is now either a connection or was aborted
-                        listen_handle = bridge
-                            .create_tcp_socket_default()
-                            .ok_or_else(|| TcpProxyError::SocketError("Failed to create new listen socket".into()))?;
+                        listen_handle = bridge.create_tcp_socket_default().ok_or_else(|| {
+                            TcpProxyError::SocketError("Failed to create new listen socket".into())
+                        })?;
 
                         {
                             let socket = bridge.get_tcp_socket_mut(listen_handle);
-                            socket
-                                .listen(self.listen_port)
-                                .map_err(|e| TcpProxyError::SocketError(format!("Failed to listen: {:?}", e)))?;
+                            socket.listen(self.listen_port).map_err(|e| {
+                                TcpProxyError::SocketError(format!("Failed to listen: {:?}", e))
+                            })?;
                         }
                     }
                 }
@@ -551,12 +562,16 @@ impl SimpleTcpProxy {
                     Ok(false) => {
                         // Connection finished
                         to_remove.push(*handle);
-                        self.stats.connections_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.stats
+                            .connections_completed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {
                         warn!("Connection error: {}", e);
                         to_remove.push(*handle);
-                        self.stats.connections_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.stats
+                            .connections_failed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -565,7 +580,9 @@ impl SimpleTcpProxy {
             for handle in to_remove {
                 if let Some(_conn) = connections.remove(&handle) {
                     bridge.remove_socket(handle);
-                    self.stats.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stats
+                        .active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -573,15 +590,22 @@ impl SimpleTcpProxy {
             let mut idle_handles = Vec::new();
             for (handle, conn) in &connections {
                 if conn.is_idle() {
-                    info!("Removing idle connection from {} (idle timeout exceeded)", conn.source_ip);
+                    info!(
+                        "Removing idle connection from {} (idle timeout exceeded)",
+                        conn.source_ip
+                    );
                     idle_handles.push(*handle);
                 }
             }
             for handle in idle_handles {
                 if let Some(_conn) = connections.remove(&handle) {
                     bridge.remove_socket(handle);
-                    self.stats.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    self.stats.connections_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stats
+                        .active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stats
+                        .connections_failed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -615,7 +639,9 @@ impl SimpleTcpProxy {
 
             // Remove finished/failed outbound connections and check timeouts
             for (handle, outbound) in &mut outbound_connections {
-                if !outbound_to_remove.contains(handle) && outbound.created_at.elapsed() > outbound.timeout {
+                if !outbound_to_remove.contains(handle)
+                    && outbound.created_at.elapsed() > outbound.timeout
+                {
                     warn!("Outbound request to {} timed out", outbound.remote_host);
                     if let Some(tx) = outbound.response_tx.take() {
                         let _ = tx.send(OutboundHttpResponse::error("Request timed out"));
@@ -633,7 +659,9 @@ impl SimpleTcpProxy {
             // Send any outgoing packets
             for packet in bridge.drain_tx_packets() {
                 if tx_sender.send(packet).await.is_err() {
-                    return Err(TcpProxyError::TunnelError("Failed to send packet to tunnel".into()));
+                    return Err(TcpProxyError::TunnelError(
+                        "Failed to send packet to tunnel".into(),
+                    ));
                 }
             }
 
@@ -738,10 +766,9 @@ impl SimpleTcpProxy {
                         conn.smoltcp_buffer.extend_from_slice(data);
 
                         // Try to detect and inject header
-                        if let Some(modified) = inject_tunnel_source_header(
-                            &conn.smoltcp_buffer,
-                            conn.source_ip,
-                        ) {
+                        if let Some(modified) =
+                            inject_tunnel_source_header(&conn.smoltcp_buffer, conn.source_ip)
+                        {
                             conn.header_injected = true;
                             conn.smoltcp_buffer = modified;
                             data = &conn.smoltcp_buffer;
@@ -758,10 +785,9 @@ impl SimpleTcpProxy {
                     // Write to local
                     match conn.local_stream.write_all(data).await {
                         Ok(()) => {
-                            self.stats.bytes_tunnel_to_local.fetch_add(
-                                data.len() as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            self.stats
+                                .bytes_tunnel_to_local
+                                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                             // Clear buffer after successful write
                             if !conn.smoltcp_buffer.is_empty() {
                                 conn.smoltcp_buffer.clear();
@@ -786,15 +812,18 @@ impl SimpleTcpProxy {
             let socket = bridge.get_tcp_socket_mut(conn.handle);
             match socket.send_slice(&conn.pending_to_tunnel) {
                 Ok(sent) => {
-                    self.stats.bytes_local_to_tunnel.fetch_add(
-                        sent as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    self.stats
+                        .bytes_local_to_tunnel
+                        .fetch_add(sent as u64, std::sync::atomic::Ordering::Relaxed);
                     if sent > 0 {
                         conn.touch();
                         // Remove sent bytes from pending buffer
                         conn.pending_to_tunnel.drain(..sent);
-                        trace!("Sent {} pending bytes to tunnel, {} remaining", sent, conn.pending_to_tunnel.len());
+                        trace!(
+                            "Sent {} pending bytes to tunnel, {} remaining",
+                            sent,
+                            conn.pending_to_tunnel.len()
+                        );
                     }
                 }
                 Err(e) => {
@@ -830,13 +859,13 @@ impl SimpleTcpProxy {
                         let socket = bridge.get_tcp_socket_mut(conn.handle);
                         match socket.send_slice(&local_buf[..n]) {
                             Ok(sent) => {
-                                self.stats.bytes_local_to_tunnel.fetch_add(
-                                    sent as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                self.stats
+                                    .bytes_local_to_tunnel
+                                    .fetch_add(sent as u64, std::sync::atomic::Ordering::Relaxed);
                                 if sent < n {
                                     // Buffer the unsent data instead of dropping it
-                                    conn.pending_to_tunnel.extend_from_slice(&local_buf[sent..n]);
+                                    conn.pending_to_tunnel
+                                        .extend_from_slice(&local_buf[sent..n]);
                                     trace!(
                                         "Buffered {} bytes for later send ({} total pending)",
                                         n - sent,
@@ -989,8 +1018,14 @@ impl SimpleTcpProxy {
                 match state {
                     TcpState::Established => {
                         // Connection established, start sending
-                        trace!("Outbound connection to {} established", outbound.remote_host);
-                        outbound.state = OutboundRequestState::Sending { sent: 0, total: outbound.request_bytes.len() };
+                        trace!(
+                            "Outbound connection to {} established",
+                            outbound.remote_host
+                        );
+                        outbound.state = OutboundRequestState::Sending {
+                            sent: 0,
+                            total: outbound.request_bytes.len(),
+                        };
                     }
                     TcpState::Closed | TcpState::TimeWait => {
                         return Err(TcpProxyError::AcceptFailed(
@@ -1005,8 +1040,13 @@ impl SimpleTcpProxy {
 
             OutboundRequestState::Sending { sent, total } => {
                 // Check if connection is still valid
-                if !matches!(state, TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2) {
-                    return Err(TcpProxyError::TunnelError("Connection closed while sending".into()));
+                if !matches!(
+                    state,
+                    TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+                ) {
+                    return Err(TcpProxyError::TunnelError(
+                        "Connection closed while sending".into(),
+                    ));
                 }
 
                 // Try to send more data
@@ -1015,11 +1055,20 @@ impl SimpleTcpProxy {
                     match socket.send_slice(&outbound.request_bytes[*sent..]) {
                         Ok(n) => {
                             *sent += n;
-                            trace!("Sent {} bytes ({}/{}) to {}", n, *sent, *total, outbound.remote_host);
+                            trace!(
+                                "Sent {} bytes ({}/{}) to {}",
+                                n,
+                                *sent,
+                                *total,
+                                outbound.remote_host
+                            );
 
                             if *sent >= *total {
                                 // All data sent, start receiving
-                                debug!("Request sent to {}, waiting for response", outbound.remote_host);
+                                debug!(
+                                    "Request sent to {}, waiting for response",
+                                    outbound.remote_host
+                                );
                                 outbound.state = OutboundRequestState::Receiving;
                             }
                         }
@@ -1055,11 +1104,14 @@ impl SimpleTcpProxy {
 
                             // Check if headers are complete
                             if !outbound.headers_complete {
-                                if let Some(pos) = Self::find_headers_end(&outbound.response_buffer) {
+                                if let Some(pos) = Self::find_headers_end(&outbound.response_buffer)
+                                {
                                     outbound.headers_complete = true;
                                     outbound.headers_end_pos = pos;
-                                    let headers_str = String::from_utf8_lossy(&outbound.response_buffer[..pos]);
-                                    outbound.content_length = Self::extract_content_length(&headers_str);
+                                    let headers_str =
+                                        String::from_utf8_lossy(&outbound.response_buffer[..pos]);
+                                    outbound.content_length =
+                                        Self::extract_content_length(&headers_str);
                                     trace!(
                                         "Headers complete for {}, Content-Length: {:?}",
                                         outbound.remote_host,
@@ -1070,7 +1122,8 @@ impl SimpleTcpProxy {
 
                             // Check if we have the complete response
                             if outbound.headers_complete {
-                                let body_received = outbound.response_buffer.len() - outbound.headers_end_pos;
+                                let body_received =
+                                    outbound.response_buffer.len() - outbound.headers_end_pos;
                                 if let Some(expected) = outbound.content_length {
                                     if body_received >= expected {
                                         return Ok(Some(self.parse_outbound_response(outbound)?));
@@ -1098,7 +1151,9 @@ impl SimpleTcpProxy {
                                 "Connection closed before headers complete".into(),
                             ));
                         } else {
-                            return Err(TcpProxyError::TunnelError("Connection closed by peer".into()));
+                            return Err(TcpProxyError::TunnelError(
+                                "Connection closed by peer".into(),
+                            ));
                         }
                     }
                     _ => {}
@@ -1133,7 +1188,10 @@ impl SimpleTcpProxy {
             body_str.len()
         );
 
-        Ok(OutboundHttpResponse::success(status_code, body_str.to_string()))
+        Ok(OutboundHttpResponse::success(
+            status_code,
+            body_str.to_string(),
+        ))
     }
 
     /// Allocate an ephemeral port for outbound connections
@@ -1232,9 +1290,10 @@ impl SimpleTcpProxy {
 
     /// Parse HTTP status code from status line
     fn parse_status_code(headers: &str) -> Result<u16, TcpProxyError> {
-        let status_line = headers.lines().next().ok_or_else(|| {
-            TcpProxyError::TunnelError("Empty response".into())
-        })?;
+        let status_line = headers
+            .lines()
+            .next()
+            .ok_or_else(|| TcpProxyError::TunnelError("Empty response".into()))?;
 
         // Format: "HTTP/1.1 200 OK"
         let parts: Vec<&str> = status_line.split_whitespace().collect();
@@ -1245,9 +1304,9 @@ impl SimpleTcpProxy {
             )));
         }
 
-        parts[1].parse().map_err(|_| {
-            TcpProxyError::TunnelError(format!("Invalid status code: {}", parts[1]))
-        })
+        parts[1]
+            .parse()
+            .map_err(|_| TcpProxyError::TunnelError(format!("Invalid status code: {}", parts[1])))
     }
 }
 
@@ -1290,10 +1349,7 @@ fn find_request_line_end(data: &[u8]) -> Option<usize> {
 /// This prevents HTTP header injection attacks where malicious values
 /// could inject additional headers.
 pub fn sanitize_header_value(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| *c != '\r' && *c != '\n')
-        .collect()
+    value.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
 /// Inject the X-Tunnel-Source-IP header into an HTTP request
@@ -1388,10 +1444,7 @@ mod tests {
             find_request_line_end(b"GET / HTTP/1.1\r\nHost: example.com\r\n"),
             Some(16)
         );
-        assert_eq!(
-            find_request_line_end(b"POST /api HTTP/1.1\r\n"),
-            Some(20)
-        );
+        assert_eq!(find_request_line_end(b"POST /api HTTP/1.1\r\n"), Some(20));
 
         // No CRLF yet
         assert_eq!(find_request_line_end(b"GET / HTTP/1.1"), None);
@@ -1433,7 +1486,8 @@ mod tests {
         assert!(modified_str.contains("X-Tunnel-Source-IP: 10.200.200.2\r\n"));
 
         // Header should be after request line
-        assert!(modified_str.starts_with("GET /api/health HTTP/1.1\r\nX-Tunnel-Source-IP: 10.200.200.2\r\n"));
+        assert!(modified_str
+            .starts_with("GET /api/health HTTP/1.1\r\nX-Tunnel-Source-IP: 10.200.200.2\r\n"));
 
         // Original headers should still be there
         assert!(modified_str.contains("Host: localhost\r\n"));
@@ -1500,11 +1554,28 @@ mod tests {
     fn test_tcp_proxy_stats() {
         let stats = TcpProxyStats::new();
 
-        assert_eq!(stats.connections_accepted.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(stats.connections_completed.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            stats
+                .connections_accepted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            stats
+                .connections_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
-        stats.connections_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(stats.connections_accepted.load(std::sync::atomic::Ordering::Relaxed), 1);
+        stats
+            .connections_accepted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            stats
+                .connections_accepted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

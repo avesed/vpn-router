@@ -15,11 +15,11 @@
 //! These tests are placeholders that will be implemented as Phase 6
 //! features are completed.
 
-use rust_router::peer::{
-    decode_pair_request, PairRequest, PairRequestConfig, PairResponse, PeerManager,
-    TunnelPortAllocator, TunnelIpAllocator, HealthChecker,
-};
 use rust_router::ipc::TunnelType;
+use rust_router::peer::{
+    decode_pair_request, HealthChecker, PairRequest, PairRequestConfig, PairResponse, PeerManager,
+    TunnelIpAllocator, TunnelPortAllocator,
+};
 
 // ============================================================================
 // Port Allocator Tests
@@ -141,18 +141,23 @@ fn test_peer_manager_list_empty() {
 fn test_pairing_request_generation() {
     let manager = PeerManager::new("local-node".to_string());
 
-    let code = manager.generate_pair_request(PairRequestConfig {
-        local_tag: "local-node".to_string(),
-        local_description: "Local Node".to_string(),
-        local_endpoint: "192.168.1.1:36200".to_string(),
-        local_api_port: 36000,
-        bidirectional: false,
-        tunnel_type: TunnelType::WireGuard,
-    }).expect("Should generate pairing code");
+    let code = manager
+        .generate_pair_request(PairRequestConfig {
+            local_tag: "local-node".to_string(),
+            local_description: "Local Node".to_string(),
+            local_endpoint: "192.168.1.1:36200".to_string(),
+            local_api_port: 36000,
+            bidirectional: false,
+            tunnel_type: TunnelType::WireGuard,
+        })
+        .expect("Should generate pairing code");
 
     // Verify code is valid Base64
     assert!(!code.code.is_empty());
-    assert!(code.code.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    assert!(code
+        .code
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
 
     // Decode and verify content
     use rust_router::peer::decode_pair_request;
@@ -168,33 +173,39 @@ async fn test_pairing_bidirectional() {
     let manager_b = PeerManager::new("node-b".to_string());
 
     // Step 1: Node A generates request with bidirectional=true
-    let request_code = manager_a.generate_pair_request(PairRequestConfig {
-        local_tag: "node-a".to_string(),
-        local_description: "Node A".to_string(),
-        local_endpoint: "192.168.1.1:36200".to_string(),
-        local_api_port: 36000,
-        bidirectional: true,
-        tunnel_type: TunnelType::WireGuard,
-    }).expect("Should generate pairing request");
-
-    // Step 2: Node B imports request and generates response
-    let response_result = manager_b.import_pair_request(
-        &request_code.code,
-        PairRequestConfig {
-            local_tag: "node-b".to_string(),
-            local_description: "Node B".to_string(),
-            local_endpoint: "192.168.1.2:36201".to_string(),
+    let request_code = manager_a
+        .generate_pair_request(PairRequestConfig {
+            local_tag: "node-a".to_string(),
+            local_description: "Node A".to_string(),
+            local_endpoint: "192.168.1.1:36200".to_string(),
             local_api_port: 36000,
             bidirectional: true,
             tunnel_type: TunnelType::WireGuard,
-        },
-    ).await.expect("Should import pairing request");
+        })
+        .expect("Should generate pairing request");
+
+    // Step 2: Node B imports request and generates response
+    let response_result = manager_b
+        .import_pair_request(
+            &request_code.code,
+            PairRequestConfig {
+                local_tag: "node-b".to_string(),
+                local_description: "Node B".to_string(),
+                local_endpoint: "192.168.1.2:36201".to_string(),
+                local_api_port: 36000,
+                bidirectional: true,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        )
+        .await
+        .expect("Should import pairing request");
 
     // Node B should now have node-a as a peer
     assert!(manager_b.peer_exists("node-a"));
 
     // Step 3: Node A completes handshake
-    manager_a.complete_handshake(&response_result.response_code)
+    manager_a
+        .complete_handshake(&response_result.response_code)
         .await
         .expect("Should complete handshake");
 
@@ -202,8 +213,12 @@ async fn test_pairing_bidirectional() {
     assert!(manager_a.peer_exists("node-b"));
 
     // Verify both peers are configured
-    let peer_a_on_b = manager_b.get_peer_config("node-a").expect("Node A should exist on B");
-    let peer_b_on_a = manager_a.get_peer_config("node-b").expect("Node B should exist on A");
+    let peer_a_on_b = manager_b
+        .get_peer_config("node-a")
+        .expect("Node A should exist on B");
+    let peer_b_on_a = manager_a
+        .get_peer_config("node-b")
+        .expect("Node B should exist on A");
 
     assert_eq!(peer_a_on_b.tunnel_type, TunnelType::WireGuard);
     assert_eq!(peer_b_on_a.tunnel_type, TunnelType::WireGuard);
@@ -214,17 +229,19 @@ async fn test_pairing_invalid_code() {
     let manager = PeerManager::new("test-node".to_string());
 
     // Invalid Base64 should fail
-    let result = manager.import_pair_request(
-        "not-valid-base64!!!",
-        PairRequestConfig {
-            local_tag: "test-node".to_string(),
-            local_description: "Test Node".to_string(),
-            local_endpoint: "192.168.1.1:36200".to_string(),
-            local_api_port: 36000,
-            bidirectional: false,
-            tunnel_type: TunnelType::WireGuard,
-        },
-    ).await;
+    let result = manager
+        .import_pair_request(
+            "not-valid-base64!!!",
+            PairRequestConfig {
+                local_tag: "test-node".to_string(),
+                local_description: "Test Node".to_string(),
+                local_endpoint: "192.168.1.1:36200".to_string(),
+                local_api_port: 36000,
+                bidirectional: false,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        )
+        .await;
 
     assert!(result.is_err());
 }
@@ -326,14 +343,16 @@ fn test_pair_response_serialization() {
 fn test_xray_pairing_request_generation() {
     let manager = PeerManager::new("xray-node".to_string());
 
-    let code = manager.generate_pair_request(PairRequestConfig {
-        local_tag: "xray-node".to_string(),
-        local_description: "Xray Test Node".to_string(),
-        local_endpoint: "192.168.1.1:443".to_string(),
-        local_api_port: 36000,
-        bidirectional: false,
-        tunnel_type: TunnelType::Xray,
-    }).expect("Should generate Xray pairing code");
+    let code = manager
+        .generate_pair_request(PairRequestConfig {
+            local_tag: "xray-node".to_string(),
+            local_description: "Xray Test Node".to_string(),
+            local_endpoint: "192.168.1.1:443".to_string(),
+            local_api_port: 36000,
+            bidirectional: false,
+            tunnel_type: TunnelType::Xray,
+        })
+        .expect("Should generate Xray pairing code");
 
     // Verify code is valid Base64
     assert!(!code.code.is_empty());
@@ -396,9 +415,15 @@ fn test_xray_pair_request_fields() {
     let decoded: PairRequest = serde_json::from_str(&json).expect("Should deserialize");
 
     assert_eq!(decoded.tunnel_type, TunnelType::Xray);
-    assert_eq!(decoded.xray_uuid, Some("550e8400-e29b-41d4-a716-446655440000".to_string()));
+    assert_eq!(
+        decoded.xray_uuid,
+        Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+    );
     assert_eq!(decoded.xray_server_name, Some("example.com".to_string()));
-    assert_eq!(decoded.xray_public_key, Some("some-reality-public-key".to_string()));
+    assert_eq!(
+        decoded.xray_public_key,
+        Some("some-reality-public-key".to_string())
+    );
     assert_eq!(decoded.xray_short_id, Some("abc123".to_string()));
 }
 
@@ -481,29 +506,33 @@ async fn test_pairing_import_truncated_code() {
     let manager = PeerManager::new("test-node".to_string());
 
     // Generate a valid code first
-    let valid_code = manager.generate_pair_request(PairRequestConfig {
-        local_tag: "source-node".to_string(),
-        local_description: "Source Node".to_string(),
-        local_endpoint: "192.168.1.1:36200".to_string(),
-        local_api_port: 36000,
-        bidirectional: false,
-        tunnel_type: TunnelType::WireGuard,
-    }).expect("Should generate code");
+    let valid_code = manager
+        .generate_pair_request(PairRequestConfig {
+            local_tag: "source-node".to_string(),
+            local_description: "Source Node".to_string(),
+            local_endpoint: "192.168.1.1:36200".to_string(),
+            local_api_port: 36000,
+            bidirectional: false,
+            tunnel_type: TunnelType::WireGuard,
+        })
+        .expect("Should generate code");
 
     // Truncate the code
     let truncated = &valid_code.code[..valid_code.code.len() / 2];
 
-    let result = manager.import_pair_request(
-        truncated,
-        PairRequestConfig {
-            local_tag: "dest-node".to_string(),
-            local_description: "Dest Node".to_string(),
-            local_endpoint: "192.168.1.2:36201".to_string(),
-            local_api_port: 36000,
-            bidirectional: false,
-            tunnel_type: TunnelType::WireGuard,
-        },
-    ).await;
+    let result = manager
+        .import_pair_request(
+            truncated,
+            PairRequestConfig {
+                local_tag: "dest-node".to_string(),
+                local_description: "Dest Node".to_string(),
+                local_endpoint: "192.168.1.2:36201".to_string(),
+                local_api_port: 36000,
+                bidirectional: false,
+                tunnel_type: TunnelType::WireGuard,
+            },
+        )
+        .await;
 
     assert!(result.is_err());
 }
@@ -522,17 +551,19 @@ async fn test_pairing_import_garbage_data() {
     ];
 
     for garbage in garbage_codes {
-        let result = manager.import_pair_request(
-            garbage,
-            PairRequestConfig {
-                local_tag: "test-node".to_string(),
-                local_description: "Test Node".to_string(),
-                local_endpoint: "192.168.1.1:36200".to_string(),
-                local_api_port: 36000,
-                bidirectional: false,
-                tunnel_type: TunnelType::WireGuard,
-            },
-        ).await;
+        let result = manager
+            .import_pair_request(
+                garbage,
+                PairRequestConfig {
+                    local_tag: "test-node".to_string(),
+                    local_description: "Test Node".to_string(),
+                    local_endpoint: "192.168.1.1:36200".to_string(),
+                    local_api_port: 36000,
+                    bidirectional: false,
+                    tunnel_type: TunnelType::WireGuard,
+                },
+            )
+            .await;
 
         assert!(result.is_err(), "Should reject garbage input: {}", garbage);
     }

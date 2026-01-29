@@ -129,7 +129,11 @@ impl SmoltcpBridge {
         let config = IfaceConfig::new(HardwareAddress::Ip);
 
         // Create the interface
-        let mut iface = Interface::new(config, &mut WgTunnelDevice::new(queue.clone(), mtu), SmoltcpInstant::from_millis(0));
+        let mut iface = Interface::new(
+            config,
+            &mut WgTunnelDevice::new(queue.clone(), mtu),
+            SmoltcpInstant::from_millis(0),
+        );
 
         // Configure the local IP address using smoltcp's Ipv4Address
         let smoltcp_ip = Ipv4Address::new(
@@ -146,10 +150,7 @@ impl SmoltcpBridge {
         // Create socket storage using Vec (requires alloc feature)
         let sockets = SocketSet::new(Vec::new());
 
-        debug!(
-            "SmoltcpBridge created: local_ip={}, mtu={}",
-            local_ip, mtu
-        );
+        debug!("SmoltcpBridge created: local_ip={}, mtu={}", local_ip, mtu);
 
         Self {
             iface,
@@ -197,7 +198,10 @@ impl SmoltcpBridge {
     ///
     /// `true` if the packet was queued, `false` if the queue is full
     pub fn feed_rx_packet(&self, packet: Vec<u8>) -> bool {
-        debug!("SmoltcpBridge: feeding {} byte packet to RX queue", packet.len());
+        debug!(
+            "SmoltcpBridge: feeding {} byte packet to RX queue",
+            packet.len()
+        );
         let result = self.queue.push_rx(packet);
         if result {
             debug!("SmoltcpBridge: packet queued for smoltcp processing");
@@ -258,10 +262,15 @@ impl SmoltcpBridge {
         let timestamp = Self::current_timestamp();
         // Log RX queue status before poll
         let rx_count_before = self.queue.rx_queue_len();
-        let result = self.iface.poll(timestamp, &mut self.device, &mut self.sockets);
+        let result = self
+            .iface
+            .poll(timestamp, &mut self.device, &mut self.sockets);
 
         if result {
-            debug!("smoltcp poll: work done (had {} RX packets)", rx_count_before);
+            debug!(
+                "smoltcp poll: work done (had {} RX packets)",
+                rx_count_before
+            );
         }
 
         result
@@ -280,9 +289,9 @@ impl SmoltcpBridge {
     #[must_use]
     pub fn poll_delay(&mut self) -> Option<Duration> {
         let timestamp = Self::current_timestamp();
-        self.iface.poll_delay(timestamp, &self.sockets).map(|d| {
-            Duration::from_micros(d.total_micros())
-        })
+        self.iface
+            .poll_delay(timestamp, &self.sockets)
+            .map(|d| Duration::from_micros(d.total_micros()))
     }
 
     /// Create a new TCP socket and return its handle
@@ -671,7 +680,10 @@ impl SmoltcpBridge {
     /// # Errors
     ///
     /// Returns an error if no data is available or the socket is not bound
-    pub fn udp_recv(&mut self, handle: SocketHandle) -> Result<(Vec<u8>, IpEndpoint), UdpRecvError> {
+    pub fn udp_recv(
+        &mut self,
+        handle: SocketHandle,
+    ) -> Result<(Vec<u8>, IpEndpoint), UdpRecvError> {
         let socket = self.sockets.get_mut::<UdpSocket>(handle);
         let (data, metadata) = socket.recv()?;
         let data_vec: Vec<u8> = data.to_vec();
@@ -1029,13 +1041,17 @@ mod tests {
             if i % 2 == 0 {
                 assert!(bridge.create_tcp_socket(1024, 1024).is_some());
             } else {
-                assert!(bridge.create_udp_socket_with_buffer(1024, 1024, 8).is_some());
+                assert!(bridge
+                    .create_udp_socket_with_buffer(1024, 1024, 8)
+                    .is_some());
             }
         }
 
         // Next should fail (either type)
         assert!(bridge.create_tcp_socket(1024, 1024).is_none());
-        assert!(bridge.create_udp_socket_with_buffer(1024, 1024, 8).is_none());
+        assert!(bridge
+            .create_udp_socket_with_buffer(1024, 1024, 8)
+            .is_none());
     }
 
     #[test]

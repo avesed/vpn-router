@@ -336,7 +336,9 @@ impl VlessWgBridge {
 
         info!(
             "VlessWgBridge created: wg_tag={}, local_ip={}, registry={}",
-            wg_tag, local_ip, reply_registry.is_some()
+            wg_tag,
+            local_ip,
+            reply_registry.is_some()
         );
 
         Self {
@@ -1307,7 +1309,9 @@ impl VlessWgBridge {
         let (addr, addr_end) = match addr_type {
             address_type::IPV4 => {
                 if frame.len() < 1 + 4 + 2 {
-                    return Err(BridgeError::SmoltcpUdp("XUDP frame too short for IPv4".into()));
+                    return Err(BridgeError::SmoltcpUdp(
+                        "XUDP frame too short for IPv4".into(),
+                    ));
                 }
                 let ip = IpAddr::V4(std::net::Ipv4Addr::new(
                     frame[1], frame[2], frame[3], frame[4],
@@ -1316,7 +1320,9 @@ impl VlessWgBridge {
             }
             address_type::DOMAIN => {
                 if frame.len() < 2 {
-                    return Err(BridgeError::SmoltcpUdp("XUDP frame too short for domain".into()));
+                    return Err(BridgeError::SmoltcpUdp(
+                        "XUDP frame too short for domain".into(),
+                    ));
                 }
                 let domain_len = frame[1] as usize;
                 let domain_end = 2 + domain_len;
@@ -1330,12 +1336,15 @@ impl VlessWgBridge {
                 // For now, log a warning and skip (or could implement async DNS)
                 warn!("XUDP domain addressing not fully supported: {}", domain);
                 return Err(BridgeError::SmoltcpUdp(format!(
-                    "XUDP domain {} requires DNS resolution (not implemented)", domain
+                    "XUDP domain {} requires DNS resolution (not implemented)",
+                    domain
                 )));
             }
             address_type::IPV6 => {
                 if frame.len() < 1 + 16 + 2 {
-                    return Err(BridgeError::SmoltcpUdp("XUDP frame too short for IPv6".into()));
+                    return Err(BridgeError::SmoltcpUdp(
+                        "XUDP frame too short for IPv6".into(),
+                    ));
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&frame[1..17]);
@@ -1344,7 +1353,8 @@ impl VlessWgBridge {
             }
             _ => {
                 return Err(BridgeError::SmoltcpUdp(format!(
-                    "invalid XUDP address type: 0x{:02x}", addr_type
+                    "invalid XUDP address type: 0x{:02x}",
+                    addr_type
                 )));
             }
         };
@@ -1622,9 +1632,9 @@ impl VlessWgBridge {
         // Send through smoltcp UDP socket
         let smoltcp_dest = match dest_ip {
             IpAddr::V4(v4) => smoltcp::wire::IpEndpoint {
-                addr: smoltcp::wire::IpAddress::Ipv4(
-                    smoltcp::wire::Ipv4Address::from_bytes(&v4.octets()),
-                ),
+                addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(
+                    &v4.octets(),
+                )),
                 port: dest_port,
             },
             IpAddr::V6(_) => {

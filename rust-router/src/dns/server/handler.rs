@@ -397,7 +397,9 @@ impl DnsHandler {
                 }
                 Err(e) => {
                     warn!(qname = %qname, error = %e, "Upstream query failed");
-                    return Ok(self.generate_servfail_response(query, &format!("upstream error: {e}")));
+                    return Ok(
+                        self.generate_servfail_response(query, &format!("upstream error: {e}"))
+                    );
                 }
             }
         }
@@ -608,16 +610,18 @@ impl DnsHandler {
             DnsError::RateLimitExceeded { .. } => ResponseCode::Refused,
             DnsError::Blocked { .. } => ResponseCode::NXDomain,
             DnsError::NoUpstream { .. } => ResponseCode::ServFail,
-            DnsError::TimeoutError { .. } | DnsError::UpstreamError { .. } => ResponseCode::ServFail,
+            DnsError::TimeoutError { .. } | DnsError::UpstreamError { .. } => {
+                ResponseCode::ServFail
+            }
             _ => ResponseCode::ServFail,
         }
     }
 
     /// Serialize a response message to bytes
     fn serialize_response(&self, response: &Message) -> DnsResult<Vec<u8>> {
-        response.to_bytes().map_err(|e| {
-            DnsError::serialize(format!("failed to serialize response: {e}"))
-        })
+        response
+            .to_bytes()
+            .map_err(|e| DnsError::serialize(format!("failed to serialize response: {e}")))
     }
 
     /// Check if a response needs truncation for UDP without EDNS0
@@ -829,9 +833,8 @@ impl DnsHandler {
         query: &Message,
         response_data: &[u8],
     ) -> DnsResult<Message> {
-        let response = Message::from_bytes(response_data).map_err(|e| {
-            DnsError::parse(format!("failed to parse response: {e}"))
-        })?;
+        let response = Message::from_bytes(response_data)
+            .map_err(|e| DnsError::parse(format!("failed to parse response: {e}")))?;
 
         if !self.validate_response(query, &response) {
             return Err(DnsError::parse("response validation failed"));

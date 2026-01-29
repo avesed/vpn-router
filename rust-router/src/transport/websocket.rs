@@ -42,8 +42,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
-use futures::stream::Stream;
 use futures::sink::Sink;
+use futures::stream::Stream;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -143,9 +143,7 @@ impl WebSocketTransport {
     }
 
     /// Create TLS client configuration
-    fn create_tls_config(
-        tls_config: &TlsConfig,
-    ) -> Result<rustls::ClientConfig, TransportError> {
+    fn create_tls_config(tls_config: &TlsConfig) -> Result<rustls::ClientConfig, TransportError> {
         use rustls::client::danger::{
             HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
         };
@@ -218,8 +216,11 @@ impl WebSocketTransport {
 
         // Set ALPN protocols if specified
         let config = if !tls_config.alpn.is_empty() {
-            let alpn_protocols: Vec<Vec<u8>> =
-                tls_config.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let alpn_protocols: Vec<Vec<u8>> = tls_config
+                .alpn
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect();
 
             let mut config = config;
             config.alpn_protocols = alpn_protocols;
@@ -233,10 +234,9 @@ impl WebSocketTransport {
 
     /// Build WebSocket request with custom headers
     fn build_request(config: &TransportConfig) -> Result<Request<()>, TransportError> {
-        let ws_config = config
-            .websocket
-            .as_ref()
-            .ok_or_else(|| TransportError::websocket_protocol("WebSocket configuration required"))?;
+        let ws_config = config.websocket.as_ref().ok_or_else(|| {
+            TransportError::websocket_protocol("WebSocket configuration required")
+        })?;
 
         // Determine scheme
         let scheme = if config.tls.is_some() { "wss" } else { "ws" };
@@ -423,10 +423,7 @@ impl Transport for WebSocketTransport {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            TransportError::connection_failed(
-                config.address_string(),
-                "no addresses to connect to",
-            )
+            TransportError::connection_failed(config.address_string(), "no addresses to connect to")
         }))
     }
 }
@@ -678,8 +675,8 @@ mod tests {
 
     #[test]
     fn test_build_request_plain() {
-        let config = TransportConfig::tcp("example.com", 80)
-            .with_websocket(WebSocketConfig::new("/ws"));
+        let config =
+            TransportConfig::tcp("example.com", 80).with_websocket(WebSocketConfig::new("/ws"));
 
         let request = WebSocketTransport::build_request(&config).unwrap();
         let uri = request.uri().to_string();

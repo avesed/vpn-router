@@ -85,13 +85,21 @@ pub use websocket::WebSocketTransport;
 
 #[cfg(feature = "transport-quic")]
 pub use quic::{
-    // Client types
-    QuicClientConfig, QuicEndpointPool, QuicStream,
-    // Server types
-    QuicServerConfig, QuicInboundListener, QuicConnection, QuicConnectionGuard,
-    QuicInboundStats, QuicInboundStatsSnapshot,
     // Helper functions
-    build_server_config, load_certs_from_pem, load_key_from_pem,
+    build_server_config,
+    load_certs_from_pem,
+    load_key_from_pem,
+    // Client types
+    QuicClientConfig,
+    QuicConnection,
+    QuicConnectionGuard,
+    QuicEndpointPool,
+    QuicInboundListener,
+    QuicInboundStats,
+    QuicInboundStatsSnapshot,
+    // Server types
+    QuicServerConfig,
+    QuicStream,
 };
 
 use std::io;
@@ -730,7 +738,8 @@ mod tests {
 
     #[test]
     fn test_transport_config_with_tls() {
-        let config = TransportConfig::tcp("example.com", 443).with_tls(TlsConfig::new("example.com"));
+        let config =
+            TransportConfig::tcp("example.com", 443).with_tls(TlsConfig::new("example.com"));
         assert!(config.is_tls());
         assert!(!config.is_websocket());
         assert_eq!(config.tls.as_ref().unwrap().server_name, "example.com");
@@ -738,7 +747,8 @@ mod tests {
 
     #[test]
     fn test_transport_config_with_websocket() {
-        let config = TransportConfig::tcp("example.com", 80).with_websocket(WebSocketConfig::new("/ws"));
+        let config =
+            TransportConfig::tcp("example.com", 80).with_websocket(WebSocketConfig::new("/ws"));
         assert!(!config.is_tls());
         assert!(config.is_websocket());
         assert_eq!(config.websocket.as_ref().unwrap().path, "/ws");
@@ -793,6 +803,9 @@ mod tests {
         assert_eq!(config.path, "/ws");
         assert_eq!(config.host, Some("cdn.example.com".to_string()));
         assert_eq!(config.headers.len(), 3);
-        assert_eq!(config.headers[0], ("X-Auth".to_string(), "token".to_string()));
+        assert_eq!(
+            config.headers[0],
+            ("X-Auth".to_string(), "token".to_string())
+        );
     }
 }

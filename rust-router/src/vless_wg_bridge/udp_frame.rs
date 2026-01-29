@@ -125,9 +125,7 @@ impl UdpFrameAddress {
                     return Err(BridgeError::SmoltcpUdp("empty domain".into()));
                 }
                 if len > MAX_DOMAIN_LEN {
-                    return Err(BridgeError::SmoltcpUdp(format!(
-                        "domain too long: {len}"
-                    )));
+                    return Err(BridgeError::SmoltcpUdp(format!("domain too long: {len}")));
                 }
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf).await?;
@@ -566,11 +564,8 @@ mod tests {
 
     #[test]
     fn test_frame_encoded_len() {
-        let frame = VlessUdpFrame::new(
-            UdpFrameAddress::Ipv4(Ipv4Addr::LOCALHOST),
-            53,
-            vec![0; 100],
-        );
+        let frame =
+            VlessUdpFrame::new(UdpFrameAddress::Ipv4(Ipv4Addr::LOCALHOST), 53, vec![0; 100]);
         // 2 (len) + 2 (port) + 1 (type) + 4 (ipv4) + 100 (payload) = 109
         assert_eq!(frame.encoded_len(), 109);
     }
@@ -683,11 +678,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_frame_write_to() {
-        let frame = VlessUdpFrame::new(
-            UdpFrameAddress::Ipv4(Ipv4Addr::LOCALHOST),
-            8080,
-            vec![0xFF],
-        );
+        let frame =
+            VlessUdpFrame::new(UdpFrameAddress::Ipv4(Ipv4Addr::LOCALHOST), 8080, vec![0xFF]);
 
         let mut buf = Vec::new();
         frame.write_to(&mut buf).await.unwrap();

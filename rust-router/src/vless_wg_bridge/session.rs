@@ -500,7 +500,11 @@ impl SessionTracker {
         }
 
         // Create session
-        let session = Arc::new(TcpSession::new(vless_conn_id.clone(), socket_handle, key.clone()));
+        let session = Arc::new(TcpSession::new(
+            vless_conn_id.clone(),
+            socket_handle,
+            key.clone(),
+        ));
 
         // Insert into all indices
         self.tcp_sessions.insert(key.clone(), Arc::clone(&session));
@@ -528,9 +532,11 @@ impl SessionTracker {
     /// Look up a TCP session by socket handle
     #[must_use]
     pub fn lookup_tcp_by_socket(&self, handle: SocketHandle) -> Option<Arc<TcpSession>> {
-        self.socket_to_session
-            .get(&handle)
-            .and_then(|key| self.tcp_sessions.get(key.value()).map(|r| Arc::clone(r.value())))
+        self.socket_to_session.get(&handle).and_then(|key| {
+            self.tcp_sessions
+                .get(key.value())
+                .map(|r| Arc::clone(r.value()))
+        })
     }
 
     /// Remove a TCP session
@@ -590,7 +596,11 @@ impl SessionTracker {
         }
 
         // Create session
-        let session = Arc::new(UdpSession::new(vless_conn_id.clone(), socket_handle, key.clone()));
+        let session = Arc::new(UdpSession::new(
+            vless_conn_id.clone(),
+            socket_handle,
+            key.clone(),
+        ));
 
         // Insert into all indices
         self.udp_sessions.insert(key.clone(), Arc::clone(&session));
@@ -618,9 +628,11 @@ impl SessionTracker {
     /// Look up a UDP session by socket handle
     #[must_use]
     pub fn lookup_udp_by_socket(&self, handle: SocketHandle) -> Option<Arc<UdpSession>> {
-        self.socket_to_session
-            .get(&handle)
-            .and_then(|key| self.udp_sessions.get(key.value()).map(|r| Arc::clone(r.value())))
+        self.socket_to_session.get(&handle).and_then(|key| {
+            self.udp_sessions
+                .get(key.value())
+                .map(|r| Arc::clone(r.value()))
+        })
     }
 
     /// Remove a UDP session
@@ -648,7 +660,9 @@ impl SessionTracker {
     /// Look up session key by socket handle
     #[must_use]
     pub fn lookup_by_socket(&self, handle: SocketHandle) -> Option<SessionKey> {
-        self.socket_to_session.get(&handle).map(|r| r.value().clone())
+        self.socket_to_session
+            .get(&handle)
+            .map(|r| r.value().clone())
     }
 
     // -------------------------------------------------------------------------
@@ -827,15 +841,9 @@ mod tests {
             80,
         );
 
-        assert_eq!(
-            key.local_ip,
-            IpAddr::V4(Ipv4Addr::new(10, 200, 200, 2))
-        );
+        assert_eq!(key.local_ip, IpAddr::V4(Ipv4Addr::new(10, 200, 200, 2)));
         assert_eq!(key.local_port, 50000);
-        assert_eq!(
-            key.remote_ip,
-            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
-        );
+        assert_eq!(key.remote_ip, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(key.remote_port, 80);
 
         let display = format!("{}", key);
@@ -979,7 +987,9 @@ mod tests {
             80,
         );
 
-        tracker.register_tcp(conn_id.clone(), handle, key.clone()).unwrap();
+        tracker
+            .register_tcp(conn_id.clone(), handle, key.clone())
+            .unwrap();
         assert_eq!(tracker.tcp_session_count(), 1);
 
         // Remove session
@@ -1084,7 +1094,9 @@ mod tests {
         );
 
         // First registration should succeed
-        tracker.register_tcp(conn_id.clone(), handle1, key.clone()).unwrap();
+        tracker
+            .register_tcp(conn_id.clone(), handle1, key.clone())
+            .unwrap();
 
         // Second registration with same key should fail
         let result = tracker.register_tcp(conn_id, handle2, key);

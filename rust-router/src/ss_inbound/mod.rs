@@ -183,9 +183,8 @@ mod tests {
     #[tokio::test]
     async fn test_full_flow() {
         // Create config with legacy AEAD (accepts plaintext password)
-        let config =
-            ShadowsocksInboundConfig::new("127.0.0.1:0".parse().unwrap(), "test-password")
-                .with_method(ShadowsocksMethod::Aes256Gcm);
+        let config = ShadowsocksInboundConfig::new("127.0.0.1:0".parse().unwrap(), "test-password")
+            .with_method(ShadowsocksMethod::Aes256Gcm);
 
         // Validate config
         assert!(config.validate().is_ok());

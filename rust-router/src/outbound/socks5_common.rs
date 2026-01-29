@@ -198,9 +198,15 @@ mod tests {
             reply_message(REPLY_NOT_ALLOWED),
             "connection not allowed by ruleset"
         );
-        assert_eq!(reply_message(REPLY_NETWORK_UNREACHABLE), "network unreachable");
+        assert_eq!(
+            reply_message(REPLY_NETWORK_UNREACHABLE),
+            "network unreachable"
+        );
         assert_eq!(reply_message(REPLY_HOST_UNREACHABLE), "host unreachable");
-        assert_eq!(reply_message(REPLY_CONNECTION_REFUSED), "connection refused");
+        assert_eq!(
+            reply_message(REPLY_CONNECTION_REFUSED),
+            "connection refused"
+        );
         assert_eq!(reply_message(REPLY_TTL_EXPIRED), "TTL expired");
         assert_eq!(
             reply_message(REPLY_COMMAND_NOT_SUPPORTED),

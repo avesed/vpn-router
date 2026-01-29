@@ -214,7 +214,10 @@ impl SocketProvider for MockSocketProvider {
 
     fn create_reply_socket(&self, bind_addr: SocketAddr) -> Result<Socket, UdpError> {
         if self.simulate_permission_denied {
-            return Err(UdpError::reply_socket(bind_addr, "Permission denied (mock)"));
+            return Err(UdpError::reply_socket(
+                bind_addr,
+                "Permission denied (mock)",
+            ));
         }
 
         // Create a regular UDP socket bound to 127.0.0.1:0 for testing
@@ -228,9 +231,9 @@ impl SocketProvider for MockSocketProvider {
 
         // For mock, bind to localhost with port 0 instead of the non-local address
         let mock_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        socket.bind(&mock_bind.into()).map_err(|e| {
-            UdpError::reply_socket(bind_addr, format!("Failed to bind: {e}"))
-        })?;
+        socket
+            .bind(&mock_bind.into())
+            .map_err(|e| UdpError::reply_socket(bind_addr, format!("Failed to bind: {e}")))?;
 
         socket.set_nonblocking(true).map_err(|e| {
             UdpError::reply_socket(bind_addr, format!("Failed to set non-blocking: {e}"))
@@ -340,7 +343,10 @@ fn set_ip_transparent(socket: &Socket) -> Result<(), TproxyError> {
         if err.raw_os_error() == Some(libc::EPERM) {
             return Err(TproxyError::PermissionDenied);
         }
-        return Err(TproxyError::socket_option("IP_TRANSPARENT", err.to_string()));
+        return Err(TproxyError::socket_option(
+            "IP_TRANSPARENT",
+            err.to_string(),
+        ));
     }
 
     Ok(())

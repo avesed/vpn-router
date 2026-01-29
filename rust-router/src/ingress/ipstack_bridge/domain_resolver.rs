@@ -187,7 +187,7 @@ pub fn is_tls_port(port: u16) -> bool {
         | 465   // SMTPS (submission)
         | 636   // LDAPS
         | 5223  // Apple Push Notification Service
-        | 5228  // Google Cloud Messaging
+        | 5228 // Google Cloud Messaging
     )
 }
 
@@ -285,10 +285,7 @@ pub fn resolve_domain(
 /// This is useful when SNI sniffing is not enabled or when
 /// only FakeDNS resolution is desired.
 #[cfg(feature = "fakedns")]
-pub fn resolve_domain_fakedns_only(
-    dst_ip: IpAddr,
-    fakedns: &FakeDnsManager,
-) -> DomainResolution {
+pub fn resolve_domain_fakedns_only(dst_ip: IpAddr, fakedns: &FakeDnsManager) -> DomainResolution {
     if fakedns.is_fake_ip(dst_ip) {
         if let Some(domain) = fakedns.map_ip_domain(dst_ip) {
             return DomainResolution::from_fakedns(domain);
@@ -410,42 +407,29 @@ mod tests {
         // This is a minimal valid ClientHello structure
         let client_hello = [
             // Content type: Handshake (0x16)
-            0x16,
-            // TLS version: 1.0 (for compatibility)
-            0x03, 0x01,
-            // Length of handshake message
-            0x00, 0x5c,
-            // Handshake type: ClientHello (0x01)
-            0x01,
-            // Length of ClientHello
-            0x00, 0x00, 0x58,
-            // Client version: TLS 1.2
-            0x03, 0x03,
-            // Random (32 bytes)
+            0x16, // TLS version: 1.0 (for compatibility)
+            0x03, 0x01, // Length of handshake message
+            0x00, 0x5c, // Handshake type: ClientHello (0x01)
+            0x01, // Length of ClientHello
+            0x00, 0x00, 0x58, // Client version: TLS 1.2
+            0x03, 0x03, // Random (32 bytes)
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            // Session ID length: 0
-            0x00,
-            // Cipher suites length: 2
-            0x00, 0x02,
-            // Cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA
-            0x00, 0x2f,
-            // Compression methods length: 1
-            0x01,
-            // Compression method: null
-            0x00,
-            // Extensions length
-            0x00, 0x17,
-            // Extension: SNI
+            0x00, 0x00, 0x00, 0x00, // Session ID length: 0
+            0x00, // Cipher suites length: 2
+            0x00, 0x02, // Cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA
+            0x00, 0x2f, // Compression methods length: 1
+            0x01, // Compression method: null
+            0x00, // Extensions length
+            0x00, 0x17, // Extension: SNI
             0x00, 0x00, // Extension type: server_name
             0x00, 0x13, // Extension length
             0x00, 0x11, // Server name list length
-            0x00,       // Name type: host_name
+            0x00, // Name type: host_name
             0x00, 0x0e, // Host name length: 14
             // "www.example.com" (truncated to fit)
-            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
-            0x00, 0x00, 0x00, // Padding
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x00, 0x00,
+            0x00, // Padding
         ];
 
         let ip: IpAddr = "93.184.216.34".parse().unwrap();
@@ -498,12 +482,8 @@ mod tests {
         let http_request = b"GET / HTTP/1.1\r\nHost: wrong-domain.com\r\n\r\n";
 
         // FakeDNS should take priority
-        let resolution = resolve_domain(
-            IpAddr::V4(fake_ip),
-            80,
-            Some(http_request),
-            Some(&fakedns),
-        );
+        let resolution =
+            resolve_domain(IpAddr::V4(fake_ip), 80, Some(http_request), Some(&fakedns));
         assert!(resolution.is_resolved());
         assert_eq!(resolution.as_domain(), Some("correct-domain.com"));
         assert_eq!(resolution.source, DomainSource::FakeDns);

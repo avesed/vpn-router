@@ -429,8 +429,14 @@ impl SsUdpRelayInbound {
 
         let removed = before - sessions.len();
         if removed > 0 {
-            debug!(removed = removed, remaining = sessions.len(), "Cleaned up expired UDP sessions");
-            self.stats.sessions_expired.fetch_add(removed as u64, Ordering::Relaxed);
+            debug!(
+                removed = removed,
+                remaining = sessions.len(),
+                "Cleaned up expired UDP sessions"
+            );
+            self.stats
+                .sessions_expired
+                .fetch_add(removed as u64, Ordering::Relaxed);
         }
         removed
     }
@@ -778,9 +784,10 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
 
         let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-        let dest = ShadowsocksDestination::from_socket_addr(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-        );
+        let dest = ShadowsocksDestination::from_socket_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+        ));
 
         // Can't create a real UdpSocket in sync test, so we'll just test the session logic
         // using a mock approach

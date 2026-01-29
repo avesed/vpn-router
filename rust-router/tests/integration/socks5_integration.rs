@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use rust_router::outbound::{Outbound, Socks5Config, Socks5Outbound, HealthStatus};
+use rust_router::outbound::{HealthStatus, Outbound, Socks5Config, Socks5Outbound};
 
 // ============================================================================
 // SOCKS5 Protocol Constants
@@ -120,7 +120,11 @@ async fn run_mock_socks5_server(
 
     if config.require_auth {
         // Reply with password auth required
-        if socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_PASSWORD]).await.is_err() {
+        if socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_PASSWORD])
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -163,7 +167,11 @@ async fn run_mock_socks5_server(
         }
     } else {
         // Reply with no auth
-        if socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await.is_err() {
+        if socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -197,8 +205,12 @@ async fn run_mock_socks5_server(
         config.reply_code,
         0x00,
         ATYP_IPV4,
-        127, 0, 0, 1, // Bound address
-        0, 0,         // Bound port
+        127,
+        0,
+        0,
+        1, // Bound address
+        0,
+        0, // Bound port
     ];
     let _ = socket.write_all(&reply).await;
 }
@@ -239,8 +251,12 @@ async fn run_multi_connection_server(
                 config.reply_code,
                 0x00,
                 ATYP_IPV4,
-                127, 0, 0, 1,
-                0, 0,
+                127,
+                0,
+                0,
+                1,
+                0,
+                0,
             ];
             let _ = socket.write_all(&reply).await;
         });
@@ -272,7 +288,14 @@ async fn test_socks5_connect_no_auth() {
     let dest: SocketAddr = "93.184.216.34:80".parse().unwrap();
     let result = outbound.connect(dest, Duration::from_secs(5)).await;
 
-    assert!(result.is_ok(), "Connection should succeed: {}", result.as_ref().err().map_or("".to_string(), |e| e.to_string()));
+    assert!(
+        result.is_ok(),
+        "Connection should succeed: {}",
+        result
+            .as_ref()
+            .err()
+            .map_or("".to_string(), |e| e.to_string())
+    );
     let conn = result.unwrap();
     assert_eq!(conn.remote_addr(), dest);
 
@@ -341,7 +364,10 @@ async fn test_socks5_auth_failure() {
     let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
     let result = outbound.connect(dest, Duration::from_secs(5)).await;
 
-    assert!(result.is_err(), "Connection should fail with wrong credentials");
+    assert!(
+        result.is_err(),
+        "Connection should fail with wrong credentials"
+    );
     let _ = server_task.await;
 }
 
@@ -380,8 +406,12 @@ async fn test_socks5_ipv6_destination() {
                 REPLY_SUCCEEDED,
                 0x00,
                 ATYP_IPV4,
-                127, 0, 0, 1,
-                0, 0,
+                127,
+                0,
+                0,
+                1,
+                0,
+                0,
             ];
             let _ = socket.write_all(&reply).await;
         }
@@ -427,8 +457,7 @@ async fn test_pool_stats_after_connection() {
         }
     });
 
-    let config = Socks5Config::new("test-pool-stats", server_addr)
-        .with_pool_size(4);
+    let config = Socks5Config::new("test-pool-stats", server_addr).with_pool_size(4);
 
     let outbound = Socks5Outbound::new(config).await.unwrap();
     let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
@@ -462,8 +491,7 @@ async fn test_pool_concurrent_connections() {
     // Give server time to start
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let config = Socks5Config::new("test-concurrent", server_addr)
-        .with_pool_size(5);
+    let config = Socks5Config::new("test-concurrent", server_addr).with_pool_size(5);
 
     let outbound = Arc::new(Socks5Outbound::new(config).await.unwrap());
     let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
@@ -472,16 +500,21 @@ async fn test_pool_concurrent_connections() {
     let mut handles = vec![];
     for _ in 0..3 {
         let ob = Arc::clone(&outbound);
-        let handle = tokio::spawn(async move {
-            ob.connect(dest, Duration::from_secs(5)).await
-        });
+        let handle = tokio::spawn(async move { ob.connect(dest, Duration::from_secs(5)).await });
         handles.push(handle);
     }
 
     // Wait for all connections
     for handle in handles {
         let result = handle.await.unwrap();
-        assert!(result.is_ok(), "Concurrent connection should succeed: {}", result.as_ref().err().map_or("".to_string(), |e| e.to_string()));
+        assert!(
+            result.is_ok(),
+            "Concurrent connection should succeed: {}",
+            result
+                .as_ref()
+                .err()
+                .map_or("".to_string(), |e| e.to_string())
+        );
     }
 
     let _ = server_task.await;
@@ -681,7 +714,10 @@ async fn test_socks5_server_closes_immediately() {
     let dest: SocketAddr = "1.2.3.4:80".parse().unwrap();
     let result = outbound.connect(dest, Duration::from_secs(5)).await;
 
-    assert!(result.is_err(), "Should fail when server closes immediately");
+    assert!(
+        result.is_err(),
+        "Should fail when server closes immediately"
+    );
 
     let _ = server_task.await;
 }

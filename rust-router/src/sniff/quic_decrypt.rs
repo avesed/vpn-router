@@ -523,7 +523,8 @@ fn decrypt_payload(
         nonce[IV_SIZE - 4 + i] ^= pn_bytes[i];
     }
 
-    let cipher = Aes128Gcm::new_from_slice(&keys.key).map_err(|_| DecryptError::DecryptionFailed)?;
+    let cipher =
+        Aes128Gcm::new_from_slice(&keys.key).map_err(|_| DecryptError::DecryptionFailed)?;
 
     let nonce = Nonce::from_slice(&nonce);
 
@@ -644,7 +645,11 @@ fn extract_crypto_data(payload: &[u8]) -> Result<Vec<u8>, DecryptError> {
 
             // Unknown frame type - we can't reliably skip it
             _ => {
-                trace!("Unknown frame type 0x{:02x} at position {}", frame_type, pos);
+                trace!(
+                    "Unknown frame type 0x{:02x} at position {}",
+                    frame_type,
+                    pos
+                );
                 break;
             }
         }
@@ -924,10 +929,7 @@ pub fn sniff_quic_with_decrypt(data: &[u8]) -> QuicSniffResult {
     // Try decryption first
     match decrypt_quic_initial(data) {
         Ok(result) => {
-            debug!(
-                "QUIC decryption successful, SNI: {:?}",
-                result.server_name
-            );
+            debug!("QUIC decryption successful, SNI: {:?}", result.server_name);
             result
         }
         Err(e) => {
@@ -1031,7 +1033,10 @@ mod tests {
         assert_eq!(parse_varint(&[0x7b, 0xbd]), Some((15293, 2)));
 
         // 4-byte encoding
-        assert_eq!(parse_varint(&[0x9d, 0x7f, 0x3e, 0x7d]), Some((494_878_333, 4)));
+        assert_eq!(
+            parse_varint(&[0x9d, 0x7f, 0x3e, 0x7d]),
+            Some((494_878_333, 4))
+        );
 
         // Empty
         assert_eq!(parse_varint(&[]), None);
@@ -1125,7 +1130,7 @@ mod tests {
         let mut data = vec![
             (list_len >> 8) as u8,
             list_len as u8, // List length
-            0x00, // Name type (host_name)
+            0x00,           // Name type (host_name)
             (name_len >> 8) as u8,
             name_len as u8, // Name length
         ];
@@ -1153,7 +1158,10 @@ mod tests {
     fn test_decrypt_error_display() {
         assert_eq!(DecryptError::PacketTooShort.to_string(), "packet too short");
         assert_eq!(DecryptError::NotQuic.to_string(), "not a QUIC packet");
-        assert_eq!(DecryptError::NotInitial.to_string(), "not an Initial packet");
+        assert_eq!(
+            DecryptError::NotInitial.to_string(),
+            "not an Initial packet"
+        );
         assert_eq!(
             DecryptError::UnsupportedVersion(0x12345678).to_string(),
             "unsupported QUIC version: 0x12345678"
@@ -1168,16 +1176,11 @@ mod tests {
         // The packet length field indicates 0x49e = 1182 bytes
         let mut packet = vec![
             // Long header: Initial, QUIC v1
-            0xc0, 0x00, 0x00, 0x00, 0x01,
-            // DCID length = 8
-            0x08,
-            // DCID (RFC 9001 Appendix A test vector)
-            0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08,
-            // SCID length = 0
-            0x00,
-            // Token length = 0
-            0x00,
-            // Packet Length (varint) - 2 byte encoding 0x4000 + 0x49e = 0x449e
+            0xc0, 0x00, 0x00, 0x00, 0x01, // DCID length = 8
+            0x08, // DCID (RFC 9001 Appendix A test vector)
+            0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08, // SCID length = 0
+            0x00, // Token length = 0
+            0x00, // Packet Length (varint) - 2 byte encoding 0x4000 + 0x49e = 0x449e
             0x44, 0x9e,
         ];
         // Pad with zeros to match payload_length (0x49e = 1182 bytes)
@@ -1243,14 +1246,8 @@ mod tests {
         // client iv: fa044b2f42a3fd3b46fb255c
         // client hp: 9f50449e04a0e810283a1e9933adedd2
 
-        assert_eq!(
-            hex::encode(keys.key),
-            "1f369613dd76d5467730efcbe3b1a22d"
-        );
+        assert_eq!(hex::encode(keys.key), "1f369613dd76d5467730efcbe3b1a22d");
         assert_eq!(hex::encode(keys.iv), "fa044b2f42a3fd3b46fb255c");
-        assert_eq!(
-            hex::encode(keys.hp),
-            "9f50449e04a0e810283a1e9933adedd2"
-        );
+        assert_eq!(hex::encode(keys.hp), "9f50449e04a0e810283a1e9933adedd2");
     }
 }

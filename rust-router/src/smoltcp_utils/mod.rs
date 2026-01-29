@@ -19,13 +19,13 @@
 //! │  │ - Limits        │    │ - TIME_WAIT      │    │ - RAII cleanup      │    │
 //! │  └─────────────────┘    └──────────────────┘    └─────────────────────┘    │
 //! │                                                                              │
-//! │  ┌─────────────────┐    ┌──────────────────┐                                │
-//! │  │     error       │    │     session      │                                │
-//! │  │                 │    │                  │                                │
-//! │  │ - BridgeError   │    │ - SessionKey     │                                │
-//! │  │ - Result type   │    │ - SessionStats   │                                │
-//! │  │ - Error helpers │    │ - SessionTracker │                                │
-//! │  └─────────────────┘    └──────────────────┘                                │
+//! │  ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐    │
+//! │  │     error       │    │     session      │    │     conn_id         │    │
+//! │  │                 │    │                  │    │                     │    │
+//! │  │ - BridgeError   │    │ - SessionKey     │    │ - ConnId            │    │
+//! │  │ - Result type   │    │ - SessionStats   │    │ - ConnIdAllocator   │    │
+//! │  │ - Error helpers │    │ - SessionTracker │    │ - Shard encoding    │    │
+//! │  └─────────────────┘    └──────────────────┘    └─────────────────────┘    │
 //! │                                                                              │
 //! └─────────────────────────────────────────────────────────────────────────────┘
 //! ```
@@ -87,12 +87,14 @@
 //! # Components
 //!
 //! - [`config`]: Configuration constants (buffer sizes, timeouts, limits)
+//! - [`conn_id`]: Connection ID allocator with optional shard encoding
 //! - [`error`]: Error types with transient/permanent classification
 //! - [`port_allocator`]: Ephemeral port allocation with TIME_WAIT tracking
 //! - [`socket_guard`]: RAII guards for TCP/UDP socket cleanup
 //! - [`session`]: Session tracking with bidirectional indices
 
 pub mod config;
+pub mod conn_id;
 pub mod error;
 pub mod port_allocator;
 pub mod session;
@@ -101,11 +103,11 @@ pub mod socket_guard;
 // Re-export commonly used types
 pub use config::{
     ephemeral_port_count, ephemeral_port_range, port_time_wait_duration, tcp_idle_timeout,
-    udp_default_timeout, udp_dns_timeout, MAX_SESSIONS_PER_CLIENT, MAX_SESSIONS_PER_CLIENT_PER_SECOND,
-    MAX_SOCKETS, MAX_TOTAL_SESSIONS, PORT_RANGE_END, PORT_RANGE_START, PORT_TIME_WAIT_SECS,
-    RATE_LIMIT_WINDOW_SECS, TCP_IDLE_TIMEOUT_SECS, TCP_MSS, TCP_RX_BUFFER, TCP_TX_BUFFER,
-    UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS, UDP_PACKET_META, UDP_RX_BUFFER, UDP_TX_BUFFER,
-    WG_MTU, WG_REPLY_CHANNEL_SIZE,
+    udp_default_timeout, udp_dns_timeout, MAX_SESSIONS_PER_CLIENT,
+    MAX_SESSIONS_PER_CLIENT_PER_SECOND, MAX_SOCKETS, MAX_TOTAL_SESSIONS, PORT_RANGE_END,
+    PORT_RANGE_START, PORT_TIME_WAIT_SECS, RATE_LIMIT_WINDOW_SECS, TCP_IDLE_TIMEOUT_SECS, TCP_MSS,
+    TCP_RX_BUFFER, TCP_TX_BUFFER, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS, UDP_PACKET_META,
+    UDP_RX_BUFFER, UDP_TX_BUFFER, WG_MTU, WG_REPLY_CHANNEL_SIZE,
 };
 
 pub use error::{BridgeError, Result};
@@ -119,3 +121,5 @@ pub use session::{
 pub use socket_guard::{
     init_cleanup_channel, run_cleanup_task, SocketCleanupReceiver, TcpSocketGuard, UdpSocketGuard,
 };
+
+pub use conn_id::{ConnId, ConnIdAllocator};

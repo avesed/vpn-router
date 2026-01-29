@@ -172,32 +172,34 @@ impl DnsConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let port = match std::env::var("RUST_ROUTER_DNS_PORT") {
-            Ok(val) => if let Ok(p) = val.parse::<u16>() {
-                if p == 0 {
+            Ok(val) => {
+                if let Ok(p) = val.parse::<u16>() {
+                    if p == 0 {
+                        tracing::warn!(
+                            value = %val,
+                            "RUST_ROUTER_DNS_PORT=0 is invalid, using default {}",
+                            Self::DEFAULT_PORT
+                        );
+                        Self::DEFAULT_PORT
+                    } else if p < 1024 {
+                        tracing::warn!(
+                            port = p,
+                            "RUST_ROUTER_DNS_PORT {} is a privileged port, may require root",
+                            p
+                        );
+                        p
+                    } else {
+                        p
+                    }
+                } else {
                     tracing::warn!(
                         value = %val,
-                        "RUST_ROUTER_DNS_PORT=0 is invalid, using default {}",
+                        "Invalid RUST_ROUTER_DNS_PORT value, using default {}",
                         Self::DEFAULT_PORT
                     );
                     Self::DEFAULT_PORT
-                } else if p < 1024 {
-                    tracing::warn!(
-                        port = p,
-                        "RUST_ROUTER_DNS_PORT {} is a privileged port, may require root",
-                        p
-                    );
-                    p
-                } else {
-                    p
                 }
-            } else {
-                tracing::warn!(
-                    value = %val,
-                    "Invalid RUST_ROUTER_DNS_PORT value, using default {}",
-                    Self::DEFAULT_PORT
-                );
-                Self::DEFAULT_PORT
-            },
+            }
             Err(_) => Self::DEFAULT_PORT,
         };
 
@@ -487,7 +489,11 @@ impl UpstreamConfig {
     /// assert_eq!(upstream.timeout_secs, 5);
     /// ```
     #[must_use]
-    pub fn new(tag: impl Into<String>, address: impl Into<String>, protocol: UpstreamProtocol) -> Self {
+    pub fn new(
+        tag: impl Into<String>,
+        address: impl Into<String>,
+        protocol: UpstreamProtocol,
+    ) -> Self {
         Self {
             tag: tag.into(),
             address: address.into(),
@@ -559,7 +565,10 @@ impl UpstreamConfig {
     /// - `timeout_secs` is zero
     pub fn validate(&self) -> DnsResult<()> {
         if self.tag.is_empty() {
-            return Err(DnsError::config_field("tag cannot be empty", "upstream.tag"));
+            return Err(DnsError::config_field(
+                "tag cannot be empty",
+                "upstream.tag",
+            ));
         }
 
         if self.address.is_empty() {
@@ -1394,8 +1403,11 @@ mod tests {
 
     #[test]
     fn test_dns_config_with_upstream() {
-        let config = DnsConfig::new()
-            .with_upstream(UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp));
+        let config = DnsConfig::new().with_upstream(UpstreamConfig::new(
+            "test",
+            "8.8.8.8:53",
+            UpstreamProtocol::Udp,
+        ));
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].tag, "test");
     }
@@ -1408,23 +1420,37 @@ mod tests {
 
     #[test]
     fn test_dns_config_validation_valid() {
-        let config = DnsConfig::new()
-            .with_upstream(UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp));
+        let config = DnsConfig::new().with_upstream(UpstreamConfig::new(
+            "test",
+            "8.8.8.8:53",
+            UpstreamProtocol::Udp,
+        ));
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn test_dns_config_validation_duplicate_tags() {
         let config = DnsConfig::new()
-            .with_upstream(UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp))
-            .with_upstream(UpstreamConfig::new("test", "1.1.1.1:53", UpstreamProtocol::Udp));
+            .with_upstream(UpstreamConfig::new(
+                "test",
+                "8.8.8.8:53",
+                UpstreamProtocol::Udp,
+            ))
+            .with_upstream(UpstreamConfig::new(
+                "test",
+                "1.1.1.1:53",
+                UpstreamProtocol::Udp,
+            ));
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_dns_config_serialization() {
-        let config = DnsConfig::new()
-            .with_upstream(UpstreamConfig::new("google", "8.8.8.8:53", UpstreamProtocol::Udp));
+        let config = DnsConfig::new().with_upstream(UpstreamConfig::new(
+            "google",
+            "8.8.8.8:53",
+            UpstreamProtocol::Udp,
+        ));
 
         let json = serde_json::to_string(&config).unwrap();
         let parsed: DnsConfig = serde_json::from_str(&json).unwrap();
@@ -1557,7 +1583,11 @@ mod tests {
         std::env::remove_var("RUST_ROUTER_DNS_ENABLED");
 
         let config = DnsConfig::from_env()
-            .with_upstream(UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp))
+            .with_upstream(UpstreamConfig::new(
+                "test",
+                "8.8.8.8:53",
+                UpstreamProtocol::Udp,
+            ))
             .with_cache(CacheConfig::default())
             .with_blocking(BlockingConfig::default());
 
@@ -1585,15 +1615,16 @@ mod tests {
 
     #[test]
     fn test_upstream_config_with_timeout() {
-        let upstream = UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp)
-            .with_timeout(10);
+        let upstream =
+            UpstreamConfig::new("test", "8.8.8.8:53", UpstreamProtocol::Udp).with_timeout(10);
         assert_eq!(upstream.timeout_secs, 10);
     }
 
     #[test]
     fn test_upstream_config_with_bootstrap() {
-        let upstream = UpstreamConfig::new("doh", "https://dns.google/dns-query", UpstreamProtocol::Doh)
-            .with_bootstrap(vec!["8.8.8.8".to_string()]);
+        let upstream =
+            UpstreamConfig::new("doh", "https://dns.google/dns-query", UpstreamProtocol::Doh)
+                .with_bootstrap(vec!["8.8.8.8".to_string()]);
         assert!(upstream.bootstrap.is_some());
         assert_eq!(upstream.bootstrap.as_ref().unwrap().len(), 1);
     }
@@ -1602,9 +1633,13 @@ mod tests {
     fn test_upstream_config_is_encrypted() {
         assert!(!UpstreamConfig::new("t", "1.1.1.1:53", UpstreamProtocol::Udp).is_encrypted());
         assert!(!UpstreamConfig::new("t", "1.1.1.1:53", UpstreamProtocol::Tcp).is_encrypted());
-        assert!(UpstreamConfig::new("t", "https://dns.google", UpstreamProtocol::Doh).is_encrypted());
+        assert!(
+            UpstreamConfig::new("t", "https://dns.google", UpstreamProtocol::Doh).is_encrypted()
+        );
         assert!(UpstreamConfig::new("t", "dns.google:853", UpstreamProtocol::Dot).is_encrypted());
-        assert!(UpstreamConfig::new("t", "dns.adguard.com:784", UpstreamProtocol::Doq).is_encrypted());
+        assert!(
+            UpstreamConfig::new("t", "dns.adguard.com:784", UpstreamProtocol::Doq).is_encrypted()
+        );
     }
 
     #[test]
@@ -1675,20 +1710,16 @@ mod tests {
 
     #[test]
     fn test_cache_config_clamp_ttl() {
-        let cache = CacheConfig::default()
-            .with_min_ttl(60)
-            .with_max_ttl(3600);
+        let cache = CacheConfig::default().with_min_ttl(60).with_max_ttl(3600);
 
-        assert_eq!(cache.clamp_ttl(30), 60);    // Below min
-        assert_eq!(cache.clamp_ttl(300), 300);  // Within range
+        assert_eq!(cache.clamp_ttl(30), 60); // Below min
+        assert_eq!(cache.clamp_ttl(300), 300); // Within range
         assert_eq!(cache.clamp_ttl(7200), 3600); // Above max
     }
 
     #[test]
     fn test_cache_config_validation_invalid_ttl() {
-        let cache = CacheConfig::default()
-            .with_min_ttl(1000)
-            .with_max_ttl(500);
+        let cache = CacheConfig::default().with_min_ttl(1000).with_max_ttl(500);
         assert!(cache.validate().is_err());
     }
 
@@ -1853,9 +1884,7 @@ mod tests {
 
     #[test]
     fn test_rate_limit_config_builder() {
-        let rate_limit = RateLimitConfig::default()
-            .with_qps(50)
-            .with_burst(100);
+        let rate_limit = RateLimitConfig::default().with_qps(50).with_burst(100);
 
         assert_eq!(rate_limit.qps_per_client, 50);
         assert_eq!(rate_limit.burst_size, 100);
@@ -1870,17 +1899,13 @@ mod tests {
 
     #[test]
     fn test_rate_limit_config_validation_burst_less_than_qps() {
-        let rate_limit = RateLimitConfig::default()
-            .with_qps(100)
-            .with_burst(50);
+        let rate_limit = RateLimitConfig::default().with_qps(100).with_burst(50);
         assert!(rate_limit.validate().is_err());
     }
 
     #[test]
     fn test_rate_limit_config_disabled_validation() {
-        let rate_limit = RateLimitConfig::default()
-            .disabled()
-            .with_qps(0);
+        let rate_limit = RateLimitConfig::default().disabled().with_qps(0);
         assert!(rate_limit.validate().is_ok());
     }
 }

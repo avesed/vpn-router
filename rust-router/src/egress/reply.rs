@@ -177,7 +177,9 @@ impl WgReplyHandler {
 
         // Update statistics
         self.stats.packets_handled.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_handled.fetch_add(len as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_handled
+            .fetch_add(len as u64, Ordering::Relaxed);
 
         // Invoke the callback
         (self.reply_callback)(packet, tag);

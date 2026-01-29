@@ -456,7 +456,7 @@ mod tests {
         // Create data with length > MAX_ADDONS_SIZE
         let mut data = vec![0u8; 2000];
         data[0] = 255; // Max single-byte length
-        // This should still fail if we try to say length is > MAX_ADDONS_SIZE
+                       // This should still fail if we try to say length is > MAX_ADDONS_SIZE
 
         // Create with actual oversized length indicator (if we could represent it)
         // For now, test the max single-byte length of 255

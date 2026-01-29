@@ -331,26 +331,13 @@ mod tests {
     fn create_ipv4_packet(dscp: u8) -> Vec<u8> {
         let tos = dscp << 2;
         let mut packet = vec![
-            0x45,
-            tos, // Version=4, IHL=5, TOS
-            0x00,
-            0x14, // Total Length = 20
-            0x00,
-            0x00,
-            0x00,
-            0x00, // ID, Flags, Fragment
-            0x40,
-            0x01, // TTL=64, Protocol=ICMP
-            0x00,
-            0x00, // Checksum (will be calculated)
-            0x0a,
-            0x00,
-            0x00,
-            0x01, // Source IP 10.0.0.1
-            0x0a,
-            0x00,
-            0x00,
-            0x02, // Dest IP 10.0.0.2
+            0x45, tos, // Version=4, IHL=5, TOS
+            0x00, 0x14, // Total Length = 20
+            0x00, 0x00, 0x00, 0x00, // ID, Flags, Fragment
+            0x40, 0x01, // TTL=64, Protocol=ICMP
+            0x00, 0x00, // Checksum (will be calculated)
+            0x0a, 0x00, 0x00, 0x01, // Source IP 10.0.0.1
+            0x0a, 0x00, 0x00, 0x02, // Dest IP 10.0.0.2
         ];
 
         // Calculate initial checksum
@@ -364,48 +351,15 @@ mod tests {
         let byte1 = (tc << 4) & 0xF0; // TC low, Flow Label high
 
         vec![
-            byte0,
-            byte1, // Version, Traffic Class, Flow Label
-            0x00,
-            0x00, // Flow Label continued
-            0x00,
-            0x00, // Payload Length
-            0x3a,
-            0x40, // Next Header=ICMPv6, Hop Limit
+            byte0, byte1, // Version, Traffic Class, Flow Label
+            0x00, 0x00, // Flow Label continued
+            0x00, 0x00, // Payload Length
+            0x3a, 0x40, // Next Header=ICMPv6, Hop Limit
             // Source IPv6 (16 bytes)
-            0x20,
-            0x01,
-            0x0d,
-            0xb8,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x01,
-            // Dest IPv6 (16 bytes)
-            0x20,
-            0x01,
-            0x0d,
-            0xb8,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x02,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01, // Dest IPv6 (16 bytes)
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
         ]
     }
 

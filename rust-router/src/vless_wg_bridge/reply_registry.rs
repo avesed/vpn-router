@@ -110,11 +110,24 @@ impl VlessReplyRegistry {
     ) {
         debug!(
             "Registering VLESS session: tunnel={} {}:{} -> {}:{} (client={})",
-            key.tunnel_tag, key.local_ip, key.local_port, key.remote_ip, key.remote_port, client_addr
+            key.tunnel_tag,
+            key.local_ip,
+            key.local_port,
+            key.remote_ip,
+            key.remote_port,
+            client_addr
         );
 
-        self.sessions.insert(key, RegistryEntry { sender, client_addr });
-        self.stats.registered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sessions.insert(
+            key,
+            RegistryEntry {
+                sender,
+                client_addr,
+            },
+        );
+        self.stats
+            .registered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Unregister a VLESS session
@@ -129,7 +142,9 @@ impl VlessReplyRegistry {
                 "Unregistered VLESS session: tunnel={} {}:{} -> {}:{}",
                 key.tunnel_tag, key.local_ip, key.local_port, key.remote_ip, key.remote_port
             );
-            self.stats.unregistered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.stats
+                .unregistered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         removed
     }
@@ -185,9 +200,15 @@ impl VlessReplyRegistry {
                 Ok(()) => {
                     trace!(
                         "Routed reply to VLESS session: {}:{} <- {}:{} (tunnel={})",
-                        dst_ip, dst_port, src_ip, src_port, tunnel_tag
+                        dst_ip,
+                        dst_port,
+                        src_ip,
+                        src_port,
+                        tunnel_tag
                     );
-                    self.stats.packets_routed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stats
+                        .packets_routed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -195,7 +216,9 @@ impl VlessReplyRegistry {
                         "VLESS reply channel full: {}:{} <- {}:{} (tunnel={})",
                         dst_ip, dst_port, src_ip, src_port, tunnel_tag
                     );
-                    self.stats.channel_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stats
+                        .channel_full
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Return true to indicate we "handled" it (even though we dropped)
                     // This prevents the packet from being double-processed
                     true
@@ -214,7 +237,11 @@ impl VlessReplyRegistry {
         } else {
             trace!(
                 "No VLESS session for reply: {}:{} <- {}:{} (tunnel={})",
-                dst_ip, dst_port, src_ip, src_port, tunnel_tag
+                dst_ip,
+                dst_port,
+                src_ip,
+                src_port,
+                tunnel_tag
             );
             false
         }
@@ -228,11 +255,26 @@ impl VlessReplyRegistry {
     /// Get statistics snapshot
     pub fn stats(&self) -> RegistryStatsSnapshot {
         RegistryStatsSnapshot {
-            registered: self.stats.registered.load(std::sync::atomic::Ordering::Relaxed),
-            unregistered: self.stats.unregistered.load(std::sync::atomic::Ordering::Relaxed),
-            packets_routed: self.stats.packets_routed.load(std::sync::atomic::Ordering::Relaxed),
-            packets_dropped: self.stats.packets_dropped.load(std::sync::atomic::Ordering::Relaxed),
-            channel_full: self.stats.channel_full.load(std::sync::atomic::Ordering::Relaxed),
+            registered: self
+                .stats
+                .registered
+                .load(std::sync::atomic::Ordering::Relaxed),
+            unregistered: self
+                .stats
+                .unregistered
+                .load(std::sync::atomic::Ordering::Relaxed),
+            packets_routed: self
+                .stats
+                .packets_routed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            packets_dropped: self
+                .stats
+                .packets_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            channel_full: self
+                .stats
+                .channel_full
+                .load(std::sync::atomic::Ordering::Relaxed),
             active_sessions: self.sessions.len(),
         }
     }

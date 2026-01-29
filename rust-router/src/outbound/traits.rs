@@ -569,24 +569,20 @@ impl Socks5UdpHandle {
             return Err(UdpError::Socks5ControlConnectionClosed);
         }
 
-        let (n, _src_addr) = self
-            .association
-            .recv_from(buf)
-            .await
-            .map_err(|e| match e {
-                super::socks5_udp::Socks5UdpError::FragmentedPacket { frag } => {
-                    UdpError::Socks5FragmentedPacket { frag }
-                }
-                super::socks5_udp::Socks5UdpError::PacketFormatError(msg) => {
-                    UdpError::Socks5PacketFormatError { reason: msg }
-                }
-                super::socks5_udp::Socks5UdpError::ControlConnectionClosed => {
-                    UdpError::Socks5ControlConnectionClosed
-                }
-                other => UdpError::Socks5UdpRelayError {
-                    reason: other.to_string(),
-                },
-            })?;
+        let (n, _src_addr) = self.association.recv_from(buf).await.map_err(|e| match e {
+            super::socks5_udp::Socks5UdpError::FragmentedPacket { frag } => {
+                UdpError::Socks5FragmentedPacket { frag }
+            }
+            super::socks5_udp::Socks5UdpError::PacketFormatError(msg) => {
+                UdpError::Socks5PacketFormatError { reason: msg }
+            }
+            super::socks5_udp::Socks5UdpError::ControlConnectionClosed => {
+                UdpError::Socks5ControlConnectionClosed
+            }
+            other => UdpError::Socks5UdpRelayError {
+                reason: other.to_string(),
+            },
+        })?;
 
         Ok(n)
     }
@@ -752,14 +748,18 @@ impl OutboundConnection {
             }
             #[cfg(feature = "transport-quic")]
             OutboundStream::Transport(TransportStream::Quic(_)) => {
-                panic!("Cannot convert QUIC stream to TcpStream; use into_outbound_stream() instead")
+                panic!(
+                    "Cannot convert QUIC stream to TcpStream; use into_outbound_stream() instead"
+                )
             }
             #[cfg(feature = "shadowsocks")]
             OutboundStream::Shadowsocks(_) => {
                 panic!("Cannot convert Shadowsocks stream to TcpStream; use into_outbound_stream() instead")
             }
             OutboundStream::Vless(_) => {
-                panic!("Cannot convert VLESS stream to TcpStream; use into_outbound_stream() instead")
+                panic!(
+                    "Cannot convert VLESS stream to TcpStream; use into_outbound_stream() instead"
+                )
             }
         }
     }

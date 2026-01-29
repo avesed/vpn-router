@@ -113,7 +113,10 @@ impl fmt::Display for Socks5UdpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidVersion { expected, actual } => {
-                write!(f, "Invalid SOCKS version: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "Invalid SOCKS version: expected {expected}, got {actual}"
+                )
             }
             Self::NoAcceptableMethod => write!(f, "No acceptable authentication method"),
             Self::AuthFailed => write!(f, "SOCKS5 authentication failed"),
@@ -216,7 +219,10 @@ impl fmt::Debug for Socks5UdpAssociation {
             .field("relay_addr", &self.relay_addr)
             .field("active", &self.active.load(Ordering::Relaxed))
             .field("packets_sent", &self.packets_sent.load(Ordering::Relaxed))
-            .field("packets_received", &self.packets_received.load(Ordering::Relaxed))
+            .field(
+                "packets_received",
+                &self.packets_received.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -308,10 +314,7 @@ impl Socks5UdpAssociation {
             .await
             .map_err(|e| Socks5UdpError::IoError(format!("UDP connect to relay failed: {e}")))?;
 
-        debug!(
-            "SOCKS5 UDP ASSOCIATE established, relay at {}",
-            relay_addr
-        );
+        debug!("SOCKS5 UDP ASSOCIATE established, relay at {}", relay_addr);
 
         Ok(Self {
             control_conn: Mutex::new(stream),
@@ -493,7 +496,9 @@ impl Socks5UdpAssociation {
     }
 
     /// Send UDP ASSOCIATE request and get relay address
-    async fn udp_associate(mut stream: TcpStream) -> Result<(TcpStream, SocketAddr), Socks5UdpError> {
+    async fn udp_associate(
+        mut stream: TcpStream,
+    ) -> Result<(TcpStream, SocketAddr), Socks5UdpError> {
         // Build UDP ASSOCIATE request
         // We use 0.0.0.0:0 as the expected client address (server chooses)
         let request = [
@@ -501,8 +506,12 @@ impl Socks5UdpAssociation {
             CMD_UDP_ASSOCIATE,
             0x00, // Reserved
             ATYP_IPV4,
-            0, 0, 0, 0, // 0.0.0.0
-            0, 0, // Port 0
+            0,
+            0,
+            0,
+            0, // 0.0.0.0
+            0,
+            0, // Port 0
         ];
 
         trace!("Sending SOCKS5 UDP ASSOCIATE request");
@@ -537,101 +546,101 @@ impl Socks5UdpAssociation {
         }
 
         // Read bound address based on ATYP
-        let relay_addr = match header[3] {
-            ATYP_IPV4 => {
-                let mut addr = [0u8; 4];
-                stream.read_exact(&mut addr).await.map_err(|e| {
-                    Socks5UdpError::ConnectionError(format!("read IPv4 addr: {e}"))
-                })?;
-
-                let mut port = [0u8; 2];
-                stream
-                    .read_exact(&mut port)
-                    .await
-                    .map_err(|e| Socks5UdpError::ConnectionError(format!("read port: {e}")))?;
-
-                SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::from(addr),
-                    u16::from_be_bytes(port),
-                ))
-            }
-            ATYP_IPV6 => {
-                let mut addr = [0u8; 16];
-                stream.read_exact(&mut addr).await.map_err(|e| {
-                    Socks5UdpError::ConnectionError(format!("read IPv6 addr: {e}"))
-                })?;
-
-                let mut port = [0u8; 2];
-                stream
-                    .read_exact(&mut port)
-                    .await
-                    .map_err(|e| Socks5UdpError::ConnectionError(format!("read port: {e}")))?;
-
-                SocketAddr::V6(SocketAddrV6::new(
-                    Ipv6Addr::from(addr),
-                    u16::from_be_bytes(port),
-                    0,
-                    0,
-                ))
-            }
-            ATYP_DOMAIN => {
-                // Domain name - we need to resolve or fail
-                let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await.map_err(|e| {
-                    Socks5UdpError::ConnectionError(format!("read domain len: {e}"))
-                })?;
-
-                let mut domain = vec![0u8; len[0] as usize];
-                stream
-                    .read_exact(&mut domain)
-                    .await
-                    .map_err(|e| Socks5UdpError::ConnectionError(format!("read domain: {e}")))?;
-
-                let mut port = [0u8; 2];
-                stream
-                    .read_exact(&mut port)
-                    .await
-                    .map_err(|e| Socks5UdpError::ConnectionError(format!("read port: {e}")))?;
-
-                // NET-2 FIX: Resolve domain BND.ADDR via DNS
-                // Some SOCKS5 servers return a domain name instead of an IP address.
-                // This is rare but valid per RFC 1928.
-                let domain_str = String::from_utf8(domain).map_err(|_| {
-                    Socks5UdpError::ProtocolError("invalid domain encoding in BND.ADDR".into())
-                })?;
-                let port_num = u16::from_be_bytes(port);
-
-                debug!(
-                    "SOCKS5 server returned domain BND.ADDR: {}:{}, resolving DNS",
-                    domain_str, port_num
-                );
-
-                // Use tokio's async DNS resolver
-                let addr_with_port = format!("{domain_str}:{port_num}");
-                let resolved = tokio::net::lookup_host(&addr_with_port)
-                    .await
-                    .map_err(|e| {
-                        Socks5UdpError::ConnectionError(format!(
-                            "DNS resolution failed for {domain_str}: {e}"
-                        ))
-                    })?
-                    .next()
-                    .ok_or_else(|| {
-                        Socks5UdpError::ConnectionError(format!(
-                            "DNS resolution returned no addresses for {domain_str}"
-                        ))
+        let relay_addr =
+            match header[3] {
+                ATYP_IPV4 => {
+                    let mut addr = [0u8; 4];
+                    stream.read_exact(&mut addr).await.map_err(|e| {
+                        Socks5UdpError::ConnectionError(format!("read IPv4 addr: {e}"))
                     })?;
 
-                debug!(
-                    "Resolved SOCKS5 domain BND.ADDR {} -> {}",
-                    domain_str, resolved
-                );
-                resolved
-            }
-            other => {
-                return Err(Socks5UdpError::InvalidAddressType(other));
-            }
-        };
+                    let mut port = [0u8; 2];
+                    stream
+                        .read_exact(&mut port)
+                        .await
+                        .map_err(|e| Socks5UdpError::ConnectionError(format!("read port: {e}")))?;
+
+                    SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::from(addr),
+                        u16::from_be_bytes(port),
+                    ))
+                }
+                ATYP_IPV6 => {
+                    let mut addr = [0u8; 16];
+                    stream.read_exact(&mut addr).await.map_err(|e| {
+                        Socks5UdpError::ConnectionError(format!("read IPv6 addr: {e}"))
+                    })?;
+
+                    let mut port = [0u8; 2];
+                    stream
+                        .read_exact(&mut port)
+                        .await
+                        .map_err(|e| Socks5UdpError::ConnectionError(format!("read port: {e}")))?;
+
+                    SocketAddr::V6(SocketAddrV6::new(
+                        Ipv6Addr::from(addr),
+                        u16::from_be_bytes(port),
+                        0,
+                        0,
+                    ))
+                }
+                ATYP_DOMAIN => {
+                    // Domain name - we need to resolve or fail
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).await.map_err(|e| {
+                        Socks5UdpError::ConnectionError(format!("read domain len: {e}"))
+                    })?;
+
+                    let mut domain = vec![0u8; len[0] as usize];
+                    stream.read_exact(&mut domain).await.map_err(|e| {
+                        Socks5UdpError::ConnectionError(format!("read domain: {e}"))
+                    })?;
+
+                    let mut port = [0u8; 2];
+                    stream
+                        .read_exact(&mut port)
+                        .await
+                        .map_err(|e| Socks5UdpError::ConnectionError(format!("read port: {e}")))?;
+
+                    // NET-2 FIX: Resolve domain BND.ADDR via DNS
+                    // Some SOCKS5 servers return a domain name instead of an IP address.
+                    // This is rare but valid per RFC 1928.
+                    let domain_str = String::from_utf8(domain).map_err(|_| {
+                        Socks5UdpError::ProtocolError("invalid domain encoding in BND.ADDR".into())
+                    })?;
+                    let port_num = u16::from_be_bytes(port);
+
+                    debug!(
+                        "SOCKS5 server returned domain BND.ADDR: {}:{}, resolving DNS",
+                        domain_str, port_num
+                    );
+
+                    // Use tokio's async DNS resolver
+                    let addr_with_port = format!("{domain_str}:{port_num}");
+                    let resolved = tokio::net::lookup_host(&addr_with_port)
+                        .await
+                        .map_err(|e| {
+                            Socks5UdpError::ConnectionError(format!(
+                                "DNS resolution failed for {domain_str}: {e}"
+                            ))
+                        })?
+                        .next()
+                        .ok_or_else(|| {
+                            Socks5UdpError::ConnectionError(format!(
+                                "DNS resolution returned no addresses for {domain_str}"
+                            ))
+                        })?;
+
+                    debug!(
+                        "Resolved SOCKS5 domain BND.ADDR {} -> {}",
+                        domain_str, resolved
+                    );
+                    resolved
+                }
+                other => {
+                    return Err(Socks5UdpError::InvalidAddressType(other));
+                }
+            };
 
         trace!("SOCKS5 UDP relay address: {}", relay_addr);
 
@@ -879,7 +888,11 @@ impl Socks5UdpAssociation {
         self.bytes_sent
             .fetch_add(data.len() as u64, Ordering::Relaxed);
 
-        trace!("SOCKS5 UDP: sent {} bytes to {} via relay", data.len(), dest);
+        trace!(
+            "SOCKS5 UDP: sent {} bytes to {} via relay",
+            data.len(),
+            dest
+        );
 
         // Return payload size (not total packet size)
         Ok(sent.saturating_sub(packet.len() - data.len()))
@@ -1098,7 +1111,9 @@ mod tests {
     #[test]
     fn test_error_display_no_acceptable_method() {
         let err = Socks5UdpError::NoAcceptableMethod;
-        assert!(err.to_string().contains("No acceptable authentication method"));
+        assert!(err
+            .to_string()
+            .contains("No acceptable authentication method"));
     }
 
     #[test]
@@ -1264,7 +1279,10 @@ mod tests {
         let packet = vec![0x00, 0x00, 0x00, 0x99, 0, 0, 0, 0, 0, 0];
         let result = Socks5UdpAssociation::decapsulate(&packet);
 
-        assert!(matches!(result, Err(Socks5UdpError::InvalidAddressType(0x99))));
+        assert!(matches!(
+            result,
+            Err(Socks5UdpError::InvalidAddressType(0x99))
+        ));
     }
 
     #[test]
@@ -1385,7 +1403,9 @@ mod tests {
             // Auth success
             socket.write_all(&[AUTH_PASSWORD_VERSION, 0x00]).await?;
         } else {
-            socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await?;
+            socket
+                .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+                .await?;
         }
 
         // Read UDP ASSOCIATE request
@@ -1429,7 +1449,8 @@ mod tests {
         });
 
         // Establish association
-        let result = Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
+        let result =
+            Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
 
         assert!(result.is_ok());
         let assoc = result.unwrap();
@@ -1478,7 +1499,8 @@ mod tests {
             run_mock_udp_associate_server(listener, false, 0x07, 0).await
         });
 
-        let result = Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
+        let result =
+            Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
 
         assert!(result.is_err());
         if let Err(Socks5UdpError::ServerReply { code, message }) = result {
@@ -1543,11 +1565,9 @@ mod tests {
 
         // Receive response with timeout
         let mut recv_buf = vec![0u8; 65535];
-        let recv_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            assoc.udp_socket.recv(&mut recv_buf),
-        )
-        .await;
+        let recv_result =
+            tokio::time::timeout(Duration::from_secs(1), assoc.udp_socket.recv(&mut recv_buf))
+                .await;
 
         // The echo will return the same SOCKS5 encapsulated packet
         if let Ok(Ok(n)) = recv_result {
@@ -1663,11 +1683,8 @@ mod tests {
 
         // Receive response
         let mut recv_buf = [0u8; 65535];
-        let recv_result = tokio::time::timeout(
-            Duration::from_secs(2),
-            assoc.recv_from(&mut recv_buf),
-        )
-        .await;
+        let recv_result =
+            tokio::time::timeout(Duration::from_secs(2), assoc.recv_from(&mut recv_buf)).await;
 
         // If we received a response, verify bytes_received was incremented
         if let Ok(Ok((n, _))) = recv_result {
@@ -1701,7 +1718,9 @@ mod tests {
         socket.read_exact(&mut methods).await?;
 
         // No auth required
-        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE]).await?;
+        socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NONE])
+            .await?;
 
         // Read UDP ASSOCIATE request
         let mut request = [0u8; 10];
@@ -1738,7 +1757,8 @@ mod tests {
             run_mock_udp_associate_server_ipv6_bnd(listener, relay_ipv6, relay_port).await
         });
 
-        let result = Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
+        let result =
+            Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
 
         // IPv6 tests may fail on systems without IPv6 loopback support
         // (e.g., some CI environments or containers)
@@ -1789,7 +1809,9 @@ mod tests {
         socket.read_exact(&mut methods).await?;
 
         // Reply with "no acceptable method" (0xFF)
-        socket.write_all(&[SOCKS5_VERSION, AUTH_METHOD_NO_ACCEPTABLE]).await?;
+        socket
+            .write_all(&[SOCKS5_VERSION, AUTH_METHOD_NO_ACCEPTABLE])
+            .await?;
 
         Ok(())
     }
@@ -1803,7 +1825,8 @@ mod tests {
             run_mock_udp_associate_server_no_acceptable_method(listener).await
         });
 
-        let result = Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
+        let result =
+            Socks5UdpAssociation::establish(server_addr, None, Duration::from_secs(5)).await;
 
         assert!(result.is_err());
         assert!(matches!(result, Err(Socks5UdpError::NoAcceptableMethod)));

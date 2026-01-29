@@ -484,7 +484,12 @@ impl VlessConnectionHandler {
             addons,
         };
 
-        Ok(Ok(VlessConnection::new(stream, user, destination, client_addr)))
+        Ok(Ok(VlessConnection::new(
+            stream,
+            user,
+            destination,
+            client_addr,
+        )))
     }
 
     /// Find user configuration by UUID bytes
@@ -547,10 +552,7 @@ mod tests {
 
         let user = AuthenticatedUser::from_account(&account);
         assert_eq!(user.email(), Some("test@example.com"));
-        assert_eq!(
-            user.uuid_string(),
-            "550e8400-e29b-41d4-a716-446655440000"
-        );
+        assert_eq!(user.uuid_string(), "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[test]
@@ -635,7 +637,10 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         let result = handler.handle(stream, client_addr).await;
-        assert!(matches!(result, Err(VlessInboundError::AuthenticationFailed)));
+        assert!(matches!(
+            result,
+            Err(VlessInboundError::AuthenticationFailed)
+        ));
     }
 
     #[test]

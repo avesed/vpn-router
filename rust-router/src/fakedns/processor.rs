@@ -52,23 +52,21 @@ pub fn handle_dns_request(req: &Message, manager: &FakeDnsManager) -> io::Result
         let domain = domain.trim_end_matches('.');
 
         match query.query_type() {
-            RecordType::A => {
-                match manager.map_domain_ipv4(domain) {
-                    Ok((ip, ttl)) => {
-                        let mut record = Record::from_rdata(
-                            query.name().clone(),
-                            ttl.as_secs() as u32,
-                            RData::A(A(ip)),
-                        );
-                        record.set_dns_class(query.query_class());
-                        rsp.add_answer(record);
-                    }
-                    Err(err) => {
-                        warn!("FakeDNS A record error for {}: {}", domain, err);
-                        rsp.set_response_code(ResponseCode::ServFail);
-                    }
+            RecordType::A => match manager.map_domain_ipv4(domain) {
+                Ok((ip, ttl)) => {
+                    let mut record = Record::from_rdata(
+                        query.name().clone(),
+                        ttl.as_secs() as u32,
+                        RData::A(A(ip)),
+                    );
+                    record.set_dns_class(query.query_class());
+                    rsp.add_answer(record);
                 }
-            }
+                Err(err) => {
+                    warn!("FakeDNS A record error for {}: {}", domain, err);
+                    rsp.set_response_code(ResponseCode::ServFail);
+                }
+            },
             RecordType::AAAA => {
                 match manager.map_domain_ipv6(domain) {
                     Ok((ip, ttl)) => {

@@ -109,7 +109,13 @@ impl std::fmt::Display for FiveTuple {
         let proto = match self.protocol {
             6 => "TCP",
             17 => "UDP",
-            n => return write!(f, "{}:{} -> {} (proto={})", self.src_addr, self.dst_addr, n, n),
+            n => {
+                return write!(
+                    f,
+                    "{}:{} -> {} (proto={})",
+                    self.src_addr, self.dst_addr, n, n
+                )
+            }
         };
         write!(f, "{}:{} -> {}", proto, self.src_addr, self.dst_addr)
     }
@@ -365,8 +371,10 @@ impl SessionTracker {
         // Only add to reverse index if we have a valid local port
         // (inject_packet uses register_forward_only instead to avoid port=0 collisions)
         if local_port != 0 {
-            self.reverse
-                .insert((local_port, session.five_tuple.protocol), Arc::clone(&session));
+            self.reverse.insert(
+                (local_port, session.five_tuple.protocol),
+                Arc::clone(&session),
+            );
         }
 
         tracing::debug!(
@@ -830,9 +838,15 @@ mod tests {
         let tuple2 = make_test_tuple(12346, 443);
         let tuple3 = make_test_tuple(12347, 8080);
 
-        tracker.register(peer1, peer_endpoint1, tuple1, 50001).unwrap();
-        tracker.register(peer1, peer_endpoint1, tuple2, 50002).unwrap();
-        tracker.register(peer2, peer_endpoint2, tuple3, 50003).unwrap();
+        tracker
+            .register(peer1, peer_endpoint1, tuple1, 50001)
+            .unwrap();
+        tracker
+            .register(peer1, peer_endpoint1, tuple2, 50002)
+            .unwrap();
+        tracker
+            .register(peer2, peer_endpoint2, tuple3, 50003)
+            .unwrap();
 
         assert_eq!(tracker.peer_session_count(&peer1), 2);
         assert_eq!(tracker.peer_session_count(&peer2), 1);
@@ -861,9 +875,15 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
         );
 
-        tracker.register(peer_key, peer_endpoint, tcp1, 50001).unwrap();
-        tracker.register(peer_key, peer_endpoint, tcp2, 50002).unwrap();
-        tracker.register(peer_key, peer_endpoint, udp1, 50003).unwrap();
+        tracker
+            .register(peer_key, peer_endpoint, tcp1, 50001)
+            .unwrap();
+        tracker
+            .register(peer_key, peer_endpoint, tcp2, 50002)
+            .unwrap();
+        tracker
+            .register(peer_key, peer_endpoint, udp1, 50003)
+            .unwrap();
 
         assert_eq!(tracker.tcp_session_count(), 2);
         assert_eq!(tracker.udp_session_count(), 1);
@@ -879,7 +899,9 @@ mod tests {
         // Add sessions with different ports
         for port in 12345..12355 {
             let tuple = make_test_tuple(port, 80);
-            tracker.register(peer_key, peer_endpoint, tuple, 50000 + port).unwrap();
+            tracker
+                .register(peer_key, peer_endpoint, tuple, 50000 + port)
+                .unwrap();
         }
 
         assert_eq!(tracker.total_sessions(), 10);

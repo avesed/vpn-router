@@ -706,10 +706,8 @@ impl BatchSender {
     ///
     /// Returns `io::Error` if sendmmsg syscall fails.
     pub fn send_packets(&mut self, packets: &[OutgoingPacket<'_>]) -> io::Result<usize> {
-        let tuples: Vec<(&[u8], SocketAddr)> = packets
-            .iter()
-            .map(|p| (p.data, p.dst_addr))
-            .collect();
+        let tuples: Vec<(&[u8], SocketAddr)> =
+            packets.iter().map(|p| (p.data, p.dst_addr)).collect();
         self.send_batch(&tuples)
     }
 
@@ -770,8 +768,7 @@ impl SockAddrStorage {
             }
             SocketAddr::V6(v6) => {
                 // Safety: We're writing to a properly aligned sockaddr_in6
-                let sin6 =
-                    unsafe { &mut *ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in6>() };
+                let sin6 = unsafe { &mut *ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in6>() };
                 sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 sin6.sin6_port = v6.port().to_be();
                 sin6.sin6_flowinfo = v6.flowinfo();
@@ -1269,9 +1266,8 @@ mod tests {
 
         // Create a large batch
         let data = b"x";
-        let packets: Vec<(&[u8], SocketAddr)> = (0..100)
-            .map(|_| (data.as_slice(), recv_addr))
-            .collect();
+        let packets: Vec<(&[u8], SocketAddr)> =
+            (0..100).map(|_| (data.as_slice(), recv_addr)).collect();
 
         // Should be capped at MAX_BATCH_SIZE
         let sent = sender.send_batch(&packets).unwrap();

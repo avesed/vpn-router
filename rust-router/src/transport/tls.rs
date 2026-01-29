@@ -134,8 +134,11 @@ impl TlsTransport {
 
         // Set ALPN protocols if specified
         let config = if !tls_config.alpn.is_empty() {
-            let alpn_protocols: Vec<Vec<u8>> =
-                tls_config.alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+            let alpn_protocols: Vec<Vec<u8>> = tls_config
+                .alpn
+                .iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect();
 
             let mut config = config;
             config.alpn_protocols = alpn_protocols;
@@ -253,10 +256,7 @@ impl Transport for TlsTransport {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            TransportError::connection_failed(
-                config.address_string(),
-                "no addresses to connect to",
-            )
+            TransportError::connection_failed(config.address_string(), "no addresses to connect to")
         }))
     }
 }
@@ -413,8 +413,8 @@ mod tests {
         init_crypto_provider();
         let transport = TlsTransport::new();
         // Invalid server name should fail
-        let config = TransportConfig::tcp("127.0.0.1", 443)
-            .with_tls(TlsConfig::new("invalid\x00name"));
+        let config =
+            TransportConfig::tcp("127.0.0.1", 443).with_tls(TlsConfig::new("invalid\x00name"));
 
         let result = transport.connect(&config).await;
         assert!(result.is_err());
@@ -438,8 +438,8 @@ mod tests {
     async fn test_connect_real_server() {
         init_crypto_provider();
         let transport = TlsTransport::new();
-        let config = TransportConfig::tcp("1.1.1.1", 443)
-            .with_tls(TlsConfig::new("cloudflare-dns.com"));
+        let config =
+            TransportConfig::tcp("1.1.1.1", 443).with_tls(TlsConfig::new("cloudflare-dns.com"));
 
         let result = transport.connect(&config).await;
         assert!(result.is_ok());

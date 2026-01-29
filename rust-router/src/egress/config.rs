@@ -620,9 +620,9 @@ impl WgEgressConfig {
             return Err(EgressError::invalid_config("private_key is required"));
         }
 
-        let private_bytes = BASE64.decode(&self.private_key).map_err(|e| {
-            EgressError::invalid_config(format!("Invalid private key Base64: {e}"))
-        })?;
+        let private_bytes = BASE64
+            .decode(&self.private_key)
+            .map_err(|e| EgressError::invalid_config(format!("Invalid private key Base64: {e}")))?;
 
         if private_bytes.len() != 32 {
             return Err(EgressError::invalid_config(format!(
@@ -670,9 +670,9 @@ impl WgEgressConfig {
 
         // Validate preshared key if present
         if let Some(ref psk) = self.preshared_key {
-            let psk_bytes = BASE64
-                .decode(psk)
-                .map_err(|e| EgressError::invalid_config(format!("Invalid preshared key Base64: {e}")))?;
+            let psk_bytes = BASE64.decode(psk).map_err(|e| {
+                EgressError::invalid_config(format!("Invalid preshared key Base64: {e}"))
+            })?;
 
             if psk_bytes.len() != 32 {
                 return Err(EgressError::invalid_config(format!(
@@ -705,7 +705,8 @@ impl WgEgressConfig {
     /// Get the effective keepalive interval
     #[must_use]
     pub fn effective_keepalive(&self) -> Option<u16> {
-        self.persistent_keepalive.or(Some(DEFAULT_PERSISTENT_KEEPALIVE))
+        self.persistent_keepalive
+            .or(Some(DEFAULT_PERSISTENT_KEEPALIVE))
     }
 }
 
@@ -795,7 +796,8 @@ mod tests {
         assert!(json.contains("pia"));
         assert!(json.contains("us-east"));
 
-        let deserialized: EgressTunnelType = serde_json::from_str(&json).expect("Should deserialize");
+        let deserialized: EgressTunnelType =
+            serde_json::from_str(&json).expect("Should deserialize");
         assert_eq!(deserialized, t);
     }
 
@@ -838,7 +840,10 @@ mod tests {
         assert_eq!(config.peer_endpoint, "1.2.3.4:51820");
         assert!(config.local_ip.is_none());
         assert_eq!(config.allowed_ips, vec!["0.0.0.0/0"]);
-        assert_eq!(config.persistent_keepalive, Some(DEFAULT_PERSISTENT_KEEPALIVE));
+        assert_eq!(
+            config.persistent_keepalive,
+            Some(DEFAULT_PERSISTENT_KEEPALIVE)
+        );
         assert_eq!(config.mtu, Some(DEFAULT_MTU));
     }
 
@@ -1280,7 +1285,10 @@ mod tests {
         let mut config = WgEgressConfig::default();
         config.persistent_keepalive = None;
 
-        assert_eq!(config.effective_keepalive(), Some(DEFAULT_PERSISTENT_KEEPALIVE));
+        assert_eq!(
+            config.effective_keepalive(),
+            Some(DEFAULT_PERSISTENT_KEEPALIVE)
+        );
     }
 
     // ========================================================================
@@ -1328,7 +1336,10 @@ mod tests {
         assert!(config.local_ip.is_none());
         assert_eq!(config.allowed_ips, vec!["0.0.0.0/0"]);
         assert_eq!(config.mtu, Some(DEFAULT_MTU));
-        assert_eq!(config.persistent_keepalive, Some(DEFAULT_PERSISTENT_KEEPALIVE));
+        assert_eq!(
+            config.persistent_keepalive,
+            Some(DEFAULT_PERSISTENT_KEEPALIVE)
+        );
     }
 
     // ========================================================================

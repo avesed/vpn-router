@@ -80,8 +80,7 @@ const ROTATION_SIZE_THRESHOLD: u64 = 100 * 1024 * 1024;
 fn days_in_year(year: i32) -> u32 {
     // Use chrono's NaiveDate to determine days in year
     // Dec 31 of the year will have ordinal equal to days in year
-    NaiveDate::from_ymd_opt(year, 12, 31)
-        .map_or(365, |d| d.ordinal()) // Fallback to 365 if year is invalid (extremely unlikely)
+    NaiveDate::from_ymd_opt(year, 12, 31).map_or(365, |d| d.ordinal()) // Fallback to 365 if year is invalid (extremely unlikely)
 }
 
 // ============================================================================
@@ -706,9 +705,18 @@ mod tests {
     fn test_log_rotator_get_rotated_path() {
         let rotator = LogRotator::new(PathBuf::from("/var/log/dns.log"), 7, 7);
 
-        assert_eq!(rotator.get_rotated_path(1), PathBuf::from("/var/log/dns.log.1"));
-        assert_eq!(rotator.get_rotated_path(2), PathBuf::from("/var/log/dns.log.2"));
-        assert_eq!(rotator.get_rotated_path(10), PathBuf::from("/var/log/dns.log.10"));
+        assert_eq!(
+            rotator.get_rotated_path(1),
+            PathBuf::from("/var/log/dns.log.1")
+        );
+        assert_eq!(
+            rotator.get_rotated_path(2),
+            PathBuf::from("/var/log/dns.log.2")
+        );
+        assert_eq!(
+            rotator.get_rotated_path(10),
+            PathBuf::from("/var/log/dns.log.10")
+        );
     }
 
     // ========================================================================
@@ -786,7 +794,11 @@ mod tests {
         // Create log and old rotated files (beyond max_files)
         fs::write(&log_path, "current").unwrap();
         for i in 1..=10 {
-            fs::write(temp_dir.path().join(format!("test.log.{}", i)), format!("old-{}", i)).unwrap();
+            fs::write(
+                temp_dir.path().join(format!("test.log.{}", i)),
+                format!("old-{}", i),
+            )
+            .unwrap();
         }
 
         // max_files = 3, so files .4 and above should be deleted after rotation
@@ -988,10 +1000,10 @@ mod tests {
     #[test]
     fn test_days_in_year_edge_cases() {
         // Test some edge cases
-        assert_eq!(days_in_year(1), 365);       // Year 1 AD
-        assert_eq!(days_in_year(4), 366);       // First leap year after 1 AD
-        assert_eq!(days_in_year(100), 365);     // First century year
-        assert_eq!(days_in_year(400), 366);     // First year divisible by 400
+        assert_eq!(days_in_year(1), 365); // Year 1 AD
+        assert_eq!(days_in_year(4), 366); // First leap year after 1 AD
+        assert_eq!(days_in_year(100), 365); // First century year
+        assert_eq!(days_in_year(400), 366); // First year divisible by 400
     }
 
     #[test]

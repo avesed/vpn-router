@@ -135,7 +135,10 @@ impl TproxyUdpListener {
 
         // Bind to the listen address
         socket.bind(&config.address.into()).map_err(|e| {
-            UdpError::socket_option("bind", format!("Failed to bind to {}: {}", config.address, e))
+            UdpError::socket_option(
+                "bind",
+                format!("Failed to bind to {}: {}", config.address, e),
+            )
         })?;
 
         // Convert to tokio UdpSocket
@@ -666,8 +669,8 @@ mod tests {
 
     #[test]
     fn test_builder() {
-        let builder = TproxyUdpListenerBuilder::new("127.0.0.1:8080".parse().unwrap())
-            .reuse_port(false);
+        let builder =
+            TproxyUdpListenerBuilder::new("127.0.0.1:8080".parse().unwrap()).reuse_port(false);
 
         assert_eq!(builder.address, "127.0.0.1:8080".parse().unwrap());
         assert!(!builder.reuse_port);
