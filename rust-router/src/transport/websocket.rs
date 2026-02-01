@@ -33,6 +33,7 @@
 //! # }
 //! ```
 
+use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
@@ -40,7 +41,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use futures::sink::Sink;
 use futures::stream::Stream;
@@ -117,15 +117,26 @@ impl WebSocketTransport {
         stream: &TcpStream,
         config: &TransportConfig,
     ) -> Result<(), TransportError> {
+        Self::configure_socket_inner(stream, config.tcp_nodelay, config.tcp_keepalive)
+    }
+
+    /// Configure TCP socket options with individual parameters
+    ///
+    /// This internal helper avoids borrowing issues with async closures.
+    fn configure_socket_inner(
+        stream: &TcpStream,
+        tcp_nodelay: bool,
+        tcp_keepalive: bool,
+    ) -> Result<(), TransportError> {
         // Set TCP_NODELAY
-        if config.tcp_nodelay {
+        if tcp_nodelay {
             stream
                 .set_nodelay(true)
                 .map_err(|e| TransportError::socket_option("TCP_NODELAY", e.to_string()))?;
         }
 
         // Set TCP keepalive
-        if config.tcp_keepalive {
+        if tcp_keepalive {
             let socket_ref = SockRef::from(stream);
             let keepalive = TcpKeepalive::new()
                 .with_time(Duration::from_secs(60))
@@ -238,12 +249,24 @@ impl WebSocketTransport {
             TransportError::websocket_protocol("WebSocket configuration required")
         })?;
 
+        Self::build_request_inner(ws_config, config.tls.as_ref(), &config.address, config.port)
+    }
+
+    /// Build WebSocket request with individual parameters
+    ///
+    /// This internal helper avoids borrowing issues with async closures.
+    fn build_request_inner(
+        ws_config: &super::WebSocketConfig,
+        tls_config: Option<&TlsConfig>,
+        address: &str,
+        port: u16,
+    ) -> Result<Request<()>, TransportError> {
         // Determine scheme
-        let scheme = if config.tls.is_some() { "wss" } else { "ws" };
+        let scheme = if tls_config.is_some() { "wss" } else { "ws" };
 
         // Build URL
-        let host = ws_config.host.as_ref().unwrap_or(&config.address);
-        let url = format!("{scheme}://{host}:{}{}", config.port, ws_config.path);
+        let host = ws_config.host.as_ref().map(|s| s.as_str()).unwrap_or(address);
+        let url = format!("{scheme}://{host}:{}{}", port, ws_config.path);
 
         // Build request
         let mut builder = Request::builder()
@@ -274,8 +297,26 @@ impl WebSocketTransport {
         tls_config: &TlsConfig,
         request: Request<()>,
     ) -> Result<WsStreamInner, TransportError> {
-        let connect_timeout = config.connect_timeout;
+        Self::connect_tls_inner(
+            addr,
+            config.connect_timeout,
+            config.tcp_nodelay,
+            config.tcp_keepalive,
+            tls_config.clone(),
+            request,
+        )
+        .await
+    }
 
+    /// Connect to WebSocket server with TLS using individual parameters
+    async fn connect_tls_inner(
+        addr: SocketAddr,
+        connect_timeout: Duration,
+        tcp_nodelay: bool,
+        tcp_keepalive: bool,
+        tls_config: TlsConfig,
+        request: Request<()>,
+    ) -> Result<WsStreamInner, TransportError> {
         // Establish TCP connection
         let tcp_connect = TcpStream::connect(addr);
         let tcp_stream = timeout(connect_timeout, tcp_connect)
@@ -286,10 +327,10 @@ impl WebSocketTransport {
             .map_err(|e| TransportError::connection_failed(addr.to_string(), e.to_string()))?;
 
         // Configure socket
-        Self::configure_socket(&tcp_stream, config)?;
+        Self::configure_socket_inner(&tcp_stream, tcp_nodelay, tcp_keepalive)?;
 
         // Create TLS connector
-        let client_config = Self::create_tls_config(tls_config)?;
+        let client_config = Self::create_tls_config(&tls_config)?;
         let connector = TlsConnector::from(Arc::new(client_config));
 
         // Parse server name
@@ -332,8 +373,24 @@ impl WebSocketTransport {
         config: &TransportConfig,
         request: Request<()>,
     ) -> Result<WsStreamInner, TransportError> {
-        let connect_timeout = config.connect_timeout;
+        Self::connect_plain_inner(
+            addr,
+            config.connect_timeout,
+            config.tcp_nodelay,
+            config.tcp_keepalive,
+            request,
+        )
+        .await
+    }
 
+    /// Connect to WebSocket server without TLS using individual parameters
+    async fn connect_plain_inner(
+        addr: SocketAddr,
+        connect_timeout: Duration,
+        tcp_nodelay: bool,
+        tcp_keepalive: bool,
+        request: Request<()>,
+    ) -> Result<WsStreamInner, TransportError> {
         // Establish TCP connection
         let tcp_connect = TcpStream::connect(addr);
         let tcp_stream = timeout(connect_timeout, tcp_connect)
@@ -344,7 +401,7 @@ impl WebSocketTransport {
             .map_err(|e| TransportError::connection_failed(addr.to_string(), e.to_string()))?;
 
         // Configure socket
-        Self::configure_socket(&tcp_stream, config)?;
+        Self::configure_socket_inner(&tcp_stream, tcp_nodelay, tcp_keepalive)?;
 
         // Perform WebSocket handshake
         let ws_connect = tokio_tungstenite::client_async(request, tcp_stream);
@@ -362,7 +419,6 @@ impl WebSocketTransport {
     }
 }
 
-#[async_trait]
 impl Transport for WebSocketTransport {
     /// Connect to a remote server over WebSocket
     ///
@@ -380,51 +436,87 @@ impl Transport for WebSocketTransport {
     /// - TCP connection fails
     /// - TLS handshake fails (if TLS is configured)
     /// - WebSocket handshake fails
-    async fn connect(&self, config: &TransportConfig) -> Result<TransportStream, TransportError> {
-        // Resolve address
-        let addrs = Self::resolve_address(&config.address, config.port)?;
+    fn connect(
+        &self,
+        config: &TransportConfig,
+    ) -> impl Future<Output = Result<TransportStream, TransportError>> + Send {
+        // Capture needed values from config
+        let address = config.address.clone();
+        let port = config.port;
+        let connect_timeout = config.connect_timeout;
+        let tcp_nodelay = config.tcp_nodelay;
+        let tcp_keepalive = config.tcp_keepalive;
+        let tls_config = config.tls.clone();
+        let ws_config = config.websocket.clone();
+        let address_string = config.address_string();
+        let resolve_result = Self::resolve_address(&address, port);
 
-        // Try connecting to each address
-        let mut last_error = None;
+        // Build request before async block (this is independent of address iteration)
+        // We need to rebuild it for each address though since the request is consumed
+        let build_request_args = (ws_config.clone(), tls_config.clone(), address.clone(), port);
 
-        for addr in addrs {
-            // Build request for this attempt
-            let request = Self::build_request(config)?;
+        async move {
+            // Resolve address
+            let addrs = resolve_result?;
 
-            let result = if let Some(tls_config) = &config.tls {
-                Self::connect_tls(addr, config, tls_config, request).await
-            } else {
-                Self::connect_plain(addr, config, request).await
-            };
+            let ws_config = ws_config.ok_or_else(|| {
+                TransportError::websocket_protocol("WebSocket configuration required")
+            })?;
 
-            match result {
-                Ok(ws_inner) => {
-                    let ws_config = config.websocket.as_ref().unwrap();
+            // Try connecting to each address
+            let mut last_error = None;
 
-                    tracing::debug!(
-                        addr = %addr,
-                        path = %ws_config.path,
-                        tls = config.tls.is_some(),
-                        "WebSocket connection established"
-                    );
+            for addr in addrs {
+                // Build request for this attempt
+                let request = Self::build_request_inner(
+                    &ws_config,
+                    tls_config.as_ref(),
+                    &build_request_args.2,
+                    build_request_args.3,
+                )?;
 
-                    let wrapper = WebSocketWrapper::new(ws_inner);
-                    return Ok(TransportStream::WebSocket(wrapper));
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        addr = %addr,
-                        error = %e,
-                        "WebSocket connection attempt failed"
-                    );
-                    last_error = Some(e);
+                let result = if let Some(ref tls_cfg) = tls_config {
+                    Self::connect_tls_inner(
+                        addr,
+                        connect_timeout,
+                        tcp_nodelay,
+                        tcp_keepalive,
+                        tls_cfg.clone(),
+                        request,
+                    )
+                    .await
+                } else {
+                    Self::connect_plain_inner(addr, connect_timeout, tcp_nodelay, tcp_keepalive, request)
+                        .await
+                };
+
+                match result {
+                    Ok(ws_inner) => {
+                        tracing::debug!(
+                            addr = %addr,
+                            path = %ws_config.path,
+                            tls = tls_config.is_some(),
+                            "WebSocket connection established"
+                        );
+
+                        let wrapper = WebSocketWrapper::new(ws_inner);
+                        return Ok(TransportStream::WebSocket(wrapper));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            addr = %addr,
+                            error = %e,
+                            "WebSocket connection attempt failed"
+                        );
+                        last_error = Some(e);
+                    }
                 }
             }
-        }
 
-        Err(last_error.unwrap_or_else(|| {
-            TransportError::connection_failed(config.address_string(), "no addresses to connect to")
-        }))
+            Err(last_error.unwrap_or_else(|| {
+                TransportError::connection_failed(address_string, "no addresses to connect to")
+            }))
+        }
     }
 }
 

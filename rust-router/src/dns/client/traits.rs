@@ -21,9 +21,10 @@
 //! ```
 
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use hickory_proto::op::Message;
 
 use crate::dns::config::UpstreamProtocol;
@@ -69,7 +70,6 @@ pub const MAX_TCP_MESSAGE_SIZE: usize = 65535;
 ///     }
 /// }
 /// ```
-#[async_trait]
 pub trait DnsUpstream: Send + Sync + Debug {
     /// Send a DNS query and await the response
     ///
@@ -88,7 +88,10 @@ pub trait DnsUpstream: Send + Sync + Debug {
     /// - Query times out
     /// - Response validation fails (wrong ID, truncated, etc.)
     /// - Upstream server returns an error response
-    async fn query(&self, query: &Message) -> DnsResult<Message>;
+    fn query<'a>(
+        &'a self,
+        query: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = DnsResult<Message>> + Send + 'a>>;
 
     /// Check if this upstream is currently healthy
     ///

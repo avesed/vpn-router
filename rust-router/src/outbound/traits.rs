@@ -12,6 +12,7 @@
 //! This abstraction allows outbound implementations like VLESS to work
 //! over different transport layers while maintaining a unified interface.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -19,7 +20,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -836,7 +836,11 @@ impl OutboundConnection {
 /// Core trait for outbound implementations
 ///
 /// All outbound types (Direct, Block, SOCKS5, etc.) must implement this trait.
-#[async_trait]
+///
+/// # Object Safety
+///
+/// This trait is object-safe and can be used as `dyn Outbound`. Async methods
+/// return boxed futures to enable dynamic dispatch.
 pub trait Outbound: Send + Sync {
     /// Connect to the target address through this outbound.
     ///
@@ -848,11 +852,11 @@ pub trait Outbound: Send + Sync {
     /// # Errors
     ///
     /// Returns `OutboundError` if the connection fails.
-    async fn connect(
+    fn connect(
         &self,
         addr: SocketAddr,
         timeout: Duration,
-    ) -> Result<OutboundConnection, OutboundError>;
+    ) -> Pin<Box<dyn Future<Output = Result<OutboundConnection, OutboundError>> + Send + '_>>;
 
     /// Get the unique tag for this outbound
     fn tag(&self) -> &str;
@@ -913,14 +917,13 @@ pub trait Outbound: Send + Sync {
     ///
     /// Returns `UdpError::UdpNotSupported` by default.
     /// Outbounds that support UDP should override this method.
-    async fn connect_udp(
+    fn connect_udp(
         &self,
         _addr: SocketAddr,
         _timeout: Duration,
-    ) -> Result<UdpOutboundHandle, UdpError> {
-        Err(UdpError::UdpNotSupported {
-            tag: self.tag().to_string(),
-        })
+    ) -> Pin<Box<dyn Future<Output = Result<UdpOutboundHandle, UdpError>> + Send + '_>> {
+        let tag = self.tag().to_string();
+        Box::pin(async move { Err(UdpError::UdpNotSupported { tag }) })
     }
 
     /// Check if this outbound supports UDP

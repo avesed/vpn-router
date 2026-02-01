@@ -49,9 +49,18 @@
 //!
 //! # Performance
 //!
-//! The smoltcp backend achieves ~30-80 Mbps throughput per connection,
-//! limited by userspace TCP/IP processing. For higher performance, use
-//! the kernel backend (TUN + TPROXY) when possible.
+//! With 1 MB TCP buffers and single-task ownership architecture, the smoltcp
+//! backend achieves:
+//!
+//! | Scenario | Throughput |
+//! |----------|------------|
+//! | TCP Single Connection | ~300 Mbps |
+//! | TCP Concurrent (4 conn) | ~650 Mbps |
+//! | UDP Stream | ~6000 Mbps |
+//! | DNS-like UDP (small packets) | ~200 Mbps, ~400K QPS |
+//!
+//! These results were measured with memory loopback testing (ideal conditions).
+//! Real-world performance depends on WireGuard tunnel latency and bandwidth.
 //!
 //! # Example
 //!

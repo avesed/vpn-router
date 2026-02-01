@@ -36,6 +36,7 @@
 //! - **Session tracking**: Thread-safe with per-peer rate limiting
 //! - **Port allocation**: TIME_WAIT tracking, shard support
 //! - **Native async traits**: Rust 1.75+ async trait syntax
+//! - **Standalone Data Plane**: Use as independent crate with callback-based routing
 //!
 //! # Quick Start
 //!
@@ -85,10 +86,44 @@
 //! - [`kernel`]: Kernel backend (TUN + TPROXY)
 //! - [`smoltcp`]: Smoltcp backend (userspace TCP/IP)
 //! - [`mod@bench`]: Benchmarking utilities
+//! - [`dataplane`]: Standalone data plane API with callback-based routing
+//!
+//! # Standalone Data Plane
+//!
+//! For using netbridge as an independent data plane with control plane separation:
+//!
+//! ```ignore
+//! use netbridge::{DataPlaneBuilder, ConnectionHandler, ConnectionInfo, RoutingDecision};
+//!
+//! // Implement your routing logic
+//! struct MyRouter;
+//!
+//! impl ConnectionHandler for MyRouter {
+//!     fn on_tcp_connect(&self, info: ConnectionInfo)
+//!         -> Pin<Box<dyn Future<Output = RoutingDecision> + Send + '_>> {
+//!         Box::pin(async move {
+//!             // Your routing decision logic here
+//!             let stream = TcpStream::connect(info.dst).await.unwrap();
+//!             RoutingDecision::Accept(Box::new(stream))
+//!         })
+//!     }
+//!     // ... implement other methods
+//! }
+//!
+//! // Create and run the data plane
+//! let dp = DataPlaneBuilder::new()
+//!     .with_tun("my-tun")
+//!     .with_handler(Arc::new(MyRouter))
+//!     .build()
+//!     .await?;
+//!
+//! dp.run().await?;
+//! ```
 
 // Submodules
 pub mod bench;
 pub mod config;
+pub mod dataplane;
 pub mod error;
 pub mod kernel;
 pub mod port;
@@ -165,6 +200,12 @@ pub use smoltcp::{SmoltcpEgress, SmoltcpShard};
 
 // Benchmark utilities
 pub use bench::{BenchConfig, BenchResults, TrafficPattern};
+
+// Standalone data plane API
+pub use dataplane::{
+    ConnectionHandler, ConnectionInfo, DataPlane, DataPlaneBuilder, DataPlaneConfig,
+    DirectHandler, OutboundStream, RejectHandler, RoutingDecision, UdpHandle, UdpHandleRemote,
+};
 
 #[cfg(test)]
 mod tests {

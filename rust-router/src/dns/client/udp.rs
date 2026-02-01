@@ -31,11 +31,12 @@
 //! # }
 //! ```
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use hickory_proto::op::Message;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -260,44 +261,48 @@ impl UdpClient {
     }
 }
 
-#[async_trait]
 impl DnsUpstream for UdpClient {
-    async fn query(&self, query: &Message) -> DnsResult<Message> {
-        let mut last_error = None;
+    fn query<'a>(
+        &'a self,
+        query: &'a Message,
+    ) -> Pin<Box<dyn Future<Output = DnsResult<Message>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut last_error = None;
 
-        // Try query with retries
-        for attempt in 0..=self.retries {
-            if attempt > 0 {
-                tracing::debug!(
-                    upstream = %self.config.tag,
-                    attempt = attempt + 1,
-                    max_attempts = self.retries + 1,
-                    "retrying UDP query"
-                );
-            }
-
-            match self.query_once(query).await {
-                Ok(response) => {
-                    self.health.record_success();
-                    return Ok(response);
-                }
-                Err(e) => {
+            // Try query with retries
+            for attempt in 0..=self.retries {
+                if attempt > 0 {
                     tracing::debug!(
                         upstream = %self.config.tag,
                         attempt = attempt + 1,
-                        error = %e,
-                        "UDP query attempt failed"
+                        max_attempts = self.retries + 1,
+                        "retrying UDP query"
                     );
-                    last_error = Some(e);
+                }
+
+                match self.query_once(query).await {
+                    Ok(response) => {
+                        self.health.record_success();
+                        return Ok(response);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            upstream = %self.config.tag,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "UDP query attempt failed"
+                        );
+                        last_error = Some(e);
+                    }
                 }
             }
-        }
 
-        // All attempts failed
-        self.health.record_failure();
-        Err(last_error.unwrap_or_else(|| {
-            DnsError::upstream(&self.config.address, "all UDP query attempts failed")
-        }))
+            // All attempts failed
+            self.health.record_failure();
+            Err(last_error.unwrap_or_else(|| {
+                DnsError::upstream(&self.config.address, "all UDP query attempts failed")
+            }))
+        })
     }
 
     fn is_healthy(&self) -> bool {

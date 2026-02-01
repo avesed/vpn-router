@@ -696,9 +696,10 @@ impl Default for UpstreamPoolBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::str::FromStr;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
@@ -736,27 +737,31 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl DnsUpstream for MockUpstream {
-        async fn query(&self, query: &Message) -> DnsResult<Message> {
-            self.query_count.fetch_add(1, Ordering::Relaxed);
+        fn query<'a>(
+            &'a self,
+            query: &'a Message,
+        ) -> Pin<Box<dyn Future<Output = DnsResult<Message>> + Send + 'a>> {
+            Box::pin(async move {
+                self.query_count.fetch_add(1, Ordering::Relaxed);
 
-            if self.should_fail.load(Ordering::SeqCst) {
-                return Err(DnsError::timeout("mock timeout", Duration::from_secs(1)));
-            }
+                if self.should_fail.load(Ordering::SeqCst) {
+                    return Err(DnsError::timeout("mock timeout", Duration::from_secs(1)));
+                }
 
-            // Return a simple response
-            let mut response = Message::new();
-            response.set_id(query.id());
-            response.set_message_type(MessageType::Response);
-            response.set_response_code(ResponseCode::NoError);
+                // Return a simple response
+                let mut response = Message::new();
+                response.set_id(query.id());
+                response.set_message_type(MessageType::Response);
+                response.set_response_code(ResponseCode::NoError);
 
-            // Copy query section
-            for q in query.queries() {
-                response.add_query(q.clone());
-            }
+                // Copy query section
+                for q in query.queries() {
+                    response.add_query(q.clone());
+                }
 
-            Ok(response)
+                Ok(response)
+            })
         }
 
         fn is_healthy(&self) -> bool {

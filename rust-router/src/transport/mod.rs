@@ -102,12 +102,12 @@ pub use quic::{
     QuicStream,
 };
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -617,7 +617,6 @@ impl AsyncWrite for TransportStream {
 /// This trait defines the interface for different transport implementations.
 /// Each implementation handles connection establishment for its specific
 /// transport type (TCP, TLS, WebSocket).
-#[async_trait]
 pub trait Transport: Send + Sync {
     /// Connect to a remote server using the given configuration
     ///
@@ -628,7 +627,10 @@ pub trait Transport: Send + Sync {
     /// # Errors
     ///
     /// Returns `TransportError` if the connection fails.
-    async fn connect(&self, config: &TransportConfig) -> Result<TransportStream, TransportError>;
+    fn connect(
+        &self,
+        config: &TransportConfig,
+    ) -> impl Future<Output = Result<TransportStream, TransportError>> + Send;
 }
 
 /// Connect to a remote server using the appropriate transport

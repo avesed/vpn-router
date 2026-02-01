@@ -76,8 +76,8 @@ pub use tun::{TunDeviceBuilder, TunDeviceWrapper};
 // TPROXY listener wrapper
 pub use tproxy::{TproxyConnectionWrapper, TproxyListenerConfig, TproxyListenerStats, TproxyListenerWrapper};
 
-// iptables manager wrapper
-pub use iptables::{IptablesConfig, IptablesManagerWrapper};
+// iptables manager wrapper (with crash recovery)
+pub use iptables::{IptablesConfig, IptablesManagerWrapper, IptablesState};
 
 // KernelIngress implementation
 pub use ingress::{KernelIngress, KernelIngressConfig};

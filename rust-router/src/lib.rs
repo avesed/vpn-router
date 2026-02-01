@@ -52,7 +52,7 @@
 //! It is designed to eventually replace:
 //!
 //! - `tun_bridge/` -> `netbridge::kernel` (TUN + TPROXY, 200-400 Mbps)
-//! - `vless_wg_bridge/` -> `netbridge::smoltcp` (userspace TCP/IP, 30-80 Mbps)
+//! - `vless_wg_bridge/` -> `netbridge::smoltcp` (userspace TCP/IP, ~300-650 Mbps)
 //! - `smoltcp_utils/` -> `netbridge` (shared utilities)
 //!
 //! During the migration period, both old and new modules coexist:

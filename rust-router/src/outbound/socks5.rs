@@ -44,7 +44,9 @@
 //! ```
 
 use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -546,6 +548,8 @@ impl Socks5ConnectionManager {
     }
 }
 
+// NOTE: deadpool::managed::Manager trait requires #[async_trait] as of version 0.10
+// We keep this implementation using async_trait since the trait itself requires it.
 #[async_trait]
 impl Manager for Socks5ConnectionManager {
     type Type = Socks5Connection;
@@ -848,87 +852,88 @@ impl Socks5Outbound {
     }
 }
 
-#[async_trait]
 impl Outbound for Socks5Outbound {
-    async fn connect(
+    fn connect(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<OutboundConnection, OutboundError> {
-        if !self.is_enabled() {
-            return Err(OutboundError::unavailable(
-                &self.config.tag,
-                "outbound is disabled",
-            ));
-        }
-
-        self.stats.record_connection();
-
-        // Get connection from pool with timeout
-        let pool_get = timeout(connect_timeout, self.pool.get()).await;
-
-        let mut conn = match pool_get {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                return Err(OutboundError::connection_failed(
-                    self.config.socks5_addr,
-                    format!("pool error: {e}"),
+    ) -> Pin<Box<dyn Future<Output = Result<OutboundConnection, OutboundError>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(OutboundError::unavailable(
+                    &self.config.tag,
+                    "outbound is disabled",
                 ));
             }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                return Err(OutboundError::Timeout {
-                    addr: self.config.socks5_addr,
-                    timeout_secs: connect_timeout.as_secs(),
-                });
-            }
-        };
 
-        // Perform CONNECT to destination
-        let connect_result = timeout(connect_timeout, self.socks5_connect(&mut conn, addr)).await;
+            self.stats.record_connection();
 
-        match connect_result {
-            Ok(Ok(())) => {
-                self.update_health(true);
-                debug!(
-                    "SOCKS5 connection to {} via {} successful",
-                    addr, self.config.tag
-                );
+            // Get connection from pool with timeout
+            let pool_get = timeout(connect_timeout, self.pool.get()).await;
 
-                // Take ownership of the stream from the pooled connection
-                // This ensures the connection won't be returned to pool
-                let stream = match conn.take_stream() {
-                    Some(s) => s,
-                    None => {
-                        self.stats.record_error();
-                        return Err(OutboundError::connection_failed(
-                            addr,
-                            "stream already taken",
-                        ));
-                    }
-                };
+            let mut conn = match pool_get {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    return Err(OutboundError::connection_failed(
+                        self.config.socks5_addr,
+                        format!("pool error: {e}"),
+                    ));
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    return Err(OutboundError::Timeout {
+                        addr: self.config.socks5_addr,
+                        timeout_secs: connect_timeout.as_secs(),
+                    });
+                }
+            };
 
-                Ok(OutboundConnection::new(stream, addr))
+            // Perform CONNECT to destination
+            let connect_result = timeout(connect_timeout, self.socks5_connect(&mut conn, addr)).await;
+
+            match connect_result {
+                Ok(Ok(())) => {
+                    self.update_health(true);
+                    debug!(
+                        "SOCKS5 connection to {} via {} successful",
+                        addr, self.config.tag
+                    );
+
+                    // Take ownership of the stream from the pooled connection
+                    // This ensures the connection won't be returned to pool
+                    let stream = match conn.take_stream() {
+                        Some(s) => s,
+                        None => {
+                            self.stats.record_error();
+                            return Err(OutboundError::connection_failed(
+                                addr,
+                                "stream already taken",
+                            ));
+                        }
+                    };
+
+                    Ok(OutboundConnection::new(stream, addr))
+                }
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    // Stream will be dropped with conn, preventing recycling
+                    Err(OutboundError::connection_failed(addr, e.to_string()))
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    // Stream will be dropped with conn, preventing recycling
+                    Err(OutboundError::Timeout {
+                        addr,
+                        timeout_secs: connect_timeout.as_secs(),
+                    })
+                }
             }
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                // Stream will be dropped with conn, preventing recycling
-                Err(OutboundError::connection_failed(addr, e.to_string()))
-            }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                // Stream will be dropped with conn, preventing recycling
-                Err(OutboundError::Timeout {
-                    addr,
-                    timeout_secs: connect_timeout.as_secs(),
-                })
-            }
-        }
+        })
     }
 
     fn tag(&self) -> &str {
@@ -977,50 +982,52 @@ impl Outbound for Socks5Outbound {
 
     // === UDP Methods ===
 
-    async fn connect_udp(
+    fn connect_udp(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<super::traits::UdpOutboundHandle, crate::error::UdpError> {
-        use super::socks5_udp::{Socks5Auth, Socks5UdpAssociation};
-        use super::traits::{Socks5UdpHandle, UdpOutboundHandle};
-        use crate::error::UdpError;
+    ) -> Pin<Box<dyn Future<Output = Result<super::traits::UdpOutboundHandle, crate::error::UdpError>> + Send + '_>> {
+        Box::pin(async move {
+            use super::socks5_udp::{Socks5Auth, Socks5UdpAssociation};
+            use super::traits::{Socks5UdpHandle, UdpOutboundHandle};
+            use crate::error::UdpError;
 
-        if !self.is_enabled() {
-            return Err(UdpError::OutboundDisabled {
-                tag: self.config.tag.clone(),
-            });
-        }
+            if !self.is_enabled() {
+                return Err(UdpError::OutboundDisabled {
+                    tag: self.config.tag.clone(),
+                });
+            }
 
-        // Convert config auth to SOCKS5 UDP auth format
-        let auth = if self.config.has_auth() {
-            Some(Socks5Auth::new(
-                self.config.username.clone().unwrap_or_default(),
-                self.config.password.clone().unwrap_or_default(),
-            ))
-        } else {
-            None
-        };
+            // Convert config auth to SOCKS5 UDP auth format
+            let auth = if self.config.has_auth() {
+                Some(Socks5Auth::new(
+                    self.config.username.clone().unwrap_or_default(),
+                    self.config.password.clone().unwrap_or_default(),
+                ))
+            } else {
+                None
+            };
 
-        // Establish UDP ASSOCIATE
-        let association =
-            Socks5UdpAssociation::establish(self.config.socks5_addr, auth, connect_timeout)
-                .await
-                .map_err(|e| UdpError::Socks5UdpAssociationFailed {
-                    reason: e.to_string(),
-                })?;
+            // Establish UDP ASSOCIATE
+            let association =
+                Socks5UdpAssociation::establish(self.config.socks5_addr, auth, connect_timeout)
+                    .await
+                    .map_err(|e| UdpError::Socks5UdpAssociationFailed {
+                        reason: e.to_string(),
+                    })?;
 
-        debug!(
-            "SOCKS5 UDP association established for {} via {} (relay: {})",
-            addr,
-            self.config.tag,
-            association.relay_addr()
-        );
+            debug!(
+                "SOCKS5 UDP association established for {} via {} (relay: {})",
+                addr,
+                self.config.tag,
+                association.relay_addr()
+            );
 
-        Ok(UdpOutboundHandle::Socks5(Socks5UdpHandle::new(
-            std::sync::Arc::new(association),
-            addr,
-        )))
+            Ok(UdpOutboundHandle::Socks5(Socks5UdpHandle::new(
+                std::sync::Arc::new(association),
+                addr,
+            )))
+        })
     }
 
     fn supports_udp(&self) -> bool {

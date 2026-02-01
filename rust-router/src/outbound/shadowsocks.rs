@@ -59,6 +59,7 @@
 //! ```
 
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -67,7 +68,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
@@ -694,28 +694,29 @@ impl ShadowsocksOutbound {
 }
 
 #[cfg(feature = "shadowsocks")]
-#[async_trait]
 impl Outbound for ShadowsocksOutbound {
-    async fn connect(
+    fn connect(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<OutboundConnection, OutboundError> {
-        if !self.is_enabled() {
-            return Err(OutboundError::unavailable(
-                &self.tag,
-                "outbound is disabled",
-            ));
-        }
+    ) -> Pin<Box<dyn Future<Output = Result<OutboundConnection, OutboundError>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(OutboundError::unavailable(
+                    &self.tag,
+                    "outbound is disabled",
+                ));
+            }
 
-        self.stats.record_connection();
+            self.stats.record_connection();
 
-        // Dispatch based on transport type
-        match &self.config.transport {
-            ShadowsocksTransport::Tcp => self.connect_tcp(addr, connect_timeout).await,
-            #[cfg(feature = "transport-quic")]
-            ShadowsocksTransport::Quic { .. } => self.connect_quic(addr, connect_timeout).await,
-        }
+            // Dispatch based on transport type
+            match &self.config.transport {
+                ShadowsocksTransport::Tcp => self.connect_tcp(addr, connect_timeout).await,
+                #[cfg(feature = "transport-quic")]
+                ShadowsocksTransport::Quic { .. } => self.connect_quic(addr, connect_timeout).await,
+            }
+        })
     }
 
     fn tag(&self) -> &str {
@@ -757,74 +758,76 @@ impl Outbound for ShadowsocksOutbound {
     ///
     /// Creates a ProxySocket connected to the Shadowsocks server for UDP relay.
     /// Each UDP packet is individually encrypted with the target address.
-    async fn connect_udp(
+    fn connect_udp(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<UdpOutboundHandle, UdpError> {
-        // Check if UDP is enabled in config
-        if !self.config.udp {
-            return Err(UdpError::UdpNotSupported {
-                tag: self.tag.clone(),
-            });
-        }
-
-        if !self.is_enabled() {
-            return Err(UdpError::OutboundDisabled {
-                tag: self.tag.clone(),
-            });
-        }
-
-        debug!(
-            "Shadowsocks UDP connecting to {} via {} (server: {})",
-            addr,
-            self.tag,
-            self.config.server_string()
-        );
-
-        // Create UDP proxy socket with timeout
-        let connect_result = timeout(
-            connect_timeout,
-            ProxySocket::connect(self.ss_context.clone(), &self.ss_config),
-        )
-        .await;
-
-        match connect_result {
-            Ok(Ok(proxy_socket)) => {
-                self.update_health(true);
-                debug!("Shadowsocks UDP socket to {} via {} ready", addr, self.tag);
-
-                // Create the handle
-                let handle = ShadowsocksUdpHandle::new(Arc::new(proxy_socket), addr);
-                Ok(UdpOutboundHandle::Shadowsocks(handle))
+    ) -> Pin<Box<dyn Future<Output = Result<UdpOutboundHandle, UdpError>> + Send + '_>> {
+        Box::pin(async move {
+            // Check if UDP is enabled in config
+            if !self.config.udp {
+                return Err(UdpError::UdpNotSupported {
+                    tag: self.tag.clone(),
+                });
             }
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                warn!(
-                    "Shadowsocks UDP connection to {} via {} failed: {}",
-                    addr, self.tag, e
-                );
-                Err(UdpError::Socks5UdpAssociationFailed {
-                    reason: format!("Shadowsocks UDP connection failed: {e}"),
-                })
+
+            if !self.is_enabled() {
+                return Err(UdpError::OutboundDisabled {
+                    tag: self.tag.clone(),
+                });
             }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                warn!(
-                    "Shadowsocks UDP connection to {} via {} timed out",
-                    addr, self.tag
-                );
-                Err(UdpError::IoError(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "Shadowsocks UDP connection timed out after {}s",
-                        connect_timeout.as_secs()
-                    ),
-                )))
+
+            debug!(
+                "Shadowsocks UDP connecting to {} via {} (server: {})",
+                addr,
+                self.tag,
+                self.config.server_string()
+            );
+
+            // Create UDP proxy socket with timeout
+            let connect_result = timeout(
+                connect_timeout,
+                ProxySocket::connect(self.ss_context.clone(), &self.ss_config),
+            )
+            .await;
+
+            match connect_result {
+                Ok(Ok(proxy_socket)) => {
+                    self.update_health(true);
+                    debug!("Shadowsocks UDP socket to {} via {} ready", addr, self.tag);
+
+                    // Create the handle
+                    let handle = ShadowsocksUdpHandle::new(Arc::new(proxy_socket), addr);
+                    Ok(UdpOutboundHandle::Shadowsocks(handle))
+                }
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    warn!(
+                        "Shadowsocks UDP connection to {} via {} failed: {}",
+                        addr, self.tag, e
+                    );
+                    Err(UdpError::Socks5UdpAssociationFailed {
+                        reason: format!("Shadowsocks UDP connection failed: {e}"),
+                    })
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    warn!(
+                        "Shadowsocks UDP connection to {} via {} timed out",
+                        addr, self.tag
+                    );
+                    Err(UdpError::IoError(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "Shadowsocks UDP connection timed out after {}s",
+                            connect_timeout.as_secs()
+                        ),
+                    )))
+                }
             }
-        }
+        })
     }
 
     fn supports_udp(&self) -> bool {

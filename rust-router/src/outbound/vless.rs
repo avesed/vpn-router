@@ -40,12 +40,13 @@
 //! ```
 
 use std::fmt;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -551,86 +552,87 @@ impl VlessOutbound {
     }
 }
 
-#[async_trait]
 impl Outbound for VlessOutbound {
-    async fn connect(
+    fn connect(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<OutboundConnection, OutboundError> {
-        if !self.is_enabled() {
-            return Err(OutboundError::unavailable(
-                &self.config.tag,
-                "outbound is disabled",
-            ));
-        }
-
-        self.stats.record_connection();
-
-        // Build transport configuration
-        let transport_config = self.build_transport_config();
-
-        debug!(
-            "VLESS connecting to {} via {} (dest: {})",
-            self.config.server_string(),
-            self.config.tag,
-            addr
-        );
-
-        // Connect transport with timeout
-        let transport_result = timeout(connect_timeout, transport_connect(&transport_config)).await;
-
-        let mut stream = match transport_result {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                return Err(OutboundError::connection_failed(
-                    addr,
-                    format!("transport connection failed: {e}"),
+    ) -> Pin<Box<dyn Future<Output = Result<OutboundConnection, OutboundError>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(OutboundError::unavailable(
+                    &self.config.tag,
+                    "outbound is disabled",
                 ));
             }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                return Err(OutboundError::Timeout {
-                    addr,
-                    timeout_secs: connect_timeout.as_secs(),
-                });
-            }
-        };
 
-        // Send VLESS request header (do NOT wait for response - deferred pattern)
-        let request_result =
-            timeout(connect_timeout, self.send_vless_request(&mut stream, addr)).await;
+            self.stats.record_connection();
 
-        match request_result {
-            Ok(Ok(())) => {
-                self.update_health(true);
-                debug!(
-                    "VLESS connection to {} via {} ready (deferred response)",
-                    addr, self.config.tag
-                );
+            // Build transport configuration
+            let transport_config = self.build_transport_config();
 
-                // Wrap in VlessStream for deferred response header handling
-                // The response header will be consumed on first read
-                let vless_stream = VlessStream::new(stream);
-                Ok(OutboundConnection::from_vless(vless_stream, addr))
+            debug!(
+                "VLESS connecting to {} via {} (dest: {})",
+                self.config.server_string(),
+                self.config.tag,
+                addr
+            );
+
+            // Connect transport with timeout
+            let transport_result = timeout(connect_timeout, transport_connect(&transport_config)).await;
+
+            let mut stream = match transport_result {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    return Err(OutboundError::connection_failed(
+                        addr,
+                        format!("transport connection failed: {e}"),
+                    ));
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    return Err(OutboundError::Timeout {
+                        addr,
+                        timeout_secs: connect_timeout.as_secs(),
+                    });
+                }
+            };
+
+            // Send VLESS request header (do NOT wait for response - deferred pattern)
+            let request_result =
+                timeout(connect_timeout, self.send_vless_request(&mut stream, addr)).await;
+
+            match request_result {
+                Ok(Ok(())) => {
+                    self.update_health(true);
+                    debug!(
+                        "VLESS connection to {} via {} ready (deferred response)",
+                        addr, self.config.tag
+                    );
+
+                    // Wrap in VlessStream for deferred response header handling
+                    // The response header will be consumed on first read
+                    let vless_stream = VlessStream::new(stream);
+                    Ok(OutboundConnection::from_vless(vless_stream, addr))
+                }
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    Err(OutboundError::connection_failed(addr, e.to_string()))
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    Err(OutboundError::Timeout {
+                        addr,
+                        timeout_secs: connect_timeout.as_secs(),
+                    })
+                }
             }
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                Err(OutboundError::connection_failed(addr, e.to_string()))
-            }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                Err(OutboundError::Timeout {
-                    addr,
-                    timeout_secs: connect_timeout.as_secs(),
-                })
-            }
-        }
+        })
     }
 
     fn tag(&self) -> &str {
@@ -678,13 +680,14 @@ impl Outbound for VlessOutbound {
     }
 
     // UDP is not supported yet
-    async fn connect_udp(
+    fn connect_udp(
         &self,
         _addr: SocketAddr,
         _timeout: Duration,
-    ) -> Result<super::traits::UdpOutboundHandle, UdpError> {
-        Err(UdpError::UdpNotSupported {
-            tag: self.config.tag.clone(),
+    ) -> Pin<Box<dyn Future<Output = Result<super::traits::UdpOutboundHandle, UdpError>> + Send + '_>> {
+        let tag = self.config.tag.clone();
+        Box::pin(async move {
+            Err(UdpError::UdpNotSupported { tag })
         })
     }
 

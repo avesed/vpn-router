@@ -6,15 +6,16 @@
 //!
 //! Supports both TCP and UDP protocols.
 
+use std::future::Future;
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -341,94 +342,95 @@ impl DirectOutbound {
     }
 }
 
-#[async_trait]
 impl Outbound for DirectOutbound {
-    async fn connect(
+    fn connect(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<OutboundConnection, OutboundError> {
-        if !self.is_enabled() {
-            return Err(OutboundError::unavailable(
-                &self.config.tag,
-                "outbound is disabled",
-            ));
-        }
-
-        self.stats.record_connection();
-
-        // Create socket with configured options
-        let socket = self.create_socket()?;
-
-        // Initiate non-blocking connect
-        // EINPROGRESS is expected for non-blocking sockets
-        match socket.connect(&addr.into()) {
-            Ok(()) => {}
-            Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(e) => {
-                // Socket is dropped here, closing the fd
-                self.stats.record_error();
-                return Err(OutboundError::connection_failed(addr, e.to_string()));
+    ) -> Pin<Box<dyn Future<Output = Result<OutboundConnection, OutboundError>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(OutboundError::unavailable(
+                    &self.config.tag,
+                    "outbound is disabled",
+                ));
             }
-        }
 
-        // Convert socket to TcpStream immediately after connect initiation
-        // This ensures proper ownership - TcpStream will close fd on drop
-        let std_stream: std::net::TcpStream = socket.into();
-        let stream = match TcpStream::from_std(std_stream) {
-            Ok(s) => s,
-            Err(e) => {
-                self.stats.record_error();
-                return Err(OutboundError::connection_failed(addr, e.to_string()));
+            self.stats.record_connection();
+
+            // Create socket with configured options
+            let socket = self.create_socket()?;
+
+            // Initiate non-blocking connect
+            // EINPROGRESS is expected for non-blocking sockets
+            match socket.connect(&addr.into()) {
+                Ok(()) => {}
+                Err(ref e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+                Err(e) => {
+                    // Socket is dropped here, closing the fd
+                    self.stats.record_error();
+                    return Err(OutboundError::connection_failed(addr, e.to_string()));
+                }
             }
-        };
 
-        // Wait for connection to complete with timeout
-        let connect_result = timeout(connect_timeout, async {
-            // Wait for socket to become writable (connection complete or failed)
-            stream
-                .writable()
-                .await
-                .map_err(|e| OutboundError::connection_failed(addr, e.to_string()))?;
+            // Convert socket to TcpStream immediately after connect initiation
+            // This ensures proper ownership - TcpStream will close fd on drop
+            let std_stream: std::net::TcpStream = socket.into();
+            let stream = match TcpStream::from_std(std_stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.stats.record_error();
+                    return Err(OutboundError::connection_failed(addr, e.to_string()));
+                }
+            };
 
-            // Check for connection errors via SO_ERROR
-            match stream.take_error() {
-                Ok(Some(e)) => Err(OutboundError::connection_failed(addr, e.to_string())),
-                Ok(None) => Ok(()),
-                Err(e) => Err(OutboundError::connection_failed(addr, e.to_string())),
+            // Wait for connection to complete with timeout
+            let connect_result = timeout(connect_timeout, async {
+                // Wait for socket to become writable (connection complete or failed)
+                stream
+                    .writable()
+                    .await
+                    .map_err(|e| OutboundError::connection_failed(addr, e.to_string()))?;
+
+                // Check for connection errors via SO_ERROR
+                match stream.take_error() {
+                    Ok(Some(e)) => Err(OutboundError::connection_failed(addr, e.to_string())),
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(OutboundError::connection_failed(addr, e.to_string())),
+                }
+            })
+            .await;
+
+            match connect_result {
+                Ok(Ok(())) => {
+                    self.update_health(true);
+                    // Disable Nagle's algorithm for lower latency
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::warn!("Failed to set TCP_NODELAY: {}", e);
+                    }
+                    debug!(
+                        "Direct connection to {} via {} successful",
+                        addr, self.config.tag
+                    );
+                    Ok(OutboundConnection::new(stream, addr))
+                }
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    // stream is dropped here, closing the fd
+                    Err(e)
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    // stream is dropped here, closing the fd
+                    Err(OutboundError::Timeout {
+                        addr,
+                        timeout_secs: connect_timeout.as_secs(),
+                    })
+                }
             }
         })
-        .await;
-
-        match connect_result {
-            Ok(Ok(())) => {
-                self.update_health(true);
-                // Disable Nagle's algorithm for lower latency
-                if let Err(e) = stream.set_nodelay(true) {
-                    tracing::warn!("Failed to set TCP_NODELAY: {}", e);
-                }
-                debug!(
-                    "Direct connection to {} via {} successful",
-                    addr, self.config.tag
-                );
-                Ok(OutboundConnection::new(stream, addr))
-            }
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                // stream is dropped here, closing the fd
-                Err(e)
-            }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                // stream is dropped here, closing the fd
-                Err(OutboundError::Timeout {
-                    addr,
-                    timeout_secs: connect_timeout.as_secs(),
-                })
-            }
-        }
     }
 
     fn tag(&self) -> &str {
@@ -462,61 +464,63 @@ impl Outbound for DirectOutbound {
 
     // === UDP Methods ===
 
-    async fn connect_udp(
+    fn connect_udp(
         &self,
         addr: SocketAddr,
         connect_timeout: Duration,
-    ) -> Result<UdpOutboundHandle, UdpError> {
-        if !self.is_enabled() {
-            return Err(UdpError::outbound_disabled(&self.config.tag));
-        }
-
-        self.stats.record_connection();
-
-        // Create UDP socket with configured options
-        let socket = self.create_udp_socket()?;
-
-        // Convert to std socket
-        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) };
-
-        // Convert to tokio UdpSocket
-        let socket = UdpSocket::from_std(std_socket).map_err(|e| {
-            UdpError::socket_option("from_std", format!("Failed to convert socket: {e}"))
-        })?;
-
-        // Connect the socket to the destination (with timeout)
-        let connect_result = timeout(connect_timeout, socket.connect(addr)).await;
-
-        match connect_result {
-            Ok(Ok(())) => {
-                self.update_health(true);
-                debug!(
-                    "Direct UDP connection to {} via {} successful",
-                    addr, self.config.tag
-                );
-                Ok(UdpOutboundHandle::Direct(DirectUdpHandle::new(
-                    socket,
-                    addr,
-                    self.config.routing_mark,
-                )))
+    ) -> Pin<Box<dyn Future<Output = Result<UdpOutboundHandle, UdpError>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.is_enabled() {
+                return Err(UdpError::outbound_disabled(&self.config.tag));
             }
-            Ok(Err(e)) => {
-                self.update_health(false);
-                self.stats.record_error();
-                Err(UdpError::socket_option(
-                    "connect",
-                    format!("Failed to connect UDP to {addr}: {e}"),
-                ))
+
+            self.stats.record_connection();
+
+            // Create UDP socket with configured options
+            let socket = self.create_udp_socket()?;
+
+            // Convert to std socket
+            let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) };
+
+            // Convert to tokio UdpSocket
+            let socket = UdpSocket::from_std(std_socket).map_err(|e| {
+                UdpError::socket_option("from_std", format!("Failed to convert socket: {e}"))
+            })?;
+
+            // Connect the socket to the destination (with timeout)
+            let connect_result = timeout(connect_timeout, socket.connect(addr)).await;
+
+            match connect_result {
+                Ok(Ok(())) => {
+                    self.update_health(true);
+                    debug!(
+                        "Direct UDP connection to {} via {} successful",
+                        addr, self.config.tag
+                    );
+                    Ok(UdpOutboundHandle::Direct(DirectUdpHandle::new(
+                        socket,
+                        addr,
+                        self.config.routing_mark,
+                    )))
+                }
+                Ok(Err(e)) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    Err(UdpError::socket_option(
+                        "connect",
+                        format!("Failed to connect UDP to {addr}: {e}"),
+                    ))
+                }
+                Err(_) => {
+                    self.update_health(false);
+                    self.stats.record_error();
+                    Err(UdpError::socket_option(
+                        "connect",
+                        format!("UDP connection to {addr} timed out after {connect_timeout:?}"),
+                    ))
+                }
             }
-            Err(_) => {
-                self.update_health(false);
-                self.stats.record_error();
-                Err(UdpError::socket_option(
-                    "connect",
-                    format!("UDP connection to {addr} timed out after {connect_timeout:?}"),
-                ))
-            }
-        }
+        })
     }
 
     fn supports_udp(&self) -> bool {

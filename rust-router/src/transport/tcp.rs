@@ -16,10 +16,10 @@
 //! # }
 //! ```
 
+use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -74,15 +74,26 @@ impl TcpTransport {
         stream: &TcpStream,
         config: &TransportConfig,
     ) -> Result<(), TransportError> {
+        Self::configure_socket_inner(stream, config.tcp_nodelay, config.tcp_keepalive)
+    }
+
+    /// Configure TCP socket options with individual parameters
+    ///
+    /// This internal helper avoids borrowing issues with async closures.
+    fn configure_socket_inner(
+        stream: &TcpStream,
+        tcp_nodelay: bool,
+        tcp_keepalive: bool,
+    ) -> Result<(), TransportError> {
         // Set TCP_NODELAY (disable Nagle's algorithm)
-        if config.tcp_nodelay {
+        if tcp_nodelay {
             stream
                 .set_nodelay(true)
                 .map_err(|e| TransportError::socket_option("TCP_NODELAY", e.to_string()))?;
         }
 
         // Set TCP keepalive
-        if config.tcp_keepalive {
+        if tcp_keepalive {
             let socket_ref = SockRef::from(stream);
             let keepalive = TcpKeepalive::new()
                 .with_time(Duration::from_secs(60))
@@ -115,7 +126,6 @@ impl TcpTransport {
     }
 }
 
-#[async_trait]
 impl Transport for TcpTransport {
     /// Connect to a remote server over TCP
     ///
@@ -132,43 +142,54 @@ impl Transport for TcpTransport {
     /// - DNS resolution fails
     /// - All connection attempts fail
     /// - Socket configuration fails
-    async fn connect(&self, config: &TransportConfig) -> Result<TransportStream, TransportError> {
-        // Resolve address to socket addresses
-        let addrs = Self::resolve_address(&config.address, config.port)?;
+    fn connect(
+        &self,
+        config: &TransportConfig,
+    ) -> impl Future<Output = Result<TransportStream, TransportError>> + Send {
+        // Resolve address to socket addresses before entering the async block
+        let resolve_result = Self::resolve_address(&config.address, config.port);
+        let connect_timeout = config.connect_timeout;
+        let tcp_nodelay = config.tcp_nodelay;
+        let tcp_keepalive = config.tcp_keepalive;
+        let address_string = config.address_string();
 
-        // Try connecting to each address
-        let mut last_error = None;
+        async move {
+            let addrs = resolve_result?;
 
-        for addr in addrs {
-            match Self::connect_to_addr(addr, config.connect_timeout).await {
-                Ok(stream) => {
-                    // Configure socket options
-                    Self::configure_socket(&stream, config)?;
+            // Try connecting to each address
+            let mut last_error = None;
 
-                    tracing::debug!(
-                        addr = %addr,
-                        nodelay = config.tcp_nodelay,
-                        keepalive = config.tcp_keepalive,
-                        "TCP connection established"
-                    );
+            for addr in addrs {
+                match Self::connect_to_addr(addr, connect_timeout).await {
+                    Ok(stream) => {
+                        // Configure socket options
+                        Self::configure_socket_inner(&stream, tcp_nodelay, tcp_keepalive)?;
 
-                    return Ok(TransportStream::Tcp(stream));
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        addr = %addr,
-                        error = %e,
-                        "TCP connection attempt failed"
-                    );
-                    last_error = Some(e);
+                        tracing::debug!(
+                            addr = %addr,
+                            nodelay = tcp_nodelay,
+                            keepalive = tcp_keepalive,
+                            "TCP connection established"
+                        );
+
+                        return Ok(TransportStream::Tcp(stream));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            addr = %addr,
+                            error = %e,
+                            "TCP connection attempt failed"
+                        );
+                        last_error = Some(e);
+                    }
                 }
             }
-        }
 
-        // All addresses failed
-        Err(last_error.unwrap_or_else(|| {
-            TransportError::connection_failed(config.address_string(), "no addresses to connect to")
-        }))
+            // All addresses failed
+            Err(last_error.unwrap_or_else(|| {
+                TransportError::connection_failed(address_string, "no addresses to connect to")
+            }))
+        }
     }
 }
 

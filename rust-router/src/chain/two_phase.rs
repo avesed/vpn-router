@@ -56,11 +56,12 @@
 //! - **Network partition**: Timeout-based abort
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -168,7 +169,6 @@ pub struct ParticipantState {
 /// This trait abstracts network communication for the 2PC protocol,
 /// allowing for mock implementations in tests and real network
 /// implementations in production.
-#[async_trait]
 pub trait ChainNetworkClient: Send + Sync {
     /// Send PREPARE request to a node
     ///
@@ -180,7 +180,11 @@ pub trait ChainNetworkClient: Send + Sync {
     /// # Returns
     ///
     /// Ok if the node is prepared, Err with reason otherwise.
-    async fn send_prepare(&self, node: &str, config: &ChainConfig) -> Result<(), String>;
+    fn send_prepare(
+        &self,
+        node: &str,
+        config: &ChainConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
     /// Send COMMIT request to a node
     ///
@@ -192,7 +196,11 @@ pub trait ChainNetworkClient: Send + Sync {
     /// # Returns
     ///
     /// Ok if commit successful, Err with reason otherwise.
-    async fn send_commit(&self, node: &str, chain_tag: &str) -> Result<(), String>;
+    fn send_commit(
+        &self,
+        node: &str,
+        chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
     /// Send ABORT request to a node
     ///
@@ -204,7 +212,11 @@ pub trait ChainNetworkClient: Send + Sync {
     /// # Returns
     ///
     /// Ok if abort successful, Err with reason otherwise.
-    async fn send_abort(&self, node: &str, chain_tag: &str) -> Result<(), String>;
+    fn send_abort(
+        &self,
+        node: &str,
+        chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 /// No-op network client for single-node testing
@@ -213,18 +225,29 @@ pub trait ChainNetworkClient: Send + Sync {
 /// testing chain activation on a single node without network.
 pub struct NoOpNetworkClient;
 
-#[async_trait]
 impl ChainNetworkClient for NoOpNetworkClient {
-    async fn send_prepare(&self, _node: &str, _config: &ChainConfig) -> Result<(), String> {
-        Ok(())
+    fn send_prepare(
+        &self,
+        _node: &str,
+        _config: &ChainConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 
-    async fn send_commit(&self, _node: &str, _chain_tag: &str) -> Result<(), String> {
-        Ok(())
+    fn send_commit(
+        &self,
+        _node: &str,
+        _chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 
-    async fn send_abort(&self, _node: &str, _chain_tag: &str) -> Result<(), String> {
-        Ok(())
+    fn send_abort(
+        &self,
+        _node: &str,
+        _chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -403,55 +426,78 @@ impl ForwardPeerNetworkClient {
     }
 }
 
-#[async_trait]
 impl ChainNetworkClient for ForwardPeerNetworkClient {
-    async fn send_prepare(&self, node: &str, config: &ChainConfig) -> Result<(), String> {
-        debug!(node = %node, chain = %config.tag, "Sending PREPARE to remote node");
+    fn send_prepare(
+        &self,
+        node: &str,
+        config: &ChainConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let node = node.to_string();
+        let config = config.clone();
+        Box::pin(async move {
+            debug!(node = %node, chain = %config.tag, "Sending PREPARE to remote node");
 
-        // Build request body
-        let body = serde_json::json!({
-            "chain_tag": config.tag,
-            "config": config,
-            "source_node": self.local_node_tag
-        });
+            // Build request body
+            let body = serde_json::json!({
+                "chain_tag": config.tag,
+                "config": config,
+                "source_node": self.local_node_tag
+            });
 
-        let response = self
-            .send_request(node, "/api/chain-routing/prepare", body.to_string())
-            .await?;
+            let response = self
+                .send_request(&node, "/api/chain-routing/prepare", body.to_string())
+                .await?;
 
-        self.parse_response(&response)
+            self.parse_response(&response)
+        })
     }
 
-    async fn send_commit(&self, node: &str, chain_tag: &str) -> Result<(), String> {
-        debug!(node = %node, chain = %chain_tag, "Sending COMMIT to remote node");
+    fn send_commit(
+        &self,
+        node: &str,
+        chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let node = node.to_string();
+        let chain_tag = chain_tag.to_string();
+        Box::pin(async move {
+            debug!(node = %node, chain = %chain_tag, "Sending COMMIT to remote node");
 
-        // Build request body
-        let body = serde_json::json!({
-            "chain_tag": chain_tag,
-            "source_node": self.local_node_tag
-        });
+            // Build request body
+            let body = serde_json::json!({
+                "chain_tag": chain_tag,
+                "source_node": self.local_node_tag
+            });
 
-        let response = self
-            .send_request(node, "/api/chain-routing/commit", body.to_string())
-            .await?;
+            let response = self
+                .send_request(&node, "/api/chain-routing/commit", body.to_string())
+                .await?;
 
-        self.parse_response(&response)
+            self.parse_response(&response)
+        })
     }
 
-    async fn send_abort(&self, node: &str, chain_tag: &str) -> Result<(), String> {
-        debug!(node = %node, chain = %chain_tag, "Sending ABORT to remote node");
+    fn send_abort(
+        &self,
+        node: &str,
+        chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let node = node.to_string();
+        let chain_tag = chain_tag.to_string();
+        Box::pin(async move {
+            debug!(node = %node, chain = %chain_tag, "Sending ABORT to remote node");
 
-        // Build request body
-        let body = serde_json::json!({
-            "chain_tag": chain_tag,
-            "source_node": self.local_node_tag
-        });
+            // Build request body
+            let body = serde_json::json!({
+                "chain_tag": chain_tag,
+                "source_node": self.local_node_tag
+            });
 
-        let response = self
-            .send_request(node, "/api/chain-routing/abort", body.to_string())
-            .await?;
+            let response = self
+                .send_request(&node, "/api/chain-routing/abort", body.to_string())
+                .await?;
 
-        self.parse_response(&response)
+            self.parse_response(&response)
+        })
     }
 }
 
@@ -504,48 +550,68 @@ impl MockNetworkClient {
     }
 }
 
-#[async_trait]
 impl ChainNetworkClient for MockNetworkClient {
-    async fn send_prepare(&self, node: &str, _config: &ChainConfig) -> Result<(), String> {
-        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        if let Ok(failures) = self.prepare_failures.lock() {
-            if let Some(reason) = failures.get(node) {
-                return Err(reason.clone());
+    fn send_prepare(
+        &self,
+        node: &str,
+        _config: &ChainConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let node = node.to_string();
+        Box::pin(async move {
+            let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-        }
-        Ok(())
+
+            if let Ok(failures) = self.prepare_failures.lock() {
+                if let Some(reason) = failures.get(&node) {
+                    return Err(reason.clone());
+                }
+            }
+            Ok(())
+        })
     }
 
-    async fn send_commit(&self, node: &str, _chain_tag: &str) -> Result<(), String> {
-        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        if let Ok(failures) = self.commit_failures.lock() {
-            if let Some(reason) = failures.get(node) {
-                return Err(reason.clone());
+    fn send_commit(
+        &self,
+        node: &str,
+        _chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let node = node.to_string();
+        Box::pin(async move {
+            let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-        }
-        Ok(())
+
+            if let Ok(failures) = self.commit_failures.lock() {
+                if let Some(reason) = failures.get(&node) {
+                    return Err(reason.clone());
+                }
+            }
+            Ok(())
+        })
     }
 
-    async fn send_abort(&self, node: &str, _chain_tag: &str) -> Result<(), String> {
-        let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        if let Ok(failures) = self.abort_failures.lock() {
-            if let Some(reason) = failures.get(node) {
-                return Err(reason.clone());
+    fn send_abort(
+        &self,
+        node: &str,
+        _chain_tag: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let node = node.to_string();
+        Box::pin(async move {
+            let delay = self.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-        }
-        Ok(())
+
+            if let Ok(failures) = self.abort_failures.lock() {
+                if let Some(reason) = failures.get(&node) {
+                    return Err(reason.clone());
+                }
+            }
+            Ok(())
+        })
     }
 }
 

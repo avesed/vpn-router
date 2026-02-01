@@ -25,11 +25,11 @@
 //! # }
 //! ```
 
+use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
@@ -88,15 +88,26 @@ impl TlsTransport {
         stream: &TcpStream,
         config: &TransportConfig,
     ) -> Result<(), TransportError> {
+        Self::configure_socket_inner(stream, config.tcp_nodelay, config.tcp_keepalive)
+    }
+
+    /// Configure TCP socket options with individual parameters
+    ///
+    /// This internal helper avoids borrowing issues with async closures.
+    fn configure_socket_inner(
+        stream: &TcpStream,
+        tcp_nodelay: bool,
+        tcp_keepalive: bool,
+    ) -> Result<(), TransportError> {
         // Set TCP_NODELAY
-        if config.tcp_nodelay {
+        if tcp_nodelay {
             stream
                 .set_nodelay(true)
                 .map_err(|e| TransportError::socket_option("TCP_NODELAY", e.to_string()))?;
         }
 
         // Set TCP keepalive
-        if config.tcp_keepalive {
+        if tcp_keepalive {
             let socket_ref = SockRef::from(stream);
             let keepalive = TcpKeepalive::new()
                 .with_time(Duration::from_secs(60))
@@ -157,8 +168,28 @@ impl TlsTransport {
         tls_connector: &TlsConnector,
         config: &TransportConfig,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, TransportError> {
-        let connect_timeout = config.connect_timeout;
+        Self::connect_to_addr_inner(
+            addr,
+            server_name,
+            tls_connector,
+            config.connect_timeout,
+            config.tcp_nodelay,
+            config.tcp_keepalive,
+        )
+        .await
+    }
 
+    /// Connect to a single address with TLS using individual parameters
+    ///
+    /// This internal helper avoids borrowing issues with async closures.
+    async fn connect_to_addr_inner(
+        addr: SocketAddr,
+        server_name: ServerName<'static>,
+        tls_connector: &TlsConnector,
+        connect_timeout: Duration,
+        tcp_nodelay: bool,
+        tcp_keepalive: bool,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, TransportError> {
         // Establish TCP connection
         let tcp_connect = TcpStream::connect(addr);
         let tcp_stream = timeout(connect_timeout, tcp_connect)
@@ -169,7 +200,7 @@ impl TlsTransport {
             .map_err(|e| TransportError::connection_failed(addr.to_string(), e.to_string()))?;
 
         // Configure TCP socket options before TLS handshake
-        Self::configure_socket(&tcp_stream, config)?;
+        Self::configure_socket_inner(&tcp_stream, tcp_nodelay, tcp_keepalive)?;
 
         // Perform TLS handshake
         let tls_connect = tls_connector.connect(server_name.clone(), tcp_stream);
@@ -189,7 +220,6 @@ impl TlsTransport {
     }
 }
 
-#[async_trait]
 impl Transport for TlsTransport {
     /// Connect to a remote server over TLS
     ///
@@ -207,57 +237,78 @@ impl Transport for TlsTransport {
     /// - TCP connection fails
     /// - TLS handshake fails
     /// - Socket configuration fails
-    async fn connect(&self, config: &TransportConfig) -> Result<TransportStream, TransportError> {
-        // TLS configuration is required
-        let tls_config = config
-            .tls
-            .as_ref()
-            .ok_or_else(|| TransportError::tls_config("TLS configuration required"))?;
+    fn connect(
+        &self,
+        config: &TransportConfig,
+    ) -> impl Future<Output = Result<TransportStream, TransportError>> + Send {
+        // Capture all needed values from config before the async block
+        let tls_config_opt = config.tls.clone();
+        let address = config.address.clone();
+        let port = config.port;
+        let connect_timeout = config.connect_timeout;
+        let tcp_nodelay = config.tcp_nodelay;
+        let tcp_keepalive = config.tcp_keepalive;
+        let address_string = config.address_string();
 
-        // Parse server name for SNI
-        let server_name: ServerName<'static> = tls_config
-            .server_name
-            .clone()
-            .try_into()
-            .map_err(|_| TransportError::invalid_server_name(&tls_config.server_name))?;
+        async move {
+            // TLS configuration is required
+            let tls_config = tls_config_opt
+                .ok_or_else(|| TransportError::tls_config("TLS configuration required"))?;
 
-        // Create TLS configuration and connector
-        let client_config = Self::create_tls_config(tls_config)?;
-        let tls_connector = TlsConnector::from(Arc::new(client_config));
+            // Parse server name for SNI
+            let server_name: ServerName<'static> = tls_config
+                .server_name
+                .clone()
+                .try_into()
+                .map_err(|_| TransportError::invalid_server_name(&tls_config.server_name))?;
 
-        // Resolve address
-        let addrs = Self::resolve_address(&config.address, config.port)?;
+            // Create TLS configuration and connector
+            let client_config = Self::create_tls_config(&tls_config)?;
+            let tls_connector = TlsConnector::from(Arc::new(client_config));
 
-        // Try connecting to each address
-        let mut last_error = None;
+            // Resolve address
+            let addrs = Self::resolve_address(&address, port)?;
 
-        for addr in addrs {
-            match Self::connect_to_addr(addr, server_name.clone(), &tls_connector, config).await {
-                Ok(tls_stream) => {
-                    tracing::debug!(
-                        addr = %addr,
-                        server_name = %tls_config.server_name,
-                        alpn = ?tls_config.alpn,
-                        "TLS connection established"
-                    );
+            // Try connecting to each address
+            let mut last_error = None;
 
-                    return Ok(TransportStream::Tls(tls_stream));
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        addr = %addr,
-                        server_name = %tls_config.server_name,
-                        error = %e,
-                        "TLS connection attempt failed"
-                    );
-                    last_error = Some(e);
+            for addr in addrs {
+                match Self::connect_to_addr_inner(
+                    addr,
+                    server_name.clone(),
+                    &tls_connector,
+                    connect_timeout,
+                    tcp_nodelay,
+                    tcp_keepalive,
+                )
+                .await
+                {
+                    Ok(tls_stream) => {
+                        tracing::debug!(
+                            addr = %addr,
+                            server_name = %tls_config.server_name,
+                            alpn = ?tls_config.alpn,
+                            "TLS connection established"
+                        );
+
+                        return Ok(TransportStream::Tls(tls_stream));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            addr = %addr,
+                            server_name = %tls_config.server_name,
+                            error = %e,
+                            "TLS connection attempt failed"
+                        );
+                        last_error = Some(e);
+                    }
                 }
             }
-        }
 
-        Err(last_error.unwrap_or_else(|| {
-            TransportError::connection_failed(config.address_string(), "no addresses to connect to")
-        }))
+            Err(last_error.unwrap_or_else(|| {
+                TransportError::connection_failed(address_string, "no addresses to connect to")
+            }))
+        }
     }
 }
 

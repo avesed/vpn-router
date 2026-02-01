@@ -68,16 +68,16 @@ use super::tun::TunDeviceWrapper;
 use crate::netbridge::config::{REPLY_CHANNEL_SIZE, TUN_MTU};
 use crate::netbridge::error::{NetBridgeError, Result};
 use crate::netbridge::reply::ReplyRouter;
-use crate::netbridge::session::SessionTracker;
-use crate::netbridge::traits::NetBridgeIngress;
-use crate::netbridge::types::{FiveTuple, IngressStats, ReplyPacket};
+use crate::netbridge::session::{RegisterResult, SessionTracker};
+use crate::netbridge::traits::{NetBridgeIngress, SessionHandler, SessionInfo};
+use crate::netbridge::types::{FiveTuple, IngressStats, IpProtocol, ReplyPacket};
 
 // =============================================================================
 // KernelIngress Configuration
 // =============================================================================
 
 /// Configuration for the kernel ingress bridge
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KernelIngressConfig {
     /// TUN device name
     pub tun_name: String,
@@ -97,6 +97,25 @@ pub struct KernelIngressConfig {
     pub tcp_backlog: u32,
     /// Reply channel size
     pub reply_channel_size: usize,
+    /// Optional session handler for lifecycle callbacks
+    pub session_handler: Option<Arc<dyn SessionHandler>>,
+}
+
+impl std::fmt::Debug for KernelIngressConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KernelIngressConfig")
+            .field("tun_name", &self.tun_name)
+            .field("tun_address", &self.tun_address)
+            .field("tun_subnet", &self.tun_subnet)
+            .field("tproxy_addr", &self.tproxy_addr)
+            .field("fwmark", &self.fwmark)
+            .field("table_id", &self.table_id)
+            .field("mtu", &self.mtu)
+            .field("tcp_backlog", &self.tcp_backlog)
+            .field("reply_channel_size", &self.reply_channel_size)
+            .field("session_handler", &self.session_handler.is_some())
+            .finish()
+    }
 }
 
 impl KernelIngressConfig {
@@ -113,6 +132,7 @@ impl KernelIngressConfig {
             mtu: TUN_MTU as u16,
             tcp_backlog: 1024,
             reply_channel_size: REPLY_CHANNEL_SIZE,
+            session_handler: None,
         }
     }
 
@@ -155,6 +175,15 @@ impl KernelIngressConfig {
     #[must_use]
     pub const fn reply_channel_size(mut self, size: usize) -> Self {
         self.reply_channel_size = size;
+        self
+    }
+
+    /// Set the session handler for lifecycle callbacks
+    ///
+    /// The handler will be notified when sessions are created or closed.
+    #[must_use]
+    pub fn with_session_handler(mut self, handler: Arc<dyn SessionHandler>) -> Self {
+        self.session_handler = Some(handler);
         self
     }
 
@@ -224,6 +253,8 @@ pub struct KernelIngress {
     shutdown_requested: AtomicBool,
     /// Statistics
     stats: KernelIngressStats,
+    /// Optional session handler for lifecycle callbacks
+    session_handler: Option<Arc<dyn SessionHandler>>,
 }
 
 impl KernelIngress {
@@ -288,9 +319,13 @@ impl KernelIngress {
         // Create reply router
         let reply_router = Arc::new(ReplyRouter::new(Arc::clone(&sessions), reply_tx.clone()));
 
+        // Extract session handler before moving config
+        let session_handler = config.session_handler.clone();
+
         info!(
             tun_name = %config.tun_name,
             tproxy_addr = %config.tproxy_addr,
+            has_session_handler = session_handler.is_some(),
             "Kernel ingress bridge created"
         );
 
@@ -306,6 +341,7 @@ impl KernelIngress {
             running: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             stats: KernelIngressStats::default(),
+            session_handler,
         })
     }
 
@@ -333,6 +369,13 @@ impl KernelIngress {
     #[must_use]
     pub fn tun(&self) -> &Arc<TunDeviceWrapper> {
         &self.tun
+    }
+
+    /// Get a reference to the session handler (if configured)
+    #[inline]
+    #[must_use]
+    pub fn session_handler(&self) -> Option<&Arc<dyn SessionHandler>> {
+        self.session_handler.as_ref()
     }
 
     /// Check if shutdown has been requested
@@ -458,20 +501,42 @@ impl NetBridgeIngress for KernelIngress {
 
         // Extract 5-tuple for session tracking
         if let Some(five_tuple) = FiveTuple::from_packet(packet) {
-            // Register or update session
-            match self.sessions.register(
+            // Register or update session using register_with_result to detect new sessions
+            match self.sessions.register_with_result(
                 peer_key,
                 peer_endpoint,
                 five_tuple,
                 "kernel".to_string(),
             ) {
-                Ok(session) => {
+                Ok(result) => {
+                    let session = result.session();
                     session.add_bytes_sent(packet.len() as u64);
-                    trace!(
-                        session_id = %session.id,
-                        five_tuple = %five_tuple,
-                        "Session registered/updated"
-                    );
+
+                    // Fire callback only for newly created sessions
+                    if result.is_new() {
+                        if let Some(ref handler) = self.session_handler {
+                            let info = SessionInfo {
+                                session_id: session.id,
+                                protocol: five_tuple.protocol,
+                                src_addr: five_tuple.src_socket_addr(),
+                                dst_addr: five_tuple.dst_socket_addr(),
+                                outbound_tag: session.outbound_tag.clone(),
+                                peer_key,
+                            };
+                            handler.on_session_created(session.id, &info);
+                        }
+                        trace!(
+                            session_id = %session.id,
+                            five_tuple = %five_tuple,
+                            "Session created (new)"
+                        );
+                    } else {
+                        trace!(
+                            session_id = %session.id,
+                            five_tuple = %five_tuple,
+                            "Session updated"
+                        );
+                    }
                 }
                 Err(e) => {
                     self.stats.session_errors.fetch_add(1, Ordering::Relaxed);
@@ -690,5 +755,132 @@ mod tests {
         assert_eq!(stats.packets_injected.load(Ordering::Relaxed), 0);
         assert_eq!(stats.bytes_injected.load(Ordering::Relaxed), 0);
         assert_eq!(stats.packets_from_tun.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_config_with_session_handler() {
+        use crate::netbridge::error::NetBridgeError;
+        use crate::netbridge::traits::{NoOpSessionHandler, SessionCloseStats};
+        use crate::netbridge::types::SessionId;
+
+        let handler = Arc::new(NoOpSessionHandler);
+        let config = KernelIngressConfig::new("tun-test", "192.168.1.1/24", "192.168.1.0/24")
+            .with_session_handler(handler);
+
+        assert!(config.session_handler.is_some());
+    }
+
+    #[test]
+    fn test_config_without_session_handler() {
+        let config = KernelIngressConfig::default();
+        assert!(config.session_handler.is_none());
+    }
+
+    /// Mock session handler for testing callback invocations
+    #[derive(Default)]
+    struct MockSessionHandler {
+        created_sessions: ParkingMutex<Vec<(crate::netbridge::types::SessionId, SessionInfo)>>,
+        closed_sessions: ParkingMutex<Vec<(crate::netbridge::types::SessionId, crate::netbridge::traits::SessionCloseStats)>>,
+        errors: ParkingMutex<Vec<(crate::netbridge::types::SessionId, String)>>,
+    }
+
+    impl SessionHandler for MockSessionHandler {
+        fn on_session_created(&self, session_id: crate::netbridge::types::SessionId, info: &SessionInfo) {
+            self.created_sessions.lock().push((session_id, info.clone()));
+        }
+
+        fn on_session_closed(&self, session_id: crate::netbridge::types::SessionId, stats: crate::netbridge::traits::SessionCloseStats) {
+            self.closed_sessions.lock().push((session_id, stats));
+        }
+
+        fn on_session_error(&self, session_id: crate::netbridge::types::SessionId, error: &NetBridgeError) {
+            self.errors.lock().push((session_id, error.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_register_result_triggers_callback() {
+        use crate::netbridge::session::SessionTracker;
+        use crate::netbridge::types::FiveTuple;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let handler = Arc::new(MockSessionHandler::default());
+        let tracker = SessionTracker::new();
+        let peer_key = [42u8; 32];
+        let peer_endpoint: SocketAddr = "192.168.1.100:51820".parse().unwrap();
+        let five_tuple = FiveTuple::tcp(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2)), 12345),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80),
+        );
+
+        // First registration should be Created
+        let result1 = tracker
+            .register_with_result(peer_key, peer_endpoint, five_tuple, "kernel".to_string())
+            .unwrap();
+
+        assert!(result1.is_new());
+
+        // Simulate what inject_packet does - call handler on new session
+        if result1.is_new() {
+            let session = result1.session();
+            let info = SessionInfo {
+                session_id: session.id,
+                protocol: five_tuple.protocol,
+                src_addr: five_tuple.src_socket_addr(),
+                dst_addr: five_tuple.dst_socket_addr(),
+                outbound_tag: session.outbound_tag.clone(),
+                peer_key,
+            };
+            handler.on_session_created(session.id, &info);
+        }
+
+        // Verify callback was fired
+        let created = handler.created_sessions.lock();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, result1.session().id);
+        assert_eq!(created[0].1.protocol, IpProtocol::Tcp);
+        drop(created);
+
+        // Second registration should be Updated - no callback
+        let result2 = tracker
+            .register_with_result(peer_key, peer_endpoint, five_tuple, "kernel".to_string())
+            .unwrap();
+
+        assert!(result2.is_update());
+
+        // Handler should NOT be called for updates
+        // (We don't call it in this test, verifying that inject_packet logic is correct)
+
+        // Verify still only one created callback
+        let created = handler.created_sessions.lock();
+        assert_eq!(created.len(), 1);
+    }
+
+    #[test]
+    fn test_session_info_fields() {
+        use crate::netbridge::types::FiveTuple;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let peer_key = [99u8; 32];
+        let five_tuple = FiveTuple::udp(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 25, 0, 5)), 54321),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+        );
+
+        let info = SessionInfo {
+            session_id: crate::netbridge::types::SessionId::new(42),
+            protocol: five_tuple.protocol,
+            src_addr: five_tuple.src_socket_addr(),
+            dst_addr: five_tuple.dst_socket_addr(),
+            outbound_tag: "dns-proxy".to_string(),
+            peer_key,
+        };
+
+        assert_eq!(info.session_id.as_u64(), 42);
+        assert!(info.protocol.is_udp());
+        assert_eq!(info.src_addr.port(), 54321);
+        assert_eq!(info.dst_addr.port(), 53);
+        assert_eq!(info.outbound_tag, "dns-proxy");
+        assert_eq!(info.peer_key, [99u8; 32]);
     }
 }

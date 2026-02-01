@@ -5,12 +5,13 @@
 //!
 //! Supports both TCP and UDP protocols (both are blocked).
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tracing::debug;
 
 use super::traits::{HealthStatus, Outbound, OutboundConnection, UdpOutboundHandle};
@@ -56,23 +57,25 @@ impl BlockOutbound {
     }
 }
 
-#[async_trait]
 impl Outbound for BlockOutbound {
-    async fn connect(
+    fn connect(
         &self,
         addr: SocketAddr,
         _timeout: Duration,
-    ) -> Result<OutboundConnection, OutboundError> {
+    ) -> Pin<Box<dyn Future<Output = Result<OutboundConnection, OutboundError>> + Send + '_>> {
         // Record the blocked connection
         self.stats.record_connection();
 
         debug!("Blocking connection to {} via {}", addr, self.tag);
 
-        // Return an error indicating the connection was blocked
-        Err(OutboundError::unavailable(
-            &self.tag,
-            format!("connection to {addr} blocked"),
-        ))
+        let tag = self.tag.clone();
+        Box::pin(async move {
+            // Return an error indicating the connection was blocked
+            Err(OutboundError::unavailable(
+                &tag,
+                format!("connection to {addr} blocked"),
+            ))
+        })
     }
 
     fn tag(&self) -> &str {
@@ -106,18 +109,21 @@ impl Outbound for BlockOutbound {
 
     // === UDP Methods ===
 
-    async fn connect_udp(
+    fn connect_udp(
         &self,
         addr: SocketAddr,
         _timeout: Duration,
-    ) -> Result<UdpOutboundHandle, UdpError> {
+    ) -> Pin<Box<dyn Future<Output = Result<UdpOutboundHandle, UdpError>> + Send + '_>> {
         // Record the blocked UDP connection
         self.stats.record_connection();
 
         debug!("Blocking UDP connection to {} via {}", addr, self.tag);
 
-        // Return an error indicating the connection was blocked
-        Err(UdpError::blocked(&self.tag, addr))
+        let tag = self.tag.clone();
+        Box::pin(async move {
+            // Return an error indicating the connection was blocked
+            Err(UdpError::blocked(&tag, addr))
+        })
     }
 
     fn supports_udp(&self) -> bool {

@@ -37,10 +37,11 @@
 
 #[cfg(feature = "dns-doh")]
 mod inner {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use async_trait::async_trait;
     use bytes::Bytes;
     use hickory_proto::op::Message;
     use http::{header, Method, Request, Uri};
@@ -316,19 +317,23 @@ mod inner {
         }
     }
 
-    #[async_trait]
     impl DnsUpstream for DohClient {
-        async fn query(&self, query: &Message) -> DnsResult<Message> {
-            match self.query_post(query).await {
-                Ok(response) => {
-                    self.health.record_success();
-                    Ok(response)
+        fn query<'a>(
+            &'a self,
+            query: &'a Message,
+        ) -> Pin<Box<dyn Future<Output = DnsResult<Message>> + Send + 'a>> {
+            Box::pin(async move {
+                match self.query_post(query).await {
+                    Ok(response) => {
+                        self.health.record_success();
+                        Ok(response)
+                    }
+                    Err(e) => {
+                        self.health.record_failure();
+                        Err(e)
+                    }
                 }
-                Err(e) => {
-                    self.health.record_failure();
-                    Err(e)
-                }
-            }
+            })
         }
 
         fn is_healthy(&self) -> bool {

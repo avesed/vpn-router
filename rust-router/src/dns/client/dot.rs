@@ -37,7 +37,9 @@
 
 #[cfg(feature = "dns-dot")]
 mod inner {
+    use std::future::Future;
     use std::net::SocketAddr;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -93,6 +95,7 @@ mod inner {
         }
     }
 
+    // NOTE: deadpool::managed::Manager trait requires #[async_trait] as of version 0.10
     #[async_trait]
     impl Manager for DotConnectionManager {
         type Type = TlsConnection;
@@ -566,57 +569,61 @@ mod inner {
         }
     }
 
-    #[async_trait]
     impl DnsUpstream for DotClient {
-        async fn query(&self, query: &Message) -> DnsResult<Message> {
-            // Get a connection from the pool
-            let mut conn = self.pool.get().await.map_err(|e| {
-                DnsError::upstream(
-                    &self.config.address,
-                    format!("failed to get DoT connection from pool: {e}"),
-                )
-            })?;
+        fn query<'a>(
+            &'a self,
+            query: &'a Message,
+        ) -> Pin<Box<dyn Future<Output = DnsResult<Message>> + Send + 'a>> {
+            Box::pin(async move {
+                // Get a connection from the pool
+                let mut conn = self.pool.get().await.map_err(|e| {
+                    DnsError::upstream(
+                        &self.config.address,
+                        format!("failed to get DoT connection from pool: {e}"),
+                    )
+                })?;
 
-            match self.query_with_connection(&mut conn, query).await {
-                Ok(response) => {
-                    self.health.record_success();
-                    Ok(response)
-                }
-                Err(e) => {
-                    self.health.record_failure();
+                match self.query_with_connection(&mut conn, query).await {
+                    Ok(response) => {
+                        self.health.record_success();
+                        Ok(response)
+                    }
+                    Err(e) => {
+                        self.health.record_failure();
 
-                    // If there was a connection error, try once more with a fresh connection
-                    if e.is_recoverable() {
-                        tracing::debug!(
-                            upstream = %self.config.tag,
-                            error = %e,
-                            "retrying DoT query with fresh connection"
-                        );
+                        // If there was a connection error, try once more with a fresh connection
+                        if e.is_recoverable() {
+                            tracing::debug!(
+                                upstream = %self.config.tag,
+                                error = %e,
+                                "retrying DoT query with fresh connection"
+                            );
 
-                        drop(conn); // Drop the potentially broken connection
+                            drop(conn); // Drop the potentially broken connection
 
-                        let mut new_conn = self.pool.get().await.map_err(|e| {
-                            DnsError::upstream(
-                                &self.config.address,
-                                format!("failed to get fresh DoT connection: {e}"),
-                            )
-                        })?;
+                            let mut new_conn = self.pool.get().await.map_err(|e| {
+                                DnsError::upstream(
+                                    &self.config.address,
+                                    format!("failed to get fresh DoT connection: {e}"),
+                                )
+                            })?;
 
-                        match self.query_with_connection(&mut new_conn, query).await {
-                            Ok(response) => {
-                                self.health.record_success();
-                                Ok(response)
+                            match self.query_with_connection(&mut new_conn, query).await {
+                                Ok(response) => {
+                                    self.health.record_success();
+                                    Ok(response)
+                                }
+                                Err(e) => {
+                                    self.health.record_failure();
+                                    Err(e)
+                                }
                             }
-                            Err(e) => {
-                                self.health.record_failure();
-                                Err(e)
-                            }
+                        } else {
+                            Err(e)
                         }
-                    } else {
-                        Err(e)
                     }
                 }
-            }
+            })
         }
 
         fn is_healthy(&self) -> bool {

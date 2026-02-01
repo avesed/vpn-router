@@ -620,4 +620,83 @@ mod tests {
 
         assert!(results.duration_ms > 0);
     }
+
+    /// Full benchmark suite test - run with --nocapture to see results
+    #[tokio::test]
+    #[ignore] // Run with: cargo test netbridge::bench::tests::test_full_benchmark_suite --release -- --ignored --nocapture
+    async fn test_full_benchmark_suite() {
+        println!("\n========================================");
+        println!("     NetBridge Full Benchmark Suite     ");
+        println!("========================================\n");
+
+        let test = LoopbackTest::new();
+
+        // Quick warmup
+        println!("Warmup...");
+        let _ = run_quick_benchmark().await;
+
+        // TCP single connection
+        println!("\n[1/6] TCP Single Connection (5s)...");
+        let tcp_single = BenchConfig {
+            pattern: TrafficPattern::SingleTcp,
+            duration_secs: 5,
+            ..Default::default()
+        };
+        let result = test.run_throughput(&tcp_single).await;
+        println!("  → {}", result.summary());
+
+        // TCP concurrent
+        println!("\n[2/6] TCP Concurrent 4 connections (5s)...");
+        let tcp_concurrent = BenchConfig {
+            pattern: TrafficPattern::ManyShortTcp,
+            duration_secs: 5,
+            concurrency: 4,
+            ..Default::default()
+        };
+        let result = test.run_throughput(&tcp_concurrent).await;
+        println!("  → {}", result.summary());
+
+        // UDP stream
+        println!("\n[3/6] UDP Stream (5s)...");
+        let udp_stream = BenchConfig {
+            pattern: TrafficPattern::UdpStream,
+            duration_secs: 5,
+            udp_packet_size: 1400,
+            ..Default::default()
+        };
+        let result = test.run_throughput(&udp_stream).await;
+        println!("  → {}", result.summary());
+
+        // DNS-like UDP
+        println!("\n[4/6] DNS-like UDP (5s)...");
+        let dns_udp = BenchConfig {
+            pattern: TrafficPattern::DnsLikeUdp,
+            duration_secs: 5,
+            udp_packet_size: 64,
+            ..Default::default()
+        };
+        let result = test.run_throughput(&dns_udp).await;
+        println!("  → {}", result.summary());
+
+        // Mixed traffic
+        println!("\n[5/6] Mixed Traffic (5s)...");
+        let mixed = BenchConfig {
+            pattern: TrafficPattern::Mixed,
+            duration_secs: 5,
+            concurrency: 2,
+            ..Default::default()
+        };
+        let result = test.run_throughput(&mixed).await;
+        println!("  → {}", result.summary());
+
+        // Latency test
+        println!("\n[6/6] Latency Test (2s)...");
+        let latency_config = BenchConfig::for_latency().with_duration(2);
+        let result = test.run_latency(&latency_config).await;
+        println!("  → {}", result.summary());
+
+        println!("\n========================================");
+        println!("         Benchmark Complete!            ");
+        println!("========================================\n");
+    }
 }

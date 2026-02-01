@@ -233,6 +233,56 @@ impl Clone for Session {
 }
 
 // =============================================================================
+// Register Result
+// =============================================================================
+
+/// Result of a session registration operation
+///
+/// Distinguishes between creating a new session and updating an existing one.
+/// This enables callers to fire callbacks only when a session is first created.
+#[derive(Debug)]
+pub enum RegisterResult {
+    /// A new session was created
+    Created(Arc<Session>),
+    /// An existing session was updated (touched + endpoint updated)
+    Updated(Arc<Session>),
+}
+
+impl RegisterResult {
+    /// Get a reference to the session
+    #[inline]
+    #[must_use]
+    pub fn session(&self) -> &Arc<Session> {
+        match self {
+            Self::Created(s) | Self::Updated(s) => s,
+        }
+    }
+
+    /// Check if this was a new session creation
+    #[inline]
+    #[must_use]
+    pub fn is_new(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+
+    /// Check if this was an update to an existing session
+    #[inline]
+    #[must_use]
+    pub fn is_update(&self) -> bool {
+        matches!(self, Self::Updated(_))
+    }
+
+    /// Consume the result and return the session
+    #[inline]
+    #[must_use]
+    pub fn into_session(self) -> Arc<Session> {
+        match self {
+            Self::Created(s) | Self::Updated(s) => s,
+        }
+    }
+}
+
+// =============================================================================
 // Session Tracker
 // =============================================================================
 
@@ -388,6 +438,94 @@ impl SessionTracker {
         );
 
         Ok(session)
+    }
+
+    /// Register a new session with a result indicating whether it was created or updated
+    ///
+    /// This method is identical to `register()` but returns a `RegisterResult` that
+    /// distinguishes between creating a new session and updating an existing one.
+    /// This enables callers to fire callbacks only when a session is first created.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_key` - WireGuard peer public key
+    /// * `peer_endpoint` - Peer's WireGuard endpoint (IP:port) for reply routing
+    /// * `five_tuple` - Client's 5-tuple
+    /// * `outbound_tag` - Outbound tag for routing
+    ///
+    /// # Returns
+    ///
+    /// `Ok(RegisterResult::Created(session))` if a new session was created,
+    /// `Ok(RegisterResult::Updated(session))` if an existing session was updated,
+    /// `Err` if limits exceeded.
+    pub fn register_with_result(
+        &self,
+        peer_key: [u8; 32],
+        peer_endpoint: SocketAddr,
+        five_tuple: FiveTuple,
+        outbound_tag: String,
+    ) -> Result<RegisterResult, SessionError> {
+        // Check if session already exists (common for ongoing connections)
+        if let Some(existing) = self.sessions.get(&five_tuple) {
+            // Update last_active on existing session
+            existing.touch();
+            // Update peer endpoint in case of NAT rebinding/roaming
+            existing.update_peer_endpoint(peer_endpoint);
+            return Ok(RegisterResult::Updated(Arc::clone(existing.value())));
+        }
+
+        // Check rate limit
+        if !self.check_rate_limit(&peer_key) {
+            return Err(SessionError::RateLimitExceeded {
+                limit: self.config.max_rate_per_peer,
+            });
+        }
+
+        // Check per-peer limit
+        let count = self
+            .peer_session_counts
+            .entry(peer_key)
+            .or_insert_with(|| AtomicU64::new(0));
+
+        let current = count.fetch_add(1, Ordering::SeqCst);
+        if current >= self.config.max_per_peer as u64 {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return Err(SessionError::PerPeerLimitExceeded {
+                peer: hex::encode(&peer_key[..8]),
+                limit: self.config.max_per_peer,
+            });
+        }
+
+        // Check total limit
+        if self.sessions.len() >= self.config.max_total {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return Err(SessionError::TotalLimitExceeded {
+                limit: self.config.max_total,
+            });
+        }
+
+        let session_id = self.id_generator.next();
+        let session = Arc::new(Session::new(
+            session_id,
+            peer_key,
+            peer_endpoint,
+            five_tuple,
+            outbound_tag.clone(),
+        ));
+
+        self.sessions.insert(five_tuple, Arc::clone(&session));
+        self.id_index.insert(session_id, five_tuple);
+
+        trace!(
+            session_id = %session_id,
+            peer = hex::encode(&peer_key[..8]),
+            peer_endpoint = %peer_endpoint,
+            five_tuple = %five_tuple,
+            outbound = %outbound_tag,
+            "Session created (new)"
+        );
+
+        Ok(RegisterResult::Created(session))
     }
 
     /// Check rate limit for a peer
@@ -934,5 +1072,122 @@ mod tests {
         assert_eq!(session1.id, session2.id);
         assert_eq!(session2.peer_endpoint(), peer_endpoint2);
         assert_eq!(tracker.total_sessions(), 1); // Still just one session
+    }
+
+    #[test]
+    fn test_register_result_methods() {
+        let session = Arc::new(Session::new(
+            SessionId::new(1),
+            [0u8; 32],
+            test_peer_endpoint(),
+            make_test_tuple(12345, 80),
+            "direct".to_string(),
+        ));
+
+        let created = RegisterResult::Created(Arc::clone(&session));
+        assert!(created.is_new());
+        assert!(!created.is_update());
+        assert_eq!(created.session().id, SessionId::new(1));
+
+        let updated = RegisterResult::Updated(Arc::clone(&session));
+        assert!(!updated.is_new());
+        assert!(updated.is_update());
+        assert_eq!(updated.session().id, SessionId::new(1));
+    }
+
+    #[test]
+    fn test_register_result_into_session() {
+        let session = Arc::new(Session::new(
+            SessionId::new(42),
+            [0u8; 32],
+            test_peer_endpoint(),
+            make_test_tuple(12345, 80),
+            "direct".to_string(),
+        ));
+
+        let created = RegisterResult::Created(Arc::clone(&session));
+        let consumed = created.into_session();
+        assert_eq!(consumed.id, SessionId::new(42));
+    }
+
+    #[test]
+    fn test_register_with_result_new_session() {
+        let tracker = SessionTracker::new();
+        let peer_key = [0u8; 32];
+        let peer_endpoint = test_peer_endpoint();
+        let five_tuple = make_test_tuple(12345, 80);
+
+        let result = tracker
+            .register_with_result(peer_key, peer_endpoint, five_tuple, "direct".to_string())
+            .unwrap();
+
+        assert!(result.is_new());
+        assert!(!result.is_update());
+        assert_eq!(result.session().id.as_u64(), 1);
+        assert_eq!(tracker.total_sessions(), 1);
+    }
+
+    #[test]
+    fn test_register_with_result_update_session() {
+        let tracker = SessionTracker::new();
+        let peer_key = [0u8; 32];
+        let peer_endpoint1 = test_peer_endpoint();
+        let peer_endpoint2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200)), 51820);
+        let five_tuple = make_test_tuple(12345, 80);
+
+        // First registration creates a new session
+        let result1 = tracker
+            .register_with_result(peer_key, peer_endpoint1, five_tuple, "direct".to_string())
+            .unwrap();
+        assert!(result1.is_new());
+        let session_id = result1.session().id;
+
+        // Second registration should update existing session
+        let result2 = tracker
+            .register_with_result(peer_key, peer_endpoint2, five_tuple, "direct".to_string())
+            .unwrap();
+        assert!(result2.is_update());
+        assert!(!result2.is_new());
+
+        // Same session ID
+        assert_eq!(result2.session().id, session_id);
+        // Endpoint updated
+        assert_eq!(result2.session().peer_endpoint(), peer_endpoint2);
+        // Still just one session
+        assert_eq!(tracker.total_sessions(), 1);
+    }
+
+    #[test]
+    fn test_register_with_result_rate_limit() {
+        let config = SessionTrackerConfig {
+            max_rate_per_peer: 1,
+            rate_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let tracker = SessionTracker::with_config(config);
+        let peer_key = [0u8; 32];
+        let peer_endpoint = test_peer_endpoint();
+
+        let tuple1 = make_test_tuple(12345, 80);
+        let tuple2 = make_test_tuple(12346, 443);
+
+        // First should succeed
+        let result1 = tracker.register_with_result(
+            peer_key,
+            peer_endpoint,
+            tuple1,
+            "direct".to_string(),
+        );
+        assert!(result1.is_ok());
+        assert!(result1.unwrap().is_new());
+
+        // Second should fail (rate limit)
+        let result2 = tracker.register_with_result(
+            peer_key,
+            peer_endpoint,
+            tuple2,
+            "direct".to_string(),
+        );
+        assert!(matches!(result2, Err(SessionError::RateLimitExceeded { .. })));
     }
 }
