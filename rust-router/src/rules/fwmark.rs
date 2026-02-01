@@ -328,6 +328,12 @@ pub struct FwmarkRouter {
     /// Chain tag -> `ChainMark` mapping.
     chains: HashMap<String, ChainMark>,
 
+    /// DSCP value -> chain tag index for O(1) lookup.
+    ///
+    /// Index 0 is unused (DSCP 0 is reserved). Indices 1-63 map to DSCP values.
+    /// This enables O(1) lookup by DSCP value instead of O(n) iteration.
+    dscp_index: [Option<String>; 64],
+
     /// Default mark for non-chain traffic (None = no mark).
     default_mark: Option<u32>,
 }
@@ -363,6 +369,7 @@ impl FwmarkRouter {
     pub fn empty() -> Self {
         Self {
             chains: HashMap::new(),
+            dscp_index: std::array::from_fn(|_| None),
             default_mark: None,
         }
     }
@@ -379,6 +386,53 @@ impl FwmarkRouter {
     #[must_use]
     pub fn get_chain_mark(&self, chain_tag: &str) -> Option<&ChainMark> {
         self.chains.get(chain_tag)
+    }
+
+    /// Get chain tag and mark by DSCP value - O(1) lookup.
+    ///
+    /// This method provides constant-time lookup of chains by DSCP value,
+    /// avoiding the O(n) cost of iterating through all chains.
+    ///
+    /// # Arguments
+    ///
+    /// * `dscp` - DSCP value (1-63)
+    ///
+    /// # Returns
+    ///
+    /// `Some((&str, &ChainMark))` if a chain exists for this DSCP, `None` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::rules::fwmark::FwmarkRouter;
+    ///
+    /// let router = FwmarkRouter::builder()
+    ///     .add_chain_with_dscp("my-chain", 10).unwrap()
+    ///     .build();
+    ///
+    /// // O(1) lookup by DSCP value
+    /// let result = router.get_chain_by_dscp(10);
+    /// assert!(result.is_some());
+    /// let (tag, mark) = result.unwrap();
+    /// assert_eq!(tag, "my-chain");
+    /// assert_eq!(mark.dscp_value, 10);
+    ///
+    /// // Returns None for unregistered DSCP
+    /// assert!(router.get_chain_by_dscp(20).is_none());
+    ///
+    /// // Returns None for invalid DSCP values
+    /// assert!(router.get_chain_by_dscp(0).is_none());
+    /// assert!(router.get_chain_by_dscp(64).is_none());
+    /// ```
+    #[must_use]
+    pub fn get_chain_by_dscp(&self, dscp: u8) -> Option<(&str, &ChainMark)> {
+        // DSCP 0 is reserved, values > 63 are out of range
+        if dscp == 0 || dscp > 63 {
+            return None;
+        }
+        self.dscp_index[dscp as usize]
+            .as_ref()
+            .and_then(|tag| self.chains.get(tag).map(|mark| (tag.as_str(), mark)))
     }
 
     /// Get the routing mark for an outbound.
@@ -640,10 +694,21 @@ impl FwmarkRouterBuilder {
     /// Build the `FwmarkRouter`.
     ///
     /// Consumes the builder and returns the configured router.
+    /// Populates the `dscp_index` for O(1) lookups by DSCP value.
     #[must_use]
     pub fn build(self) -> FwmarkRouter {
+        // Build the DSCP index for O(1) lookups
+        let mut dscp_index: [Option<String>; 64] = std::array::from_fn(|_| None);
+        for (tag, chain_mark) in &self.chains {
+            let dscp = chain_mark.dscp_value;
+            if dscp >= 1 && dscp <= 63 {
+                dscp_index[dscp as usize] = Some(tag.clone());
+            }
+        }
+
         FwmarkRouter {
             chains: self.chains,
+            dscp_index,
             default_mark: self.default_mark,
         }
     }
@@ -1126,6 +1191,146 @@ mod tests {
                 mark.dscp_value
             );
         }
+    }
+
+    // ========================================================================
+    // O(1) DSCP Lookup Tests
+    // ========================================================================
+
+    #[test]
+    fn test_get_chain_by_dscp_o1_lookup() {
+        // Create router with multiple chains at specific DSCP values
+        let router = FwmarkRouter::builder()
+            .add_chain_with_dscp("chain-10", 10)
+            .unwrap()
+            .add_chain_with_dscp("chain-20", 20)
+            .unwrap()
+            .add_chain_with_dscp("chain-63", 63)
+            .unwrap()
+            .build();
+
+        // Valid lookups should return correct chain
+        let result = router.get_chain_by_dscp(10);
+        assert!(result.is_some());
+        let (tag, mark) = result.unwrap();
+        assert_eq!(tag, "chain-10");
+        assert_eq!(mark.dscp_value, 10);
+
+        let result = router.get_chain_by_dscp(20);
+        assert!(result.is_some());
+        let (tag, mark) = result.unwrap();
+        assert_eq!(tag, "chain-20");
+        assert_eq!(mark.dscp_value, 20);
+
+        let result = router.get_chain_by_dscp(63);
+        assert!(result.is_some());
+        let (tag, mark) = result.unwrap();
+        assert_eq!(tag, "chain-63");
+        assert_eq!(mark.dscp_value, 63);
+    }
+
+    #[test]
+    fn test_get_chain_by_dscp_empty_router() {
+        let router = FwmarkRouter::empty();
+
+        // All lookups should return None on empty router
+        assert!(router.get_chain_by_dscp(1).is_none());
+        assert!(router.get_chain_by_dscp(10).is_none());
+        assert!(router.get_chain_by_dscp(63).is_none());
+    }
+
+    #[test]
+    fn test_get_chain_by_dscp_invalid_dscp() {
+        let router = FwmarkRouter::builder()
+            .add_chain_with_dscp("chain-10", 10)
+            .unwrap()
+            .build();
+
+        // DSCP 0 is reserved - should return None
+        assert!(router.get_chain_by_dscp(0).is_none());
+
+        // DSCP > 63 is out of range - should return None
+        assert!(router.get_chain_by_dscp(64).is_none());
+        assert!(router.get_chain_by_dscp(100).is_none());
+        assert!(router.get_chain_by_dscp(255).is_none());
+    }
+
+    #[test]
+    fn test_get_chain_by_dscp_unregistered_dscp() {
+        let router = FwmarkRouter::builder()
+            .add_chain_with_dscp("chain-10", 10)
+            .unwrap()
+            .build();
+
+        // Unregistered DSCP values should return None
+        assert!(router.get_chain_by_dscp(1).is_none());
+        assert!(router.get_chain_by_dscp(9).is_none());
+        assert!(router.get_chain_by_dscp(11).is_none());
+        assert!(router.get_chain_by_dscp(63).is_none());
+    }
+
+    #[test]
+    fn test_dscp_index_consistency() {
+        // Verify that dscp_index matches chains() iterator for all DSCP values
+        let router = FwmarkRouter::builder()
+            .add_chain_with_dscp("chain-1", 1)
+            .unwrap()
+            .add_chain_with_dscp("chain-32", 32)
+            .unwrap()
+            .add_chain_with_dscp("chain-63", 63)
+            .unwrap()
+            .build();
+
+        // Build a map from chains() iterator
+        let mut chains_by_dscp: std::collections::HashMap<u8, &str> = std::collections::HashMap::new();
+        for (tag, mark) in router.chains() {
+            chains_by_dscp.insert(mark.dscp_value, tag);
+        }
+
+        // Verify get_chain_by_dscp matches chains() for all valid DSCP values
+        for dscp in 1..=63u8 {
+            let from_index = router.get_chain_by_dscp(dscp);
+            let from_iter = chains_by_dscp.get(&dscp);
+
+            match (from_index, from_iter) {
+                (Some((tag1, _)), Some(tag2)) => {
+                    assert_eq!(tag1, *tag2, "DSCP {} tag mismatch", dscp);
+                }
+                (None, None) => {
+                    // Both return None - consistent
+                }
+                (Some((tag, _)), None) => {
+                    panic!("DSCP {}: index has {} but iterator has None", dscp, tag);
+                }
+                (None, Some(tag)) => {
+                    panic!("DSCP {}: index has None but iterator has {}", dscp, tag);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_chain_by_dscp_boundary_values() {
+        let router = FwmarkRouter::builder()
+            .add_chain_with_dscp("chain-1", 1)
+            .unwrap()
+            .add_chain_with_dscp("chain-63", 63)
+            .unwrap()
+            .build();
+
+        // Minimum valid DSCP (1)
+        let result = router.get_chain_by_dscp(1);
+        assert!(result.is_some());
+        let (tag, mark) = result.unwrap();
+        assert_eq!(tag, "chain-1");
+        assert_eq!(mark.dscp_value, 1);
+
+        // Maximum valid DSCP (63)
+        let result = router.get_chain_by_dscp(63);
+        assert!(result.is_some());
+        let (tag, mark) = result.unwrap();
+        assert_eq!(tag, "chain-63");
+        assert_eq!(mark.dscp_value, 63);
     }
 
     // ========================================================================

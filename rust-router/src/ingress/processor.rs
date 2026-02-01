@@ -314,11 +314,8 @@ impl IngressProcessor {
         if dscp > 0 {
             let snapshot = self.rule_engine.load();
 
-            if let Some((chain_tag, chain_mark)) = snapshot
-                .fwmark_router
-                .chains()
-                .find(|(_, chain_mark)| chain_mark.dscp_value == dscp)
-            {
+            // O(1) lookup by DSCP value
+            if let Some((chain_tag, chain_mark)) = snapshot.fwmark_router.get_chain_by_dscp(dscp) {
                 if let Some(chain_manager) = self.chain_manager.read().clone() {
                     let my_role = chain_manager.get_chain_role(chain_tag);
 

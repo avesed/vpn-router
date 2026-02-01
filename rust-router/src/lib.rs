@@ -111,6 +111,7 @@
 pub mod chain;
 pub mod config;
 pub mod connection;
+pub mod controlplane;
 pub mod dns;
 pub mod ecmp;
 pub mod egress;
@@ -156,6 +157,7 @@ pub use connection::{
     UdpProcessorStatsSnapshot, UdpReplyHandler, UdpSession, UdpSessionConfig, UdpSessionKey,
     UdpSessionManager, UdpSessionSnapshot, UdpSessionStats, UdpSessionWrapper,
 };
+pub use controlplane::{ControlPlaneError, Result as ControlPlaneResult};
 pub use dns::{
     analyze_negative_response, dns_classes, extract_soa_minimum, get_negative_cache_ttl,
     is_negative_response, record_types, BlockResponseType, BlockingConfig, CacheConfig, CacheEntry,
