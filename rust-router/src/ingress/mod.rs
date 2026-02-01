@@ -74,7 +74,6 @@ pub mod config;
 pub mod dns_cache;
 pub mod error;
 pub mod forwarder;
-pub mod ipstack_bridge;
 pub mod manager;
 pub mod processor;
 pub mod socks5_server;
@@ -117,24 +116,22 @@ pub use socks5_server::{
     Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot,
 };
 
-// IpStack bridge (feature-gated)
-// Note: Uses ShardedIpStackBridge internally for parallel processing across CPU cores.
-// The sharded bridge distributes packets using 5-tuple hashing for consistent session routing.
+// TUN ingress bridge (feature-gated)
+// Note: Uses TunIngressBridge internally which leverages the kernel's TCP/IP stack
+// via TUN + TPROXY for better performance (200+ Mbps vs ipstack's 30-80 Mbps).
 #[cfg(feature = "ipstack-tcp")]
 pub use forwarder::{
-    get_ipstack_diagnostics, get_ipstack_stats, init_ipstack_bridge, is_ipstack_enabled,
-    set_ipstack_enabled, spawn_ipstack_reply_router,
+    get_ipstack_diagnostics, get_ipstack_stats, init_ipstack_bridge, init_tun_ingress_bridge,
+    is_ipstack_enabled, set_ipstack_enabled, spawn_ipstack_reply_router, try_route_wg_egress_reply,
 };
+
+// Re-export TUN bridge types for public API
 #[cfg(feature = "ipstack-tcp")]
-pub use ipstack_bridge::{
-    // Single-instance bridge types (kept for compatibility)
-    DiagnosticSnapshot as IpStackDiagnosticSnapshot,
-    IpStackBridge,
-    IpStackBridgeStats,
-    IpStackBridgeStatsSnapshot,
-    ShardedBridgeStats,
-    ShardedBridgeStatsSnapshot,
-    ShardedDiagnosticSnapshot,
-    // Sharded bridge types (primary)
-    ShardedIpStackBridge,
+pub use crate::tun_bridge::{
+    FiveTuple as TunFiveTuple, SessionInfo as TunSessionInfo, SessionTracker as TunSessionTracker,
+    TunIngressBridge, TunIngressConfig, TunIngressStats, TunIngressStatsSnapshot,
 };
+
+// Note: ipstack_bridge module has been removed.
+// TunIngressBridge (TUN + TPROXY) now provides the WG ingress → outbound path.
+// The vless_wg_bridge module is still used for VLESS/SS → WG egress path.

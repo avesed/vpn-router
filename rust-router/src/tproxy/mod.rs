@@ -151,8 +151,8 @@ pub use connection::{ConnectionInfo, TproxyConnection};
 pub use listener::{TproxyListener, TproxyListenerBuilder};
 pub use socket::{
     create_tproxy_tcp_socket, create_tproxy_udp_socket, default_socket_provider, get_original_dst,
-    get_original_dst_v6, has_net_admin_capability, is_root, RealSocketProvider, SocketProvider,
-    IP_RECVORIGDSTADDR, IP_TRANSPARENT, SO_ORIGINAL_DST,
+    get_original_dst_v6, has_net_admin_capability, is_root, set_socket_mark, RealSocketProvider,
+    SocketProvider, IP_RECVORIGDSTADDR, IP_TRANSPARENT, SO_MARK, SO_ORIGINAL_DST,
 };
 pub use udp_listener::{TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo};
 pub use udp_worker::{

@@ -9,8 +9,10 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
+use std::os::unix::io::AsRawFd;
+
 use super::connection::TproxyConnection;
-use super::socket::create_tproxy_tcp_socket;
+use super::socket::{create_tproxy_tcp_socket, set_socket_mark};
 use crate::config::ListenConfig;
 use crate::error::TproxyError;
 
@@ -152,6 +154,8 @@ pub struct TproxyListenerBuilder {
     address: SocketAddr,
     backlog: u32,
     reuse_port: bool,
+    /// Optional fwmark for policy routing
+    fwmark: Option<u32>,
 }
 
 impl TproxyListenerBuilder {
@@ -162,6 +166,7 @@ impl TproxyListenerBuilder {
             address,
             backlog: 1024,
             reuse_port: true,
+            fwmark: None,
         }
     }
 
@@ -179,25 +184,76 @@ impl TproxyListenerBuilder {
         self
     }
 
+    /// Set the fwmark (firewall mark) for policy routing.
+    ///
+    /// When set, `SO_MARK` is applied to the socket, which marks all
+    /// packets sent from this socket with the specified value. This is
+    /// used with `ip rule fwmark` for policy routing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Set fwmark to match policy routing rule
+    /// let listener = TproxyListenerBuilder::new(addr)
+    ///     .fwmark(Some(0x1))
+    ///     .build()?;
+    ///
+    /// // Requires corresponding ip rule:
+    /// // ip rule add fwmark 0x1 lookup 100
+    /// ```
+    #[must_use]
+    pub const fn fwmark(mut self, mark: Option<u32>) -> Self {
+        self.fwmark = mark;
+        self
+    }
+
     /// Build the listener.
     ///
     /// # Errors
     ///
     /// Returns `TproxyError` if listener creation fails.
     pub fn build(self) -> Result<TproxyListener, TproxyError> {
-        let config = ListenConfig {
-            address: self.address,
-            tcp_enabled: true,
-            udp_enabled: false,
-            tcp_backlog: self.backlog,
-            udp_timeout_secs: 300,
-            reuse_port: self.reuse_port,
-            sniff_timeout_ms: 300,
-            udp_workers: None,
-            udp_buffer_pool_size: 1024,
-        };
+        info!("Creating TPROXY TCP listener on {}", self.address);
 
-        TproxyListener::bind(&config)
+        // Create the TPROXY socket
+        let socket = create_tproxy_tcp_socket()?;
+
+        // Apply fwmark if specified (before bind for consistency)
+        if let Some(mark) = self.fwmark {
+            set_socket_mark(socket.as_raw_fd(), mark)?;
+            debug!("Set SO_MARK={:#x} on TCP listener socket", mark);
+        }
+
+        // Bind to the listen address
+        socket
+            .bind(&self.address.into())
+            .map_err(|e| TproxyError::BindError {
+                addr: self.address,
+                reason: e.to_string(),
+            })?;
+
+        // Start listening with the configured backlog
+        socket
+            .listen(self.backlog as i32)
+            .map_err(|e| TproxyError::socket_option("listen", e.to_string()))?;
+
+        // Convert to tokio TcpListener
+        // Safety: We own the socket and it's a valid listening socket
+        let std_listener = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
+
+        let listener = TcpListener::from_std(std_listener)
+            .map_err(|e| TproxyError::SocketCreation(e.to_string()))?;
+
+        info!(
+            "TPROXY TCP listener ready on {} (backlog={}, fwmark={:?})",
+            self.address, self.backlog, self.fwmark
+        );
+
+        Ok(TproxyListener {
+            listener,
+            listen_addr: self.address,
+            active: true,
+        })
     }
 }
 
@@ -215,11 +271,19 @@ mod tests {
     fn test_builder() {
         let builder = TproxyListenerBuilder::new("127.0.0.1:8080".parse().unwrap())
             .backlog(512)
-            .reuse_port(true);
+            .reuse_port(true)
+            .fwmark(Some(0x1));
 
         assert_eq!(builder.address, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(builder.backlog, 512);
         assert!(builder.reuse_port);
+        assert_eq!(builder.fwmark, Some(0x1));
+    }
+
+    #[test]
+    fn test_builder_no_fwmark() {
+        let builder = TproxyListenerBuilder::new("127.0.0.1:8080".parse().unwrap());
+        assert_eq!(builder.fwmark, None);
     }
 
     #[test]
@@ -227,6 +291,7 @@ mod tests {
         let builder = TproxyListenerBuilder::default();
         assert_eq!(builder.address, "127.0.0.1:7893".parse().unwrap());
         assert_eq!(builder.backlog, 1024);
+        assert_eq!(builder.fwmark, None);
     }
 
     // Note: Actual listener tests require CAP_NET_ADMIN and iptables setup

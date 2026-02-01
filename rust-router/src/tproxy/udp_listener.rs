@@ -44,9 +44,9 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
-use super::socket::create_tproxy_udp_socket;
+use super::socket::{create_tproxy_udp_socket, set_socket_mark};
 use crate::config::ListenConfig;
 use crate::error::UdpError;
 use crate::io::UdpBuffer;
@@ -597,6 +597,8 @@ fn recv_with_original_dst_checked<B: std::ops::DerefMut<Target = [u8]>>(
 pub struct TproxyUdpListenerBuilder {
     address: SocketAddr,
     reuse_port: bool,
+    /// Optional fwmark for policy routing
+    fwmark: Option<u32>,
 }
 
 impl TproxyUdpListenerBuilder {
@@ -606,6 +608,7 @@ impl TproxyUdpListenerBuilder {
         Self {
             address,
             reuse_port: true,
+            fwmark: None,
         }
     }
 
@@ -616,25 +619,90 @@ impl TproxyUdpListenerBuilder {
         self
     }
 
+    /// Set the fwmark (firewall mark) for policy routing.
+    ///
+    /// When set, `SO_MARK` is applied to the socket, which marks all
+    /// packets sent from this socket with the specified value. This is
+    /// used with `ip rule fwmark` for policy routing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Set fwmark to match policy routing rule
+    /// let listener = TproxyUdpListenerBuilder::new(addr)
+    ///     .fwmark(Some(0x1))
+    ///     .build()?;
+    ///
+    /// // Requires corresponding ip rule:
+    /// // ip rule add fwmark 0x1 lookup 100
+    /// ```
+    #[must_use]
+    pub const fn fwmark(mut self, mark: Option<u32>) -> Self {
+        self.fwmark = mark;
+        self
+    }
+
     /// Build the listener
     ///
     /// # Errors
     ///
     /// Returns `UdpError` if listener creation fails.
     pub fn build(self) -> Result<TproxyUdpListener, UdpError> {
-        let config = ListenConfig {
-            address: self.address,
-            tcp_enabled: false,
-            udp_enabled: true,
-            tcp_backlog: 1024,
-            udp_timeout_secs: 300,
-            reuse_port: self.reuse_port,
-            sniff_timeout_ms: 300,
-            udp_workers: None,
-            udp_buffer_pool_size: 1024,
-        };
+        info!("Creating TPROXY UDP listener on {}", self.address);
 
-        TproxyUdpListener::bind(&config)
+        // Create the TPROXY socket with IP_TRANSPARENT and IP_RECVORIGDSTADDR
+        let socket = create_tproxy_udp_socket().map_err(|e| match e {
+            crate::error::TproxyError::PermissionDenied => UdpError::PermissionDenied,
+            crate::error::TproxyError::SocketOption { option, reason } => {
+                UdpError::SocketOption { option, reason }
+            }
+            other => UdpError::SocketOption {
+                option: "create".into(),
+                reason: other.to_string(),
+            },
+        })?;
+
+        // Apply fwmark if specified (before bind for consistency)
+        if let Some(mark) = self.fwmark {
+            set_socket_mark(socket.as_raw_fd(), mark).map_err(|e| match e {
+                crate::error::TproxyError::PermissionDenied => UdpError::PermissionDenied,
+                crate::error::TproxyError::SocketOption { option, reason } => {
+                    UdpError::SocketOption { option, reason }
+                }
+                other => UdpError::SocketOption {
+                    option: "SO_MARK".into(),
+                    reason: other.to_string(),
+                },
+            })?;
+            debug!("Set SO_MARK={:#x} on UDP listener socket", mark);
+        }
+
+        // Bind to the listen address
+        socket.bind(&self.address.into()).map_err(|e| {
+            UdpError::socket_option(
+                "bind",
+                format!("Failed to bind to {}: {}", self.address, e),
+            )
+        })?;
+
+        // Convert to tokio UdpSocket
+        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) };
+        let socket = UdpSocket::from_std(std_socket).map_err(|e| {
+            UdpError::socket_option("from_std", format!("Failed to convert socket: {e}"))
+        })?;
+
+        info!(
+            "TPROXY UDP listener ready on {} (reuse_port={}, fwmark={:?})",
+            self.address, self.reuse_port, self.fwmark
+        );
+
+        Ok(TproxyUdpListener {
+            socket,
+            listen_addr: self.address,
+            active: AtomicBool::new(true),
+            packets_received: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+        })
     }
 }
 
@@ -669,11 +737,19 @@ mod tests {
 
     #[test]
     fn test_builder() {
-        let builder =
-            TproxyUdpListenerBuilder::new("127.0.0.1:8080".parse().unwrap()).reuse_port(false);
+        let builder = TproxyUdpListenerBuilder::new("127.0.0.1:8080".parse().unwrap())
+            .reuse_port(false)
+            .fwmark(Some(0x1));
 
         assert_eq!(builder.address, "127.0.0.1:8080".parse().unwrap());
         assert!(!builder.reuse_port);
+        assert_eq!(builder.fwmark, Some(0x1));
+    }
+
+    #[test]
+    fn test_builder_no_fwmark() {
+        let builder = TproxyUdpListenerBuilder::new("127.0.0.1:8080".parse().unwrap());
+        assert_eq!(builder.fwmark, None);
     }
 
     #[test]
@@ -681,6 +757,7 @@ mod tests {
         let builder = TproxyUdpListenerBuilder::default();
         assert_eq!(builder.address, "127.0.0.1:7893".parse().unwrap());
         assert!(builder.reuse_port);
+        assert_eq!(builder.fwmark, None);
     }
 
     // Note: Actual listener tests require CAP_NET_ADMIN and iptables setup

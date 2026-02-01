@@ -801,15 +801,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "etherparse"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b119b9796ff800751a220394b8b3613f26dd30c48f254f6837e64c464872d1c7"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1416,21 +1407,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "ipstack"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d603c9807158f8054f56c3672c8670096580c3ec1d5bab6f27b2aca89be89117"
-dependencies = [
- "ahash",
- "etherparse",
- "log",
- "rand 0.9.2",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -2286,7 +2262,6 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "ipnet",
- "ipstack",
  "libc",
  "md-5",
  "moka",

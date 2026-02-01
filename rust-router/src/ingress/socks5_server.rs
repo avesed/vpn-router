@@ -50,7 +50,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::error::OutboundError;
-use crate::io::bidirectional_copy;
+use tokio::io::copy_bidirectional;
 use crate::outbound::socks5_common::{
     ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_METHOD_NONE, CMD_CONNECT,
     REPLY_ADDRESS_TYPE_NOT_SUPPORTED, REPLY_COMMAND_NOT_SUPPORTED, REPLY_CONNECTION_REFUSED,
@@ -306,10 +306,8 @@ async fn handle_connection(
     // Get the underlying stream for relay (supports TCP, TLS, VLESS, Shadowsocks, etc.)
     let mut outbound_stream = outbound_conn.into_outbound_stream();
 
-    // Bidirectional relay using generic copy function
-    let copy_result = bidirectional_copy(&mut stream, &mut outbound_stream).await?;
-    let bytes_sent = copy_result.client_to_upstream;
-    let bytes_recv = copy_result.upstream_to_client;
+    // Bidirectional relay using tokio's optimized copy function
+    let (bytes_sent, bytes_recv) = copy_bidirectional(&mut stream, &mut outbound_stream).await?;
 
     stats.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
     stats

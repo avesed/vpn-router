@@ -38,6 +38,11 @@ pub const SO_ORIGINAL_DST: libc::c_int = 80;
 /// When enabled, UDP packets include the original destination in ancillary data (cmsg).
 pub const IP_RECVORIGDSTADDR: libc::c_int = 20;
 
+/// Linux kernel constant: `SO_MARK` (`SOL_SOCKET` level)
+/// Sets the fwmark (firewall mark) on all packets sent from the socket.
+/// This is used with policy routing to ensure reply packets use the correct route.
+pub const SO_MARK: libc::c_int = 36;
+
 // =============================================================================
 // Socket Provider Trait
 // =============================================================================
@@ -378,6 +383,51 @@ fn set_ip_recvorigdstaddr(socket: &Socket) -> Result<(), TproxyError> {
     Ok(())
 }
 
+/// Set `SO_MARK` socket option for fwmark-based policy routing.
+///
+/// This sets the firewall mark on all packets sent from the socket,
+/// which can be used with `ip rule` for policy routing. This is
+/// essential for TPROXY reply packets to follow the correct route.
+///
+/// # Arguments
+///
+/// * `fd` - Raw file descriptor of the socket
+/// * `mark` - The fwmark value to set (must match `ip rule fwmark` value)
+///
+/// # Example
+///
+/// ```bash
+/// # Policy routing setup for fwmark 0x1
+/// ip rule add fwmark 0x1 lookup 100
+/// ip route add local 0.0.0.0/0 dev lo table 100
+/// ```
+///
+/// # Errors
+///
+/// Returns `TproxyError::SocketOption` if setsockopt fails.
+/// Returns `TproxyError::PermissionDenied` if `CAP_NET_ADMIN` is required.
+pub fn set_socket_mark(fd: RawFd, mark: u32) -> Result<(), TproxyError> {
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_MARK,
+            std::ptr::addr_of!(mark).cast::<libc::c_void>(),
+            mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EPERM) {
+            return Err(TproxyError::PermissionDenied);
+        }
+        return Err(TproxyError::socket_option("SO_MARK", err.to_string()));
+    }
+
+    Ok(())
+}
+
 /// Get the original destination address from a TPROXY TCP connection.
 ///
 /// When iptables TPROXY redirects a connection, the original destination
@@ -502,6 +552,7 @@ mod tests {
         assert_eq!(IP_TRANSPARENT, 19);
         assert_eq!(SO_ORIGINAL_DST, 80);
         assert_eq!(IP_RECVORIGDSTADDR, 20);
+        assert_eq!(SO_MARK, 36);
     }
 
     #[test]

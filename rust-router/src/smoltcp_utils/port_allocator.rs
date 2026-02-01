@@ -135,6 +135,108 @@ impl PortAllocator {
         Self::with_config(PortAllocatorConfig::default())
     }
 
+    /// Create a new port allocator for a specific shard with partitioned port range
+    ///
+    /// This partitions the default ephemeral port range (49152-65535) into equal-sized
+    /// ranges for each shard. This ensures no port collisions between shards when all
+    /// shards use the same source IP.
+    ///
+    /// # Arguments
+    ///
+    /// * `shard_index` - The index of this shard (0-based)
+    /// * `total_shards` - Total number of shards
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // With 4 shards and default range (49152-65535 = 16384 ports):
+    /// // Shard 0: 49152-53247 (4096 ports)
+    /// // Shard 1: 53248-57343 (4096 ports)
+    /// // Shard 2: 57344-61439 (4096 ports)
+    /// // Shard 3: 61440-65535 (4096 ports)
+    /// let allocator = PortAllocator::for_shard(0, 4);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `total_shards` is 0 or if `shard_index >= total_shards`.
+    #[must_use]
+    pub fn for_shard(shard_index: u16, total_shards: u16) -> Self {
+        assert!(total_shards > 0, "total_shards must be > 0");
+        assert!(
+            shard_index < total_shards,
+            "shard_index {} must be < total_shards {}",
+            shard_index,
+            total_shards
+        );
+
+        let total_ports = PORT_RANGE_END - PORT_RANGE_START + 1; // 16384
+        let ports_per_shard = total_ports / total_shards;
+
+        // Calculate this shard's port range
+        let shard_start = PORT_RANGE_START + (shard_index * ports_per_shard);
+        let shard_end = if shard_index == total_shards - 1 {
+            // Last shard gets any remaining ports
+            PORT_RANGE_END
+        } else {
+            shard_start + ports_per_shard - 1
+        };
+
+        let config = PortAllocatorConfig {
+            range: shard_start..=shard_end,
+            time_wait_duration: Duration::from_secs(PORT_TIME_WAIT_SECS),
+        };
+
+        debug!(
+            "PortAllocator for shard {}/{}: port range {}..={} ({} ports)",
+            shard_index,
+            total_shards,
+            shard_start,
+            shard_end,
+            shard_end - shard_start + 1
+        );
+
+        Self::with_config(config)
+    }
+
+    /// Get the shard index from a port number
+    ///
+    /// This is the inverse of `for_shard()` - given a port, determine which shard
+    /// it belongs to. Used by the reply dispatcher to route packets to the correct shard.
+    ///
+    /// # Arguments
+    ///
+    /// * `port` - The port number to look up
+    /// * `total_shards` - Total number of shards
+    ///
+    /// # Returns
+    ///
+    /// The shard index (0-based), or `None` if the port is outside the ephemeral range.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // With 4 shards:
+    /// assert_eq!(PortAllocator::shard_for_port(49152, 4), Some(0));
+    /// assert_eq!(PortAllocator::shard_for_port(53248, 4), Some(1));
+    /// assert_eq!(PortAllocator::shard_for_port(65535, 4), Some(3));
+    /// ```
+    #[must_use]
+    pub fn shard_for_port(port: u16, total_shards: u16) -> Option<usize> {
+        if port < PORT_RANGE_START || port > PORT_RANGE_END {
+            return None;
+        }
+
+        let total_ports = PORT_RANGE_END - PORT_RANGE_START + 1;
+        let ports_per_shard = total_ports / total_shards;
+
+        let offset = port - PORT_RANGE_START;
+        let shard_index = (offset / ports_per_shard) as usize;
+
+        // Clamp to valid shard range (for ports in the last shard's "extra" range)
+        Some(shard_index.min((total_shards - 1) as usize))
+    }
+
     /// Create a new port allocator with custom configuration
     ///
     /// # Arguments
@@ -733,5 +835,109 @@ mod tests {
 
         // Should not be in TIME_WAIT since it was never allocated
         assert!(!allocator.is_in_time_wait(50000));
+    }
+
+    // -------------------------------------------------------------------------
+    // Sharded Port Allocation Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_for_shard_basic() {
+        // Test basic shard allocation with 4 shards
+        let allocator = PortAllocator::for_shard(0, 4);
+
+        // Shard 0 should have ports 49152-53247 (4096 ports)
+        assert!(allocator.port_range_start >= 49152);
+        assert!(allocator.port_range_end <= 53247);
+    }
+
+    #[test]
+    fn test_for_shard_all_shards() {
+        // Verify all 4 shards have non-overlapping ranges
+        let a0 = PortAllocator::for_shard(0, 4);
+        let a1 = PortAllocator::for_shard(1, 4);
+        let a2 = PortAllocator::for_shard(2, 4);
+        let a3 = PortAllocator::for_shard(3, 4);
+
+        // Ranges should not overlap
+        assert!(a0.port_range_end < a1.port_range_start);
+        assert!(a1.port_range_end < a2.port_range_start);
+        assert!(a2.port_range_end < a3.port_range_start);
+
+        // Last shard should end at PORT_RANGE_END
+        assert_eq!(a3.port_range_end, 65535);
+    }
+
+    #[test]
+    fn test_for_shard_allocates_in_range() {
+        // Test that allocated ports are within the shard's range
+        let allocator = PortAllocator::for_shard(1, 4);
+        let start = allocator.port_range_start;
+        let end = allocator.port_range_end;
+
+        // Allocate multiple ports and verify they're in range
+        for _ in 0..10 {
+            if let Some(guard) = allocator.allocate() {
+                let port = guard.port();
+                assert!(port >= start && port <= end, "Port {} not in range [{}, {}]", port, start, end);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_for_port_basic() {
+        // Test shard_for_port with 4 shards
+        // Ports 49152-65535 = 16384 ports, 4096 per shard
+
+        // Shard 0: 49152-53247
+        assert_eq!(PortAllocator::shard_for_port(49152, 4), Some(0));
+        assert_eq!(PortAllocator::shard_for_port(53247, 4), Some(0));
+
+        // Shard 1: 53248-57343
+        assert_eq!(PortAllocator::shard_for_port(53248, 4), Some(1));
+        assert_eq!(PortAllocator::shard_for_port(57343, 4), Some(1));
+
+        // Shard 2: 57344-61439
+        assert_eq!(PortAllocator::shard_for_port(57344, 4), Some(2));
+        assert_eq!(PortAllocator::shard_for_port(61439, 4), Some(2));
+
+        // Shard 3: 61440-65535
+        assert_eq!(PortAllocator::shard_for_port(61440, 4), Some(3));
+        assert_eq!(PortAllocator::shard_for_port(65535, 4), Some(3));
+    }
+
+    #[test]
+    fn test_shard_for_port_outside_range() {
+        // Ports outside ephemeral range should return None
+        assert_eq!(PortAllocator::shard_for_port(80, 4), None);
+        assert_eq!(PortAllocator::shard_for_port(443, 4), None);
+        assert_eq!(PortAllocator::shard_for_port(49151, 4), None);
+        assert_eq!(PortAllocator::shard_for_port(0, 4), None);
+    }
+
+    #[test]
+    fn test_shard_for_port_roundtrip() {
+        // Verify that for_shard and shard_for_port are inverses
+        // Test using the port range boundaries instead of allocating
+        for shard_idx in 0u16..4 {
+            let allocator = PortAllocator::for_shard(shard_idx, 4);
+            // Use the start of each shard's range as a representative port
+            let port = allocator.port_range_start;
+            let detected_shard = PortAllocator::shard_for_port(port, 4);
+            assert_eq!(detected_shard, Some(shard_idx as usize),
+                "Port {} from shard {} detected as shard {:?}", port, shard_idx, detected_shard);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "total_shards must be > 0")]
+    fn test_for_shard_zero_shards() {
+        let _ = PortAllocator::for_shard(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "shard_index 5 must be < total_shards 4")]
+    fn test_for_shard_invalid_index() {
+        let _ = PortAllocator::for_shard(5, 4);
     }
 }

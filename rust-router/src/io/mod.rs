@@ -44,7 +44,7 @@ pub use buffer_pool::{
     DEFAULT_UDP_BUFFER_SIZE,
     MAX_LOCAL_CACHE_SIZE,
 };
-pub use copy::{bidirectional_copy, bidirectional_copy_with_buffer, CopyResult};
+pub use copy::CopyResult;
 
 // Batch I/O exports (Linux only)
 #[cfg(target_os = "linux")]

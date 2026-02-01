@@ -84,7 +84,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::smoltcp_utils::BridgeError;
+use crate::smoltcp_utils::{BridgeError, PortAllocator};
 
 use super::cleanup::{CleanupConfig, CleanupStats};
 use super::event_channel::{create_event_channel, EventChannelConfig, EventSender};
@@ -214,6 +214,12 @@ pub struct ShardedBridgeConfig {
     pub cleanup_config: CleanupConfig,
     /// Event channel configuration
     pub event_channel_config: EventChannelConfig,
+    /// Tunnel's actual local IP address
+    ///
+    /// This is the IP address assigned to the WireGuard tunnel (e.g., 10.200.200.2).
+    /// All shards will use this IP as the source address for smoltcp-generated packets.
+    /// If not set, falls back to synthetic shard IPs (10.200.{shard_index}.1).
+    pub tunnel_local_ip: Option<IpAddress>,
 }
 
 impl ShardedBridgeConfig {
@@ -226,7 +232,17 @@ impl ShardedBridgeConfig {
             shard_config: ShardConfigTemplate::default(),
             cleanup_config: CleanupConfig::default(),
             event_channel_config: EventChannelConfig::default(),
+            tunnel_local_ip: None,
         }
+    }
+
+    /// Set the tunnel's actual local IP address
+    ///
+    /// All shards will use this IP as the source address for generated packets.
+    #[must_use]
+    pub fn with_tunnel_local_ip(mut self, ip: IpAddress) -> Self {
+        self.tunnel_local_ip = Some(ip);
+        self
     }
 
     /// Set the cleanup configuration
@@ -288,28 +304,43 @@ pub struct ShardConfigTemplate {
 
 impl ShardConfigTemplate {
     /// Create a ShardConfig for a specific shard index
+    ///
+    /// If `tunnel_local_ip` is provided, all shards will use that IP as their source address.
+    /// This is the correct behavior for WG tunnels where all packets must have the tunnel's
+    /// assigned IP as the source.
+    ///
+    /// If `tunnel_local_ip` is None, falls back to synthetic shard IPs (10.200.{shard_index}.1).
+    ///
+    /// # Arguments
+    ///
+    /// * `shard_index` - Index of this shard (0-based)
+    /// * `total_shards` - Total number of shards (needed for port range partitioning)
+    /// * `tunnel_local_ip` - Optional tunnel IP to use for all shards
     #[must_use]
-    pub fn for_shard(&self, shard_index: u16) -> ShardConfig {
-        // Each shard gets its own subnet: 10.200.{shard_index}.0/24
-        // Local IP is 10.200.{shard_index}.1
-        let local_ip = IpAddress::v4(
-            SHARD_BASE_IP_OCTET_1,
-            SHARD_BASE_IP_OCTET_2,
-            shard_index as u8,
-            1,
-        );
-        let cidr = IpCidr::new(
+    pub fn for_shard(
+        &self,
+        shard_index: u16,
+        total_shards: u16,
+        tunnel_local_ip: Option<IpAddress>,
+    ) -> ShardConfig {
+        // Use tunnel's actual IP if provided, otherwise fall back to synthetic shard IP
+        let local_ip = tunnel_local_ip.unwrap_or_else(|| {
+            // Legacy behavior: each shard gets its own synthetic IP
             IpAddress::v4(
                 SHARD_BASE_IP_OCTET_1,
                 SHARD_BASE_IP_OCTET_2,
                 shard_index as u8,
-                0,
-            ),
-            self.base_cidr_prefix,
-        );
+                1,
+            )
+        });
+
+        // CIDR is always based on the actual local_ip with /32 prefix for point-to-point tunnel
+        // We don't use the synthetic subnet anymore since all shards share the same tunnel IP
+        let cidr = IpCidr::new(local_ip, 32);
 
         ShardConfig {
             shard_index,
+            total_shards,
             local_ip,
             local_cidr: cidr,
             mtu: self.mtu,
@@ -754,8 +785,13 @@ impl ShardedVlessWgBridge {
             // Clone the shared WG TX for this shard
             wg_tx_senders.push(wg_tx.clone());
 
-            // Create shard configuration
-            let shard_config = config.shard_config.for_shard(shard_idx as u16);
+            // Create shard configuration, passing the tunnel's local IP if available
+            // Also pass total_shards for port range partitioning
+            let shard_config = config.shard_config.for_shard(
+                shard_idx as u16,
+                num_shards as u16,
+                config.tunnel_local_ip,
+            );
             let shard_local_ip = shard_config.local_ip;
 
             // Create shard with cleanup configuration
@@ -896,11 +932,25 @@ impl ShardedVlessWgBridge {
     }
 
     /// Compute shard index from IP and port
-    fn compute_shard_index(ip: IpAddr, port: u16, num_shards: usize) -> usize {
-        let mut hasher = DefaultHasher::new();
-        ip.hash(&mut hasher);
-        port.hash(&mut hasher);
-        (hasher.finish() as usize) % num_shards
+    ///
+    /// Uses port-based routing to determine the correct shard. Each shard has a
+    /// partitioned range of ephemeral ports, so we can determine which shard owns
+    /// a connection by looking at which port range the destination port falls into.
+    ///
+    /// Falls back to hash-based routing for ports outside the ephemeral range.
+    fn compute_shard_index(_ip: IpAddr, port: u16, num_shards: usize) -> usize {
+        // Use port-based routing for ephemeral ports (where our connections originate)
+        // This avoids routing errors when all shards share the same tunnel IP
+        if let Some(shard_idx) = PortAllocator::shard_for_port(port, num_shards as u16) {
+            shard_idx
+        } else {
+            // For non-ephemeral ports (e.g., well-known ports), fall back to hash routing
+            // This shouldn't normally happen for reply packets since we always use
+            // ephemeral ports as source ports
+            let mut hasher = DefaultHasher::new();
+            port.hash(&mut hasher);
+            (hasher.finish() as usize) % num_shards
+        }
     }
 
     /// Route to the appropriate shard based on a ShardKey
@@ -1023,6 +1073,11 @@ impl ShardedVlessWgBridge {
         // Generate connection ID using atomic counter
         let conn_id = self.allocate_conn_id();
 
+        info!(
+            "[VLESS-WG] handle_tcp_connection called: conn_id={}, dest={}",
+            conn_id, dest_addr
+        );
+
         // Create the TCP session key for shard routing
         // Use a pseudo source address based on conn_id for consistent routing
         let pseudo_src_port = (conn_id & 0xFFFF) as u16;
@@ -1038,9 +1093,9 @@ impl ShardedVlessWgBridge {
         );
         let shard_idx = self.route_to_shard(&tcp_key);
 
-        debug!(
-            "TCP connection {} -> {} routed to shard {}",
-            conn_id, dest_addr, shard_idx
+        info!(
+            "[VLESS-WG] TCP conn_id={} -> {} routed to shard {} (pseudo_src={}:{})",
+            conn_id, dest_addr, shard_idx, pseudo_src_ip, pseudo_src_port
         );
 
         // Create reply channel for this connection
@@ -1048,7 +1103,15 @@ impl ShardedVlessWgBridge {
 
         // Send TcpConnect event to the shard
         let event = BridgeEvent::tcp_connect(conn_id, dest_addr, reply_tx);
+        info!(
+            "[VLESS-WG] Sending TcpConnect event to shard {}: conn_id={}",
+            shard_idx, conn_id
+        );
         if let Err(e) = self.shard_senders[shard_idx].try_send(event) {
+            error!(
+                "[VLESS-WG] Failed to send TcpConnect to shard {}: conn_id={}, err={:?}",
+                shard_idx, conn_id, e
+            );
             return Err(BridgeError::ChannelSendFailed(format!(
                 "failed to send TcpConnect to shard {}: {:?}",
                 shard_idx, e
@@ -1087,6 +1150,7 @@ impl ShardedVlessWgBridge {
         let mut bytes_received = 0u64;
         let mut buf = vec![0u8; TCP_BUFFER_SIZE];
         let mut remote_closed = false;
+        let mut local_eof = false; // Track local EOF to avoid repeated CloseWrite
 
         loop {
             if self.is_shutdown() {
@@ -1097,11 +1161,12 @@ impl ShardedVlessWgBridge {
             tokio::select! {
                 biased;
 
-                // Read from stream -> send to shard
-                result = stream.read(&mut buf) => {
+                // Read from stream -> send to shard (only if not already EOF)
+                result = stream.read(&mut buf), if !local_eof => {
                     match result {
                         Ok(0) => {
                             // EOF - send CloseWrite to initiate graceful close
+                            local_eof = true; // Prevent further reads
                             debug!("TCP {} stream EOF, sending CloseWrite", conn_id);
                             let _ = self.shard_senders[shard_idx]
                                 .try_send(BridgeEvent::tcp_close_write(conn_id));
@@ -1472,17 +1537,66 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_config_template() {
+    fn test_shard_config_template_synthetic_ip() {
         let template = ShardConfigTemplate::default();
-        let config = template.for_shard(5);
+        // Without tunnel_local_ip, should use synthetic shard IP
+        // Pass total_shards=8 for port partitioning
+        let config = template.for_shard(5, 8, None);
 
         assert_eq!(config.shard_index, 5);
+        assert_eq!(config.total_shards, 8);
         assert_eq!(config.mtu, 1420);
-        // IP should be 10.200.5.1
+        // IP should be 10.200.5.1 (synthetic shard IP)
+        assert_eq!(config.local_ip, IpAddress::v4(10, 200, 5, 1));
+        // CIDR should be /32 for point-to-point
         assert_eq!(
-            config.local_ip,
-            IpAddress::v4(10, 200, 5, 1)
+            config.local_cidr,
+            IpCidr::new(IpAddress::v4(10, 200, 5, 1), 32)
         );
+    }
+
+    #[test]
+    fn test_shard_config_template_with_tunnel_ip() {
+        let template = ShardConfigTemplate::default();
+        let tunnel_ip = IpAddress::v4(10, 200, 200, 5);
+        // With tunnel_local_ip, all shards should use the tunnel's IP
+        // Pass total_shards=8 for port partitioning
+        let config = template.for_shard(5, 8, Some(tunnel_ip));
+
+        assert_eq!(config.shard_index, 5);
+        assert_eq!(config.total_shards, 8);
+        assert_eq!(config.mtu, 1420);
+        // IP should be the tunnel's actual IP
+        assert_eq!(config.local_ip, IpAddress::v4(10, 200, 200, 5));
+        // CIDR should be /32 for point-to-point
+        assert_eq!(
+            config.local_cidr,
+            IpCidr::new(IpAddress::v4(10, 200, 200, 5), 32)
+        );
+    }
+
+    #[test]
+    fn test_port_based_shard_routing() {
+        // Test that port-based routing works correctly with partitioned ports
+        // With 4 shards and 16384 ports (49152-65535):
+        // Shard 0: 49152-53247 (4096 ports)
+        // Shard 1: 53248-57343 (4096 ports)
+        // Shard 2: 57344-61439 (4096 ports)
+        // Shard 3: 61440-65535 (4096 ports)
+
+        assert_eq!(PortAllocator::shard_for_port(49152, 4), Some(0));
+        assert_eq!(PortAllocator::shard_for_port(53247, 4), Some(0));
+        assert_eq!(PortAllocator::shard_for_port(53248, 4), Some(1));
+        assert_eq!(PortAllocator::shard_for_port(57343, 4), Some(1));
+        assert_eq!(PortAllocator::shard_for_port(57344, 4), Some(2));
+        assert_eq!(PortAllocator::shard_for_port(61439, 4), Some(2));
+        assert_eq!(PortAllocator::shard_for_port(61440, 4), Some(3));
+        assert_eq!(PortAllocator::shard_for_port(65535, 4), Some(3));
+
+        // Ports outside ephemeral range return None
+        assert_eq!(PortAllocator::shard_for_port(80, 4), None);
+        assert_eq!(PortAllocator::shard_for_port(443, 4), None);
+        assert_eq!(PortAllocator::shard_for_port(49151, 4), None);
     }
 
     // -------------------------------------------------------------------------

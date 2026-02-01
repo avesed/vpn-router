@@ -172,6 +172,8 @@ pub const WG_BATCH_TIMEOUT_US: u64 = 100;
 pub struct ShardConfig {
     /// Shard index (used for connection ID encoding)
     pub shard_index: u16,
+    /// Total number of shards (used for port partitioning)
+    pub total_shards: u16,
     /// Local IP address for the smoltcp interface
     pub local_ip: IpAddress,
     /// IP CIDR for the smoltcp interface (e.g., 10.200.200.0/24)
@@ -183,9 +185,10 @@ pub struct ShardConfig {
 impl ShardConfig {
     /// Create a new shard config with common defaults
     #[must_use]
-    pub fn new(shard_index: u16, local_ip: IpAddress, local_cidr: IpCidr) -> Self {
+    pub fn new(shard_index: u16, total_shards: u16, local_ip: IpAddress, local_cidr: IpCidr) -> Self {
         Self {
             shard_index,
+            total_shards,
             local_ip,
             local_cidr,
             mtu: WG_MTU,
@@ -491,9 +494,11 @@ impl SmoltcpShard {
         let iface_config = IfaceConfig::new(HardwareAddress::Ip);
         let mut iface = Interface::new(iface_config, &mut device, smoltcp_now);
 
-        // Configure IP address
+        // Configure IP address - use /32 for the host IP (point-to-point tunnel)
+        // Note: We use local_ip with /32 prefix, NOT local_cidr (network address)
+        // This matches how smoltcp_bridge.rs configures its interface
         iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(config.local_cidr);
+            let _ = addrs.push(IpCidr::new(config.local_ip, 32));
         });
 
         // Create socket set
@@ -513,7 +518,9 @@ impl SmoltcpShard {
             sockets,
             device,
             conn_id_allocator,
-            port_allocator: PortAllocator::new(),
+            // Use partitioned port allocator to avoid port collisions between shards
+            // when all shards share the same tunnel IP
+            port_allocator: PortAllocator::for_shard(config.shard_index, config.total_shards),
             tcp_sessions: HashMap::new(),
             tcp_handle_to_conn: HashMap::new(),
             tcp_ports: HashMap::new(),
@@ -731,8 +738,8 @@ impl SmoltcpShard {
         dest_addr: SocketAddr,
         reply_tx: mpsc::Sender<TcpReply>,
     ) {
-        debug!(
-            "Shard {}: TCP connect request: conn_id={}, dest={}",
+        info!(
+            "[SHARD {}] Received TcpConnect: conn_id={}, dest={}",
             self.shard_index, conn_id, dest_addr
         );
 
@@ -767,7 +774,19 @@ impl SmoltcpShard {
         let handle = self.sockets.add(socket);
 
         // Convert destination address to smoltcp endpoint
-        let remote_endpoint = socket_addr_to_endpoint(dest_addr);
+        let Some(remote_endpoint) = socket_addr_to_endpoint(dest_addr) else {
+            // IPv6 not supported
+            warn!(
+                "Shard {}: IPv6 destination not supported: {:?}",
+                self.shard_index, dest_addr
+            );
+            self.sockets.remove(handle);
+            self.port_allocator.release_immediate(local_port);
+            let _ = reply_tx.try_send(TcpReply::ConnectFailed {
+                error: BridgeError::InvalidAddress("IPv6 not supported".to_string()),
+            });
+            return;
+        };
         let local_endpoint = IpEndpoint::new(self.local_ip, local_port);
 
         // Initiate connection
@@ -799,9 +818,9 @@ impl SmoltcpShard {
         self.tcp_ports.insert(conn_id, local_port);
         self.stats.tcp_sessions_created += 1;
 
-        debug!(
-            "Shard {}: Created TCP session: conn_id={}, handle={:?}, local_port={}",
-            self.shard_index, conn_id, handle, local_port
+        info!(
+            "[SHARD {}] Created TCP session: conn_id={}, handle={:?}, local_port={}, local_ip={}, total_sessions={}",
+            self.shard_index, conn_id, handle, local_port, self.local_ip, self.tcp_sessions.len()
         );
     }
 
@@ -892,9 +911,11 @@ impl SmoltcpShard {
         );
 
         let Some(session) = self.tcp_sessions.get_mut(&conn_id) else {
+            // Log existing sessions for debugging
+            let existing_ids: Vec<_> = self.tcp_sessions.keys().take(10).collect();
             warn!(
-                "Shard {}: TCP close write for unknown connection: {}",
-                self.shard_index, conn_id
+                "[SHARD {}] TCP close write for unknown connection: {} (existing sessions: {:?}, total={})",
+                self.shard_index, conn_id, existing_ids, self.tcp_sessions.len()
             );
             return;
         };
@@ -1053,7 +1074,14 @@ impl SmoltcpShard {
         };
 
         // Convert destination to smoltcp IpEndpoint
-        let smoltcp_dest = socket_addr_to_endpoint(dest);
+        let Some(smoltcp_dest) = socket_addr_to_endpoint(dest) else {
+            // IPv6 not supported
+            warn!(
+                "Shard {}: IPv6 destination not supported for UDP: {:?}",
+                self.shard_index, dest
+            );
+            return;
+        };
 
         // Send the data
         {
@@ -1807,17 +1835,17 @@ impl std::fmt::Debug for SmoltcpShard {
 /// Convert a `std::net::SocketAddr` to a smoltcp `IpEndpoint`
 ///
 /// Note: IPv6 is not supported by smoltcp in this build. IPv6 addresses will
-/// cause a panic.
+/// Returns `None` for IPv6 addresses as smoltcp is compiled without IPv6 support.
 #[inline]
-fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
+fn socket_addr_to_endpoint(addr: SocketAddr) -> Option<IpEndpoint> {
     match addr {
-        SocketAddr::V4(v4) => IpEndpoint {
+        SocketAddr::V4(v4) => Some(IpEndpoint {
             addr: IpAddress::Ipv4(Ipv4Address::from_bytes(&v4.ip().octets())),
             port: v4.port(),
-        },
+        }),
         SocketAddr::V6(_) => {
             // smoltcp is compiled without IPv6 support in this project
-            panic!("IPv6 is not supported by smoltcp in this build");
+            None
         }
     }
 }
@@ -1851,6 +1879,7 @@ mod tests {
     fn test_config() -> ShardConfig {
         ShardConfig {
             shard_index: 0,
+            total_shards: 4, // Use 4 shards for tests
             local_ip: IpAddress::v4(10, 200, 200, 2),
             local_cidr: IpCidr::new(IpAddress::v4(10, 200, 200, 0), 24),
             mtu: WG_MTU,
@@ -1861,10 +1890,12 @@ mod tests {
     fn test_shard_config_new() {
         let config = ShardConfig::new(
             1,
+            4, // total_shards
             IpAddress::v4(10, 0, 0, 1),
             IpCidr::new(IpAddress::v4(10, 0, 0, 0), 24),
         );
         assert_eq!(config.shard_index, 1);
+        assert_eq!(config.total_shards, 4);
         assert_eq!(config.mtu, WG_MTU);
     }
 
@@ -1872,6 +1903,7 @@ mod tests {
     fn test_shard_config_with_mtu() {
         let config = ShardConfig::new(
             0,
+            4, // total_shards
             IpAddress::v4(10, 0, 0, 1),
             IpCidr::new(IpAddress::v4(10, 0, 0, 0), 24),
         )
@@ -2228,23 +2260,21 @@ mod tests {
     #[test]
     fn test_socket_addr_to_endpoint_ipv4() {
         let addr: SocketAddr = "192.168.1.100:8080".parse().unwrap();
-        let endpoint = socket_addr_to_endpoint(addr);
+        let endpoint = socket_addr_to_endpoint(addr).expect("IPv4 should succeed");
 
         assert_eq!(endpoint.port, 8080);
         match endpoint.addr {
             IpAddress::Ipv4(v4) => {
                 assert_eq!(v4.as_bytes(), &[192, 168, 1, 100]);
             }
-            _ => panic!("Expected IPv4 address"),
         }
     }
 
     #[test]
-    #[should_panic(expected = "IPv6 is not supported")]
-    fn test_socket_addr_to_endpoint_ipv6_panics() {
+    fn test_socket_addr_to_endpoint_ipv6_returns_none() {
         // IPv6 is not supported in this build of smoltcp
         let addr: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
-        let _ = socket_addr_to_endpoint(addr);
+        assert!(socket_addr_to_endpoint(addr).is_none(), "IPv6 should return None");
     }
 
     #[test]
@@ -2261,7 +2291,7 @@ mod tests {
     #[test]
     fn test_endpoint_conversion_roundtrip() {
         let original: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let endpoint = socket_addr_to_endpoint(original);
+        let endpoint = socket_addr_to_endpoint(original).expect("IPv4 should succeed");
         let converted = endpoint_to_socket_addr(endpoint);
 
         assert_eq!(original, converted);

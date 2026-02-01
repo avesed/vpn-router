@@ -96,6 +96,8 @@ pub mod sniff;
 pub mod ss_inbound;
 pub mod tproxy;
 pub mod transport;
+pub mod tun;
+pub mod tun_bridge;
 pub mod tunnel;
 pub mod vision;
 pub mod vless;
@@ -161,6 +163,12 @@ pub use sniff::{
 };
 pub use tproxy::{
     TproxyConnection, TproxyListener, TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo,
+};
+pub use tun::{TunConfig, TunDevice, DEFAULT_MTU as TUN_DEFAULT_MTU};
+pub use tun_bridge::{
+    FiveTuple as TunBridgeFiveTuple, IptablesManager, SessionInfo as TunBridgeSessionInfo,
+    SessionTracker as TunBridgeSessionTracker, TunIngressBridge, TunIngressConfig,
+    TunIngressStats, TunIngressStatsSnapshot,
 };
 #[cfg(feature = "transport-tls")]
 pub use transport::TlsTransport;

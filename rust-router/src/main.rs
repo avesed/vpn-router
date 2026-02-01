@@ -573,6 +573,16 @@ async fn main() -> Result<()> {
                 return;
             }
 
+            // Try to route to WgEgressBridge (ipstack -> WG egress)
+            // This handles replies from WG tunnels used by ipstack for WG egress routing
+            #[cfg(feature = "ipstack-tcp")]
+            {
+                if rust_router::ingress::try_route_wg_egress_reply(&tunnel_tag, &packet) {
+                    // Successfully routed to a WgEgressBridge
+                    return;
+                }
+            }
+
             // Route peer tunnel packets (peer-*) to the peer tunnel processor
             // for DSCP-based chain routing on Terminal nodes
             if tunnel_tag.starts_with("peer-") {

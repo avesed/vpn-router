@@ -7,12 +7,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::copy_bidirectional;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::ecmp::{DestKey, EcmpGroupManager, FiveTuple, LbAlgorithm, Protocol};
 use crate::error::{ConnectionError, RustRouterError};
-use crate::io::{bidirectional_copy, CopyResult};
+use crate::io::CopyResult;
 use crate::outbound::{Outbound, OutboundManager};
 use crate::sniff::sniff_tls_sni;
 use crate::tproxy::TproxyConnection;
@@ -149,17 +150,17 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
     // Get the stream from the outbound connection
     let mut upstream_stream = upstream.into_stream();
 
-    // Bidirectional copy
-    match bidirectional_copy(&mut stream, &mut upstream_stream).await {
-        Ok(copy_result) => {
+    // Bidirectional copy using tokio's optimized implementation
+    match copy_bidirectional(&mut stream, &mut upstream_stream).await {
+        Ok((client_to_upstream, upstream_to_client)) => {
             info!(
                 "Connection closed: {} -> {}, {} up / {} down bytes",
-                client_addr,
-                original_dst,
-                copy_result.client_to_upstream,
-                copy_result.upstream_to_client
+                client_addr, original_dst, client_to_upstream, upstream_to_client
             );
-            result.copy_result = Some(copy_result);
+            result.copy_result = Some(CopyResult {
+                client_to_upstream,
+                upstream_to_client,
+            });
         }
         Err(e) => {
             debug!(

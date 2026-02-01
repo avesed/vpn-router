@@ -143,7 +143,7 @@ pub use events::{BridgeEvent, EventPriority, TcpReply, UdpReply, UdpSessionKey};
 // Event Channel for shard communication
 pub use event_channel::{
     create_event_channel, EventChannelConfig, EventChannelStats, EventReceiver, EventSender,
-    SendError, TrySendError, HIGH_PRIORITY_CHANNEL_SIZE, NORMAL_PRIORITY_CHANNEL_SIZE,
+    TrySendError, HIGH_PRIORITY_CHANNEL_SIZE, NORMAL_PRIORITY_CHANNEL_SIZE,
 };
 
 // TCP Session State Machine for Event Bus architecture

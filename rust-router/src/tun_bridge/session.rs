@@ -1,47 +1,47 @@
-//! Session tracking for IpStack bridge
+//! Session tracking for TUN + TPROXY bridge
 //!
-//! Tracks TCP/UDP sessions and maps them back to WireGuard peers
+//! This module tracks TCP/UDP sessions and maps them back to WireGuard peers
 //! for reply packet routing.
 //!
 //! # Design
 //!
-//! The session tracker provides bidirectional lookup:
-//! - Forward: client 5-tuple -> session info (for new packets from client)
-//! - Reverse: local port + protocol -> session info (for reply routing)
+//! Unlike the ipstack bridge which needs bidirectional lookup (forward and reverse
+//! by port), the TUN + TPROXY bridge only needs:
+//! - Forward lookup: 5-tuple (from reply packets) → peer info
+//!
+//! When the kernel sends reply packets out through the TUN device, we parse
+//! the IP header to extract the 5-tuple, reverse it (dst becomes src), and
+//! look up the session to find which WireGuard peer to send the packet to.
 //!
 //! # Thread Safety
 //!
-//! Uses `DashMap` for lock-free concurrent access, allowing the forwarder
-//! and multiple connection handlers to access the tracker simultaneously.
-//!
-//! # Resource Limits
-//!
-//! The tracker enforces per-peer and total session limits to prevent
-//! resource exhaustion:
-//!
-//! - `MAX_SESSIONS_PER_PEER`: Limits sessions per WireGuard peer
-//! - `MAX_TOTAL_SESSIONS`: Hard limit on total concurrent sessions
+//! Uses `DashMap` for lock-free concurrent access, allowing:
+//! - `inject_packet()` to register sessions
+//! - `run_tun_read_loop()` to look up sessions for reply routing
+//! - `run_accept_loop()` to update session activity
+//! - Cleanup task to remove idle sessions
 
 use ahash::RandomState;
 use dashmap::DashMap;
-use std::net::SocketAddr;
+use parking_lot::Mutex;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
 
 /// Type alias for DashMap with ahash for faster lookups
-/// ahash is ~2-3x faster than the default SipHash for small keys
 type AHashMap<K, V> = DashMap<K, V, RandomState>;
 
 /// 5-tuple identifying a TCP/UDP session
 ///
 /// A 5-tuple uniquely identifies a network session based on:
-/// - Source address (IP + port)
-/// - Destination address (IP + port)
+/// - Source address (IP + port) - the WireGuard client
+/// - Destination address (IP + port) - the target server
 /// - Protocol (TCP = 6, UDP = 17)
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct FiveTuple {
-    /// Source socket address (client)
+    /// Source socket address (WireGuard client)
     pub src_addr: SocketAddr,
     /// Destination socket address (target server)
     pub dst_addr: SocketAddr,
@@ -56,6 +56,7 @@ impl FiveTuple {
     ///
     /// * `src` - Source socket address (client)
     /// * `dst` - Destination socket address (server)
+    #[must_use]
     pub fn tcp(src: SocketAddr, dst: SocketAddr) -> Self {
         Self {
             src_addr: src,
@@ -70,6 +71,7 @@ impl FiveTuple {
     ///
     /// * `src` - Source socket address (client)
     /// * `dst` - Destination socket address (server)
+    #[must_use]
     pub fn udp(src: SocketAddr, dst: SocketAddr) -> Self {
         Self {
             src_addr: src,
@@ -81,8 +83,9 @@ impl FiveTuple {
     /// Create the reverse tuple (for reply packets)
     ///
     /// Returns a new 5-tuple with source and destination swapped.
-    /// This is used to match reply packets from the server back
+    /// This is used to match reply packets from the kernel back
     /// to the original client session.
+    #[must_use]
     pub fn reverse(&self) -> Self {
         Self {
             src_addr: self.dst_addr,
@@ -93,14 +96,144 @@ impl FiveTuple {
 
     /// Check if this is a TCP session
     #[inline]
+    #[must_use]
     pub fn is_tcp(&self) -> bool {
         self.protocol == 6
     }
 
     /// Check if this is a UDP session
     #[inline]
+    #[must_use]
     pub fn is_udp(&self) -> bool {
         self.protocol == 17
+    }
+
+    /// Parse a 5-tuple from an IP packet
+    ///
+    /// Returns `None` if the packet is malformed or not TCP/UDP.
+    #[must_use]
+    pub fn from_packet(packet: &[u8]) -> Option<Self> {
+        if packet.is_empty() {
+            return None;
+        }
+
+        let version = packet[0] >> 4;
+
+        match version {
+            4 => Self::parse_ipv4(packet),
+            6 => Self::parse_ipv6(packet),
+            _ => None,
+        }
+    }
+
+    /// Parse an IPv4 packet to extract the 5-tuple
+    fn parse_ipv4(packet: &[u8]) -> Option<Self> {
+        // Minimum IPv4 header is 20 bytes
+        if packet.len() < 20 {
+            return None;
+        }
+
+        let ihl = (packet[0] & 0x0f) as usize * 4;
+        if packet.len() < ihl {
+            return None;
+        }
+
+        let protocol = packet[9];
+        let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+        let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+
+        // Need at least 4 more bytes for ports (TCP/UDP)
+        if packet.len() < ihl + 4 {
+            return None;
+        }
+
+        let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+        let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+
+        let src_addr = SocketAddr::new(IpAddr::V4(src_ip), src_port);
+        let dst_addr = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
+
+        match protocol {
+            6 => Some(Self::tcp(src_addr, dst_addr)),
+            17 => Some(Self::udp(src_addr, dst_addr)),
+            _ => None,
+        }
+    }
+
+    /// Parse an IPv6 packet to extract the 5-tuple
+    ///
+    /// Handles IPv6 extension headers by skipping through them to find the
+    /// actual transport protocol (TCP/UDP).
+    fn parse_ipv6(packet: &[u8]) -> Option<Self> {
+        // Minimum IPv6 header is 40 bytes
+        if packet.len() < 40 {
+            return None;
+        }
+
+        // Extract addresses from the fixed header first
+        let mut src_octets = [0u8; 16];
+        let mut dst_octets = [0u8; 16];
+        src_octets.copy_from_slice(&packet[8..24]);
+        dst_octets.copy_from_slice(&packet[24..40]);
+
+        let src_ip = Ipv6Addr::from(src_octets);
+        let dst_ip = Ipv6Addr::from(dst_octets);
+
+        // Skip extension headers to find the transport protocol
+        let mut next_header = packet[6];
+        let mut offset = 40; // Start after fixed IPv6 header
+
+        loop {
+            match next_header {
+                // TCP (6) or UDP (17) - we found the transport layer
+                6 | 17 => break,
+
+                // Hop-by-Hop Options (0), Routing (43), Destination Options (60), Mobility (135)
+                // These headers have their length in the second byte (in 8-byte units, not including first 8)
+                0 | 43 | 60 | 135 => {
+                    if packet.len() < offset + 2 {
+                        return None;
+                    }
+                    next_header = packet[offset];
+                    let ext_len = (packet[offset + 1] as usize + 1) * 8;
+                    offset += ext_len;
+                }
+
+                // Fragment header (44) - fixed 8 bytes
+                44 => {
+                    if packet.len() < offset + 8 {
+                        return None;
+                    }
+                    next_header = packet[offset];
+                    offset += 8;
+                }
+
+                // No Next Header (59), or unknown/unsupported extension header
+                _ => return None,
+            }
+
+            // Safety check to prevent infinite loops on malformed packets
+            if offset > packet.len() {
+                return None;
+            }
+        }
+
+        // Need at least 4 more bytes for ports (TCP/UDP header starts at offset)
+        if packet.len() < offset + 4 {
+            return None;
+        }
+
+        let src_port = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let dst_port = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+
+        let src_addr = SocketAddr::new(IpAddr::V6(src_ip), src_port);
+        let dst_addr = SocketAddr::new(IpAddr::V6(dst_ip), dst_port);
+
+        match next_header {
+            6 => Some(Self::tcp(src_addr, dst_addr)),
+            17 => Some(Self::udp(src_addr, dst_addr)),
+            _ => None,
+        }
     }
 }
 
@@ -109,13 +242,7 @@ impl std::fmt::Display for FiveTuple {
         let proto = match self.protocol {
             6 => "TCP",
             17 => "UDP",
-            n => {
-                return write!(
-                    f,
-                    "{}:{} -> {} (proto={})",
-                    self.src_addr, self.dst_addr, n, n
-                )
-            }
+            n => return write!(f, "{}:{} -> {} (proto={})", self.src_addr, self.dst_addr, n, n),
         };
         write!(f, "{}:{} -> {}", proto, self.src_addr, self.dst_addr)
     }
@@ -132,20 +259,16 @@ pub struct SessionInfo {
     /// WireGuard peer public key (for routing replies)
     pub peer_key: [u8; 32],
     /// Peer's WireGuard endpoint (IP:port) for reply routing
-    /// Uses parking_lot::Mutex to allow updates on NAT rebinding/roaming
-    peer_endpoint: parking_lot::Mutex<SocketAddr>,
+    /// Uses Mutex to allow updates on NAT rebinding/roaming
+    peer_endpoint: Mutex<SocketAddr>,
     /// Original 5-tuple from client
     pub five_tuple: FiveTuple,
-    /// Local ephemeral port allocated for this session
-    pub local_port: u16,
     /// Outbound tag for routing (e.g., "direct", "vless-xxx", "ss-xxx")
-    /// Determined by RuleEngine before packet injection
     pub outbound_tag: String,
     /// Session creation time
     pub created_at: Instant,
     /// Last activity time (updated on packet send/receive)
-    /// Uses parking_lot::Mutex for interior mutability with minimal overhead
-    last_active: parking_lot::Mutex<Instant>,
+    last_active: Mutex<Instant>,
     /// Bytes sent to outbound
     pub bytes_sent: AtomicU64,
     /// Bytes received from outbound
@@ -161,26 +284,24 @@ impl SessionInfo {
     /// * `peer_key` - WireGuard peer public key
     /// * `peer_endpoint` - Peer's WireGuard endpoint (IP:port)
     /// * `five_tuple` - Client's 5-tuple
-    /// * `local_port` - Allocated ephemeral port
     /// * `outbound_tag` - Outbound tag for routing
+    #[must_use]
     pub fn new(
         session_id: u64,
         peer_key: [u8; 32],
         peer_endpoint: SocketAddr,
         five_tuple: FiveTuple,
-        local_port: u16,
         outbound_tag: String,
     ) -> Self {
         let now = Instant::now();
         Self {
             session_id,
             peer_key,
-            peer_endpoint: parking_lot::Mutex::new(peer_endpoint),
+            peer_endpoint: Mutex::new(peer_endpoint),
             five_tuple,
-            local_port,
             outbound_tag,
             created_at: now,
-            last_active: parking_lot::Mutex::new(now),
+            last_active: Mutex::new(now),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
         }
@@ -188,6 +309,7 @@ impl SessionInfo {
 
     /// Get the peer's WireGuard endpoint
     #[inline]
+    #[must_use]
     pub fn peer_endpoint(&self) -> SocketAddr {
         *self.peer_endpoint.lock()
     }
@@ -198,7 +320,7 @@ impl SessionInfo {
     pub fn update_peer_endpoint(&self, new_endpoint: SocketAddr) -> bool {
         let mut endpoint = self.peer_endpoint.lock();
         if *endpoint != new_endpoint {
-            tracing::debug!(
+            debug!(
                 session_id = self.session_id,
                 old = %*endpoint,
                 new = %new_endpoint,
@@ -231,26 +353,31 @@ impl SessionInfo {
     }
 
     /// Get total bytes sent
+    #[must_use]
     pub fn total_bytes_sent(&self) -> u64 {
         self.bytes_sent.load(Ordering::Relaxed)
     }
 
     /// Get total bytes received
+    #[must_use]
     pub fn total_bytes_received(&self) -> u64 {
         self.bytes_received.load(Ordering::Relaxed)
     }
 
     /// Get session duration
-    pub fn duration(&self) -> std::time::Duration {
+    #[must_use]
+    pub fn duration(&self) -> Duration {
         self.created_at.elapsed()
     }
 
     /// Get time since last activity
-    pub fn idle_time(&self) -> std::time::Duration {
+    #[must_use]
+    pub fn idle_time(&self) -> Duration {
         self.last_active.lock().elapsed()
     }
 
     /// Get the last active time
+    #[must_use]
     pub fn last_active(&self) -> Instant {
         *self.last_active.lock()
     }
@@ -261,23 +388,21 @@ impl Clone for SessionInfo {
         Self {
             session_id: self.session_id,
             peer_key: self.peer_key,
-            peer_endpoint: parking_lot::Mutex::new(*self.peer_endpoint.lock()),
+            peer_endpoint: Mutex::new(*self.peer_endpoint.lock()),
             five_tuple: self.five_tuple.clone(),
-            local_port: self.local_port,
             outbound_tag: self.outbound_tag.clone(),
             created_at: self.created_at,
-            last_active: parking_lot::Mutex::new(*self.last_active.lock()),
+            last_active: Mutex::new(*self.last_active.lock()),
             bytes_sent: AtomicU64::new(self.bytes_sent.load(Ordering::Relaxed)),
             bytes_received: AtomicU64::new(self.bytes_received.load(Ordering::Relaxed)),
         }
     }
 }
 
-/// Tracks sessions for the IpStack bridge
+/// Tracks sessions for the TUN + TPROXY bridge
 ///
-/// Provides bidirectional lookup:
-/// - Forward: client 5-tuple -> session info
-/// - Reverse: (local_port, protocol) -> session info (for reply routing)
+/// Provides lookup by 5-tuple for routing reply packets back to
+/// the correct WireGuard peer.
 ///
 /// # Thread Safety
 ///
@@ -288,24 +413,36 @@ impl Clone for SessionInfo {
 /// Uses ahash instead of SipHash for 2-3x faster lookups on the hot path.
 pub struct SessionTracker {
     /// Forward index: client 5-tuple -> session info
-    forward: AHashMap<FiveTuple, Arc<SessionInfo>>,
-    /// Reverse index: (local_port, protocol) -> session info
-    /// Used for routing reply packets back to the correct peer
-    reverse: AHashMap<(u16, u8), Arc<SessionInfo>>,
+    sessions: AHashMap<FiveTuple, Arc<SessionInfo>>,
     /// Session ID counter (monotonically increasing)
     next_session_id: AtomicU64,
     /// Per-peer session counts for rate limiting
     peer_session_counts: AHashMap<[u8; 32], AtomicU64>,
+    /// Maximum sessions per peer
+    max_sessions_per_peer: usize,
+    /// Maximum total sessions
+    max_total_sessions: usize,
 }
 
 impl SessionTracker {
-    /// Create a new session tracker
+    /// Create a new session tracker with default limits
+    #[must_use]
     pub fn new() -> Self {
+        Self::with_limits(
+            super::MAX_SESSIONS_PER_PEER,
+            super::MAX_TOTAL_SESSIONS,
+        )
+    }
+
+    /// Create a new session tracker with custom limits
+    #[must_use]
+    pub fn with_limits(max_per_peer: usize, max_total: usize) -> Self {
         Self {
-            forward: DashMap::with_hasher(RandomState::new()),
-            reverse: DashMap::with_hasher(RandomState::new()),
+            sessions: DashMap::with_hasher(RandomState::new()),
             next_session_id: AtomicU64::new(1),
             peer_session_counts: DashMap::with_hasher(RandomState::new()),
+            max_sessions_per_peer: max_per_peer,
+            max_total_sessions: max_total,
         }
     }
 
@@ -316,7 +453,6 @@ impl SessionTracker {
     /// * `peer_key` - WireGuard peer public key
     /// * `peer_endpoint` - Peer's WireGuard endpoint (IP:port) for reply routing
     /// * `five_tuple` - Client's 5-tuple
-    /// * `local_port` - Allocated ephemeral port for this session
     /// * `outbound_tag` - Outbound tag for routing (e.g., "direct", "vless-xxx")
     ///
     /// # Returns
@@ -327,98 +463,14 @@ impl SessionTracker {
         peer_key: [u8; 32],
         peer_endpoint: SocketAddr,
         five_tuple: FiveTuple,
-        local_port: u16,
-        outbound_tag: String,
-    ) -> Option<Arc<SessionInfo>> {
-        // Check per-peer limit
-        let count = self
-            .peer_session_counts
-            .entry(peer_key)
-            .or_insert_with(|| AtomicU64::new(0));
-
-        let current = count.fetch_add(1, Ordering::SeqCst);
-        if current >= super::config::MAX_SESSIONS_PER_PEER as u64 {
-            count.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(
-                peer = hex::encode(&peer_key[..8]),
-                limit = super::config::MAX_SESSIONS_PER_PEER,
-                "Per-peer session limit exceeded"
-            );
-            return None;
-        }
-
-        // Check total limit
-        if self.forward.len() >= super::config::MAX_TOTAL_SESSIONS {
-            count.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(
-                limit = super::config::MAX_TOTAL_SESSIONS,
-                "Total session limit exceeded"
-            );
-            return None;
-        }
-
-        let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
-        let session = Arc::new(SessionInfo::new(
-            session_id,
-            peer_key,
-            peer_endpoint,
-            five_tuple.clone(),
-            local_port,
-            outbound_tag.clone(),
-        ));
-
-        self.forward.insert(five_tuple, Arc::clone(&session));
-        // Only add to reverse index if we have a valid local port
-        // (inject_packet uses register_forward_only instead to avoid port=0 collisions)
-        if local_port != 0 {
-            self.reverse.insert(
-                (local_port, session.five_tuple.protocol),
-                Arc::clone(&session),
-            );
-        }
-
-        tracing::debug!(
-            session_id,
-            peer = hex::encode(&peer_key[..8]),
-            peer_endpoint = %peer_endpoint,
-            five_tuple = %session.five_tuple,
-            local_port,
-            outbound = %outbound_tag,
-            "Session registered"
-        );
-
-        Some(session)
-    }
-
-    /// Register a session for forward lookup only (no reverse index)
-    ///
-    /// This is used by `inject_packet` where we don't have a local ephemeral port yet.
-    /// The session is tracked only in the forward index for reply routing.
-    ///
-    /// # Arguments
-    ///
-    /// * `peer_key` - WireGuard peer public key
-    /// * `peer_endpoint` - Peer's WireGuard endpoint (IP:port) for reply routing
-    /// * `five_tuple` - Client's 5-tuple
-    /// * `outbound_tag` - Outbound tag for routing (e.g., "direct", "vless-xxx")
-    ///
-    /// # Returns
-    ///
-    /// `Some(session)` if registration succeeded or session already exists, `None` if limits exceeded.
-    pub fn register_forward_only(
-        &self,
-        peer_key: [u8; 32],
-        peer_endpoint: SocketAddr,
-        five_tuple: FiveTuple,
         outbound_tag: String,
     ) -> Option<Arc<SessionInfo>> {
         // Check if session already exists (common for ongoing connections)
-        if let Some(existing) = self.forward.get(&five_tuple) {
+        if let Some(existing) = self.sessions.get(&five_tuple) {
             // Update last_active on existing session
             existing.touch();
             // Update peer endpoint in case of NAT rebinding/roaming
             existing.update_peer_endpoint(peer_endpoint);
-            // Note: We don't update outbound_tag - the first registration determines the route
             return Some(Arc::clone(existing.value()));
         }
 
@@ -429,21 +481,21 @@ impl SessionTracker {
             .or_insert_with(|| AtomicU64::new(0));
 
         let current = count.fetch_add(1, Ordering::SeqCst);
-        if current >= super::config::MAX_SESSIONS_PER_PEER as u64 {
+        if current >= self.max_sessions_per_peer as u64 {
             count.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(
+            warn!(
                 peer = hex::encode(&peer_key[..8]),
-                limit = super::config::MAX_SESSIONS_PER_PEER,
+                limit = self.max_sessions_per_peer,
                 "Per-peer session limit exceeded"
             );
             return None;
         }
 
         // Check total limit
-        if self.forward.len() >= super::config::MAX_TOTAL_SESSIONS {
+        if self.sessions.len() >= self.max_total_sessions {
             count.fetch_sub(1, Ordering::SeqCst);
-            tracing::warn!(
-                limit = super::config::MAX_TOTAL_SESSIONS,
+            warn!(
+                limit = self.max_total_sessions,
                 "Total session limit exceeded"
             );
             return None;
@@ -455,20 +507,18 @@ impl SessionTracker {
             peer_key,
             peer_endpoint,
             five_tuple.clone(),
-            0, // No local port for forward-only registration
             outbound_tag.clone(),
         ));
 
-        // Only add to forward index (no reverse index)
-        self.forward.insert(five_tuple, Arc::clone(&session));
+        self.sessions.insert(five_tuple, Arc::clone(&session));
 
-        tracing::trace!(
+        trace!(
             session_id,
             peer = hex::encode(&peer_key[..8]),
             peer_endpoint = %peer_endpoint,
             five_tuple = %session.five_tuple,
             outbound = %outbound_tag,
-            "Session registered (forward-only)"
+            "Session registered"
         );
 
         Some(session)
@@ -483,55 +533,29 @@ impl SessionTracker {
     /// # Returns
     ///
     /// The session info if found.
+    #[must_use]
     pub fn lookup(&self, five_tuple: &FiveTuple) -> Option<Arc<SessionInfo>> {
-        self.forward.get(five_tuple).map(|r| Arc::clone(r.value()))
+        self.sessions.get(five_tuple).map(|r| Arc::clone(r.value()))
     }
 
-    /// Look up session by local port (for reply routing)
+    /// Look up session by reversed 5-tuple (for reply packets)
+    ///
+    /// When the kernel sends a reply packet, the source and destination
+    /// are swapped compared to the original client packet. This method
+    /// takes the reply packet's 5-tuple and reverses it to find the
+    /// original session.
     ///
     /// # Arguments
     ///
-    /// * `local_port` - The local ephemeral port
-    /// * `protocol` - The IP protocol (6 = TCP, 17 = UDP)
+    /// * `reply_tuple` - The 5-tuple from the reply packet
     ///
     /// # Returns
     ///
     /// The session info if found.
-    pub fn lookup_by_port(&self, local_port: u16, protocol: u8) -> Option<Arc<SessionInfo>> {
-        self.reverse
-            .get(&(local_port, protocol))
-            .map(|r| Arc::clone(r.value()))
-    }
-
-    /// Look up session by 5-tuple for reply routing
-    ///
-    /// This is a convenience method that returns the peer key (as Base64) and endpoint
-    /// needed for routing reply packets back to the WireGuard peer.
-    ///
-    /// # Arguments
-    ///
-    /// * `five_tuple` - The client's 5-tuple to look up
-    ///
-    /// # Returns
-    ///
-    /// `Some((peer_key_base64, peer_endpoint))` if found, `None` otherwise.
-    pub fn lookup_for_reply(&self, five_tuple: &FiveTuple) -> Option<(String, SocketAddr)> {
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine;
-
-        self.forward.get(five_tuple).map(|session| {
-            let peer_key_b64 = BASE64.encode(session.peer_key);
-            (peer_key_b64, session.peer_endpoint())
-        })
-    }
-
-    /// Expose the forward index for direct access
-    ///
-    /// This is useful for the ipstack reply router which needs to access sessions
-    /// by 5-tuple without the overhead of Arc cloning.
-    #[inline]
-    pub fn forward(&self) -> &AHashMap<FiveTuple, Arc<SessionInfo>> {
-        &self.forward
+    #[must_use]
+    pub fn lookup_by_reply(&self, reply_tuple: &FiveTuple) -> Option<Arc<SessionInfo>> {
+        let forward_tuple = reply_tuple.reverse();
+        self.lookup(&forward_tuple)
     }
 
     /// Remove a session
@@ -544,17 +568,13 @@ impl SessionTracker {
     ///
     /// The removed session info if it existed.
     pub fn remove(&self, five_tuple: &FiveTuple) -> Option<Arc<SessionInfo>> {
-        if let Some((_, session)) = self.forward.remove(five_tuple) {
-            // Clean up reverse index
-            self.reverse
-                .remove(&(session.local_port, session.five_tuple.protocol));
-
+        if let Some((_, session)) = self.sessions.remove(five_tuple) {
             // Decrement peer count
             if let Some(count) = self.peer_session_counts.get(&session.peer_key) {
                 count.fetch_sub(1, Ordering::SeqCst);
             }
 
-            tracing::debug!(
+            debug!(
                 session_id = session.session_id,
                 peer = hex::encode(&session.peer_key[..8]),
                 five_tuple = %session.five_tuple,
@@ -562,38 +582,6 @@ impl SessionTracker {
                 bytes_received = session.total_bytes_received(),
                 duration_secs = session.duration().as_secs(),
                 "Session removed"
-            );
-
-            Some(session)
-        } else {
-            None
-        }
-    }
-
-    /// Remove a session by local port
-    ///
-    /// # Arguments
-    ///
-    /// * `local_port` - The local ephemeral port
-    /// * `protocol` - The IP protocol (6 = TCP, 17 = UDP)
-    ///
-    /// # Returns
-    ///
-    /// The removed session info if it existed.
-    pub fn remove_by_port(&self, local_port: u16, protocol: u8) -> Option<Arc<SessionInfo>> {
-        if let Some((_, session)) = self.reverse.remove(&(local_port, protocol)) {
-            // Clean up forward index
-            self.forward.remove(&session.five_tuple);
-
-            // Decrement peer count
-            if let Some(count) = self.peer_session_counts.get(&session.peer_key) {
-                count.fetch_sub(1, Ordering::SeqCst);
-            }
-
-            tracing::debug!(
-                session_id = session.session_id,
-                local_port,
-                "Session removed by port"
             );
 
             Some(session)
@@ -611,6 +599,7 @@ impl SessionTracker {
     /// # Returns
     ///
     /// The number of active sessions for this peer.
+    #[must_use]
     pub fn peer_session_count(&self, peer_key: &[u8; 32]) -> u64 {
         self.peer_session_counts
             .get(peer_key)
@@ -619,21 +608,24 @@ impl SessionTracker {
     }
 
     /// Get total session count
+    #[must_use]
     pub fn total_sessions(&self) -> usize {
-        self.forward.len()
+        self.sessions.len()
     }
 
     /// Get TCP session count
+    #[must_use]
     pub fn tcp_session_count(&self) -> usize {
-        self.forward
+        self.sessions
             .iter()
             .filter(|entry| entry.value().five_tuple.is_tcp())
             .count()
     }
 
     /// Get UDP session count
+    #[must_use]
     pub fn udp_session_count(&self) -> usize {
-        self.forward
+        self.sessions
             .iter()
             .filter(|entry| entry.value().five_tuple.is_udp())
             .count()
@@ -648,7 +640,7 @@ impl SessionTracker {
     where
         F: FnMut(&Arc<SessionInfo>),
     {
-        for entry in self.forward.iter() {
+        for entry in self.sessions.iter() {
             f(entry.value());
         }
     }
@@ -670,7 +662,7 @@ impl SessionTracker {
         let mut to_remove = Vec::new();
 
         // Collect sessions to remove (can't remove while iterating)
-        for entry in self.forward.iter() {
+        for entry in self.sessions.iter() {
             if predicate(entry.value()) {
                 to_remove.push(entry.key().clone());
             }
@@ -684,6 +676,27 @@ impl SessionTracker {
         }
 
         removed
+    }
+
+    /// Remove idle sessions based on timeouts
+    ///
+    /// # Arguments
+    ///
+    /// * `tcp_timeout` - Timeout for TCP sessions
+    /// * `udp_timeout` - Timeout for UDP sessions
+    ///
+    /// # Returns
+    ///
+    /// The number of sessions removed.
+    pub fn cleanup_idle(&self, tcp_timeout: Duration, udp_timeout: Duration) -> usize {
+        self.remove_if(|session| {
+            let timeout = if session.five_tuple.is_tcp() {
+                tcp_timeout
+            } else {
+                udp_timeout
+            };
+            session.idle_time() > timeout
+        })
     }
 }
 
@@ -705,29 +718,30 @@ mod tests {
         )
     }
 
-    /// Default test peer endpoint (WireGuard client endpoint)
     fn test_peer_endpoint() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 51820)
     }
 
     #[test]
-    fn test_session_tracker_basic() {
-        let tracker = SessionTracker::new();
-        let peer_key = [0u8; 32];
-        let peer_endpoint = test_peer_endpoint();
-        let five_tuple = make_test_tuple(12345, 80);
+    fn test_five_tuple_tcp() {
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2)), 12345);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443);
+        let tuple = FiveTuple::tcp(src, dst);
 
-        let session = tracker
-            .register(peer_key, peer_endpoint, five_tuple.clone(), 50000)
-            .unwrap();
-        assert_eq!(session.session_id, 1);
-        assert_eq!(session.peer_endpoint(), peer_endpoint);
+        assert!(tuple.is_tcp());
+        assert!(!tuple.is_udp());
+        assert_eq!(tuple.protocol, 6);
+    }
 
-        let found = tracker.lookup(&five_tuple).unwrap();
-        assert_eq!(found.session_id, 1);
+    #[test]
+    fn test_five_tuple_udp() {
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 25, 0, 2)), 12345);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+        let tuple = FiveTuple::udp(src, dst);
 
-        assert_eq!(tracker.total_sessions(), 1);
-        assert_eq!(tracker.peer_session_count(&peer_key), 1);
+        assert!(!tuple.is_tcp());
+        assert!(tuple.is_udp());
+        assert_eq!(tuple.protocol, 17);
     }
 
     #[test]
@@ -737,6 +751,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 80),
         );
         let reversed = tuple.reverse();
+
         assert_eq!(reversed.src_addr.port(), 80);
         assert_eq!(reversed.dst_addr.port(), 12345);
         assert_eq!(reversed.protocol, 6);
@@ -762,19 +777,94 @@ mod tests {
     }
 
     #[test]
-    fn test_session_tracker_lookup_by_port() {
+    fn test_five_tuple_from_ipv4_tcp_packet() {
+        // IPv4 TCP packet: 10.25.0.2:12345 -> 93.184.216.34:80
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x28, // Version, IHL, DSCP, Total Length
+            0x00, 0x00, 0x00, 0x00, // ID, Flags, Fragment Offset
+            0x40, 0x06, 0x00, 0x00, // TTL, Protocol (TCP=6), Checksum
+            0x0a, 0x19, 0x00, 0x02, // Source IP: 10.25.0.2
+            0x5d, 0xb8, 0xd8, 0x22, // Dest IP: 93.184.216.34
+            0x30, 0x39, 0x00, 0x50, // Source Port: 12345, Dest Port: 80
+        ];
+
+        let five_tuple = FiveTuple::from_packet(&packet);
+        assert!(five_tuple.is_some());
+
+        let ft = five_tuple.unwrap();
+        assert!(ft.is_tcp());
+        assert_eq!(ft.src_addr.port(), 12345);
+        assert_eq!(ft.dst_addr.port(), 80);
+    }
+
+    #[test]
+    fn test_five_tuple_from_ipv4_udp_packet() {
+        // IPv4 UDP packet: 10.25.0.2:54321 -> 8.8.8.8:53
+        let packet = vec![
+            0x45, 0x00, 0x00, 0x1c, // Version, IHL, DSCP, Total Length
+            0x00, 0x00, 0x00, 0x00, // ID, Flags, Fragment Offset
+            0x40, 0x11, 0x00, 0x00, // TTL, Protocol (UDP=17), Checksum
+            0x0a, 0x19, 0x00, 0x02, // Source IP: 10.25.0.2
+            0x08, 0x08, 0x08, 0x08, // Dest IP: 8.8.8.8
+            0xd4, 0x31, 0x00, 0x35, // Source Port: 54321, Dest Port: 53
+        ];
+
+        let five_tuple = FiveTuple::from_packet(&packet);
+        assert!(five_tuple.is_some());
+
+        let ft = five_tuple.unwrap();
+        assert!(ft.is_udp());
+        assert_eq!(ft.src_addr.port(), 54321);
+        assert_eq!(ft.dst_addr.port(), 53);
+    }
+
+    #[test]
+    fn test_five_tuple_from_malformed_packet() {
+        // Too short
+        assert!(FiveTuple::from_packet(&[0x45, 0x00]).is_none());
+
+        // Empty
+        assert!(FiveTuple::from_packet(&[]).is_none());
+
+        // Invalid version
+        assert!(FiveTuple::from_packet(&[0x00; 40]).is_none());
+    }
+
+    #[test]
+    fn test_session_tracker_basic() {
         let tracker = SessionTracker::new();
-        let peer_key = [1u8; 32];
+        let peer_key = [0u8; 32];
         let peer_endpoint = test_peer_endpoint();
-        let five_tuple = make_test_tuple(12345, 443);
+        let five_tuple = make_test_tuple(12345, 80);
+
+        let session = tracker
+            .register(peer_key, peer_endpoint, five_tuple.clone(), "direct".to_string())
+            .unwrap();
+        assert_eq!(session.session_id, 1);
+        assert_eq!(session.peer_endpoint(), peer_endpoint);
+
+        let found = tracker.lookup(&five_tuple).unwrap();
+        assert_eq!(found.session_id, 1);
+
+        assert_eq!(tracker.total_sessions(), 1);
+        assert_eq!(tracker.peer_session_count(&peer_key), 1);
+    }
+
+    #[test]
+    fn test_session_tracker_lookup_by_reply() {
+        let tracker = SessionTracker::new();
+        let peer_key = [0u8; 32];
+        let peer_endpoint = test_peer_endpoint();
+        let five_tuple = make_test_tuple(12345, 80);
 
         tracker
-            .register(peer_key, peer_endpoint, five_tuple.clone(), 50001)
+            .register(peer_key, peer_endpoint, five_tuple.clone(), "direct".to_string())
             .unwrap();
 
-        let found = tracker.lookup_by_port(50001, 6).unwrap();
+        // Create a reply tuple (reversed)
+        let reply_tuple = five_tuple.reverse();
+        let found = tracker.lookup_by_reply(&reply_tuple).unwrap();
         assert_eq!(found.five_tuple, five_tuple);
-        assert_eq!(found.local_port, 50001);
     }
 
     #[test]
@@ -785,45 +875,14 @@ mod tests {
         let five_tuple = make_test_tuple(12345, 80);
 
         tracker
-            .register(peer_key, peer_endpoint, five_tuple.clone(), 50002)
+            .register(peer_key, peer_endpoint, five_tuple.clone(), "direct".to_string())
             .unwrap();
         assert_eq!(tracker.total_sessions(), 1);
 
         let removed = tracker.remove(&five_tuple).unwrap();
-        assert_eq!(removed.local_port, 50002);
+        assert_eq!(removed.session_id, 1);
         assert_eq!(tracker.total_sessions(), 0);
         assert_eq!(tracker.peer_session_count(&peer_key), 0);
-    }
-
-    #[test]
-    fn test_session_tracker_remove_by_port() {
-        let tracker = SessionTracker::new();
-        let peer_key = [3u8; 32];
-        let peer_endpoint = test_peer_endpoint();
-        let five_tuple = make_test_tuple(12345, 80);
-
-        tracker
-            .register(peer_key, peer_endpoint, five_tuple.clone(), 50003)
-            .unwrap();
-
-        let removed = tracker.remove_by_port(50003, 6).unwrap();
-        assert_eq!(removed.five_tuple, five_tuple);
-        assert_eq!(tracker.total_sessions(), 0);
-    }
-
-    #[test]
-    fn test_session_info_stats() {
-        let peer_key = [0u8; 32];
-        let peer_endpoint = test_peer_endpoint();
-        let five_tuple = make_test_tuple(12345, 80);
-        let session = SessionInfo::new(1, peer_key, peer_endpoint, five_tuple, 50000);
-
-        session.add_bytes_sent(100);
-        session.add_bytes_sent(200);
-        assert_eq!(session.total_bytes_sent(), 300);
-
-        session.add_bytes_received(500);
-        assert_eq!(session.total_bytes_received(), 500);
     }
 
     #[test]
@@ -838,15 +897,9 @@ mod tests {
         let tuple2 = make_test_tuple(12346, 443);
         let tuple3 = make_test_tuple(12347, 8080);
 
-        tracker
-            .register(peer1, peer_endpoint1, tuple1, 50001)
-            .unwrap();
-        tracker
-            .register(peer1, peer_endpoint1, tuple2, 50002)
-            .unwrap();
-        tracker
-            .register(peer2, peer_endpoint2, tuple3, 50003)
-            .unwrap();
+        tracker.register(peer1, peer_endpoint1, tuple1, "direct".to_string()).unwrap();
+        tracker.register(peer1, peer_endpoint1, tuple2, "direct".to_string()).unwrap();
+        tracker.register(peer2, peer_endpoint2, tuple3, "direct".to_string()).unwrap();
 
         assert_eq!(tracker.peer_session_count(&peer1), 2);
         assert_eq!(tracker.peer_session_count(&peer2), 1);
@@ -854,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tcp_udp_session_counts() {
+    fn test_session_tracker_tcp_udp_counts() {
         let tracker = SessionTracker::new();
         let peer_key = [0u8; 32];
         let peer_endpoint = test_peer_endpoint();
@@ -875,15 +928,9 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
         );
 
-        tracker
-            .register(peer_key, peer_endpoint, tcp1, 50001)
-            .unwrap();
-        tracker
-            .register(peer_key, peer_endpoint, tcp2, 50002)
-            .unwrap();
-        tracker
-            .register(peer_key, peer_endpoint, udp1, 50003)
-            .unwrap();
+        tracker.register(peer_key, peer_endpoint, tcp1, "direct".to_string()).unwrap();
+        tracker.register(peer_key, peer_endpoint, tcp2, "direct".to_string()).unwrap();
+        tracker.register(peer_key, peer_endpoint, udp1, "direct".to_string()).unwrap();
 
         assert_eq!(tracker.tcp_session_count(), 2);
         assert_eq!(tracker.udp_session_count(), 1);
@@ -891,50 +938,77 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_if() {
-        let tracker = SessionTracker::new();
-        let peer_key = [0u8; 32];
-        let peer_endpoint = test_peer_endpoint();
-
-        // Add sessions with different ports
-        for port in 12345..12355 {
-            let tuple = make_test_tuple(port, 80);
-            tracker
-                .register(peer_key, peer_endpoint, tuple, 50000 + port)
-                .unwrap();
-        }
-
-        assert_eq!(tracker.total_sessions(), 10);
-
-        // Remove sessions with even source ports
-        let removed = tracker.remove_if(|session| session.five_tuple.src_addr.port() % 2 == 0);
-
-        assert_eq!(removed, 5);
-        assert_eq!(tracker.total_sessions(), 5);
-    }
-
-    #[test]
-    fn test_lookup_for_reply() {
-        let tracker = SessionTracker::new();
+    fn test_session_info_stats() {
         let peer_key = [0u8; 32];
         let peer_endpoint = test_peer_endpoint();
         let five_tuple = make_test_tuple(12345, 80);
+        let session = SessionInfo::new(1, peer_key, peer_endpoint, five_tuple, "direct".to_string());
 
-        tracker
-            .register(peer_key, peer_endpoint, five_tuple.clone(), 50000)
-            .unwrap();
+        session.add_bytes_sent(100);
+        session.add_bytes_sent(200);
+        assert_eq!(session.total_bytes_sent(), 300);
 
-        // Look up session using the forward tuple
-        let (peer_key_b64, found_endpoint) = tracker.lookup_for_reply(&five_tuple).unwrap();
-
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine;
-        assert_eq!(peer_key_b64, BASE64.encode(peer_key));
-        assert_eq!(found_endpoint, peer_endpoint);
+        session.add_bytes_received(500);
+        assert_eq!(session.total_bytes_received(), 500);
     }
 
     #[test]
-    fn test_peer_endpoint_update() {
+    fn test_session_tracker_cleanup_idle() {
+        let tracker = SessionTracker::new();
+        let peer_key = [0u8; 32];
+        let peer_endpoint = test_peer_endpoint();
+
+        // Add a session
+        let five_tuple = make_test_tuple(12345, 80);
+        tracker.register(peer_key, peer_endpoint, five_tuple, "direct".to_string()).unwrap();
+
+        // Immediately cleaning with 0 timeout should remove it
+        let removed = tracker.cleanup_idle(Duration::ZERO, Duration::ZERO);
+        assert_eq!(removed, 1);
+        assert_eq!(tracker.total_sessions(), 0);
+    }
+
+    #[test]
+    fn test_session_tracker_per_peer_limit() {
+        let tracker = SessionTracker::with_limits(2, 100);
+        let peer_key = [0u8; 32];
+        let peer_endpoint = test_peer_endpoint();
+
+        // Register 2 sessions (within limit)
+        let tuple1 = make_test_tuple(12345, 80);
+        let tuple2 = make_test_tuple(12346, 443);
+        let tuple3 = make_test_tuple(12347, 8080);
+
+        assert!(tracker.register(peer_key, peer_endpoint, tuple1, "direct".to_string()).is_some());
+        assert!(tracker.register(peer_key, peer_endpoint, tuple2, "direct".to_string()).is_some());
+
+        // Third should fail (exceeds per-peer limit)
+        assert!(tracker.register(peer_key, peer_endpoint, tuple3, "direct".to_string()).is_none());
+    }
+
+    #[test]
+    fn test_session_tracker_total_limit() {
+        let tracker = SessionTracker::with_limits(100, 2);
+        let peer_endpoint = test_peer_endpoint();
+
+        // Register 2 sessions (within limit)
+        let peer1 = [1u8; 32];
+        let peer2 = [2u8; 32];
+        let peer3 = [3u8; 32];
+
+        let tuple1 = make_test_tuple(12345, 80);
+        let tuple2 = make_test_tuple(12346, 443);
+        let tuple3 = make_test_tuple(12347, 8080);
+
+        assert!(tracker.register(peer1, peer_endpoint, tuple1, "direct".to_string()).is_some());
+        assert!(tracker.register(peer2, peer_endpoint, tuple2, "direct".to_string()).is_some());
+
+        // Third should fail (exceeds total limit)
+        assert!(tracker.register(peer3, peer_endpoint, tuple3, "direct".to_string()).is_none());
+    }
+
+    #[test]
+    fn test_session_endpoint_update() {
         let tracker = SessionTracker::new();
         let peer_key = [0u8; 32];
         let peer_endpoint1 = test_peer_endpoint();
@@ -943,13 +1017,13 @@ mod tests {
 
         // Register with initial endpoint
         let session = tracker
-            .register(peer_key, peer_endpoint1, five_tuple.clone(), 50000)
+            .register(peer_key, peer_endpoint1, five_tuple.clone(), "direct".to_string())
             .unwrap();
         assert_eq!(session.peer_endpoint(), peer_endpoint1);
 
         // Register same session again with different endpoint (NAT rebinding)
         let session2 = tracker
-            .register_forward_only(peer_key, peer_endpoint2, five_tuple.clone())
+            .register(peer_key, peer_endpoint2, five_tuple.clone(), "direct".to_string())
             .unwrap();
 
         // Endpoint should be updated

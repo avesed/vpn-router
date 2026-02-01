@@ -31,6 +31,7 @@ pub type FakeDnsResult<T> = Result<T, FakeDnsError>;
 ///
 /// This manager uses a DashMap-based cache for high-performance concurrent access
 /// and IP pools for address allocation.
+#[derive(Debug)]
 pub struct FakeDnsManager {
     /// Bidirectional cache for domain-IP mappings
     cache: FakeDnsCache,

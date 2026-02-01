@@ -40,7 +40,8 @@ use crate::ingress::manager::WgIngressManager;
 use crate::ingress::{
     get_sni_routing_config, ForwardingStats, IngressReplyStats, IngressSessionTracker,
 };
-use crate::io::bidirectional_copy;
+// use crate::io::bidirectional_copy;  // Temporarily use tokio's for testing
+use tokio::io::copy_bidirectional;
 use crate::io::UdpBufferPool;
 use crate::outbound::vless::{TlsSettings, VlessConfig, VlessOutbound, VlessTransportConfig};
 use crate::outbound::{Outbound, OutboundManager};
@@ -730,6 +731,7 @@ impl IpcHandler {
         &self,
         tunnel_tag: String,
         wg_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        tunnel_local_ip: Option<smoltcp::wire::IpAddress>,
     ) -> tokio::sync::mpsc::Sender<bytes::Bytes> {
         use crate::vless_wg_bridge::{ShardedBridgeConfig, ShardedVlessWgBridge};
 
@@ -737,7 +739,11 @@ impl IpcHandler {
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
 
         // Create the sharded bridge with configuration from environment
-        let config = ShardedBridgeConfig::from_env();
+        // If tunnel_local_ip is provided, all shards will use it as their source IP
+        let mut config = ShardedBridgeConfig::from_env();
+        if let Some(ip) = tunnel_local_ip {
+            config = config.with_tunnel_local_ip(ip);
+        }
         let bridge = ShardedVlessWgBridge::new(config, reply_rx, wg_tx).await;
         let bridge = Arc::new(bridge);
 
@@ -757,10 +763,17 @@ impl IpcHandler {
             reply_txs.insert(tunnel_tag.clone(), reply_tx.clone());
         }
 
-        // Also register with the shared reply registry so WgReplyHandler can route packets
-        if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
-            registry.register(tunnel_tag, reply_tx.clone());
-        }
+        // NOTE: We intentionally do NOT register with sharded_bridge_reply_registry here.
+        // The sharded bridge is for VLESS → WG routing only. If we register here, ALL packets
+        // from the WG tunnel will be intercepted, including those from TUN ingress that should
+        // go through the reply_router.
+        //
+        // VLESS sessions will register their reply channels directly when connections are made.
+        // See vless_wg_bridge/reply_registry.rs for per-session registration.
+        //
+        // The bridge is stored in sharded_bridges and can be accessed via
+        // get_sharded_bridge_for_tunnel() when needed.
+        debug!("Sharded bridge created for tunnel '{}' (NOT registered with global reply registry - on-demand routing)", tunnel_tag);
 
         reply_tx
     }
@@ -3464,6 +3477,36 @@ impl IpcHandler {
             &config.peer_endpoint,
         );
 
+        // Parse and save the tunnel local IP for sharded bridge configuration
+        // The IP is stripped of CIDR suffix (e.g., "10.200.200.5/32" -> "10.200.200.5")
+        #[cfg(feature = "sharded-vless-wg-bridge")]
+        let tunnel_local_ip_for_bridge: Option<smoltcp::wire::IpAddress> =
+            config.local_ip.as_ref().and_then(|ip_str| {
+                // Strip CIDR suffix if present (e.g., "10.200.200.5/32" -> "10.200.200.5")
+                let ip_str = ip_str.split('/').next().unwrap_or(ip_str);
+                ip_str.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+                    std::net::IpAddr::V4(v4) => smoltcp::wire::IpAddress::v4(
+                        v4.octets()[0],
+                        v4.octets()[1],
+                        v4.octets()[2],
+                        v4.octets()[3],
+                    ),
+                    std::net::IpAddr::V6(_) => {
+                        // IPv6 not supported for WG tunnel local IP in smoltcp
+                        warn!("IPv6 tunnel local IP not supported for sharded bridge, using synthetic IP");
+                        smoltcp::wire::IpAddress::v4(10, 200, 0, 1)
+                    }
+                })
+            });
+
+        // Parse tunnel local IP for ipstack WgEgressBridge (before config.local_ip is moved)
+        #[cfg(feature = "ipstack-tcp")]
+        let ipstack_local_ipv4: Option<std::net::Ipv4Addr> =
+            config.local_ip.as_ref().and_then(|ip_str| {
+                let ip_str = ip_str.split('/').next().unwrap_or(ip_str);
+                ip_str.parse::<std::net::Ipv4Addr>().ok()
+            });
+
         // Apply optional fields
         if let Some(local_ip) = config.local_ip {
             egress_config = egress_config.with_local_ip(local_ip);
@@ -3481,6 +3524,74 @@ impl IpcHandler {
         match egress_manager.create_tunnel(egress_config).await {
             Ok(()) => {
                 info!("Created WireGuard tunnel '{}'", tag);
+
+                // Create sharded bridge for this tunnel (if feature enabled)
+                #[cfg(feature = "sharded-vless-wg-bridge")]
+                {
+                    // Create a channel for sending WG packets from sharded bridge to egress manager
+                    let (wg_tx, mut wg_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+
+                    // Clone references for the forwarder task
+                    let egress_mgr = egress_manager.clone();
+                    let tunnel_tag = tag.clone();
+
+                    // Spawn a forwarder task that reads from wg_rx and sends to egress manager
+                    tokio::spawn(async move {
+                        while let Some(packet) = wg_rx.recv().await {
+                            if let Err(e) = egress_mgr.send(&tunnel_tag, packet.to_vec()).await {
+                                warn!(
+                                    "Failed to send packet through WG tunnel '{}': {}",
+                                    tunnel_tag, e
+                                );
+                            }
+                        }
+                        debug!("WG packet forwarder for tunnel '{}' stopped", tunnel_tag);
+                    });
+
+                    // Create the sharded bridge for this tunnel with the tunnel's local IP
+                    let _reply_tx = self
+                        .create_sharded_bridge_for_tunnel(tag.clone(), wg_tx, tunnel_local_ip_for_bridge)
+                        .await;
+                    info!(
+                        "Created sharded bridge for WireGuard tunnel '{}' with local_ip={:?}",
+                        tag, tunnel_local_ip_for_bridge
+                    );
+                }
+
+                // Create WgEgressBridge for ipstack -> WG egress routing (if ipstack-tcp feature enabled)
+                // This is separate from the VLESS-WG bridge above - this one handles traffic from
+                // WireGuard ingress (via ipstack TCP reconstruction) to WireGuard egress tunnels
+                #[cfg(feature = "ipstack-tcp")]
+                {
+                    // Use pre-extracted local IP (extracted before config.local_ip was moved)
+                    if let Some(local_ip) = ipstack_local_ipv4 {
+                        // Create WgEgressBridge for this tunnel
+                        let wg_egress_bridge = std::sync::Arc::new(
+                            crate::outbound::WgEgressBridge::new(
+                                tag.clone(),
+                                egress_manager.clone(),
+                                local_ip,
+                            )
+                        );
+
+                        // Register with ipstack bridge
+                        if crate::ingress::forwarder::register_wg_egress_bridge(
+                            tag.clone(),
+                            wg_egress_bridge,
+                        ) {
+                            info!(
+                                "Registered WgEgressBridge for tunnel '{}' (local_ip={})",
+                                tag, local_ip
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "Cannot create WgEgressBridge for tunnel '{}' - no valid local_ip",
+                            tag
+                        );
+                    }
+                }
+
                 IpcResponse::success_with_message(format!("WireGuard tunnel '{tag}' created"))
             }
             Err(e) => {
@@ -3511,6 +3622,22 @@ impl IpcHandler {
         match egress_manager.remove_tunnel(tag, drain_timeout).await {
             Ok(()) => {
                 info!("Removed WireGuard tunnel '{}'", tag);
+
+                // Also remove the sharded bridge for this tunnel (if feature enabled)
+                #[cfg(feature = "sharded-vless-wg-bridge")]
+                {
+                    self.remove_sharded_bridge_for_tunnel(tag).await;
+                    info!("Removed sharded bridge for WireGuard tunnel '{}'", tag);
+                }
+
+                // Also unregister WgEgressBridge for ipstack (if feature enabled)
+                #[cfg(feature = "ipstack-tcp")]
+                {
+                    if crate::ingress::forwarder::unregister_wg_egress_bridge(tag).is_some() {
+                        info!("Unregistered WgEgressBridge for tunnel '{}'", tag);
+                    }
+                }
+
                 IpcResponse::success_with_message(format!("WireGuard tunnel '{tag}' removed"))
             }
             Err(e) => {
@@ -7040,9 +7167,18 @@ impl IpcHandler {
                         #[cfg(feature = "sharded-vless-wg-bridge")]
                         {
                             // Look up sharded bridge for this tunnel
+                            let available_bridges: Vec<_> = sharded_bridges.read().keys().cloned().collect();
+                            info!(
+                                "[VLESS-WG-LOOKUP] Looking for sharded bridge '{}', available bridges: {:?}",
+                                actual_outbound_tag, available_bridges
+                            );
                             let maybe_sharded = sharded_bridges.read().get(&actual_outbound_tag).cloned();
 
                             if let Some(sharded_bridge) = maybe_sharded {
+                                info!(
+                                    "[VLESS-WG-LOOKUP] Found sharded bridge for '{}', using sharded mode",
+                                    actual_outbound_tag
+                                );
                                 // Use sharded bridge for better parallelism
                                 if is_udp_conn {
                                     match sharded_bridge.handle_udp_connection(client_stream, dest_addr).await {
@@ -7084,6 +7220,10 @@ impl IpcHandler {
 
                         // Fallback: Create legacy bridge for this WireGuard tunnel
                         // Pass the reply registry so WgReplyHandler can route replies back
+                        info!(
+                            "[VLESS-WG-LOOKUP] No sharded bridge found for '{}', falling back to legacy bridge",
+                            actual_outbound_tag
+                        );
                         let bridge = crate::vless_wg_bridge::VlessWgBridge::with_registry(
                             Arc::clone(wg_manager),
                             actual_outbound_tag.clone(),
@@ -7180,15 +7320,15 @@ impl IpcHandler {
                         let mut client_stream = conn.into_stream();
                         let mut upstream_stream = upstream.into_stream();
 
-                        // Relay traffic bidirectionally
-                        match bidirectional_copy(&mut client_stream, &mut upstream_stream).await {
-                            Ok(result) => {
+                        // Relay traffic bidirectionally (using tokio's copy_bidirectional for testing)
+                        match copy_bidirectional(&mut client_stream, &mut upstream_stream).await {
+                            Ok((client_to_upstream, upstream_to_client)) => {
                                 info!(
                                     "VLESS connection closed: {} -> {}, {} up / {} down bytes",
                                     client_addr,
                                     destination,
-                                    result.client_to_upstream,
-                                    result.upstream_to_client
+                                    client_to_upstream,
+                                    upstream_to_client
                                 );
                             }
                             Err(e) => {
@@ -7904,9 +8044,18 @@ impl IpcHandler {
                                 #[cfg(feature = "sharded-vless-wg-bridge")]
                                 {
                                     // Look up sharded bridge for this tunnel
+                                    let available_bridges: Vec<_> = sharded_bridges.read().keys().cloned().collect();
+                                    info!(
+                                        "[SS-WG-LOOKUP] Looking for sharded bridge '{}', available bridges: {:?}",
+                                        actual_outbound_tag, available_bridges
+                                    );
                                     let maybe_sharded = sharded_bridges.read().get(&actual_outbound_tag).cloned();
 
                                     if let Some(sharded_bridge) = maybe_sharded {
+                                        info!(
+                                            "[SS-WG-LOOKUP] Found sharded bridge for '{}', using sharded mode",
+                                            actual_outbound_tag
+                                        );
                                         // Use sharded bridge for better parallelism
                                         match sharded_bridge.handle_tcp_connection(client_stream, dest_addr).await {
                                             Ok(stats) => {
@@ -7929,6 +8078,10 @@ impl IpcHandler {
 
                                 // Fallback: Use smoltcp bridge for WG tunnel (TCP only for now)
                                 // Create bridge with reply registry for proper WG reply routing
+                                info!(
+                                    "[SS-WG-LOOKUP] No sharded bridge found for '{}', falling back to legacy bridge",
+                                    actual_outbound_tag
+                                );
                                 let bridge = crate::vless_wg_bridge::VlessWgBridge::with_registry(
                                     Arc::clone(wg_manager),
                                     actual_outbound_tag.clone(),
@@ -8001,14 +8154,14 @@ impl IpcHandler {
                                 let mut client_stream = conn.into_stream();
                                 let mut upstream_stream = upstream.into_stream();
 
-                                // Relay traffic bidirectionally
-                                match bidirectional_copy(&mut client_stream, &mut upstream_stream)
+                                // Relay traffic bidirectionally (using tokio's copy_bidirectional for testing)
+                                match copy_bidirectional(&mut client_stream, &mut upstream_stream)
                                     .await
                                 {
-                                    Ok(result) => {
+                                    Ok((client_to_upstream, upstream_to_client)) => {
                                         info!(
                                             "Shadowsocks connection closed: {} -> {}, {} up / {} down bytes",
-                                            client_addr, destination, result.client_to_upstream, result.upstream_to_client
+                                            client_addr, destination, client_to_upstream, upstream_to_client
                                         );
                                     }
                                     Err(e) => {
