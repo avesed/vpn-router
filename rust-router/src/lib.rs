@@ -46,6 +46,41 @@
 //! # }
 //! ```
 //!
+//! # Module Migration Guide
+//!
+//! The `netbridge` module is the new unified implementation for IP <-> TCP/UDP bridging.
+//! It is designed to eventually replace:
+//!
+//! - `tun_bridge/` -> `netbridge::kernel` (TUN + TPROXY, 200-400 Mbps)
+//! - `vless_wg_bridge/` -> `netbridge::smoltcp` (userspace TCP/IP, 30-80 Mbps)
+//! - `smoltcp_utils/` -> `netbridge` (shared utilities)
+//!
+//! During the migration period, both old and new modules coexist:
+//!
+//! - **Existing code**: Continue using `tun_bridge`, `vless_wg_bridge`, `smoltcp_utils`
+//! - **New code**: Prefer `netbridge` types (prefixed with `Net` for disambiguation)
+//!
+//! ## Type Mapping (Old -> New)
+//!
+//! | Old Type | New Type | Notes |
+//! |----------|----------|-------|
+//! | `tun_bridge::FiveTuple` | `netbridge::FiveTuple` | Same semantics |
+//! | `tun_bridge::SessionTracker` | `netbridge::SessionTracker` | New has rate limiting |
+//! | `vless_wg_bridge::PortAllocator` | `netbridge::PortAllocator` | New has shard support |
+//! | `smoltcp_utils::BridgeError` | `netbridge::NetBridgeError` | New has classification |
+//!
+//! ## Example Migration
+//!
+//! ```ignore
+//! // Old code (still works)
+//! use rust_router::{TunBridgeFiveTuple, PortAllocator, BridgeError};
+//!
+//! // New code (recommended for new implementations)
+//! use rust_router::netbridge::{FiveTuple, PortAllocator, NetBridgeError};
+//! // Or use re-exported aliases with Net prefix
+//! use rust_router::{NetSessionTracker, NetPortAllocator, NetBridgeError};
+//! ```
+//!
 //! # Modules
 //!
 //! - [`config`]: Configuration types and loading
@@ -64,7 +99,10 @@
 //! - [`reality`]: REALITY protocol configuration (TLS 1.3 camouflage)
 //! - [`transport`]: Transport layer abstraction (TCP, TLS, WebSocket)
 //! - [`ss_inbound`]: Shadowsocks inbound listener (server mode)
-//! - [`smoltcp_utils`]: Shared utilities for smoltcp-based bridges
+//! - [`smoltcp_utils`]: Shared utilities for smoltcp-based bridges (legacy)
+//! - [`tun_bridge`]: TUN + TPROXY ingress bridge (legacy)
+//! - [`vless_wg_bridge`]: VLESS -> WireGuard bridge (legacy)
+//! - [`netbridge`]: **NEW** Unified network bridge for IP <-> TCP/UDP conversion
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -82,6 +120,7 @@ pub mod fakedns;
 pub mod ingress;
 pub mod io;
 pub mod ipc;
+pub mod netbridge;
 pub mod outbound;
 pub mod peer;
 #[cfg(feature = "transport-quic")]
@@ -198,9 +237,107 @@ pub use vless_wg_bridge::{
     SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig,
     UdpSession as BridgeUdpSession, VlessConnectionId, VlessWgBridge, WgReplyPacket,
 };
-// Note: smoltcp_utils provides shared utilities for building bridges.
-// The types from vless_wg_bridge are re-exported for backwards compatibility.
-// New code can use smoltcp_utils directly for fresh implementations.
+
+// =============================================================================
+// netbridge module re-exports (NEW unified bridge implementation)
+// =============================================================================
+//
+// The netbridge module provides a unified abstraction for IP <-> TCP/UDP bridging.
+// It is designed to eventually replace tun_bridge, vless_wg_bridge, and smoltcp_utils.
+//
+// During migration, both old and new modules coexist:
+// - Existing code: Continue using tun_bridge, vless_wg_bridge, smoltcp_utils
+// - New code: Prefer netbridge types (prefixed with Net for disambiguation)
+//
+// Types are re-exported with "Net" prefix to avoid conflicts with legacy types.
+
+// Core types (with Net prefix to avoid conflicts)
+pub use netbridge::{
+    // Core types
+    FiveTuple as NetFiveTuple,
+    IpPacket as NetIpPacket,
+    IpProtocol as NetIpProtocol,
+    ReplyPacket as NetReplyPacket,
+    SessionId as NetSessionId,
+    SessionIdGenerator as NetSessionIdGenerator,
+    // Statistics
+    EgressStats as NetEgressStats,
+    IngressStats as NetIngressStats,
+};
+
+// Session tracking (with Net prefix)
+pub use netbridge::{
+    Session as NetSession,
+    SessionError as NetSessionError,
+    SessionTracker as NetSessionTracker,
+    SessionTrackerConfig as NetSessionTrackerConfig,
+    SessionTrackerStats as NetSessionTrackerStats,
+};
+
+// Port allocation (with Net prefix)
+pub use netbridge::{
+    PortAllocator as NetPortAllocator,
+    PortAllocatorConfig as NetPortAllocatorConfig,
+    PortAllocatorStats as NetPortAllocatorStats,
+    PortGuard as NetPortGuard,
+};
+
+// Reply routing
+pub use netbridge::{ReplyChannelBuilder, ReplyRouter, ReplyRouterStatsSnapshot};
+
+// Error types
+pub use netbridge::NetBridgeError;
+
+// Traits (no prefix needed - unique names)
+pub use netbridge::{
+    CloseReason, NetBridgeEgress, NetBridgeIngress, NoOpSessionHandler, ReplyRouterExt,
+    SessionCloseStats, SessionHandler, SessionInfo,
+};
+
+// Configuration constants (prefixed to avoid conflicts with smoltcp_utils)
+pub use netbridge::{
+    // Buffer sizes
+    TCP_RX_BUFFER as NET_TCP_RX_BUFFER,
+    TCP_TX_BUFFER as NET_TCP_TX_BUFFER,
+    UDP_RX_BUFFER as NET_UDP_RX_BUFFER,
+    UDP_TX_BUFFER as NET_UDP_TX_BUFFER,
+    // Network parameters
+    TCP_MSS as NET_TCP_MSS,
+    TUN_MTU as NET_TUN_MTU,
+    WG_MTU as NET_WG_MTU,
+    MAX_IP_PACKET_SIZE as NET_MAX_IP_PACKET_SIZE,
+    MAX_SOCKETS as NET_MAX_SOCKETS,
+    // Timeouts
+    TCP_IDLE_TIMEOUT_SECS as NET_TCP_IDLE_TIMEOUT_SECS,
+    UDP_DEFAULT_TIMEOUT_SECS as NET_UDP_DEFAULT_TIMEOUT_SECS,
+    UDP_DNS_TIMEOUT_SECS as NET_UDP_DNS_TIMEOUT_SECS,
+    // Session limits
+    MAX_SESSIONS_PER_PEER as NET_MAX_SESSIONS_PER_PEER,
+    MAX_TOTAL_SESSIONS as NET_MAX_TOTAL_SESSIONS,
+};
+
+// Kernel backend (TUN + TPROXY)
+pub use netbridge::kernel::{
+    KernelIngress, KernelIngressConfig, KernelEgress, KernelEgressConfig,
+    TunDeviceWrapper, TunDeviceBuilder,
+    TproxyListenerWrapper, TproxyListenerConfig, TproxyListenerStats,
+    IptablesManagerWrapper, IptablesConfig,
+    DEFAULT_TPROXY_PORT, DEFAULT_FWMARK, DEFAULT_TABLE_ID,
+};
+
+// Smoltcp backend (userspace TCP/IP for VLESS/SS -> WG)
+pub use netbridge::smoltcp::{
+    SmoltcpEgress, SmoltcpEgressConfig, SmoltcpEgressStats,
+    SmoltcpShard, SmoltcpShardConfig, SmoltcpShardStats,
+    SmoltcpBridge, SmoltcpBridgeConfig,
+    VirtualDevice, VirtualDeviceStats,
+};
+
+// Benchmarking utilities
+pub use netbridge::bench::{
+    BenchConfig, BenchResults, TrafficPattern, LoopbackTest,
+    run_benchmark, run_quick_benchmark, run_full_suite,
+};
 #[cfg(feature = "fakedns")]
 pub use fakedns::{
     FakeDns, FakeDnsBuilder, FakeDnsCache, FakeDnsCacheStats, FakeDnsCacheStatsSnapshot,

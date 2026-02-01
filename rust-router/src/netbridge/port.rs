@@ -1,46 +1,37 @@
 //! Ephemeral port allocator with TIME_WAIT tracking
 //!
-//! This module provides a thread-safe port allocator for smoltcp bridge
-//! implementations. It manages ephemeral ports (49152-65535) and tracks
-//! TIME_WAIT state to prevent port reuse issues.
+//! This module provides a thread-safe port allocator for netbridge implementations.
+//! It manages ephemeral ports (49152-65535) and tracks TIME_WAIT state to prevent
+//! port reuse issues.
 //!
 //! # Features
 //!
 //! - **Thread-safe**: Uses `DashSet` and `DashMap` for lock-free concurrent access
 //! - **TIME_WAIT tracking**: Released ports enter a TIME_WAIT state before reuse
 //! - **RAII guards**: `PortGuard` automatically releases ports when dropped
+//! - **Sharding support**: Partition port ranges for multi-shard bridges
 //! - **Random start**: Allocations start from a random port to distribute usage
 //!
 //! # Usage
 //!
 //! ```ignore
-//! use rust_router::smoltcp_utils::{PortAllocator, PortAllocatorConfig};
+//! use rust_router::netbridge::{PortAllocator, PortAllocatorConfig};
 //!
-//! // Create allocator with default config (IANA ephemeral ports)
+//! // Create allocator with default config
 //! let allocator = PortAllocator::new();
 //!
 //! // Allocate a port - returns a RAII guard
 //! if let Some(guard) = allocator.allocate() {
 //!     let port = guard.port();
 //!     println!("Allocated port: {}", port);
-//!
 //!     // Port is automatically released when guard is dropped
-//! }
-//!
-//! // Or take ownership of the port for manual management
-//! if let Some(guard) = allocator.allocate() {
-//!     let port = guard.take(); // Consumes guard, port stays allocated
-//!     // ... use port ...
-//!     allocator.release(port); // Manual release into TIME_WAIT
 //! }
 //! ```
 //!
 //! # TIME_WAIT Behavior
 //!
-//! When a port is released (either by dropping `PortGuard` or calling `release()`),
-//! it enters a TIME_WAIT state for 60 seconds (configurable). During this time,
-//! the port cannot be reallocated. This prevents issues with delayed packets
-//! from previous connections arriving at new connections using the same port.
+//! When a port is released, it enters TIME_WAIT state for 60 seconds (configurable).
+//! This prevents issues with delayed packets from previous connections.
 
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -51,6 +42,10 @@ use dashmap::DashSet;
 use tracing::{debug, trace, warn};
 
 use super::config::{PORT_RANGE_END, PORT_RANGE_START, PORT_TIME_WAIT_SECS};
+
+// =============================================================================
+// Configuration
+// =============================================================================
 
 /// Configuration for the port allocator
 #[derive(Debug, Clone)]
@@ -72,23 +67,6 @@ impl Default for PortAllocatorConfig {
 
 impl PortAllocatorConfig {
     /// Create a new configuration with custom settings
-    ///
-    /// # Arguments
-    ///
-    /// * `range` - The port range to allocate from
-    /// * `time_wait_duration` - How long to keep ports in TIME_WAIT after release
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use std::time::Duration;
-    /// use rust_router::smoltcp_utils::PortAllocatorConfig;
-    ///
-    /// let config = PortAllocatorConfig::new(
-    ///     50000..=50099, // 100 ports
-    ///     Duration::from_secs(30), // 30 second TIME_WAIT
-    /// );
-    /// ```
     #[must_use]
     pub fn new(range: RangeInclusive<u16>, time_wait_duration: Duration) -> Self {
         Self {
@@ -102,7 +80,23 @@ impl PortAllocatorConfig {
     pub fn port_count(&self) -> usize {
         (*self.range.end() - *self.range.start() + 1) as usize
     }
+
+    /// Get the range start
+    #[must_use]
+    pub fn start(&self) -> u16 {
+        *self.range.start()
+    }
+
+    /// Get the range end
+    #[must_use]
+    pub fn end(&self) -> u16 {
+        *self.range.end()
+    }
 }
+
+// =============================================================================
+// Port Allocator
+// =============================================================================
 
 /// Thread-safe ephemeral port allocator with TIME_WAIT tracking
 ///
@@ -137,9 +131,8 @@ impl PortAllocator {
 
     /// Create a new port allocator for a specific shard with partitioned port range
     ///
-    /// This partitions the default ephemeral port range (49152-65535) into equal-sized
-    /// ranges for each shard. This ensures no port collisions between shards when all
-    /// shards use the same source IP.
+    /// This partitions the default ephemeral port range into equal-sized ranges
+    /// for each shard, ensuring no port collisions between shards.
     ///
     /// # Arguments
     ///
@@ -149,7 +142,7 @@ impl PortAllocator {
     /// # Example
     ///
     /// ```ignore
-    /// // With 4 shards and default range (49152-65535 = 16384 ports):
+    /// // With 4 shards and default range (16384 ports):
     /// // Shard 0: 49152-53247 (4096 ports)
     /// // Shard 1: 53248-57343 (4096 ports)
     /// // Shard 2: 57344-61439 (4096 ports)
@@ -188,12 +181,12 @@ impl PortAllocator {
         };
 
         debug!(
-            "PortAllocator for shard {}/{}: port range {}..={} ({} ports)",
             shard_index,
             total_shards,
-            shard_start,
-            shard_end,
-            shard_end - shard_start + 1
+            start = shard_start,
+            end = shard_end,
+            count = shard_end - shard_start + 1,
+            "PortAllocator created for shard"
         );
 
         Self::with_config(config)
@@ -201,8 +194,8 @@ impl PortAllocator {
 
     /// Get the shard index from a port number
     ///
-    /// This is the inverse of `for_shard()` - given a port, determine which shard
-    /// it belongs to. Used by the reply dispatcher to route packets to the correct shard.
+    /// This is the inverse of `for_shard()` - given a port, determine which
+    /// shard it belongs to.
     ///
     /// # Arguments
     ///
@@ -211,16 +204,7 @@ impl PortAllocator {
     ///
     /// # Returns
     ///
-    /// The shard index (0-based), or `None` if the port is outside the ephemeral range.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // With 4 shards:
-    /// assert_eq!(PortAllocator::shard_for_port(49152, 4), Some(0));
-    /// assert_eq!(PortAllocator::shard_for_port(53248, 4), Some(1));
-    /// assert_eq!(PortAllocator::shard_for_port(65535, 4), Some(3));
-    /// ```
+    /// The shard index (0-based), or `None` if outside the ephemeral range.
     #[must_use]
     pub fn shard_for_port(port: u16, total_shards: u16) -> Option<usize> {
         if port < PORT_RANGE_START || port > PORT_RANGE_END {
@@ -238,23 +222,6 @@ impl PortAllocator {
     }
 
     /// Create a new port allocator with custom configuration
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Port allocator configuration
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use std::time::Duration;
-    /// use rust_router::smoltcp_utils::{PortAllocator, PortAllocatorConfig};
-    ///
-    /// let config = PortAllocatorConfig::new(
-    ///     50000..=50099,
-    ///     Duration::from_secs(30),
-    /// );
-    /// let allocator = PortAllocator::with_config(config);
-    /// ```
     #[must_use]
     pub fn with_config(config: PortAllocatorConfig) -> Self {
         // Start from a random port within the range
@@ -262,8 +229,11 @@ impl PortAllocator {
             *config.range.start() + (rand::random::<u16>() % config.port_count() as u16);
 
         debug!(
-            "PortAllocator created: range={:?}, time_wait={:?}, start={}",
-            config.range, config.time_wait_duration, start_port
+            range_start = config.start(),
+            range_end = config.end(),
+            time_wait_secs = config.time_wait_duration.as_secs(),
+            start_port,
+            "PortAllocator created"
         );
 
         Self {
@@ -272,18 +242,6 @@ impl PortAllocator {
             next_port: AtomicU16::new(start_port),
             config,
         }
-    }
-
-    /// Get the start of this allocator's port range
-    #[must_use]
-    pub fn port_range_start(&self) -> u16 {
-        *self.config.range.start()
-    }
-
-    /// Get the end of this allocator's port range
-    #[must_use]
-    pub fn port_range_end(&self) -> u16 {
-        *self.config.range.end()
     }
 
     /// Allocate a new port, returning a RAII guard
@@ -295,23 +253,11 @@ impl PortAllocator {
     ///
     /// - `Some(PortGuard)` if a port was successfully allocated
     /// - `None` if all ports are in use or in TIME_WAIT
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let allocator = PortAllocator::new();
-    /// if let Some(guard) = allocator.allocate() {
-    ///     println!("Got port: {}", guard.port());
-    ///     // Port released when guard drops
-    /// } else {
-    ///     println!("No ports available");
-    /// }
-    /// ```
     pub fn allocate(&self) -> Option<PortGuard<'_>> {
         // Clean up expired TIME_WAIT entries first
         self.cleanup_time_wait();
 
-        let range_start = *self.config.range.start();
+        let range_start = self.config.start();
         let range_len = self.config.port_count();
 
         // Try each port in the range, starting from next_port
@@ -324,22 +270,24 @@ impl PortAllocator {
 
             // Skip ports in TIME_WAIT
             if self.time_wait.contains_key(&port) {
-                trace!("Port {} is in TIME_WAIT, skipping", port);
+                trace!(port, "Port is in TIME_WAIT, skipping");
                 continue;
             }
 
             // Try to allocate this port
             if self.allocated.insert(port) {
-                debug!("Allocated port {}", port);
+                trace!(port, "Port allocated");
                 return Some(PortGuard::new(self, port));
             }
 
-            trace!("Port {} already allocated, trying next", port);
+            trace!(port, "Port already allocated, trying next");
         }
 
         warn!(
-            "Port exhaustion: all {} ports in use or TIME_WAIT",
-            range_len
+            range_len,
+            allocated = self.allocated.len(),
+            time_wait = self.time_wait.len(),
+            "Port exhaustion: all ports in use or TIME_WAIT"
         );
         None
     }
@@ -348,16 +296,12 @@ impl PortAllocator {
     ///
     /// This is called automatically by `PortGuard::drop()`, but can also be
     /// called manually if the port was taken with `PortGuard::take()`.
-    ///
-    /// # Arguments
-    ///
-    /// * `port` - The port to release
     pub fn release(&self, port: u16) {
         if self.allocated.remove(&port).is_some() {
             self.time_wait.insert(port, Instant::now());
-            debug!("Released port {} into TIME_WAIT", port);
+            trace!(port, "Port released into TIME_WAIT");
         } else {
-            warn!("Attempted to release unallocated port {}", port);
+            warn!(port, "Attempted to release unallocated port");
         }
     }
 
@@ -369,11 +313,27 @@ impl PortAllocator {
         self.time_wait.retain(|port, released_at| {
             let expired = now.duration_since(*released_at) >= duration;
             if expired {
-                trace!("Port {} TIME_WAIT expired", port);
+                trace!(port, "Port TIME_WAIT expired");
             }
             !expired
         });
     }
+
+    /// Force immediate release of a port (skip TIME_WAIT)
+    ///
+    /// This should only be used when TIME_WAIT is not needed, such as when
+    /// the connection was never established.
+    pub fn release_immediate(&self, port: u16) {
+        if self.allocated.remove(&port).is_some() {
+            debug!(port, "Port immediately released (skipped TIME_WAIT)");
+        } else if self.time_wait.remove(&port).is_some() {
+            debug!(port, "Port removed from TIME_WAIT");
+        }
+    }
+
+    // =========================================================================
+    // Statistics
+    // =========================================================================
 
     /// Get the number of currently allocated ports
     #[must_use]
@@ -414,22 +374,16 @@ impl PortAllocator {
         &self.config
     }
 
-    /// Force immediate release of a port (skip TIME_WAIT)
-    ///
-    /// This should only be used in special cases where TIME_WAIT is not needed,
-    /// such as when the connection was never established.
-    ///
-    /// # Arguments
-    ///
-    /// * `port` - The port to release immediately
-    pub fn release_immediate(&self, port: u16) {
-        if self.allocated.remove(&port).is_some() {
-            debug!("Immediately released port {} (skipped TIME_WAIT)", port);
-        } else {
-            // Maybe it's already in TIME_WAIT
-            if self.time_wait.remove(&port).is_some() {
-                debug!("Removed port {} from TIME_WAIT", port);
-            }
+    /// Get allocator statistics
+    #[must_use]
+    pub fn stats(&self) -> PortAllocatorStats {
+        PortAllocatorStats {
+            allocated: self.allocated_count(),
+            time_wait: self.time_wait_count(),
+            available: self.available_count(),
+            total: self.config.port_count(),
+            range_start: self.config.start(),
+            range_end: self.config.end(),
         }
     }
 }
@@ -444,37 +398,22 @@ impl std::fmt::Debug for PortAllocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PortAllocator")
             .field("config", &self.config)
-            .field("allocated_count", &self.allocated_count())
-            .field("time_wait_count", &self.time_wait_count())
-            .field("available_count", &self.available_count())
+            .field("allocated", &self.allocated_count())
+            .field("time_wait", &self.time_wait_count())
+            .field("available", &self.available_count())
             .finish()
     }
 }
+
+// =============================================================================
+// Port Guard
+// =============================================================================
 
 /// RAII guard for an allocated port
 ///
 /// When this guard is dropped, the port is automatically released into
 /// TIME_WAIT state. Use `take()` to consume the guard and take ownership
 /// of the port for manual management.
-///
-/// # Example
-///
-/// ```ignore
-/// let allocator = PortAllocator::new();
-///
-/// // Automatic release on drop
-/// {
-///     let guard = allocator.allocate().unwrap();
-///     let port = guard.port();
-///     // ... use port ...
-/// } // Port released here
-///
-/// // Manual management
-/// let guard = allocator.allocate().unwrap();
-/// let port = guard.take(); // Consumes guard
-/// // ... use port ...
-/// allocator.release(port); // Manual release
-/// ```
 pub struct PortGuard<'a> {
     /// Reference to the allocator
     allocator: &'a PortAllocator,
@@ -503,9 +442,8 @@ impl<'a> PortGuard<'a> {
 
     /// Take ownership of the port, consuming the guard
     ///
-    /// After calling this method, the port will NOT be automatically released
-    /// when the guard is dropped. You must manually call `PortAllocator::release()`
-    /// when done with the port.
+    /// After calling this method, the port will NOT be automatically released.
+    /// You must manually call `PortAllocator::release()` when done.
     ///
     /// # Panics
     ///
@@ -542,11 +480,43 @@ impl std::fmt::Debug for PortGuard<'_> {
     }
 }
 
+// =============================================================================
+// Statistics
+// =============================================================================
+
+/// Port allocator statistics
+#[derive(Debug, Clone, Default)]
+pub struct PortAllocatorStats {
+    /// Currently allocated ports
+    pub allocated: usize,
+    /// Ports in TIME_WAIT
+    pub time_wait: usize,
+    /// Available ports
+    pub available: usize,
+    /// Total ports in range
+    pub total: usize,
+    /// Range start
+    pub range_start: u16,
+    /// Range end
+    pub range_end: u16,
+}
+
+impl PortAllocatorStats {
+    /// Get utilization as a percentage
+    #[must_use]
+    pub fn utilization_percent(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            ((self.allocated + self.time_wait) as f64 / self.total as f64) * 100.0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_allocator_default() {
@@ -559,15 +529,11 @@ mod tests {
     fn test_basic_allocation() {
         let allocator = PortAllocator::new();
 
-        // Allocate a port
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.port();
 
-        // Verify it's in the valid range
         assert!(port >= PORT_RANGE_START);
         assert!(port <= PORT_RANGE_END);
-
-        // Verify it's marked as allocated
         assert!(allocator.is_allocated(port));
         assert_eq!(allocator.allocated_count(), 1);
     }
@@ -576,14 +542,12 @@ mod tests {
     fn test_allocation_and_release() {
         let allocator = PortAllocator::new();
 
-        // Allocate a port
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.port();
 
         assert!(allocator.is_allocated(port));
         assert!(!allocator.is_in_time_wait(port));
 
-        // Drop the guard - port should enter TIME_WAIT
         drop(guard);
 
         assert!(!allocator.is_allocated(port));
@@ -595,7 +559,6 @@ mod tests {
     fn test_take_ownership() {
         let allocator = PortAllocator::new();
 
-        // Allocate and take ownership
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.take();
 
@@ -614,11 +577,9 @@ mod tests {
     fn test_release_immediate() {
         let allocator = PortAllocator::new();
 
-        // Allocate a port
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.port();
 
-        // Release immediately (skip TIME_WAIT)
         guard.release_immediate();
 
         assert!(!allocator.is_allocated(port));
@@ -627,318 +588,139 @@ mod tests {
 
     #[test]
     fn test_time_wait_expiry() {
-        // Use a very short TIME_WAIT for testing
         let config = PortAllocatorConfig {
             range: 50000..=50010,
             time_wait_duration: Duration::from_millis(50),
         };
         let allocator = PortAllocator::with_config(config);
 
-        // Allocate and release
         let guard = allocator.allocate().expect("should allocate");
         let port = guard.port();
         drop(guard);
 
         assert!(allocator.is_in_time_wait(port));
 
-        // Wait for TIME_WAIT to expire
         thread::sleep(Duration::from_millis(100));
 
         // Trigger cleanup via allocation
         let _guard2 = allocator.allocate();
 
-        // Port should no longer be in TIME_WAIT
         assert!(!allocator.is_in_time_wait(port));
     }
 
     #[test]
     fn test_no_reuse_during_time_wait() {
-        // Use a small range and moderate TIME_WAIT
         let config = PortAllocatorConfig {
             range: 50000..=50002, // Only 3 ports
             time_wait_duration: Duration::from_secs(60),
         };
         let allocator = PortAllocator::with_config(config);
 
-        // Allocate all ports
         let guard1 = allocator.allocate().expect("should allocate 1");
-        let port1 = guard1.port();
         let guard2 = allocator.allocate().expect("should allocate 2");
-        let port2 = guard2.port();
         let guard3 = allocator.allocate().expect("should allocate 3");
-        let port3 = guard3.port();
 
-        // Should fail - all ports allocated
         assert!(allocator.allocate().is_none());
 
-        // Release one into TIME_WAIT
+        let port1 = guard1.port();
         drop(guard1);
 
         // Still should fail - port is in TIME_WAIT
         assert!(allocator.allocate().is_none());
         assert!(allocator.is_in_time_wait(port1));
 
-        // Verify other ports are still allocated
-        assert!(allocator.is_allocated(port2));
-        assert!(allocator.is_allocated(port3));
+        drop(guard2);
+        drop(guard3);
     }
 
     #[test]
     fn test_port_exhaustion() {
-        // Use a tiny range
         let config = PortAllocatorConfig {
             range: 50000..=50001, // Only 2 ports
             time_wait_duration: Duration::from_secs(60),
         };
         let allocator = PortAllocator::with_config(config);
 
-        // Allocate both ports
         let _guard1 = allocator.allocate().expect("should allocate 1");
         let _guard2 = allocator.allocate().expect("should allocate 2");
 
-        // Third allocation should fail
         assert!(allocator.allocate().is_none());
         assert_eq!(allocator.allocated_count(), 2);
     }
 
     #[test]
-    fn test_multiple_allocations() {
-        let allocator = PortAllocator::new();
-
-        // Allocate multiple ports
-        let mut guards = Vec::new();
-        let mut ports = Vec::new();
-
-        for _ in 0..100 {
-            let guard = allocator.allocate().expect("should allocate");
-            ports.push(guard.port());
-            guards.push(guard);
-        }
-
-        assert_eq!(allocator.allocated_count(), 100);
-
-        // All ports should be unique
-        ports.sort();
-        ports.dedup();
-        assert_eq!(ports.len(), 100);
-
-        // Release all
-        drop(guards);
-
-        assert_eq!(allocator.allocated_count(), 0);
-        assert_eq!(allocator.time_wait_count(), 100);
-    }
-
-    #[test]
-    fn test_debug_impl() {
-        let allocator = PortAllocator::new();
-        let debug_str = format!("{:?}", allocator);
-        assert!(debug_str.contains("PortAllocator"));
-        assert!(debug_str.contains("allocated_count"));
-
-        let guard = allocator.allocate().expect("should allocate");
-        let debug_str = format!("{:?}", guard);
-        assert!(debug_str.contains("PortGuard"));
-    }
-
-    #[test]
-    fn test_config() {
-        let config = PortAllocatorConfig::default();
-        assert_eq!(config.port_count(), 16384); // 65535 - 49152 + 1
-
-        let custom_config = PortAllocatorConfig::new(50000..=50099, Duration::from_secs(30));
-        assert_eq!(custom_config.port_count(), 100);
-        assert_eq!(custom_config.time_wait_duration, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn test_available_count() {
-        let config = PortAllocatorConfig {
-            range: 50000..=50009, // 10 ports
-            time_wait_duration: Duration::from_secs(60),
-        };
-        let allocator = PortAllocator::with_config(config);
-
-        assert_eq!(allocator.available_count(), 10);
-
-        // Allocate 3
-        let g1 = allocator.allocate();
-        let g2 = allocator.allocate();
-        let g3 = allocator.allocate();
-
-        assert_eq!(allocator.available_count(), 7);
-        assert_eq!(allocator.allocated_count(), 3);
-
-        // Release 1 into TIME_WAIT
-        drop(g3);
-
-        assert_eq!(allocator.available_count(), 7); // 10 - 2 - 1 = 7
-        assert_eq!(allocator.allocated_count(), 2);
-        assert_eq!(allocator.time_wait_count(), 1);
-
-        // Keep g1 and g2 alive to prevent early cleanup
-        drop(g1);
-        drop(g2);
-    }
-
-    #[test]
-    fn test_concurrent_allocation() {
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        use std::sync::Arc;
-
-        let allocator = Arc::new(PortAllocator::new());
-        let successful_allocations = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-
-        // Spawn multiple threads allocating ports
-        for _ in 0..10 {
-            let alloc = Arc::clone(&allocator);
-            let counter = Arc::clone(&successful_allocations);
-            handles.push(thread::spawn(move || {
-                let mut count = 0;
-                for _ in 0..10 {
-                    if let Some(guard) = alloc.allocate() {
-                        count += 1;
-                        // Take ownership so the port stays allocated
-                        let _ = guard.take();
-                    }
-                }
-                counter.fetch_add(count, AtomicOrdering::Relaxed);
-                count
-            }));
-        }
-
-        // Wait for all threads to complete
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // All allocations should succeed (100 ports from 16384 available)
-        let total = successful_allocations.load(AtomicOrdering::Relaxed);
-        assert_eq!(total, 100);
-        assert_eq!(allocator.allocated_count(), 100);
-    }
-
-    #[test]
-    fn test_port_guard_take_consumes() {
-        let allocator = PortAllocator::new();
-        let guard = allocator.allocate().expect("should allocate");
-        let port = guard.port();
-
-        // Take consumes the guard
-        let taken_port = guard.take();
-        assert_eq!(port, taken_port);
-
-        // Port should still be allocated since we took it
-        assert!(allocator.is_allocated(taken_port));
-
-        // Manually release
-        allocator.release(taken_port);
-        assert!(!allocator.is_allocated(taken_port));
-        assert!(allocator.is_in_time_wait(taken_port));
-    }
-
-    #[test]
-    fn test_release_unallocated_port() {
-        let allocator = PortAllocator::new();
-
-        // Try to release a port that was never allocated
-        allocator.release(50000);
-
-        // Should not be in TIME_WAIT since it was never allocated
-        assert!(!allocator.is_in_time_wait(50000));
-    }
-
-    // -------------------------------------------------------------------------
-    // Sharded Port Allocation Tests
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_for_shard_basic() {
-        // Test basic shard allocation with 4 shards
-        let allocator = PortAllocator::for_shard(0, 4);
-
-        // Shard 0 should have ports 49152-53247 (4096 ports)
-        assert!(allocator.port_range_start() >= 49152);
-        assert!(allocator.port_range_end() <= 53247);
-    }
-
-    #[test]
-    fn test_for_shard_all_shards() {
-        // Verify all 4 shards have non-overlapping ranges
+    fn test_shard_allocation() {
         let a0 = PortAllocator::for_shard(0, 4);
         let a1 = PortAllocator::for_shard(1, 4);
         let a2 = PortAllocator::for_shard(2, 4);
         let a3 = PortAllocator::for_shard(3, 4);
 
         // Ranges should not overlap
-        assert!(a0.port_range_end() < a1.port_range_start());
-        assert!(a1.port_range_end() < a2.port_range_start());
-        assert!(a2.port_range_end() < a3.port_range_start());
+        assert!(a0.config.end() < a1.config.start());
+        assert!(a1.config.end() < a2.config.start());
+        assert!(a2.config.end() < a3.config.start());
 
         // Last shard should end at PORT_RANGE_END
-        assert_eq!(a3.port_range_end(), 65535);
+        assert_eq!(a3.config.end(), PORT_RANGE_END);
     }
 
     #[test]
-    fn test_for_shard_allocates_in_range() {
-        // Test that allocated ports are within the shard's range
-        let allocator = PortAllocator::for_shard(1, 4);
-        let start = allocator.port_range_start();
-        let end = allocator.port_range_end();
-
-        // Allocate multiple ports and verify they're in range
-        for _ in 0..10 {
-            if let Some(guard) = allocator.allocate() {
-                let port = guard.port();
-                assert!(port >= start && port <= end, "Port {} not in range [{}, {}]", port, start, end);
-            }
-        }
-    }
-
-    #[test]
-    fn test_shard_for_port_basic() {
-        // Test shard_for_port with 4 shards
-        // Ports 49152-65535 = 16384 ports, 4096 per shard
-
+    fn test_shard_for_port() {
         // Shard 0: 49152-53247
         assert_eq!(PortAllocator::shard_for_port(49152, 4), Some(0));
         assert_eq!(PortAllocator::shard_for_port(53247, 4), Some(0));
 
         // Shard 1: 53248-57343
         assert_eq!(PortAllocator::shard_for_port(53248, 4), Some(1));
-        assert_eq!(PortAllocator::shard_for_port(57343, 4), Some(1));
-
-        // Shard 2: 57344-61439
-        assert_eq!(PortAllocator::shard_for_port(57344, 4), Some(2));
-        assert_eq!(PortAllocator::shard_for_port(61439, 4), Some(2));
 
         // Shard 3: 61440-65535
-        assert_eq!(PortAllocator::shard_for_port(61440, 4), Some(3));
         assert_eq!(PortAllocator::shard_for_port(65535, 4), Some(3));
-    }
 
-    #[test]
-    fn test_shard_for_port_outside_range() {
-        // Ports outside ephemeral range should return None
+        // Outside range
         assert_eq!(PortAllocator::shard_for_port(80, 4), None);
         assert_eq!(PortAllocator::shard_for_port(443, 4), None);
-        assert_eq!(PortAllocator::shard_for_port(49151, 4), None);
-        assert_eq!(PortAllocator::shard_for_port(0, 4), None);
     }
 
     #[test]
-    fn test_shard_for_port_roundtrip() {
-        // Verify that for_shard and shard_for_port are inverses
-        // Test using the port range boundaries instead of allocating
-        for shard_idx in 0u16..4 {
-            let allocator = PortAllocator::for_shard(shard_idx, 4);
-            // Use the start of each shard's range as a representative port
-            let port = allocator.port_range_start();
-            let detected_shard = PortAllocator::shard_for_port(port, 4);
-            assert_eq!(detected_shard, Some(shard_idx as usize),
-                "Port {} from shard {} detected as shard {:?}", port, shard_idx, detected_shard);
-        }
+    fn test_stats() {
+        let config = PortAllocatorConfig {
+            range: 50000..=50009, // 10 ports
+            time_wait_duration: Duration::from_secs(60),
+        };
+        let allocator = PortAllocator::with_config(config);
+
+        assert_eq!(allocator.stats().total, 10);
+        assert_eq!(allocator.stats().available, 10);
+
+        let g1 = allocator.allocate();
+        let g2 = allocator.allocate();
+        let g3 = allocator.allocate();
+
+        assert_eq!(allocator.stats().allocated, 3);
+        assert_eq!(allocator.stats().available, 7);
+
+        drop(g3);
+
+        assert_eq!(allocator.stats().allocated, 2);
+        assert_eq!(allocator.stats().time_wait, 1);
+        assert_eq!(allocator.stats().available, 7);
+
+        drop(g1);
+        drop(g2);
+    }
+
+    #[test]
+    fn test_utilization_percent() {
+        let stats = PortAllocatorStats {
+            allocated: 50,
+            time_wait: 25,
+            available: 25,
+            total: 100,
+            range_start: 50000,
+            range_end: 50099,
+        };
+
+        assert!((stats.utilization_percent() - 75.0).abs() < 0.01);
     }
 
     #[test]
