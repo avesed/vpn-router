@@ -64,7 +64,7 @@ use smoltcp::wire::IpAddress;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, trace};
+use tracing::{debug, info, trace, warn};
 
 use super::shard::{ShardCommand, SmoltcpShard, SmoltcpShardConfig, SmoltcpShardStats};
 use crate::netbridge::error::{NetBridgeError, Result};
@@ -266,6 +266,11 @@ impl SmoltcpEgress {
 
     /// Shutdown the egress bridge
     pub async fn shutdown(&self) -> Result<()> {
+        info!(
+            target: "netbridge::egress",
+            local_ip = %self.config.local_ip,
+            "SmoltcpEgress initiating shutdown"
+        );
         self.command_tx
             .send(ShardCommand::Shutdown)
             .await
@@ -327,6 +332,13 @@ impl NetBridgeEgress for SmoltcpEgress {
                 .map_err(|_| NetBridgeError::ChannelClosed)??;
 
             stats.tcp_connections.fetch_add(1, Ordering::Relaxed);
+
+            debug!(
+                target: "netbridge::egress",
+                session_id,
+                %dest,
+                "TCP session created via SmoltcpEgress"
+            );
 
             // Spawn a task to pump data between stream and shard
             let data_tx_clone = command_tx.clone();
@@ -436,6 +448,11 @@ impl NetBridgeEgress for SmoltcpEgress {
             .try_send(data)
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => {
+                    warn!(
+                        target: "netbridge::egress",
+                        packet_len = packet.len(),
+                        "WG reply channel full, dropping packet"
+                    );
                     NetBridgeError::ChannelSendFailed("WG reply channel full".to_string())
                 }
                 mpsc::error::TrySendError::Closed(_) => NetBridgeError::ChannelClosed,

@@ -84,7 +84,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::smoltcp_utils::{BridgeError, PortAllocator};
+use crate::netbridge::{NetBridgeError as BridgeError, PortAllocator};
 
 use super::cleanup::{CleanupConfig, CleanupStats};
 use super::event_channel::{create_event_channel, EventChannelConfig, EventSender};

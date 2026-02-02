@@ -92,7 +92,7 @@ mod shard;
 // Re-export public types
 pub use bridge::{SmoltcpBridge, SmoltcpBridgeConfig};
 pub use device::{VirtualDevice, VirtualDeviceStats};
-pub use egress::{SmoltcpEgress, SmoltcpEgressConfig, SmoltcpEgressStats};
+pub use egress::{SmoltcpEgress, SmoltcpEgressConfig, SmoltcpEgressHandle, SmoltcpEgressStats};
 pub use shard::{SmoltcpShard, SmoltcpShardConfig, SmoltcpShardStats};
 
 // =============================================================================

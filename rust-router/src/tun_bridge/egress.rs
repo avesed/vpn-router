@@ -514,7 +514,7 @@ impl TunEgressBridge {
     /// - `CAP_NET_RAW` capability for `SO_BINDTODEVICE`
     pub async fn handle_tcp_connection<S>(
         &self,
-        mut stream: S,
+        stream: S,
         dest_addr: SocketAddr,
         tunnel_tag: &str,
     ) -> io::Result<TcpConnectionStats>

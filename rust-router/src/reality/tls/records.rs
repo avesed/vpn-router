@@ -6,7 +6,7 @@
 use crate::reality::common::{
     build_record_header, strip_content_type_slice, AEAD_TAG_SIZE, ALERT_DESC_CLOSE_NOTIFY,
     ALERT_LEVEL_WARNING, CONTENT_TYPE_ALERT, CONTENT_TYPE_APPLICATION_DATA, CONTENT_TYPE_HANDSHAKE,
-    MAX_TLS_PLAINTEXT_LEN, TLS_RECORD_HEADER_SIZE,
+    MAX_TLS_PLAINTEXT_LEN,
 };
 use crate::reality::crypto::AeadKey;
 use crate::reality::error::{RealityError, RealityResult};
@@ -189,6 +189,7 @@ pub fn check_sequence_overflow(seq: u64) -> RealityResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reality::common::TLS_RECORD_HEADER_SIZE;
     use crate::reality::crypto::{AeadKey, CipherSuite};
 
     const CS: CipherSuite = CipherSuite::AES_128_GCM_SHA256;

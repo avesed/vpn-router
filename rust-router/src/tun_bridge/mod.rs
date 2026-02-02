@@ -234,6 +234,38 @@ pub const DEFAULT_EGRESS_TUN_CIDR: &str = "10.200.200.1/24";
 /// Default routing table ID for egress TUN
 pub const DEFAULT_EGRESS_ROUTE_TABLE: u32 = 201;
 
+// =============================================================================
+// Migration Compatibility Re-exports from netbridge
+// =============================================================================
+//
+// These re-exports allow code to migrate from tun_bridge to netbridge gradually.
+// During migration, both modules coexist and code can use either path.
+//
+// Legacy path: use crate::tun_bridge::{FiveTuple, SessionTracker, ...}
+// New path:    use crate::netbridge::{FiveTuple, SessionTracker, ...}
+//
+// Eventually, these re-exports will be deprecated in favor of direct netbridge imports.
+
+/// Re-export netbridge FiveTuple as NetFiveTuple for disambiguation
+pub use crate::netbridge::FiveTuple as NetFiveTuple;
+
+/// Re-export netbridge SessionTracker as NetSessionTracker for disambiguation
+pub use crate::netbridge::SessionTracker as NetSessionTracker;
+
+/// Re-export netbridge IpProtocol
+pub use crate::netbridge::IpProtocol;
+
+/// Re-export netbridge KernelIngress and related types
+pub use crate::netbridge::{
+    KernelIngress, KernelIngressConfig, KernelIngressStats, KernelIngressStatsSnapshot,
+};
+
+/// Re-export netbridge types for reply routing
+pub use crate::netbridge::{ReplyPacket, ReplyRouter};
+
+/// Re-export netbridge session types
+pub use crate::netbridge::Session as NetSession;
+
 #[cfg(test)]
 mod tests {
     use super::*;

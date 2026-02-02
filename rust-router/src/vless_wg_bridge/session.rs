@@ -54,9 +54,9 @@ use dashmap::DashMap;
 use smoltcp::iface::SocketHandle;
 use tracing::{debug, trace};
 
-use crate::smoltcp_utils::{
-    BridgeError, PortAllocator, PortGuard, Result, MAX_SESSIONS_PER_CLIENT, MAX_TOTAL_SESSIONS,
-    TCP_IDLE_TIMEOUT_SECS, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS,
+use crate::netbridge::{
+    NetBridgeError as BridgeError, PortAllocator, PortGuard, Result, MAX_SESSIONS_PER_PEER as MAX_SESSIONS_PER_CLIENT,
+    MAX_TOTAL_SESSIONS, TCP_IDLE_TIMEOUT_SECS, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS,
 };
 
 // =============================================================================

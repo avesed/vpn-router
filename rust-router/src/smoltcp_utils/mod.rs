@@ -118,8 +118,10 @@ pub use session::{
     ConnectionId, SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig, UdpSession,
 };
 
-pub use socket_guard::{
+// Socket guards are now in netbridge, re-export for backward compatibility
+pub use crate::netbridge::{
     init_cleanup_channel, run_cleanup_task, SocketCleanupReceiver, TcpSocketGuard, UdpSocketGuard,
 };
 
-pub use conn_id::{ConnId, ConnIdAllocator};
+// ConnId types are now in netbridge, re-export for backward compatibility
+pub use crate::netbridge::{ConnId, ConnIdAllocator};

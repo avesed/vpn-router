@@ -68,9 +68,9 @@ use super::tun::TunDeviceWrapper;
 use crate::netbridge::config::{REPLY_CHANNEL_SIZE, TUN_MTU};
 use crate::netbridge::error::{NetBridgeError, Result};
 use crate::netbridge::reply::ReplyRouter;
-use crate::netbridge::session::{RegisterResult, SessionTracker};
+use crate::netbridge::session::SessionTracker;
 use crate::netbridge::traits::{NetBridgeIngress, SessionHandler, SessionInfo};
-use crate::netbridge::types::{FiveTuple, IngressStats, IpProtocol, ReplyPacket};
+use crate::netbridge::types::{FiveTuple, IngressStats, ReplyPacket};
 
 // =============================================================================
 // KernelIngress Configuration
@@ -378,6 +378,52 @@ impl KernelIngress {
         self.session_handler.as_ref()
     }
 
+    /// Get a reference to the raw statistics counters
+    #[inline]
+    #[must_use]
+    pub fn raw_stats(&self) -> &KernelIngressStats {
+        &self.stats
+    }
+
+    /// Get a snapshot of statistics
+    ///
+    /// This method is API-compatible with `TunIngressBridge::stats_snapshot()`.
+    #[must_use]
+    pub fn stats_snapshot(&self) -> KernelIngressStatsSnapshot {
+        let mut snapshot = KernelIngressStatsSnapshot::from(&self.stats);
+        // Fill in session counts from the tracker
+        snapshot.tcp_connections_active = self.sessions.tcp_session_count() as u64;
+        snapshot.udp_sessions_active = self.sessions.udp_session_count() as u64;
+        snapshot
+    }
+
+    /// Get the number of active TCP sessions
+    ///
+    /// This method is API-compatible with `TunIngressBridge::tcp_session_count()`.
+    #[inline]
+    #[must_use]
+    pub fn tcp_session_count(&self) -> usize {
+        self.sessions.tcp_session_count()
+    }
+
+    /// Get the number of active UDP sessions
+    ///
+    /// This method is API-compatible with `TunIngressBridge::udp_session_count()`.
+    #[inline]
+    #[must_use]
+    pub fn udp_session_count(&self) -> usize {
+        self.sessions.udp_session_count()
+    }
+
+    /// Get the total number of active sessions
+    ///
+    /// This method is API-compatible with `TunIngressBridge::total_sessions()`.
+    #[inline]
+    #[must_use]
+    pub fn total_sessions(&self) -> usize {
+        self.sessions.total_sessions()
+    }
+
     /// Check if shutdown has been requested
     #[inline]
     fn is_shutdown_requested(&self) -> bool {
@@ -660,29 +706,97 @@ impl std::fmt::Debug for KernelIngress {
 // Statistics
 // =============================================================================
 
-/// Internal statistics counters
+/// Internal statistics counters for KernelIngress
+///
+/// This struct provides detailed counters for monitoring and diagnostics.
+/// It is API-compatible with `tun_bridge::TunIngressStats` for easy migration.
 #[derive(Debug, Default)]
-struct KernelIngressStats {
-    /// Packets injected from WireGuard
-    packets_injected: AtomicU64,
-    /// Bytes injected from WireGuard
-    bytes_injected: AtomicU64,
+pub struct KernelIngressStats {
+    /// Packets injected from WireGuard into TUN
+    pub packets_injected: AtomicU64,
+    /// Bytes injected from WireGuard into TUN
+    pub bytes_injected: AtomicU64,
     /// Packets read from TUN (kernel replies)
-    packets_from_tun: AtomicU64,
+    pub packets_from_tun: AtomicU64,
     /// Bytes read from TUN
-    bytes_from_tun: AtomicU64,
+    pub bytes_from_tun: AtomicU64,
     /// TUN write errors
-    tun_write_errors: AtomicU64,
+    pub tun_write_errors: AtomicU64,
     /// TUN read errors
-    tun_read_errors: AtomicU64,
+    pub tun_read_errors: AtomicU64,
     /// Reply routing errors
-    reply_route_errors: AtomicU64,
+    pub reply_route_errors: AtomicU64,
     /// Session registration errors
-    session_errors: AtomicU64,
+    pub session_errors: AtomicU64,
     /// TPROXY connections accepted
-    tproxy_connections: AtomicU64,
+    pub tproxy_connections: AtomicU64,
     /// TPROXY accept errors
-    tproxy_accept_errors: AtomicU64,
+    pub tproxy_accept_errors: AtomicU64,
+    /// DNS queries hijacked (FakeDNS) - for tun_bridge compatibility
+    pub dns_queries_hijacked: AtomicU64,
+    /// FakeDNS reverse lookup hits - for tun_bridge compatibility
+    pub fakedns_reverse_hits: AtomicU64,
+    /// SNI extractions - for tun_bridge compatibility
+    pub sni_extractions: AtomicU64,
+    /// Connection errors - for tun_bridge compatibility
+    pub connection_errors: AtomicU64,
+    /// Session limit rejections - for tun_bridge compatibility
+    pub session_limit_rejections: AtomicU64,
+    /// Bytes sent to outbound - for tun_bridge compatibility
+    pub bytes_sent: AtomicU64,
+    /// Bytes received from outbound - for tun_bridge compatibility
+    pub bytes_received: AtomicU64,
+}
+
+/// Snapshot of KernelIngress statistics (for reporting)
+///
+/// This struct is API-compatible with `tun_bridge::TunIngressStatsSnapshot`
+/// to facilitate migration and provide consistent monitoring interfaces.
+#[derive(Debug, Clone, Default)]
+pub struct KernelIngressStatsSnapshot {
+    /// Packets injected into TUN
+    pub packets_injected: u64,
+    /// Packets read from TUN (replies)
+    pub packets_read: u64,
+    /// TCP connections accepted (via TPROXY)
+    pub tcp_connections_accepted: u64,
+    /// TCP connections currently active
+    pub tcp_connections_active: u64,
+    /// UDP sessions currently active
+    pub udp_sessions_active: u64,
+    /// DNS queries hijacked (FakeDNS)
+    pub dns_queries_hijacked: u64,
+    /// FakeDNS reverse lookup hits
+    pub fakedns_reverse_hits: u64,
+    /// SNI extractions
+    pub sni_extractions: u64,
+    /// Connection errors
+    pub connection_errors: u64,
+    /// Session limit rejections
+    pub session_limit_rejections: u64,
+    /// Bytes sent to outbound
+    pub bytes_sent: u64,
+    /// Bytes received from outbound
+    pub bytes_received: u64,
+}
+
+impl From<&KernelIngressStats> for KernelIngressStatsSnapshot {
+    fn from(stats: &KernelIngressStats) -> Self {
+        Self {
+            packets_injected: stats.packets_injected.load(Ordering::Relaxed),
+            packets_read: stats.packets_from_tun.load(Ordering::Relaxed),
+            tcp_connections_accepted: stats.tproxy_connections.load(Ordering::Relaxed),
+            tcp_connections_active: 0, // Tracked by session tracker
+            udp_sessions_active: 0,    // Tracked by session tracker
+            dns_queries_hijacked: stats.dns_queries_hijacked.load(Ordering::Relaxed),
+            fakedns_reverse_hits: stats.fakedns_reverse_hits.load(Ordering::Relaxed),
+            sni_extractions: stats.sni_extractions.load(Ordering::Relaxed),
+            connection_errors: stats.connection_errors.load(Ordering::Relaxed),
+            session_limit_rejections: stats.session_limit_rejections.load(Ordering::Relaxed),
+            bytes_sent: stats.bytes_sent.load(Ordering::Relaxed),
+            bytes_received: stats.bytes_received.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -758,6 +872,37 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_snapshot() {
+        let stats = KernelIngressStats::default();
+        stats.packets_injected.store(100, Ordering::Relaxed);
+        stats.packets_from_tun.store(50, Ordering::Relaxed);
+        stats.tproxy_connections.store(10, Ordering::Relaxed);
+        stats.dns_queries_hijacked.store(5, Ordering::Relaxed);
+        stats.sni_extractions.store(3, Ordering::Relaxed);
+        stats.bytes_sent.store(1000, Ordering::Relaxed);
+        stats.bytes_received.store(2000, Ordering::Relaxed);
+
+        let snapshot = KernelIngressStatsSnapshot::from(&stats);
+        assert_eq!(snapshot.packets_injected, 100);
+        assert_eq!(snapshot.packets_read, 50);
+        assert_eq!(snapshot.tcp_connections_accepted, 10);
+        assert_eq!(snapshot.dns_queries_hijacked, 5);
+        assert_eq!(snapshot.sni_extractions, 3);
+        assert_eq!(snapshot.bytes_sent, 1000);
+        assert_eq!(snapshot.bytes_received, 2000);
+    }
+
+    #[test]
+    fn test_stats_snapshot_default() {
+        let snapshot = KernelIngressStatsSnapshot::default();
+        assert_eq!(snapshot.packets_injected, 0);
+        assert_eq!(snapshot.packets_read, 0);
+        assert_eq!(snapshot.tcp_connections_accepted, 0);
+        assert_eq!(snapshot.tcp_connections_active, 0);
+        assert_eq!(snapshot.udp_sessions_active, 0);
+    }
+
+    #[test]
     fn test_config_with_session_handler() {
         use crate::netbridge::error::NetBridgeError;
         use crate::netbridge::traits::{NoOpSessionHandler, SessionCloseStats};
@@ -801,7 +946,7 @@ mod tests {
     #[test]
     fn test_register_result_triggers_callback() {
         use crate::netbridge::session::SessionTracker;
-        use crate::netbridge::types::FiveTuple;
+        use crate::netbridge::types::{FiveTuple, IpProtocol};
         use std::net::{IpAddr, Ipv4Addr};
 
         let handler = Arc::new(MockSessionHandler::default());

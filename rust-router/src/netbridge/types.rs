@@ -817,6 +817,252 @@ pub struct EgressStats {
     pub errors: u64,
 }
 
+// =============================================================================
+// Connection ID (migrated from smoltcp_utils/conn_id.rs)
+// =============================================================================
+
+/// Number of bits reserved for the shard index
+const SHARD_BITS: u32 = 16;
+
+/// Number of bits for the sequence number
+const SEQUENCE_BITS: u32 = 64 - SHARD_BITS;
+
+/// Mask for extracting the sequence number (48 bits)
+const SEQUENCE_MASK: u64 = (1 << SEQUENCE_BITS) - 1;
+
+/// Mask for extracting the shard index (high 16 bits)
+const SHARD_MASK: u64 = !SEQUENCE_MASK;
+
+/// Maximum sequence value before wrapping (2^48 - 1)
+const MAX_SEQUENCE: u64 = SEQUENCE_MASK;
+
+/// Unique identifier for a connection/session
+///
+/// A 64-bit value that can optionally encode a shard index in the high 16 bits.
+/// When created without a shard, the entire 64 bits are used for the sequence.
+///
+/// # ID Layout
+///
+/// ```text
+/// Without shard (global allocator):
+/// +----------------------------------------------------------------+
+/// |                         64-bit sequence                         |
+/// +----------------------------------------------------------------+
+///
+/// With shard (per-shard allocator):
+/// +----------------+------------------------------------------------+
+/// | 16-bit shard   |              48-bit sequence                    |
+/// +----------------+------------------------------------------------+
+/// ```
+///
+/// # Properties
+///
+/// - `Copy` and `Clone`: IDs are cheap to copy
+/// - `Eq` and `Hash`: Can be used as map keys
+/// - `Ord`: Sortable by raw value (shard-aware ordering)
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConnId(u64);
+
+impl ConnId {
+    /// Create a connection ID from a raw 64-bit value
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Get the raw 64-bit value
+    #[must_use]
+    pub const fn raw(&self) -> u64 {
+        self.0
+    }
+
+    /// Create a connection ID with a specific shard index and sequence
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if sequence exceeds 48 bits.
+    #[must_use]
+    pub const fn with_shard_and_sequence(shard_index: u16, sequence: u64) -> Self {
+        debug_assert!(
+            sequence <= MAX_SEQUENCE,
+            "sequence exceeds 48-bit limit"
+        );
+        let raw = ((shard_index as u64) << SEQUENCE_BITS) | (sequence & SEQUENCE_MASK);
+        Self(raw)
+    }
+
+    /// Get the shard index if this ID was created with one
+    ///
+    /// Returns `Some(shard_index)` if the high 16 bits are non-zero,
+    /// `None` otherwise. Note that shard index 0 is indistinguishable
+    /// from a global ID.
+    #[must_use]
+    pub const fn shard_index(&self) -> Option<u16> {
+        let shard = ((self.0 & SHARD_MASK) >> SEQUENCE_BITS) as u16;
+        if shard == 0 {
+            None
+        } else {
+            Some(shard)
+        }
+    }
+
+    /// Get the shard index, returning 0 if not set
+    #[must_use]
+    pub const fn shard_index_or_zero(&self) -> u16 {
+        ((self.0 & SHARD_MASK) >> SEQUENCE_BITS) as u16
+    }
+
+    /// Get the sequence number portion (low 48 bits for sharded IDs)
+    ///
+    /// For global IDs (no shard), this returns the full 64-bit value.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.0 & SEQUENCE_MASK
+    }
+
+    /// Check if this ID has a shard index encoded
+    #[must_use]
+    pub const fn has_shard(&self) -> bool {
+        (self.0 & SHARD_MASK) != 0
+    }
+}
+
+impl fmt::Debug for ConnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(shard) = self.shard_index() {
+            write!(f, "ConnId(shard={}, seq={})", shard, self.sequence())
+        } else {
+            write!(f, "ConnId({})", self.0)
+        }
+    }
+}
+
+impl fmt::Display for ConnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(shard) = self.shard_index() {
+            write!(f, "s{}-{}", shard, self.sequence())
+        } else {
+            write!(f, "c{}", self.0)
+        }
+    }
+}
+
+/// Thread-safe allocator for connection IDs
+///
+/// Can operate in two modes:
+/// 1. **Global mode**: Creates IDs using the full 64-bit space
+/// 2. **Shard mode**: Encodes a shard index in the high 16 bits
+///
+/// # Example
+///
+/// ```ignore
+/// // Create allocators for different shards
+/// let alloc_shard_1 = ConnIdAllocator::with_shard(1);
+/// let alloc_shard_2 = ConnIdAllocator::with_shard(2);
+///
+/// // IDs from different shards are always unique
+/// let id1 = alloc_shard_1.next();
+/// let id2 = alloc_shard_2.next();
+/// assert_ne!(id1, id2);
+///
+/// // Can identify which shard generated the ID
+/// assert_eq!(id1.shard_index(), Some(1));
+/// assert_eq!(id2.shard_index(), Some(2));
+/// ```
+pub struct ConnIdAllocator {
+    /// Next sequence number (low 48 bits when sharded)
+    next_seq: AtomicU64,
+    /// Optional shard index (None for global allocator)
+    shard_index: Option<u16>,
+}
+
+impl ConnIdAllocator {
+    /// Create a global allocator (no shard encoding)
+    ///
+    /// IDs will use the full 64-bit space for the sequence number.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next_seq: AtomicU64::new(1), // Start at 1, reserve 0 for "no ID"
+            shard_index: None,
+        }
+    }
+
+    /// Create a shard-specific allocator
+    ///
+    /// IDs will have the shard index encoded in the high 16 bits.
+    ///
+    /// # Note
+    ///
+    /// Using `shard_index = 0` is valid but the resulting IDs will be
+    /// indistinguishable from global IDs when calling `shard_index()`.
+    #[must_use]
+    pub fn with_shard(shard_index: u16) -> Self {
+        Self {
+            next_seq: AtomicU64::new(1), // Start at 1
+            shard_index: Some(shard_index),
+        }
+    }
+
+    /// Allocate the next connection ID
+    ///
+    /// This operation is lock-free and thread-safe. The sequence number
+    /// will wrap around after reaching the maximum value (2^48 - 1 for
+    /// sharded allocators, 2^64 - 1 for global allocators).
+    #[must_use]
+    pub fn next(&self) -> ConnId {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+
+        match self.shard_index {
+            Some(shard) => {
+                // Wrap sequence at 48 bits
+                let seq = seq & SEQUENCE_MASK;
+                ConnId::with_shard_and_sequence(shard, seq)
+            }
+            None => {
+                // Use full 64-bit space
+                ConnId::from_raw(seq)
+            }
+        }
+    }
+
+    /// Get the current allocation count (for debugging)
+    ///
+    /// Returns the number of IDs that have been allocated.
+    /// Note: Due to concurrent access, this may be slightly stale.
+    #[must_use]
+    pub fn current_count(&self) -> u64 {
+        self.next_seq.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
+    /// Check if this allocator encodes shard indices
+    #[must_use]
+    pub fn is_sharded(&self) -> bool {
+        self.shard_index.is_some()
+    }
+
+    /// Get the shard index for this allocator
+    #[must_use]
+    pub fn shard(&self) -> Option<u16> {
+        self.shard_index
+    }
+}
+
+impl Default for ConnIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for ConnIdAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnIdAllocator")
+            .field("shard_index", &self.shard_index)
+            .field("allocated", &self.current_count())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1207,184 @@ mod tests {
         assert!(display.contains("TCP"));
         assert!(display.contains("10.25.0.2"));
         assert!(display.contains("12345"));
+    }
+
+    // =========================================================================
+    // ConnId Tests
+    // =========================================================================
+
+    #[test]
+    fn test_conn_id_from_raw() {
+        let id = ConnId::from_raw(12345);
+        assert_eq!(id.raw(), 12345);
+    }
+
+    #[test]
+    fn test_conn_id_with_shard() {
+        let id = ConnId::with_shard_and_sequence(5, 1000);
+        assert_eq!(id.shard_index(), Some(5));
+        assert_eq!(id.sequence(), 1000);
+        assert!(id.has_shard());
+    }
+
+    #[test]
+    fn test_conn_id_without_shard() {
+        let id = ConnId::from_raw(12345);
+        assert_eq!(id.shard_index(), None);
+        assert_eq!(id.sequence(), 12345);
+        assert!(!id.has_shard());
+    }
+
+    #[test]
+    fn test_conn_id_shard_zero() {
+        // Shard 0 is indistinguishable from global
+        let id = ConnId::with_shard_and_sequence(0, 1000);
+        assert_eq!(id.shard_index(), None);
+        assert_eq!(id.shard_index_or_zero(), 0);
+        assert_eq!(id.sequence(), 1000);
+    }
+
+    #[test]
+    fn test_conn_id_display_with_shard() {
+        let id = ConnId::with_shard_and_sequence(3, 42);
+        let s = id.to_string();
+        assert_eq!(s, "s3-42");
+    }
+
+    #[test]
+    fn test_conn_id_display_without_shard() {
+        let id = ConnId::from_raw(999);
+        let s = id.to_string();
+        assert_eq!(s, "c999");
+    }
+
+    #[test]
+    fn test_conn_id_debug() {
+        let id_with_shard = ConnId::with_shard_and_sequence(7, 123);
+        let s = format!("{:?}", id_with_shard);
+        assert!(s.contains("shard=7"));
+        assert!(s.contains("seq=123"));
+
+        let id_without_shard = ConnId::from_raw(456);
+        let s = format!("{:?}", id_without_shard);
+        assert!(s.contains("456"));
+    }
+
+    #[test]
+    fn test_conn_id_eq_hash() {
+        use std::collections::HashSet;
+
+        let id1 = ConnId::from_raw(100);
+        let id2 = ConnId::from_raw(100);
+        let id3 = ConnId::from_raw(200);
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+
+        let mut set = HashSet::new();
+        set.insert(id1);
+        assert!(set.contains(&id2));
+        assert!(!set.contains(&id3));
+    }
+
+    #[test]
+    fn test_conn_id_ordering() {
+        let id1 = ConnId::with_shard_and_sequence(1, 100);
+        let id2 = ConnId::with_shard_and_sequence(1, 200);
+        let id3 = ConnId::with_shard_and_sequence(2, 50);
+
+        // Same shard, different sequence
+        assert!(id1 < id2);
+
+        // Different shard (higher shard = higher ID)
+        assert!(id2 < id3);
+    }
+
+    // =========================================================================
+    // ConnIdAllocator Tests
+    // =========================================================================
+
+    #[test]
+    fn test_conn_id_allocator_global_monotonic() {
+        let alloc = ConnIdAllocator::new();
+
+        let id1 = alloc.next();
+        let id2 = alloc.next();
+        let id3 = alloc.next();
+
+        assert!(id1.raw() < id2.raw());
+        assert!(id2.raw() < id3.raw());
+        assert_eq!(alloc.current_count(), 3);
+    }
+
+    #[test]
+    fn test_conn_id_allocator_starts_at_one() {
+        let alloc = ConnIdAllocator::new();
+        let id = alloc.next();
+        assert_eq!(id.raw(), 1); // 0 is reserved
+    }
+
+    #[test]
+    fn test_conn_id_allocator_sharded_monotonic() {
+        let alloc = ConnIdAllocator::with_shard(5);
+
+        let id1 = alloc.next();
+        let id2 = alloc.next();
+
+        assert_eq!(id1.shard_index(), Some(5));
+        assert_eq!(id2.shard_index(), Some(5));
+        assert!(id1.sequence() < id2.sequence());
+    }
+
+    #[test]
+    fn test_conn_id_allocator_different_shards_unique() {
+        let alloc1 = ConnIdAllocator::with_shard(1);
+        let alloc2 = ConnIdAllocator::with_shard(2);
+
+        let id1 = alloc1.next();
+        let id2 = alloc2.next();
+
+        // Same sequence number but different shards
+        assert_eq!(id1.sequence(), 1);
+        assert_eq!(id2.sequence(), 1);
+
+        // But IDs are different
+        assert_ne!(id1, id2);
+        assert_ne!(id1.raw(), id2.raw());
+    }
+
+    #[test]
+    fn test_conn_id_allocator_is_sharded() {
+        let global = ConnIdAllocator::new();
+        let sharded = ConnIdAllocator::with_shard(1);
+
+        assert!(!global.is_sharded());
+        assert!(sharded.is_sharded());
+    }
+
+    #[test]
+    fn test_conn_id_allocator_shard_getter() {
+        let global = ConnIdAllocator::new();
+        let sharded = ConnIdAllocator::with_shard(42);
+
+        assert_eq!(global.shard(), None);
+        assert_eq!(sharded.shard(), Some(42));
+    }
+
+    #[test]
+    fn test_conn_id_allocator_debug() {
+        let alloc = ConnIdAllocator::with_shard(3);
+        let _ = alloc.next();
+        let _ = alloc.next();
+
+        let s = format!("{:?}", alloc);
+        assert!(s.contains("shard_index: Some(3)"));
+        assert!(s.contains("allocated: 2"));
+    }
+
+    #[test]
+    fn test_conn_id_allocator_default() {
+        let alloc = ConnIdAllocator::default();
+        assert!(!alloc.is_sharded());
     }
 }

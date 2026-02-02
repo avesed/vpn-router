@@ -217,6 +217,14 @@ pub enum NetBridgeError {
     /// Internal error (should not happen)
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Internal error with additional context
+    #[error("internal error: {0}")]
+    InternalError(String),
+
+    /// Feature not supported
+    #[error("not supported: {0}")]
+    NotSupported(String),
 }
 
 impl NetBridgeError {
@@ -257,6 +265,7 @@ impl NetBridgeError {
                 | Self::NotInitialized
                 | Self::Config(_)
                 | Self::PermissionDenied(_)
+                | Self::NotSupported(_)
         )
     }
 

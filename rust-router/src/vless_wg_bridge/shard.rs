@@ -94,7 +94,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::smoltcp_utils::{BridgeError, ConnId, ConnIdAllocator, PortAllocator};
+use crate::netbridge::{ConnId, ConnIdAllocator, NetBridgeError as BridgeError, PortAllocator};
 
 use super::cleanup::{CleanupConfig, CleanupStats};
 use super::event_channel::EventReceiver;

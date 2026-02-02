@@ -4,7 +4,7 @@
 //! as required by the REALITY protocol.
 
 use crate::reality::common::{
-    CONTENT_TYPE_HANDSHAKE, HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
+    HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
     HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, HANDSHAKE_TYPE_FINISHED, HANDSHAKE_TYPE_SERVER_HELLO,
     TLS_RECORD_HEADER_SIZE, VERSION_TLS_1_2_MAJOR, VERSION_TLS_1_2_MINOR,
 };
@@ -683,6 +683,7 @@ pub fn extract_client_public_key(client_hello: &[u8]) -> RealityResult<[u8; 32]>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reality::common::CONTENT_TYPE_HANDSHAKE;
 
     #[test]
     fn test_construct_client_hello() {

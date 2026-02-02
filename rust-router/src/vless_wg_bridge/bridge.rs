@@ -61,10 +61,10 @@ use crate::egress::config::EgressState;
 use crate::egress::manager::WgEgressManager;
 use crate::tunnel::smoltcp_bridge::SmoltcpBridge;
 
-use crate::smoltcp_utils::{
-    BridgeError, PortAllocator, Result, TcpSocketGuard, MAX_SOCKETS, TCP_IDLE_TIMEOUT_SECS,
+use crate::netbridge::{
+    NetBridgeError as BridgeError, PortAllocator, Result, TcpSocketGuard, MAX_SOCKETS, TCP_IDLE_TIMEOUT_SECS,
     TCP_RX_BUFFER, TCP_TX_BUFFER, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS, UDP_RX_BUFFER,
-    WG_MTU, WG_REPLY_CHANNEL_SIZE,
+    WG_MTU, REPLY_CHANNEL_SIZE as WG_REPLY_CHANNEL_SIZE,
 };
 
 use super::reply_registry::{VlessReplyKey, VlessReplyRegistry};

@@ -266,6 +266,18 @@ pub struct IpcHandler {
     shard_supervisor: RwLock<Option<Arc<parking_lot::Mutex<crate::vless_wg_bridge::ShardSupervisor>>>>,
 
     // ========================================================================
+    // Netbridge Egress Components (feature: use-netbridge-egress)
+    // ========================================================================
+    /// Netbridge adapters per WG tunnel (tag -> adapter)
+    /// Each WG tunnel gets its own NetbridgeVlessAdapter for the new unified bridge
+    #[cfg(feature = "use-netbridge-egress")]
+    netbridge_adapters: RwLock<std::collections::HashMap<String, Arc<crate::netbridge::NetbridgeVlessAdapter>>>,
+
+    /// Netbridge egress handles per tunnel (for joining tasks on shutdown)
+    #[cfg(feature = "use-netbridge-egress")]
+    netbridge_handles: RwLock<std::collections::HashMap<String, crate::netbridge::smoltcp::SmoltcpEgressHandle>>,
+
+    // ========================================================================
     // Shadowsocks Components
     // ========================================================================
     /// Shadowsocks inbound listener (wrapped in RwLock for dynamic updates)
@@ -339,6 +351,10 @@ impl IpcHandler {
             sharded_bridge: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             shard_supervisor: RwLock::new(None),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -405,6 +421,10 @@ impl IpcHandler {
             sharded_bridge: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             shard_supervisor: RwLock::new(None),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -470,6 +490,10 @@ impl IpcHandler {
             sharded_bridge: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             shard_supervisor: RwLock::new(None),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -538,6 +562,10 @@ impl IpcHandler {
             sharded_bridge: RwLock::new(None),
             #[cfg(feature = "sharded-vless-wg-bridge")]
             shard_supervisor: RwLock::new(None),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_adapters: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "use-netbridge-egress")]
+            netbridge_handles: RwLock::new(std::collections::HashMap::new()),
             #[cfg(feature = "shadowsocks")]
             ss_inbound: RwLock::new(None),
             #[cfg(feature = "shadowsocks")]
@@ -861,6 +889,120 @@ impl IpcHandler {
         &self,
     ) -> Option<Arc<crate::vless_wg_bridge::ShardedBridgeReplyRegistry>> {
         self.sharded_bridge_reply_registry.read().clone()
+    }
+
+    // ========================================================================
+    // Per-Tunnel Netbridge Adapter Management (feature: use-netbridge-egress)
+    // ========================================================================
+
+    /// Create and register a netbridge adapter for a WireGuard tunnel
+    ///
+    /// This creates a `NetbridgeVlessAdapter` for the specified tunnel, which wraps
+    /// the new `SmoltcpEgress` implementation with a ShardedVlessWgBridge-compatible API.
+    ///
+    /// # Arguments
+    ///
+    /// * `tunnel_tag` - The tag of the WireGuard tunnel
+    /// * `tunnel_local_ip` - Optional local IP for the tunnel interface
+    ///
+    /// # Returns
+    ///
+    /// The created adapter wrapped in Arc.
+    #[cfg(feature = "use-netbridge-egress")]
+    pub async fn create_netbridge_adapter_for_tunnel(
+        &self,
+        tunnel_tag: String,
+        tunnel_local_ip: Option<smoltcp::wire::IpAddress>,
+    ) -> Arc<crate::netbridge::NetbridgeVlessAdapter> {
+        use crate::netbridge::smoltcp::SmoltcpEgressConfig;
+        use crate::netbridge::NetbridgeVlessAdapter;
+
+        // Create SmoltcpEgress configuration with the tunnel's local IP
+        let config = if let Some(ip) = tunnel_local_ip {
+            SmoltcpEgressConfig::new(ip)
+        } else {
+            SmoltcpEgressConfig::default()
+        };
+
+        // Spawn the adapter (which creates SmoltcpEgress + shard task)
+        let (adapter, handle) = NetbridgeVlessAdapter::spawn(config);
+
+        info!(
+            "Created NetbridgeVlessAdapter for tunnel '{}' with {} shards",
+            tunnel_tag,
+            adapter.num_shards()
+        );
+
+        // Store the adapter and handle
+        {
+            let mut adapters = self.netbridge_adapters.write();
+            adapters.insert(tunnel_tag.clone(), Arc::clone(&adapter));
+        }
+        {
+            let mut handles = self.netbridge_handles.write();
+            handles.insert(tunnel_tag.clone(), handle);
+        }
+
+        debug!(
+            "Netbridge adapter created for tunnel '{}' (unified bridge path)",
+            tunnel_tag
+        );
+
+        adapter
+    }
+
+    /// Get a netbridge adapter for a specific WireGuard tunnel
+    ///
+    /// Returns `Some(Arc<NetbridgeVlessAdapter>)` if an adapter exists for the tunnel,
+    /// `None` otherwise.
+    #[cfg(feature = "use-netbridge-egress")]
+    pub fn get_netbridge_adapter_for_tunnel(
+        &self,
+        tunnel_tag: &str,
+    ) -> Option<Arc<crate::netbridge::NetbridgeVlessAdapter>> {
+        self.netbridge_adapters.read().get(tunnel_tag).cloned()
+    }
+
+    /// Remove a netbridge adapter for a WireGuard tunnel
+    ///
+    /// This should be called when a WireGuard tunnel is removed to clean up
+    /// the associated adapter and its resources.
+    #[cfg(feature = "use-netbridge-egress")]
+    pub async fn remove_netbridge_adapter_for_tunnel(&self, tunnel_tag: &str) {
+        // Remove the adapter
+        let adapter = {
+            let mut adapters = self.netbridge_adapters.write();
+            adapters.remove(tunnel_tag)
+        };
+
+        // Shutdown the adapter if it exists
+        if let Some(adapter) = adapter {
+            info!("Shutting down NetbridgeVlessAdapter for tunnel '{}'", tunnel_tag);
+            adapter.shutdown().await;
+        }
+
+        // Remove and await the handle
+        let handle = {
+            let mut handles = self.netbridge_handles.write();
+            handles.remove(tunnel_tag)
+        };
+
+        if let Some(handle) = handle {
+            // Best-effort await the task completion
+            let _ = handle.task.await;
+        }
+    }
+
+    /// Check if a netbridge adapter exists for a tunnel
+    #[cfg(feature = "use-netbridge-egress")]
+    pub fn has_netbridge_adapter_for_tunnel(&self, tunnel_tag: &str) -> bool {
+        self.netbridge_adapters.read().contains_key(tunnel_tag)
+    }
+
+    /// List all tunnel tags that have netbridge adapters
+    #[cfg(feature = "use-netbridge-egress")]
+    pub fn list_netbridge_adapter_tunnels(&self) -> Vec<String> {
+        self.netbridge_adapters.read().keys().cloned().collect()
     }
 
     /// Create a new IPC handler with a default (empty) rule engine
@@ -6934,6 +7076,12 @@ impl IpcHandler {
             self.sharded_bridges.read().clone(),
         ));
 
+        // Clone netbridge adapters map for per-tunnel adapter lookup (feature-gated)
+        #[cfg(feature = "use-netbridge-egress")]
+        let netbridge_adapters_map = Arc::new(parking_lot::RwLock::new(
+            self.netbridge_adapters.read().clone(),
+        ));
+
         // Store references for statistics updates
         let total_conn_stat = Arc::clone(&total_connections);
         let active_conn_stat = Arc::clone(&active_connections);
@@ -7004,6 +7152,8 @@ impl IpcHandler {
                 let active_conn = Arc::clone(&active_conn_stat);
                 #[cfg(feature = "sharded-vless-wg-bridge")]
                 let sharded_bridges = Arc::clone(&sharded_bridges_map);
+                #[cfg(feature = "use-netbridge-egress")]
+                let netbridge_adapters = Arc::clone(&netbridge_adapters_map);
 
                 // Spawn a task to handle this connection
                 tokio::spawn(async move {
@@ -7163,7 +7313,61 @@ impl IpcHandler {
                         // Handle the connection through the bridge (TCP or UDP)
                         let client_stream = conn.into_stream();
 
-                        // Try to use sharded bridge if available (feature-gated)
+                        // Priority 1: Try netbridge adapter (new unified implementation)
+                        #[cfg(feature = "use-netbridge-egress")]
+                        {
+                            let available_adapters: Vec<_> = netbridge_adapters.read().keys().cloned().collect();
+                            info!(
+                                "[VLESS-WG-LOOKUP] Looking for netbridge adapter '{}', available adapters: {:?}",
+                                actual_outbound_tag, available_adapters
+                            );
+                            let maybe_adapter = netbridge_adapters.read().get(&actual_outbound_tag).cloned();
+
+                            if let Some(adapter) = maybe_adapter {
+                                info!(
+                                    "[VLESS-WG-LOOKUP] Found netbridge adapter for '{}', using unified netbridge path",
+                                    actual_outbound_tag
+                                );
+                                // Use netbridge adapter (new implementation)
+                                if is_udp_conn {
+                                    match adapter.handle_udp_connection(client_stream, dest_addr).await {
+                                        Ok(stats) => {
+                                            info!(
+                                                "VLESS-WG UDP (netbridge) connection closed: {} via {}, {} dgrams sent, {} dgrams recv",
+                                                client_addr, actual_outbound_tag,
+                                                stats.datagrams_sent, stats.datagrams_received
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "VLESS-WG UDP (netbridge) error: {} via {}: {}",
+                                                client_addr, actual_outbound_tag, e
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    match adapter.handle_tcp_connection(client_stream, dest_addr).await {
+                                        Ok(stats) => {
+                                            info!(
+                                                "VLESS-WG TCP (netbridge) connection closed: {} -> {} via {}, {} bytes up, {} bytes down",
+                                                client_addr, destination, actual_outbound_tag,
+                                                stats.bytes_sent, stats.bytes_received
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "VLESS-WG TCP (netbridge) error: {} -> {} via {}: {}",
+                                                client_addr, destination, actual_outbound_tag, e
+                                            );
+                                        }
+                                    }
+                                }
+                                active_conn.fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+
+                        // Priority 2: Try sharded bridge if available (feature-gated)
                         #[cfg(feature = "sharded-vless-wg-bridge")]
                         {
                             // Look up sharded bridge for this tunnel
@@ -7867,6 +8071,12 @@ impl IpcHandler {
             self.sharded_bridges.read().clone(),
         ));
 
+        // Clone netbridge adapters map for per-tunnel adapter lookup (feature-gated)
+        #[cfg(feature = "use-netbridge-egress")]
+        let netbridge_adapters_map = Arc::new(parking_lot::RwLock::new(
+            self.netbridge_adapters.read().clone(),
+        ));
+
         // Start the accept loop in a background task with full routing support
         let accept_task = tokio::spawn(async move {
             info!("Shadowsocks inbound accept loop started");
@@ -7891,6 +8101,8 @@ impl IpcHandler {
                         let reply_registry = vless_reply_registry.clone();
                         #[cfg(feature = "sharded-vless-wg-bridge")]
                         let sharded_bridges = Arc::clone(&sharded_bridges_map);
+                        #[cfg(feature = "use-netbridge-egress")]
+                        let netbridge_adapters = Arc::clone(&netbridge_adapters_map);
 
                         // Spawn a task to handle this connection
                         tokio::spawn(async move {
@@ -8040,7 +8252,42 @@ impl IpcHandler {
 
                                 let client_stream = conn.into_stream();
 
-                                // Try to use sharded bridge if available (feature-gated)
+                                // Priority 1: Try netbridge adapter (new unified implementation)
+                                #[cfg(feature = "use-netbridge-egress")]
+                                {
+                                    let available_adapters: Vec<_> = netbridge_adapters.read().keys().cloned().collect();
+                                    info!(
+                                        "[SS-WG-LOOKUP] Looking for netbridge adapter '{}', available adapters: {:?}",
+                                        actual_outbound_tag, available_adapters
+                                    );
+                                    let maybe_adapter = netbridge_adapters.read().get(&actual_outbound_tag).cloned();
+
+                                    if let Some(adapter) = maybe_adapter {
+                                        info!(
+                                            "[SS-WG-LOOKUP] Found netbridge adapter for '{}', using unified netbridge path",
+                                            actual_outbound_tag
+                                        );
+                                        // Use netbridge adapter (new implementation) - TCP only for Shadowsocks
+                                        match adapter.handle_tcp_connection(client_stream, dest_addr).await {
+                                            Ok(stats) => {
+                                                info!(
+                                                    "Shadowsocks-WG (netbridge) connection closed: {} -> {} via {}, {} bytes up, {} bytes down",
+                                                    client_addr, destination, actual_outbound_tag,
+                                                    stats.bytes_sent, stats.bytes_received
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Shadowsocks-WG (netbridge) error: {} -> {} via {}: {}",
+                                                    client_addr, destination, actual_outbound_tag, e
+                                                );
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // Priority 2: Try sharded bridge if available (feature-gated)
                                 #[cfg(feature = "sharded-vless-wg-bridge")]
                                 {
                                     // Look up sharded bridge for this tunnel

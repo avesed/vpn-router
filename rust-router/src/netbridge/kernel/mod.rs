@@ -80,7 +80,7 @@ pub use tproxy::{TproxyConnectionWrapper, TproxyListenerConfig, TproxyListenerSt
 pub use iptables::{IptablesConfig, IptablesManagerWrapper, IptablesState};
 
 // KernelIngress implementation
-pub use ingress::{KernelIngress, KernelIngressConfig};
+pub use ingress::{KernelIngress, KernelIngressConfig, KernelIngressStats, KernelIngressStatsSnapshot};
 
 // KernelEgress placeholder
 pub use egress::{KernelEgress, KernelEgressConfig};

@@ -65,7 +65,7 @@ use smoltcp::iface::SocketHandle;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::smoltcp_utils::ConnId;
+use crate::netbridge::ConnId;
 
 use super::events::TcpReply;
 

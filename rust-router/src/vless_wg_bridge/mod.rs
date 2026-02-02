@@ -90,20 +90,23 @@ pub mod tcp_session;
 pub mod udp_frame;
 pub mod udp_session;
 
-// Re-export from smoltcp_utils for API compatibility
-pub use crate::smoltcp_utils::{
+// Re-export from netbridge for API compatibility
+pub use crate::netbridge::{
     // Error types
-    BridgeError,
+    NetBridgeError as BridgeError,
+    Result,
     // Port allocator
     PortAllocator,
     PortAllocatorConfig,
     PortGuard,
-    Result,
     // Socket guards
     TcpSocketGuard,
     UdpSocketGuard,
+    // Connection ID types
+    ConnId,
+    ConnIdAllocator,
     // Config constants
-    MAX_SESSIONS_PER_CLIENT,
+    MAX_SESSIONS_PER_PEER as MAX_SESSIONS_PER_CLIENT,
     MAX_SOCKETS,
     MAX_TOTAL_SESSIONS,
     PORT_RANGE_END,
@@ -115,11 +118,10 @@ pub use crate::smoltcp_utils::{
     TCP_TX_BUFFER,
     UDP_DEFAULT_TIMEOUT_SECS,
     UDP_DNS_TIMEOUT_SECS,
-    UDP_PACKET_META,
     UDP_RX_BUFFER,
     UDP_TX_BUFFER,
     WG_MTU,
-    WG_REPLY_CHANNEL_SIZE,
+    REPLY_CHANNEL_SIZE as WG_REPLY_CHANNEL_SIZE,
 };
 
 // VLESS-specific session types

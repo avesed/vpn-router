@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rand::Rng;
 use smoltcp::wire::IpAddress;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
@@ -1531,6 +1531,7 @@ impl Unpin for ChannelStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_loopback_config_default() {

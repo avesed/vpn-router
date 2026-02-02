@@ -130,8 +130,10 @@ pub mod port;
 pub mod reply;
 pub mod session;
 pub mod smoltcp;
+pub mod socket_guard;
 pub mod traits;
 pub mod types;
+pub mod vless_adapter;
 
 // Re-export commonly used types at the module level
 pub use config::{
@@ -190,12 +192,21 @@ pub use traits::{
 };
 
 pub use types::{
-    EgressStats, FiveTuple, IngressStats, IpPacket, IpProtocol, ReplyPacket, SessionId,
-    SessionIdGenerator,
+    ConnId, ConnIdAllocator, EgressStats, FiveTuple, IngressStats, IpPacket, IpProtocol,
+    ReplyPacket, SessionId, SessionIdGenerator,
 };
 
-// Backend placeholders
-pub use kernel::KernelIngress;
+// Socket guard types (migrated from smoltcp_utils)
+pub use socket_guard::{
+    init_cleanup_channel, run_cleanup_task, SocketCleanupReceiver, TcpSocketGuard, UdpSocketGuard,
+};
+
+// Kernel backend (TUN + TPROXY)
+pub use kernel::{
+    KernelIngress, KernelIngressConfig, KernelIngressStats, KernelIngressStatsSnapshot,
+};
+
+// Smoltcp backend (userspace TCP/IP)
 pub use smoltcp::{SmoltcpEgress, SmoltcpShard};
 
 // Benchmark utilities
@@ -205,6 +216,12 @@ pub use bench::{BenchConfig, BenchResults, TrafficPattern};
 pub use dataplane::{
     ConnectionHandler, ConnectionInfo, DataPlane, DataPlaneBuilder, DataPlaneConfig,
     DirectHandler, OutboundStream, RejectHandler, RoutingDecision, UdpHandle, UdpHandleRemote,
+};
+
+// VLESS adapter for ShardedVlessWgBridge API compatibility
+pub use vless_adapter::{
+    NetbridgeVlessAdapter, TcpConnectionStats, UdpConnectionStats,
+    AggregatedStats as VlessAdapterStats,
 };
 
 #[cfg(test)]

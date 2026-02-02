@@ -17,7 +17,7 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::reality::common::{
-    REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE, REALITY_DEFAULT_MAX_TIME_DIFF_MS, REALITY_NONCE_SIZE,
+    REALITY_AUTH_INFO, REALITY_AUTH_KEY_SIZE, REALITY_NONCE_SIZE,
     REALITY_SALT_SIZE, REALITY_SESSION_ID_PLAINTEXT_SIZE, REALITY_SESSION_ID_SIZE,
     REALITY_SHORT_ID_SIZE,
 };
@@ -374,6 +374,7 @@ pub fn current_timestamp() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reality::common::REALITY_DEFAULT_MAX_TIME_DIFF_MS;
     use crate::reality::crypto::{generate_keypair, random_bytes};
 
     #[test]

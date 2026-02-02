@@ -28,7 +28,7 @@ use tracing::{debug, info, trace, warn};
 
 #[cfg(feature = "fakedns")]
 use crate::fakedns::FakeDnsManager;
-use crate::outbound::{Outbound, OutboundManager};
+use crate::outbound::OutboundManager;
 use crate::rules::engine::{ConnectionInfo, RuleEngine};
 use crate::sniff::sniff_tls_sni;
 use crate::tproxy::{TproxyConnection, TproxyListener, TproxyListenerBuilder};

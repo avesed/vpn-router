@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tracing::{debug, trace};
 use uuid::Uuid;
@@ -716,6 +716,7 @@ impl fmt::Debug for VlessOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     // ========================================================================
     // Configuration Tests

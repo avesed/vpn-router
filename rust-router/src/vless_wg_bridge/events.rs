@@ -68,7 +68,7 @@ use std::net::{IpAddr, SocketAddr};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::smoltcp_utils::BridgeError;
+use crate::netbridge::NetBridgeError as BridgeError;
 
 // =============================================================================
 // Constants

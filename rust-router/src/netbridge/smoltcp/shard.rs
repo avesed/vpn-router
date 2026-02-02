@@ -49,7 +49,6 @@ use bytes::Bytes;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::State as TcpState;
 use smoltcp::wire::{IpAddress, IpEndpoint};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, trace, warn};
 
@@ -500,7 +499,15 @@ impl SmoltcpShard {
 
         // Allocate port
         let local_port = self.port_allocator.allocate()
-            .ok_or(NetBridgeError::PortExhausted)?
+            .ok_or_else(|| {
+                warn!(
+                    target: "netbridge::shard",
+                    shard_index = self.config.shard_index,
+                    ?remote,
+                    "TCP port allocation failed: port range exhausted"
+                );
+                NetBridgeError::PortExhausted
+            })?
             .take();
 
         // Create socket

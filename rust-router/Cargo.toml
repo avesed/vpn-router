@@ -199,6 +199,9 @@ quic-sni = ["rustls"]
 domain-routing = ["sni-sniffing", "fakedns", "quic-sni"]
 # Sharded VLESS-WG bridge for high-throughput parallel processing
 sharded-vless-wg-bridge = []
+# Use netbridge egress instead of vless_wg_bridge (new unified implementation)
+# When enabled, tries netbridge::SmoltcpEgress first, falls back to sharded-vless-wg-bridge
+use-netbridge-egress = []
 
 [dev-dependencies]
 tempfile = "3"
