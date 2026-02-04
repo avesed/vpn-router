@@ -13,9 +13,9 @@
 //!         ▼ try_route(tunnel_tag, packet)
 //! ShardedBridgeReplyRegistry
 //!         │
-//!         ├── tunnel-1 -> mpsc::Sender<Bytes>
-//!         ├── tunnel-2 -> mpsc::Sender<Bytes>
-//!         └── tunnel-N -> mpsc::Sender<Bytes>
+//!         ├── tunnel-1 -> mpsc::Sender<Vec<u8>>
+//!         ├── tunnel-2 -> mpsc::Sender<Vec<u8>>
+//!         └── tunnel-N -> mpsc::Sender<Vec<u8>>
 //!                 │
 //!                 ▼
 //!         ShardedVlessWgBridge.wg_reply_rx
@@ -23,7 +23,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -39,7 +38,7 @@ use tracing::{debug, trace, warn};
 /// Uses `DashMap` for lock-free concurrent access from multiple tasks.
 pub struct ShardedBridgeReplyRegistry {
     /// Tunnel tag -> reply sender
-    senders: DashMap<String, mpsc::Sender<Bytes>>,
+    senders: DashMap<String, mpsc::Sender<Vec<u8>>>,
     /// Statistics
     stats: RegistryStats,
 }
@@ -98,8 +97,8 @@ impl ShardedBridgeReplyRegistry {
     pub fn register(
         &self,
         tunnel_tag: String,
-        sender: mpsc::Sender<Bytes>,
-    ) -> Option<mpsc::Sender<Bytes>> {
+        sender: mpsc::Sender<Vec<u8>>,
+    ) -> Option<mpsc::Sender<Vec<u8>>> {
         self.stats.registered.fetch_add(1, Ordering::Relaxed);
         debug!(tunnel_tag = %tunnel_tag, "Registered sharded bridge reply channel");
         self.senders.insert(tunnel_tag, sender)
@@ -114,7 +113,7 @@ impl ShardedBridgeReplyRegistry {
     /// # Returns
     ///
     /// The removed sender if it existed
-    pub fn unregister(&self, tunnel_tag: &str) -> Option<mpsc::Sender<Bytes>> {
+    pub fn unregister(&self, tunnel_tag: &str) -> Option<mpsc::Sender<Vec<u8>>> {
         let removed = self.senders.remove(tunnel_tag).map(|(_, sender)| sender);
         if removed.is_some() {
             self.stats.unregistered.fetch_add(1, Ordering::Relaxed);
@@ -140,8 +139,8 @@ impl ShardedBridgeReplyRegistry {
     /// handled by other mechanisms)
     pub fn try_route(&self, tunnel_tag: &str, packet: &[u8]) -> bool {
         if let Some(sender) = self.senders.get(tunnel_tag) {
-            let bytes = Bytes::copy_from_slice(packet);
-            match sender.try_send(bytes) {
+            let packet_vec = packet.to_vec();
+            match sender.try_send(packet_vec) {
                 Ok(()) => {
                     self.stats.packets_routed.fetch_add(1, Ordering::Relaxed);
                     trace!(
@@ -268,7 +267,7 @@ mod tests {
         assert!(registry.try_route("test-tunnel", &packet));
 
         let received = rx.recv().await.unwrap();
-        assert_eq!(received.as_ref(), &packet[..]);
+        assert_eq!(&received[..], &packet[..]);
 
         let stats = registry.stats();
         assert_eq!(stats.packets_routed, 1);

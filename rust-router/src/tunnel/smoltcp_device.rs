@@ -275,11 +275,10 @@ pub struct WgRxToken {
 impl RxToken for WgRxToken {
     fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        let mut packet = self.packet;
-        trace!("RxToken consume: {} bytes", packet.len());
-        f(&mut packet)
+        trace!("RxToken consume: {} bytes", self.packet.len());
+        f(&self.packet)
     }
 }
 

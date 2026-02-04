@@ -498,7 +498,7 @@ impl VlessWgBridge {
 
         // Connect the socket (IPv4 only - smoltcp is not compiled with IPv6 support)
         let smoltcp_dest = match dest_ip {
-            IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&v4.octets())),
+            IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(v4.octets())),
             IpAddr::V6(_) => {
                 // Socket guard will clean up automatically on early return
                 return Err(BridgeError::SmoltcpTcp("IPv6 not supported".into()));
@@ -1252,7 +1252,7 @@ impl VlessWgBridge {
                             let smoltcp_dest = match dest_ip {
                                 IpAddr::V4(v4) => smoltcp::wire::IpEndpoint {
                                     addr: smoltcp::wire::IpAddress::Ipv4(
-                                        smoltcp::wire::Ipv4Address::from_bytes(&v4.octets()),
+                                        smoltcp::wire::Ipv4Address::from(v4.octets()),
                                     ),
                                     port: dest_port,
                                 },
@@ -1632,8 +1632,8 @@ impl VlessWgBridge {
         // Send through smoltcp UDP socket
         let smoltcp_dest = match dest_ip {
             IpAddr::V4(v4) => smoltcp::wire::IpEndpoint {
-                addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(
-                    &v4.octets(),
+                addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(
+                    v4.octets(),
                 )),
                 port: dest_port,
             },
@@ -1790,7 +1790,7 @@ impl VlessWgBridge {
                     if !data.is_empty() {
                         let source_ip = match endpoint.addr {
                             smoltcp::wire::IpAddress::Ipv4(v4) => {
-                                IpAddr::V4(std::net::Ipv4Addr::from(v4.0))
+                                IpAddr::V4(v4)
                             }
                         };
 

@@ -41,15 +41,16 @@
 //! `SmoltcpShard` is `Send` but NOT `Sync`. It should be moved into a single
 //! async task via `tokio::spawn(shard.run())`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::State as TcpState;
 use smoltcp::wire::{IpAddress, IpEndpoint};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tracing::{debug, info, trace, warn};
 
 use super::bridge::{socket_addr_to_endpoint, SmoltcpBridge, SmoltcpBridgeConfig};
@@ -197,6 +198,12 @@ pub struct SmoltcpShardStats {
     pub cleanup_runs: u64,
     /// Sessions cleaned up
     pub sessions_cleaned: u64,
+    /// Upload notify wakeups
+    pub upload_notify_wakeups: u64,
+    /// Times the per-session drain limit was hit (potential throughput bottleneck)
+    pub drain_limit_hits: u64,
+    /// Times the 2nd poll in poll_and_process produced new TX packets
+    pub second_poll_productive: u64,
 }
 
 // =============================================================================
@@ -223,6 +230,14 @@ struct TcpSession {
     bytes_received: u64,
     /// Pending data to send (buffered when socket can't send)
     pending_send: Vec<u8>,
+    /// Pending data to receive (buffered when data_tx channel is full)
+    /// This prevents data loss: smoltcp has already ACK'd this data,
+    /// so we MUST deliver it to the client eventually.
+    pending_recv: Option<Bytes>,
+    /// Per-session upload data receiver.
+    /// Data arrives from the pump task's read_half via per-session channel,
+    /// bypassing the shared command_tx to eliminate contention.
+    data_rx: mpsc::Receiver<Bytes>,
 }
 
 // =============================================================================
@@ -286,13 +301,20 @@ pub struct SmoltcpShard {
     /// Command receiver
     command_rx: mpsc::Receiver<ShardCommand>,
     /// WG reply packet receiver
-    wg_reply_rx: mpsc::Receiver<Bytes>,
+    wg_reply_rx: mpsc::Receiver<Vec<u8>>,
     /// WG TX packet sender
     wg_tx: mpsc::Sender<Bytes>,
+    /// Upload data notification -- signaled by pump tasks when new data arrives
+    upload_notify: Arc<Notify>,
     /// Shutdown flag
     shutdown: bool,
     /// Statistics
     stats: SmoltcpShardStats,
+    /// Pending WG TX packets that couldn't be sent (channel full)
+    /// Used by non-blocking drain to buffer unsent packets.
+    pending_wg_tx: VecDeque<Bytes>,
+    /// Reusable buffer for TCP recv to avoid per-session allocation
+    tcp_recv_buf: Vec<u8>,
 }
 
 impl SmoltcpShard {
@@ -304,12 +326,14 @@ impl SmoltcpShard {
     /// * `command_rx` - Channel for receiving commands
     /// * `wg_reply_rx` - Channel for receiving WG reply packets
     /// * `wg_tx` - Channel for sending WG packets
+    /// * `upload_notify` - Notify handle signaled by pump tasks when upload data arrives
     #[must_use]
     pub fn new(
         config: SmoltcpShardConfig,
         command_rx: mpsc::Receiver<ShardCommand>,
-        wg_reply_rx: mpsc::Receiver<Bytes>,
+        wg_reply_rx: mpsc::Receiver<Vec<u8>>,
         wg_tx: mpsc::Sender<Bytes>,
+        upload_notify: Arc<Notify>,
     ) -> Self {
         // Create bridge with the local IP
         let bridge_config = SmoltcpBridgeConfig::new(config.local_ip).with_mtu(config.mtu);
@@ -341,8 +365,11 @@ impl SmoltcpShard {
             command_rx,
             wg_reply_rx,
             wg_tx,
+            upload_notify,
             shutdown: false,
             stats: SmoltcpShardStats::default(),
+            pending_wg_tx: VecDeque::new(),
+            tcp_recv_buf: vec![0u8; 65536],
         }
     }
 
@@ -380,27 +407,61 @@ impl SmoltcpShard {
             tokio::select! {
                 biased;
 
-                // Highest priority: WG reply packets
+                // WG reply packets trigger processing
                 Some(packet) = self.wg_reply_rx.recv() => {
                     self.handle_wg_reply(packet);
+                    // Batch drain all queued reply packets with interleaved polling
+                    self.handle_wg_reply_batch();
+                    // ALSO drain commands to prevent priority inversion
+                    // (control commands like TcpConnect/TcpClose need timely processing)
+                    while let Ok(cmd) = self.command_rx.try_recv() {
+                        self.handle_command(cmd).await;
+                    }
                     self.poll_and_process();
-                    self.drain_wg_packets().await;
+                    self.drain_wg_packets();
                 }
 
-                // Medium priority: Commands
+                // Commands trigger processing (TcpConnect, TcpClose, UdpSend, etc.)
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
+                    // Batch drain all queued commands
+                    while let Ok(cmd) = self.command_rx.try_recv() {
+                        self.handle_command(cmd).await;
+                    }
+                    // ALSO drain WG replies to prevent starvation in other direction
+                    self.handle_wg_reply_batch();
                     self.poll_and_process();
-                    self.drain_wg_packets().await;
+                    self.drain_wg_packets();
                 }
 
-                // Low priority: Timer-based polling
+                // Upload data notification (from pump tasks)
+                // Priority: lower than WG replies and commands, higher than timer
+                _ = self.upload_notify.notified() => {
+                    self.stats.upload_notify_wakeups += 1;
+                    // CRITICAL: Must cross-drain all channels to prevent starvation
+                    // Under heavy upload, this branch fires continuously. Without
+                    // cross-drain, WG replies (ACKs) and commands (TcpClose) would
+                    // be starved, causing download stalls and session leaks.
+                    self.handle_wg_reply_batch();
+                    while let Ok(cmd) = self.command_rx.try_recv() {
+                        self.handle_command(cmd).await;
+                    }
+                    self.poll_and_process();
+                    self.drain_wg_packets();
+                }
+
+                // Timer-based polling (process both channels)
                 _ = tokio::time::sleep(poll_delay) => {
+                    // Drain both channels even on timer tick
+                    self.handle_wg_reply_batch();
+                    while let Ok(cmd) = self.command_rx.try_recv() {
+                        self.handle_command(cmd).await;
+                    }
                     self.poll_and_process();
-                    self.drain_wg_packets().await;
+                    self.drain_wg_packets();
                 }
 
-                // Lowest priority: Periodic cleanup
+                // Periodic cleanup
                 _ = cleanup_timer.tick() => {
                     self.cleanup_expired_sessions();
                 }
@@ -427,14 +488,26 @@ impl SmoltcpShard {
 
     /// Poll smoltcp and process socket events
     fn poll_and_process(&mut self) {
+        // 1st poll: process RX (incoming ACKs/data), generate TX (ACKs, retransmits)
         self.bridge.poll();
         self.stats.poll_count += 1;
+        // Flush TX from 1st poll to free device buffer space
+        // Critical: smoltcp's socket_ingress consumes TX slots for ACKs,
+        // which can fill the entire TX buffer and starve data segments
+        self.drain_wg_packets();
+        // Drain per-session upload data into smoltcp socket TX buffers
         self.process_tcp_sockets();
         self.process_udp_sockets();
+        // 2nd poll: convert newly injected upload data into IP packets
+        // Without this, data waits until the next event loop iteration (5-50ms)
+        let second_poll_did_work = self.bridge.poll();
+        if second_poll_did_work {
+            self.stats.second_poll_productive += 1;
+        }
     }
 
     /// Handle a WG reply packet
-    fn handle_wg_reply(&mut self, packet: Bytes) {
+    fn handle_wg_reply(&mut self, packet: Vec<u8>) {
         trace!(
             shard_index = self.config.shard_index,
             len = packet.len(),
@@ -443,11 +516,54 @@ impl SmoltcpShard {
 
         self.stats.wg_packets_received += 1;
 
-        // Feed packet to the bridge
-        if !self.bridge.feed_rx(packet.to_vec()) {
+        // Feed packet to the bridge (zero-copy: Vec<u8> passed directly)
+        if !self.bridge.feed_rx(packet) {
             warn!(
                 shard_index = self.config.shard_index,
                 "Bridge RX buffer full, dropping packet"
+            );
+        }
+    }
+
+    /// Batch drain WG reply packets with interleaved polling.
+    ///
+    /// Polls smoltcp every BATCH_POLL_THRESHOLD packets to prevent
+    /// VirtualDevice RX buffer overflow. Without this, a burst of 2048
+    /// packets from wg_reply_rx would overflow the 512/1024-entry RX buffer,
+    /// silently dropping ACKs and causing retransmission storms.
+    ///
+    /// Tracks RX drops during the batch and logs a single summary at the end
+    /// instead of per-packet warnings to avoid log storms under burst.
+    fn handle_wg_reply_batch(&mut self) {
+        const BATCH_POLL_THRESHOLD: usize = 64;
+        let mut count = 0;
+        let mut drops = 0;
+        while let Ok(packet) = self.wg_reply_rx.try_recv() {
+            self.stats.wg_packets_received += 1;
+            if !self.bridge.feed_rx(packet) {
+                drops += 1;
+            }
+            count += 1;
+            if count % BATCH_POLL_THRESHOLD == 0 {
+                // Intermediate poll: process accumulated RX packets (generates ACKs)
+                self.bridge.poll();
+                // Drain ACKs to free TX buffer space for next batch
+                self.drain_wg_packets();
+            }
+        }
+        if drops > 0 {
+            warn!(
+                shard_index = self.config.shard_index,
+                batch_size = count,
+                drops,
+                "WG reply batch RX drops (buffer overflow)"
+            );
+        }
+        if count > 0 {
+            trace!(
+                shard_index = self.config.shard_index,
+                batch_size = count,
+                "WG reply batch drained"
             );
         }
     }
@@ -490,7 +606,7 @@ impl SmoltcpShard {
         &mut self,
         dest: SocketAddr,
         data_tx: mpsc::Sender<Bytes>,
-        _data_rx: mpsc::Receiver<Bytes>,  // Will be used in async pump
+        data_rx: mpsc::Receiver<Bytes>,
     ) -> Result<u64> {
         // Convert destination
         let remote = socket_addr_to_endpoint(dest).ok_or_else(|| {
@@ -532,6 +648,8 @@ impl SmoltcpShard {
             bytes_sent: 0,
             bytes_received: 0,
             pending_send: Vec::new(),
+            pending_recv: None,
+            data_rx,
         };
 
         self.tcp_sessions.insert(session_id, session);
@@ -582,7 +700,40 @@ impl SmoltcpShard {
 
     /// Handle TCP close command
     fn handle_tcp_close(&mut self, session_id: u64) {
-        if let Some(session) = self.tcp_sessions.remove(&session_id) {
+        if let Some(mut session) = self.tcp_sessions.remove(&session_id) {
+            // Drain any remaining upload data before closing
+            let mut close_drained: u64 = 0;
+            while let Ok(data) = session.data_rx.try_recv() {
+                if self.bridge.tcp_can_send(session.handle) && session.pending_send.is_empty() {
+                    match self.bridge.tcp_send(session.handle, &data) {
+                        Ok(sent) => {
+                            close_drained += sent as u64;
+                            session.bytes_sent += sent as u64;
+                            self.stats.tcp_bytes_sent += sent as u64;
+                            if sent < data.len() {
+                                debug!(
+                                    session_id,
+                                    dropped = data.len() - sent,
+                                    "TCP close: partial send, dropping remaining bytes"
+                                );
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if close_drained > 0 {
+                debug!(
+                    session_id,
+                    close_drained,
+                    "TCP close: flushed remaining upload data"
+                );
+            }
+
             self.tcp_by_handle.remove(&session.handle);
             self.bridge.tcp_close(session.handle);
             self.bridge.remove_socket(session.handle);
@@ -703,6 +854,10 @@ impl SmoltcpShard {
         // Collect session IDs to avoid borrow issues
         let session_ids: Vec<u64> = self.tcp_sessions.keys().copied().collect();
 
+        // Take the reusable recv buffer out of self to avoid borrow conflicts.
+        // mem::take replaces it with an empty Vec (zero-cost, no allocation).
+        let mut recv_buf = std::mem::take(&mut self.tcp_recv_buf);
+
         for session_id in session_ids {
             let Some(session) = self.tcp_sessions.get_mut(&session_id) else {
                 continue;
@@ -728,20 +883,91 @@ impl SmoltcpShard {
                 }
             }
 
-            // Check for received data
+            // ── Per-session upload data drain ──
+            // Drain upload data from per-session channel when buffer is available.
+            // Only drain when pending_send is empty to maintain backpressure.
+            if session.pending_send.is_empty() {
+                const MAX_DRAIN_PER_SESSION: usize = 16;
+                let mut drained = 0;
+                while drained < MAX_DRAIN_PER_SESSION {
+                    match session.data_rx.try_recv() {
+                        Ok(data) => {
+                            session.last_active = Instant::now();
+                            if self.bridge.tcp_can_send(handle) {
+                                match self.bridge.tcp_send(handle, &data) {
+                                    Ok(sent) => {
+                                        session.bytes_sent += sent as u64;
+                                        self.stats.tcp_bytes_sent += sent as u64;
+                                        if sent < data.len() {
+                                            session.pending_send.extend_from_slice(&data[sent..]);
+                                            break; // Buffer full, stop draining
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(session_id, ?e, "TCP send error from data_rx");
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Socket can't send - buffer and stop draining
+                                session.pending_send.extend_from_slice(&data);
+                                break;
+                            }
+                            drained += 1;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            trace!(session_id, "Per-session data_rx disconnected (pump task exited)");
+                            break;
+                        }
+                    }
+                }
+                if drained >= MAX_DRAIN_PER_SESSION {
+                    self.stats.drain_limit_hits += 1;
+                }
+            }
+
+            // First, try to flush any pending_recv from previous iteration
+            if let Some(pending) = session.pending_recv.take() {
+                match session.data_tx.try_send(pending) {
+                    Ok(()) => {} // Successfully flushed
+                    Err(mpsc::error::TrySendError::Full(data)) => {
+                        // Still can't send - put it back and skip reading more
+                        session.pending_recv = Some(data);
+                        // Don't read from smoltcp - backpressure will stop remote sender
+                        continue;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Channel closed - session is dead
+                        continue;
+                    }
+                }
+            }
+
+            // Check for received data (only if no pending_recv - backpressure)
+            // PERF: Reuse recv_buf instead of allocating vec![0u8; 65536] per session per poll
             if self.bridge.tcp_can_recv(handle) {
-                let mut buf = vec![0u8; 65536];
-                match self.bridge.tcp_recv(handle, &mut buf) {
+                match self.bridge.tcp_recv(handle, &mut recv_buf) {
                     Ok(len) if len > 0 => {
-                        buf.truncate(len);
                         session.bytes_received += len as u64;
                         self.stats.tcp_bytes_received += len as u64;
                         session.last_active = Instant::now();
 
-                        // Send to client task
-                        let data = Bytes::from(buf);
-                        if session.data_tx.try_send(data).is_err() {
-                            warn!(session_id, "TCP data channel full or closed");
+                        // Send to client task (with backpressure)
+                        // Allocates only `len` bytes (not 65536)
+                        let data = Bytes::copy_from_slice(&recv_buf[..len]);
+                        match session.data_tx.try_send(data) {
+                            Ok(()) => {} // Sent successfully
+                            Err(mpsc::error::TrySendError::Full(data)) => {
+                                // Channel full - buffer for next iteration
+                                // Data is safe: smoltcp already ACK'd it, we MUST deliver it
+                                trace!(session_id, len = data.len(), "TCP download channel full, buffering in pending_recv");
+                                session.pending_recv = Some(data);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // Client disconnected
+                                trace!(session_id, "TCP data channel closed");
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -757,6 +983,9 @@ impl SmoltcpShard {
                 // Session will be cleaned up by cleanup_expired_sessions
             }
         }
+
+        // Put the buffer back for reuse on the next poll cycle
+        self.tcp_recv_buf = recv_buf;
     }
 
     /// Process UDP socket events
@@ -792,18 +1021,80 @@ impl SmoltcpShard {
         }
     }
 
-    /// Drain TX packets and send through WG channel
-    async fn drain_wg_packets(&mut self) {
-        let packets = self.bridge.drain_tx();
-        for packet in packets {
+    /// Maximum pending WG TX packets before dropping (prevents unbounded growth)
+    const MAX_PENDING_WG_TX: usize = 4096;
+
+    /// Drain TX packets and send through WG channel (NON-BLOCKING)
+    ///
+    /// CRITICAL: This method must NEVER block/await. If the wg_tx channel is full,
+    /// unsent packets are buffered in `pending_wg_tx` and retried on the next
+    /// event loop iteration.
+    ///
+    /// CRITICAL: VirtualDevice TX MUST always be drained. If the device TX buffer
+    /// fills up, smoltcp cannot generate ANY packets — not data segments, not ACKs,
+    /// not retransmissions. This would stall both upload and download directions.
+    /// The `pending_wg_tx` buffer exists precisely to decouple smoltcp's output
+    /// rate from the WG TX channel's drain rate.
+    fn drain_wg_packets(&mut self) {
+        // First, try to flush pending TX from previous iterations (FIFO order)
+        while let Some(bytes) = self.pending_wg_tx.front().cloned() {
+            match self.wg_tx.try_send(bytes) {
+                Ok(()) => {
+                    self.pending_wg_tx.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    break; // Channel full, but MUST still drain device TX below
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(shard_index = self.config.shard_index, "WG TX channel closed, initiating shutdown");
+                    self.shutdown = true;
+                    return;
+                }
+            }
+        }
+
+        // ALWAYS drain smoltcp device TX — this is critical for preventing
+        // VirtualDevice TX buffer overflow which would block smoltcp entirely.
+        // When pending_wg_tx has items, append to it (maintain FIFO order).
+        // When pending_wg_tx is empty, try wg_tx directly for zero-copy fast path.
+        let has_pending = !self.pending_wg_tx.is_empty();
+        for packet in self.bridge.drain_tx() {
             self.stats.wg_packets_sent += 1;
-            if self.wg_tx.send(Bytes::from(packet)).await.is_err() {
-                warn!(
-                    shard_index = self.config.shard_index,
-                    "WG TX channel closed"
-                );
-                self.shutdown = true;
-                break;
+            let bytes = Bytes::from(packet);
+
+            if has_pending {
+                // Pending queue is non-empty: append to maintain FIFO ordering.
+                // Sending directly to wg_tx would reorder packets (new before old).
+                if self.pending_wg_tx.len() < Self::MAX_PENDING_WG_TX {
+                    self.pending_wg_tx.push_back(bytes);
+                } else {
+                    warn!(
+                        shard_index = self.config.shard_index,
+                        pending = self.pending_wg_tx.len(),
+                        "Pending WG TX overflow, dropping packet"
+                    );
+                }
+            } else {
+                // Fast path: no pending items, try direct send
+                match self.wg_tx.try_send(bytes) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(bytes)) => {
+                        if self.pending_wg_tx.len() < Self::MAX_PENDING_WG_TX {
+                            self.pending_wg_tx.push_back(bytes);
+                        } else {
+                            warn!(
+                                shard_index = self.config.shard_index,
+                                pending = self.pending_wg_tx.len(),
+                                "Pending WG TX overflow, dropping packet"
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(shard_index = self.config.shard_index, "WG TX channel closed, initiating shutdown");
+                        self.shutdown = true;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -812,6 +1103,7 @@ impl SmoltcpShard {
     fn cleanup_expired_sessions(&mut self) {
         self.stats.cleanup_runs += 1;
         let now = Instant::now();
+        let mut cleaned_this_run: u64 = 0;
 
         // Cleanup TCP sessions
         let tcp_to_remove: Vec<u64> = self.tcp_sessions.iter()
@@ -827,6 +1119,7 @@ impl SmoltcpShard {
         for id in tcp_to_remove {
             self.handle_tcp_close(id);
             self.stats.sessions_cleaned += 1;
+            cleaned_this_run += 1;
         }
 
         // Cleanup UDP sessions
@@ -840,17 +1133,30 @@ impl SmoltcpShard {
         for id in udp_to_remove {
             self.handle_udp_close(id);
             self.stats.sessions_cleaned += 1;
+            cleaned_this_run += 1;
         }
 
-        if self.stats.sessions_cleaned > 0 {
+        if cleaned_this_run > 0 {
             trace!(
                 shard_index = self.config.shard_index,
-                cleaned = self.stats.sessions_cleaned,
+                cleaned = cleaned_this_run,
                 tcp_sessions = self.tcp_sessions.len(),
                 udp_sessions = self.udp_sessions.len(),
                 "Cleanup completed"
             );
         }
+
+        debug!(
+            shard_index = self.config.shard_index,
+            tcp_sessions = self.tcp_sessions.len(),
+            udp_sessions = self.udp_sessions.len(),
+            pending_wg_tx = self.pending_wg_tx.len(),
+            poll_count = self.stats.poll_count,
+            upload_notify_wakeups = self.stats.upload_notify_wakeups,
+            drain_limit_hits = self.stats.drain_limit_hits,
+            second_poll_productive = self.stats.second_poll_productive,
+            "Shard health summary"
+        );
     }
 
     /// Get current statistics
@@ -905,7 +1211,7 @@ mod tests {
         let (_wg_reply_tx, wg_reply_rx) = mpsc::channel(128);
         let (wg_tx, _wg_rx) = mpsc::channel(128);
 
-        let shard = SmoltcpShard::new(config, cmd_rx, wg_reply_rx, wg_tx);
+        let shard = SmoltcpShard::new(config, cmd_rx, wg_reply_rx, wg_tx, Arc::new(Notify::new()));
 
         assert_eq!(shard.config.shard_index, 0);
         assert!(shard.tcp_sessions.is_empty());
@@ -920,7 +1226,7 @@ mod tests {
         let (_wg_reply_tx, wg_reply_rx) = mpsc::channel(128);
         let (wg_tx, _wg_rx) = mpsc::channel(128);
 
-        let shard = SmoltcpShard::new(config, cmd_rx, wg_reply_rx, wg_tx);
+        let shard = SmoltcpShard::new(config, cmd_rx, wg_reply_rx, wg_tx, Arc::new(Notify::new()));
 
         // Spawn the shard
         let handle = tokio::spawn(shard.run());
@@ -942,7 +1248,7 @@ mod tests {
         let (_wg_reply_tx, wg_reply_rx) = mpsc::channel(128);
         let (wg_tx, _wg_rx) = mpsc::channel(128);
 
-        let shard = SmoltcpShard::new(config, cmd_rx, wg_reply_rx, wg_tx);
+        let shard = SmoltcpShard::new(config, cmd_rx, wg_reply_rx, wg_tx, Arc::new(Notify::new()));
 
         let handle = tokio::spawn(shard.run());
 

@@ -421,7 +421,7 @@ impl WgEgressBridge {
 
         // Connect the socket (IPv4 only)
         let smoltcp_dest = match dest_ip {
-            IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(&v4.octets())),
+            IpAddr::V4(v4) => IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(v4.octets())),
             IpAddr::V6(_) => {
                 return Err(BridgeError::SmoltcpTcp("IPv6 not supported".into()));
             }
@@ -935,8 +935,8 @@ impl WgEgressBridge {
 
         let smoltcp_dest = match dest_ip {
             IpAddr::V4(v4) => smoltcp::wire::IpEndpoint {
-                addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_bytes(
-                    &v4.octets(),
+                addr: smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(
+                    v4.octets(),
                 )),
                 port: dest_port,
             },

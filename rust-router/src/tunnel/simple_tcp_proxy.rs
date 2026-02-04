@@ -490,7 +490,7 @@ impl SimpleTcpProxy {
                     // A connection was accepted - get the remote endpoint
                     if let Some(remote) = socket.remote_endpoint() {
                         let source_ip = match remote.addr {
-                            IpAddress::Ipv4(addr) => Ipv4Addr::from(addr.0),
+                            IpAddress::Ipv4(addr) => addr,
                         };
 
                         // Check connection limit before accepting
@@ -1408,7 +1408,7 @@ pub fn extract_source_ip(packet: &[u8]) -> Option<Ipv4Addr> {
     match Ipv4Packet::new_checked(packet) {
         Ok(ipv4) => {
             let src = ipv4.src_addr();
-            Some(Ipv4Addr::new(src.0[0], src.0[1], src.0[2], src.0[3]))
+            Some(Ipv4Addr::from(src.octets()))
         }
         Err(_) => None,
     }

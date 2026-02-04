@@ -32,7 +32,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
 use smoltcp::socket::udp::{
     PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
@@ -269,7 +269,7 @@ impl SmoltcpBridge {
     /// `true` if any work was done (packets processed or generated)
     pub fn poll(&mut self) -> bool {
         let timestamp = self.now();
-        self.iface.poll(timestamp, &mut self.device, &mut self.sockets)
+        self.iface.poll(timestamp, &mut self.device, &mut self.sockets) != PollResult::None
     }
 
     /// Get the delay until the next poll is needed
@@ -656,11 +656,8 @@ pub fn socket_addr_to_endpoint(addr: SocketAddr) -> Option<IpEndpoint> {
 pub fn endpoint_to_socket_addr(endpoint: IpEndpoint) -> Option<SocketAddr> {
     match endpoint.addr {
         IpAddress::Ipv4(v4) => {
-            let octets = v4.as_bytes();
             Some(SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                    octets[0], octets[1], octets[2], octets[3],
-                )),
+                std::net::IpAddr::V4(v4),
                 endpoint.port,
             ))
         }

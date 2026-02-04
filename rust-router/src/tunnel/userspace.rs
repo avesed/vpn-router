@@ -2160,7 +2160,8 @@ async fn handle_decapsulate_result(
 
                         // Rewrite destination IP back to original client IP
                         if let Some(rewritten) = rewrite_dest_ip(&packet, original_src_ip) {
-                            debug!(
+                            // Hot path — trace level only (fires on every NAT-matched packet)
+                            trace!(
                                 "DNAT: {} -> {} (proto={}, {}:{} -> local:{})",
                                 tuple.dst_ip,
                                 original_src_ip,
@@ -2206,18 +2207,18 @@ async fn handle_decapsulate_result(
             // Send to receiver channel
             let recv_tx = shared.recv_tx.read().await;
             if let Some(tx) = recv_tx.as_ref() {
-                // Log channel send for debugging
-                debug!("Sending {} bytes to recv_tx channel", packet_len);
+                // Hot path — trace level only (debug! evaluates args at ~27K pps)
+                trace!("Sending {} bytes to recv_tx channel", packet_len);
                 if tx.send(packet).await.is_err() {
                     warn!("Receiver channel closed - packet dropped");
                 } else {
-                    debug!("Successfully sent {} bytes to recv_tx channel", packet_len);
+                    trace!("Successfully sent {} bytes to recv_tx channel", packet_len);
                 }
             } else {
                 warn!("recv_tx is None - packet dropped (tunnel may not be connected)");
             }
 
-            debug!(
+            trace!(
                 "Decrypted IPv4 packet: {} bytes (stats: rx_bytes={}, rx_packets={})",
                 packet_len,
                 shared.stats.rx_bytes.load(Ordering::Relaxed),
@@ -2243,7 +2244,8 @@ async fn handle_decapsulate_result(
                         drop(entry);
 
                         if let Some(rewritten) = rewrite_dest_ip(&packet, original_src_ip) {
-                            debug!(
+                            // Hot path — trace level only (fires on every NAT-matched packet)
+                            trace!(
                                 "DNAT (v6): {} -> {} (proto={}, {}:{} -> local:{})",
                                 tuple.dst_ip,
                                 original_src_ip,

@@ -35,6 +35,7 @@
 //! `VirtualDevice` is NOT thread-safe. It should be owned by a single task
 //! (typically `SmoltcpShard`) and accessed only from that task.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -136,8 +137,10 @@ pub struct VirtualDevice {
     mtu: usize,
     /// Packets to transmit (smoltcp -> WG)
     tx_buffer: Vec<Vec<u8>>,
-    /// Packets received (WG -> smoltcp)
-    rx_buffer: Vec<Vec<u8>>,
+    /// Packets received (WG -> smoltcp) — VecDeque for FIFO ordering
+    /// CRITICAL: Must be FIFO so smoltcp processes TCP segments in-order,
+    /// avoiding unnecessary reassembly overhead and duplicate ACKs.
+    rx_buffer: VecDeque<Vec<u8>>,
     /// Statistics
     stats: VirtualDeviceStats,
 }
@@ -153,7 +156,7 @@ impl VirtualDevice {
         Self {
             mtu,
             tx_buffer: Vec::with_capacity(DEVICE_TX_BUFFER_CAPACITY),
-            rx_buffer: Vec::with_capacity(DEVICE_RX_BUFFER_CAPACITY),
+            rx_buffer: VecDeque::with_capacity(DEVICE_RX_BUFFER_CAPACITY),
             stats: VirtualDeviceStats::new(),
         }
     }
@@ -194,7 +197,7 @@ impl VirtualDevice {
         }
 
         let len = packet.len();
-        self.rx_buffer.push(packet);
+        self.rx_buffer.push_back(packet);
         self.stats.rx_packets.fetch_add(1, Ordering::Relaxed);
         self.stats.rx_bytes.fetch_add(len as u64, Ordering::Relaxed);
 
@@ -296,12 +299,12 @@ pub struct VirtualRxToken {
 }
 
 impl RxToken for VirtualRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         trace!(len = self.packet.len(), "VirtualRxToken consumed");
-        f(&mut self.packet)
+        f(&self.packet)
     }
 }
 
@@ -347,8 +350,8 @@ impl Device for VirtualDevice {
         &mut self,
         _timestamp: SmoltcpInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Pop a packet from the RX buffer (LIFO for simplicity)
-        if let Some(packet) = self.rx_buffer.pop() {
+        // Pop a packet from the RX buffer (FIFO for correct TCP segment ordering)
+        if let Some(packet) = self.rx_buffer.pop_front() {
             trace!(
                 len = packet.len(),
                 remaining = self.rx_buffer.len(),
@@ -385,7 +388,10 @@ impl Device for VirtualDevice {
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
 
-        // smoltcp should compute checksums since we're a virtual device
+        // Tx = compute checksum on transmit, skip verification on receive.
+        // TX checksums are REQUIRED: after WG decapsulation, the remote peer's kernel
+        // verifies inner packet checksums. Poly1305 MAC only protects the WG layer.
+        // RX verification can be skipped since WG integrity covers incoming packets.
         caps.checksum.ipv4 = smoltcp::phy::Checksum::Tx;
         caps.checksum.tcp = smoltcp::phy::Checksum::Tx;
         caps.checksum.udp = smoltcp::phy::Checksum::Tx;

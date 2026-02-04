@@ -326,11 +326,11 @@ struct VirtualRxToken {
 }
 
 impl RxToken for VirtualRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.packet)
+        f(&self.packet)
     }
 }
 
@@ -1840,7 +1840,7 @@ impl std::fmt::Debug for SmoltcpShard {
 fn socket_addr_to_endpoint(addr: SocketAddr) -> Option<IpEndpoint> {
     match addr {
         SocketAddr::V4(v4) => Some(IpEndpoint {
-            addr: IpAddress::Ipv4(Ipv4Address::from_bytes(&v4.ip().octets())),
+            addr: IpAddress::Ipv4(Ipv4Address::from(v4.ip().octets())),
             port: v4.port(),
         }),
         SocketAddr::V6(_) => {
@@ -1857,9 +1857,8 @@ fn socket_addr_to_endpoint(addr: SocketAddr) -> Option<IpEndpoint> {
 fn endpoint_to_socket_addr(endpoint: IpEndpoint) -> SocketAddr {
     match endpoint.addr {
         IpAddress::Ipv4(v4) => {
-            let octets = v4.as_bytes();
             SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+                IpAddr::V4(v4),
                 endpoint.port,
             )
         }
@@ -2265,7 +2264,7 @@ mod tests {
         assert_eq!(endpoint.port, 8080);
         match endpoint.addr {
             IpAddress::Ipv4(v4) => {
-                assert_eq!(v4.as_bytes(), &[192, 168, 1, 100]);
+                assert_eq!(v4.octets(), [192, 168, 1, 100]);
             }
         }
     }

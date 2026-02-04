@@ -3649,6 +3649,25 @@ impl IpcHandler {
                 ip_str.parse::<std::net::Ipv4Addr>().ok()
             });
 
+        // Parse tunnel local IP for netbridge adapter (before config.local_ip is moved)
+        #[cfg(feature = "use-netbridge-egress")]
+        let netbridge_local_ip: Option<smoltcp::wire::IpAddress> =
+            config.local_ip.as_ref().and_then(|ip_str| {
+                let ip_str = ip_str.split('/').next().unwrap_or(ip_str);
+                ip_str.parse::<std::net::IpAddr>().ok().map(|ip| match ip {
+                    std::net::IpAddr::V4(v4) => smoltcp::wire::IpAddress::v4(
+                        v4.octets()[0],
+                        v4.octets()[1],
+                        v4.octets()[2],
+                        v4.octets()[3],
+                    ),
+                    std::net::IpAddr::V6(_) => {
+                        warn!("IPv6 tunnel local IP not supported for netbridge, using synthetic IP");
+                        smoltcp::wire::IpAddress::v4(10, 200, 0, 1)
+                    }
+                })
+            });
+
         // Apply optional fields
         if let Some(local_ip) = config.local_ip {
             egress_config = egress_config.with_local_ip(local_ip);
@@ -3677,17 +3696,41 @@ impl IpcHandler {
                     let egress_mgr = egress_manager.clone();
                     let tunnel_tag = tag.clone();
 
-                    // Spawn a forwarder task that reads from wg_rx and sends to egress manager
+                    // Spawn a batch TX forwarder: collects up to 64 packets per send_batch call
+                    // for batched encryption + sendmmsg on Linux
                     tokio::spawn(async move {
-                        while let Some(packet) = wg_rx.recv().await {
-                            if let Err(e) = egress_mgr.send(&tunnel_tag, packet.to_vec()).await {
-                                warn!(
-                                    "Failed to send packet through WG tunnel '{}': {}",
-                                    tunnel_tag, e
-                                );
+                        info!(target: "netbridge::tx", "Sharded TX forwarder started for tunnel '{}'", tunnel_tag);
+                        const BATCH_SIZE: usize = 64;
+                        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+                        while let Some(first_packet) = wg_rx.recv().await {
+                            batch.push(first_packet.to_vec());
+                            // Non-blocking drain of all immediately available packets
+                            while batch.len() < BATCH_SIZE {
+                                match wg_rx.try_recv() {
+                                    Ok(packet) => batch.push(packet.to_vec()),
+                                    Err(_) => break,
+                                }
                             }
+                            let batch_len = batch.len();
+                            match egress_mgr.send_batch(&tunnel_tag, std::mem::take(&mut batch)).await {
+                                Ok(sent) => {
+                                    trace!(
+                                        target: "netbridge::tx",
+                                        "Sent batch of {}/{} pkts through WG tunnel '{}'",
+                                        sent, batch_len, tunnel_tag
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        target: "netbridge::tx",
+                                        "Failed to send batch ({} pkts) through WG tunnel '{}': {}",
+                                        batch_len, tunnel_tag, e
+                                    );
+                                }
+                            }
+                            batch.reserve(BATCH_SIZE);
                         }
-                        debug!("WG packet forwarder for tunnel '{}' stopped", tunnel_tag);
+                        info!(target: "netbridge::tx", "Sharded TX forwarder for tunnel '{}' stopped", tunnel_tag);
                     });
 
                     // Create the sharded bridge for this tunnel with the tunnel's local IP
@@ -3697,6 +3740,85 @@ impl IpcHandler {
                     info!(
                         "Created sharded bridge for WireGuard tunnel '{}' with local_ip={:?}",
                         tag, tunnel_local_ip_for_bridge
+                    );
+                }
+
+                // Create NetbridgeVlessAdapter for the new unified netbridge path (if feature enabled)
+                // This is the preferred path for VLESS/SS inbound → WG outbound routing
+                #[cfg(feature = "use-netbridge-egress")]
+                {
+                    // Use pre-extracted netbridge_local_ip (extracted before config.local_ip was moved)
+                    // Create the netbridge adapter for this tunnel
+                    let adapter = self
+                        .create_netbridge_adapter_for_tunnel(tag.clone(), netbridge_local_ip)
+                        .await;
+
+                    // Take the TX receiver for event-driven forwarding (zero-latency)
+                    let egress_mgr = egress_manager.clone();
+                    let tunnel_tag_tx = tag.clone();
+
+                    if let Some(mut tx_rx) = adapter.take_tx_receiver() {
+                        // Spawn batch TX forwarder: collects up to 64 packets per send_batch call
+                        // for batched encryption + sendmmsg on Linux
+                        tokio::spawn(async move {
+                            info!(target: "netbridge::tx", "Netbridge TX forwarder started for tunnel '{}'", tunnel_tag_tx);
+                            const BATCH_SIZE: usize = 64;
+                            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+                            while let Some(first_packet) = tx_rx.recv().await {
+                                batch.push(first_packet.to_vec());
+                                // Non-blocking drain of all immediately available packets
+                                while batch.len() < BATCH_SIZE {
+                                    match tx_rx.try_recv() {
+                                        Ok(packet) => batch.push(packet.to_vec()),
+                                        Err(_) => break,
+                                    }
+                                }
+                                let batch_len = batch.len();
+                                match egress_mgr.send_batch(&tunnel_tag_tx, std::mem::take(&mut batch)).await {
+                                    Ok(sent) => {
+                                        trace!(
+                                            target: "netbridge::tx",
+                                            "Sent batch of {}/{} pkts through WG tunnel '{}'",
+                                            sent, batch_len, tunnel_tag_tx
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "netbridge::tx",
+                                            "Failed to send batch ({} pkts) through WG tunnel '{}': {}",
+                                            batch_len, tunnel_tag_tx, e
+                                        );
+                                    }
+                                }
+                                batch.reserve(BATCH_SIZE);
+                            }
+                            info!(target: "netbridge::tx", "Netbridge TX forwarder for tunnel '{}' stopped", tunnel_tag_tx);
+                        });
+                    } else {
+                        warn!("Failed to take TX receiver for tunnel '{}' - TX forwarding disabled", tag);
+                    }
+
+                    // Register the shard's WG reply channel DIRECTLY with the registry.
+                    // This eliminates the intermediate feeder task and extra copy:
+                    //   Before: Registry → channel → feeder task → feed_reply() → copy → shard
+                    //   After:  Registry → shard (direct)
+                    if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
+                        let reply_tx = adapter.wg_reply_sender();
+                        registry.register(tag.clone(), reply_tx);
+                        info!(
+                            "Registered NetbridgeVlessAdapter for tunnel '{}' with direct reply channel",
+                            tag
+                        );
+                    } else {
+                        warn!(
+                            "Sharded bridge reply registry not available - netbridge adapter for '{}' will not receive WG replies",
+                            tag
+                        );
+                    }
+
+                    info!(
+                        "Created NetbridgeVlessAdapter for WireGuard tunnel '{}' with local_ip={:?}",
+                        tag, netbridge_local_ip
                     );
                 }
 
@@ -3770,6 +3892,18 @@ impl IpcHandler {
                 {
                     self.remove_sharded_bridge_for_tunnel(tag).await;
                     info!("Removed sharded bridge for WireGuard tunnel '{}'", tag);
+                }
+
+                // Also remove the netbridge adapter for this tunnel (if feature enabled)
+                #[cfg(feature = "use-netbridge-egress")]
+                {
+                    // Unregister from the reply registry first
+                    if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
+                        registry.unregister(tag);
+                    }
+                    // Then shutdown the adapter
+                    self.remove_netbridge_adapter_for_tunnel(tag).await;
+                    info!("Removed netbridge adapter for WireGuard tunnel '{}'", tag);
                 }
 
                 // Also unregister WgEgressBridge for ipstack (if feature enabled)

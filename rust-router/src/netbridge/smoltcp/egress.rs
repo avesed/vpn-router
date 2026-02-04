@@ -58,11 +58,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use smoltcp::wire::IpAddress;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
@@ -102,7 +102,7 @@ impl SmoltcpEgressConfig {
             command_channel_size: 1024,
             wg_reply_channel_size: 2048,
             wg_tx_channel_size: 2048,
-            tcp_data_channel_size: 256,
+            tcp_data_channel_size: 16,
         }
     }
 
@@ -180,9 +180,11 @@ pub struct SmoltcpEgress {
     /// Command sender to the shard
     command_tx: mpsc::Sender<ShardCommand>,
     /// WG reply sender (for feed_reply)
-    wg_reply_tx: mpsc::Sender<Bytes>,
-    /// WG TX receiver (for drain_tx)
-    wg_tx_rx: Mutex<mpsc::Receiver<Bytes>>,
+    wg_reply_tx: mpsc::Sender<Vec<u8>>,
+    /// WG TX receiver (for drain_tx / take_tx_receiver)
+    wg_tx_rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
+    /// Upload notification -- shared with shard for wakeup signaling
+    upload_notify: Arc<Notify>,
     /// Statistics
     stats: Arc<SmoltcpEgressStats>,
     /// Active session count
@@ -211,7 +213,7 @@ impl SmoltcpEgress {
     pub fn spawn(config: SmoltcpEgressConfig) -> (Arc<Self>, SmoltcpEgressHandle) {
         // Create channels
         let (command_tx, command_rx) = mpsc::channel(config.command_channel_size);
-        let (wg_reply_tx, wg_reply_rx) = mpsc::channel(config.wg_reply_channel_size);
+        let (wg_reply_tx, wg_reply_rx) = mpsc::channel::<Vec<u8>>(config.wg_reply_channel_size);
         let (wg_tx_tx, wg_tx_rx) = mpsc::channel(config.wg_tx_channel_size);
 
         // Create shard config
@@ -225,14 +227,18 @@ impl SmoltcpEgress {
             cleanup_interval: Duration::from_secs(30),
         };
 
+        // Create upload notify for shard wakeup signaling
+        let upload_notify = Arc::new(Notify::new());
+
         // Create and spawn shard
-        let shard = SmoltcpShard::new(shard_config, command_rx, wg_reply_rx, wg_tx_tx);
+        let shard = SmoltcpShard::new(shard_config, command_rx, wg_reply_rx, wg_tx_tx, upload_notify.clone());
         let task = tokio::spawn(shard.run());
 
         let egress = Arc::new(Self {
             command_tx,
             wg_reply_tx,
-            wg_tx_rx: Mutex::new(wg_tx_rx),
+            wg_tx_rx: Mutex::new(Some(wg_tx_rx)),
+            upload_notify,
             stats: Arc::new(SmoltcpEgressStats::new()),
             active_sessions: AtomicUsize::new(0),
             config,
@@ -251,17 +257,46 @@ impl SmoltcpEgress {
     pub fn with_channels(
         config: SmoltcpEgressConfig,
         command_tx: mpsc::Sender<ShardCommand>,
-        wg_reply_tx: mpsc::Sender<Bytes>,
+        wg_reply_tx: mpsc::Sender<Vec<u8>>,
         wg_tx_rx: mpsc::Receiver<Bytes>,
+        upload_notify: Arc<Notify>,
     ) -> Arc<Self> {
         Arc::new(Self {
             command_tx,
             wg_reply_tx,
-            wg_tx_rx: Mutex::new(wg_tx_rx),
+            wg_tx_rx: Mutex::new(Some(wg_tx_rx)),
+            upload_notify,
             stats: Arc::new(SmoltcpEgressStats::new()),
             active_sessions: AtomicUsize::new(0),
             config,
         })
+    }
+
+    /// Take the WG TX receiver for event-driven forwarding.
+    ///
+    /// After calling this, `drain_tx()` will return empty results.
+    /// The caller is responsible for receiving packets from the returned receiver
+    /// and forwarding them to the WireGuard tunnel.
+    ///
+    /// This enables zero-latency TX forwarding (recv() loop) instead of polling.
+    pub fn take_tx_receiver(&self) -> Option<mpsc::Receiver<Bytes>> {
+        self.wg_tx_rx.lock().take()
+    }
+
+    /// Get a clone of the WG reply sender for direct registration.
+    ///
+    /// This allows registering the shard's reply channel directly with the
+    /// `ShardedBridgeReplyRegistry`, eliminating an intermediate feeder task
+    /// and an extra `Bytes::copy_from_slice` copy on the reply path.
+    ///
+    /// The returned sender feeds packets directly to the shard's `wg_reply_rx`.
+    pub fn wg_reply_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.wg_reply_tx.clone()
+    }
+
+    /// Get the upload notify handle for pump tasks to signal data arrival
+    pub fn upload_notify(&self) -> Arc<Notify> {
+        self.upload_notify.clone()
     }
 
     /// Shutdown the egress bridge
@@ -306,6 +341,7 @@ impl NetBridgeEgress for SmoltcpEgress {
         let command_tx = self.command_tx.clone();
         let stats = Arc::clone(&self.stats);
         let tcp_data_channel_size = self.config.tcp_data_channel_size;
+        let upload_notify = self.upload_notify.clone();
 
         async move {
             // Create data channels for the TCP pump
@@ -341,43 +377,42 @@ impl NetBridgeEgress for SmoltcpEgress {
             );
 
             // Spawn a task to pump data between stream and shard
-            let data_tx_clone = command_tx.clone();
+            let close_tx = command_tx.clone();
             let session_id_copy = session_id;
             tokio::spawn(async move {
                 let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-                // Read from stream, send to shard
+                // Read from stream, send to shard via per-session channel
                 let read_task = {
-                    let data_tx = data_tx_clone.clone();
+                    let close_tx = close_tx.clone();
                     async move {
-                        let mut buf = [0u8; 65536];
+                        let mut buf = BytesMut::with_capacity(65536);
                         loop {
-                            match read_half.read(&mut buf).await {
+                            // Zero-copy read: read_buf appends directly into BytesMut
+                            match read_half.read_buf(&mut buf).await {
                                 Ok(0) => {
-                                    // EOF
-                                    let _ = data_tx
+                                    // EOF - send close via shared command channel
+                                    trace!(session_id = session_id_copy, "TCP pump: stream EOF, closing session");
+                                    let _ = close_tx
                                         .send(ShardCommand::TcpClose {
                                             session_id: session_id_copy,
                                         })
                                         .await;
                                     break;
                                 }
-                                Ok(n) => {
-                                    let data = Bytes::copy_from_slice(&buf[..n]);
-                                    if data_tx
-                                        .send(ShardCommand::TcpSend {
-                                            session_id: session_id_copy,
-                                            data,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
+                                Ok(_) => {
+                                    // Zero-copy: freeze() converts BytesMut -> Bytes without copying
+                                    let data = buf.split().freeze();
+                                    // Send via per-session channel (not shared command_tx!)
+                                    if data_tx.send(data).await.is_err() {
                                         break;
                                     }
+                                    // Signal the shard that upload data is available
+                                    upload_notify.notify_one();
                                 }
                                 Err(e) => {
-                                    trace!(?e, "TCP read error");
-                                    let _ = data_tx
+                                    debug!(session_id = session_id_copy, ?e, "TCP pump: read error, closing session");
+                                    let _ = close_tx
                                         .send(ShardCommand::TcpClose {
                                             session_id: session_id_copy,
                                         })
@@ -398,11 +433,23 @@ impl NetBridgeEgress for SmoltcpEgress {
                     }
                 };
 
-                // Run both tasks
+                // Run both tasks; when one finishes, the other is cancelled
                 tokio::select! {
                     _ = read_task => {}
                     _ = write_task => {}
                 }
+
+                // Ensure session is closed regardless of which side finished.
+                // If read_task already sent TcpClose (EOF/error path), this is
+                // a no-op in the shard (session already removed). But if write_task
+                // finished first (remote closed download), read_task was cancelled
+                // without sending TcpClose — this guarantees cleanup.
+                debug!(session_id = session_id_copy, "TCP pump: safety cleanup TcpClose sent");
+                let _ = close_tx
+                    .send(ShardCommand::TcpClose {
+                        session_id: session_id_copy,
+                    })
+                    .await;
             });
 
             Ok(SessionId::new(session_id))
@@ -442,7 +489,7 @@ impl NetBridgeEgress for SmoltcpEgress {
     ///
     /// The packet is sent to the shard for processing by smoltcp.
     fn feed_reply(&self, packet: &[u8]) -> Result<()> {
-        let data = Bytes::copy_from_slice(packet);
+        let data = packet.to_vec();
 
         self.wg_reply_tx
             .try_send(data)
@@ -465,19 +512,22 @@ impl NetBridgeEgress for SmoltcpEgress {
     /// Drain pending TX packets
     ///
     /// Returns all IP packets waiting to be sent to WireGuard.
+    /// Note: This only works if the TX receiver hasn't been taken via `take_tx_receiver()`.
     fn drain_tx(&self) -> Vec<Bytes> {
-        let mut rx = self.wg_tx_rx.lock();
+        let mut guard = self.wg_tx_rx.lock();
         let mut packets = Vec::new();
 
-        // Non-blocking drain
-        loop {
-            match rx.try_recv() {
-                Ok(packet) => {
-                    self.stats.tx_packets_drained.fetch_add(1, Ordering::Relaxed);
-                    packets.push(packet);
+        if let Some(rx) = guard.as_mut() {
+            // Non-blocking drain
+            loop {
+                match rx.try_recv() {
+                    Ok(packet) => {
+                        self.stats.tx_packets_drained.fetch_add(1, Ordering::Relaxed);
+                        packets.push(packet);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
 

@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info, trace, warn};
 
 use super::error::{NetBridgeError, Result};
@@ -248,11 +248,102 @@ impl AdapterStats {
 // NetbridgeVlessAdapter
 // =============================================================================
 
-/// Default TCP read/write buffer size
-const TCP_BUFFER_SIZE: usize = 32768;
-
 /// Default reply channel size per connection
 const REPLY_CHANNEL_SIZE: usize = 128;
+
+// =============================================================================
+// CountingStream - Zero-copy byte counting wrapper with lifecycle tracking
+// =============================================================================
+
+/// Sends a completion signal when dropped.
+///
+/// This is used to detect when the background pump task completes,
+/// since the pump owns the stream and drops it when done.
+struct CompletionNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for CompletionNotifier {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// A stream wrapper that counts bytes read/written without any buffering overhead.
+///
+/// This replaces the previous duplex + pump architecture with a zero-copy approach:
+/// - No extra tasks spawned
+/// - No extra buffer allocations
+/// - No extra data copies
+/// - Bytes counted at the poll level (near-zero overhead)
+///
+/// When this stream is dropped (by the background pump task), the `CompletionNotifier`
+/// fires, signaling the adapter that the connection has finished.
+struct CountingStream<S> {
+    inner: S,
+    session: Arc<SessionState>,
+    _completion: CompletionNotifier,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S, session: Arc<SessionState>, completion_tx: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            inner,
+            session,
+            _completion: CompletionNotifier(Some(completion_tx)),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let n = buf.filled().len() - before;
+            if n > 0 {
+                // Bytes read from client = bytes "sent" (uploaded by client)
+                this.session.add_bytes_sent(n as u64);
+            }
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &result {
+            // Bytes written to client = bytes "received" (downloaded by client)
+            this.session.add_bytes_received(*n as u64);
+        }
+        result
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 /// Adapter that wraps SmoltcpEgress with ShardedVlessWgBridge-compatible API.
 ///
@@ -409,112 +500,43 @@ impl NetbridgeVlessAdapter {
     }
 
     /// Internal TCP handling implementation.
+    ///
+    /// Uses `CountingStream` to wrap the client stream with zero-copy byte counting,
+    /// then passes it directly to `SmoltcpEgress::handle_tcp()`. This eliminates
+    /// the previous duplex + pump architecture which added:
+    /// - 2 extra tokio tasks per connection
+    /// - 2 extra 1MB buffer allocations per connection
+    /// - 2 extra data copies per direction
+    ///
+    /// A `CompletionNotifier` inside the `CountingStream` fires when the background
+    /// pump task drops the stream, allowing us to wait for connection completion
+    /// without blocking the egress's spawned pump task.
     async fn handle_tcp_internal<S>(
         &self,
         stream: S,
         dest_addr: SocketAddr,
-        conn_id: u64,
+        _conn_id: u64,
         session_state: Arc<SessionState>,
     ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        // Create a duplex channel for bidirectional communication with SmoltcpEgress
-        // SmoltcpEgress::handle_tcp expects to own the stream and pump data itself.
-        // We need to intercept the data flow to track bytes.
-        //
-        // Strategy: Use tokio::io::duplex to create a pair of streams.
-        // We pump data between our input stream and the duplex, tracking bytes.
-        // SmoltcpEgress handles the other end of the duplex.
+        // Create completion notification channel
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let (client_stream, egress_stream) = tokio::io::duplex(TCP_BUFFER_SIZE);
+        // Wrap the stream with zero-copy byte counting + completion notification
+        let counting_stream = CountingStream::new(stream, session_state, done_tx);
 
-        // Spawn the egress handler
-        let egress = Arc::clone(&self.egress);
-        let session_id_result = tokio::spawn(async move {
-            egress.handle_tcp(egress_stream, dest_addr).await
-        });
+        // Pass directly to egress — no duplex, no extra pump tasks, no extra copies
+        // handle_tcp spawns a background pump task that owns the CountingStream
+        self.egress.handle_tcp(counting_stream, dest_addr).await?;
 
-        // Bidirectional pump between client stream and our duplex
-        let (mut read_half, mut write_half) = tokio::io::split(stream);
-        let (mut duplex_read, mut duplex_write) = tokio::io::split(client_stream);
+        // Wait for the background pump task to complete.
+        // When the pump finishes (EOF, error, or peer close), it drops the
+        // CountingStream, which triggers CompletionNotifier to fire done_tx.
+        let _ = done_rx.await;
 
-        let session_state_read = Arc::clone(&session_state);
-        let session_state_write = Arc::clone(&session_state);
-
-        // Client -> Egress pump
-        let conn_id_for_read = conn_id;
-        let read_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; TCP_BUFFER_SIZE];
-            loop {
-                match read_half.read(&mut buf).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        session_state_read.add_bytes_sent(n as u64);
-                        if duplex_write.write_all(&buf[..n]).await.is_err() {
-                            trace!(
-                                target: "netbridge::vless_adapter",
-                                conn_id = conn_id_for_read,
-                                "TCP pump client->egress write error, closing"
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        trace!(
-                            target: "netbridge::vless_adapter",
-                            conn_id = conn_id_for_read,
-                            error = %e,
-                            "TCP pump client->egress read error, closing"
-                        );
-                        break;
-                    }
-                }
-            }
-            let _ = duplex_write.shutdown().await;
-        });
-
-        // Egress -> Client pump
-        let conn_id_for_write = conn_id;
-        let write_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; TCP_BUFFER_SIZE];
-            loop {
-                match duplex_read.read(&mut buf).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        session_state_write.add_bytes_received(n as u64);
-                        if write_half.write_all(&buf[..n]).await.is_err() {
-                            trace!(
-                                target: "netbridge::vless_adapter",
-                                conn_id = conn_id_for_write,
-                                "TCP pump egress->client write error, closing"
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        trace!(
-                            target: "netbridge::vless_adapter",
-                            conn_id = conn_id_for_write,
-                            error = %e,
-                            "TCP pump egress->client read error, closing"
-                        );
-                        break;
-                    }
-                }
-            }
-            let _ = write_half.shutdown().await;
-        });
-
-        // Wait for all tasks
-        let _ = tokio::join!(read_task, write_task);
-
-        // Check if the egress completed successfully
-        match session_id_result.await {
-            Ok(Ok(_session_id)) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(NetBridgeError::InternalError(format!("egress task panicked: {}", e))),
-        }
+        Ok(())
     }
 
     /// Handle a UDP connection from VLESS UDP-over-TCP.
@@ -736,9 +758,42 @@ impl NetbridgeVlessAdapter {
         self.egress.feed_reply(packet)
     }
 
+    /// Get a clone of the WG reply sender for direct registration.
+    ///
+    /// This returns the shard's reply channel sender, allowing direct registration
+    /// with `ShardedBridgeReplyRegistry`. This eliminates the intermediate feeder
+    /// task and an extra `Bytes::copy_from_slice` on the WG reply path.
+    ///
+    /// # Performance
+    ///
+    /// Without direct registration, WG replies flow:
+    /// ```text
+    /// Registry → intermediate channel → feeder task → feed_reply() → copy → wg_reply_tx → shard
+    /// ```
+    ///
+    /// With direct registration:
+    /// ```text
+    /// Registry → wg_reply_tx → shard
+    /// ```
+    ///
+    /// This removes 1 task, 1 channel hop, 1 copy, and 1 packet-drop point.
+    pub fn wg_reply_sender(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.egress.wg_reply_sender()
+    }
+
+    /// Take the WG TX receiver for event-driven forwarding.
+    ///
+    /// This enables zero-latency packet forwarding via recv() loop instead of
+    /// polling drain_tx() at fixed intervals. After calling this, drain_tx()
+    /// will return empty results.
+    pub fn take_tx_receiver(&self) -> Option<tokio::sync::mpsc::Receiver<Bytes>> {
+        self.egress.take_tx_receiver()
+    }
+
     /// Drain pending TX packets.
     ///
     /// This is a passthrough to the underlying SmoltcpEgress.
+    /// Note: Returns empty if take_tx_receiver() was called.
     #[must_use]
     pub fn drain_tx(&self) -> Vec<Bytes> {
         self.egress.drain_tx()

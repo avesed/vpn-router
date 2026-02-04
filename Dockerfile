@@ -38,7 +38,7 @@ COPY rust-router/benches ./benches
 # Rebuild with actual source (dependencies are cached)
 # Profile settings from Cargo.toml: lto=true, codegen-units=1, panic=abort, strip=true
 RUN touch src/main.rs src/lib.rs && \
-    cargo build --release --bin rust-router --features shadowsocks && \
+    cargo build --release --bin rust-router --features "shadowsocks,use-netbridge-egress" && \
     ls -lh target/release/rust-router
 
 # ==========================================

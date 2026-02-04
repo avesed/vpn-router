@@ -124,10 +124,14 @@ pub const UDP_PACKET_META: usize = crate::netbridge::config::UDP_PACKET_META;
 pub const MAX_SOCKETS: usize = crate::netbridge::config::MAX_SOCKETS;
 
 /// Maximum TX buffer capacity for virtual device
-pub const DEVICE_TX_BUFFER_CAPACITY: usize = 256;
+/// With 1 MB TCP TX buffer and MSS=1380, one full flush produces ~760 packets.
+/// Plus up to ~1024 ACKs from ingress processing. 2048 provides headroom for both.
+pub const DEVICE_TX_BUFFER_CAPACITY: usize = 2048;
 
 /// Maximum RX buffer capacity for virtual device
-pub const DEVICE_RX_BUFFER_CAPACITY: usize = 256;
+/// Defense-in-depth alongside interleaved batch polling (every 64 packets).
+/// 1024 provides safety margin for edge cases where smoltcp cannot drain fast enough.
+pub const DEVICE_RX_BUFFER_CAPACITY: usize = 1024;
 
 /// Minimum poll interval (1ms) - prevents busy-looping
 pub const MIN_POLL_INTERVAL_MS: u64 = 1;

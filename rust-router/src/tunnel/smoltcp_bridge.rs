@@ -44,7 +44,7 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer, State as TcpState};
 use smoltcp::socket::udp::{
     PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata,
@@ -262,9 +262,10 @@ impl SmoltcpBridge {
         let timestamp = Self::current_timestamp();
         // Log RX queue status before poll
         let rx_count_before = self.queue.rx_queue_len();
-        let result = self
+        let poll_result = self
             .iface
             .poll(timestamp, &mut self.device, &mut self.sockets);
+        let result = poll_result != PollResult::None;
 
         if result {
             debug!(
