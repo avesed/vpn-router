@@ -62,6 +62,7 @@
 
 mod egress;
 mod ingress;
+pub mod iptables_core;
 mod iptables;
 mod tproxy;
 mod tun;
@@ -75,6 +76,9 @@ pub use tun::{TunDeviceBuilder, TunDeviceWrapper};
 
 // TPROXY listener wrapper
 pub use tproxy::{TproxyConnectionWrapper, TproxyListenerConfig, TproxyListenerStats, TproxyListenerWrapper};
+
+// Core iptables manager (canonical location)
+pub use iptables_core::IptablesManager;
 
 // iptables manager wrapper (with crash recovery)
 pub use iptables::{IptablesConfig, IptablesManagerWrapper, IptablesState};

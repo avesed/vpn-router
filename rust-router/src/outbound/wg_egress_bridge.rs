@@ -79,7 +79,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::egress::config::EgressState;
 use crate::egress::manager::WgEgressManager;
-use crate::smoltcp_utils::{
+use crate::vless_wg_bridge::{
     BridgeError, PortAllocator, Result, SessionTracker, TcpSocketGuard, UdpSocketGuard,
     MAX_SOCKETS, TCP_RX_BUFFER, TCP_TX_BUFFER, UDP_DEFAULT_TIMEOUT_SECS, UDP_DNS_TIMEOUT_SECS,
     WG_MTU, WG_REPLY_CHANNEL_SIZE,
@@ -292,7 +292,7 @@ impl WgEgressBridge {
         Self {
             tunnel_tag,
             smoltcp: Arc::new(Mutex::new(smoltcp)),
-            sessions: SessionTracker::with_port_allocator(port_allocator),
+            sessions: SessionTracker::new(port_allocator),
             wg_egress,
             local_ip,
             reply_channels: DashMap::new(),

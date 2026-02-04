@@ -67,12 +67,9 @@ use crate::peer::manager::PeerManager;
 use crate::rules::fwmark::ChainMark;
 use crate::rules::MatchedRule;
 
-// TUN bridge imports (feature-gated)
-#[cfg(feature = "ipstack-tcp")]
-use crate::tun_bridge::{
-    FiveTuple as TunFiveTuple, SessionTracker as TunSessionTracker, TunIngressBridge,
-    TunIngressConfig, TunIngressStatsSnapshot,
-};
+// NetBridgeIngress trait import (for KernelIngress.inject_packet() method)
+#[cfg(feature = "use-netbridge-ingress")]
+use crate::netbridge::traits::NetBridgeIngress as _;
 
 /// IP protocol numbers
 const IPPROTO_TCP: u8 = 6;
@@ -127,25 +124,14 @@ static PROXY_UDP_SESSIONS: Lazy<DashMap<FiveTuple, Arc<ProxyUdpSessionEntry>>> =
     Lazy::new(DashMap::new);
 
 // ============================================================================
-// IpStack Bridge Integration (feature-gated)
+// KernelIngress Integration (netbridge path)
 // ============================================================================
 
-/// Global TUN ingress bridge for TCP/UDP handling (replaces ipstack)
-/// Feature-gated: only active when ipstack-tcp feature is enabled
-///
-/// Note: We use Arc<TunIngressBridge> because all public methods
-/// on TunIngressBridge only require &self (interior mutability via atomics and channels).
-/// This eliminates lock contention on the hot path.
-///
-/// The TUN + TPROXY approach uses the kernel's TCP/IP stack for better performance
-/// and full TCP/congestion control support (200+ Mbps vs ipstack's 30-80 Mbps).
-#[cfg(feature = "ipstack-tcp")]
-static TUN_INGRESS_BRIDGE: once_cell::sync::OnceCell<std::sync::Arc<TunIngressBridge>> =
+/// Global KernelIngress bridge for WG ingress
+/// Feature-gated: only active when use-netbridge-ingress feature is enabled
+#[cfg(feature = "use-netbridge-ingress")]
+static KERNEL_INGRESS: once_cell::sync::OnceCell<std::sync::Arc<crate::netbridge::kernel::KernelIngress>> =
     once_cell::sync::OnceCell::new();
-
-/// Environment variable to enable/disable TUN bridge at runtime
-#[cfg(feature = "ipstack-tcp")]
-static TUN_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // ============================================================================
 // WireGuard SNI Routing Configuration
@@ -2256,10 +2242,10 @@ async fn forward_tcp_packet(
             sni_config,
         );
 
-        // If domain routing is needed, route through ipstack for SNI extraction
-        #[cfg(feature = "ipstack-tcp")]
-        if needs_sni && is_ipstack_enabled() {
-            if let Some(bridge) = TUN_INGRESS_BRIDGE.get() {
+        // If domain routing is needed, route through ingress bridge for SNI extraction
+        #[cfg(feature = "use-netbridge-ingress")]
+        if needs_sni && is_kernel_ingress_enabled() {
+            if let Some(ingress) = KERNEL_INGRESS.get() {
                 use base64::engine::general_purpose::STANDARD as BASE64;
                 use base64::Engine;
 
@@ -2271,22 +2257,21 @@ async fn forward_tcp_packet(
                     }
                     _ => {
                         warn!(
-                            "Invalid peer key for WG SNI routing, falling back to direct: {}:{} -> {}:{}",
+                            "Invalid peer key for WG SNI routing (netbridge), falling back to direct: {}:{} -> {}:{}",
                             parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
                         );
-                        [0u8; 32] // Will trigger fallback to direct forwarding
+                        [0u8; 32]
                     }
                 };
 
                 if peer_key != [0u8; 32] {
-                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
-                    match bridge
-                        .inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag)
+                    match ingress
+                        .inject_packet(&processed.data, peer_key, processed.src_addr)
                         .await
                     {
                         Ok(()) => {
                             debug!(
-                                "WG egress SNI routing via TUN '{}': {}:{} -> {}:{} (domain match)",
+                                "WG egress SNI routing via KernelIngress '{}': {}:{} -> {}:{} (domain match)",
                                 outbound_tag,
                                 parsed.src_ip,
                                 tcp_details.src_port,
@@ -2299,9 +2284,8 @@ async fn forward_tcp_packet(
                             return;
                         }
                         Err(e) => {
-                            // Fall through to direct forwarding if TUN inject fails
                             warn!(
-                                "TUN inject failed for WG SNI routing, using direct forwarding: {}:{} -> {}:{}, error: {}",
+                                "KernelIngress inject failed for WG SNI routing, using direct forwarding: {}:{} -> {}:{}, error: {}",
                                 parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port, e
                             );
                         }
@@ -2411,15 +2395,10 @@ async fn forward_tcp_packet(
         return;
     }
 
-    // === IPSTACK INTEGRATION ===
-    // When ipstack-tcp feature is enabled and TUN bridge is active, route non-WG TCP
-    // traffic through TunIngressBridge which uses the kernel's TCP/IP stack.
-    // This provides better performance (200+ Mbps) than the old ipstack approach (30-80 Mbps).
-    // No fallback - if TUN inject fails, drop the packet and let TCP retransmit.
-    #[cfg(feature = "ipstack-tcp")]
-    if is_ipstack_enabled() {
-        if let Some(bridge) = TUN_INGRESS_BRIDGE.get() {
-            // Convert peer_public_key to 32-byte array
+    // === KERNEL INGRESS INTEGRATION (netbridge path) ===
+    #[cfg(feature = "use-netbridge-ingress")]
+    if is_kernel_ingress_enabled() {
+        if let Some(ingress) = KERNEL_INGRESS.get() {
             use base64::engine::general_purpose::STANDARD as BASE64;
             use base64::Engine;
 
@@ -2432,7 +2411,7 @@ async fn forward_tcp_packet(
                     }
                     _ => {
                         warn!(
-                        "Invalid peer key for TUN bridge, dropping packet: {}:{} -> {}:{} (peer={})",
+                        "Invalid peer key for KernelIngress, dropping packet: {}:{} -> {}:{} (peer={})",
                         parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port,
                         &processed.peer_public_key[..8.min(processed.peer_public_key.len())]
                     );
@@ -2441,21 +2420,13 @@ async fn forward_tcp_packet(
                     }
                 };
 
-            // Convert the processed packet to BytesMut for TUN bridge
-            let packet_data = bytes::BytesMut::from(&processed.data[..]);
-
-            // Get the outbound tag from routing decision
-            let outbound_tag = &processed.routing.outbound;
-
-            // Inject into TUN device (async operation)
-            // The TunIngressBridge handles session tracking and routing through OutboundManager.
-            match bridge
-                .inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag)
+            match ingress
+                .inject_packet(&processed.data, peer_key, processed.src_addr)
                 .await
             {
                 Ok(()) => {
                     trace!(
-                        "Routed TCP to TUN: {}:{} -> {}:{}",
+                        "Routed TCP to KernelIngress: {}:{} -> {}:{}",
                         parsed.src_ip,
                         tcp_details.src_port,
                         parsed.dst_ip,
@@ -2466,9 +2437,8 @@ async fn forward_tcp_packet(
                     return;
                 }
                 Err(e) => {
-                    // TUN inject failed - drop packet, TCP will retransmit
                     warn!(
-                        "TUN inject failed, dropping TCP packet (will retransmit): {}:{} -> {}:{}, error: {}",
+                        "KernelIngress inject failed, dropping TCP packet (will retransmit): {}:{} -> {}:{}, error: {}",
                         parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port, e
                     );
                     stats.forward_errors.fetch_add(1, Ordering::Relaxed);
@@ -2476,38 +2446,27 @@ async fn forward_tcp_packet(
                 }
             }
         } else {
-            // Bridge not initialized - this shouldn't happen if ipstack is enabled
             warn!(
-                "TUN bridge enabled but not initialized, dropping TCP packet: {}:{} -> {}:{}",
+                "KernelIngress enabled but not initialized, dropping TCP packet: {}:{} -> {}:{}",
                 parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
             );
             stats.forward_errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
-    // === END TUN BRIDGE INTEGRATION ===
+    // === END KERNEL INGRESS INTEGRATION ===
 
-    // When ipstack-tcp feature is not compiled, log error and drop packet
-    // (The manual TCP state machine has known bugs and is no longer supported)
-    #[cfg(not(feature = "ipstack-tcp"))]
+    // When use-netbridge-ingress is not compiled, log error and drop packet
+    #[cfg(not(feature = "use-netbridge-ingress"))]
     {
         warn!(
-            "TCP packet dropped: ipstack-tcp feature not enabled. \
-             Manual TCP state machine removed due to bugs. \
-             Rebuild with --features ipstack-tcp. \
+            "TCP packet dropped: use-netbridge-ingress feature not enabled. \
+             Rebuild with --features use-netbridge-ingress. \
              Packet: {}:{} -> {}:{}",
             parsed.src_ip, tcp_details.src_port, parsed.dst_ip, tcp_details.dst_port
         );
         stats.forward_errors.fetch_add(1, Ordering::Relaxed);
     }
-
-    // REMOVED: Manual TCP state machine code (lines 2654-3314)
-    // The manual implementation had bugs:
-    // - server_seq initialization error causing wrong ACK numbers
-    // - No retransmission mechanism causing connection stalls on packet loss
-    // - Out-of-order packet dropping causing data loss
-    // - Fixed window size (65535) with no flow control
-    // All TCP traffic now goes through IpStack which handles these correctly.
 }
 
 /// DNS hijacking statistics
@@ -2819,10 +2778,10 @@ async fn forward_udp_packet(
             sni_config,
         );
 
-        // If domain routing is needed, route through TUN bridge for QUIC SNI extraction
-        #[cfg(feature = "ipstack-tcp")]
-        if needs_sni && is_ipstack_enabled() {
-            if let Some(bridge) = TUN_INGRESS_BRIDGE.get() {
+        // If domain routing is needed, route through ingress bridge for QUIC SNI extraction
+        #[cfg(feature = "use-netbridge-ingress")]
+        if needs_sni && is_kernel_ingress_enabled() {
+            if let Some(ingress) = KERNEL_INGRESS.get() {
                 use base64::engine::general_purpose::STANDARD as BASE64;
                 use base64::Engine;
 
@@ -2834,22 +2793,21 @@ async fn forward_udp_packet(
                     }
                     _ => {
                         warn!(
-                            "Invalid peer key for WG SNI routing, falling back to direct: {}:{} -> {}:{}",
+                            "Invalid peer key for WG SNI routing (netbridge), falling back to direct: {}:{} -> {}:{}",
                             parsed.src_ip, src_port, parsed.dst_ip, dst_port
                         );
-                        [0u8; 32] // Will trigger fallback to direct forwarding
+                        [0u8; 32]
                     }
                 };
 
                 if peer_key != [0u8; 32] {
-                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
-                    match bridge
-                        .inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag)
+                    match ingress
+                        .inject_packet(&processed.data, peer_key, processed.src_addr)
                         .await
                     {
                         Ok(()) => {
                             debug!(
-                                "WG egress SNI routing via TUN '{}': {}:{} -> {}:{} (domain match, UDP)",
+                                "WG egress SNI routing via KernelIngress '{}': {}:{} -> {}:{} (domain match, UDP)",
                                 outbound_tag, parsed.src_ip, src_port, parsed.dst_ip, dst_port
                             );
                             stats.wg_sni_routed.fetch_add(1, Ordering::Relaxed);
@@ -2858,9 +2816,8 @@ async fn forward_udp_packet(
                             return;
                         }
                         Err(e) => {
-                            // Fall through to direct forwarding if TUN inject fails
                             warn!(
-                                "TUN inject failed for WG SNI routing, using direct forwarding: {}:{} -> {}:{} (UDP), error: {}",
+                                "KernelIngress inject failed for WG SNI routing, using direct forwarding: {}:{} -> {}:{} (UDP), error: {}",
                                 parsed.src_ip, src_port, parsed.dst_ip, dst_port, e
                             );
                         }
@@ -2982,11 +2939,10 @@ async fn forward_udp_packet(
     }
 
     if outbound_tag == "direct" || outbound_tag.starts_with("direct-") {
-        // === DIRECT UDP TUN INTEGRATION (Phase 3) ===
-        // Route direct UDP traffic through TUN bridge for FakeDNS support
-        #[cfg(feature = "ipstack-tcp")]
-        if is_ipstack_enabled() {
-            if let Some(bridge) = TUN_INGRESS_BRIDGE.get() {
+        // === DIRECT UDP KERNEL INGRESS INTEGRATION (netbridge path) ===
+        #[cfg(feature = "use-netbridge-ingress")]
+        if is_kernel_ingress_enabled() {
+            if let Some(ingress) = KERNEL_INGRESS.get() {
                 use base64::engine::general_purpose::STANDARD as BASE64;
                 use base64::Engine;
 
@@ -2996,18 +2952,17 @@ async fn forward_udp_packet(
                         arr.copy_from_slice(&bytes);
                         arr
                     }
-                    _ => [0u8; 32], // Invalid key will cause fallback
+                    _ => [0u8; 32],
                 };
 
                 if peer_key != [0u8; 32] {
-                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
-                    match bridge
-                        .inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag)
+                    match ingress
+                        .inject_packet(&processed.data, peer_key, processed.src_addr)
                         .await
                     {
                         Ok(()) => {
                             trace!(
-                                "Routed direct UDP to TUN: {}:{} -> {}:{}",
+                                "Routed direct UDP to KernelIngress: {}:{} -> {}:{}",
                                 parsed.src_ip,
                                 src_port,
                                 parsed.dst_ip,
@@ -3024,7 +2979,7 @@ async fn forward_udp_packet(
                 }
             }
         }
-        // === END DIRECT UDP TUN INTEGRATION ===
+        // === END DIRECT UDP KERNEL INGRESS INTEGRATION ===
 
         // Direct outbound - send UDP directly to destination and listen for reply
         let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
@@ -3143,18 +3098,10 @@ async fn forward_udp_packet(
         );
         stats.blocked_packets.fetch_add(1, Ordering::Relaxed);
     } else {
-        // === UDP TUN INTEGRATION (Phase 3) ===
-        // When ipstack-tcp feature is enabled and TUN bridge is active, route non-WG UDP
-        // traffic through TunIngressBridge for:
-        // 1. Unified session management with TCP
-        // 2. FakeDNS support for domain-based routing
-        // 3. Consistent reply routing through TUN reply router
-        //
-        // Falls back to manual UDP handling if TUN injection fails.
-        #[cfg(feature = "ipstack-tcp")]
-        if is_ipstack_enabled() {
-            if let Some(bridge) = TUN_INGRESS_BRIDGE.get() {
-                // Convert peer_public_key to 32-byte array
+        // === UDP KERNEL INGRESS INTEGRATION (netbridge path) ===
+        #[cfg(feature = "use-netbridge-ingress")]
+        if is_kernel_ingress_enabled() {
+            if let Some(ingress) = KERNEL_INGRESS.get() {
                 use base64::engine::general_purpose::STANDARD as BASE64;
                 use base64::Engine;
 
@@ -3166,29 +3113,22 @@ async fn forward_udp_packet(
                     }
                     _ => {
                         warn!(
-                            "Invalid peer key for TUN UDP, using fallback: {}:{} -> {}:{} (peer={})",
+                            "Invalid peer key for KernelIngress UDP, using fallback: {}:{} -> {}:{} (peer={})",
                             parsed.src_ip, src_port, parsed.dst_ip, dst_port,
                             &processed.peer_public_key[..8.min(processed.peer_public_key.len())]
                         );
-                        // Fall through to manual UDP handling below
-                        [0u8; 32] // Invalid key will cause fallback
+                        [0u8; 32]
                     }
                 };
 
-                // Only proceed with TUN if we have a valid peer key
                 if peer_key != [0u8; 32] {
-                    // Convert the processed packet to BytesMut for TUN bridge
-                    let packet_data = bytes::BytesMut::from(&processed.data[..]);
-
-                    // Try to inject into TUN device
-                    // UDP packets can tolerate loss better than TCP
-                    match bridge
-                        .inject_packet(packet_data, peer_key, processed.src_addr, outbound_tag)
+                    match ingress
+                        .inject_packet(&processed.data, peer_key, processed.src_addr)
                         .await
                     {
                         Ok(()) => {
                             trace!(
-                                "Routed UDP to TUN: {}:{} -> {}:{}",
+                                "Routed UDP to KernelIngress: {}:{} -> {}:{}",
                                 parsed.src_ip,
                                 src_port,
                                 parsed.dst_ip,
@@ -3199,21 +3139,18 @@ async fn forward_udp_packet(
                             return;
                         }
                         Err(_) => {
-                            // TUN inject failed - fall through to manual UDP handling
-                            // UDP is lossy by nature, so this is acceptable
                             debug!(
-                                "TUN inject failed for UDP, using fallback: {}:{} -> {}:{}",
+                                "KernelIngress inject failed for UDP, using fallback: {}:{} -> {}:{}",
                                 parsed.src_ip, src_port, parsed.dst_ip, dst_port
                             );
-                            // Continue to manual UDP handling below
                         }
                     }
                 }
             }
         }
-        // === END UDP TUN INTEGRATION ===
+        // === END UDP KERNEL INGRESS INTEGRATION ===
 
-        // Manual UDP handling (fallback when ipstack disabled or channel full)
+        // Manual UDP handling (fallback when kernel ingress disabled or unavailable)
         // Try to get SOCKS5 or other outbound from manager
         if let Some(outbound) = outbound_manager.get(outbound_tag) {
             let dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
@@ -4786,50 +4723,66 @@ pub fn get_proxy_udp_session_count() -> usize {
 }
 
 // ============================================================================
-// TUN Ingress Bridge Public API (feature-gated)
+// KernelIngress Integration (feature: use-netbridge-ingress)
 // ============================================================================
 
-/// Initialize the TUN ingress bridge (call once at startup)
+/// Initialize KernelIngress for WG ingress packet processing
 ///
-/// Returns a receiver channel for reply packets that should be sent back
-/// through WireGuard to clients. Each tuple contains:
-/// - The IP packet (BytesMut)
-/// - The peer's public key ([u8; 32])
+/// This creates a `KernelIngress` bridge with a `ControlPlaneHandler` for routing,
+/// starts it, and stores it in the global `KERNEL_INGRESS` static.
 ///
-/// # Errors
-///
-/// Returns an error if:
-/// - The bridge has already been initialized
-/// - Failed to create TUN device or TPROXY listener
-/// - Failed to apply iptables rules
-///
-/// # Arguments
-///
-/// * `rule_engine` - RuleEngine for routing decisions (required)
-/// * `fakedns_manager` - Optional FakeDnsManager for DNS hijacking and domain-based routing
-///   (only available when both `ipstack-tcp` and `fakedns` features are enabled)
-/// * `outbound_manager` - OutboundManager for outbound connections (required)
+/// When `use-netbridge-ingress` is enabled alongside `ipstack-tcp`, the KernelIngress
+/// takes priority and the legacy TunIngressBridge is not initialized.
 ///
 /// # Returns
 ///
-/// A tuple containing:
-/// - The reply receiver channel for routing packets back to WireGuard peers
-/// - The session tracker Arc for session lookup (used by `spawn_tun_reply_router`)
-#[cfg(feature = "ipstack-tcp")]
-pub async fn init_tun_ingress_bridge(
+/// - Reply packet receiver for routing replies back to WireGuard peers
+///
+/// # Errors
+///
+/// Returns an error if bridge creation or startup fails.
+#[cfg(feature = "use-netbridge-ingress")]
+pub async fn init_kernel_ingress(
     rule_engine: std::sync::Arc<crate::rules::engine::RuleEngine>,
     #[cfg(feature = "fakedns")] fakedns_manager: Option<
         std::sync::Arc<crate::fakedns::FakeDnsManager>,
     >,
     outbound_manager: std::sync::Arc<crate::outbound::OutboundManager>,
-) -> anyhow::Result<(
-    mpsc::Receiver<(bytes::BytesMut, [u8; 32])>,
-    Arc<TunSessionTracker>,
-)> {
-    // Build configuration from environment variables with sensible defaults
+    chain_manager: Option<std::sync::Arc<crate::chain::ChainManager>>,
+    dns_cache: Option<std::sync::Arc<crate::ingress::dns_cache::IpDomainCache>>,
+) -> anyhow::Result<mpsc::Receiver<crate::netbridge::types::ReplyPacket>> {
+    use crate::controlplane::ControlPlaneBuilder;
+    use crate::netbridge::kernel::{KernelIngress, KernelIngressConfig};
+    use crate::netbridge::traits::NetBridgeIngress;
+
+    // Build the ControlPlaneHandler
+    let mut builder = ControlPlaneBuilder::new()
+        .with_rule_engine(rule_engine)
+        .with_outbound_manager(outbound_manager);
+
+    if let Some(cm) = chain_manager {
+        builder = builder.with_chain_manager(cm);
+    }
+    if let Some(dc) = dns_cache {
+        builder = builder.with_dns_cache(dc);
+    }
+    #[cfg(feature = "fakedns")]
+    if let Some(fdns) = fakedns_manager {
+        builder = builder.with_fakedns(fdns);
+    }
+
+    let handler = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build ControlPlaneHandler: {}", e))?;
+    let handler: std::sync::Arc<dyn crate::netbridge::dataplane::ConnectionHandler> =
+        std::sync::Arc::new(handler);
+
+    // Read configuration from environment variables (same env vars as init_tun_ingress_bridge)
     let tun_name = std::env::var("TUN_BRIDGE_NAME").unwrap_or_else(|_| "tun-in".to_string());
     let tun_cidr =
         std::env::var("TUN_BRIDGE_CIDR").unwrap_or_else(|_| "10.25.0.1/24".to_string());
+    let tun_subnet =
+        std::env::var("TUN_BRIDGE_SUBNET").unwrap_or_else(|_| "10.25.0.0/24".to_string());
     let tun_mtu: u16 = std::env::var("TUN_BRIDGE_MTU")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -4847,577 +4800,107 @@ pub async fn init_tun_ingress_bridge(
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
 
-    let max_sessions_per_peer: usize = std::env::var("IPSTACK_MAX_SESSIONS_PER_PEER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(crate::tun_bridge::MAX_SESSIONS_PER_PEER);
-    let max_total_sessions: usize = std::env::var("IPSTACK_MAX_SESSIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(crate::tun_bridge::MAX_TOTAL_SESSIONS);
-
-    let mut config = TunIngressConfig::new(rule_engine, outbound_manager)
-        .with_tun_name(&tun_name)
-        .with_tun_cidr(&tun_cidr)
-        .with_tun_mtu(tun_mtu)
-        .with_tproxy_port(tproxy_port)
-        .with_fwmark(fwmark)
-        .with_route_table_id(route_table_id);
-
-    config.max_sessions_per_peer = max_sessions_per_peer;
-    config.max_total_sessions = max_total_sessions;
-
-    // Set FakeDNS manager if provided (enables DNS hijacking for domain-based routing)
-    #[cfg(feature = "fakedns")]
-    if let Some(fakedns) = fakedns_manager {
-        config = config.with_fakedns(fakedns);
-        info!("FakeDNS manager configured for TUN ingress bridge");
-    }
-
-    let mut bridge = TunIngressBridge::new(config)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create TunIngressBridge: {}", e))?;
-
-    let reply_rx = bridge
-        .take_reply_rx()
-        .ok_or_else(|| anyhow::anyhow!("Failed to take reply_rx from TunIngressBridge"))?;
-    let session_tracker = Arc::clone(bridge.session_tracker());
-
-    let bridge = Arc::new(bridge);
-
-    // Spawn the TPROXY accept loop task
-    let accept_bridge = Arc::clone(&bridge);
-    tokio::spawn(async move {
-        if let Err(e) = accept_bridge.run_accept_loop().await {
-            tracing::error!("TUN TPROXY accept loop error: {}", e);
-        }
-    });
-
-    // Spawn the TUN read loop task (for reply packets)
-    let read_bridge = Arc::clone(&bridge);
-    tokio::spawn(async move {
-        if let Err(e) = read_bridge.run_tun_read_loop().await {
-            tracing::error!("TUN read loop error: {}", e);
-        }
-    });
-
-    // Spawn the cleanup loop task
-    let cleanup_bridge = Arc::clone(&bridge);
-    tokio::spawn(async move {
-        cleanup_bridge.run_cleanup_loop().await;
-    });
-
-    TUN_INGRESS_BRIDGE
-        .set(bridge)
-        .map_err(|_| anyhow::anyhow!("TunIngressBridge already initialized"))?;
+    let tproxy_addr: std::net::SocketAddr =
+        format!("127.0.0.1:{}", tproxy_port).parse().unwrap();
 
     info!(
         tun_name = %tun_name,
+        tun_cidr = %tun_cidr,
+        tun_subnet = %tun_subnet,
+        tun_mtu = tun_mtu,
         tproxy_port = tproxy_port,
         fwmark = fwmark,
-        "TunIngressBridge initialized"
+        route_table_id = route_table_id,
+        "KernelIngress configuration resolved from environment"
     );
-    Ok((reply_rx, session_tracker))
-}
 
-/// Legacy alias for init_tun_ingress_bridge (for backwards compatibility)
-#[cfg(feature = "ipstack-tcp")]
-pub async fn init_ipstack_bridge(
-    rule_engine: Option<std::sync::Arc<crate::rules::engine::RuleEngine>>,
-    #[cfg(feature = "fakedns")] fakedns_manager: Option<
-        std::sync::Arc<crate::fakedns::FakeDnsManager>,
-    >,
-    outbound_manager: Option<std::sync::Arc<crate::outbound::OutboundManager>>,
-) -> anyhow::Result<(
-    mpsc::Receiver<(bytes::BytesMut, [u8; 32])>,
-    Arc<TunSessionTracker>,
-)> {
-    let rule_engine = rule_engine.ok_or_else(|| anyhow::anyhow!("RuleEngine is required"))?;
-    let outbound_manager =
-        outbound_manager.ok_or_else(|| anyhow::anyhow!("OutboundManager is required"))?;
+    let config = KernelIngressConfig::new(&tun_name, &tun_cidr, &tun_subnet)
+        .tproxy_addr(tproxy_addr)
+        .fwmark(fwmark)
+        .table_id(route_table_id)
+        .mtu(tun_mtu)
+        .with_handler(handler);
 
-    #[cfg(feature = "fakedns")]
-    return init_tun_ingress_bridge(rule_engine, fakedns_manager, outbound_manager).await;
+    let mut ingress = KernelIngress::new(config)
+        .map_err(|e| anyhow::anyhow!("Failed to create KernelIngress: {}", e))?;
 
-    #[cfg(not(feature = "fakedns"))]
-    return init_tun_ingress_bridge(rule_engine, outbound_manager).await;
-}
+    let reply_rx = ingress
+        .take_reply_rx()
+        .ok_or_else(|| anyhow::anyhow!("Failed to take reply_rx from KernelIngress"))?;
 
-/// Check if TUN bridge is enabled and running
-///
-/// Returns true if:
-/// - The ipstack-tcp feature is enabled
-/// - The bridge has been initialized
-/// - Runtime enable flag is set (default: true)
-#[cfg(feature = "ipstack-tcp")]
-#[must_use]
-pub fn is_ipstack_enabled() -> bool {
-    TUN_BRIDGE_ENABLED.load(Ordering::Relaxed) && TUN_INGRESS_BRIDGE.get().is_some()
-}
+    let ingress = std::sync::Arc::new(ingress);
 
-/// Set TUN bridge enabled/disabled at runtime
-///
-/// This allows dynamically enabling or disabling the TUN bridge without
-/// restarting the router. When disabled, traffic falls back to
-/// direct forwarding.
-#[cfg(feature = "ipstack-tcp")]
-pub fn set_ipstack_enabled(enabled: bool) {
-    TUN_BRIDGE_ENABLED.store(enabled, Ordering::Relaxed);
-    info!(
-        "TUN ingress bridge {}",
-        if enabled { "enabled" } else { "disabled" }
-    );
-}
-
-/// Get TUN ingress bridge statistics
-///
-/// Returns None if the bridge is not initialized.
-/// Returns TunIngressStatsSnapshot for monitoring.
-#[cfg(feature = "ipstack-tcp")]
-#[must_use]
-pub fn get_ipstack_stats() -> Option<TunIngressStatsSnapshot> {
-    let bridge = TUN_INGRESS_BRIDGE.get()?;
-    Some(bridge.stats_snapshot())
-}
-
-/// Get TUN ingress bridge diagnostic snapshot
-///
-/// Returns detailed diagnostics including session counts.
-/// Note: The TUN bridge returns stats snapshot (simpler than ipstack's sharded diagnostics)
-#[cfg(feature = "ipstack-tcp")]
-#[must_use]
-pub fn get_ipstack_diagnostics() -> Option<TunIngressStatsSnapshot> {
-    // TUN bridge has simpler stats - return the same snapshot
-    get_ipstack_stats()
-}
-
-/// Register a WgEgressBridge for a WireGuard egress tunnel
-///
-/// NOTE: The TUN + TPROXY bridge does not need WgEgressBridge registration
-/// because it uses kernel sockets that are directly routed. This function
-/// is kept for API compatibility but is a no-op.
-///
-/// # Arguments
-///
-/// * `tag` - The tunnel tag (e.g., "warp-1", "us_east_stream")
-/// * `bridge` - The WgEgressBridge instance for this tunnel
-///
-/// # Returns
-///
-/// Always returns `true` for API compatibility.
-#[cfg(feature = "ipstack-tcp")]
-pub fn register_wg_egress_bridge(
-    tag: String,
-    _bridge: std::sync::Arc<crate::outbound::WgEgressBridge>,
-) -> bool {
-    // TUN + TPROXY uses kernel routing, no need for WgEgressBridge registration
-    debug!("WgEgressBridge registration skipped for '{}' - TUN bridge uses kernel routing", tag);
-    true
-}
-
-/// Unregister a WgEgressBridge for a WireGuard egress tunnel
-///
-/// NOTE: The TUN + TPROXY bridge does not need WgEgressBridge registration/unregistration
-/// because it uses kernel sockets that are directly routed. This function
-/// is kept for API compatibility but is a no-op.
-///
-/// # Arguments
-///
-/// * `tag` - The tunnel tag to unregister
-///
-/// # Returns
-///
-/// Always returns `None` for API compatibility.
-#[cfg(feature = "ipstack-tcp")]
-pub fn unregister_wg_egress_bridge(
-    tag: &str,
-) -> Option<std::sync::Arc<crate::outbound::WgEgressBridge>> {
-    // TUN + TPROXY uses kernel routing, no need for WgEgressBridge unregistration
-    debug!("WgEgressBridge unregistration skipped for '{}' - TUN bridge uses kernel routing", tag);
-    None
-}
-
-/// Try to route a WG egress reply packet to the appropriate WgEgressBridge
-///
-/// NOTE: The TUN + TPROXY bridge handles replies through the kernel's routing
-/// and the TUN read loop. This function is kept for API compatibility but
-/// always returns false.
-///
-/// # Arguments
-///
-/// * `tunnel_tag` - The tag of the tunnel that received the reply
-/// * `packet` - The raw IP packet data
-///
-/// # Returns
-///
-/// Always returns `false` - TUN bridge uses kernel routing for replies
-#[cfg(feature = "ipstack-tcp")]
-pub fn try_route_wg_egress_reply(_tunnel_tag: &str, _packet: &[u8]) -> bool {
-    // TUN + TPROXY handles replies through the kernel's routing and TUN read loop
-    false
-}
-
-/// Spawn a task to route ipstack reply packets to WireGuard peers
-///
-/// This task receives reply packets from the IpStackBridge and sends them
-/// back to the appropriate WireGuard peer based on the peer_key.
-///
-/// # Arguments
-///
-/// * `ipstack_reply_rx` - Receiver for (packet, peer_key) tuples from IpStackBridge
-/// * `wg_ingress_manager` - Reference to the WireGuard ingress manager for sending packets
-/// * `session_tracker` - Session tracker for looking up peer_endpoint from 5-tuple
-///
-/// # Returns
-///
-/// A JoinHandle for the spawned task.
-///
-/// # Implementation Notes
-///
-/// This function processes packets **sequentially** for correct WireGuard operation:
-/// - WireGuard uses nonce counters that must be sequential per peer
-/// - The `send_to_peer` call handles encryption with proper nonce ordering
-/// - Per-peer sequential processing ensures reply packets arrive in the correct order
-///
-/// # Parallel Processing Architecture
-///
-/// WireGuard nonces only need to be sequential **per peer**, not globally.
-/// This implementation uses per-peer reply channels that allow parallel processing
-/// across different peers while maintaining sequential ordering within each peer:
-///
-/// ```text
-///                      ipstack_reply_rx (global)
-///                             |
-///                             v
-///                     +--------------+
-///                     | Fan-out task |
-///                     | (routes by   |
-///                     |  peer_key)   |
-///                     +--------------+
-///                             |
-///          +------------------+------------------+
-///          |                  |                  |
-///          v                  v                  v
-///    +----------+       +----------+       +----------+
-///    | Peer A   |       | Peer B   |       | Peer C   |
-///    | channel  |       | channel  |       | channel  |
-///    | + task   |       | + task   |       | + task   |
-///    +----------+       +----------+       +----------+
-///          |                  |                  |
-///          v                  v                  v
-///    send_to_peer()    send_to_peer()    send_to_peer()
-///    (sequential)      (sequential)      (sequential)
-/// ```
-///
-/// For throughput optimization, the TunIngressBridge uses the kernel's TCP/IP stack
-/// which provides better performance than userspace ipstack implementations.
-#[cfg(feature = "ipstack-tcp")]
-pub fn spawn_ipstack_reply_router(
-    mut tun_reply_rx: mpsc::Receiver<(bytes::BytesMut, [u8; 32])>,
-    wg_ingress_manager: Arc<super::manager::WgIngressManager>,
-    session_tracker: Arc<TunSessionTracker>,
-) -> tokio::task::JoinHandle<()> {
-    let router = ParallelReplyRouter::new(wg_ingress_manager, session_tracker);
-
+    // Spawn the run task (TUN read loop + TPROXY accept loop)
+    let run_ingress = std::sync::Arc::clone(&ingress);
     tokio::spawn(async move {
-        info!("Parallel TUN reply router started");
+        if let Err(e) = run_ingress.run().await {
+            tracing::error!("KernelIngress run loop error: {}", e);
+        }
+    });
 
-        while let Some((packet, peer_key)) = tun_reply_rx.recv().await {
-            router.route_packet(packet, peer_key).await;
+    // Store in global static
+    KERNEL_INGRESS
+        .set(ingress)
+        .map_err(|_| anyhow::anyhow!("KERNEL_INGRESS already initialized"))?;
+
+    info!("KernelIngress initialized for WG ingress (netbridge path)");
+
+    Ok(reply_rx)
+}
+
+/// Spawn the KernelIngress reply router
+///
+/// This routes reply packets from the KernelIngress back to the correct
+/// WireGuard peer via the WgIngressManager. The `ReplyPacket` already contains
+/// `peer_key` and `peer_endpoint`, so no session tracker lookup is needed.
+#[cfg(feature = "use-netbridge-ingress")]
+pub fn spawn_kernel_reply_router(
+    mut reply_rx: mpsc::Receiver<crate::netbridge::types::ReplyPacket>,
+    wg_ingress_manager: Arc<super::manager::WgIngressManager>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use base64::Engine;
+        info!("KernelIngress reply router started");
+        let mut count = 0u64;
+
+        while let Some(reply) = reply_rx.recv().await {
+            count += 1;
+            // ReplyPacket includes peer_key and peer_endpoint directly
+            let peer_key_b64 =
+                base64::engine::general_purpose::STANDARD.encode(reply.peer_key);
+            if let Err(e) = wg_ingress_manager
+                .send_to_peer(&peer_key_b64, reply.peer_endpoint, &reply.data)
+                .await
+            {
+                trace!("Failed to send reply to peer: {}", e);
+            }
         }
 
-        let stats = router.stats();
         info!(
-            "Parallel TUN reply router stopped: routed={}, failed={}, tasks_spawned={}, channel_drops={}",
-            stats.packets_routed.load(Ordering::Relaxed),
-            stats.packets_failed.load(Ordering::Relaxed),
-            stats.peer_tasks_spawned.load(Ordering::Relaxed),
-            stats.channel_full_drops.load(Ordering::Relaxed),
+            total_replies = count,
+            "KernelIngress reply router stopped"
         );
     })
 }
 
-/// Information needed to send a reply packet to a peer
-#[cfg(feature = "ipstack-tcp")]
-struct ReplyPacketInfo {
-    /// Decrypted IP packet to send
-    packet: bytes::BytesMut,
-    /// Peer's external endpoint (IP:port)
-    peer_endpoint: SocketAddr,
-    /// Peer's WireGuard public key (Base64)
-    peer_key_b64: String,
+/// Check if KernelIngress is enabled and running
+///
+/// Returns true if the `use-netbridge-ingress` feature is enabled
+/// and the bridge has been initialized.
+#[cfg(feature = "use-netbridge-ingress")]
+#[must_use]
+pub fn is_kernel_ingress_enabled() -> bool {
+    KERNEL_INGRESS.get().is_some()
 }
 
-/// Statistics for the parallel reply router
-#[cfg(feature = "ipstack-tcp")]
-pub struct ParallelReplyRouterStats {
-    /// Number of packets successfully routed to peers
-    pub packets_routed: AtomicU64,
-    /// Number of packets that failed to route
-    pub packets_failed: AtomicU64,
-    /// Number of per-peer tasks spawned
-    pub peer_tasks_spawned: AtomicU64,
-    /// Number of packets dropped due to full per-peer channel
-    pub channel_full_drops: AtomicU64,
-}
-
-#[cfg(feature = "ipstack-tcp")]
-impl Default for ParallelReplyRouterStats {
-    fn default() -> Self {
-        Self {
-            packets_routed: AtomicU64::new(0),
-            packets_failed: AtomicU64::new(0),
-            peer_tasks_spawned: AtomicU64::new(0),
-            channel_full_drops: AtomicU64::new(0),
-        }
-    }
-}
-
-/// Per-peer channel buffer size
+/// Get KernelIngress statistics snapshot
 ///
-/// This determines how many packets can be queued for a single peer before
-/// backpressure is applied. A larger buffer reduces the chance of drops
-/// during traffic bursts but increases memory usage per active peer.
-///
-/// At 1.5 Gbps with 1420-byte packets (~132K pps), a buffer of 256 fills in
-/// only 1.9ms, causing frequent drops. Increased to 4096 for ~31ms buffer,
-/// matching the global reply channel capacity.
-///
-/// Memory impact: ~60KB per active peer (4096 * ~15 bytes per packet info)
-#[cfg(feature = "ipstack-tcp")]
-const PEER_CHANNEL_BUFFER_SIZE: usize = 4096;
-
-/// Parallel reply router that distributes packets to per-peer channels
-///
-/// This allows multiple peers to process their reply packets concurrently
-/// while maintaining sequential ordering within each peer (required for
-/// WireGuard nonce correctness).
-#[cfg(feature = "ipstack-tcp")]
-struct ParallelReplyRouter {
-    /// Per-peer reply channels: peer_key bytes -> sender
-    peer_channels: Arc<DashMap<[u8; 32], mpsc::Sender<ReplyPacketInfo>>>,
-    /// WireGuard ingress manager for sending packets
-    wg_manager: Arc<super::manager::WgIngressManager>,
-    /// Session tracker for endpoint lookup (unified with TUN bridge)
-    session_tracker: Arc<TunSessionTracker>,
-    /// Statistics
-    stats: Arc<ParallelReplyRouterStats>,
-}
-
-#[cfg(feature = "ipstack-tcp")]
-impl ParallelReplyRouter {
-    /// Create a new parallel reply router
-    fn new(
-        wg_manager: Arc<super::manager::WgIngressManager>,
-        session_tracker: Arc<TunSessionTracker>,
-    ) -> Self {
-        Self {
-            peer_channels: Arc::new(DashMap::new()),
-            wg_manager,
-            session_tracker,
-            stats: Arc::new(ParallelReplyRouterStats::default()),
-        }
-    }
-
-    /// Get router statistics
-    fn stats(&self) -> &ParallelReplyRouterStats {
-        &self.stats
-    }
-
-    /// Route a packet to the appropriate per-peer channel
-    ///
-    /// This method:
-    /// 1. Parses the packet and looks up the session
-    /// 2. Gets or creates a per-peer channel
-    /// 3. Sends the packet info to the channel (non-blocking)
-    async fn route_packet(&self, packet: bytes::BytesMut, peer_key: [u8; 32]) {
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine;
-
-        // Parse packet and look up session first (before routing)
-        let Some(info) = self.prepare_packet_info(packet, peer_key) else {
-            return;
-        };
-
-        // Get or create per-peer channel
-        let sender = self.get_or_create_peer_channel(peer_key);
-
-        // Non-blocking send to per-peer channel
-        match sender.try_send(info) {
-            Ok(()) => {
-                // Successfully queued for per-peer processing
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.stats
-                    .channel_full_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                // Don't log at trace level to avoid log spam under load
-                // The packet is dropped; TCP will retransmit if needed
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                // Peer task died unexpectedly, remove stale channel and retry once
-                self.peer_channels.remove(&peer_key);
-                debug!(
-                    "Peer task closed unexpectedly for {}..., removed channel",
-                    &BASE64.encode(peer_key)[..8]
-                );
-            }
-        }
-    }
-
-    /// Prepare packet info by parsing and looking up the session
-    ///
-    /// Returns `None` if the packet is invalid or no session exists.
-    fn prepare_packet_info(
-        &self,
-        packet: bytes::BytesMut,
-        peer_key: [u8; 32],
-    ) -> Option<ReplyPacketInfo> {
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine;
-
-        let peer_key_b64 = BASE64.encode(peer_key);
-
-        // Parse the packet to find the session info
-        let parsed = match parse_ip_packet(&packet) {
-            Some(p) => p,
-            None => {
-                debug!("Failed to parse ipstack reply packet");
-                self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-
-        // Get ports for session lookup
-        let (src_port, dst_port) = match (parsed.src_port, parsed.dst_port) {
-            (Some(s), Some(d)) => (s, d),
-            _ => {
-                debug!("IpStack reply packet missing ports");
-                self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-
-        // Look up the original session to get the peer endpoint
-        // Reply packets have swapped src/dst compared to the original flow
-        // Create lookup key using TUN bridge FiveTuple (uses SocketAddr)
-        // For reply packets: src_addr is the server (was dst), dst_addr is the client (was src)
-        let reply_src_addr = SocketAddr::new(parsed.src_ip, src_port);
-        let reply_dst_addr = SocketAddr::new(parsed.dst_ip, dst_port);
-        let reply_tuple = if parsed.protocol == IPPROTO_TCP {
-            TunFiveTuple::tcp(reply_src_addr, reply_dst_addr)
-        } else {
-            TunFiveTuple::udp(reply_src_addr, reply_dst_addr)
-        };
-
-        // Use TUN session tracker lookup_by_reply (handles tuple reversal internally)
-        let session_info = match self.session_tracker.lookup_by_reply(&reply_tuple) {
-            Some(info) => info,
-            None => {
-                trace!(
-                    "No session for TUN reply: {} -> {}",
-                    parsed.src_ip,
-                    parsed.dst_ip
-                );
-                self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        };
-
-        let session_peer_key_b64 = BASE64.encode(session_info.peer_key);
-        let peer_endpoint = session_info.peer_endpoint();
-
-        // Verify peer key matches
-        if session_info.peer_key != peer_key {
-            debug!(
-                "TUN reply peer key mismatch: expected {}, got {}",
-                &peer_key_b64[..8.min(peer_key_b64.len())],
-                &session_peer_key_b64[..8.min(session_peer_key_b64.len())]
-            );
-            self.stats.packets_failed.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-
-        Some(ReplyPacketInfo {
-            packet,
-            peer_endpoint,
-            peer_key_b64,
-        })
-    }
-
-    /// Get or create a per-peer channel
-    ///
-    /// If a channel already exists for this peer, returns the sender.
-    /// Otherwise, creates a new channel and spawns a task to process it.
-    fn get_or_create_peer_channel(&self, peer_key: [u8; 32]) -> mpsc::Sender<ReplyPacketInfo> {
-        // Fast path: channel exists
-        if let Some(sender) = self.peer_channels.get(&peer_key) {
-            return sender.clone();
-        }
-
-        // Slow path: create new channel and spawn task
-        // Use entry API to avoid race conditions
-        let entry = self.peer_channels.entry(peer_key);
-        entry
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(PEER_CHANNEL_BUFFER_SIZE);
-                self.spawn_peer_task(peer_key, rx);
-                self.stats
-                    .peer_tasks_spawned
-                    .fetch_add(1, Ordering::Relaxed);
-                tx
-            })
-            .clone()
-    }
-
-    /// Spawn a task to process packets for a single peer
-    ///
-    /// This task processes packets sequentially for the peer, ensuring
-    /// WireGuard nonces remain in order. The task automatically terminates
-    /// when the channel is closed (sender dropped or router shutdown).
-    fn spawn_peer_task(&self, peer_key: [u8; 32], mut rx: mpsc::Receiver<ReplyPacketInfo>) {
-        use base64::engine::general_purpose::STANDARD as BASE64;
-        use base64::Engine;
-
-        let wg_manager = Arc::clone(&self.wg_manager);
-        let stats = Arc::clone(&self.stats);
-        let peer_channels = Arc::clone(&self.peer_channels);
-        let peer_key_b64_for_log = BASE64.encode(peer_key);
-
-        tokio::spawn(async move {
-            trace!(
-                "Per-peer reply task started for {}...",
-                &peer_key_b64_for_log[..8]
-            );
-
-            // Process packets sequentially for this peer
-            while let Some(info) = rx.recv().await {
-                match wg_manager
-                    .send_to_peer(&info.peer_key_b64, info.peer_endpoint, &info.packet)
-                    .await
-                {
-                    Ok(()) => {
-                        stats.packets_routed.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        stats.packets_failed.fetch_add(1, Ordering::Relaxed);
-                        debug!(
-                            "Failed to send reply to peer {}: {}",
-                            &info.peer_key_b64[..8],
-                            e
-                        );
-                    }
-                }
-            }
-
-            // Channel closed, clean up
-            peer_channels.remove(&peer_key);
-            trace!(
-                "Per-peer reply task stopped for {}...",
-                &peer_key_b64_for_log[..8]
-            );
-        });
-    }
+/// Returns None if the bridge is not initialized.
+#[cfg(feature = "use-netbridge-ingress")]
+#[must_use]
+pub fn get_kernel_ingress_stats() -> Option<crate::netbridge::kernel::KernelIngressStatsSnapshot> {
+    let ingress = KERNEL_INGRESS.get()?;
+    Some(ingress.stats_snapshot())
 }
 
 // ============================================================================

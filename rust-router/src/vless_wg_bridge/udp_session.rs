@@ -77,13 +77,13 @@ use super::events::{UdpReply, UdpSessionKey};
 /// Default UDP session timeout (30 seconds)
 ///
 /// UDP sessions with no activity for this duration are considered expired.
-/// This matches the value in `smoltcp_utils/config.rs`.
+/// This matches the value in `netbridge/config.rs`.
 pub const UDP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// DNS UDP session timeout (10 seconds)
 ///
 /// DNS queries should complete quickly, so we use a shorter timeout
-/// to free up resources faster. This matches the value in `smoltcp_utils/config.rs`.
+/// to free up resources faster. This matches the value in `netbridge/config.rs`.
 pub const UDP_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Activity update interval (packet count)

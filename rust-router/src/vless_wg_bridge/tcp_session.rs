@@ -29,7 +29,7 @@
 //!
 //! ```ignore
 //! use rust_router::vless_wg_bridge::tcp_session::{TcpSession, TcpSessionState};
-//! use rust_router::smoltcp_utils::ConnId;
+//! use rust_router::netbridge::ConnId;
 //! use tokio::sync::mpsc;
 //!
 //! let conn_id = ConnId::from_raw(42);

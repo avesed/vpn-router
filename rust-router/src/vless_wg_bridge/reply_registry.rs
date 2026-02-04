@@ -11,7 +11,17 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-use super::bridge::WgReplyPacket;
+/// WireGuard reply packet
+///
+/// This struct is used by the legacy VlessWgBridge for routing replies.
+/// For new code, use the types from `netbridge` or `sharded_bridge` instead.
+#[derive(Debug)]
+pub struct WgReplyPacket {
+    /// Tunnel tag
+    pub tag: String,
+    /// IP packet data
+    pub packet: Vec<u8>,
+}
 
 /// Key for session lookup in the registry
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

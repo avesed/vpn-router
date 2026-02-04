@@ -1,177 +1,28 @@
-//! TUN + TPROXY Bridge Module
+//! TUN + TPROXY Bridge Module (Legacy Compatibility)
 //!
-//! This module provides high-performance bridges for routing traffic between
-//! WireGuard, VLESS/Shadowsocks, and outbound connections using TUN devices.
+//! This module provides backward-compatible re-exports from `netbridge` for code
+//! that still uses `tun_bridge` types. The actual implementation has been moved
+//! to `netbridge::kernel`.
 //!
-//! # Module Overview
+//! # Migration
 //!
-//! ## Ingress Bridge (`ingress.rs`)
+//! New code should use `netbridge` directly:
+//! - `netbridge::KernelIngress` instead of `TunIngressBridge`
+//! - `netbridge::FiveTuple` instead of local `FiveTuple`
+//! - `netbridge::SessionTracker` instead of local `SessionTracker`
 //!
-//! Routes WireGuard ingress traffic through the kernel's TCP/IP stack using
-//! TUN device + TPROXY. Used for: WG -> Direct/SOCKS5/VLESS outbound.
+//! # Note
 //!
-//! ## Egress Bridge (`egress.rs`)
-//!
-//! Routes VLESS/Shadowsocks inbound TCP/UDP streams through WireGuard tunnels
-//! using kernel sockets bound to a TUN device. Used for: VLESS/SS -> WG outbound.
-//!
-//! # Ingress Architecture
-//!
-//! ```text
-//! WireGuard (boringtun)          Linux Kernel                    Outbound
-//!       │                            │                              │
-//!       ▼                            ▼                              ▼
-//! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │                         TunIngressBridge                                │
-//! │                                                                         │
-//! │  ┌─────────────────────────┐   ┌──────────────────────────────────┐   │
-//! │  │   inject_packet()       │   │        TproxyListener             │   │
-//! │  │   ────────────────►     │   │   ◄───────────────────────        │   │
-//! │  │   WG decrypted packet   │   │   Intercepted TCP/UDP             │   │
-//! │  │                         │   │   with original destination       │   │
-//! │  └───────────┬─────────────┘   └──────────────┬───────────────────┘   │
-//! │              │                                │                        │
-//! │              ▼                                ▼                        │
-//! │  ┌─────────────────────────┐   ┌──────────────────────────────────┐   │
-//! │  │     TUN Device          │   │     run_accept_loop()             │   │
-//! │  │   (write IP packets)    │   │   - DNS hijack (FakeDNS)         │   │
-//! │  │         │               │   │   - Domain resolution            │   │
-//! │  │         ▼               │   │   - Rule matching                │   │
-//! │  │   Kernel routes to      │   │   - Outbound connect             │   │
-//! │  │   TPROXY listener       │   │   - Bidirectional copy           │   │
-//! │  └─────────────────────────┘   └──────────────────────────────────┘   │
-//! │                                                                        │
-//! │  ┌─────────────────────────┐   ┌──────────────────────────────────┐   │
-//! │  │   run_tun_read_loop()   │   │        SessionTracker             │   │
-//! │  │   ────────────────►     │   │   - 5-tuple → peer_key mapping   │   │
-//! │  │   Reply packets from    │   │   - Thread-safe (DashMap)        │   │
-//! │  │   kernel → WG peer      │   │   - Session timeout cleanup      │   │
-//! │  └─────────────────────────┘   └──────────────────────────────────┘   │
-//! │                                                                        │
-//! │  ┌─────────────────────────────────────────────────────────────────┐  │
-//! │  │                     IptablesManager                              │  │
-//! │  │   - TPROXY mangle rules (TCP/UDP)                               │  │
-//! │  │   - Policy routing (fwmark → table)                             │  │
-//! │  │   - Local route for TPROXY                                      │  │
-//! │  │   - sysctl settings (ip_forward, route_localnet, rp_filter)     │  │
-//! │  └─────────────────────────────────────────────────────────────────┘  │
-//! └─────────────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Egress Architecture
-//!
-//! ```text
-//! VLESS/SS Inbound                  Kernel Space                    WireGuard Egress
-//! ┌─────────────────┐              ┌─────────────────┐              ┌─────────────────┐
-//! │ TCP/UDP Stream  │───────────▶  │ Socket (bound   │──────────▶  │ TUN Device      │
-//! │ from VLESS/SS   │              │ to tun-out)     │              │ (tun-out)       │
-//! └─────────────────┘              └─────────────────┘              └────────┬────────┘
-//!                                                                            │
-//!                                                                            │ IP packets
-//!                                                                            ▼
-//!                                                                   ┌─────────────────┐
-//!                                                                   │ WgEgressManager │
-//!                                                                   │ (send to tunnel)│
-//!                                                                   └─────────────────┘
-//! ```
-//!
-//! # Advantages over ipstack
-//!
-//! | Aspect | ipstack (userspace) | TUN + TPROXY (kernel) |
-//! |--------|---------------------|------------------------|
-//! | TCP implementation | Userspace (limited) | Kernel (full-featured) |
-//! | Congestion control | Basic | CUBIC, BBR, etc. |
-//! | Performance | 30-80 Mbps | 200+ Mbps |
-//! | Memory usage | Higher (buffers) | Lower (kernel manages) |
-//! | Connection tracking | Manual | Kernel conntrack |
-//! | Path MTU discovery | Manual | Kernel handles |
-//!
-//! # Data Flow
-//!
-//! ## Ingress (client → outbound):
-//! 1. WireGuard decrypts packet → `inject_packet()`
-//! 2. Packet written to TUN device
-//! 3. Kernel routes packet, TPROXY intercepts
-//! 4. `run_accept_loop()` accepts connection
-//! 5. FakeDNS/SNI resolution for domain routing
-//! 6. `OutboundManager::connect()` to destination
-//! 7. Bidirectional copy until connection closes
-//!
-//! ## Egress (outbound → client):
-//! 1. Outbound sends data through kernel socket
-//! 2. Kernel generates reply packets
-//! 3. Packets routed to TUN device
-//! 4. `run_tun_read_loop()` reads reply packets
-//! 5. `SessionTracker` looks up peer_key by 5-tuple
-//! 6. Reply sent to `reply_tx` for WireGuard encryption
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use rust_router::tun_bridge::{TunIngressBridge, TunIngressConfig};
-//!
-//! // Create configuration
-//! let config = TunIngressConfig {
-//!     tun_name: "tun-in".to_string(),
-//!     tun_cidr: "10.25.0.1/24".to_string(),
-//!     tun_mtu: 1420,
-//!     tproxy_port: 7893,
-//!     fwmark: 0x1,
-//!     route_table_id: 100,
-//!     fakedns: Arc::clone(&fakedns_manager),
-//!     rule_engine: Arc::clone(&rule_engine),
-//!     outbound_manager: Arc::clone(&outbound_manager),
-//! };
-//!
-//! // Create bridge
-//! let mut bridge = TunIngressBridge::new(config).await?;
-//!
-//! // Get reply receiver for WireGuard encryption
-//! let reply_rx = bridge.take_reply_rx().unwrap();
-//!
-//! // Spawn the accept loop and TUN read loop
-//! let bridge = Arc::new(bridge);
-//! tokio::spawn({
-//!     let bridge = Arc::clone(&bridge);
-//!     async move { bridge.run_accept_loop().await }
-//! });
-//! tokio::spawn({
-//!     let bridge = Arc::clone(&bridge);
-//!     async move { bridge.run_tun_read_loop().await }
-//! });
-//!
-//! // Inject packets from WireGuard
-//! bridge.inject_packet(packet, peer_key, peer_endpoint, "direct").await?;
-//! ```
-//!
-//! # Requirements
-//!
-//! - Linux kernel with TUN and TPROXY support
-//! - `CAP_NET_ADMIN` capability (for TUN, iptables, routing)
-//! - `CAP_NET_RAW` capability (for TPROXY)
-//! - iptables installed
-//!
-//! # Feature Flags
-//!
-//! This module is always compiled. Feature-specific functionality:
-//! - `fakedns`: Enables FakeDNS integration for domain-based routing
-//! - `sni-sniffing`: Enables TLS SNI extraction for domain resolution
+//! The original TunIngressBridge implementation has been removed in favor of
+//! netbridge::KernelIngress. This module now only provides:
+//! - Constants for backward compatibility
+//! - Re-exports from netbridge for gradual migration
+//! - IptablesManager re-export (for backward compatibility)
 
-mod egress;
-mod ingress;
 mod iptables;
-mod session;
 
-// Re-export public types - Ingress
-pub use ingress::{TunIngressBridge, TunIngressConfig, TunIngressStats, TunIngressStatsSnapshot};
+// Re-export iptables manager for backward compatibility
 pub use iptables::IptablesManager;
-pub use session::{FiveTuple, SessionInfo, SessionTracker};
-
-// Re-export public types - Egress
-pub use egress::{
-    EgressRoutingManager, SessionId, TcpConnectionStats, TunEgressBridge, TunEgressConfig,
-    TunEgressStats, TunnelRouter, UdpConnectionStats,
-};
 
 /// Default TPROXY listener port
 pub const DEFAULT_TPROXY_PORT: u16 = 7893;
@@ -220,19 +71,6 @@ pub const SNI_PEEK_TIMEOUT_MS: u64 = 50;
 
 /// TCP connect timeout in seconds
 pub const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
-
-// =============================================================================
-// Egress Bridge Constants
-// =============================================================================
-
-/// Default egress TUN device name
-pub const DEFAULT_EGRESS_TUN_NAME: &str = "tun-out";
-
-/// Default egress TUN CIDR
-pub const DEFAULT_EGRESS_TUN_CIDR: &str = "10.200.200.1/24";
-
-/// Default routing table ID for egress TUN
-pub const DEFAULT_EGRESS_ROUTE_TABLE: u32 = 201;
 
 // =============================================================================
 // Migration Compatibility Re-exports from netbridge
@@ -290,11 +128,4 @@ mod tests {
         assert_eq!(TCP_CONNECT_TIMEOUT_SECS, 10);
     }
 
-    #[test]
-    fn test_egress_constants() {
-        assert_eq!(DEFAULT_EGRESS_TUN_NAME, "tun-out");
-        assert_eq!(DEFAULT_EGRESS_TUN_CIDR, "10.200.200.1/24");
-        assert_eq!(DEFAULT_EGRESS_ROUTE_TABLE, 201);
-        // Note: fwmark removed - egress uses SO_BINDTODEVICE instead
-    }
 }

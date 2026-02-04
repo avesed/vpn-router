@@ -43,9 +43,9 @@
 //!
 //! # Key Components
 //!
-//! - [`crate::smoltcp_utils::config`]: Configuration constants (socket limits, timeouts, buffer sizes)
-//! - [`crate::smoltcp_utils::error`]: Error types for bridge operations
-//! - [`crate::smoltcp_utils::port_allocator`]: Ephemeral port allocation with TIME_WAIT tracking
+//! - [`crate::netbridge::config`]: Configuration constants (socket limits, timeouts, buffer sizes)
+//! - [`crate::netbridge::error`]: Error types for bridge operations (`NetBridgeError`)
+//! - [`crate::netbridge::port`]: Ephemeral port allocation with TIME_WAIT tracking
 //! - [`session`]: VLESS-specific session tracking with forward and reverse indices
 //!
 //! # Usage
@@ -73,10 +73,9 @@
 //! # Implementation Notes
 //!
 //! This module shares common infrastructure with other smoltcp bridges via
-//! `crate::smoltcp_utils`. VLESS-specific components (session tracking, UDP framing,
+//! `crate::netbridge`. VLESS-specific components (session tracking, UDP framing,
 //! reply registry) are defined here.
 
-pub mod bridge;
 pub mod cleanup;
 pub mod event_channel;
 pub mod events;
@@ -85,7 +84,6 @@ pub mod session;
 pub mod shard;
 pub mod sharded_bridge;
 pub mod sharded_reply_registry;
-pub mod supervisor;
 pub mod tcp_session;
 pub mod udp_frame;
 pub mod udp_session;
@@ -132,12 +130,13 @@ pub use session::{
 
 pub use udp_frame::{UdpFrameAddress, VlessUdpCodec, VlessUdpFrame};
 
-pub use bridge::{
-    BridgeStats, BridgeStatsSnapshot, RawUdpReply, RawUdpSessionKey, VlessUdpMode, VlessWgBridge,
-    WgReplyPacket,
-};
+// Compatibility re-exports for code that uses these types from vless_wg_bridge
+// RawUdpReply is provided by sharded_bridge (the modern implementation)
+#[cfg(any(feature = "use-netbridge-egress", feature = "sharded-vless-wg-bridge"))]
+pub use sharded_bridge::RawUdpReply;
 
-pub use reply_registry::{RegistryStatsSnapshot, VlessReplyKey, VlessReplyRegistry};
+// WgReplyPacket is now defined in reply_registry (always available)
+pub use reply_registry::{RegistryStatsSnapshot, VlessReplyKey, VlessReplyRegistry, WgReplyPacket};
 
 // Event Bus types for the new architecture
 pub use events::{BridgeEvent, EventPriority, TcpReply, UdpReply, UdpSessionKey};
@@ -168,13 +167,6 @@ pub use cleanup::{
     CleanupConfig, CleanupStats, CLEANUP_INTERVAL_SECS, TCP_IDLE_TIMEOUT_SECS as CLEANUP_TCP_TIMEOUT_SECS,
     UDP_DEFAULT_TIMEOUT_SECS as CLEANUP_UDP_DEFAULT_TIMEOUT_SECS,
     UDP_DNS_TIMEOUT_SECS as CLEANUP_UDP_DNS_TIMEOUT_SECS,
-};
-
-// Shard Supervisor for monitoring and recovery (Task 3.3)
-pub use supervisor::{
-    BoxedShardFactory, ShardFactory, ShardHealth, ShardSupervisor, SupervisorConfig, SupervisorStats,
-    DEFAULT_CIRCUIT_BREAKER_RESET_SECS, DEFAULT_MAX_CONSECUTIVE_FAILURES, DEFAULT_RESTART_DELAY_MS,
-    HEALTH_CHECK_INTERVAL_SECS,
 };
 
 // ShardedVlessWgBridge routing layer (Task 3.1) + Public API (Task 3.2)

@@ -818,7 +818,7 @@ pub struct EgressStats {
 }
 
 // =============================================================================
-// Connection ID (migrated from smoltcp_utils/conn_id.rs)
+// Connection ID
 // =============================================================================
 
 /// Number of bits reserved for the shard index

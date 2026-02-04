@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use tokio::signal;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{debug, error, info, trace, warn, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 
@@ -65,9 +65,9 @@ use rust_router::tproxy::{
     has_net_admin_capability, is_root, TproxyListener, UdpWorkerPool, UdpWorkerPoolConfig,
 };
 
-// IpStack bridge for TCP handling (feature-gated)
-#[cfg(feature = "ipstack-tcp")]
-use rust_router::ingress::{init_ipstack_bridge, spawn_ipstack_reply_router};
+// KernelIngress bridge for TCP handling (netbridge path, feature-gated)
+#[cfg(feature = "use-netbridge-ingress")]
+use rust_router::ingress::{init_kernel_ingress, spawn_kernel_reply_router};
 
 /// Command-line arguments
 struct Args {
@@ -548,6 +548,18 @@ async fn main() -> Result<()> {
     #[cfg(feature = "sharded-vless-wg-bridge")]
     debug!("Created ShardedBridgeReplyRegistry for sharded bridge reply routing");
 
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    let ingress_subnet: ipnet::Ipv4Net = userspace_wg_config
+        .wg_subnet
+        .parse()
+        .unwrap_or_else(|e| {
+            warn!("Failed to parse wg_subnet '{}': {}, using default 10.25.0.0/24",
+                  userspace_wg_config.wg_subnet, e);
+            "10.25.0.0/24".parse().unwrap()
+        });
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    info!(ingress_subnet = %ingress_subnet, "Reply routing: using ingress subnet filter");
+
     let wg_reply_handler = Arc::new(WgReplyHandler::new({
         let reply_router_tx = Arc::clone(&reply_router_tx);
         let peer_tunnel_tx = Arc::clone(&peer_tunnel_tx);
@@ -558,11 +570,37 @@ async fn main() -> Result<()> {
         let sharded_registry = Arc::clone(&sharded_bridge_reply_registry);
         move |packet, tunnel_tag: String| {
             // First, try to route to sharded bridges (feature-gated)
+            // Skip for packets destined to WG ingress subnet — these are direct
+            // forwarding replies (post-DNAT) that must reach reply_router.
             #[cfg(feature = "sharded-vless-wg-bridge")]
             {
-                if sharded_registry.try_route(&tunnel_tag, &packet) {
-                    // Successfully routed to a sharded bridge
-                    return;
+                let is_wg_client_reply = if packet.len() >= 20 && (packet[0] >> 4) == 4 {
+                    let dst = std::net::Ipv4Addr::new(
+                        packet[16], packet[17], packet[18], packet[19],
+                    );
+                    let in_subnet = ingress_subnet.contains(&dst);
+                    trace!(
+                        dst_ip = %dst,
+                        in_ingress_subnet = in_subnet,
+                        tunnel = %tunnel_tag,
+                        "Reply routing: subnet check"
+                    );
+                    in_subnet
+                } else {
+                    trace!(
+                        pkt_len = packet.len(),
+                        tunnel = %tunnel_tag,
+                        "Reply routing: non-IPv4, skipping sharded registry"
+                    );
+                    true
+                };
+
+                if !is_wg_client_reply {
+                    if sharded_registry.try_route(&tunnel_tag, &packet) {
+                        trace!(tunnel = %tunnel_tag, "Reply routed to sharded bridge");
+                        return;
+                    }
+                    trace!(tunnel = %tunnel_tag, "Sharded bridge did not claim reply, falling through");
                 }
             }
 
@@ -571,16 +609,6 @@ async fn main() -> Result<()> {
             if vless_registry.try_route(&tunnel_tag, &packet) {
                 // Successfully routed to a VLESS session
                 return;
-            }
-
-            // Try to route to WgEgressBridge (ipstack -> WG egress)
-            // This handles replies from WG tunnels used by ipstack for WG egress routing
-            #[cfg(feature = "ipstack-tcp")]
-            {
-                if rust_router::ingress::try_route_wg_egress_reply(&tunnel_tag, &packet) {
-                    // Successfully routed to a WgEgressBridge
-                    return;
-                }
             }
 
             // Route peer tunnel packets (peer-*) to the peer tunnel processor
@@ -964,7 +992,7 @@ async fn main() -> Result<()> {
     let mut forwarding_task_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut peer_tunnel_task_handle: Option<tokio::task::JoinHandle<()>> = None;
-    #[cfg(feature = "ipstack-tcp")]
+    #[cfg(any(feature = "ipstack-tcp", feature = "use-netbridge-ingress"))]
     let mut ipstack_reply_task_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     if let Some(ref ingress_mgr) = wg_ingress_manager {
@@ -1009,6 +1037,10 @@ async fn main() -> Result<()> {
                 let direct_reply_tx = reply_tx.clone();
                 *reply_router_tx.write() = Some(reply_tx);
 
+                // Clone dns_cache before moving it, so it can be used by KernelIngress
+                #[cfg(feature = "use-netbridge-ingress")]
+                let dns_cache_for_ingress = Arc::clone(&dns_cache);
+
                 let reply_handle = rust_router::ingress::spawn_reply_router(
                     reply_rx,
                     Arc::clone(ingress_mgr),
@@ -1037,39 +1069,39 @@ async fn main() -> Result<()> {
                     Some(Arc::new(manager))
                 };
 
-                // Initialize IpStack bridge for TCP handling (replaces manual TCP state machine)
-                #[cfg(feature = "ipstack-tcp")]
+                // Initialize KernelIngress for TCP/UDP handling (netbridge path)
+                #[cfg(feature = "use-netbridge-ingress")]
                 {
-                    // Pass rule_engine for domain-based routing (SNI/FakeDNS)
-                    // Pass outbound_manager for proxy routing (VLESS, Shadowsocks, SOCKS5, etc.)
-                    let ipstack_rule_engine = Some(Arc::clone(&rule_engine));
-                    let ipstack_outbound_manager = Some(Arc::clone(&outbound_manager));
                     #[cfg(feature = "fakedns")]
-                    let init_result = init_ipstack_bridge(
-                        ipstack_rule_engine,
+                    let init_result = init_kernel_ingress(
+                        Arc::clone(&rule_engine),
                         fakedns_manager.clone(),
-                        ipstack_outbound_manager,
+                        Arc::clone(&outbound_manager),
+                        Some(Arc::clone(&chain_manager)),
+                        Some(dns_cache_for_ingress),
                     )
                     .await;
                     #[cfg(not(feature = "fakedns"))]
-                    let init_result =
-                        init_ipstack_bridge(ipstack_rule_engine, ipstack_outbound_manager).await;
+                    let init_result = init_kernel_ingress(
+                        Arc::clone(&rule_engine),
+                        Arc::clone(&outbound_manager),
+                        Some(Arc::clone(&chain_manager)),
+                        Some(dns_cache_for_ingress),
+                    )
+                    .await;
 
                     match init_result {
-                        Ok((ipstack_reply_rx, ipstack_session_tracker)) => {
-                            info!("IpStack bridge initialized for TCP handling");
-                            // Spawn reply router for ipstack (routes TCP replies back to WireGuard peers)
-                            // Uses the bridge's unified SessionTracker which now includes peer_endpoint
-                            let ipstack_handle = spawn_ipstack_reply_router(
-                                ipstack_reply_rx,
+                        Ok(kernel_reply_rx) => {
+                            info!("KernelIngress initialized for TCP/UDP handling (netbridge path)");
+                            let kernel_handle = spawn_kernel_reply_router(
+                                kernel_reply_rx,
                                 Arc::clone(ingress_mgr),
-                                ipstack_session_tracker,
                             );
-                            ipstack_reply_task_handle = Some(ipstack_handle);
-                            info!("IpStack reply router started");
+                            ipstack_reply_task_handle = Some(kernel_handle);
+                            info!("KernelIngress reply router started");
                         }
                         Err(e) => {
-                            error!("Failed to initialize IpStack bridge: {}. TCP connections will use fallback.", e);
+                            error!("Failed to initialize KernelIngress: {}. TCP/UDP ingress via TPROXY will be unavailable.", e);
                         }
                     }
                 }
@@ -1215,12 +1247,12 @@ async fn main() -> Result<()> {
         info!("Reply router task shutdown complete");
     }
 
-    // Shutdown IpStack reply router task
-    #[cfg(feature = "ipstack-tcp")]
+    // Shutdown IpStack / KernelIngress reply router task
+    #[cfg(any(feature = "ipstack-tcp", feature = "use-netbridge-ingress"))]
     if let Some(handle) = ipstack_reply_task_handle {
-        info!("Waiting for IpStack reply router task to complete...");
+        info!("Waiting for ingress reply router task to complete...");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-        info!("IpStack reply router task shutdown complete");
+        info!("Ingress reply router task shutdown complete");
     }
 
     // Shutdown peer tunnel processor task (drop sender to close channel)

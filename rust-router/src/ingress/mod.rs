@@ -116,22 +116,10 @@ pub use socks5_server::{
     Socks5Server, Socks5ServerConfig, Socks5ServerStats, Socks5ServerStatsSnapshot,
 };
 
-// TUN ingress bridge (feature-gated)
-// Note: Uses TunIngressBridge internally which leverages the kernel's TCP/IP stack
-// via TUN + TPROXY for better performance (200+ Mbps vs ipstack's 30-80 Mbps).
-#[cfg(feature = "ipstack-tcp")]
+// KernelIngress bridge (feature-gated: use-netbridge-ingress)
+// Uses netbridge::KernelIngress + ControlPlaneHandler for WG ingress packet processing.
+#[cfg(feature = "use-netbridge-ingress")]
 pub use forwarder::{
-    get_ipstack_diagnostics, get_ipstack_stats, init_ipstack_bridge, init_tun_ingress_bridge,
-    is_ipstack_enabled, set_ipstack_enabled, spawn_ipstack_reply_router, try_route_wg_egress_reply,
+    get_kernel_ingress_stats, init_kernel_ingress, is_kernel_ingress_enabled,
+    spawn_kernel_reply_router,
 };
-
-// Re-export TUN bridge types for public API
-#[cfg(feature = "ipstack-tcp")]
-pub use crate::tun_bridge::{
-    FiveTuple as TunFiveTuple, SessionInfo as TunSessionInfo, SessionTracker as TunSessionTracker,
-    TunIngressBridge, TunIngressConfig, TunIngressStats, TunIngressStatsSnapshot,
-};
-
-// Note: ipstack_bridge module has been removed.
-// TunIngressBridge (TUN + TPROXY) now provides the WG ingress → outbound path.
-// The vless_wg_bridge module is still used for VLESS/SS → WG egress path.

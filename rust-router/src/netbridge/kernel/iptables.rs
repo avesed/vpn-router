@@ -1,7 +1,7 @@
 //! iptables rule management for the kernel backend
 //!
 //! This module manages the iptables and routing rules required for TPROXY
-//! transparent proxying, wrapping the existing `tun_bridge::IptablesManager`.
+//! transparent proxying, wrapping the `IptablesManager` from `iptables_core`.
 //!
 //! # Architecture
 //!
@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::netbridge::error::{NetBridgeError, Result};
-use crate::tun_bridge::IptablesManager;
+use super::iptables_core::IptablesManager;
 
 // =============================================================================
 // State File for Crash Recovery

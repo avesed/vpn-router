@@ -172,7 +172,7 @@ shadowsocks = { version = "1.21", default-features = false, features = [
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [features]
-default = ["dns-doh", "dns-dot", "handshake_retry", "transport-tls", "transport-ws", "ipstack-tcp", "jemalloc", "sharded-vless-wg-bridge"]
+default = ["dns-doh", "dns-dot", "handshake_retry", "transport-tls", "transport-ws", "ipstack-tcp", "jemalloc", "sharded-vless-wg-bridge", "use-netbridge-egress", "use-netbridge-ingress"]
 # Memory allocator for high-throughput packet processing (Linux/macOS only)
 jemalloc = ["tikv-jemallocator"]
 dns-doh = ["hyper", "hyper-util", "http-body-util", "hyper-rustls", "http", "rustls", "rustls-pki-types", "webpki-roots"]
@@ -199,9 +199,13 @@ quic-sni = ["rustls"]
 domain-routing = ["sni-sniffing", "fakedns", "quic-sni"]
 # Sharded VLESS-WG bridge for high-throughput parallel processing
 sharded-vless-wg-bridge = []
-# Use netbridge egress instead of vless_wg_bridge (new unified implementation)
+# Use netbridge egress as Priority 1 for VLESS/SS -> WG bridging (default, recommended)
 # When enabled, tries netbridge::SmoltcpEgress first, falls back to sharded-vless-wg-bridge
 use-netbridge-egress = []
+# Use netbridge KernelIngress for WG ingress (experimental, replaces TunIngressBridge)
+# When enabled, uses netbridge::KernelIngress + ControlPlaneHandler instead of tun_bridge
+# Takes priority over ipstack-tcp when both are enabled
+use-netbridge-ingress = []
 
 [dev-dependencies]
 tempfile = "3"

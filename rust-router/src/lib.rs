@@ -48,34 +48,26 @@
 //!
 //! # Module Migration Guide
 //!
-//! The `netbridge` module is the new unified implementation for IP <-> TCP/UDP bridging.
-//! It is designed to eventually replace:
+//! The `netbridge` module is the unified implementation for IP <-> TCP/UDP bridging.
+//! Legacy modules have been consolidated:
 //!
 //! - `tun_bridge/` -> `netbridge::kernel` (TUN + TPROXY, 200-400 Mbps)
 //! - `vless_wg_bridge/` -> `netbridge::smoltcp` (userspace TCP/IP, ~300-650 Mbps)
-//! - `smoltcp_utils/` -> `netbridge` (shared utilities)
-//!
-//! During the migration period, both old and new modules coexist:
-//!
-//! - **Existing code**: Continue using `tun_bridge`, `vless_wg_bridge`, `smoltcp_utils`
-//! - **New code**: Prefer `netbridge` types (prefixed with `Net` for disambiguation)
+//! - `smoltcp_utils/` -> **removed** (types migrated to `netbridge` and `vless_wg_bridge`)
 //!
 //! ## Type Mapping (Old -> New)
 //!
 //! | Old Type | New Type | Notes |
 //! |----------|----------|-------|
 //! | `tun_bridge::FiveTuple` | `netbridge::FiveTuple` | Same semantics |
-//! | `tun_bridge::SessionTracker` | `netbridge::SessionTracker` | New has rate limiting |
-//! | `vless_wg_bridge::PortAllocator` | `netbridge::PortAllocator` | New has shard support |
-//! | `smoltcp_utils::BridgeError` | `netbridge::NetBridgeError` | New has classification |
+//! | `tun_bridge::SessionTracker` | `netbridge::SessionTracker` | Has rate limiting |
+//! | `vless_wg_bridge::PortAllocator` | `netbridge::PortAllocator` | Has shard support |
+//! | `smoltcp_utils::BridgeError` | `netbridge::NetBridgeError` | Has classification |
 //!
-//! ## Example Migration
+//! ## Example
 //!
 //! ```ignore
-//! // Old code (still works)
-//! use rust_router::{TunBridgeFiveTuple, PortAllocator, BridgeError};
-//!
-//! // New code (recommended for new implementations)
+//! // Recommended imports
 //! use rust_router::netbridge::{FiveTuple, PortAllocator, NetBridgeError};
 //! // Or use re-exported aliases with Net prefix
 //! use rust_router::{NetSessionTracker, NetPortAllocator, NetBridgeError};
@@ -99,10 +91,9 @@
 //! - [`reality`]: REALITY protocol configuration (TLS 1.3 camouflage)
 //! - [`transport`]: Transport layer abstraction (TCP, TLS, WebSocket)
 //! - [`ss_inbound`]: Shadowsocks inbound listener (server mode)
-//! - [`smoltcp_utils`]: Shared utilities for smoltcp-based bridges (legacy)
-//! - [`tun_bridge`]: TUN + TPROXY ingress bridge (legacy)
-//! - [`vless_wg_bridge`]: VLESS -> WireGuard bridge (legacy)
-//! - [`netbridge`]: **NEW** Unified network bridge for IP <-> TCP/UDP conversion
+//! - [`tun_bridge`]: TUN + TPROXY ingress bridge (legacy, use `netbridge::kernel`)
+//! - [`vless_wg_bridge`]: VLESS -> WireGuard bridge (legacy, use `netbridge::smoltcp`)
+//! - [`netbridge`]: Unified network bridge for IP <-> TCP/UDP conversion
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
@@ -130,7 +121,6 @@ pub mod reality;
 pub mod rules;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
-pub mod smoltcp_utils;
 pub mod sniff;
 #[cfg(feature = "shadowsocks")]
 pub mod ss_inbound;
@@ -144,6 +134,17 @@ pub mod vless;
 pub mod vless_inbound;
 pub mod vless_wg_bridge;
 pub mod warp;
+
+// Ensure at least one egress bridge feature is enabled when building without defaults
+#[cfg(all(
+    not(feature = "use-netbridge-egress"),
+    not(feature = "sharded-vless-wg-bridge")
+))]
+compile_error!(
+    "At least one egress bridge feature must be enabled: \
+     use-netbridge-egress or sharded-vless-wg-bridge. \
+     The legacy VlessWgBridge fallback has been removed."
+);
 
 // Re-export commonly used types at the crate root
 pub use chain::{
@@ -206,6 +207,8 @@ pub use tproxy::{
     TproxyConnection, TproxyListener, TproxyUdpListener, TproxyUdpListenerBuilder, UdpPacketInfo,
 };
 pub use tun::{TunConfig, TunDevice, DEFAULT_MTU as TUN_DEFAULT_MTU};
+#[cfg(all(feature = "ipstack-tcp", not(feature = "use-netbridge-ingress")))]
+#[deprecated(since = "0.2.0", note = "Use netbridge::kernel types instead")]
 pub use tun_bridge::{
     FiveTuple as TunBridgeFiveTuple, IptablesManager, SessionInfo as TunBridgeSessionInfo,
     SessionTracker as TunBridgeSessionTracker, TunIngressBridge, TunIngressConfig,
@@ -234,22 +237,22 @@ pub use vless_inbound::{
     VlessInboundConfig, VlessInboundError, VlessInboundListener, VlessInboundResult,
     VlessInboundStats, VlessUser,
 };
+// Always-available types from vless_wg_bridge (shared infrastructure)
 pub use vless_wg_bridge::{
-    BridgeError, BridgeStats, BridgeStatsSnapshot, PortAllocator, PortAllocatorConfig, PortGuard,
+    BridgeError, PortAllocator, PortAllocatorConfig, PortGuard,
     SessionKey, SessionStats, SessionTracker, TcpSession, TimeoutConfig,
-    UdpSession as BridgeUdpSession, VlessConnectionId, VlessWgBridge, WgReplyPacket,
+    UdpSession as BridgeUdpSession, VlessConnectionId, WgReplyPacket,
 };
 
+// Note: Legacy VlessWgBridge has been removed. Use ShardedVlessWgBridge or NetbridgeVlessAdapter.
+
 // =============================================================================
-// netbridge module re-exports (NEW unified bridge implementation)
+// netbridge module re-exports (unified bridge implementation)
 // =============================================================================
 //
 // The netbridge module provides a unified abstraction for IP <-> TCP/UDP bridging.
-// It is designed to eventually replace tun_bridge, vless_wg_bridge, and smoltcp_utils.
-//
-// During migration, both old and new modules coexist:
-// - Existing code: Continue using tun_bridge, vless_wg_bridge, smoltcp_utils
-// - New code: Prefer netbridge types (prefixed with Net for disambiguation)
+// It consolidates functionality from tun_bridge, vless_wg_bridge.
+// The smoltcp_utils module has been removed - its types are now in netbridge.
 //
 // Types are re-exported with "Net" prefix to avoid conflicts with legacy types.
 

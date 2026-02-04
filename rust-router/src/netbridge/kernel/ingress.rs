@@ -57,20 +57,24 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::netbridge::config::{TCP_IDLE_TIMEOUT_SECS, UDP_DEFAULT_TIMEOUT_SECS};
+
 use super::iptables::IptablesManagerWrapper;
 use super::tproxy::TproxyListenerWrapper;
 use super::tun::TunDeviceWrapper;
 use crate::netbridge::config::{REPLY_CHANNEL_SIZE, TUN_MTU};
+use crate::netbridge::dataplane::{ConnectionHandler, ConnectionInfo, RoutingDecision};
 use crate::netbridge::error::{NetBridgeError, Result};
 use crate::netbridge::reply::ReplyRouter;
 use crate::netbridge::session::SessionTracker;
 use crate::netbridge::traits::{NetBridgeIngress, SessionHandler, SessionInfo};
-use crate::netbridge::types::{FiveTuple, IngressStats, ReplyPacket};
+use crate::netbridge::types::{FiveTuple, IpProtocol, IngressStats, ReplyPacket, SessionIdGenerator};
 
 // =============================================================================
 // KernelIngress Configuration
@@ -99,6 +103,12 @@ pub struct KernelIngressConfig {
     pub reply_channel_size: usize,
     /// Optional session handler for lifecycle callbacks
     pub session_handler: Option<Arc<dyn SessionHandler>>,
+    /// Connection handler for routing decisions (control plane integration)
+    pub handler: Option<Arc<dyn ConnectionHandler>>,
+    /// Enable SNI extraction from TLS ClientHello
+    pub enable_sni: bool,
+    /// SNI peek timeout in milliseconds
+    pub sni_peek_timeout_ms: u64,
 }
 
 impl std::fmt::Debug for KernelIngressConfig {
@@ -114,6 +124,9 @@ impl std::fmt::Debug for KernelIngressConfig {
             .field("tcp_backlog", &self.tcp_backlog)
             .field("reply_channel_size", &self.reply_channel_size)
             .field("session_handler", &self.session_handler.is_some())
+            .field("handler", &self.handler.is_some())
+            .field("enable_sni", &self.enable_sni)
+            .field("sni_peek_timeout_ms", &self.sni_peek_timeout_ms)
             .finish()
     }
 }
@@ -133,6 +146,9 @@ impl KernelIngressConfig {
             tcp_backlog: 1024,
             reply_channel_size: REPLY_CHANNEL_SIZE,
             session_handler: None,
+            handler: None,
+            enable_sni: true,
+            sni_peek_timeout_ms: 50,
         }
     }
 
@@ -187,6 +203,30 @@ impl KernelIngressConfig {
         self
     }
 
+    /// Set the connection handler for routing TPROXY connections
+    ///
+    /// The handler is called for each accepted TCP connection to decide
+    /// routing (accept with outbound stream, or reject).
+    #[must_use]
+    pub fn with_handler(mut self, handler: Arc<dyn ConnectionHandler>) -> Self {
+        self.handler = Some(handler);
+        self
+    }
+
+    /// Enable or disable SNI extraction from TLS ClientHello
+    #[must_use]
+    pub const fn enable_sni(mut self, enable: bool) -> Self {
+        self.enable_sni = enable;
+        self
+    }
+
+    /// Set the SNI peek timeout in milliseconds
+    #[must_use]
+    pub const fn sni_peek_timeout_ms(mut self, ms: u64) -> Self {
+        self.sni_peek_timeout_ms = ms;
+        self
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<()> {
         if self.tun_name.is_empty() {
@@ -217,6 +257,28 @@ impl Default for KernelIngressConfig {
 // =============================================================================
 // KernelIngress Implementation
 // =============================================================================
+
+/// RAII guard for the active TPROXY connections counter.
+///
+/// Increments the counter on creation and decrements on drop, guaranteeing
+/// correct counter management even if the task panics during processing.
+/// Uses `Arc<KernelIngressStats>` (not a borrow) so it can be used in `tokio::spawn`.
+struct ConnectionGuard {
+    stats: Arc<KernelIngressStats>,
+}
+
+impl ConnectionGuard {
+    fn new(stats: &Arc<KernelIngressStats>) -> Self {
+        stats.active_tproxy_connections.fetch_add(1, Ordering::Relaxed);
+        Self { stats: Arc::clone(stats) }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.stats.active_tproxy_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Kernel-based ingress bridge using TUN + TPROXY
 ///
@@ -251,10 +313,19 @@ pub struct KernelIngress {
     running: AtomicBool,
     /// Whether shutdown has been requested
     shutdown_requested: AtomicBool,
-    /// Statistics
-    stats: KernelIngressStats,
+    /// Statistics (Arc-wrapped for sharing with spawned tasks)
+    stats: Arc<KernelIngressStats>,
     /// Optional session handler for lifecycle callbacks
     session_handler: Option<Arc<dyn SessionHandler>>,
+    /// Connection handler for routing decisions (control plane integration)
+    handler: Option<Arc<dyn ConnectionHandler>>,
+    /// Session ID generator for TPROXY connections
+    session_id_gen: SessionIdGenerator,
+    /// Whether SNI extraction is enabled
+    enable_sni: bool,
+    /// SNI peek timeout in milliseconds (used when sni-sniffing feature is active)
+    #[cfg_attr(not(feature = "sni-sniffing"), allow(dead_code))]
+    sni_peek_timeout_ms: u64,
 }
 
 impl KernelIngress {
@@ -319,13 +390,19 @@ impl KernelIngress {
         // Create reply router
         let reply_router = Arc::new(ReplyRouter::new(Arc::clone(&sessions), reply_tx.clone()));
 
-        // Extract session handler before moving config
+        // Extract fields before moving config
         let session_handler = config.session_handler.clone();
+        let handler = config.handler.clone();
+        let enable_sni = config.enable_sni;
+        let sni_peek_timeout_ms = config.sni_peek_timeout_ms;
 
         info!(
             tun_name = %config.tun_name,
             tproxy_addr = %config.tproxy_addr,
             has_session_handler = session_handler.is_some(),
+            has_connection_handler = handler.is_some(),
+            enable_sni = enable_sni,
+            sni_peek_timeout_ms = sni_peek_timeout_ms,
             "Kernel ingress bridge created"
         );
 
@@ -340,8 +417,12 @@ impl KernelIngress {
             reply_rx: ParkingMutex::new(Some(reply_rx)),
             running: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
-            stats: KernelIngressStats::default(),
+            stats: Arc::new(KernelIngressStats::default()),
             session_handler,
+            handler,
+            session_id_gen: SessionIdGenerator::new(),
+            enable_sni,
+            sni_peek_timeout_ms,
         })
     }
 
@@ -390,9 +471,12 @@ impl KernelIngress {
     /// This method is API-compatible with `TunIngressBridge::stats_snapshot()`.
     #[must_use]
     pub fn stats_snapshot(&self) -> KernelIngressStatsSnapshot {
-        let mut snapshot = KernelIngressStatsSnapshot::from(&self.stats);
+        let mut snapshot = KernelIngressStatsSnapshot::from(self.stats.as_ref());
         // Fill in session counts from the tracker
-        snapshot.tcp_connections_active = self.sessions.tcp_session_count() as u64;
+        // Use active_tproxy_connections for TPROXY-handled TCP, session tracker for injected
+        let tproxy_active = snapshot.active_tproxy_connections;
+        let session_tcp = self.sessions.tcp_session_count() as u64;
+        snapshot.tcp_connections_active = tproxy_active.max(session_tcp);
         snapshot.udp_sessions_active = self.sessions.udp_session_count() as u64;
         snapshot
     }
@@ -428,6 +512,34 @@ impl KernelIngress {
     #[inline]
     fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Relaxed)
+    }
+
+    /// Run periodic session cleanup
+    ///
+    /// Removes idle sessions that have exceeded their timeout. Runs every 30 seconds
+    /// to prevent unbounded session accumulation.
+    async fn run_session_cleanup_loop(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let tcp_timeout = Duration::from_secs(TCP_IDLE_TIMEOUT_SECS);
+        let udp_timeout = Duration::from_secs(UDP_DEFAULT_TIMEOUT_SECS);
+
+        loop {
+            interval.tick().await;
+
+            if self.is_shutdown_requested() {
+                debug!("Session cleanup loop shutdown requested");
+                return;
+            }
+
+            let removed = self.sessions.cleanup_idle(tcp_timeout, udp_timeout);
+            if removed > 0 {
+                debug!(
+                    removed = removed,
+                    remaining = self.sessions.total_sessions(),
+                    "Cleaned up idle sessions"
+                );
+            }
+        }
     }
 
     /// Run the TUN read loop
@@ -472,12 +584,65 @@ impl KernelIngress {
         Ok(())
     }
 
+    /// Extract SNI from a TCP stream by peeking at the TLS ClientHello
+    ///
+    /// Returns the server name if extraction succeeds, or None on timeout/failure.
+    #[cfg(feature = "sni-sniffing")]
+    async fn extract_sni(stream: &tokio::net::TcpStream, timeout_ms: u64) -> Option<String> {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let mut buf = [0u8; 4096];
+        let result = timeout(Duration::from_millis(timeout_ms), stream.peek(&mut buf)).await;
+        match result {
+            Ok(Ok(n)) if n > 0 => {
+                crate::sniff::sniff_tls_sni(&buf[..n])
+            }
+            _ => None,
+        }
+    }
+
     /// Run the TPROXY accept loop
     ///
-    /// This accepts TCP connections from the TPROXY listener and provides
-    /// connection metadata for session tracking.
+    /// This accepts TCP connections from the TPROXY listener and routes them
+    /// via the `ConnectionHandler`. Each connection is spawned as an independent
+    /// task for concurrent processing.
     async fn run_tproxy_accept_loop(&self) -> Result<()> {
         debug!("Starting TPROXY accept loop");
+
+        let handler = match self.handler {
+            Some(ref h) => Arc::clone(h),
+            None => {
+                warn!("No connection handler configured, TPROXY connections will be dropped");
+                // Run a simple accept-and-drop loop to avoid connection backlog
+                loop {
+                    if self.is_shutdown_requested() {
+                        debug!("TPROXY accept loop shutdown requested (no handler)");
+                        return Ok(());
+                    }
+                    let connection = {
+                        let mut tproxy = self.tproxy.lock().await;
+                        match tproxy.accept().await {
+                            Ok(conn) => conn,
+                            Err(_) => {
+                                if self.is_shutdown_requested() {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    self.stats.tproxy_connections.fetch_add(1, Ordering::Relaxed);
+                    self.stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                    trace!(
+                        client = %connection.client_addr(),
+                        dst = %connection.original_dst(),
+                        "Dropping TPROXY connection (no handler)"
+                    );
+                    let _ = connection.into_stream();
+                }
+            }
+        };
 
         loop {
             if self.is_shutdown_requested() {
@@ -503,16 +668,152 @@ impl KernelIngress {
 
             self.stats.tproxy_connections.fetch_add(1, Ordering::Relaxed);
 
-            trace!(
-                client = %connection.client_addr(),
-                dst = %connection.original_dst(),
+            let client_addr = connection.client_addr();
+            let original_dst = connection.original_dst();
+
+            debug!(
+                client = %client_addr,
+                dst = %original_dst,
                 "Accepted TPROXY connection"
             );
 
-            // TODO: Spawn a task to handle the connection
-            // This requires integration with the outbound system
-            // For now, we just log and close the connection
-            let _ = connection.into_stream();
+            // Generate session ID
+            let session_id = self.session_id_gen.next();
+
+            // Capture SNI config for the spawned task (SNI extraction moved into task
+            // to avoid blocking the accept loop for up to sni_peek_timeout_ms per connection)
+            let enable_sni = self.enable_sni;
+            #[cfg(feature = "sni-sniffing")]
+            let sni_peek_timeout_ms = self.sni_peek_timeout_ms;
+
+            // Capture five_tuple before moving connection
+            let five_tuple = connection.five_tuple();
+
+            // Clone shared state for the spawned task
+            let handler = Arc::clone(&handler);
+            let stats = Arc::clone(&self.stats);
+
+            // Spawn a task to handle the connection
+            tokio::spawn(async move {
+                // RAII guard: guarantees counter is decremented even on panic
+                let _conn_guard = ConnectionGuard::new(&stats);
+                let start = Instant::now();
+
+                // Extract SNI inside the spawned task (non-blocking for accept loop)
+                let domain = if enable_sni {
+                    #[cfg(feature = "sni-sniffing")]
+                    {
+                        let sni = Self::extract_sni(connection.stream(), sni_peek_timeout_ms).await;
+                        if sni.is_some() {
+                            stats.sni_extractions.fetch_add(1, Ordering::Relaxed);
+                            trace!(
+                                session_id = %session_id,
+                                sni = ?sni,
+                                "SNI extracted from TLS ClientHello"
+                            );
+                        }
+                        sni
+                    }
+                    #[cfg(not(feature = "sni-sniffing"))]
+                    { None }
+                } else {
+                    None
+                };
+
+                // Build ConnectionInfo for the handler
+                let conn_info = ConnectionInfo {
+                    session_id,
+                    src: client_addr,
+                    dst: original_dst,
+                    protocol: IpProtocol::Tcp,
+                    peer_key: [0u8; 32], // Not available from TPROXY (peer is tracked at inject_packet level)
+                    peer_endpoint: client_addr, // Best approximation from TPROXY
+                    domain,
+                    five_tuple,
+                };
+
+                // Call the connection handler to get a routing decision
+                let decision = handler.on_tcp_connect(conn_info).await;
+
+                match decision {
+                    RoutingDecision::Accept(outbound_stream) => {
+                        // Get client stream from the TPROXY connection
+                        let mut client_stream = connection.into_stream();
+                        let mut outbound_stream = outbound_stream;
+
+                        // Bidirectional copy with proper TCP half-close semantics.
+                        // Uses tokio::io::copy_bidirectional which waits for BOTH directions
+                        // to complete (via FIN), unlike select! which cancels the surviving
+                        // direction. This correctly handles HTTP pipelining and other
+                        // protocols that rely on half-close.
+                        let result = tokio::io::copy_bidirectional(
+                            &mut client_stream,
+                            &mut outbound_stream,
+                        ).await;
+
+                        let duration = start.elapsed();
+
+                        match result {
+                            Ok((sent, recv)) => {
+                                // Update global stats
+                                stats.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                                stats.bytes_received.fetch_add(recv, Ordering::Relaxed);
+
+                                // Notify handler of session close
+                                handler.on_session_closed(session_id, sent, recv, duration);
+
+                                trace!(
+                                    session_id = %session_id,
+                                    bytes_sent = sent,
+                                    bytes_received = recv,
+                                    duration_ms = duration.as_millis(),
+                                    "Connection copy finished"
+                                );
+                            }
+                            Err(e) => {
+                                // Notify handler with zero bytes on error
+                                handler.on_session_closed(session_id, 0, 0, duration);
+
+                                trace!(
+                                    session_id = %session_id,
+                                    error = %e,
+                                    duration_ms = duration.as_millis(),
+                                    "Connection copy finished with error"
+                                );
+                            }
+                        }
+                    }
+                    RoutingDecision::Reject => {
+                        debug!(
+                            session_id = %session_id,
+                            client = %client_addr,
+                            dst = %original_dst,
+                            "Connection rejected by handler"
+                        );
+                        stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = connection.into_stream();
+                    }
+                    RoutingDecision::RejectWithError(reason) => {
+                        debug!(
+                            session_id = %session_id,
+                            client = %client_addr,
+                            dst = %original_dst,
+                            reason = %reason,
+                            "Connection rejected by handler"
+                        );
+                        stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = connection.into_stream();
+                    }
+                    RoutingDecision::AcceptUdp(_) => {
+                        warn!(
+                            session_id = %session_id,
+                            "AcceptUdp routing decision for TCP connection, rejecting"
+                        );
+                        stats.connection_errors.fetch_add(1, Ordering::Relaxed);
+                        let _ = connection.into_stream();
+                    }
+                }
+            });
         }
 
         debug!("TPROXY accept loop stopped");
@@ -637,9 +938,12 @@ impl NetBridgeIngress for KernelIngress {
             "Starting kernel ingress bridge"
         );
 
-        // Run both loops concurrently
+        // Run all three loops concurrently: TUN read, TPROXY accept, and session cleanup.
+        // If any critical loop (TUN or TPROXY) exits, the bridge stops.
+        // The cleanup loop runs periodically to reclaim idle sessions.
         let tun_loop = self.run_tun_read_loop();
         let tproxy_loop = self.run_tproxy_accept_loop();
+        let cleanup_loop = self.run_session_cleanup_loop();
 
         tokio::select! {
             result = tun_loop => {
@@ -651,6 +955,9 @@ impl NetBridgeIngress for KernelIngress {
                 if let Err(e) = result {
                     error!(error = %e, "TPROXY accept loop failed");
                 }
+            }
+            _ = cleanup_loop => {
+                debug!("Session cleanup loop exited");
             }
         }
 
@@ -681,8 +988,8 @@ impl NetBridgeIngress for KernelIngress {
             packets_dropped: self.stats.tun_write_errors.load(Ordering::Relaxed)
                 + self.stats.session_errors.load(Ordering::Relaxed),
             active_sessions: self.sessions.total_sessions(),
-            dns_queries_intercepted: 0, // TODO: Implement FakeDNS
-            sni_extractions: 0, // TODO: Implement SNI sniffing
+            dns_queries_intercepted: self.stats.dns_queries_hijacked.load(Ordering::Relaxed),
+            sni_extractions: self.stats.sni_extractions.load(Ordering::Relaxed),
         }
     }
 
@@ -742,6 +1049,8 @@ pub struct KernelIngressStats {
     pub connection_errors: AtomicU64,
     /// Session limit rejections - for tun_bridge compatibility
     pub session_limit_rejections: AtomicU64,
+    /// Active TPROXY connections (currently being handled)
+    pub active_tproxy_connections: AtomicU64,
     /// Bytes sent to outbound - for tun_bridge compatibility
     pub bytes_sent: AtomicU64,
     /// Bytes received from outbound - for tun_bridge compatibility
@@ -774,6 +1083,8 @@ pub struct KernelIngressStatsSnapshot {
     pub connection_errors: u64,
     /// Session limit rejections
     pub session_limit_rejections: u64,
+    /// Active TPROXY connections (currently being handled)
+    pub active_tproxy_connections: u64,
     /// Bytes sent to outbound
     pub bytes_sent: u64,
     /// Bytes received from outbound
@@ -786,13 +1097,14 @@ impl From<&KernelIngressStats> for KernelIngressStatsSnapshot {
             packets_injected: stats.packets_injected.load(Ordering::Relaxed),
             packets_read: stats.packets_from_tun.load(Ordering::Relaxed),
             tcp_connections_accepted: stats.tproxy_connections.load(Ordering::Relaxed),
-            tcp_connections_active: 0, // Tracked by session tracker
+            tcp_connections_active: stats.active_tproxy_connections.load(Ordering::Relaxed),
             udp_sessions_active: 0,    // Tracked by session tracker
             dns_queries_hijacked: stats.dns_queries_hijacked.load(Ordering::Relaxed),
             fakedns_reverse_hits: stats.fakedns_reverse_hits.load(Ordering::Relaxed),
             sni_extractions: stats.sni_extractions.load(Ordering::Relaxed),
             connection_errors: stats.connection_errors.load(Ordering::Relaxed),
             session_limit_rejections: stats.session_limit_rejections.load(Ordering::Relaxed),
+            active_tproxy_connections: stats.active_tproxy_connections.load(Ordering::Relaxed),
             bytes_sent: stats.bytes_sent.load(Ordering::Relaxed),
             bytes_received: stats.bytes_received.load(Ordering::Relaxed),
         }

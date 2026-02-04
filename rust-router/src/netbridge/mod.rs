@@ -66,13 +66,14 @@
 //!
 //! # Migration from Legacy Modules
 //!
-//! This module is designed to eventually replace:
+//! This module has consolidated the following legacy modules:
 //!
 //! - `tun_bridge/` -> `netbridge::kernel`
 //! - `vless_wg_bridge/` -> `netbridge::smoltcp`
-//! - `smoltcp_utils/` -> `netbridge` (shared utilities)
+//! - `smoltcp_utils/` -> **removed** (types migrated to `netbridge` and `vless_wg_bridge`)
 //!
-//! During migration, both old and new modules coexist.
+//! The `smoltcp_utils` module has been deleted. All its types are now available
+//! through either `netbridge` or `vless_wg_bridge` re-exports.
 //!
 //! # Submodules
 //!
@@ -196,7 +197,7 @@ pub use types::{
     ReplyPacket, SessionId, SessionIdGenerator,
 };
 
-// Socket guard types (migrated from smoltcp_utils)
+// Socket guard types
 pub use socket_guard::{
     init_cleanup_channel, run_cleanup_task, SocketCleanupReceiver, TcpSocketGuard, UdpSocketGuard,
 };

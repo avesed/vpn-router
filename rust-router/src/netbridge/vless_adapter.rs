@@ -68,6 +68,10 @@ use super::traits::NetBridgeEgress;
 #[cfg(feature = "sharded-vless-wg-bridge")]
 use crate::vless_wg_bridge::udp_frame::VlessUdpFrame;
 
+// Re-export RawUdpReply for API compatibility with ShardedVlessWgBridge
+#[cfg(feature = "sharded-vless-wg-bridge")]
+pub use crate::vless_wg_bridge::sharded_bridge::RawUdpReply;
+
 // =============================================================================
 // Statistics Types (compatible with ShardedVlessWgBridge)
 // =============================================================================
@@ -719,6 +723,54 @@ impl NetbridgeVlessAdapter {
 
         self.stats.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.egress.handle_udp(src, dest, data).await
+    }
+
+    /// Send a raw UDP packet through the WireGuard tunnel.
+    ///
+    /// This is API-compatible with `ShardedVlessWgBridge::send_raw_udp_packet`,
+    /// designed for protocols like Shadowsocks that send individual UDP packets.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_addr` - Original client address (for reply routing)
+    /// * `dest_addr` - Destination address (IP:port)
+    /// * `payload` - UDP payload to send
+    /// * `reply_tx` - Channel for receiving replies (replies are sent here)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the packet was queued for sending.
+    ///
+    /// # Note
+    ///
+    /// Unlike `ShardedVlessWgBridge`, this implementation does not yet support
+    /// receiving UDP replies back through the `reply_tx` channel. The smoltcp
+    /// egress would need UDP session tracking with reply routing to fully
+    /// support bidirectional UDP. For now, this method sends the UDP packet
+    /// but reply handling is a TODO.
+    #[cfg(feature = "sharded-vless-wg-bridge")]
+    pub async fn send_raw_udp_packet(
+        &self,
+        client_addr: SocketAddr,
+        dest_addr: SocketAddr,
+        payload: Bytes,
+        _reply_tx: tokio::sync::mpsc::Sender<RawUdpReply>,
+    ) -> Result<()> {
+        if self.is_shutdown() {
+            return Err(NetBridgeError::TunnelDown("adapter is shutting down".into()));
+        }
+
+        trace!(
+            "NetbridgeVlessAdapter: raw UDP {} -> {}: {} bytes",
+            client_addr, dest_addr, payload.len()
+        );
+
+        self.stats.bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        self.stats.udp_sessions_created.fetch_add(1, Ordering::Relaxed);
+
+        // Send through SmoltcpEgress
+        // Note: client_addr is used as the pseudo-source for the smoltcp socket
+        self.egress.handle_udp(client_addr, dest_addr, &payload).await
     }
 
     /// Get aggregated statistics.
