@@ -396,14 +396,14 @@ async fn main() -> Result<()> {
     let ecmp_group_manager = Arc::new(EcmpGroupManager::new());
     debug!("Created EcmpGroupManager for load balancing");
 
-    // Create connection manager with ECMP support
-    let mut connection_manager = ConnectionManager::new(
+    // Create connection manager
+    // Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge
+    let connection_manager = ConnectionManager::new(
         &config.connection,
         Arc::clone(&outbound_manager),
         config.default_outbound.clone(),
         config.listen.sniff_timeout(),
     );
-    connection_manager.set_ecmp_group_manager(Arc::clone(&ecmp_group_manager));
     let connection_manager = Arc::new(connection_manager);
 
     // Create TPROXY listener (TCP) - only if enabled via env var
@@ -428,11 +428,10 @@ async fn main() -> Result<()> {
         // The actual session tracking happens inside UdpPacketProcessor's handle_cache
         let session_manager = Arc::new(UdpSessionManager::new(UdpSessionConfig::default()));
 
-        // Create UDP packet processor with ECMP group manager for load balancing support
+        // Create UDP packet processor
+        // Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge
         let processor_config = UdpProcessorConfig::default();
-        let mut processor = UdpPacketProcessor::new(processor_config);
-        processor.set_ecmp_group_manager(Arc::clone(&ecmp_group_manager));
-        let processor = Arc::new(processor);
+        let processor = Arc::new(UdpPacketProcessor::new(processor_config));
 
         // Determine worker count
         let num_workers = config.listen.udp_workers.unwrap_or_else(num_cpus::get);
@@ -1132,6 +1131,7 @@ async fn main() -> Result<()> {
                 // When peer tunnels receive non-API packets, they forward to peer_tunnel_processor
                 peer_manager.set_peer_tunnel_tx(peer_tx);
 
+                // Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge
                 let forward_handle = rust_router::ingress::spawn_forwarding_task(
                     packet_rx,
                     Arc::clone(&outbound_manager),
@@ -1140,7 +1140,6 @@ async fn main() -> Result<()> {
                     Arc::clone(&fwd_stats),
                     Some(direct_reply_tx), // Enable direct UDP reply handling
                     Some(userspace_wg_config.wg_local_ip), // Local IP for responding to pings to gateway
-                    Some(Arc::clone(&ecmp_group_manager)), // ECMP group manager for load balancing
                     Some(Arc::clone(&peer_manager)), // Peer manager for peer WireGuard tunnels
                 );
 

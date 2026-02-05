@@ -11,10 +11,9 @@ use tokio::io::copy_bidirectional;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::ecmp::{DestKey, EcmpGroupManager, FiveTuple, LbAlgorithm, Protocol};
 use crate::error::{ConnectionError, RustRouterError};
 use crate::io::CopyResult;
-use crate::outbound::{Outbound, OutboundManager};
+use crate::outbound::OutboundManager;
 use crate::sniff::sniff_tls_sni;
 use crate::tproxy::TproxyConnection;
 
@@ -25,9 +24,6 @@ pub struct TcpConnectionContext {
 
     /// Outbound manager
     pub outbound_manager: Arc<OutboundManager>,
-
-    /// ECMP group manager for load balancing
-    pub ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 
     /// Sniff timeout
     pub sniff_timeout: Duration,
@@ -106,20 +102,12 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
 
     // TODO: Route selection based on SNI/destination
     // For now, use default outbound
+    // Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge
     let outbound_tag = &ctx.default_outbound;
 
-    // Get the outbound with ECMP group resolution
-    // This supports both direct outbounds and ECMP load balancing groups
-    // Pass SNI for DestHash algorithm (video streaming session affinity)
-    let (outbound, actual_outbound_tag) = match resolve_outbound_with_ecmp(
-        outbound_tag,
-        client_addr,
-        original_dst,
-        result.sni.as_deref(),
-        &ctx.outbound_manager,
-        ctx.ecmp_group_manager.as_ref(),
-    ) {
-        Some(resolved) => resolved,
+    // Get the outbound directly
+    let outbound = match ctx.outbound_manager.get(outbound_tag) {
+        Some(outbound) => outbound,
         None => {
             error!("Outbound '{}' not found", outbound_tag);
             result.error = Some(format!("Outbound '{outbound_tag}' not found"));
@@ -127,7 +115,7 @@ pub async fn handle_tcp_connection(ctx: TcpConnectionContext) -> TcpConnectionRe
         }
     };
 
-    result.outbound_tag = actual_outbound_tag.clone();
+    result.outbound_tag = outbound_tag.clone();
 
     // Connect to upstream
     let upstream = match outbound.connect(original_dst, ctx.connect_timeout).await {
@@ -214,106 +202,6 @@ fn is_tls_port(port: u16) -> bool {
         | 990   // FTPS control
         | 5061 // SIP over TLS
     )
-}
-
-/// Resolve outbound tag to actual outbound, with ECMP group support.
-///
-/// If the tag refers to an ECMP group, this function selects a member using
-/// the configured load balancing algorithm:
-/// - `FiveTupleHash` (default): Hash src/dst IP+port for connection affinity
-/// - `DestHash`: Hash destination (domain or IP) for session affinity (video streaming)
-/// - `DestHashLeastLoad`: Session affinity + intelligent load balancing for new sessions
-///
-/// # Arguments
-///
-/// * `tag` - The outbound or group tag to resolve
-/// * `client_addr` - Client socket address
-/// * `original_dst` - Original destination socket address
-/// * `domain` - Optional domain name from TLS SNI (used by DestHash/DestHashLeastLoad)
-/// * `outbound_manager` - Manager for direct outbounds
-/// * `ecmp_group_manager` - Optional ECMP group manager
-///
-/// # Returns
-///
-/// Tuple of (outbound, actual_tag) if found, None otherwise
-fn resolve_outbound_with_ecmp(
-    tag: &str,
-    client_addr: SocketAddr,
-    original_dst: SocketAddr,
-    domain: Option<&str>,
-    outbound_manager: &OutboundManager,
-    ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
-) -> Option<(Arc<dyn Outbound>, String)> {
-    // Try direct lookup first
-    if let Some(outbound) = outbound_manager.get(tag) {
-        return Some((outbound, tag.to_string()));
-    }
-
-    // Check if it's an ECMP group
-    if let Some(ecmp_mgr) = ecmp_group_manager {
-        if ecmp_mgr.has_group(tag) {
-            // Select member using the group's load balancing algorithm
-            if let Some(group) = ecmp_mgr.get_group(tag) {
-                // Choose selection method based on algorithm
-                let select_result = match group.algorithm() {
-                    LbAlgorithm::DestHash => {
-                        // DestHash: hash(source_ip + domain/dest_ip) for per-client session affinity
-                        // Same client to same domain → same exit; different clients → load balanced
-                        let dest_key = DestKey::new(client_addr.ip(), domain, original_dst.ip());
-                        debug!("ECMP group '{}' using DestHash with key: {}", tag, dest_key);
-                        group.select_by_dest(&dest_key)
-                    }
-                    LbAlgorithm::DestHashLeastLoad => {
-                        // DestHashLeastLoad: session affinity + intelligent load balancing
-                        // New sessions: select least loaded exit; existing: use cached selection
-                        let dest_key = DestKey::new(client_addr.ip(), domain, original_dst.ip());
-                        debug!(
-                            "ECMP group '{}' using DestHashLeastLoad with key: {}",
-                            tag, dest_key
-                        );
-                        group.select_by_dest_least_load(&dest_key)
-                    }
-                    LbAlgorithm::Ketama => {
-                        // Ketama: consistent hashing with domain/dest as key
-                        // Better than FiveTupleHash when members change frequently
-                        let key = domain.unwrap_or(&original_dst.to_string()).to_string();
-                        debug!("ECMP group '{}' using Ketama with key: {}", tag, key);
-                        group.select_ketama(&key)
-                    }
-                    _ => {
-                        // Default: use five-tuple hash for connection affinity
-                        let five_tuple = FiveTuple::new(
-                            client_addr.ip(),
-                            original_dst.ip(),
-                            client_addr.port(),
-                            original_dst.port(),
-                            Protocol::Tcp,
-                        );
-                        group.select_by_connection(&five_tuple)
-                    }
-                };
-
-                match select_result {
-                    Ok(member_tag) => {
-                        debug!(
-                            "ECMP group '{}' selected member '{}' for TCP {} -> {} (domain: {:?})",
-                            tag, member_tag, client_addr, original_dst, domain
-                        );
-                        // Recursively resolve the member
-                        if let Some(outbound) = outbound_manager.get(&member_tag) {
-                            return Some((outbound, member_tag));
-                        }
-                        warn!("ECMP member '{}' not found in outbound_manager", member_tag);
-                    }
-                    Err(e) => {
-                        warn!("ECMP group '{}' failed to select member: {}", tag, e);
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }
 
 /// Spawn a task to handle a TCP connection with proper instrumentation

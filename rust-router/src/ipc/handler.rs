@@ -3757,18 +3757,31 @@ impl IpcHandler {
                     // This eliminates the intermediate feeder task and extra copy:
                     //   Before: Registry → channel → feeder task → feed_reply() → copy → shard
                     //   After:  Registry → shard (direct)
-                    if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
-                        let reply_tx = adapter.wg_reply_sender();
-                        registry.register(tag.clone(), reply_tx);
-                        info!(
-                            "Registered NetbridgeVlessAdapter for tunnel '{}' with direct reply channel",
+                    #[cfg(feature = "sharded-vless-wg-bridge")]
+                    {
+                        if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
+                            let reply_tx = adapter.wg_reply_sender();
+                            registry.register(tag.clone(), reply_tx);
+                            info!(
+                                "Registered NetbridgeVlessAdapter for tunnel '{}' with direct reply channel",
+                                tag
+                            );
+                        } else {
+                            warn!(
+                                "Sharded bridge reply registry not available - netbridge adapter for '{}' will not receive WG replies",
+                                tag
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "sharded-vless-wg-bridge"))]
+                    {
+                        // Without sharded-vless-wg-bridge, the netbridge adapter WG replies
+                        // are handled through the main ingress reply router
+                        debug!(
+                            "NetbridgeVlessAdapter for tunnel '{}' will receive WG replies via ingress reply router",
                             tag
                         );
-                    } else {
-                        warn!(
-                            "Sharded bridge reply registry not available - netbridge adapter for '{}' will not receive WG replies",
-                            tag
-                        );
+                        let _ = adapter; // silence unused warning
                     }
 
                     info!(
@@ -3818,7 +3831,8 @@ impl IpcHandler {
                 // Also remove the netbridge adapter for this tunnel (if feature enabled)
                 #[cfg(feature = "use-netbridge-egress")]
                 {
-                    // Unregister from the reply registry first
+                    // Unregister from the reply registry first (only if sharded-vless-wg-bridge is enabled)
+                    #[cfg(feature = "sharded-vless-wg-bridge")]
                     if let Some(registry) = self.sharded_bridge_reply_registry.read().as_ref() {
                         registry.unregister(tag);
                     }

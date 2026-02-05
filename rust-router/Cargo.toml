@@ -175,7 +175,7 @@ shadowsocks = { version = "1.21", default-features = false, features = [
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [features]
-default = ["dns-doh", "dns-dot", "handshake_retry", "transport-tls", "transport-ws", "ipstack-tcp", "jemalloc", "sharded-vless-wg-bridge", "use-netbridge-egress", "use-netbridge-ingress"]
+default = ["dns-doh", "dns-dot", "handshake_retry", "transport-tls", "transport-ws", "ipstack-tcp", "jemalloc", "use-netbridge-egress", "use-netbridge-ingress"]
 # Memory allocator for high-throughput packet processing (Linux/macOS only)
 jemalloc = ["tikv-jemallocator"]
 dns-doh = ["hyper", "hyper-util", "http-body-util", "hyper-rustls", "http", "rustls", "rustls-pki-types", "webpki-roots"]

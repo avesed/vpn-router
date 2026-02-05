@@ -59,7 +59,6 @@ use tracing::{debug, info, trace, warn};
 use super::manager::{ProcessedPacket, WgIngressManager};
 use super::processor::RoutingDecision;
 use crate::chain::dscp::set_dscp;
-use crate::ecmp::{EcmpGroupManager, FiveTuple as EcmpFiveTuple, Protocol as EcmpProtocol};
 use crate::egress::manager::WgEgressManager;
 use crate::ipc::ChainRole;
 use crate::outbound::OutboundManager;
@@ -1644,13 +1643,13 @@ fn dscp_update_value(routing: &RoutingDecision) -> Option<u8> {
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 /// * `local_ip` - Gateway's local IP for responding to pings to self
-/// * `ecmp_group_manager` - Optional ECMP group manager for load balancing
 /// * `peer_manager` - Optional peer manager for peer tunnel forwarding
 ///
 /// # Note
 ///
 /// TCP connections are handled by IpStack bridge (when `ipstack-tcp` feature is enabled).
 /// The manual TCP state machine was removed due to bugs.
+/// ECMP load balancing is now handled by ControlPlaneHandler in netbridge.
 pub async fn run_forwarding_loop(
     mut packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
@@ -1659,7 +1658,6 @@ pub async fn run_forwarding_loop(
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     local_ip: Option<IpAddr>,
-    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
     peer_manager: Option<Arc<PeerManager>>,
 ) {
     info!("Ingress forwarding loop started");
@@ -1720,7 +1718,6 @@ pub async fn run_forwarding_loop(
                     &session_tracker,
                     &stats,
                     direct_reply_tx.clone(),
-                    ecmp_group_manager.as_ref(),
                     peer_manager.as_ref(),
                 )
                 .await;
@@ -1737,7 +1734,6 @@ pub async fn run_forwarding_loop(
                         &wg_egress_manager,
                         &session_tracker,
                         &stats,
-                        ecmp_group_manager.as_ref(),
                         peer_manager.as_ref(),
                     )
                     .await;
@@ -2162,6 +2158,8 @@ pub async fn run_reply_router_loop(
 /// For direct or SOCKS5 outbounds, we establish a TCP connection on the
 /// first SYN packet, send a synthetic SYN-ACK back to the client, and
 /// spawn a reader task to forward server responses.
+///
+/// Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge.
 async fn forward_tcp_packet(
     processed: &ProcessedPacket,
     parsed: &ParsedPacket,
@@ -2169,7 +2167,6 @@ async fn forward_tcp_packet(
     wg_egress_manager: &Arc<WgEgressManager>,
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
-    ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
     peer_manager: Option<&Arc<PeerManager>>,
 ) {
     let routing_outbound = &processed.routing.outbound;
@@ -2183,42 +2180,8 @@ async fn forward_tcp_packet(
         IPPROTO_TCP,
     );
 
-    // Resolve ECMP group to member using five-tuple hash
-    let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
-        if let Some(group) = ecmp_mgr.get_group(routing_outbound) {
-            // Create ECMP five-tuple for consistent hashing
-            let ecmp_tuple = EcmpFiveTuple::new(
-                parsed.src_ip,
-                parsed.dst_ip,
-                tcp_details.src_port,
-                tcp_details.dst_port,
-                EcmpProtocol::Tcp,
-            );
-            match group.select_by_connection(&ecmp_tuple) {
-                Ok(member) => {
-                    debug!(
-                        "ECMP resolved '{}' -> '{}' for TCP {}:{} -> {}:{}",
-                        routing_outbound,
-                        member,
-                        parsed.src_ip,
-                        tcp_details.src_port,
-                        parsed.dst_ip,
-                        tcp_details.dst_port
-                    );
-                    member
-                }
-                Err(e) => {
-                    warn!("ECMP group '{}' selection failed: {}", routing_outbound, e);
-                    routing_outbound.clone()
-                }
-            }
-        } else {
-            routing_outbound.clone()
-        }
-    } else {
-        routing_outbound.clone()
-    };
-    let outbound_tag = &outbound_tag;
+    // Use routing outbound directly (ECMP is handled by ControlPlaneHandler)
+    let outbound_tag = routing_outbound;
 
     // Check if this goes to a WireGuard egress (full IP packet forwarding)
     // This includes:
@@ -2563,6 +2526,8 @@ pub fn dns_hijack_stats() -> &'static DnsHijackStats {
 }
 
 /// Forward a UDP packet to the appropriate outbound
+///
+/// Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge.
 async fn forward_udp_packet(
     processed: &ProcessedPacket,
     parsed: &ParsedPacket,
@@ -2571,7 +2536,6 @@ async fn forward_udp_packet(
     session_tracker: &Arc<IngressSessionTracker>,
     stats: &Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
-    ecmp_group_manager: Option<&Arc<EcmpGroupManager>>,
     peer_manager: Option<&Arc<PeerManager>>,
 ) {
     let routing_outbound = &processed.routing.outbound;
@@ -2724,37 +2688,8 @@ async fn forward_udp_packet(
         IPPROTO_UDP,
     );
 
-    // Resolve ECMP group to member using five-tuple hash
-    let outbound_tag: String = if let Some(ecmp_mgr) = ecmp_group_manager {
-        if let Some(group) = ecmp_mgr.get_group(routing_outbound) {
-            // Create ECMP five-tuple for consistent hashing
-            let ecmp_tuple = EcmpFiveTuple::new(
-                parsed.src_ip,
-                parsed.dst_ip,
-                src_port,
-                dst_port,
-                EcmpProtocol::Udp,
-            );
-            match group.select_by_connection(&ecmp_tuple) {
-                Ok(member) => {
-                    debug!(
-                        "ECMP resolved '{}' -> '{}' for UDP {}:{} -> {}:{}",
-                        routing_outbound, member, parsed.src_ip, src_port, parsed.dst_ip, dst_port
-                    );
-                    member
-                }
-                Err(e) => {
-                    warn!("ECMP group '{}' selection failed: {}", routing_outbound, e);
-                    routing_outbound.clone()
-                }
-            }
-        } else {
-            routing_outbound.clone()
-        }
-    } else {
-        routing_outbound.clone()
-    };
-    let outbound_tag = &outbound_tag;
+    // Use routing outbound directly (ECMP is handled by ControlPlaneHandler)
+    let outbound_tag = routing_outbound;
 
     // Determine if this is a WireGuard egress tunnel (managed by WgEgressManager)
     // This includes:
@@ -4145,12 +4080,13 @@ async fn create_icmp_socket() -> std::io::Result<UdpSocket> {
 /// * `stats` - Statistics collector
 /// * `direct_reply_tx` - Optional sender for direct outbound UDP replies
 /// * `local_ip` - Gateway's local IP for responding to pings to self
-/// * `ecmp_group_manager` - Optional ECMP group manager for load balancing
 /// * `peer_manager` - Optional peer manager for peer tunnel forwarding
 ///
 /// # Returns
 ///
 /// A `JoinHandle` for the spawned task.
+///
+/// Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge.
 pub fn spawn_forwarding_task(
     packet_rx: mpsc::Receiver<ProcessedPacket>,
     outbound_manager: Arc<OutboundManager>,
@@ -4159,7 +4095,6 @@ pub fn spawn_forwarding_task(
     stats: Arc<ForwardingStats>,
     direct_reply_tx: Option<mpsc::Sender<ReplyPacket>>,
     local_ip: Option<IpAddr>,
-    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
     peer_manager: Option<Arc<PeerManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_forwarding_loop(
@@ -4170,7 +4105,6 @@ pub fn spawn_forwarding_task(
         stats,
         direct_reply_tx,
         local_ip,
-        ecmp_group_manager,
         peer_manager,
     ))
 }

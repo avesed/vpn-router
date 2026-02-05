@@ -59,7 +59,6 @@ use moka::sync::Cache;
 use tracing::{debug, trace, warn};
 
 use super::udp::{UdpSessionConfig, UdpSessionKey};
-use crate::ecmp::{DestKey, EcmpGroupManager, FiveTuple, LbAlgorithm, Protocol};
 use crate::error::UdpError;
 use crate::outbound::{Outbound, OutboundManager, UdpOutboundHandle};
 use crate::rules::engine::{ConnectionInfo, RuleEngine};
@@ -329,8 +328,6 @@ pub struct UdpPacketProcessor {
     decrement_counter: AtomicU64,
     /// SEC-2 FIX: Last cleanup timestamp, protected by Mutex for thread-safe updates
     last_cleanup: Mutex<Instant>,
-    /// ECMP group manager for load balancing
-    ecmp_group_manager: Option<Arc<EcmpGroupManager>>,
 }
 
 impl UdpPacketProcessor {
@@ -372,7 +369,6 @@ impl UdpPacketProcessor {
             ip_session_counts,
             decrement_counter: AtomicU64::new(0),
             last_cleanup: Mutex::new(Instant::now()),
-            ecmp_group_manager: None,
         }
     }
 
@@ -382,123 +378,25 @@ impl UdpPacketProcessor {
         Self::new(UdpProcessorConfig::default())
     }
 
-    /// Set ECMP group manager for load balancing
-    pub fn with_ecmp_group_manager(mut self, ecmp_manager: Arc<EcmpGroupManager>) -> Self {
-        self.ecmp_group_manager = Some(ecmp_manager);
-        self
-    }
-
-    /// Set ECMP group manager (mutable reference version)
-    pub fn set_ecmp_group_manager(&mut self, ecmp_manager: Arc<EcmpGroupManager>) {
-        self.ecmp_group_manager = Some(ecmp_manager);
-    }
-
-    /// Resolve an outbound tag, checking ECMP groups if needed.
+    /// Resolve an outbound tag to an outbound.
     ///
-    /// This method first tries to find the tag in `outbound_manager`. If not found
-    /// and an ECMP group manager is configured, it checks if the tag is an ECMP
-    /// group and selects a member using the configured algorithm:
-    /// - `FiveTupleHash` (default): Hash src/dst IP+port for connection affinity
-    /// - `DestHash`: Hash destination (domain or IP) for session affinity (video streaming)
-    /// - `DestHashLeastLoad`: Session affinity + intelligent load balancing for new sessions
+    /// Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge.
+    /// This method performs simple direct lookup in the outbound manager.
     ///
     /// # Arguments
     ///
     /// * `tag` - The outbound tag to resolve
-    /// * `packet` - The UDP packet (for building five-tuple)
-    /// * `domain` - Optional domain name from QUIC SNI (used by DestHash/DestHashLeastLoad)
     /// * `outbound_manager` - The outbound manager
     ///
     /// # Returns
     ///
     /// The resolved outbound and its tag, or None if not found.
-    fn resolve_outbound_with_ecmp(
+    fn resolve_outbound(
         &self,
         tag: &str,
-        packet: &UdpPacketInfo,
-        domain: Option<&str>,
         outbound_manager: &OutboundManager,
     ) -> Option<(Arc<dyn Outbound>, String)> {
-        // Try direct lookup first
-        if let Some(outbound) = outbound_manager.get(tag) {
-            return Some((outbound, tag.to_string()));
-        }
-
-        // Check if it's an ECMP group
-        if let Some(ref ecmp_mgr) = self.ecmp_group_manager {
-            if ecmp_mgr.has_group(tag) {
-                // Select member using the group's load balancing algorithm
-                if let Some(group) = ecmp_mgr.get_group(tag) {
-                    // Choose selection method based on algorithm
-                    let select_result = match group.algorithm() {
-                        LbAlgorithm::DestHash => {
-                            // DestHash: hash(source_ip + domain/dest_ip) for per-client session affinity
-                            // Same client to same domain → same exit; different clients → load balanced
-                            let dest_key = DestKey::new(
-                                packet.client_addr.ip(),
-                                domain,
-                                packet.original_dst.ip(),
-                            );
-                            debug!("ECMP group '{}' using DestHash with key: {}", tag, dest_key);
-                            group.select_by_dest(&dest_key)
-                        }
-                        LbAlgorithm::DestHashLeastLoad => {
-                            // DestHashLeastLoad: session affinity + intelligent load balancing
-                            // New sessions: select least loaded exit; existing: use cached selection
-                            let dest_key = DestKey::new(
-                                packet.client_addr.ip(),
-                                domain,
-                                packet.original_dst.ip(),
-                            );
-                            debug!(
-                                "ECMP group '{}' using DestHashLeastLoad with key: {}",
-                                tag, dest_key
-                            );
-                            group.select_by_dest_least_load(&dest_key)
-                        }
-                        LbAlgorithm::Ketama => {
-                            // Ketama: consistent hashing with domain/dest as key
-                            // Better than FiveTupleHash when members change frequently
-                            let key = domain
-                                .unwrap_or(&packet.original_dst.to_string())
-                                .to_string();
-                            debug!("ECMP group '{}' using Ketama with key: {}", tag, key);
-                            group.select_ketama(&key)
-                        }
-                        _ => {
-                            // Default: use five-tuple hash for connection affinity
-                            let five_tuple = FiveTuple::new(
-                                packet.client_addr.ip(),
-                                packet.original_dst.ip(),
-                                packet.client_addr.port(),
-                                packet.original_dst.port(),
-                                Protocol::Udp,
-                            );
-                            group.select_by_connection(&five_tuple)
-                        }
-                    };
-
-                    match select_result {
-                        Ok(member_tag) => {
-                            debug!(
-                                "ECMP group '{}' selected member '{}' for {} -> {} (domain: {:?})",
-                                tag, member_tag, packet.client_addr, packet.original_dst, domain
-                            );
-                            // Recursively resolve the member (it might be in outbound_manager)
-                            if let Some(outbound) = outbound_manager.get(&member_tag) {
-                                return Some((outbound, member_tag));
-                            }
-                            warn!("ECMP member '{}' not found in outbound_manager", member_tag);
-                        }
-                        Err(e) => {
-                            warn!("ECMP group '{}' failed to select member: {}", tag, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+        outbound_manager.get(tag).map(|outbound| (outbound, tag.to_string()))
     }
 
     /// SEC-1 FIX: Check if source IP has exceeded session limit.
@@ -838,27 +736,20 @@ impl UdpPacketProcessor {
             !match_result.is_default()
         );
 
-        // Get outbound from manager with ECMP group resolution
-        // This supports both direct outbounds and ECMP load balancing groups
-        // Pass domain for DestHash algorithm (video streaming session affinity)
+        // Get outbound from manager
+        // Note: ECMP load balancing is now handled by ControlPlaneHandler in netbridge
         let (outbound, actual_outbound_tag) = if let Some(resolved) = self
-            .resolve_outbound_with_ecmp(
-                &match_result.outbound,
-                packet,
-                sniffed_domain.as_deref(),
-                outbound_manager,
-            ) {
+            .resolve_outbound(&match_result.outbound, outbound_manager)
+        {
             resolved
         } else {
             warn!(
                 "Outbound '{}' not found, using default",
                 match_result.outbound
             );
-            // Try to resolve the default outbound (which could also be an ECMP group)
-            if let Some(resolved) = self.resolve_outbound_with_ecmp(
+            // Try to resolve the default outbound
+            if let Some(resolved) = self.resolve_outbound(
                 &rule_engine.default_outbound(),
-                packet,
-                sniffed_domain.as_deref(),
                 outbound_manager,
             ) {
                 resolved
