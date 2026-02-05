@@ -88,6 +88,10 @@
 
 pub mod group;
 pub mod lb;
+pub mod traffic_test;
+
+#[cfg(test)]
+mod traffic_tests;
 
 // Re-export commonly used types from group module
 pub use group::{
@@ -98,3 +102,10 @@ pub use group::{
 
 // Re-export commonly used types from lb module
 pub use lb::{DestKey, FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer, Protocol};
+
+// Re-export traffic testing infrastructure
+pub use traffic_test::{
+    create_test_group, create_weighted_group, verify_dest_affinity, verify_five_tuple_affinity,
+    EcmpTrafficGenerator, EcmpTrafficResults, MockTrafficOutbound, TrafficPattern,
+    DEFAULT_ITERATIONS, DEFAULT_TOLERANCE, WEIGHTED_TOLERANCE,
+};

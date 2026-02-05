@@ -1079,6 +1079,7 @@ async fn main() -> Result<()> {
                         Arc::clone(&outbound_manager),
                         Some(Arc::clone(&chain_manager)),
                         Some(dns_cache_for_ingress),
+                        Some(Arc::clone(&ecmp_group_manager)),
                     )
                     .await;
                     #[cfg(not(feature = "fakedns"))]
@@ -1087,6 +1088,7 @@ async fn main() -> Result<()> {
                         Arc::clone(&outbound_manager),
                         Some(Arc::clone(&chain_manager)),
                         Some(dns_cache_for_ingress),
+                        Some(Arc::clone(&ecmp_group_manager)),
                     )
                     .await;
 

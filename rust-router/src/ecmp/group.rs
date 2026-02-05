@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, trace, warn};
 
 use crate::ecmp::lb::{DestKey, FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer};
 
@@ -435,10 +436,15 @@ impl EcmpGroup {
 
         // Handle algorithms that require connection info (fall back to simpler selection)
         let index = match self.config.algorithm {
-            LbAlgorithm::FiveTupleHash => {
-                // Fall back to round-robin when no tuple is provided
+            LbAlgorithm::FiveTupleHash | LbAlgorithm::Ketama => {
+                // Fall back to round-robin when no tuple/key is provided
                 let healthy: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
                 if healthy.is_empty() {
+                    warn!(
+                        group = %self.config.tag,
+                        total_members = lb_members.len(),
+                        "No healthy ECMP members available"
+                    );
                     return Err(EcmpGroupError::NoHealthyMembers);
                 }
                 let counter = self.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -448,6 +454,11 @@ impl EcmpGroup {
                 // Fall back to least connections when no dest key is provided
                 let healthy: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
                 if healthy.is_empty() {
+                    warn!(
+                        group = %self.config.tag,
+                        total_members = lb_members.len(),
+                        "No healthy ECMP members available"
+                    );
                     return Err(EcmpGroupError::NoHealthyMembers);
                 }
                 self.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -713,6 +724,11 @@ impl EcmpGroup {
         let healthy_members: Vec<&LbMember> = lb_members.iter().filter(|m| m.healthy).collect();
 
         if healthy_members.is_empty() {
+            warn!(
+                group = %self.config.tag,
+                total_members = lb_members.len(),
+                "No healthy ECMP members available for dest-hash-least-load"
+            );
             return Err(EcmpGroupError::NoHealthyMembers);
         }
 
@@ -760,6 +776,72 @@ impl EcmpGroup {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
         Ok(selected_tag)
+    }
+
+    /// Select a member using Ketama consistent hashing.
+    ///
+    /// Uses pingora-ketama for consistent hashing. This is better than simple
+    /// modulo hashing when members change frequently, as it minimizes key
+    /// remapping when nodes are added or removed.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to hash (e.g., domain name or five-tuple string)
+    ///
+    /// # Returns
+    ///
+    /// The tag of the selected member.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EcmpGroupError::NoHealthyMembers` if no healthy members are available.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::ecmp::group::{EcmpGroup, EcmpGroupConfig, EcmpMember};
+    /// use rust_router::ecmp::lb::LbAlgorithm;
+    ///
+    /// let config = EcmpGroupConfig {
+    ///     tag: "test".to_string(),
+    ///     members: vec![
+    ///         EcmpMember::new("m1".to_string()),
+    ///         EcmpMember::new("m2".to_string()),
+    ///     ],
+    ///     algorithm: LbAlgorithm::Ketama,
+    ///     ..Default::default()
+    /// };
+    /// let group = EcmpGroup::new(config).unwrap();
+    ///
+    /// // Same key always returns same member
+    /// let m1 = group.select_ketama("example.com").unwrap();
+    /// let m2 = group.select_ketama("example.com").unwrap();
+    /// assert_eq!(m1, m2);
+    /// ```
+    pub fn select_ketama(&self, key: &str) -> Result<String, EcmpGroupError> {
+        let members = self.members.read();
+
+        // Build LbMember list and collect tags
+        let lb_members: Vec<LbMember> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                LbMember::new(i)
+                    .with_weight(m.config.weight)
+                    .with_active_connections(m.active_connections.load(Ordering::Relaxed))
+                    .with_healthy(m.healthy)
+            })
+            .collect();
+
+        let member_tags: Vec<String> = members.iter().map(|m| m.config.tag.clone()).collect();
+
+        // Use Ketama selection
+        let index = self.load_balancer.select_ketama(&lb_members, key, &member_tags)?;
+
+        // Increment total requests
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        Ok(members[index].config.tag.clone())
     }
 
     /// Clean up expired entries from the session affinity cache.
@@ -896,6 +978,23 @@ impl EcmpGroup {
             .find(|m| m.config.tag == tag)
             .ok_or_else(|| EcmpGroupError::MemberNotFound(tag.to_string()))?;
 
+        // Log health state change
+        if member.healthy != healthy {
+            if healthy {
+                info!(
+                    group = %self.config.tag,
+                    member = %tag,
+                    "ECMP member recovered"
+                );
+            } else {
+                warn!(
+                    group = %self.config.tag,
+                    member = %tag,
+                    "ECMP member marked unhealthy"
+                );
+            }
+        }
+
         member.healthy = healthy;
         Ok(())
     }
@@ -936,8 +1035,15 @@ impl EcmpGroup {
         let mut members = self.members.write();
 
         if members.iter().any(|m| m.config.tag == member.tag) {
-            return Err(EcmpGroupError::MemberExists(member.tag));
+            return Err(EcmpGroupError::MemberExists(member.tag.clone()));
         }
+
+        info!(
+            group = %self.config.tag,
+            member = %member.tag,
+            weight = member.weight,
+            "Added ECMP member"
+        );
 
         members.push(MemberState {
             config: member,
@@ -964,6 +1070,12 @@ impl EcmpGroup {
             .iter()
             .position(|m| m.config.tag == tag)
             .ok_or_else(|| EcmpGroupError::MemberNotFound(tag.to_string()))?;
+
+        info!(
+            group = %self.config.tag,
+            member = %tag,
+            "Removed ECMP member"
+        );
 
         members.remove(pos);
         Ok(())
@@ -1206,10 +1318,12 @@ impl EcmpGroupManager {
         for table in ECMP_ROUTING_TABLE_MIN..=ECMP_ROUTING_TABLE_MAX {
             if !allocated.contains(&table) {
                 allocated.insert(table);
+                debug!(table = table, "Allocated ECMP routing table");
                 return Some(table);
             }
         }
 
+        warn!("No available ECMP routing tables in range {}-{}", ECMP_ROUTING_TABLE_MIN, ECMP_ROUTING_TABLE_MAX);
         None
     }
 
@@ -1221,6 +1335,7 @@ impl EcmpGroupManager {
     pub fn release_routing_table(&self, table: u32) {
         if (ECMP_ROUTING_TABLE_MIN..=ECMP_ROUTING_TABLE_MAX).contains(&table) {
             self.routing_table_allocator.write().remove(&table);
+            debug!(table = table, "Released ECMP routing table");
         }
     }
 

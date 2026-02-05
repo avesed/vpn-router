@@ -56,12 +56,14 @@ use bytes::Bytes;
 use tracing::{debug, error, trace, warn};
 
 use crate::chain::ChainManager;
+use crate::ecmp::group::EcmpGroupManager;
+use crate::ecmp::lb::{DestKey, FiveTuple as EcmpFiveTuple, LbAlgorithm, Protocol as EcmpProtocol};
 use crate::error::UdpError;
 use crate::netbridge::dataplane::{
     ConnectionHandler, ConnectionInfo as NetbridgeConnectionInfo,
     RoutingDecision as NetbridgeRoutingDecision, UdpHandle, UdpHandleRemote,
 };
-use crate::netbridge::types::IpProtocol;
+use crate::netbridge::types::{FiveTuple as NetbridgeFiveTuple, IpProtocol};
 use crate::outbound::{OutboundConnection, OutboundManager, UdpOutboundHandle};
 use crate::rules::engine::{ConnectionInfo as RulesConnectionInfo, RuleEngine};
 use crate::rules::fwmark::ChainMark;
@@ -148,6 +150,10 @@ pub struct ControlPlaneStats {
     pub outbound_failures: AtomicU64,
     /// Rule matching errors
     pub rule_errors: AtomicU64,
+    /// Connections routed via ECMP groups
+    pub ecmp_selections: AtomicU64,
+    /// ECMP selection failures (no healthy members, etc.)
+    pub ecmp_selection_failures: AtomicU64,
 }
 
 impl ControlPlaneStats {
@@ -170,6 +176,8 @@ impl ControlPlaneStats {
             domain_resolved_cache: self.domain_resolved_cache.load(Ordering::Relaxed),
             outbound_failures: self.outbound_failures.load(Ordering::Relaxed),
             rule_errors: self.rule_errors.load(Ordering::Relaxed),
+            ecmp_selections: self.ecmp_selections.load(Ordering::Relaxed),
+            ecmp_selection_failures: self.ecmp_selection_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -186,6 +194,8 @@ pub struct ControlPlaneStatsSnapshot {
     pub domain_resolved_cache: u64,
     pub outbound_failures: u64,
     pub rule_errors: u64,
+    pub ecmp_selections: u64,
+    pub ecmp_selection_failures: u64,
 }
 
 // =============================================================================
@@ -255,6 +265,7 @@ pub struct ControlPlaneHandler {
     #[cfg(feature = "fakedns")]
     fakedns: Option<Arc<FakeDnsManager>>,
     dns_cache: Option<Arc<IpDomainCache>>,
+    ecmp_manager: Option<Arc<EcmpGroupManager>>,
 
     // Configuration
     config: ControlPlaneConfig,
@@ -284,6 +295,7 @@ impl ControlPlaneHandler {
             #[cfg(feature = "fakedns")]
             fakedns: None,
             dns_cache: None,
+            ecmp_manager: None,
             config: ControlPlaneConfig {
                 default_outbound,
                 ..Default::default()
@@ -306,6 +318,7 @@ impl ControlPlaneHandler {
             #[cfg(feature = "fakedns")]
             fakedns: None,
             dns_cache: None,
+            ecmp_manager: None,
             config,
             stats: ControlPlaneStats::new(),
         }
@@ -325,6 +338,17 @@ impl ControlPlaneHandler {
     /// Set the DNS cache for IP-to-domain lookups
     pub fn set_dns_cache(&mut self, dns_cache: Arc<IpDomainCache>) {
         self.dns_cache = Some(dns_cache);
+    }
+
+    /// Set the ECMP group manager for load balancing across multiple outbounds
+    pub fn set_ecmp_manager(&mut self, ecmp_manager: Arc<EcmpGroupManager>) {
+        self.ecmp_manager = Some(ecmp_manager);
+    }
+
+    /// Get the ECMP group manager
+    #[must_use]
+    pub fn ecmp_manager(&self) -> Option<&Arc<EcmpGroupManager>> {
+        self.ecmp_manager.as_ref()
     }
 
     /// Get the rule engine
@@ -488,27 +512,49 @@ impl ControlPlaneHandler {
     // Outbound Connection
     // =========================================================================
 
-    /// Connect to an outbound by tag
+    /// Connect to an outbound by tag, with ECMP support
     ///
-    /// Looks up the outbound in the manager and establishes a connection.
-    /// Falls back to the default outbound if the specified tag is not found.
+    /// If the tag refers to an ECMP group, selects a member using the appropriate
+    /// load balancing algorithm. Falls back to the default outbound if the
+    /// specified tag is not found.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - Outbound tag (may be an ECMP group tag)
+    /// * `dest` - Destination address
+    /// * `domain` - Optional domain name for DestHash algorithm
+    /// * `five_tuple` - Optional five-tuple for FiveTupleHash/Ketama algorithms
     async fn connect_outbound(
         &self,
         tag: &str,
         dest: std::net::SocketAddr,
-        _domain: Option<&str>,
+        domain: Option<&str>,
+        five_tuple: Option<&NetbridgeFiveTuple>,
     ) -> Result<OutboundConnection, ControlPlaneError> {
-        // Get outbound from manager
+        // 1. Check if this is an ECMP group and resolve to actual outbound
+        let (resolved_tag, was_ecmp) = self.resolve_ecmp_outbound(tag, dest, domain, five_tuple)?;
+
+        // 2. Get outbound from manager (using resolved tag)
         let outbound = self
             .outbound_manager
-            .get(tag)
+            .get(&resolved_tag)
             .or_else(|| self.outbound_manager.get(&self.config.default_outbound))
-            .ok_or_else(|| ControlPlaneError::OutboundNotFound(tag.to_string()))?;
+            .ok_or_else(|| ControlPlaneError::OutboundNotFound(resolved_tag.clone()))?;
 
-        // Connect with timeout
+        // 3. Connect with timeout
         let connect_fut = outbound.connect(dest, self.config.connect_timeout);
         match tokio::time::timeout(self.config.connect_timeout, connect_fut).await {
-            Ok(Ok(conn)) => Ok(conn),
+            Ok(Ok(conn)) => {
+                // Increment connection count for ECMP load balancing if this was an ECMP group
+                if was_ecmp {
+                    if let Some(ref ecmp) = self.ecmp_manager {
+                        if let Some(group) = ecmp.get_group(tag) {
+                            let _ = group.increment_connections(&resolved_tag);
+                        }
+                    }
+                }
+                Ok(conn)
+            }
             Ok(Err(e)) => {
                 self.stats.outbound_failures.fetch_add(1, Ordering::Relaxed);
                 Err(ControlPlaneError::outbound_connect(e))
@@ -518,6 +564,118 @@ impl ControlPlaneHandler {
                 Err(ControlPlaneError::Timeout)
             }
         }
+    }
+
+    /// Resolve an outbound tag, handling ECMP group selection
+    ///
+    /// Returns (resolved_tag, was_ecmp_group)
+    fn resolve_ecmp_outbound(
+        &self,
+        tag: &str,
+        dest: std::net::SocketAddr,
+        domain: Option<&str>,
+        five_tuple: Option<&NetbridgeFiveTuple>,
+    ) -> Result<(String, bool), ControlPlaneError> {
+        // If no ECMP manager, or tag is not an ECMP group, return as-is
+        let ecmp = match &self.ecmp_manager {
+            Some(e) if e.has_group(tag) => e,
+            _ => return Ok((tag.to_string(), false)),
+        };
+
+        // Get the ECMP group
+        let group = ecmp.get_group(tag).ok_or_else(|| {
+            ControlPlaneError::EcmpGroupNotFound(tag.to_string())
+        })?;
+
+        // Select member based on algorithm
+        let member = match group.algorithm() {
+            LbAlgorithm::FiveTupleHash => {
+                if let Some(ft) = five_tuple {
+                    // Convert netbridge FiveTuple to ECMP FiveTuple
+                    let ecmp_ft = self.convert_five_tuple(ft);
+                    group.select_by_connection(&ecmp_ft)
+                } else {
+                    // Fall back to next_member (round-robin fallback)
+                    debug!(group = %tag, "FiveTupleHash without five_tuple, falling back to round-robin");
+                    group.next_member()
+                }
+            }
+            LbAlgorithm::Ketama => {
+                // For Ketama, use domain if available, otherwise five-tuple string
+                let key = if let Some(d) = domain {
+                    d.to_string()
+                } else if let Some(ft) = five_tuple {
+                    format!(
+                        "{}:{}",
+                        ft.src_socket_addr(),
+                        ft.dst_socket_addr()
+                    )
+                } else {
+                    dest.to_string()
+                };
+                group.select_ketama(&key)
+            }
+            LbAlgorithm::DestHash | LbAlgorithm::DestHashLeastLoad => {
+                if let Some(ft) = five_tuple {
+                    let dest_key = DestKey::new(ft.src_addr, domain, ft.dst_addr);
+                    if matches!(group.algorithm(), LbAlgorithm::DestHashLeastLoad) {
+                        group.select_by_dest_least_load(&dest_key)
+                    } else {
+                        group.select_by_dest(&dest_key)
+                    }
+                } else {
+                    // Fall back to next_member
+                    debug!(group = %tag, "DestHash without five_tuple, falling back");
+                    group.next_member()
+                }
+            }
+            _ => {
+                // RoundRobin, Weighted, LeastConnections, Random
+                group.next_member()
+            }
+        };
+
+        match member {
+            Ok(selected) => {
+                self.stats.ecmp_selections.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    group = %tag,
+                    selected = %selected,
+                    algorithm = %group.algorithm(),
+                    "ECMP member selected"
+                );
+                Ok((selected, true))
+            }
+            Err(e) => {
+                self.stats.ecmp_selection_failures.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    group = %tag,
+                    error = %e,
+                    "ECMP member selection failed"
+                );
+                Err(ControlPlaneError::EcmpSelectionFailed {
+                    group: tag.to_string(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Convert netbridge FiveTuple to ECMP FiveTuple
+    fn convert_five_tuple(&self, ft: &NetbridgeFiveTuple) -> EcmpFiveTuple {
+        let protocol = match ft.protocol {
+            IpProtocol::Tcp => EcmpProtocol::Tcp,
+            IpProtocol::Udp => EcmpProtocol::Udp,
+            _ => EcmpProtocol::Tcp, // Default to TCP for other protocols
+        };
+
+        EcmpFiveTuple::new(
+            ft.src_addr,
+            ft.dst_addr,
+            ft.src_port,
+            ft.dst_port,
+            protocol,
+        )
     }
 
     /// Connect to a UDP outbound by tag
@@ -599,6 +757,7 @@ impl ControlPlaneHandler {
                                 &outbound,
                                 ctx.netbridge_info.dst,
                                 ctx.rules_info.domain.as_deref(),
+                                Some(&ctx.netbridge_info.five_tuple),
                             )
                             .await
                         {
@@ -629,6 +788,7 @@ impl ControlPlaneHandler {
                                 &outbound,
                                 ctx.netbridge_info.dst,
                                 ctx.rules_info.domain.as_deref(),
+                                Some(&ctx.netbridge_info.five_tuple),
                             )
                             .await;
                     }
@@ -652,6 +812,7 @@ impl ControlPlaneHandler {
             &match_result.outbound,
             ctx.netbridge_info.dst,
             ctx.rules_info.domain.as_deref(),
+            Some(&ctx.netbridge_info.five_tuple),
         )
         .await
     }
@@ -662,8 +823,9 @@ impl ControlPlaneHandler {
         outbound: &str,
         dest: std::net::SocketAddr,
         domain: Option<&str>,
+        five_tuple: Option<&NetbridgeFiveTuple>,
     ) -> NetbridgeRoutingDecision {
-        match self.connect_outbound(outbound, dest, domain).await {
+        match self.connect_outbound(outbound, dest, domain, five_tuple).await {
             Ok(conn) => NetbridgeRoutingDecision::Accept(Box::new(conn.into_outbound_stream())),
             Err(e) => {
                 warn!(error = %e, outbound = %outbound, "Outbound connect failed");

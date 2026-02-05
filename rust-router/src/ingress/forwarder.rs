@@ -4750,6 +4750,7 @@ pub async fn init_kernel_ingress(
     outbound_manager: std::sync::Arc<crate::outbound::OutboundManager>,
     chain_manager: Option<std::sync::Arc<crate::chain::ChainManager>>,
     dns_cache: Option<std::sync::Arc<crate::ingress::dns_cache::IpDomainCache>>,
+    ecmp_manager: Option<std::sync::Arc<crate::ecmp::EcmpGroupManager>>,
 ) -> anyhow::Result<mpsc::Receiver<crate::netbridge::types::ReplyPacket>> {
     use crate::controlplane::ControlPlaneBuilder;
     use crate::netbridge::kernel::{KernelIngress, KernelIngressConfig};
@@ -4769,6 +4770,9 @@ pub async fn init_kernel_ingress(
     #[cfg(feature = "fakedns")]
     if let Some(fdns) = fakedns_manager {
         builder = builder.with_fakedns(fdns);
+    }
+    if let Some(ecmp) = ecmp_manager {
+        builder = builder.with_ecmp_manager(ecmp);
     }
 
     let handler = builder

@@ -362,6 +362,11 @@ pub enum LbAlgorithm {
     /// This combines session affinity with intelligent load balancing.
     #[serde(rename = "dest_hash_least_load")]
     DestHashLeastLoad,
+    /// Ketama consistent hashing: Uses pingora-ketama for consistent hashing.
+    /// Better than `FiveTupleHash` when members change frequently, as it minimizes
+    /// key remapping when nodes are added/removed.
+    #[serde(rename = "ketama")]
+    Ketama,
     /// Round-robin: Cycle through members sequentially
     RoundRobin,
     /// Weighted: Distribute based on member weights
@@ -378,6 +383,7 @@ impl std::fmt::Display for LbAlgorithm {
             Self::FiveTupleHash => write!(f, "five_tuple_hash"),
             Self::DestHash => write!(f, "dest_hash"),
             Self::DestHashLeastLoad => write!(f, "dest_hash_least_load"),
+            Self::Ketama => write!(f, "ketama"),
             Self::RoundRobin => write!(f, "round_robin"),
             Self::Weighted => write!(f, "weighted"),
             Self::LeastConnections => write!(f, "least_connections"),
@@ -526,7 +532,7 @@ impl LoadBalancer {
                 let index = seed % member_count;
                 Ok(index)
             }
-            LbAlgorithm::FiveTupleHash => Err(LbError::MissingFiveTuple),
+            LbAlgorithm::FiveTupleHash | LbAlgorithm::Ketama => Err(LbError::MissingFiveTuple),
             LbAlgorithm::DestHash | LbAlgorithm::DestHashLeastLoad => Err(LbError::MissingDestKey),
             LbAlgorithm::Weighted | LbAlgorithm::LeastConnections => Err(LbError::Internal(
                 "Algorithm requires detailed member information".into(),
@@ -576,7 +582,7 @@ impl LoadBalancer {
             }
             LbAlgorithm::Weighted => self.select_weighted(&healthy),
             LbAlgorithm::LeastConnections => self.select_least_connections(&healthy),
-            LbAlgorithm::FiveTupleHash => Err(LbError::MissingFiveTuple),
+            LbAlgorithm::FiveTupleHash | LbAlgorithm::Ketama => Err(LbError::MissingFiveTuple),
             LbAlgorithm::DestHash | LbAlgorithm::DestHashLeastLoad => Err(LbError::MissingDestKey),
         }
     }
@@ -817,6 +823,98 @@ impl LoadBalancer {
             .ok_or(LbError::NoMembers)?;
 
         Ok(selected.index)
+    }
+
+    /// Select a member using Ketama-style consistent hashing.
+    ///
+    /// Implements consistent hashing using CRC32, which minimizes key remapping
+    /// when nodes are added or removed. This is better than simple modulo hashing
+    /// when members change frequently.
+    ///
+    /// The algorithm works by:
+    /// 1. Building a sorted ring of (hash_value, member_index) tuples
+    /// 2. Hashing the key and finding the first ring entry >= hash
+    /// 3. If no entry found (wrap around), using the first entry
+    ///
+    /// # Arguments
+    ///
+    /// * `members` - List of member information with tags for the hash ring
+    /// * `key` - The key to hash (e.g., domain name or five-tuple string)
+    /// * `member_tags` - Mapping from index to member tag string for the hash ring
+    ///
+    /// # Returns
+    ///
+    /// Selected member index
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rust_router::ecmp::lb::{LoadBalancer, LbAlgorithm, LbMember};
+    ///
+    /// let lb = LoadBalancer::new(LbAlgorithm::Ketama);
+    /// let members = vec![
+    ///     LbMember::new(0),
+    ///     LbMember::new(1),
+    ///     LbMember::new(2),
+    /// ];
+    /// let tags = vec!["member-0".to_string(), "member-1".to_string(), "member-2".to_string()];
+    ///
+    /// // Same key always returns same member
+    /// let idx1 = lb.select_ketama(&members, "example.com", &tags).unwrap();
+    /// let idx2 = lb.select_ketama(&members, "example.com", &tags).unwrap();
+    /// assert_eq!(idx1, idx2);
+    /// ```
+    pub fn select_ketama(
+        &self,
+        members: &[LbMember],
+        key: &str,
+        member_tags: &[String],
+    ) -> Result<usize, LbError> {
+        // Filter healthy members
+        let healthy: Vec<&LbMember> = members.iter().filter(|m| m.healthy).collect();
+
+        if healthy.is_empty() {
+            return Err(LbError::NoMembers);
+        }
+
+        // Build consistent hash ring
+        // Each member gets multiple virtual nodes based on weight (more weight = more positions)
+        const VIRTUAL_NODES_PER_WEIGHT: u32 = 40; // 40 virtual nodes per weight unit
+        let mut ring: Vec<(u32, usize)> = Vec::new();
+
+        for member in &healthy {
+            if member.index >= member_tags.len() {
+                continue;
+            }
+            let tag = &member_tags[member.index];
+            let num_vnodes = member.weight * VIRTUAL_NODES_PER_WEIGHT;
+
+            for i in 0..num_vnodes {
+                // Create virtual node key: "tag-vnode#"
+                let vnode_key = format!("{}-{}", tag, i);
+                let hash = crc32fast::hash(vnode_key.as_bytes());
+                ring.push((hash, member.index));
+            }
+        }
+
+        if ring.is_empty() {
+            return Err(LbError::NoMembers);
+        }
+
+        // Sort ring by hash value
+        ring.sort_by_key(|(hash, _)| *hash);
+
+        // Hash the key and find position in ring
+        let key_hash = crc32fast::hash(key.as_bytes());
+
+        // Binary search for first entry >= key_hash
+        let idx = match ring.binary_search_by_key(&key_hash, |(h, _)| *h) {
+            Ok(i) => i,           // Exact match
+            Err(i) if i < ring.len() => i, // First entry >= key_hash
+            Err(_) => 0,          // Wrap around to first entry
+        };
+
+        Ok(ring[idx].1)
     }
 
     /// Reset the round-robin counter

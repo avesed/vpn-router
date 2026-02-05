@@ -56,12 +56,14 @@
 //! let results = test.run_throughput(&config).await;
 //! ```
 
+pub mod ecmp_loopback;
 pub mod latency;
 pub mod loopback;
 pub mod report;
 pub mod throughput;
 
 // Re-export key types
+pub use ecmp_loopback::{EcmpBenchResults, EcmpLoopbackConfig, EcmpLoopbackTest, LatencyStats};
 pub use latency::{LatencyConfig, LatencyHistogram, LatencyRecorder, LatencyResults, LatencyTest};
 pub use loopback::{LoopbackTest, LoopbackTestConfig, MockResponder};
 pub use report::{BenchmarkReport, ReportFormat};

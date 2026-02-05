@@ -4120,6 +4120,7 @@ impl IpcHandler {
             super::protocol::EcmpAlgorithm::DestHashLeastLoad => {
                 crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad
             }
+            super::protocol::EcmpAlgorithm::Ketama => crate::ecmp::lb::LbAlgorithm::Ketama,
             super::protocol::EcmpAlgorithm::Weighted => crate::ecmp::lb::LbAlgorithm::Weighted,
             super::protocol::EcmpAlgorithm::LeastConnections => {
                 crate::ecmp::lb::LbAlgorithm::LeastConnections
@@ -4199,6 +4200,9 @@ impl IpcHandler {
                     crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => {
                         super::protocol::EcmpAlgorithm::DestHashLeastLoad
                     }
+                    crate::ecmp::lb::LbAlgorithm::Ketama => {
+                        super::protocol::EcmpAlgorithm::Ketama
+                    }
                     crate::ecmp::lb::LbAlgorithm::Weighted => {
                         super::protocol::EcmpAlgorithm::Weighted
                     }
@@ -4274,6 +4278,9 @@ impl IpcHandler {
                         }
                         crate::ecmp::lb::LbAlgorithm::DestHashLeastLoad => {
                             super::protocol::EcmpAlgorithm::DestHashLeastLoad
+                        }
+                        crate::ecmp::lb::LbAlgorithm::Ketama => {
+                            super::protocol::EcmpAlgorithm::Ketama
                         }
                         crate::ecmp::lb::LbAlgorithm::Weighted => {
                             super::protocol::EcmpAlgorithm::Weighted

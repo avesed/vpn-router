@@ -40,6 +40,7 @@
 pub mod ab_comparison;
 pub mod chaos;
 pub mod controlplane_equivalence;
+pub mod ecmp_netbridge;
 pub mod dns_ipc;
 #[cfg(any(
     feature = "sni-sniffing",

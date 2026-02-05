@@ -110,6 +110,26 @@ pub enum ControlPlaneError {
     ChainNotFound(String),
 
     // =========================================================================
+    // ECMP Errors
+    // =========================================================================
+    /// ECMP group not found
+    ///
+    /// The specified ECMP group does not exist in the manager.
+    #[error("ECMP group not found: {0}")]
+    EcmpGroupNotFound(String),
+
+    /// ECMP member selection failed
+    ///
+    /// Failed to select a member from the ECMP group.
+    #[error("ECMP member selection failed for group '{group}': {reason}")]
+    EcmpSelectionFailed {
+        /// ECMP group tag
+        group: String,
+        /// Failure reason
+        reason: String,
+    },
+
+    // =========================================================================
     // Domain and DNS Errors
     // =========================================================================
     /// Invalid domain
@@ -307,6 +327,15 @@ impl ControlPlaneError {
         )
     }
 
+    /// Returns true if this is an ECMP-related error
+    #[must_use]
+    pub fn is_ecmp_error(&self) -> bool {
+        matches!(
+            self,
+            Self::EcmpGroupNotFound(_) | Self::EcmpSelectionFailed { .. }
+        )
+    }
+
     // =========================================================================
     // Constructor Helpers
     // =========================================================================
@@ -364,6 +393,19 @@ impl ControlPlaneError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
+
+    /// Create an ECMP group not found error
+    pub fn ecmp_group_not_found(group: impl Into<String>) -> Self {
+        Self::EcmpGroupNotFound(group.into())
+    }
+
+    /// Create an ECMP selection failed error
+    pub fn ecmp_selection_failed(group: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::EcmpSelectionFailed {
+            group: group.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 /// A specialized Result type for control plane operations
@@ -388,6 +430,23 @@ impl From<crate::chain::ChainError> for ControlPlaneError {
 impl From<crate::transport::TransportError> for ControlPlaneError {
     fn from(err: crate::transport::TransportError) -> Self {
         Self::OutboundConnect(Box::new(err))
+    }
+}
+
+impl From<crate::ecmp::group::EcmpGroupError> for ControlPlaneError {
+    fn from(err: crate::ecmp::group::EcmpGroupError) -> Self {
+        use crate::ecmp::group::EcmpGroupError;
+        match err {
+            EcmpGroupError::GroupNotFound(tag) => Self::EcmpGroupNotFound(tag),
+            EcmpGroupError::NoHealthyMembers => Self::EcmpSelectionFailed {
+                group: "unknown".to_string(),
+                reason: "no healthy members available".to_string(),
+            },
+            other => Self::EcmpSelectionFailed {
+                group: "unknown".to_string(),
+                reason: other.to_string(),
+            },
+        }
     }
 }
 
@@ -512,5 +571,25 @@ mod tests {
     fn test_error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ControlPlaneError>();
+    }
+
+    #[test]
+    fn test_is_ecmp_error() {
+        assert!(ControlPlaneError::ecmp_group_not_found("us-exits").is_ecmp_error());
+        assert!(ControlPlaneError::ecmp_selection_failed("us-exits", "no healthy members")
+            .is_ecmp_error());
+
+        assert!(!ControlPlaneError::OutboundNotFound("x".to_string()).is_ecmp_error());
+        assert!(!ControlPlaneError::ChainRouting("x".to_string()).is_ecmp_error());
+    }
+
+    #[test]
+    fn test_ecmp_error_display() {
+        let err = ControlPlaneError::ecmp_group_not_found("us-exits");
+        assert_eq!(err.to_string(), "ECMP group not found: us-exits");
+
+        let err = ControlPlaneError::ecmp_selection_failed("us-exits", "no healthy members");
+        assert!(err.to_string().contains("us-exits"));
+        assert!(err.to_string().contains("no healthy members"));
     }
 }

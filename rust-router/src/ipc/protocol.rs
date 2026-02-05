@@ -1979,6 +1979,10 @@ pub enum EcmpAlgorithm {
     /// - New sessions: select the exit with lowest active connections
     /// - Existing sessions: maintain affinity with cached selection
     DestHashLeastLoad,
+    /// Ketama consistent hashing (from Pingora)
+    /// Better than SourceHash when members change frequently as it minimizes
+    /// key remapping when nodes are added or removed
+    Ketama,
     /// Weighted random selection
     Weighted,
     /// Least connections

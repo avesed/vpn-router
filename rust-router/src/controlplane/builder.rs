@@ -38,6 +38,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::chain::ChainManager;
+use crate::ecmp::group::EcmpGroupManager;
 use crate::ingress::dns_cache::IpDomainCache;
 use crate::outbound::OutboundManager;
 use crate::rules::engine::RuleEngine;
@@ -74,6 +75,7 @@ pub struct ControlPlaneBuilder {
     rule_engine: Option<Arc<RuleEngine>>,
     chain_manager: Option<Arc<ChainManager>>,
     outbound_manager: Option<Arc<OutboundManager>>,
+    ecmp_manager: Option<Arc<EcmpGroupManager>>,
     #[cfg(feature = "fakedns")]
     fakedns: Option<Arc<FakeDnsManager>>,
     dns_cache: Option<Arc<IpDomainCache>>,
@@ -101,6 +103,7 @@ impl ControlPlaneBuilder {
             rule_engine: None,
             chain_manager: None,
             outbound_manager: None,
+            ecmp_manager: None,
             #[cfg(feature = "fakedns")]
             fakedns: None,
             dns_cache: None,
@@ -207,6 +210,27 @@ impl ControlPlaneBuilder {
     #[must_use]
     pub fn with_dns_cache(mut self, dns_cache: Arc<IpDomainCache>) -> Self {
         self.dns_cache = Some(dns_cache);
+        self
+    }
+
+    /// Set the ECMP group manager (optional)
+    ///
+    /// The ECMP manager enables load balancing across multiple outbound
+    /// connections. When an outbound tag matches an ECMP group, the handler
+    /// will select a member using the group's configured algorithm.
+    ///
+    /// # Arguments
+    ///
+    /// * `ecmp_manager` - The ECMP group manager instance
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// builder.with_ecmp_manager(Arc::new(ecmp_manager))
+    /// ```
+    #[must_use]
+    pub fn with_ecmp_manager(mut self, ecmp_manager: Arc<EcmpGroupManager>) -> Self {
+        self.ecmp_manager = Some(ecmp_manager);
         self
     }
 
@@ -378,6 +402,10 @@ impl ControlPlaneBuilder {
             handler.set_dns_cache(dns_cache);
         }
 
+        if let Some(ecmp_manager) = self.ecmp_manager {
+            handler.set_ecmp_manager(ecmp_manager);
+        }
+
         Ok(handler)
     }
 }
@@ -395,6 +423,7 @@ impl std::fmt::Debug for ControlPlaneBuilder {
             .field("has_rule_engine", &self.rule_engine.is_some())
             .field("has_chain_manager", &self.chain_manager.is_some())
             .field("has_outbound_manager", &self.outbound_manager.is_some())
+            .field("has_ecmp_manager", &self.ecmp_manager.is_some())
             .field("has_dns_cache", &self.dns_cache.is_some())
             .field("default_outbound", &self.default_outbound)
             .field("connect_timeout", &self.connect_timeout)

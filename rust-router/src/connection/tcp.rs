@@ -273,6 +273,13 @@ fn resolve_outbound_with_ecmp(
                         );
                         group.select_by_dest_least_load(&dest_key)
                     }
+                    LbAlgorithm::Ketama => {
+                        // Ketama: consistent hashing with domain/dest as key
+                        // Better than FiveTupleHash when members change frequently
+                        let key = domain.unwrap_or(&original_dst.to_string()).to_string();
+                        debug!("ECMP group '{}' using Ketama with key: {}", tag, key);
+                        group.select_ketama(&key)
+                    }
                     _ => {
                         // Default: use five-tuple hash for connection affinity
                         let five_tuple = FiveTuple::new(

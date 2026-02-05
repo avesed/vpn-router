@@ -127,6 +127,9 @@ hickory-proto = "0.24"
 # Rate limiting
 governor = "0.6"
 
+# CRC32 hashing for Ketama-style consistent hashing in ECMP load balancing
+crc32fast = "1.5"
+
 # Userspace TCP/IP stack for tunnel HTTP/UDP client
 # Userspace TCP/IP stack - 1MB buffers for high throughput
 smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "alloc"] }
