@@ -143,8 +143,11 @@ export interface RouteRulesResponse {
 // Domain Catalog
 export interface DomainListSummary {
   id: string;
-  domain_count: number;
-  sample_domains: string[];
+  name?: string;
+  // JSON catalog uses "count", API custom items use "domain_count"
+  count?: number;
+  domain_count?: number;
+  sample_domains?: string[];
   is_custom?: boolean;
 }
 

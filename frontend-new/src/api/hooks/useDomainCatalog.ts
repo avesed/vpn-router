@@ -1,6 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../client";
-import { toast } from "sonner";
 
 export const domainCatalogKeys = {
   all: ["domain-catalog"] as const,
@@ -57,11 +56,9 @@ export function useCreateQuickRule() {
       api.createQuickRule(listIds, outbound, tag),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["rules"] });
-      toast.success("Domain rule created successfully");
+      // Toast handled by component for batch operation support
     },
-    onError: (error: Error) => {
-      toast.error(`Failed to create domain rule: ${error.message}`);
-    },
+    // Error toast handled by component for batch operation support
   });
 }
 
@@ -80,10 +77,8 @@ export function useCreateIpQuickRule() {
       api.createIpQuickRule(countryCodes, outbound, tag, ipv4Only),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["rules"] });
-      toast.success("IP rule created successfully");
+      // Toast handled by component for batch operation support
     },
-    onError: (error: Error) => {
-      toast.error(`Failed to create IP rule: ${error.message}`);
-    },
+    // Error toast handled by component for batch operation support
   });
 }
