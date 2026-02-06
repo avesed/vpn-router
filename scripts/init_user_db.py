@@ -505,7 +505,7 @@ CREATE TABLE IF NOT EXISTS remote_rule_sets (
 );
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_enabled ON remote_rule_sets(enabled);
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_category ON remote_rule_sets(category);
-CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_status ON remote_rule_sets(status);
+-- Note: idx_remote_rule_sets_status created by migration function for existing DBs
 
 -- 管理员认证表（单行）
 CREATE TABLE IF NOT EXISTS admin_auth (
@@ -2014,9 +2014,11 @@ def migrate_remote_rule_sets_binary_fields(conn: sqlite3.Connection):
         fields_added += 1
         print("✓ 添加 remote_rule_sets.error_message 字段")
 
-    if fields_added > 0:
-        # 创建状态索引
+    # 始终尝试创建状态索引（如果 status 列存在）
+    if "status" in columns or fields_added > 0:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_status ON remote_rule_sets(status)")
+
+    if fields_added > 0:
         conn.commit()
         print(f"✓ 添加了 {fields_added} 个二进制存储字段")
     else:

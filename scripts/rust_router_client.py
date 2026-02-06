@@ -134,6 +134,7 @@ class UpdateRoutingResult:
     version: int = 0
     rule_count: int = 0
     default_outbound: str = ""
+    error: Optional[str] = None  # Error message if success=False
 
 
 @dataclass
@@ -913,14 +914,19 @@ class RustRouterClient:
         })
 
         if not response.success:
-            return UpdateRoutingResult(success=False)
+            return UpdateRoutingResult(
+                success=False,
+                error=response.error or response.message or "IPC command failed"
+            )
 
         if response.data:
+            data_success = response.data.get("success", True)
             return UpdateRoutingResult(
-                success=response.data.get("success", True),
+                success=data_success,
                 version=response.data.get("version", 0),
                 rule_count=response.data.get("rule_count", 0),
                 default_outbound=response.data.get("default_outbound", default_outbound),
+                error=response.data.get("error") if not data_success else None,
             )
         return UpdateRoutingResult(success=True)
 

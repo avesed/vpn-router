@@ -11496,7 +11496,11 @@ async def api_reload_adblock_rule(tag: str):
 
 @app.post("/api/adblock/apply")
 async def api_apply_adblock_rules():
-    """应用广告拦截规则（下载启用的规则并加载到内存）"""
+    """应用广告拦截规则（下载启用的规则并加载到内存）
+
+    Adblock rules are applied via DNS blocking (NXDOMAIN) rather than routing.
+    This is more efficient and avoids IPC message size limits.
+    """
     if not _rule_loader:
         raise HTTPException(status_code=503, detail="规则加载器未初始化")
 
@@ -11526,8 +11530,9 @@ async def api_apply_adblock_rules():
                 await _rule_loader.unload_remote_rule_set(rs["tag"])
                 results["skipped"].append(rs["tag"])
 
-        # 同步规则到 rust-router
-        _regenerate_and_reload()
+        # Write combined adblock rules to file and reload via DNS engine
+        # (instead of sending through IPC which has size limits)
+        await _sync_adblock_rules_to_dns_engine()
 
         return {
             "message": f"已加载 {len(results['loaded'])} 个规则集",
@@ -11535,8 +11540,68 @@ async def api_apply_adblock_rules():
             "status": "success"
         }
     except Exception as exc:
+        import traceback
+        import sys
+        tb = traceback.format_exc()
+        print(f"[ADBLOCK APPLY ERROR] {exc}", file=sys.stderr)
+        print(f"[ADBLOCK APPLY TRACEBACK]\n{tb}", file=sys.stderr)
+        sys.stderr.flush()
         logging.error(f"Failed to apply adblock rules: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to apply configuration")
+        logging.error(f"Traceback: {tb}")
+        raise HTTPException(status_code=500, detail=f"Failed to apply configuration: {exc}")
+
+
+async def _sync_adblock_rules_to_dns_engine():
+    """Sync adblock rules to rust-router DNS engine via file + IPC.
+
+    Instead of sending rules through IPC (which has a 1 MB limit),
+    write rules to a JSON file and tell rust-router to reload.
+
+    This uses DNS-level blocking (return NXDOMAIN) which is more efficient
+    than routing-level blocking.
+    """
+    if not _rule_loader:
+        logging.warning("[adblock] Rule loader not initialized, skipping DNS sync")
+        return
+
+    # Collect all adblock rules from loaded remote sets
+    all_domains = []
+    for tag, data in _rule_loader._loaded_remote_sets.items():
+        rules = data.get("rules", [])
+        all_domains.extend(rules)
+        logging.debug(f"[adblock] Collected {len(rules)} domains from {tag}")
+
+    logging.info(f"[adblock] Total {len(all_domains)} domains to sync to DNS engine")
+
+    # Write to sing-box ruleset format
+    # Path: /etc/sing-box/rulesets/__adblock_combined__.json
+    ruleset_dir = Path("/etc/sing-box/rulesets")
+    ruleset_dir.mkdir(parents=True, exist_ok=True)
+    combined_file = ruleset_dir / "__adblock_combined__.json"
+
+    if all_domains:
+        ruleset = {
+            "version": 1,
+            "rules": [{"domain_suffix": all_domains}]
+        }
+        combined_file.write_text(json.dumps(ruleset, ensure_ascii=False))
+        logging.info(f"[adblock] Written {len(all_domains)} domains to {combined_file}")
+    else:
+        # Remove file if no domains
+        if combined_file.exists():
+            combined_file.unlink()
+            logging.info("[adblock] Removed empty adblock file")
+
+    # Reload via IPC
+    from rust_router_client import RustRouterClient
+    client = RustRouterClient()
+
+    response = await client.reload_dns_blocklist()
+    if not response.success:
+        error_msg = response.error or response.message or "Unknown error"
+        raise RuntimeError(f"DNS blocklist reload failed: {error_msg}")
+
+    logging.info(f"[adblock] DNS blocklist reloaded successfully")
 
 
 def _regenerate_and_reload():
@@ -11625,16 +11690,23 @@ def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRout
             "outbound": outbound,
         })
 
-    # Add rules from loaded rule sets (GeoIP, adblock)
+    # Add rules from loaded LOCAL rule sets (GeoIP, etc.)
+    # NOTE: Remote/adblock rules are handled via DNS blocking (see _sync_adblock_rules_to_dns_engine)
+    # and are NOT included here to avoid IPC message size limits
     if _rule_loader:
         loaded_rules = _rule_loader.get_all_rules()
-        for rule in loaded_rules:
+        # Filter out remote rules (adblock) - only include local rule sets
+        local_rules = [r for r in loaded_rules if r.get("source") != "remote"]
+        logging.info(f"[_sync_rules] Adding {len(local_rules)} local rules (skipping {len(loaded_rules) - len(local_rules)} remote/adblock rules)")
+        for rule in local_rules:
             rule_configs.append({
                 "rule_type": rule.get("rule_type", "domain_suffix"),
                 "target": rule.get("rule", ""),
-                "outbound": rule.get("outbound", "block"),
+                "outbound": rule.get("outbound", "direct"),
             })
-        logging.debug(f"Added {len(loaded_rules)} rules from rule_loader")
+        logging.debug(f"Added {len(local_rules)} rules from rule_loader")
+    else:
+        logging.debug("[_sync_rules] _rule_loader is None")
 
     default_outbound = db.get_setting("default_outbound", "direct") or "direct"
 
@@ -11645,11 +11717,13 @@ def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRout
         if not ping_response.success:
             return None, "rust-router not available"
 
+        logging.debug(f"[_sync_rules] Sending {len(rule_configs)} rules to rust-router")
         result = await client.update_routing(rule_configs, default_outbound)
         if result.success:
             return result, None
         else:
-            return None, "rust-router sync failed"
+            error_detail = getattr(result, 'error', getattr(result, 'message', 'unknown error'))
+            return None, f"rust-router sync failed: {error_detail}"
 
     def _handle_error(error_msg: str) -> RustRouterSyncResult:
         """Handle sync error - either raise or return failure result."""

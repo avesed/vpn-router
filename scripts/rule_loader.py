@@ -868,11 +868,12 @@ class AsyncRuleLoader:
 
                         # Update database with new file path and checksum
                         file_path = f"remote-{tag}.bin"
-                        self.db.update_remote_rule_set(tag, {
-                            "file_path": file_path,
-                            "checksum": new_checksum,
-                            "count": rule_count,
-                        })
+                        self.db.update_remote_rule_set(
+                            tag,
+                            file_path=file_path,
+                            checksum=new_checksum,
+                            domain_count=rule_count
+                        )
                         checksum = new_checksum
 
                         logger.info(

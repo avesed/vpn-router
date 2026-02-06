@@ -23,6 +23,12 @@ try:
 except ImportError:
     HAS_MSGPACK = False
 
+try:
+    from rule_binary import write_rule_binary
+    HAS_RULE_BINARY = True
+except ImportError:
+    HAS_RULE_BINARY = False
+
 
 def parse_adblock_rule(line: str) -> Optional[str]:
     """解析 ABP 规则，只提取域名 (忽略元素隐藏规则)"""
@@ -178,7 +184,7 @@ def save_singbox_ruleset(domains: Set[str], output_path: Path):
 
 
 def save_binary_ruleset(domains: Set[str], output_path: Path, outbound: str = "block") -> Tuple[str, int]:
-    """保存为 msgpack 二进制格式
+    """保存为 msgpack 二进制格式（与 rule_binary.py 格式兼容）
 
     Args:
         domains: 域名集合
@@ -188,24 +194,17 @@ def save_binary_ruleset(domains: Set[str], output_path: Path, outbound: str = "b
     Returns:
         (checksum, domain_count) 元组
     """
-    if not HAS_MSGPACK:
-        raise ImportError("msgpack module not available, install with: pip install msgpack")
+    if not HAS_RULE_BINARY:
+        raise ImportError("rule_binary module not available")
 
-    data = {
-        "magic": "RULE",
-        "version": 1,
-        "rule_type": "domain_suffix",
-        "outbound": outbound,
-        "rules": sorted(domains)  # 排序以保证一致性
-    }
-    binary = msgpack.packb(data, use_bin_type=True)
-    checksum = hashlib.sha256(binary).hexdigest()
-
-    # 原子写入
+    # 使用 rule_binary 模块写入，保证格式兼容
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_suffix(".tmp")
-    tmp_path.write_bytes(binary)
-    tmp_path.rename(output_path)
+    checksum = write_rule_binary(
+        str(output_path),
+        rules=sorted(domains),  # 排序以保证一致性
+        rule_type="domain_suffix",
+        outbound=outbound
+    )
 
     file_size = output_path.stat().st_size / 1024
     print(f"已保存二进制: {output_path} ({file_size:.1f} KB, {len(domains):,} 条规则)")
