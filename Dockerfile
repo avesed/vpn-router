@@ -188,6 +188,9 @@ COPY scripts/render_routing_config.py /usr/local/bin/render_routing_config.py
 COPY scripts/watchdog.py /usr/local/bin/watchdog.py
 # Global logging configuration module (LOG_LEVEL environment variable support)
 COPY scripts/log_config.py /usr/local/bin/log_config.py
+# Binary rule storage modules (performance optimization)
+COPY scripts/rule_binary.py /usr/local/bin/rule_binary.py
+COPY scripts/rule_loader.py /usr/local/bin/rule_loader.py
 COPY config/pia/ca/rsa_4096.crt /opt/pia/ca/rsa_4096.crt
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fetch-geodata.sh \
     /usr/local/bin/pia_provision.py \

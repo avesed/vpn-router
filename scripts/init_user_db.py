@@ -35,6 +35,27 @@ CREATE INDEX IF NOT EXISTS idx_rule_enabled ON routing_rules(enabled, priority);
 CREATE INDEX IF NOT EXISTS idx_rule_outbound ON routing_rules(outbound);
 CREATE INDEX IF NOT EXISTS idx_rule_tag ON routing_rules(tag);
 
+-- 规则集表（二进制规则文件元数据）
+-- 存储 IP/域名规则集的元数据，实际规则存储在 msgpack 文件中
+CREATE TABLE IF NOT EXISTS rule_sets (
+    id TEXT PRIMARY KEY,              -- 规则集 ID，如 'geoip-cn', 'custom-streaming'
+    name TEXT NOT NULL,               -- 人类可读名称
+    rule_type TEXT NOT NULL,          -- 'ip', 'domain', 'domain_suffix', 'domain_keyword'
+    outbound TEXT NOT NULL,           -- 出口标签
+    rule_count INTEGER DEFAULT 0,     -- 规则集中的规则数量
+    file_path TEXT,                   -- 二进制文件的相对路径
+    checksum TEXT,                    -- SHA256 校验和
+    status TEXT DEFAULT 'pending',    -- pending/loading/loaded/error
+    error_message TEXT,               -- 错误状态时的错误信息
+    enabled INTEGER DEFAULT 1,
+    priority INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_rule_sets_enabled ON rule_sets(enabled);
+CREATE INDEX IF NOT EXISTS idx_rule_sets_status ON rule_sets(status);
+CREATE INDEX IF NOT EXISTS idx_rule_sets_outbound ON rule_sets(outbound);
+
 -- 出口配置表
 CREATE TABLE IF NOT EXISTS outbounds (
     tag TEXT PRIMARY KEY,
@@ -475,11 +496,16 @@ CREATE TABLE IF NOT EXISTS remote_rule_sets (
     region TEXT,  -- cn, de, fr, kr, ru, etc.
     last_updated TIMESTAMP,
     domain_count INTEGER DEFAULT 0,
+    file_path TEXT,                -- 二进制文件相对路径 (msgpack)
+    checksum TEXT,                 -- SHA256 校验和
+    status TEXT DEFAULT 'pending', -- pending/downloading/loaded/error
+    error_message TEXT,            -- 错误信息
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_enabled ON remote_rule_sets(enabled);
 CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_category ON remote_rule_sets(category);
+CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_status ON remote_rule_sets(status);
 
 -- 管理员认证表（单行）
 CREATE TABLE IF NOT EXISTS admin_auth (
@@ -1946,6 +1972,57 @@ def migrate_warp_egress_wireguard_fields(conn: sqlite3.Connection):
         print("⊘ warp_egress WireGuard 字段已存在，跳过迁移")
 
 
+def migrate_remote_rule_sets_binary_fields(conn: sqlite3.Connection):
+    """为 remote_rule_sets 表添加二进制存储字段
+
+    用于将广告拦截规则迁移到 msgpack 二进制格式：
+    - file_path: 二进制文件相对路径
+    - checksum: SHA256 校验和
+    - status: 状态 (pending/downloading/loaded/error)
+    - error_message: 错误信息
+    """
+    cursor = conn.cursor()
+
+    # 检查 remote_rule_sets 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='remote_rule_sets'")
+    if not cursor.fetchone():
+        print("⊘ remote_rule_sets 表不存在，跳过迁移")
+        return
+
+    cursor.execute("PRAGMA table_info(remote_rule_sets)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    fields_added = 0
+
+    if "file_path" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN file_path TEXT")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.file_path 字段")
+
+    if "checksum" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN checksum TEXT")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.checksum 字段")
+
+    if "status" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN status TEXT DEFAULT 'pending'")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.status 字段")
+
+    if "error_message" not in columns:
+        cursor.execute("ALTER TABLE remote_rule_sets ADD COLUMN error_message TEXT")
+        fields_added += 1
+        print("✓ 添加 remote_rule_sets.error_message 字段")
+
+    if fields_added > 0:
+        # 创建状态索引
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_remote_rule_sets_status ON remote_rule_sets(status)")
+        conn.commit()
+        print(f"✓ 添加了 {fields_added} 个二进制存储字段")
+    else:
+        print("⊘ remote_rule_sets 二进制字段已存在，跳过迁移")
+
+
 def generate_wireguard_private_key() -> str:
     """生成 WireGuard 私钥"""
     try:
@@ -2190,6 +2267,9 @@ def main():
 
     # WARP WireGuard 配置持久化
     migrate_warp_egress_wireguard_fields(conn)
+
+    # 广告拦截规则二进制存储
+    migrate_remote_rule_sets_binary_fields(conn)
 
     # 添加默认数据
     add_default_outbounds(conn)

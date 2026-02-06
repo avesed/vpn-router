@@ -429,6 +429,28 @@
       "default": "Traffic that doesn't match any rule uses the default outbound"
     }
   },
+  "ruleSets": {
+    "title": "Rule Sets",
+    "ruleCount": "Rules",
+    "typeDomain": "Domain",
+    "status": {
+      "pending": "Pending",
+      "loading": "Loading",
+      "loaded": "Loaded",
+      "error": "Error"
+    },
+    "enabled": "Rule set \"{{id}}\" enabled",
+    "disabled": "Rule set \"{{id}}\" disabled",
+    "deleted": "Rule set \"{{id}}\" deleted",
+    "confirmDelete": "Are you sure you want to delete rule set \"{{id}}\"?",
+    "reload": "Reload",
+    "reloading": "Reloading \"{{id}}\"...",
+    "reloaded": "Rule set \"{{id}}\" reloaded",
+    "reloadFailed": "Failed to reload rule set",
+    "editTitle": "Edit Rule Set",
+    "editDescription": "Change the outbound configuration for rule set \"{{id}}\"",
+    "outboundChanged": "Rule set \"{{id}}\" outbound changed to \"{{outbound}}\""
+  },
   "pia": {
     "title": "PIA Login",
     "subtitle": "Enter Private Internet Access credentials to configure VPN egress lines",

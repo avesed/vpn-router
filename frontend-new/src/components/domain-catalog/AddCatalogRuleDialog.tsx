@@ -7,6 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Input } from "../ui/input";
 import { Checkbox } from "../ui/checkbox";
 import { useAllEgress } from "../../api/hooks/useEgress";
+import { useOutboundGroups } from "../../api/hooks/useOutboundGroups";
 import { Loader2 } from "lucide-react";
 
 interface AddCatalogRuleDialogProps {
@@ -38,6 +39,7 @@ export function AddCatalogRuleDialog({
 }: AddCatalogRuleDialogProps) {
   const { t } = useTranslation();
   const { data: egressData } = useAllEgress();
+  const { data: groupsData } = useOutboundGroups(true); // Only enabled groups
   const [outbound, setOutbound] = useState<string>("");
   const [tag, setTag] = useState<string>("");
   const [separateRules, setSeparateRules] = useState<boolean>(false);
@@ -65,7 +67,40 @@ export function AddCatalogRuleDialog({
     }
   };
 
-  const outbounds = Array.isArray(egressData) ? egressData : [];
+  // Flatten all egress types and ECMP groups into a single array
+  const outbounds = useMemo(() => {
+    const items: Array<{ tag: string; type: string; isGroup?: boolean }> = [];
+
+    // Add ECMP groups first (they're often preferred)
+    if (groupsData?.groups) {
+      for (const group of groupsData.groups) {
+        items.push({
+          tag: group.tag,
+          type: group.type === "loadbalance" ? "ECMP" : "Failover",
+          isGroup: true,
+        });
+      }
+    }
+
+    // Add regular egress
+    if (egressData) {
+      const allEgress = [
+        ...(egressData.direct || []),
+        ...(egressData.pia || []),
+        ...(egressData.custom || []),
+        ...(egressData.warp || []),
+        ...(egressData.openvpn || []),
+        ...(egressData.v2ray || []),
+        ...(egressData.shadowsocks || []),
+      ];
+      for (const egress of allEgress) {
+        items.push({ tag: egress.tag, type: egress.type });
+      }
+    }
+
+    return items;
+  }, [egressData, groupsData]);
+
   const actionLabel = type === "domain" ? t("catalog.createRule") : t("catalog.createIpRule");
 
   // Format the selected lists display for multi-list mode

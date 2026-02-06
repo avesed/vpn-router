@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useRouteRules } from "../api/hooks/useRules";
 import { RulesList } from "../components/rules/RulesList";
+import { RuleSetsSection } from "../components/rules/RuleSetsSection";
 import { RuleEditDialog } from "../components/rules/RuleEditDialog";
 import { DefaultOutboundSelect } from "../components/rules/DefaultOutboundSelect";
 import { Button } from "../components/ui/button";
@@ -16,6 +17,8 @@ export default function RulesPage() {
   if (error) return <div>{t("common.error")}: {error.message}</div>;
 
   const rules = data?.rules || [];
+  const ruleSets = data?.rule_sets || [];
+  const availableOutbounds = data?.available_outbounds || [];
 
   return (
     <div className="space-y-6">
@@ -32,6 +35,9 @@ export default function RulesPage() {
       </div>
 
       <DefaultOutboundSelect />
+
+      {/* Rule Sets Section - shown above individual rules */}
+      <RuleSetsSection ruleSets={ruleSets} availableOutbounds={availableOutbounds} />
 
       <div className="space-y-4">
         <h2 className="text-xl font-semibold tracking-tight">{t("rules.title")}</h2>

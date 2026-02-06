@@ -580,6 +580,266 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount
 
+    # ============ 规则集管理 (Rule Sets) ============
+
+    # 有效的规则集状态
+    VALID_RULE_SET_STATUSES = frozenset({'pending', 'loading', 'loaded', 'error'})
+
+    def get_rule_sets(self, enabled_only: bool = True) -> List[Dict]:
+        """获取规则集列表
+
+        Args:
+            enabled_only: 是否只返回启用的规则集
+
+        Returns:
+            规则集列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            if enabled_only:
+                rows = cursor.execute("""
+                    SELECT id, name, rule_type, outbound, rule_count, file_path,
+                           checksum, status, error_message, enabled, priority,
+                           created_at, updated_at
+                    FROM rule_sets
+                    WHERE enabled = 1
+                    ORDER BY priority DESC, name ASC
+                """).fetchall()
+            else:
+                rows = cursor.execute("""
+                    SELECT id, name, rule_type, outbound, rule_count, file_path,
+                           checksum, status, error_message, enabled, priority,
+                           created_at, updated_at
+                    FROM rule_sets
+                    ORDER BY priority DESC, name ASC
+                """).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_rule_set(self, set_id: str) -> Optional[Dict]:
+        """获取单个规则集
+
+        Args:
+            set_id: 规则集 ID
+
+        Returns:
+            规则集信息，不存在则返回 None
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority,
+                       created_at, updated_at
+                FROM rule_sets
+                WHERE id = ?
+            """, (set_id,)).fetchone()
+            return dict(row) if row else None
+
+    def add_rule_set(
+        self,
+        set_id: str,
+        name: str,
+        rule_type: str,
+        outbound: str,
+        rule_count: int,
+        file_path: str,
+        checksum: str,
+        priority: int = 0
+    ) -> bool:
+        """添加规则集
+
+        Args:
+            set_id: 规则集 ID（如 'geoip-cn', 'custom-streaming'）
+            name: 人类可读名称
+            rule_type: 规则类型（'ip', 'domain', 'domain_suffix', 'domain_keyword'）
+            outbound: 出口标签
+            rule_count: 规则数量
+            file_path: 二进制文件的相对路径
+            checksum: SHA256 校验和
+            priority: 优先级（默认 0）
+
+        Returns:
+            是否成功添加
+        """
+        with self._transaction() as (conn, cursor):
+            try:
+                cursor.execute("""
+                    INSERT INTO rule_sets (id, name, rule_type, outbound, rule_count,
+                                          file_path, checksum, priority)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (set_id, name, rule_type, outbound, rule_count, file_path, checksum, priority))
+                logger.info(f"添加规则集: {set_id} (类型={rule_type}, 规则数={rule_count})")
+                return True
+            except sqlite3.IntegrityError:
+                logger.warning(f"规则集已存在: {set_id}")
+                return False
+
+    def update_rule_set(
+        self,
+        set_id: str,
+        name: str = None,
+        outbound: str = None,
+        rule_count: int = None,
+        file_path: str = None,
+        checksum: str = None,
+        enabled: bool = None,
+        priority: int = None
+    ) -> bool:
+        """更新规则集
+
+        Args:
+            set_id: 规则集 ID
+            name: 新名称（可选）
+            outbound: 新出口（可选）
+            rule_count: 新规则数量（可选）
+            file_path: 新文件路径（可选）
+            checksum: 新校验和（可选）
+            enabled: 是否启用（可选）
+            priority: 新优先级（可选）
+
+        Returns:
+            是否成功更新
+        """
+        updates = []
+        params = []
+
+        if name is not None:
+            updates.append("name = ?")
+            params.append(name)
+        if outbound is not None:
+            updates.append("outbound = ?")
+            params.append(outbound)
+        if rule_count is not None:
+            updates.append("rule_count = ?")
+            params.append(rule_count)
+        if file_path is not None:
+            updates.append("file_path = ?")
+            params.append(file_path)
+        if checksum is not None:
+            updates.append("checksum = ?")
+            params.append(checksum)
+        if enabled is not None:
+            updates.append("enabled = ?")
+            params.append(1 if enabled else 0)
+        if priority is not None:
+            updates.append("priority = ?")
+            params.append(priority)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(set_id)
+
+        with self._transaction() as (conn, cursor):
+            cursor.execute(f"""
+                UPDATE rule_sets
+                SET {', '.join(updates)}
+                WHERE id = ?
+            """, params)
+            if cursor.rowcount > 0:
+                logger.info(f"更新规则集: {set_id}")
+            return cursor.rowcount > 0
+
+    def update_rule_set_status(
+        self,
+        set_id: str,
+        status: str,
+        error_message: str = None
+    ) -> bool:
+        """更新规则集状态
+
+        Args:
+            set_id: 规则集 ID
+            status: 状态值 ('pending', 'loading', 'loaded', 'error')
+            error_message: 错误状态时的错误信息（可选）
+
+        Returns:
+            是否成功更新
+
+        Raises:
+            ValueError: 如果状态值无效
+        """
+        if status not in self.VALID_RULE_SET_STATUSES:
+            raise ValueError(f"无效的状态值: {status}，有效值为: {', '.join(sorted(self.VALID_RULE_SET_STATUSES))}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE rule_sets
+                SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (status, error_message, set_id))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"更新规则集状态: {set_id} -> {status}")
+            return cursor.rowcount > 0
+
+    def delete_rule_set(self, set_id: str) -> bool:
+        """删除规则集
+
+        Args:
+            set_id: 规则集 ID
+
+        Returns:
+            是否成功删除
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM rule_sets WHERE id = ?", (set_id,))
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"删除规则集: {set_id}")
+            return cursor.rowcount > 0
+
+    def get_rule_sets_by_outbound(self, outbound: str) -> List[Dict]:
+        """获取指定出口的所有规则集
+
+        Args:
+            outbound: 出口标签
+
+        Returns:
+            规则集列表
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority,
+                       created_at, updated_at
+                FROM rule_sets
+                WHERE outbound = ?
+                ORDER BY priority DESC, name ASC
+            """, (outbound,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_rule_sets_by_status(self, status: str) -> List[Dict]:
+        """获取指定状态的规则集
+
+        Args:
+            status: 状态值 ('pending', 'loading', 'loaded', 'error')
+
+        Returns:
+            规则集列表
+
+        Raises:
+            ValueError: 如果状态值无效
+        """
+        if status not in self.VALID_RULE_SET_STATUSES:
+            raise ValueError(f"无效的状态值: {status}，有效值为: {', '.join(sorted(self.VALID_RULE_SET_STATUSES))}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority,
+                       created_at, updated_at
+                FROM rule_sets
+                WHERE status = ?
+                ORDER BY priority DESC, name ASC
+            """, (status,)).fetchall()
+            return [dict(row) for row in rows]
+
     # ============ 出口管理 ============
 
     def get_outbounds(self, enabled_only: bool = True) -> List[Dict]:
@@ -1299,7 +1559,8 @@ class UserDatabase:
         """更新远程规则集"""
         allowed_fields = {"name", "description", "url", "format", "outbound",
                           "enabled", "priority", "category", "region",
-                          "last_updated", "domain_count"}
+                          "last_updated", "domain_count",
+                          "file_path", "checksum", "status", "error_message"}
         updates = []
         values = []
         for key, value in kwargs.items():
@@ -1317,6 +1578,34 @@ class UserDatabase:
             """, values)
             conn.commit()
             return cursor.rowcount > 0
+
+    def update_remote_rule_set_status(self, tag: str, status: str, error_message: Optional[str] = None) -> bool:
+        """更新远程规则集状态（用于异步加载）"""
+        valid_statuses = {'pending', 'downloading', 'loaded', 'error'}
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid status: {status}, must be one of {valid_statuses}")
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE remote_rule_sets
+                SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE tag = ?
+            """, (status, error_message, tag))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_remote_rule_sets_by_status(self, status: str) -> List[Dict]:
+        """获取指定状态的远程规则集"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, tag, name, description, url, format, outbound, enabled,
+                       priority, category, region, last_updated, domain_count,
+                       file_path, checksum, status, error_message
+                FROM remote_rule_sets WHERE status = ?
+            """, (status,)).fetchall()
+            return [dict(row) for row in rows]
 
     def add_remote_rule_set(self, tag: str, name: str, url: str,
                             description: str = "", format: str = "adblock",
@@ -4822,6 +5111,58 @@ class DatabaseManager:
     def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
         return self.user.delete_all_routing_rules(preserve_adblock)
 
+    # Rule Sets (规则集)
+    def get_rule_sets(self, enabled_only: bool = True) -> List[Dict]:
+        return self.user.get_rule_sets(enabled_only)
+
+    def get_rule_set(self, set_id: str) -> Optional[Dict]:
+        return self.user.get_rule_set(set_id)
+
+    def add_rule_set(
+        self,
+        set_id: str,
+        name: str,
+        rule_type: str,
+        outbound: str,
+        rule_count: int,
+        file_path: str,
+        checksum: str,
+        priority: int = 0
+    ) -> bool:
+        return self.user.add_rule_set(set_id, name, rule_type, outbound, rule_count,
+                                      file_path, checksum, priority)
+
+    def update_rule_set(
+        self,
+        set_id: str,
+        name: str = None,
+        outbound: str = None,
+        rule_count: int = None,
+        file_path: str = None,
+        checksum: str = None,
+        enabled: bool = None,
+        priority: int = None
+    ) -> bool:
+        return self.user.update_rule_set(set_id, name, outbound, rule_count,
+                                         file_path, checksum, enabled, priority)
+
+    def update_rule_set_status(
+        self,
+        set_id: str,
+        status: str,
+        error_message: str = None
+    ) -> bool:
+        return self.user.update_rule_set_status(set_id, status, error_message)
+
+    def delete_rule_set(self, set_id: str) -> bool:
+        return self.user.delete_rule_set(set_id)
+
+    def get_rule_sets_by_outbound(self, outbound: str) -> List[Dict]:
+        return self.user.get_rule_sets_by_outbound(outbound)
+
+    def get_rule_sets_by_status(self, status: str) -> List[Dict]:
+        return self.user.get_rule_sets_by_status(status)
+
     def get_outbounds(self, enabled_only: bool = True) -> List[Dict]:
         return self.user.get_outbounds(enabled_only)
 
@@ -4990,6 +5331,12 @@ class DatabaseManager:
 
     def delete_remote_rule_set(self, tag: str) -> bool:
         return self.user.delete_remote_rule_set(tag)
+
+    def update_remote_rule_set_status(self, tag: str, status: str, error_message: Optional[str] = None) -> bool:
+        return self.user.update_remote_rule_set_status(tag, status, error_message)
+
+    def get_remote_rule_sets_by_status(self, status: str) -> List[Dict]:
+        return self.user.get_remote_rule_sets_by_status(status)
 
     # Direct Egress
     def get_direct_egress_list(self, enabled_only: bool = False) -> List[Dict]:

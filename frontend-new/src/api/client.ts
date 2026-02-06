@@ -5,7 +5,8 @@ import type {
   PiaLoginResponse,
   PiaRegionsResponse,
   ProfilesResponse,
-  RouteRulesResponse,
+  RouteRulesWithSetsResponse,
+  RuleSet,
   RouteRule,
   DomainCatalogResponse,
   DomainCategoriesResponse,
@@ -339,11 +340,24 @@ export const api = {
     }),
 
   // Route Rules
-  getRouteRules: () => request<RouteRulesResponse>("/rules"),
+  getRouteRules: () => request<RouteRulesWithSetsResponse>("/rules"),
   updateRouteRules: (rules: RouteRule[], defaultOutbound: string) =>
     request<{ message: string }>("/rules", {
       method: "PUT",
       body: { rules, default_outbound: defaultOutbound }
+    }),
+
+  // Rule Sets (binary rule storage for large rule sets)
+  updateRuleSet: (id: string, updates: { enabled?: boolean; outbound?: string }) =>
+    request<{ message: string; rule_set: RuleSet }>(`/rule-sets/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: updates
+    }),
+  deleteRuleSet: (id: string) =>
+    request<{ message: string }>(`/rule-sets/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  reloadRuleSet: (id: string) =>
+    request<{ message: string; rule_set: RuleSet }>(`/rule-sets/${encodeURIComponent(id)}/reload`, {
+      method: "POST"
     }),
 
   // Default Outbound (Hot Switch)

@@ -6,6 +6,7 @@ import type { RouteRule } from "../../types";
 export const ruleKeys = {
   all: ["rules"] as const,
   defaultOutbound: ["rules", "defaultOutbound"] as const,
+  ruleSets: ["ruleSets"] as const,
 };
 
 // Hooks
@@ -72,6 +73,38 @@ export function useDeleteCustomRule() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: api.deleteCustomRule,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ruleKeys.all });
+    },
+  });
+}
+
+// Rule Sets hooks
+export function useUpdateRuleSet() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled, outbound }: { id: string; enabled?: boolean; outbound?: string }) =>
+      api.updateRuleSet(id, { enabled, outbound }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ruleKeys.all });
+    },
+  });
+}
+
+export function useDeleteRuleSet() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.deleteRuleSet,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ruleKeys.all });
+    },
+  });
+}
+
+export function useReloadRuleSet() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: api.reloadRuleSet,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ruleKeys.all });
     },

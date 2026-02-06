@@ -20,3 +20,6 @@ pysqlcipher3==1.2.0
 
 # SOCKS5 proxy support for requests library (tunnel API client)
 PySocks>=1.7.1
+
+# MessagePack for binary rule storage (Phase 1 optimization)
+msgpack==1.0.7

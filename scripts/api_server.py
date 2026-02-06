@@ -71,6 +71,26 @@ except ImportError:
     HAS_DATABASE = False
     print("WARNING: Database helper not available, falling back to JSON storage")
 
+# Binary rule storage support
+USE_BINARY_RULES = os.environ.get("USE_BINARY_RULES", "true").lower() == "true"
+try:
+    from rule_binary import write_rule_binary, read_rule_binary, get_rule_binary_info, RuleBinaryError, VALID_RULE_TYPES as BINARY_RULE_TYPES
+    HAS_RULE_BINARY = True and USE_BINARY_RULES
+except ImportError:
+    HAS_RULE_BINARY = False
+    BINARY_RULE_TYPES = frozenset({"ip", "domain", "domain_suffix", "domain_keyword"})
+    print("WARNING: Rule binary module not available")
+if not USE_BINARY_RULES:
+    print("INFO: Binary rule storage disabled via USE_BINARY_RULES=false")
+
+# Async rule loader support
+try:
+    from rule_loader import AsyncRuleLoader
+    HAS_RULE_LOADER = True
+except ImportError:
+    HAS_RULE_LOADER = False
+    print("WARNING: Async rule loader not available")
+
 try:
     # [Xray-lite] Only import VLESS-related functions; VMess/Trojan removed
     from v2ray_uri_parser import parse_v2ray_uri, generate_vless_uri
@@ -165,6 +185,14 @@ _GEOIP_CATALOG: Dict[str, Any] = {}
 CUSTOM_CATEGORY_ITEMS_FILE = Path(os.environ.get("CUSTOM_CATEGORY_ITEMS_FILE", "/etc/sing-box/custom-category-items.json"))
 SETTINGS_FILE = Path(os.environ.get("SETTINGS_FILE", "/etc/sing-box/settings.json"))
 ENTRY_DIR = Path("/usr/local/bin")
+
+# ============ Binary Rule Storage ============
+# Directory for binary rule files (msgpack format)
+RULES_DIR = Path(os.environ.get("RULES_DIR", "/etc/sing-box/rules"))
+# Threshold for using binary storage (rules >= this count go to binary file)
+RULE_SET_THRESHOLD = int(os.environ.get("RULE_SET_THRESHOLD", "1000"))
+# Rule loader instance (initialized at startup)
+_rule_loader: Optional["AsyncRuleLoader"] = None
 
 
 def _safe_int_env(name: str, default: int) -> int:
@@ -1338,6 +1366,33 @@ class V2RayUserUpdateRequest(BaseModel):
     # [REMOVED in Xray-lite] password, alter_id - VMess/Trojan fields removed
     flow: Optional[str] = None
     enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
+# ============ 规则集 (Rule Sets) 模型 ============
+
+class RuleSetCreateRequest(BaseModel):
+    """创建规则集请求"""
+    id: Optional[str] = Field(None, description="规则集 ID（不填则自动生成）")
+    name: str = Field(..., description="规则集名称")
+    rule_type: str = Field(..., description="规则类型: ip, domain, domain_suffix, domain_keyword")
+    outbound: str = Field(..., description="出口标签")
+    rules: List[str] = Field(..., description="规则列表")
+    priority: int = Field(0, description="优先级（数值越大优先级越高）")
+
+    @validator("rule_type")
+    def validate_rule_type(cls, v):
+        valid_types = {"ip", "domain", "domain_suffix", "domain_keyword"}
+        if v not in valid_types:
+            raise ValueError(f"rule_type 必须是 {', '.join(valid_types)} 之一")
+        return v
+
+
+class RuleSetUpdateRequest(BaseModel):
+    """更新规则集请求"""
+    name: Optional[str] = Field(None, description="规则集名称")
+    outbound: Optional[str] = Field(None, description="出口标签")
+    enabled: Optional[bool] = Field(None, description="是否启用")
+    priority: Optional[int] = Field(None, description="优先级")
 
 
 # ============ 对等节点 (Peer Node) 模型 ============
@@ -2674,6 +2729,17 @@ async def startup_event():
     print("[Chain] 启动 chain 路由恢复后台任务")
     # Note: VLESS/Shadowsocks 出口恢复已移至 rust_router_manager.py 的 sync_outbounds()
     # 统一由 rust-router-manager 在启动时同步，避免竞态条件
+    # Initialize rule loader for binary rule sets
+    if HAS_RULE_LOADER and HAS_RULE_BINARY and HAS_DATABASE:
+        global _rule_loader
+        try:
+            RULES_DIR.mkdir(parents=True, exist_ok=True)
+            _rule_loader = AsyncRuleLoader(RULES_DIR, _get_db())
+            asyncio.create_task(_rule_loader.start_background_load())
+            print(f"[RuleLoader] 规则加载器已初始化，目录: {RULES_DIR}")
+        except Exception as e:
+            logging.error(f"[RuleLoader] 初始化失败: {e}")
+            _rule_loader = None
 
 
 def _validate_network_config():
@@ -4150,8 +4216,28 @@ def api_get_rules():
         custom = load_custom_rules()
         rules = custom.get("rules", [])
 
+    # Add rule_sets summary (return all, including disabled, so UI can manage them)
+    rule_sets_summary = []
+    if HAS_DATABASE and USER_DB_PATH.exists():
+        try:
+            db = _get_db()
+            rule_sets = db.get_rule_sets(enabled_only=False)
+            for rs in rule_sets:
+                rule_sets_summary.append({
+                    "id": rs["id"],
+                    "name": rs["name"],
+                    "rule_type": rs["rule_type"],
+                    "outbound": rs["outbound"],
+                    "count": rs["rule_count"],
+                    "status": rs["status"],
+                    "enabled": rs["enabled"],
+                })
+        except Exception as e:
+            logging.debug(f"获取规则集摘要失败: {e}")
+
     return {
         "rules": rules,
+        "rule_sets": rule_sets_summary,
         "default_outbound": default_outbound,
         "available_outbounds": available_outbounds,
     }
@@ -5034,6 +5120,305 @@ def api_list_wireguard_peers():
         raise HTTPException(status_code=404, detail="wireguard server config missing")
     data = json.loads(WG_CONFIG_PATH.read_text())
     return data
+
+
+# ============ Rule Sets API ============
+
+@app.get("/api/rule-sets")
+def api_get_rule_sets():
+    """获取所有规则集"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+    rule_sets = db.get_rule_sets(enabled_only=False)
+
+    # Add loader status if available
+    result = []
+    for rs in rule_sets:
+        item = {
+            "id": rs["id"],
+            "name": rs["name"],
+            "rule_type": rs["rule_type"],
+            "outbound": rs["outbound"],
+            "rule_count": rs["rule_count"],
+            "file_path": rs["file_path"],
+            "status": rs["status"],
+            "enabled": rs["enabled"],
+            "priority": rs.get("priority", 0),
+            "created_at": rs.get("created_at"),
+            "updated_at": rs.get("updated_at"),
+        }
+        if rs.get("error_message"):
+            item["error_message"] = rs["error_message"]
+        # Add loaded status from rule loader
+        if _rule_loader and _rule_loader.is_loaded(rs["id"]):
+            item["in_memory"] = True
+        else:
+            item["in_memory"] = False
+        result.append(item)
+
+    return {"rule_sets": result, "total": len(result)}
+
+
+@app.get("/api/rule-sets/stats")
+def api_get_rule_loader_stats():
+    """获取规则加载器统计"""
+    if not _rule_loader:
+        return {
+            "available": False,
+            "message": "规则加载器未初始化"
+        }
+
+    stats = _rule_loader.get_stats()
+    stats["available"] = True
+    stats["loaded_set_ids"] = _rule_loader.get_loaded_set_ids()
+    return stats
+
+
+@app.get("/api/rule-sets/{set_id}")
+def api_get_rule_set(set_id: str):
+    """获取单个规则集详情"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+    rule_set = db.get_rule_set(set_id)
+
+    if not rule_set:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    result = {
+        "id": rule_set["id"],
+        "name": rule_set["name"],
+        "rule_type": rule_set["rule_type"],
+        "outbound": rule_set["outbound"],
+        "rule_count": rule_set["rule_count"],
+        "file_path": rule_set["file_path"],
+        "checksum": rule_set.get("checksum"),
+        "status": rule_set["status"],
+        "enabled": rule_set["enabled"],
+        "priority": rule_set.get("priority", 0),
+        "created_at": rule_set.get("created_at"),
+        "updated_at": rule_set.get("updated_at"),
+    }
+
+    if rule_set.get("error_message"):
+        result["error_message"] = rule_set["error_message"]
+
+    # Add loaded status and rules from loader
+    if _rule_loader and _rule_loader.is_loaded(set_id):
+        result["in_memory"] = True
+        loaded_data = _rule_loader.get_loaded_set(set_id)
+        if loaded_data:
+            result["rules"] = loaded_data.get("rules", [])
+    else:
+        result["in_memory"] = False
+        # Try to read rules from binary file
+        if HAS_RULE_BINARY and rule_set.get("file_path"):
+            try:
+                file_path = RULES_DIR / rule_set["file_path"]
+                if file_path.exists():
+                    data = read_rule_binary(str(file_path))
+                    result["rules"] = data.get("rules", [])
+            except Exception as e:
+                logging.error(f"无法读取规则集文件 {set_id}: {e}")
+
+    return result
+
+
+@app.post("/api/rule-sets")
+async def api_create_rule_set(payload: RuleSetCreateRequest):
+    """创建规则集（大规则集使用二进制存储）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    if not HAS_RULE_BINARY:
+        raise HTTPException(status_code=503, detail="规则二进制存储模块不可用")
+
+    # Generate ID if not provided
+    if payload.id:
+        set_id = payload.id
+    else:
+        # Generate ID from name and timestamp
+        import hashlib
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        name_hash = hashlib.md5(payload.name.encode()).hexdigest()[:8]
+        set_id = f"{payload.rule_type}-{name_hash}-{timestamp}"
+
+    # Validate rules is not empty
+    if not payload.rules:
+        raise HTTPException(status_code=400, detail="规则列表不能为空")
+
+    db = _get_db()
+
+    # Check if ID already exists
+    existing = db.get_rule_set(set_id)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"规则集 '{set_id}' 已存在")
+
+    # Create rules directory if needed
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write binary file
+    file_name = f"{set_id}.bin"
+    file_path = RULES_DIR / file_name
+
+    try:
+        checksum = write_rule_binary(
+            str(file_path),
+            rules=payload.rules,
+            rule_type=payload.rule_type,
+            outbound=payload.outbound,
+            tag=set_id
+        )
+    except Exception as e:
+        logging.error(f"Failed to write binary file for rule set {set_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"写入规则文件失败: {e}") from e
+
+    # Add to database
+    success = db.add_rule_set(
+        set_id=set_id,
+        name=payload.name,
+        rule_type=payload.rule_type,
+        outbound=payload.outbound,
+        rule_count=len(payload.rules),
+        file_path=file_name,
+        checksum=checksum,
+        priority=payload.priority
+    )
+
+    if not success:
+        # Clean up file on failure
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception as e:
+            logging.warning(f"Failed to cleanup file {file_path}: {e}")
+        raise HTTPException(status_code=500, detail="添加规则集到数据库失败")
+
+    # Load into memory if loader is available
+    if _rule_loader:
+        try:
+            await _rule_loader.load_rule_set(set_id)
+        except Exception as e:
+            logging.warning(f"加载规则集到内存失败 {set_id}: {e}")
+
+    return {
+        "message": f"规则集 '{payload.name}' 创建成功",
+        "id": set_id,
+        "rule_count": len(payload.rules),
+        "file_path": file_name,
+        "checksum": checksum,
+    }
+
+
+@app.put("/api/rule-sets/{set_id}")
+async def api_update_rule_set(set_id: str, payload: RuleSetUpdateRequest):
+    """更新规则集"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+
+    # Check if exists
+    existing = db.get_rule_set(set_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    # Update database record
+    success = db.update_rule_set(
+        set_id=set_id,
+        name=payload.name,
+        outbound=payload.outbound,
+        enabled=payload.enabled,
+        priority=payload.priority
+    )
+
+    if not success:
+        raise HTTPException(status_code=500, detail="更新规则集失败")
+
+    # If outbound changed and loader available, reload
+    if payload.outbound and _rule_loader and _rule_loader.is_loaded(set_id):
+        try:
+            await _rule_loader.reload_rule_set(set_id)
+        except Exception as e:
+            logging.warning(f"重新加载规则集失败 {set_id}: {e}")
+
+    return {
+        "message": f"规则集 '{set_id}' 更新成功",
+        "id": set_id,
+    }
+
+
+@app.delete("/api/rule-sets/{set_id}")
+async def api_delete_rule_set(set_id: str):
+    """删除规则集（同时删除内存、文件、数据库记录）"""
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+
+    # Get rule set info first
+    rule_set = db.get_rule_set(set_id)
+    if not rule_set:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    # Unload from memory if loaded
+    if _rule_loader:
+        try:
+            await _rule_loader.unload_rule_set(set_id)
+        except Exception as e:
+            logging.warning(f"从内存卸载规则集失败 {set_id}: {e}")
+
+    # Delete binary file
+    file_path = rule_set.get("file_path")
+    if file_path:
+        full_path = RULES_DIR / file_path
+        try:
+            full_path.unlink(missing_ok=True)
+            logging.info(f"Deleted binary file for rule set {set_id}: {full_path}")
+        except Exception as e:
+            logging.error(f"删除规则文件失败 {full_path}: {e}")
+
+    # Delete from database
+    success = db.delete_rule_set(set_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="从数据库删除规则集失败")
+
+    return {
+        "message": f"规则集 '{set_id}' 已删除",
+        "id": set_id,
+    }
+
+
+@app.post("/api/rule-sets/{set_id}/reload")
+async def api_reload_rule_set(set_id: str):
+    """重新加载规则集"""
+    if not _rule_loader:
+        raise HTTPException(status_code=503, detail="规则加载器未初始化")
+
+    if not HAS_DATABASE or not USER_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="数据库不可用")
+
+    db = _get_db()
+
+    # Check if exists
+    rule_set = db.get_rule_set(set_id)
+    if not rule_set:
+        raise HTTPException(status_code=404, detail=f"规则集 '{set_id}' 不存在")
+
+    try:
+        success = await _rule_loader.reload_rule_set(set_id)
+        if success:
+            return {
+                "message": f"规则集 '{set_id}' 重新加载成功",
+                "id": set_id,
+                "in_memory": True,
+            }
+        else:
+            raise HTTPException(status_code=500, detail="重新加载规则集失败")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"重新加载规则集失败: {e}") from e
 
 
 # ============ Ingress WireGuard Management APIs ============
@@ -10937,6 +11322,14 @@ def api_list_adblock_rules(category: Optional[str] = None):
     db = _get_db()
     rules = db.get_remote_rule_sets(enabled_only=False, category=category)
 
+    # 添加加载状态
+    for rule in rules:
+        tag = rule.get("tag")
+        if _rule_loader and tag:
+            rule["loaded"] = _rule_loader.is_remote_loaded(tag)
+        else:
+            rule["loaded"] = False
+
     # 按分类分组
     by_category = {}
     for rule in rules:
@@ -10949,7 +11342,8 @@ def api_list_adblock_rules(category: Optional[str] = None):
         "rules": rules,
         "by_category": by_category,
         "total": len(rules),
-        "enabled_count": sum(1 for r in rules if r.get("enabled"))
+        "enabled_count": sum(1 for r in rules if r.get("enabled")),
+        "loaded_count": sum(1 for r in rules if r.get("loaded"))
     }
 
 
@@ -10960,6 +11354,13 @@ def api_get_adblock_rule(tag: str):
     rule = db.get_remote_rule_set(tag)
     if not rule:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 添加加载状态
+    if _rule_loader:
+        rule["loaded"] = _rule_loader.is_remote_loaded(tag)
+    else:
+        rule["loaded"] = False
+
     return rule
 
 
@@ -11027,7 +11428,7 @@ def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
 
 
 @app.delete("/api/adblock/rules/{tag}")
-def api_delete_adblock_rule(tag: str):
+async def api_delete_adblock_rule(tag: str):
     """删除广告拦截规则集"""
     db = _get_db()
 
@@ -11035,24 +11436,107 @@ def api_delete_adblock_rule(tag: str):
     if not db.get_remote_rule_set(tag):
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
-    # 删除
+    # 先从 rule_loader 卸载（如果已加载）
+    if _rule_loader:
+        try:
+            await _rule_loader.unload_remote_rule_set(tag)
+        except Exception as e:
+            logging.warning(f"Failed to unload remote rule set {tag}: {e}")
+
+    # 删除二进制文件（如果存在）
+    rule_set = db.get_remote_rule_set(tag)
+    if rule_set and rule_set.get("file_path"):
+        file_path = RULES_DIR / rule_set["file_path"]
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception as e:
+            logging.warning(f"Failed to delete binary file for {tag}: {e}")
+
+    # 删除数据库记录
     db.delete_remote_rule_set(tag)
 
     return {"message": f"规则集 '{tag}' 已删除"}
 
 
-@app.post("/api/adblock/apply")
-def api_apply_adblock_rules():
-    """应用广告拦截规则（下载启用的规则并重新生成配置）"""
-    reload_status = ""
+@app.post("/api/adblock/rules/{tag}/reload")
+async def api_reload_adblock_rule(tag: str):
+    """重新下载并加载单个广告拦截规则集（使用 msgpack 二进制格式）"""
+    db = _get_db()
+
+    # 检查规则是否存在
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    if not _rule_loader:
+        raise HTTPException(status_code=503, detail="规则加载器未初始化")
+
+    # 使用 rule_loader 重新下载并加载
     try:
+        success = await _rule_loader.reload_remote_rule_set(tag)
+        if not success:
+            # 获取错误信息
+            updated_rule = db.get_remote_rule_set(tag)
+            error_msg = updated_rule.get("error_message", "下载或转换失败")
+            raise HTTPException(status_code=500, detail=error_msg)
+
+        # 获取更新后的规则信息
+        updated_rule = db.get_remote_rule_set(tag)
+        return {
+            "message": f"规则集 '{tag}' 已重新加载",
+            "rule": updated_rule,
+            "loaded": _rule_loader.is_remote_loaded(tag)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"Failed to reload adblock rule {tag}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/adblock/apply")
+async def api_apply_adblock_rules():
+    """应用广告拦截规则（下载启用的规则并加载到内存）"""
+    if not _rule_loader:
+        raise HTTPException(status_code=503, detail="规则加载器未初始化")
+
+    db = _get_db()
+    results = {"loaded": [], "failed": [], "skipped": []}
+
+    try:
+        # 获取所有启用的远程规则集
+        remote_sets = db.get_remote_rule_sets(enabled_only=True)
+
+        for rs in remote_sets:
+            tag = rs["tag"]
+            try:
+                success = await _rule_loader.load_remote_rule_set(tag)
+                if success:
+                    results["loaded"].append(tag)
+                else:
+                    results["failed"].append(tag)
+            except Exception as e:
+                logging.error(f"Failed to load remote rule set {tag}: {e}")
+                results["failed"].append(tag)
+
+        # 卸载已禁用但仍在内存中的规则集
+        disabled_sets = db.get_remote_rule_sets(enabled_only=False)
+        for rs in disabled_sets:
+            if not rs.get("enabled") and _rule_loader.is_remote_loaded(rs["tag"]):
+                await _rule_loader.unload_remote_rule_set(rs["tag"])
+                results["skipped"].append(rs["tag"])
+
+        # 同步规则到 rust-router
         _regenerate_and_reload()
-        reload_status = "配置已重新生成并重载"
+
+        return {
+            "message": f"已加载 {len(results['loaded'])} 个规则集",
+            "results": results,
+            "status": "success"
+        }
     except Exception as exc:
         logging.error(f"Failed to apply adblock rules: {exc}")
         raise HTTPException(status_code=500, detail="Failed to apply configuration")
-
-    return {"message": reload_status, "status": "success"}
 
 
 def _regenerate_and_reload():
@@ -11103,6 +11587,10 @@ def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRout
     Fixed asyncio event loop handling for FastAPI context.
     Now raises exception on failure instead of returning error string.
 
+    Includes rules from:
+    1. Database routing rules (custom rules)
+    2. Loaded rule sets (GeoIP, adblock via rule_loader)
+
     Args:
         db: Optional DatabaseManager instance. If None, will get from _get_db().
         raise_on_error: If True, raises RustRouterSyncError on failure. If False,
@@ -11136,6 +11624,17 @@ def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRout
             "target": target,
             "outbound": outbound,
         })
+
+    # Add rules from loaded rule sets (GeoIP, adblock)
+    if _rule_loader:
+        loaded_rules = _rule_loader.get_all_rules()
+        for rule in loaded_rules:
+            rule_configs.append({
+                "rule_type": rule.get("rule_type", "domain_suffix"),
+                "target": rule.get("rule", ""),
+                "outbound": rule.get("outbound", "block"),
+            })
+        logging.debug(f"Added {len(loaded_rules)} rules from rule_loader")
 
     default_outbound = db.get_setting("default_outbound", "direct") or "direct"
 
@@ -11961,7 +12460,11 @@ class IpQuickRuleRequest(BaseModel):
 
 @app.post("/api/ip-catalog/quick-rule")
 def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
-    """从 IP 列表快速创建路由规则"""
+    """从 IP 列表快速创建路由规则
+
+    当 CIDR 数量 >= RULE_SET_THRESHOLD 时，使用二进制规则集存储以提高性能。
+    否则使用传统数据库行存储。
+    """
     all_cidrs = []
 
     for cc in payload.country_codes:
@@ -11989,6 +12492,84 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
 
     db = _get_db()
 
+    # Large rule sets: use binary storage for better performance
+    if len(all_cidrs) >= RULE_SET_THRESHOLD and HAS_RULE_BINARY:
+        # Use binary rule set storage
+        set_id = f"geoip-{'-'.join(cc.lower() for cc in payload.country_codes[:3])}"
+
+        # Check if already exists
+        existing = db.get_rule_set(set_id)
+        if existing:
+            # Delete existing and recreate
+            db.delete_rule_set(set_id)
+            old_file = RULES_DIR / existing.get("file_path", "")
+            try:
+                old_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Create rules directory if needed
+        RULES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Write binary file
+        file_name = f"{set_id}.bin"
+        file_path = RULES_DIR / file_name
+
+        try:
+            checksum = write_rule_binary(
+                str(file_path),
+                rules=all_cidrs,
+                rule_type="ip",
+                outbound=payload.outbound,
+                tag=set_id
+            )
+        except Exception as e:
+            logging.error(f"Failed to write binary file for rule set {set_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"写入规则文件失败: {e}") from e
+
+        # Add to database
+        name = f"GeoIP {' '.join(cc.upper() for cc in payload.country_codes[:5])}"
+        success = db.add_rule_set(
+            set_id=set_id,
+            name=name,
+            rule_type="ip",
+            outbound=payload.outbound,
+            rule_count=len(all_cidrs),
+            file_path=file_name,
+            checksum=checksum,
+            priority=0
+        )
+
+        if not success:
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception as e:
+                logging.warning(f"Failed to cleanup file {file_path}: {e}")
+            raise HTTPException(status_code=500, detail="添加规则集到数据库失败")
+
+        # Load into memory if loader is available
+        if _rule_loader:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(_rule_loader.load_rule_set(set_id))
+                else:
+                    loop.run_until_complete(_rule_loader.load_rule_set(set_id))
+            except Exception as e:
+                logging.warning(f"加载规则集到内存失败 {set_id}: {e}")
+
+        return {
+            "message": f"IP 快速规则已创建（二进制存储），添加了 {len(all_cidrs)} 个 CIDR",
+            "tag": tag,
+            "set_id": set_id,
+            "cidr_count": len(all_cidrs),
+            "outbound": payload.outbound,
+            "storage": "binary",
+            "file_path": file_name,
+        }
+
+    # Small rule sets: use traditional database row storage
     # 批量添加 IP CIDR 到数据库（使用 executemany 一次性插入）
     # 格式: (rule_type, target, outbound, tag, priority)
     rules = [("ip", cidr, payload.outbound, tag, 0) for cidr in all_cidrs]
@@ -11999,12 +12580,13 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
         "tag": tag,
         "cidr_count": added_count,
         "outbound": payload.outbound,
+        "storage": "database",
     }
 
 
 # ============ Backup / Restore APIs ============
 
-BACKUP_VERSION = "2.0"
+BACKUP_VERSION = "2.1"
 
 
 @app.post("/api/backup/export")
@@ -12052,12 +12634,40 @@ def api_export_backup(payload: BackupExportRequest):
         "encryption_key": encrypted_key,
     }
 
+    # 5. 包含二进制规则文件（如果存在）
+    rule_files = {}
+    rule_files_size = 0
+    if RULES_DIR.exists() and HAS_DATABASE:
+        try:
+            db = _get_db()
+            rule_sets = db.get_rule_sets(enabled_only=False)
+            for rs in rule_sets:
+                file_path_str = rs.get("file_path")
+                if file_path_str:
+                    file_path = RULES_DIR / file_path_str
+                    if file_path.exists():
+                        try:
+                            file_bytes = file_path.read_bytes()
+                            rule_files[file_path_str] = base64.b64encode(file_bytes).decode("utf-8")
+                            rule_files_size += len(file_bytes)
+                        except Exception as e:
+                            logging.warning(f"无法读取规则文件 {file_path}: {e}")
+        except Exception as e:
+            logging.warning(f"备份规则文件时出错: {e}")
+
+    if rule_files:
+        backup_data["rule_files"] = rule_files
+        backup_data["rule_files_count"] = len(rule_files)
+        backup_data["rule_files_size_bytes"] = rule_files_size
+
     return {
         "message": "备份已生成 (v2.0)",
         "backup": backup_data,
         "encrypted": True,
         "database_size_bytes": db_size,
         "checksum": f"sha256:{checksum}",
+        "rule_files_count": len(rule_files),
+        "rule_files_size_bytes": rule_files_size,
     }
 
 
@@ -12397,7 +13007,30 @@ def api_import_backup(payload: BackupImportRequest):
                 shutil.move(backup_db_path, USER_DB_PATH)
             raise HTTPException(status_code=500, detail=f"导入失败: {e}") from e
 
-        # 6. 完整重新生成所有接口和配置
+        # 6. 恢复二进制规则文件（如果存在）
+        rule_files_restored = 0
+        if "rule_files" in backup_data:
+            try:
+                RULES_DIR.mkdir(parents=True, exist_ok=True)
+                for file_name, file_data_b64 in backup_data["rule_files"].items():
+                    try:
+                        file_bytes = base64.b64decode(file_data_b64)
+                        file_path = RULES_DIR / file_name
+                        # Atomic write
+                        with tempfile.NamedTemporaryFile(
+                            dir=RULES_DIR, suffix=".tmp", delete=False
+                        ) as tmp:
+                            tmp.write(file_bytes)
+                            tmp_path = tmp.name
+                        shutil.move(tmp_path, file_path)
+                        rule_files_restored += 1
+                    except Exception as e:
+                        logging.warning(f"恢复规则文件 {file_name} 失败: {e}")
+                print(f"[backup] 恢复了 {rule_files_restored} 个规则文件")
+            except Exception as e:
+                logging.warning(f"恢复规则文件时出错: {e}")
+
+        # 7. 完整重新生成所有接口和配置
         regen_results = {}
         try:
             regen_results = _full_regenerate_after_import()
@@ -12406,7 +13039,22 @@ def api_import_backup(payload: BackupImportRequest):
             print(f"[backup] 重新生成配置失败: {e}")
             # 不回滚，数据已成功导入
 
-        # 7. 清除速率限制（用户可能需要重新登录，之前的限制不应影响）
+        # 8. 重新初始化规则加载器（如果可用）
+        if _rule_loader and HAS_RULE_LOADER:
+            try:
+                import asyncio
+                # Reset and reload all rule sets
+                _rule_loader.reset_stats()
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(_rule_loader.start_background_load())
+                else:
+                    loop.run_until_complete(_rule_loader.start_background_load())
+                print("[backup] 规则加载器已重新初始化")
+            except Exception as e:
+                logging.warning(f"重新初始化规则加载器失败: {e}")
+
+        # 9. 清除速率限制（用户可能需要重新登录，之前的限制不应影响）
         _clear_rate_limit()
 
         return {
@@ -12415,6 +13063,7 @@ def api_import_backup(payload: BackupImportRequest):
             "checksum_verified": True,
             "database_size_bytes": len(db_bytes),
             "regeneration_results": regen_results,
+            "rule_files_restored": rule_files_restored,
         }
 
     # === v1.0 格式处理（向后兼容）===

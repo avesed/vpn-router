@@ -1595,4 +1595,26 @@ export interface ShadowsocksInboundConfigResponse {
   config: ShadowsocksInboundConfig;
 }
 
+// Rule Sets (binary rule storage for large rule sets)
+export type RuleSetStatus = "pending" | "loading" | "loaded" | "error";
+export type RuleSetType = "ip" | "domain";
+
+export interface RuleSet {
+  id: string;
+  name: string;
+  rule_type: RuleSetType;
+  outbound: string;
+  count: number;
+  status: RuleSetStatus;
+  enabled: boolean;
+}
+
+export interface RouteRulesWithSetsResponse {
+  rules: RouteRule[];
+  rule_sets?: RuleSet[];
+  custom_rules: RouteRule[];
+  default_outbound: string;
+  available_outbounds: string[];
+}
+
 // Updated types

@@ -36,10 +36,14 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 # Add script directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Type hint for AsyncRuleLoader (avoid circular import)
+if TYPE_CHECKING:
+    from rule_loader import AsyncRuleLoader
 
 from rust_router_client import (
     RustRouterClient,
@@ -59,6 +63,7 @@ logger = logging.getLogger(__name__)
 # Environment variables for paths
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "/etc/sing-box/user-config.db")
 GEODATA_DB_PATH = os.environ.get("GEODATA_DB_PATH", "/etc/sing-box/geoip-geodata.db")
+RULES_DIR = Path(os.environ.get("RULES_DIR", "/etc/sing-box/rules"))
 
 # Egress type to rust-router outbound type mapping
 EGRESS_TYPE_MAP = {
@@ -1296,13 +1301,23 @@ class RustRouterManager:
     # Routing Rules Sync
     # =========================================================================
 
-    async def sync_routing_rules(self) -> SyncResult:
-        """Sync routing rules from database to rust-router.
+    async def sync_routing_rules(
+        self,
+        rule_loader: Optional["AsyncRuleLoader"] = None,
+    ) -> SyncResult:
+        """Sync routing rules from database and binary files to rust-router.
 
         This method:
         1. Gets all enabled routing rules from database
-        2. Validates outbounds and skips invalid rules         3. Converts them to RuleConfig format
-        4. Sends UpdateRouting command to rust-router
+        2. Gets rules from binary files via rule_loader (if provided)
+        3. Merges both rule sources (database rules have higher priority)
+        4. Validates outbounds and skips invalid rules
+        5. Converts them to RuleConfig format
+        6. Sends UpdateRouting command to rust-router
+
+        Args:
+            rule_loader: Optional AsyncRuleLoader for loading rules from binary files.
+                        If None, only database rules are used.
 
         Returns:
             SyncResult with statistics and errors
@@ -1312,7 +1327,42 @@ class RustRouterManager:
         async with self._sync_lock:
             try:
                 db = self._get_db()
-                rules = db.get_routing_rules(enabled_only=True)
+
+                # 1. Get rules from database
+                db_rules = db.get_routing_rules(enabled_only=True)
+
+                # 2. Get rules from binary files (if rule_loader provided)
+                loader_rules = []
+                if rule_loader is not None:
+                    try:
+                        loader_rules = rule_loader.get_all_rules()
+                        logger.debug(
+                            f"Got {len(loader_rules)} rules from rule_loader"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to get rules from rule_loader: {e}")
+                        result.errors.append(f"Rule loader error: {e}")
+
+                # 3. Merge rules: database rules first (higher priority), then loader rules
+                # Convert loader rules to database rule format for uniform processing
+                rules = list(db_rules)  # Copy to avoid modifying original
+                for loader_rule in loader_rules:
+                    # Map loader rule format to database rule format
+                    # loader: {set_id, rule_type, outbound, rule, priority?, tag?}
+                    # db: {id, rule_type, target, outbound, tag, priority, enabled, ...}
+                    rules.append({
+                        "rule_type": loader_rule.get("rule_type", "domain"),
+                        "target": loader_rule.get("rule", ""),  # 'rule' -> 'target'
+                        "outbound": loader_rule.get("outbound", "direct"),
+                        "priority": loader_rule.get("priority", 0),
+                        "tag": loader_rule.get("tag"),
+                        "set_id": loader_rule.get("set_id"),  # For debugging
+                    })
+
+                logger.info(
+                    f"Merged rules: {len(db_rules)} from database, "
+                    f"{len(loader_rules)} from binary files"
+                )
 
                 # Get default outbound from settings or use "direct"
                 #  使用正确的方法名 get_setting() (不是 get_settings())
@@ -1430,6 +1480,27 @@ class RustRouterManager:
                 logger.error(f"Routing rules sync failed: {e}")
 
         return result
+
+    async def notify_rules_changed(
+        self,
+        rule_loader: Optional["AsyncRuleLoader"] = None,
+    ) -> SyncResult:
+        """Notify rust-router that routing rules have changed.
+
+        This is a convenience method that triggers a full routing rules sync.
+        Call this when:
+        - Binary rule files have been updated
+        - Rule loader has completed loading new rule sets
+        - Database rules have changed externally
+
+        Args:
+            rule_loader: Optional AsyncRuleLoader for loading rules from binary files.
+
+        Returns:
+            SyncResult from sync_routing_rules()
+        """
+        logger.info("Routing rules change notification received, triggering sync")
+        return await self.sync_routing_rules(rule_loader=rule_loader)
 
     # =========================================================================
     # Peer Node Sync     # =========================================================================

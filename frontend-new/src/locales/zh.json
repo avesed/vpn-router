@@ -429,6 +429,28 @@
       "default": "未匹配任何规则的流量使用默认出口"
     }
   },
+  "ruleSets": {
+    "title": "规则集",
+    "ruleCount": "规则数",
+    "typeDomain": "域名",
+    "status": {
+      "pending": "待加载",
+      "loading": "加载中",
+      "loaded": "已加载",
+      "error": "错误"
+    },
+    "enabled": "规则集 \"{{id}}\" 已启用",
+    "disabled": "规则集 \"{{id}}\" 已禁用",
+    "deleted": "规则集 \"{{id}}\" 已删除",
+    "confirmDelete": "确定要删除规则集 \"{{id}}\" 吗？",
+    "reload": "重新加载",
+    "reloading": "正在重新加载 \"{{id}}\"...",
+    "reloaded": "规则集 \"{{id}}\" 已重新加载",
+    "reloadFailed": "重新加载规则集失败",
+    "editTitle": "编辑规则集",
+    "editDescription": "修改规则集 \"{{id}}\" 的出站配置",
+    "outboundChanged": "规则集 \"{{id}}\" 出站已更改为 \"{{outbound}}\""
+  },
   "pia": {
     "title": "PIA 登录",
     "subtitle": "输入 Private Internet Access 凭证以配置 VPN 出口线路",
