@@ -27,9 +27,9 @@
 //! let config = CacheConfig::default();
 //! let cache = DnsCache::new(config);
 //!
-//! // Cache statistics
+//! // Cache statistics (use getter methods, not fields)
 //! let stats = cache.stats();
-//! println!("Hits: {}, Misses: {}", stats.hits, stats.misses);
+//! println!("Hits: {}, Misses: {}", stats.hits(), stats.misses());
 //! ```
 //!
 //! # Performance Targets

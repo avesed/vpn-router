@@ -888,10 +888,11 @@ impl DerefMut for LocalPooledBuffer<'_> {
 /// ```
 /// use rust_router::io::{UdpBuffer, UdpBufferPool, LocalBufferCache};
 /// use std::sync::Arc;
+/// use std::ops::DerefMut;
 ///
 /// fn receive_into_buffer<B: UdpBuffer>(mut buf: B) -> bytes::Bytes {
-///     // Write some data
-///     buf.as_mut()[0] = 42;
+///     // Write some data (UdpBuffer implements DerefMut<Target = [u8]>)
+///     buf.deref_mut()[0] = 42;
 ///     // Freeze to Bytes (zero-copy)
 ///     buf.freeze(1)
 /// }

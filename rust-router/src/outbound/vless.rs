@@ -1267,6 +1267,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_vless_handshake_invalid_response_version() {
+        use tokio::io::AsyncReadExt;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
 
@@ -1294,8 +1296,17 @@ mod tests {
         let dest: SocketAddr = "8.8.8.8:443".parse().unwrap();
         let result = outbound.connect(dest, Duration::from_secs(5)).await;
 
-        // Should fail due to invalid response version
-        assert!(result.is_err());
+        // Connect succeeds (deferred response pattern - header not read yet)
+        assert!(result.is_ok(), "connect should succeed with deferred response pattern");
+
+        // The invalid version error surfaces on first read
+        let conn = result.unwrap();
+        let mut stream = conn.into_outbound_stream();
+        let mut buf = [0u8; 16];
+        let read_result = stream.read(&mut buf).await;
+
+        // Should fail due to invalid response version when reading
+        assert!(read_result.is_err(), "read should fail due to invalid VLESS version");
 
         let _ = server.await;
     }

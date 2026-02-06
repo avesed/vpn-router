@@ -223,6 +223,7 @@ pub struct DnsHandler {
     /// DNS router for split DNS routing (optional)
     router: Option<Arc<DnsRouter>>,
     /// Query logger (optional)
+    #[allow(dead_code)] // Optional component, may be used in future
     query_logger: Option<Arc<QueryLogger>>,
 }
 

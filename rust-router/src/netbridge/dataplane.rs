@@ -1,3 +1,6 @@
+// Some fields are reserved for future features.
+#![allow(dead_code)]
+
 //! Standalone Data Plane API for netbridge
 //!
 //! This module provides a clean, independent API for using netbridge as a

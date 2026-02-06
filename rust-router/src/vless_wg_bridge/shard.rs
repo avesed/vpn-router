@@ -1006,7 +1006,7 @@ impl SmoltcpShard {
         );
 
         // Get or create session
-        let (handle, is_new) = if let Some(session) = self.udp_sessions.get(&session_key) {
+        let (handle, _is_new) = if let Some(session) = self.udp_sessions.get(&session_key) {
             (session.socket_handle(), false)
         } else {
             // Need to create a new session

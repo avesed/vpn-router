@@ -1,3 +1,6 @@
+// Some methods are reserved for future features.
+#![allow(dead_code)]
+
 //! SmoltcpBridge - Core smoltcp interface and socket management
 //!
 //! This module provides the `SmoltcpBridge` struct which wraps the smoltcp

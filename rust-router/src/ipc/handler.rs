@@ -7216,7 +7216,7 @@ impl IpcHandler {
                 let rule_engine = Arc::clone(&rule_engine);
                 let ecmp_mgr = ecmp_group_manager.clone();
                 let wg_mgr = wg_egress_manager.clone();
-                let reply_registry = vless_reply_registry.clone();
+                let _reply_registry = vless_reply_registry.clone();
                 let active_conn = Arc::clone(&active_conn_stat);
                 #[cfg(feature = "sharded-vless-wg-bridge")]
                 let sharded_bridges = Arc::clone(&sharded_bridges_map);
@@ -8182,7 +8182,7 @@ impl IpcHandler {
                         let rule_eng = Arc::clone(&rule_engine);
                         let ecmp_mgr = ecmp_group_manager.clone();
                         let wg_mgr = wg_egress_manager.clone();
-                        let reply_registry = vless_reply_registry.clone();
+                        let _reply_registry = vless_reply_registry.clone();
                         #[cfg(feature = "sharded-vless-wg-bridge")]
                         let sharded_bridges = Arc::clone(&sharded_bridges_map);
                         #[cfg(feature = "use-netbridge-egress")]
@@ -8612,7 +8612,7 @@ impl IpcHandler {
                         if let Err(e) = udp_relay_clone.run(move |packet| {
                             let rule_eng = Arc::clone(&rule_engine_ref);
                             let wg_mgr = wg_mgr_ref.clone();
-                            let registry = registry_ref.clone();
+                            let _registry = registry_ref.clone();
                             let ecmp_mgr = ecmp_mgr_ref.clone();
                             #[cfg(not(any(feature = "use-netbridge-egress", feature = "sharded-vless-wg-bridge")))]
                             let bridges = Arc::clone(&bridges_ref);
@@ -8621,7 +8621,7 @@ impl IpcHandler {
                             #[cfg(feature = "sharded-vless-wg-bridge")]
                             let sharded_bridges = Arc::clone(&sharded_bridges_ref);
                             #[cfg(feature = "use-netbridge-egress")]
-                            let netbridge_adapters = Arc::clone(&netbridge_adapters_ref);
+                            let _netbridge_adapters = Arc::clone(&netbridge_adapters_ref);
 
                             async move {
                                 use crate::rules::ConnectionInfo;
@@ -8723,42 +8723,7 @@ impl IpcHandler {
                                     .unwrap_or(false);
 
                                 if is_wg_tunnel {
-                                    // Route through WireGuard tunnel
-                                    // Priority 1: Try netbridge adapter (newest implementation)
-                                    #[cfg(feature = "use-netbridge-egress")]
-                                    {
-                                        let maybe_adapter = netbridge_adapters.read().get(&actual_outbound_tag).cloned();
-                                        if let Some(adapter) = maybe_adapter {
-                                            // Create reply channel for this UDP packet
-                                            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<
-                                                crate::netbridge::vless_adapter::RawUdpReply
-                                            >(16);
-
-                                            // Send UDP packet through netbridge adapter
-                                            if let Err(e) = adapter.send_raw_udp_packet(
-                                                packet.client_addr,
-                                                dest_addr,
-                                                bytes::Bytes::copy_from_slice(&packet.payload),
-                                                reply_tx,
-                                            ).await {
-                                                warn!(
-                                                    "Failed to send UDP via netbridge adapter '{}': {}",
-                                                    actual_outbound_tag, e
-                                                );
-                                            } else {
-                                                trace!(
-                                                    "Sent SS UDP via netbridge adapter '{}': {} -> {}",
-                                                    actual_outbound_tag, packet.client_addr, dest_addr
-                                                );
-                                            }
-                                            // Note: Reply handling through reply_rx would need a
-                                            // separate task or integration with the UDP relay's reply mechanism
-                                            let _ = reply_rx; // TODO: Handle replies
-                                            return Ok(());
-                                        }
-                                    }
-
-                                    // Priority 2: Try sharded bridge (high-performance sharded implementation)
+                                    // Route through WireGuard tunnel via sharded bridge
                                     #[cfg(feature = "sharded-vless-wg-bridge")]
                                     {
                                         let maybe_sharded = sharded_bridges.read().get(&actual_outbound_tag).cloned();

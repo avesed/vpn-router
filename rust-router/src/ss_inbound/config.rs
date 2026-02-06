@@ -163,7 +163,7 @@ impl ShadowsocksInboundConfig {
     /// Returns error if the configuration is invalid or cipher is not supported.
     #[cfg(feature = "shadowsocks")]
     pub fn build_server_config(&self) -> ShadowsocksInboundResult<ServerConfig> {
-        use crate::shadowsocks::ShadowsocksError;
+        
 
         self.validate()?;
 

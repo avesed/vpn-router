@@ -70,6 +70,7 @@ impl FeedResult {
 }
 
 /// Connection state machine
+#[allow(dead_code)] // Some variant fields stored for state completeness but not read
 enum ConnectionState {
     /// Initial state - need to generate ClientHello
     Initial,

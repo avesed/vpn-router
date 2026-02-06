@@ -35,7 +35,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rust_router::reality::server::{RealityServer, RealityServerConfig, RealityAcceptResult};
+//! use rust_router::reality::server::{RealityServer, RealityServerConfig, RealityHandshakeResult};
 //! use tokio::net::TcpListener;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,11 +56,12 @@
 //!
 //!     tokio::spawn(async move {
 //!         match server.accept_with_handshake(stream).await {
-//!             Ok(RealityAcceptResult::Authenticated { stream, short_id, .. }) => {
+//!             Ok(RealityHandshakeResult::Authenticated { stream, short_id }) => {
 //!                 // Valid REALITY client - proceed with VLESS
 //!                 println!("Authenticated with short_id: {:?}", short_id);
+//!                 let _ = stream; // Use the encrypted stream
 //!             }
-//!             Ok(RealityAcceptResult::Fallback) => {
+//!             Ok(RealityHandshakeResult::Fallback) => {
 //!                 // Invalid auth - already proxied to fallback
 //!                 println!("Proxied to fallback");
 //!             }
@@ -915,6 +916,7 @@ impl RealityServer {
             )?;
 
             client_hs_seq += 1;
+            let _ = client_hs_seq; // Value not read again, but increment kept for protocol correctness
 
             // Verify it's a Finished message
             if plaintext.is_empty() || plaintext[0] != HANDSHAKE_TYPE_FINISHED {

@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use tokio::signal;
-use tracing::{debug, error, info, trace, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
 

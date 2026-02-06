@@ -747,14 +747,17 @@ impl PeerSession {
 /// Uses a concurrent hash map (`DashMap`) for thread-safe access
 /// from multiple async tasks.
 ///
-/// **DEPRECATED**: Use `tun_bridge::SessionTracker` instead, which provides
-/// unified session tracking with `peer_endpoint` support. The TUN bridge's
-/// `SessionTracker` is now the single source of truth for session information,
-/// eliminating duplicate tracking between this struct and the bridge.
-#[deprecated(
-    since = "0.15.0",
-    note = "Use tun_bridge::SessionTracker instead for unified session tracking"
-)]
+/// Session tracker for WireGuard ingress packet forwarding.
+///
+/// This tracker is used for the WG→WG direct forwarding path (`spawn_forwarding_task`),
+/// which handles:
+/// - WireGuard to WireGuard egress forwarding (IP packet passthrough)
+/// - UDP packet forwarding
+/// - ICMP/ping handling
+/// - Peer tunnel routing
+///
+/// Note: TCP/UDP connections via TUN+TPROXY use `netbridge::SessionTracker` instead.
+/// Both trackers serve different purposes and are both still needed.
 pub struct IngressSessionTracker {
     /// Active sessions indexed by 5-tuple
     sessions: DashMap<FiveTuple, PeerSession>,

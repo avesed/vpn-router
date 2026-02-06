@@ -16,6 +16,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// WARP+ license key format (expected pattern)
+#[allow(dead_code)] // Reserved for license validation
 const WARP_PLUS_LICENSE_PATTERN: &str = r"^[A-Za-z0-9]{8}-[A-Za-z0-9]{8}-[A-Za-z0-9]{8}$";
 
 /// Generate x25519 keypair for WireGuard

@@ -175,6 +175,7 @@ impl<'a> RecordDecryptor<'a> {
 ///
 /// TLS 1.3 requires that implementations MUST NOT allow the sequence number
 /// to wrap. This function checks if we're approaching the limit.
+#[allow(dead_code)] // Security check, may be integrated in future
 pub fn check_sequence_overflow(seq: u64) -> RealityResult<()> {
     // RFC 8446 doesn't specify exact limit, but 2^64-1 is the max
     // We check at 2^63 to provide early warning

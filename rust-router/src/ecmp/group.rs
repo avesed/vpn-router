@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use crate::ecmp::lb::{DestKey, FiveTuple, LbAlgorithm, LbError, LbMember, LoadBalancer};
 

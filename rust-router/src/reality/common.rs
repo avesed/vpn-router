@@ -23,36 +23,45 @@ pub const CONTENT_TYPE_APPLICATION_DATA: u8 = 0x17;
 
 // =============================================================================
 // TLS Alert constants (RFC 8446 Section 6)
+// These are standard TLS protocol constants. Some are reserved for future error handling.
 // =============================================================================
 
 /// TLS alert level: Warning
 pub const ALERT_LEVEL_WARNING: u8 = 0x01;
 
 /// TLS alert level: Fatal
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_LEVEL_FATAL: u8 = 0x02;
 
 /// TLS alert description: close_notify (0)
 pub const ALERT_DESC_CLOSE_NOTIFY: u8 = 0x00;
 
 /// TLS alert description: unexpected_message (10)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_UNEXPECTED_MESSAGE: u8 = 0x0a;
 
 /// TLS alert description: bad_record_mac (20)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_BAD_RECORD_MAC: u8 = 0x14;
 
 /// TLS alert description: record_overflow (22)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_RECORD_OVERFLOW: u8 = 0x16;
 
 /// TLS alert description: handshake_failure (40)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_HANDSHAKE_FAILURE: u8 = 0x28;
 
 /// TLS alert description: illegal_parameter (47)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_ILLEGAL_PARAMETER: u8 = 0x2f;
 
 /// TLS alert description: decode_error (50)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_DECODE_ERROR: u8 = 0x32;
 
 /// TLS alert description: decrypt_error (51)
+#[allow(dead_code)] // Reserved for TLS error handling
 pub const ALERT_DESC_DECRYPT_ERROR: u8 = 0x33;
 
 // =============================================================================
@@ -66,6 +75,7 @@ pub const VERSION_TLS_1_2_MAJOR: u8 = 0x03;
 pub const VERSION_TLS_1_2_MINOR: u8 = 0x03;
 
 /// TLS 1.3 version bytes for supported_versions extension
+#[allow(dead_code)] // Protocol constant for reference
 pub const VERSION_TLS_1_3: [u8; 2] = [0x03, 0x04];
 
 // =============================================================================
@@ -73,6 +83,7 @@ pub const VERSION_TLS_1_3: [u8; 2] = [0x03, 0x04];
 // =============================================================================
 
 /// Handshake type: ClientHello (1)
+#[allow(dead_code)] // Protocol constant, sniff/tls.rs has own local constant
 pub const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 1;
 
 /// Handshake type: ServerHello (2)
@@ -129,12 +140,15 @@ pub const NONCE_SIZE: usize = 12;
 // =============================================================================
 
 /// Buffer capacity for incoming ciphertext (2x max record for safety)
+#[allow(dead_code)] // May be used in future optimizations
 pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
 /// Buffer capacity for decrypted plaintext
+#[allow(dead_code)] // May be used in future optimizations
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
 /// Buffer capacity for outgoing data (matches rustls DEFAULT_BUFFER_LIMIT)
+#[allow(dead_code)] // May be used in future optimizations
 pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 
 // =============================================================================
@@ -300,6 +314,7 @@ pub fn build_record_header(content_type: u8, length: u16) -> [u8; TLS_RECORD_HEA
 /// * `Ok((content_type, version, length))` - Parsed header fields
 /// * `Err` - If header is invalid
 #[inline]
+#[allow(dead_code)] // Utility function for TLS record parsing
 pub fn parse_record_header(header: &[u8]) -> io::Result<(u8, u16, u16)> {
     if header.len() < TLS_RECORD_HEADER_SIZE {
         return Err(Error::new(ErrorKind::InvalidData, "Header too short"));

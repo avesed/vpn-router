@@ -1,3 +1,6 @@
+// Benchmark module - some constants reserved for future use.
+#![allow(dead_code)]
+
 //! Loopback test - Performance testing with realistic network simulation
 //!
 //! This module provides `LoopbackTest` which creates a closed-loop testing

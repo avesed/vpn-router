@@ -1,3 +1,6 @@
+// Some fields are reserved for future cleanup or debugging.
+#![allow(dead_code)]
+
 //! KernelIngress implementation for the kernel backend
 //!
 //! This module provides the `KernelIngress` implementation that uses TUN + TPROXY

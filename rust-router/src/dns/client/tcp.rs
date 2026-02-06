@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rust_router::dns::client::TcpClient;
+//! use rust_router::dns::client::{TcpClient, DnsUpstream};
 //! use rust_router::dns::{UpstreamConfig, UpstreamProtocol};
 //! use hickory_proto::op::Message;
 //!
@@ -56,6 +56,7 @@ const DEFAULT_POOL_SIZE: usize = 4;
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// Default idle timeout in seconds for pooled connections
+#[allow(dead_code)] // Reserved for future connection pool configuration
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// TCP connection manager for deadpool
@@ -137,7 +138,7 @@ impl Manager for TcpConnectionManager {
 /// # Example
 ///
 /// ```no_run
-/// use rust_router::dns::client::TcpClient;
+/// use rust_router::dns::client::{TcpClient, DnsUpstream};
 /// use rust_router::dns::{UpstreamConfig, UpstreamProtocol};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rust_router::dns::client::{DnsUpstream, UpstreamProtocol};
+//! use rust_router::dns::client::DnsUpstream;
 //! use hickory_proto::op::Message;
 //!
 //! async fn query_upstream(upstream: &dyn DnsUpstream, query: &Message) {
@@ -257,6 +257,7 @@ pub fn validate_response(query: &Message, response: &Message) -> bool {
 /// # Returns
 ///
 /// A new message with the updated ID
+#[allow(dead_code)] // Utility function for DNS message manipulation
 pub fn set_query_id(mut message: Message, id: u16) -> Message {
     message.set_id(id);
     message

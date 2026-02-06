@@ -218,7 +218,7 @@ impl From<IpProtocol> for u8 {
 /// let tuple = FiveTuple::tcp(src, dst);
 ///
 /// assert!(tuple.is_tcp());
-/// assert_eq!(tuple.src_port(), 12345);
+/// assert_eq!(tuple.src_port, 12345);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FiveTuple {

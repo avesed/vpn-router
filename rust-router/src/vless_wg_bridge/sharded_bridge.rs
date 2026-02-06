@@ -1504,7 +1504,7 @@ impl std::fmt::Debug for ShardedVlessWgBridge {
 // Tests
 // =============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sharded-vless-wg-bridge"))]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;

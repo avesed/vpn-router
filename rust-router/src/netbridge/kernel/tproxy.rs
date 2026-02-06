@@ -1,3 +1,6 @@
+// Some fields are reserved for internal tracking.
+#![allow(dead_code)]
+
 //! TPROXY listener wrapper for the kernel backend
 //!
 //! This module provides wrappers around the existing TPROXY listener implementation,

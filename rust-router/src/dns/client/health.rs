@@ -14,8 +14,7 @@
 //! # Example
 //!
 //! ```
-//! use rust_router::dns::client::HealthChecker;
-//! use rust_router::dns::config::HealthCheckConfig;
+//! use rust_router::dns::client::{HealthChecker, HealthCheckConfig};
 //!
 //! let config = HealthCheckConfig::default();
 //! let checker = HealthChecker::new(&config);
@@ -201,8 +200,7 @@ impl HealthStats {
 /// # Example
 ///
 /// ```
-/// use rust_router::dns::client::HealthChecker;
-/// use rust_router::dns::config::HealthCheckConfig;
+/// use rust_router::dns::client::{HealthChecker, HealthCheckConfig};
 ///
 /// let config = HealthCheckConfig::default();
 /// let checker = HealthChecker::new(&config);
@@ -268,8 +266,7 @@ impl HealthChecker {
     /// # Example
     ///
     /// ```
-    /// use rust_router::dns::client::HealthChecker;
-    /// use rust_router::dns::config::HealthCheckConfig;
+    /// use rust_router::dns::client::{HealthChecker, HealthCheckConfig};
     ///
     /// let config = HealthCheckConfig::default()
     ///     .with_failure_threshold(5)

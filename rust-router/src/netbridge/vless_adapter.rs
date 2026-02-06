@@ -1,3 +1,7 @@
+// Feature-gated module: Some code is only used when sharded-vless-wg-bridge feature is enabled.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 //! Adapter to make SmoltcpEgress compatible with ShardedVlessWgBridge API.
 //!
 //! This module provides `NetbridgeVlessAdapter`, a wrapper around `SmoltcpEgress`
@@ -58,7 +62,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use super::error::{NetBridgeError, Result};
 use super::smoltcp::{SmoltcpEgress, SmoltcpEgressConfig, SmoltcpEgressHandle};
@@ -1010,9 +1014,9 @@ mod tests {
         let _ = handle.task.await;
     }
 
-    #[test]
-    fn test_adapter_debug_impl() {
-        // Can't easily test async spawn in sync test, so just test formatting works
+    #[tokio::test]
+    async fn test_adapter_debug_impl() {
+        // SmoltcpEgress::spawn requires Tokio runtime for internal task spawning
         let egress_config = SmoltcpEgressConfig::default();
         let (egress, _handle) = SmoltcpEgress::spawn(egress_config);
         let adapter = NetbridgeVlessAdapter::new(egress);

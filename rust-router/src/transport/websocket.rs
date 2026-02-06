@@ -113,6 +113,7 @@ impl WebSocketTransport {
     }
 
     /// Configure TCP socket options
+    #[allow(dead_code)] // Helper for socket configuration
     fn configure_socket(
         stream: &TcpStream,
         config: &TransportConfig,
@@ -244,6 +245,7 @@ impl WebSocketTransport {
     }
 
     /// Build WebSocket request with custom headers
+    #[allow(dead_code)] // Helper for WebSocket connection
     fn build_request(config: &TransportConfig) -> Result<Request<()>, TransportError> {
         let ws_config = config.websocket.as_ref().ok_or_else(|| {
             TransportError::websocket_protocol("WebSocket configuration required")
@@ -291,6 +293,7 @@ impl WebSocketTransport {
     }
 
     /// Connect to WebSocket server with TLS at specific address
+    #[allow(dead_code)] // Helper for WebSocket TLS connection
     async fn connect_tls(
         addr: SocketAddr,
         config: &TransportConfig,
@@ -368,6 +371,7 @@ impl WebSocketTransport {
     }
 
     /// Connect to WebSocket server without TLS at specific address
+    #[allow(dead_code)] // Helper for WebSocket plain connection
     async fn connect_plain(
         addr: SocketAddr,
         config: &TransportConfig,

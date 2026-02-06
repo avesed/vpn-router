@@ -1,3 +1,6 @@
+// Some structs/functions are defined for completeness but not all are used.
+#![allow(dead_code)]
+
 //! Linux TUN/TAP ioctl constants and helper functions
 //!
 //! This module provides the low-level constants needed to interact with
@@ -254,6 +257,7 @@ pub struct IfReq {
 /// This is the original simplified version kept for backward compatibility
 /// with existing code that only uses TUNSETIFF.
 #[repr(C)]
+#[allow(dead_code)] // Reserved for backward compatibility
 pub struct IfReqFlags {
     /// Interface name (null-terminated, max 15 chars + null)
     pub ifr_name: [libc::c_char; IFNAMSIZ],

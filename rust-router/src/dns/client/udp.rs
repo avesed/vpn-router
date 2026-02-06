@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rust_router::dns::client::UdpClient;
+//! use rust_router::dns::client::{UdpClient, DnsUpstream};
 //! use rust_router::dns::UpstreamConfig;
 //! use rust_router::dns::UpstreamProtocol;
 //! use hickory_proto::op::Message;
@@ -66,7 +66,7 @@ const UDP_RECV_BUFFER_SIZE: usize = 4096;
 /// # Example
 ///
 /// ```no_run
-/// use rust_router::dns::client::UdpClient;
+/// use rust_router::dns::client::{UdpClient, DnsUpstream};
 /// use rust_router::dns::{UpstreamConfig, UpstreamProtocol};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

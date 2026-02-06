@@ -1,3 +1,6 @@
+// Some fields/methods are reserved for future features or debugging.
+#![allow(dead_code)]
+
 //! SmoltcpShard - Single-task owner of smoltcp resources
 //!
 //! This module provides `SmoltcpShard`, which owns the smoltcp `Interface`
@@ -764,7 +767,7 @@ impl SmoltcpShard {
             id
         } else {
             // Create new session
-            let remote = socket_addr_to_endpoint(dest).ok_or_else(|| {
+            let _remote = socket_addr_to_endpoint(dest).ok_or_else(|| {
                 NetBridgeError::InvalidAddress("IPv6 not supported".to_string())
             })?;
 

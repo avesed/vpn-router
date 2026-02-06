@@ -84,6 +84,7 @@ impl TlsTransport {
     }
 
     /// Configure TCP socket options
+    #[allow(dead_code)] // Helper for socket configuration
     fn configure_socket(
         stream: &TcpStream,
         config: &TransportConfig,
@@ -162,6 +163,7 @@ impl TlsTransport {
     }
 
     /// Connect to a single address with TLS
+    #[allow(dead_code)] // Helper for TLS connection
     async fn connect_to_addr(
         addr: SocketAddr,
         server_name: ServerName<'static>,

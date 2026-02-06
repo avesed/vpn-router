@@ -1,3 +1,7 @@
+// Feature-gated module: Some code is compiled but unused when features are disabled.
+// This is expected as the module provides multiple features that can be independently enabled.
+#![allow(dead_code)]
+
 //! VLESS to WireGuard Bridge Module
 //!
 //! This module provides the infrastructure for bridging VLESS inbound TCP/UDP

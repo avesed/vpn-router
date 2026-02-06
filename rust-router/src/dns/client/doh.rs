@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use rust_router::dns::client::DohClient;
+//! use rust_router::dns::client::{DohClient, DnsUpstream};
 //! use rust_router::dns::{UpstreamConfig, UpstreamProtocol};
 //! use hickory_proto::op::Message;
 //!
@@ -75,7 +75,7 @@ mod inner {
     /// # Example
     ///
     /// ```no_run
-    /// use rust_router::dns::client::DohClient;
+    /// use rust_router::dns::client::{DohClient, DnsUpstream};
     /// use rust_router::dns::{UpstreamConfig, UpstreamProtocol};
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

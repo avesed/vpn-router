@@ -70,6 +70,7 @@ impl TcpTransport {
     }
 
     /// Configure TCP socket options
+    #[allow(dead_code)] // Helper for socket configuration
     fn configure_socket(
         stream: &TcpStream,
         config: &TransportConfig,

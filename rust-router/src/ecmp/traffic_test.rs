@@ -534,7 +534,7 @@ impl EcmpTrafficResults {
         for (tag, &count) in &self.member_counts {
             let weight = weights.get(tag).copied().unwrap_or(1);
             let expected_ratio = weight as f64 / total_weight as f64;
-            let expected_count = self.total_connections as f64 * expected_ratio;
+            let _expected_count = self.total_connections as f64 * expected_ratio;
             let actual_ratio = count as f64 / self.total_connections as f64;
             let expected_ratio_normalized = expected_ratio;
 

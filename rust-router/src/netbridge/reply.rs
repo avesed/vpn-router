@@ -328,7 +328,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn make_ipv4_tcp_packet(src_port: u16, dst_port: u16) -> Vec<u8> {
-        // IPv4 TCP packet: 10.25.0.2:src_port -> 93.184.216.34:dst_port
+        // IPv4 TCP reply packet: 93.184.216.34:src_port -> 10.25.0.2:dst_port
+        // (Server reply to client)
         let src_port_bytes = src_port.to_be_bytes();
         let dst_port_bytes = dst_port.to_be_bytes();
 
@@ -336,8 +337,8 @@ mod tests {
             0x45, 0x00, 0x00, 0x28, // Version=4, IHL=5, Total Length=40
             0x00, 0x00, 0x00, 0x00, // ID, Flags, Fragment
             0x40, 0x06, 0x00, 0x00, // TTL=64, Protocol=TCP, Checksum
-            0x0a, 0x19, 0x00, 0x02, // Src: 10.25.0.2
-            0x5d, 0xb8, 0xd8, 0x22, // Dst: 93.184.216.34
+            0x5d, 0xb8, 0xd8, 0x22, // Src: 93.184.216.34 (server)
+            0x0a, 0x19, 0x00, 0x02, // Dst: 10.25.0.2 (client)
             src_port_bytes[0], src_port_bytes[1],
             dst_port_bytes[0], dst_port_bytes[1],
             // Minimal TCP header would follow...

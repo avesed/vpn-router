@@ -142,7 +142,6 @@ impl Clone for ConnectionGuard {
 
 #[cfg(feature = "shadowsocks")]
 use shadowsocks::{
-    config::ServerConfig,
     context::SharedContext,
     relay::tcprelay::{proxy_listener::ProxyListener, proxy_stream::server::ProxyServerStream},
 };
@@ -156,7 +155,8 @@ pub struct ShadowsocksInboundListener {
     /// The underlying proxy listener from shadowsocks crate
     proxy_listener: ProxyListener,
 
-    /// Shadowsocks context
+    /// Shadowsocks context (used for crypto operations, may be needed for future features)
+    #[allow(dead_code)]
     context: SharedContext,
 
     /// Configuration

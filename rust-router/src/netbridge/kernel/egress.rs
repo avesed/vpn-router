@@ -33,10 +33,16 @@ use crate::netbridge::types::EgressStats;
 // =============================================================================
 
 /// Configuration for the kernel egress bridge
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KernelEgressConfig {
     /// Enable statistics collection
     pub enable_stats: bool,
+}
+
+impl Default for KernelEgressConfig {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KernelEgressConfig {

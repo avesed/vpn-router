@@ -166,7 +166,8 @@ pub struct SsUdpRelayInbound {
     /// The underlying proxy socket for UDP relay
     proxy_socket: ProxySocket<shadowsocks::net::UdpSocket>,
 
-    /// Shadowsocks context
+    /// Shadowsocks context (used for crypto operations, may be needed for future features)
+    #[allow(dead_code)]
     context: SharedContext,
 
     /// Configuration

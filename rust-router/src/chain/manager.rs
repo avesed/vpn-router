@@ -320,6 +320,7 @@ struct ChainStateInternal {
     /// Last error message
     last_error: Option<String>,
     /// Creation timestamp (Unix epoch seconds)
+    #[allow(dead_code)] // Stored for debugging/metrics but not yet read
     created_at: u64,
 }
 
