@@ -627,13 +627,20 @@ export interface RateHistoryPoint {
 }
 
 export interface DashboardStats {
-  online_clients: number;
+  // 通用字段
+  is_admin: boolean;
   total_clients: number;
-  traffic_by_outbound: Record<string, { download: number; upload: number }>;
-  traffic_rates: Record<string, { download_rate: number; upload_rate: number }>;
-  rate_history: RateHistoryPoint[];  // 24小时速率历史
-  adblock_connections: number;
-  active_connections: number;
+
+  // 管理员专用字段
+  online_clients?: number;
+  traffic_by_outbound?: Record<string, { download: number; upload: number }>;
+  traffic_rates?: Record<string, { download_rate: number; upload_rate: number }>;
+  rate_history?: RateHistoryPoint[];  // 24小时速率历史
+  adblock_connections?: number;
+  active_connections?: number;
+
+  // 普通用户专用字段
+  ingress_traffic?: { rx_bytes: number; tx_bytes: number };
 }
 
 // Egress Connection Test

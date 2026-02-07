@@ -166,7 +166,10 @@
     "timeRange24H": "24 hours",
     "now": "now",
     "rate": "Rate",
-    "traffic": "Traffic"
+    "traffic": "Traffic",
+    "myClients": "My Clients",
+    "myClientsDesc": "Your configured WireGuard peers",
+    "ingressTraffic": "Ingress Traffic"
   },
   "profile": {
     "title": "Profile Manager",

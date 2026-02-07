@@ -4681,7 +4681,7 @@ def api_status():
 
 
 @app.get("/api/stats/dashboard")
-def api_stats_dashboard(time_range: str = "1m"):
+def api_stats_dashboard(request: Request, time_range: str = "1m"):
     """获取 Dashboard 可视化统计数据
 
     参数：
@@ -4690,29 +4690,53 @@ def api_stats_dashboard(time_range: str = "1m"):
       - 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
       - 24h: 最近 24 小时，1 小时间隔（24 个数据点）
 
-    返回：
+    返回（管理员）：
     - online_clients: 在线客户端数量（有活跃连接的 WireGuard peer）
     - total_clients: 总客户端数量（所有配置的 WireGuard peer）
     - traffic_by_outbound: 按出口分组的流量 {tag: {download, upload}}
     - adblock_connections: 匹配广告拦截规则的连接数
     - active_connections: 总活跃连接数
     - rate_history: 速率历史（根据 time_range 聚合）
+    - is_admin: True
+
+    返回（普通用户）：
+    - total_clients: 用户自己的客户端数量
+    - ingress_traffic: 入口流量统计 {rx_bytes, tx_bytes}
+    - is_admin: False
     """
     import urllib.request
 
+    # 获取用户上下文
+    user = get_user_context(request)
+    is_admin = user.is_admin
+
     # 初始化返回数据
     stats = {
-        "online_clients": 0,
-        "total_clients": 0,
-        "traffic_by_outbound": {},
-        "adblock_connections": 0,
-        "active_connections": 0,
+        "is_admin": is_admin,
     }
 
-    # 获取总客户端数量（从数据库）
+    if is_admin:
+        # 管理员：完整数据
+        stats.update({
+            "online_clients": 0,
+            "total_clients": 0,
+            "traffic_by_outbound": {},
+            "adblock_connections": 0,
+            "active_connections": 0,
+        })
+    else:
+        # 普通用户：简化数据
+        stats.update({
+            "total_clients": 0,
+            "ingress_traffic": {"rx_bytes": 0, "tx_bytes": 0},
+        })
+
+    # 获取客户端数量（从数据库）
     try:
         db = _get_db()
-        peers = db.get_wireguard_peers()
+        # 管理员看所有 peers，普通用户只看自己的
+        owner_filter = None if is_admin else user.user_id
+        peers = db.get_wireguard_peers(owner_id=owner_filter)
         stats["total_clients"] = len(peers) if peers else 0
     except Exception:
         pass
@@ -4738,140 +4762,153 @@ def api_stats_dashboard(time_range: str = "1m"):
 
             if ingress_resp.success and ingress_resp.data:
                 manager_stats = ingress_resp.data.get("manager_stats") or {}
-                
-                stats["online_clients"] = manager_stats.get("active_peer_count", 0)
-                # 总客户端也可以从 ingress 获取
-                if manager_stats.get("peer_count", 0) > 0:
-                    stats["total_clients"] = manager_stats.get("peer_count", 0)
-                
-                # 活跃会话数（实际连接数）
-                stats["active_connections"] = ingress_resp.data.get("active_sessions", 0)
+
+                if is_admin:
+                    # 管理员：完整统计
+                    stats["online_clients"] = manager_stats.get("active_peer_count", 0)
+                    # 总客户端也可以从 ingress 获取
+                    if manager_stats.get("peer_count", 0) > 0:
+                        stats["total_clients"] = manager_stats.get("peer_count", 0)
+                    # 活跃会话数（实际连接数）
+                    stats["active_connections"] = ingress_resp.data.get("active_sessions", 0)
+                else:
+                    # 普通用户：入口流量统计
+                    stats["ingress_traffic"] = {
+                        "rx_bytes": manager_stats.get("rx_bytes", 0),
+                        "tx_bytes": manager_stats.get("tx_bytes", 0),
+                    }
 
         except Exception as e:
             logging.warning(f"rust-router stats unavailable: {type(e).__name__}: {e}")
 
-    # 使用累计流量统计和实时速率（由后台线程更新）
-    # 包含所有配置的出口，没有流量的显示为 0
-    # 排除阻止类出口（block, adblock）- 这些没有实际流量数据
-    all_outbounds = _get_all_outbounds()
-    blocked_outbounds = {"block", "adblock"}  # 阻止类出口，不显示在图表中
-    chart_outbounds = [o for o in all_outbounds if o not in blocked_outbounds]
+    # 管理员：出口流量统计和速率历史
+    # 普通用户不显示出口流量（只显示入口流量）
+    if is_admin:
+        # 使用累计流量统计和实时速率（由后台线程更新）
+        # 包含所有配置的出口，没有流量的显示为 0
+        # 排除阻止类出口（block, adblock）- 这些没有实际流量数据
+        all_outbounds = _get_all_outbounds()
+        blocked_outbounds = {"block", "adblock"}  # 阻止类出口，不显示在图表中
+        chart_outbounds = [o for o in all_outbounds if o not in blocked_outbounds]
 
-    with _traffic_stats_lock:
-        # 确保所有出口都有流量数据（没有流量的显示为 0）
-        traffic_by_outbound = {}
-        for outbound in chart_outbounds:
-            if outbound in _traffic_stats:
-                traffic_by_outbound[outbound] = dict(_traffic_stats[outbound])
-            else:
-                traffic_by_outbound[outbound] = {"download": 0, "upload": 0}
-        stats["traffic_by_outbound"] = traffic_by_outbound
-        # 确保所有出口都有速率数据
-        traffic_rates = {}
-        for outbound in chart_outbounds:
-            if outbound in _traffic_rates:
-                traffic_rates[outbound] = dict(_traffic_rates[outbound])
-            else:
-                traffic_rates[outbound] = {"download_rate": 0.0, "upload_rate": 0.0}
-        stats["traffic_rates"] = traffic_rates
-
-        # 根据 time_range 聚合 rate_history
-        # 1m: 最近 60 秒，1 秒间隔（原始数据）
-        # 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
-        # 24h: 最近 24 小时，1 小时间隔（24 个数据点）
-        now = int(time.time())
-
-        if time_range == "1h":
-            # 最近 1 小时，每 10 分钟聚合一次（6 个数据点）
-            interval_seconds = 10 * 60  # 10 分钟
-            num_points = 6
-            cutoff = now - 60 * 60  # 1 小时前
-        elif time_range == "24h":
-            # 最近 24 小时，每 1 小时聚合一次（24 个数据点）
-            interval_seconds = 60 * 60  # 1 小时
-            num_points = 24
-            cutoff = now - 24 * 60 * 60  # 24 小时前
-        else:  # "1m" 默认
-            # 最近 60 秒，不聚合，直接返回原始数据
-            interval_seconds = 1
-            num_points = 60
-            cutoff = now - 60  # 60 秒前
-
-        # 过滤时间范围内的数据
-        filtered_data = [p for p in _rate_history if p["timestamp"] > cutoff]
-
-        if time_range == "1m":
-            # 1 分钟视图：直接返回最近 60 个数据点
-            filtered_history = []
-            for point in filtered_data[-60:]:
-                filtered_point = {
-                    "timestamp": point["timestamp"],
-                    "rates": {k: v for k, v in point["rates"].items() if k not in blocked_outbounds}
-                }
-                filtered_history.append(filtered_point)
-        else:
-            # 1h/24h 视图：按时间段聚合（取平均值）
-            filtered_history = []
-
-            for i in range(num_points):
-                # 计算这个时间段的起止时间
-                slot_end = now - i * interval_seconds
-                slot_start = slot_end - interval_seconds
-
-                # 找到这个时间段内的所有数据点
-                slot_points = [p for p in filtered_data if slot_start < p["timestamp"] <= slot_end]
-
-                if slot_points:
-                    # 计算每个出口的平均速率
-                    avg_rates = {}
-                    for outbound in chart_outbounds:
-                        rates = [p["rates"].get(outbound, 0) for p in slot_points]
-                        avg_rates[outbound] = round(sum(rates) / len(rates), 1) if rates else 0
-
-                    filtered_history.append({
-                        "timestamp": slot_end,
-                        "rates": avg_rates
-                    })
+        with _traffic_stats_lock:
+            # 确保所有出口都有流量数据（没有流量的显示为 0）
+            traffic_by_outbound = {}
+            for outbound in chart_outbounds:
+                if outbound in _traffic_stats:
+                    traffic_by_outbound[outbound] = dict(_traffic_stats[outbound])
                 else:
-                    # 没有数据时填充 0
-                    filtered_history.append({
-                        "timestamp": slot_end,
-                        "rates": {o: 0 for o in chart_outbounds}
-                    })
+                    traffic_by_outbound[outbound] = {"download": 0, "upload": 0}
+            stats["traffic_by_outbound"] = traffic_by_outbound
+            # 确保所有出口都有速率数据
+            traffic_rates = {}
+            for outbound in chart_outbounds:
+                if outbound in _traffic_rates:
+                    traffic_rates[outbound] = dict(_traffic_rates[outbound])
+                else:
+                    traffic_rates[outbound] = {"download_rate": 0.0, "upload_rate": 0.0}
+            stats["traffic_rates"] = traffic_rates
 
-            # 反转顺序，使时间从旧到新
-            filtered_history.reverse()
+            # 根据 time_range 聚合 rate_history
+            # 1m: 最近 60 秒，1 秒间隔（原始数据）
+            # 1h: 最近 1 小时，10 分钟间隔（6 个数据点）
+            # 24h: 最近 24 小时，1 小时间隔（24 个数据点）
+            now = int(time.time())
 
-        stats["rate_history"] = filtered_history
+            if time_range == "1h":
+                # 最近 1 小时，每 10 分钟聚合一次（6 个数据点）
+                interval_seconds = 10 * 60  # 10 分钟
+                num_points = 6
+                cutoff = now - 60 * 60  # 1 小时前
+            elif time_range == "24h":
+                # 最近 24 小时，每 1 小时聚合一次（24 个数据点）
+                interval_seconds = 60 * 60  # 1 小时
+                num_points = 24
+                cutoff = now - 24 * 60 * 60  # 24 小时前
+            else:  # "1m" 默认
+                # 最近 60 秒，不聚合，直接返回原始数据
+                interval_seconds = 1
+                num_points = 60
+                cutoff = now - 60  # 60 秒前
 
-    # 从 sing-box 日志文件统计广告拦截（增量扫描优化）
-    # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
-    global _adblock_count, _adblock_log_position, _adblock_log_inode
-    try:
-        log_file = Path("/var/log/sing-box.log")
-        if log_file.exists():
-            # 检测日志轮转（inode 变化或文件变小）
-            stat = log_file.stat()
-            current_inode = stat.st_ino
-            current_size = stat.st_size
+            # 过滤时间范围内的数据
+            filtered_data = [p for p in _rate_history if p["timestamp"] > cutoff]
 
-            if current_inode != _adblock_log_inode or current_size < _adblock_log_position:
-                # 日志轮转，重新全量扫描
-                _adblock_count = 0
-                _adblock_log_position = 0
-                _adblock_log_inode = current_inode
+            if time_range == "1m":
+                # 1 分钟视图：直接返回最近 60 个数据点
+                filtered_history = []
+                for point in filtered_data[-60:]:
+                    filtered_point = {
+                        "timestamp": point["timestamp"],
+                        "rates": {k: v for k, v in point["rates"].items() if k not in blocked_outbounds}
+                    }
+                    filtered_history.append(filtered_point)
+            else:
+                # 1h/24h 视图：按时间段聚合（取平均值）
+                filtered_history = []
 
-            # 增量扫描：从上次位置读取新内容
-            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
-                f.seek(_adblock_log_position)
-                for line in f:
-                    if "outbound/block[adblock]: blocked connection" in line:
-                        _adblock_count += 1
-                _adblock_log_position = f.tell()
+                for i in range(num_points):
+                    # 计算这个时间段的起止时间
+                    slot_end = now - i * interval_seconds
+                    slot_start = slot_end - interval_seconds
 
-        stats["adblock_connections"] = _adblock_count
-    except Exception:
-        stats["adblock_connections"] = _adblock_count  # 出错时返回已有计数
+                    # 找到这个时间段内的所有数据点
+                    slot_points = [p for p in filtered_data if slot_start < p["timestamp"] <= slot_end]
+
+                    if slot_points:
+                        # 计算每个出口的平均速率
+                        avg_rates = {}
+                        for outbound in chart_outbounds:
+                            rates = [p["rates"].get(outbound, 0) for p in slot_points]
+                            avg_rates[outbound] = round(sum(rates) / len(rates), 1) if rates else 0
+
+                        filtered_history.append({
+                            "timestamp": slot_end,
+                            "rates": avg_rates
+                        })
+                    else:
+                        # 没有数据时填充 0
+                        filtered_history.append({
+                            "timestamp": slot_end,
+                            "rates": {o: 0 for o in chart_outbounds}
+                        })
+
+                # 反转顺序，使时间从旧到新
+                filtered_history.reverse()
+
+            stats["rate_history"] = filtered_history
+
+    # 管理员：广告拦截统计
+    # 普通用户不显示广告拦截计数
+    if is_admin:
+        # 从 sing-box 日志文件统计广告拦截（增量扫描优化）
+        # 使用专用的 adblock 出口，日志格式: outbound/block[adblock]: blocked connection to x.x.x.x:443
+        global _adblock_count, _adblock_log_position, _adblock_log_inode
+        try:
+            log_file = Path("/var/log/sing-box.log")
+            if log_file.exists():
+                # 检测日志轮转（inode 变化或文件变小）
+                stat = log_file.stat()
+                current_inode = stat.st_ino
+                current_size = stat.st_size
+
+                if current_inode != _adblock_log_inode or current_size < _adblock_log_position:
+                    # 日志轮转，重新全量扫描
+                    _adblock_count = 0
+                    _adblock_log_position = 0
+                    _adblock_log_inode = current_inode
+
+                # 增量扫描：从上次位置读取新内容
+                with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    f.seek(_adblock_log_position)
+                    for line in f:
+                        if "outbound/block[adblock]: blocked connection" in line:
+                            _adblock_count += 1
+                    _adblock_log_position = f.tell()
+
+            stats["adblock_connections"] = _adblock_count
+        except Exception:
+            stats["adblock_connections"] = _adblock_count  # 出错时返回已有计数
 
     return stats
 

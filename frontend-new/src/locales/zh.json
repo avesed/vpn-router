@@ -166,7 +166,10 @@
     "timeRange24H": "24小时",
     "now": "现在",
     "rate": "速率",
-    "traffic": "流量"
+    "traffic": "流量",
+    "myClients": "我的客户端",
+    "myClientsDesc": "您配置的 WireGuard 客户端",
+    "ingressTraffic": "入口流量"
   },
   "profile": {
     "title": "线路管理",
