@@ -2403,6 +2403,72 @@ def migrate_owner_id_columns(conn: sqlite3.Connection):
     print(f"✓ owner_id 列迁移完成（添加 {columns_added} 列，{indexes_added} 个索引）")
 
 
+def migrate_users_rules_ignored(conn: sqlite3.Connection):
+    """为 users 表添加 rules_ignored 列（迁移版本 102）
+
+    添加功能：
+    - users.rules_ignored: 每用户规则忽略开关
+    - settings.ignore_all_user_rules: 全局规则忽略开关
+
+    当开关启用时，用户创建的规则不会同步到 rust-router，
+    只有管理员的规则会生效。
+    """
+    cursor = conn.cursor()
+    MIGRATION_VERSION = 102
+
+    # 1. 确保 schema_migrations 表存在
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            description TEXT
+        )
+    """)
+
+    # 2. 检查是否已应用此迁移
+    cursor.execute("SELECT version FROM schema_migrations WHERE version = ?", (MIGRATION_VERSION,))
+    if cursor.fetchone():
+        print("⊘ rules_ignored 迁移（版本 102）已应用，跳过")
+        return
+
+    print("开始 rules_ignored 迁移（版本 102）...")
+
+    # 3. 检查 users 表是否存在
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    if not cursor.fetchone():
+        print("⊘ users 表不存在，跳过迁移")
+        return
+
+    # 4. 检查 rules_ignored 列是否已存在
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if "rules_ignored" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN rules_ignored INTEGER DEFAULT 0")
+        print("✓ 添加 users.rules_ignored 列")
+    else:
+        print("⊘ users.rules_ignored 列已存在")
+
+    # 5. 添加全局忽略设置（如果不存在）
+    cursor.execute("SELECT value FROM settings WHERE key = 'ignore_all_user_rules'")
+    if not cursor.fetchone():
+        cursor.execute("""
+            INSERT INTO settings (key, value) VALUES ('ignore_all_user_rules', 'false')
+        """)
+        print("✓ 添加 ignore_all_user_rules 设置")
+    else:
+        print("⊘ ignore_all_user_rules 设置已存在")
+
+    # 6. 记录迁移版本
+    cursor.execute("""
+        INSERT INTO schema_migrations (version, description)
+        VALUES (?, '添加 users.rules_ignored 列和 ignore_all_user_rules 设置')
+    """, (MIGRATION_VERSION,))
+
+    conn.commit()
+    print("✓ rules_ignored 迁移完成")
+
+
 def repair_null_owner_ids(conn):
     """修复 owner_id 为 NULL 的记录
 
@@ -2703,6 +2769,9 @@ def main():
 
     # 用户所属资源 owner_id 列迁移
     migrate_owner_id_columns(conn)
+
+    # 用户规则忽略开关迁移
+    migrate_users_rules_ignored(conn)
 
     # 修复 owner_id 为 NULL 的记录（迁移可能在 UPDATE 语句添加前运行过）
     repair_null_owner_ids(conn)

@@ -4456,6 +4456,124 @@ def api_reject_user(user_id: int, request: Request):
     return {"message": "User rejected and removed"}
 
 
+# ============ 规则忽略设置端点 ============
+
+@app.get("/api/settings/rules-ignore")
+def api_get_rules_ignore_settings(request: Request):
+    """获取规则忽略设置（管理员）
+
+    返回:
+    - ignore_all_user_rules: 全局用户规则忽略开关
+    """
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    return {
+        "ignore_all_user_rules": db.get_ignore_all_user_rules()
+    }
+
+
+@app.put("/api/settings/rules-ignore")
+def api_update_rules_ignore_settings(request: Request, body: dict = Body(...)):
+    """更新规则忽略设置（管理员）
+
+    Body:
+    - ignore_all_user_rules: 全局用户规则忽略开关 (bool)
+    """
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+
+    if "ignore_all_user_rules" in body:
+        enabled = bool(body["ignore_all_user_rules"])
+        old_value = db.get_ignore_all_user_rules()
+        db.set_ignore_all_user_rules(enabled)
+
+        # 记录审计日志
+        db.add_audit_log(
+            action="toggle_ignore_all_user_rules",
+            user_id=user_ctx.user_id,
+            details=json.dumps({
+                "old_value": old_value,
+                "new_value": enabled
+            })
+        )
+
+        logging.info(f"Global ignore_all_user_rules changed: {old_value} -> {enabled}, by user_id={user_ctx.user_id}")
+
+        # 同步规则到 rust-router
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            logging.info(f"Rules synced after ignore_all_user_rules change: {sync_result.rule_count} rules")
+        except Exception as exc:
+            logging.error(f"Failed to sync rules after ignore_all_user_rules change: {exc}")
+
+    return {
+        "ignore_all_user_rules": db.get_ignore_all_user_rules()
+    }
+
+
+@app.put("/api/users/{user_id}/rules-ignored")
+def api_update_user_rules_ignored(user_id: int, request: Request, body: dict = Body(...)):
+    """更新单个用户的规则忽略状态（管理员）
+
+    Body:
+    - rules_ignored: 是否忽略该用户的规则 (bool)
+    """
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    user = db.get_user(user_id)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 不能修改管理员的规则忽略状态
+    if user["role"] == "admin":
+        raise HTTPException(status_code=400, detail="Cannot ignore admin rules")
+
+    if "rules_ignored" in body:
+        enabled = 1 if body["rules_ignored"] else 0
+        old_value = user.get("rules_ignored", 0)
+        db.update_user(user_id, rules_ignored=enabled)
+
+        # 记录审计日志
+        db.add_audit_log(
+            action="toggle_user_rules_ignored",
+            user_id=user_ctx.user_id,
+            resource_type="user",
+            resource_id=str(user_id),
+            details=json.dumps({
+                "target_user": user["username"],
+                "old_value": bool(old_value),
+                "new_value": bool(enabled)
+            })
+        )
+
+        logging.info(f"User rules_ignored changed: user_id={user_id}, {old_value} -> {enabled}, by admin user_id={user_ctx.user_id}")
+
+        # 同步规则到 rust-router
+        try:
+            sync_result = _sync_rules_to_rust_router(db)
+            logging.info(f"Rules synced after user rules_ignored change: {sync_result.rule_count} rules")
+        except Exception as exc:
+            logging.error(f"Failed to sync rules after user rules_ignored change: {exc}")
+
+    # 返回更新后的用户信息
+    updated_user = db.get_user(user_id)
+    return {
+        "id": updated_user["id"],
+        "username": updated_user["username"],
+        "rules_ignored": bool(updated_user.get("rules_ignored", 0))
+    }
+
+
 # ============ 系统状态端点 ============
 
 @app.get("/api/health")
@@ -12875,10 +12993,23 @@ def _sync_rules_to_rust_router(db=None, raise_on_error: bool = True) -> RustRout
     if db is None:
         db = _get_db()
 
+    # Get allowed owner IDs based on global and per-user ignore settings
+    allowed_owner_ids = db.get_allowed_rule_owner_ids()
+    logging.debug(f"[_sync_rules] Allowed owner IDs: {allowed_owner_ids}")
+
     # Prepare rule configs before async operations
     all_rules = db.get_routing_rules(enabled_only=True)
+
+    # Filter rules based on owner_id - only include rules from allowed owners
+    filtered_rules = [
+        r for r in all_rules
+        if r.get("owner_id") is None or r.get("owner_id") in allowed_owner_ids
+    ]
+    if len(filtered_rules) < len(all_rules):
+        logging.info(f"[_sync_rules] Filtered {len(all_rules) - len(filtered_rules)} rules from ignored users")
+
     rule_configs = []
-    for rule in all_rules:
+    for rule in filtered_rules:
         rule_type = rule.get("rule_type", "")
         target = rule.get("target", "")
         outbound = rule.get("outbound", "direct")

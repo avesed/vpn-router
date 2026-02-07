@@ -1627,9 +1627,14 @@ export interface User {
   email?: string;
   role: UserRole;
   enabled: boolean;
+  rules_ignored?: boolean;
   created_at?: string;
   last_login_at?: string;
   created_by?: number;
+}
+
+export interface RulesIgnoreSettings {
+  ignore_all_user_rules: boolean;
 }
 
 export interface UserQuota {

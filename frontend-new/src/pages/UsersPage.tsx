@@ -5,6 +5,9 @@ import {
   useCreateUser,
   useUpdateUser,
   useDeleteUser,
+  useRulesIgnoreSettings,
+  useSetRulesIgnoreSettings,
+  useSetUserRulesIgnored,
 } from "@/api/hooks/useUsers";
 import { useAuth } from "@/providers/AuthProvider";
 import { api } from "@/api/client";
@@ -66,6 +69,7 @@ import {
   Check,
   X,
   Hourglass,
+  AlertTriangle,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -76,6 +80,9 @@ export function UsersPage() {
   const createUser = useCreateUser();
   const updateUser = useUpdateUser();
   const deleteUser = useDeleteUser();
+  const { data: rulesIgnoreSettings, isLoading: loadingRulesIgnore } = useRulesIgnoreSettings();
+  const setRulesIgnoreSettings = useSetRulesIgnoreSettings();
+  const setUserRulesIgnored = useSetUserRulesIgnored();
 
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<User | null>(null);
@@ -393,6 +400,41 @@ export function UsersPage() {
         </CardContent>
       </Card>
 
+      {/* Rules Ignore Settings Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <AlertTriangle className="h-5 w-5" />
+            {t("users.rulesIgnoreTitle")}
+          </CardTitle>
+          <CardDescription>{t("users.rulesIgnoreDesc")}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {loadingRulesIgnore ? (
+            <div className="flex items-center justify-center py-4">
+              <Loader2 className="h-4 w-4 animate-spin" />
+            </div>
+          ) : (
+            <div className="flex items-center justify-between">
+              <div>
+                <Label htmlFor="ignore-all-rules">{t("users.ignoreAllUserRules")}</Label>
+                <p className="text-sm text-muted-foreground">
+                  {t("users.ignoreAllUserRulesDesc")}
+                </p>
+              </div>
+              <Switch
+                id="ignore-all-rules"
+                checked={rulesIgnoreSettings?.ignore_all_user_rules ?? false}
+                onCheckedChange={(checked) => {
+                  setRulesIgnoreSettings.mutate({ ignore_all_user_rules: checked });
+                }}
+                disabled={setRulesIgnoreSettings.isPending}
+              />
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Pending Users Card */}
       {pendingUsers.length > 0 && (
         <Card>
@@ -483,6 +525,7 @@ export function UsersPage() {
                   <TableHead>{t("users.role")}</TableHead>
                   <TableHead>{t("users.status")}</TableHead>
                   <TableHead>{t("users.lastLogin")}</TableHead>
+                  <TableHead>{t("users.rulesIgnored")}</TableHead>
                   <TableHead className="text-right">{t("common.actions")}</TableHead>
                 </TableRow>
               </TableHeader>
@@ -516,6 +559,25 @@ export function UsersPage() {
                       </Badge>
                     </TableCell>
                     <TableCell>{formatDate(user.last_login_at)}</TableCell>
+                    <TableCell>
+                      {user.role === "admin" ? (
+                        <span className="text-muted-foreground">-</span>
+                      ) : (
+                        <Switch
+                          checked={user.rules_ignored ?? false}
+                          onCheckedChange={(checked) => {
+                            setUserRulesIgnored.mutate({
+                              userId: user.id,
+                              rulesIgnored: checked,
+                            });
+                          }}
+                          disabled={
+                            setUserRulesIgnored.isPending ||
+                            rulesIgnoreSettings?.ignore_all_user_rules
+                          }
+                        />
+                      )}
+                    </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-2">
                         <Dialog

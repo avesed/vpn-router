@@ -430,7 +430,10 @@
       "port": "Port: Matches destination port numbers or ranges, e.g., 80, 443 or 6881:6889",
       "order": "Rules are matched in order, the first matching rule takes effect",
       "default": "Traffic that doesn't match any rule uses the default outbound"
-    }
+    },
+    "rulesIgnoredTitle": "Your Rules Are Not Active",
+    "rulesIgnoredGlobalDesc": "The administrator has enabled a global override. Your routing rules are currently not being applied.",
+    "rulesIgnoredUserDesc": "Your routing rules have been temporarily disabled by the administrator. Contact them if you believe this is an error."
   },
   "ruleSets": {
     "title": "Rule Sets",
@@ -1592,7 +1595,16 @@
     "approve": "Approve",
     "reject": "Reject",
     "userApproved": "User approved successfully",
-    "userRejected": "User rejected and removed"
+    "userRejected": "User rejected and removed",
+    "rulesIgnoreTitle": "Rules Override Settings",
+    "rulesIgnoreDesc": "Control whether user-defined routing rules are applied",
+    "ignoreAllUserRules": "Ignore All User Rules",
+    "ignoreAllUserRulesDesc": "When enabled, only admin rules are applied. User rules are temporarily disabled.",
+    "rulesIgnored": "Rules Ignored",
+    "rulesIgnoreUpdated": "Rules override setting updated",
+    "rulesIgnoreUpdateFailed": "Failed to update rules override setting",
+    "userRulesIgnoreUpdated": "Rules for user \"{{name}}\" have been updated",
+    "userRulesIgnoreUpdateFailed": "Failed to update user rules setting"
   },
   "settings": {
     "registrationTitle": "User Registration",

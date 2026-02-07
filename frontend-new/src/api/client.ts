@@ -1077,4 +1077,23 @@ export const api = {
     request<ApproveRejectResponse>(`/users/${userId}/reject`, {
       method: "POST"
     }),
+
+  // Rules ignore settings (admin only)
+  getRulesIgnoreSettings: () =>
+    request<{ ignore_all_user_rules: boolean }>("/settings/rules-ignore"),
+
+  setRulesIgnoreSettings: (settings: { ignore_all_user_rules: boolean }) =>
+    request<{ ignore_all_user_rules: boolean }>("/settings/rules-ignore", {
+      method: "PUT",
+      body: settings
+    }),
+
+  setUserRulesIgnored: (userId: number, rulesIgnored: boolean) =>
+    request<{ id: number; username: string; rules_ignored: boolean }>(
+      `/users/${userId}/rules-ignored`,
+      {
+        method: "PUT",
+        body: { rules_ignored: rulesIgnored }
+      }
+    ),
 };

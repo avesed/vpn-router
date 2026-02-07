@@ -100,3 +100,48 @@ export function useUpdateUserQuota() {
     },
   });
 }
+
+// ============ Rules Ignore Settings ============
+
+export function useRulesIgnoreSettings() {
+  return useQuery<{ ignore_all_user_rules: boolean }>({
+    queryKey: ["settings", "rules-ignore"],
+    queryFn: api.getRulesIgnoreSettings,
+  });
+}
+
+export function useSetRulesIgnoreSettings() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: (settings: { ignore_all_user_rules: boolean }) =>
+      api.setRulesIgnoreSettings(settings),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["settings", "rules-ignore"] });
+      toast.success(t("users.rulesIgnoreUpdated"));
+    },
+    onError: (error: Error) => {
+      toast.error(`${t("users.rulesIgnoreUpdateFailed")}: ${error.message}`);
+    },
+  });
+}
+
+export function useSetUserRulesIgnored() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: ({ userId, rulesIgnored }: { userId: number; rulesIgnored: boolean }) =>
+      api.setUserRulesIgnored(userId, rulesIgnored),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["users"] });
+      toast.success(
+        t("users.userRulesIgnoreUpdated", { name: data.username })
+      );
+    },
+    onError: (error: Error) => {
+      toast.error(`${t("users.userRulesIgnoreUpdateFailed")}: ${error.message}`);
+    },
+  });
+}

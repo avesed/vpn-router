@@ -1469,7 +1469,7 @@ class UserDatabase:
             rows = cursor.execute("""
                 SELECT id, username, email, role, enabled, token_version,
                        failed_login_count, locked_until, created_at, updated_at,
-                       last_login_at, created_by
+                       last_login_at, created_by, rules_ignored
                 FROM users
                 ORDER BY id
             """).fetchall()
@@ -1481,7 +1481,8 @@ class UserDatabase:
             cursor = conn.cursor()
             row = cursor.execute("""
                 SELECT id, username, email, password_hash, role, enabled, token_version,
-                       failed_login_count, locked_until, created_at, updated_at, last_login_at
+                       failed_login_count, locked_until, created_at, updated_at, last_login_at,
+                       rules_ignored
                 FROM users WHERE id = ?
             """, (user_id,)).fetchone()
             return dict(row) if row else None
@@ -1492,7 +1493,8 @@ class UserDatabase:
             cursor = conn.cursor()
             row = cursor.execute("""
                 SELECT id, username, email, password_hash, role, enabled, token_version,
-                       failed_login_count, locked_until, created_at, updated_at, last_login_at
+                       failed_login_count, locked_until, created_at, updated_at, last_login_at,
+                       rules_ignored
                 FROM users WHERE username = ?
             """, (username,)).fetchone()
             return dict(row) if row else None
@@ -1539,7 +1541,7 @@ class UserDatabase:
     def update_user(self, user_id: int, **kwargs) -> bool:
         """更新用户字段"""
         allowed = {"password_hash", "email", "role", "enabled", "token_version",
-                   "failed_login_count", "locked_until", "last_login_at"}
+                   "failed_login_count", "locked_until", "last_login_at", "rules_ignored"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
@@ -1732,6 +1734,44 @@ class UserDatabase:
                 WHERE id = ? AND locked_until > datetime('now')
             """, (user_id,)).fetchone()
             return row is not None
+
+    # ============ 规则忽略设置 ============
+
+    def get_ignore_all_user_rules(self) -> bool:
+        """获取全局用户规则忽略开关状态"""
+        value = self.get_setting("ignore_all_user_rules", "false")
+        return value.lower() == "true"
+
+    def set_ignore_all_user_rules(self, enabled: bool) -> bool:
+        """设置全局用户规则忽略开关"""
+        return self.set_setting("ignore_all_user_rules", "true" if enabled else "false")
+
+    def get_allowed_rule_owner_ids(self) -> set:
+        """获取允许规则同步的用户 ID 集合
+
+        根据全局开关和每用户开关决定哪些用户的规则应被同步到 rust-router。
+        返回一个集合，包含:
+        - 所有管理员用户的 ID（管理员规则永远不会被忽略）
+        - 如果全局开关关闭：rules_ignored = 0 的普通用户 ID
+        - 如果全局开关开启：只包含管理员 ID
+        """
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+
+            # 全局开关开启时，只返回管理员 ID
+            if self.get_ignore_all_user_rules():
+                rows = cursor.execute(
+                    "SELECT id FROM users WHERE role = 'admin' AND enabled = 1"
+                ).fetchall()
+                return {row[0] for row in rows}
+
+            # 全局开关关闭时，返回管理员 + 未被忽略的普通用户
+            rows = cursor.execute("""
+                SELECT id FROM users
+                WHERE enabled = 1
+                  AND (role = 'admin' OR (role != 'pending' AND COALESCE(rules_ignored, 0) = 0))
+            """).fetchall()
+            return {row[0] for row in rows}
 
     # ============ Custom Egress 方法 ============
 

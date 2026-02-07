@@ -430,7 +430,10 @@
       "port": "端口：匹配目标端口号或端口范围，如 80, 443 或 6881:6889",
       "order": "规则按顺序匹配，第一条匹配的规则生效",
       "default": "未匹配任何规则的流量使用默认出口"
-    }
+    },
+    "rulesIgnoredTitle": "您的规则未生效",
+    "rulesIgnoredGlobalDesc": "管理员已启用全局覆盖，您的路由规则当前未被应用。",
+    "rulesIgnoredUserDesc": "您的路由规则已被管理员暂时禁用。如有疑问请联系管理员。"
   },
   "ruleSets": {
     "title": "规则集",
@@ -1590,7 +1593,16 @@
     "approve": "批准",
     "reject": "拒绝",
     "userApproved": "用户已批准",
-    "userRejected": "用户已拒绝并删除"
+    "userRejected": "用户已拒绝并删除",
+    "rulesIgnoreTitle": "规则覆盖设置",
+    "rulesIgnoreDesc": "控制是否应用用户定义的路由规则",
+    "ignoreAllUserRules": "忽略所有用户规则",
+    "ignoreAllUserRulesDesc": "启用后，只有管理员规则生效，用户规则将被暂时禁用",
+    "rulesIgnored": "规则已忽略",
+    "rulesIgnoreUpdated": "规则覆盖设置已更新",
+    "rulesIgnoreUpdateFailed": "更新规则覆盖设置失败",
+    "userRulesIgnoreUpdated": "用户 \"{{name}}\" 的规则设置已更新",
+    "userRulesIgnoreUpdateFailed": "更新用户规则设置失败"
   },
   "settings": {
     "registrationTitle": "用户注册",
