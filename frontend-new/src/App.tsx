@@ -15,6 +15,8 @@ import { Loader2 } from "lucide-react";
 // Lazy load pages
 const LoginPage = lazy(() => import("@/pages/LoginPage").then(module => ({ default: module.LoginPage })));
 const SetupPage = lazy(() => import("@/pages/SetupPage").then(module => ({ default: module.SetupPage })));
+const RegisterPage = lazy(() => import("@/pages/RegisterPage").then(module => ({ default: module.RegisterPage })));
+const PendingPage = lazy(() => import("@/pages/PendingPage").then(module => ({ default: module.PendingPage })));
 const DashboardPage = lazy(() => import("@/pages/DashboardPage").then(module => ({ default: module.DashboardPage })));
 const PeersPage = lazy(() => import("@/pages/PeersPage").then(module => ({ default: module.PeersPage })));
 const EgressPage = lazy(() => import("@/pages/EgressPage"));
@@ -30,6 +32,7 @@ const TopologyPage = lazy(() => import("@/pages/TopologyPage"));
 const DomainCatalogPage = lazy(() => import("@/pages/DomainCatalogPage"));
 const IpCatalogPage = lazy(() => import("@/pages/IpCatalogPage"));
 const OutboundGroupsPage = lazy(() => import("@/pages/OutboundGroupsPage"));
+const UsersPage = lazy(() => import("@/pages/UsersPage").then(module => ({ default: module.UsersPage })));
 
 // Loading fallback
 function PageLoader() {
@@ -42,7 +45,7 @@ function PageLoader() {
 
 // Protected route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, isLoading, isSetup } = useAuth();
+  const { isAuthenticated, isLoading, isSetup, isPending } = useAuth();
   const { t } = useTranslation();
 
   if (isLoading) {
@@ -55,6 +58,11 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
   if (!isSetup) {
     return <Navigate to="/setup" replace />;
+  }
+
+  // If user is pending approval, redirect to pending page
+  if (isPending) {
+    return <Navigate to="/pending" replace />;
   }
 
   if (!isAuthenticated) {
@@ -70,6 +78,8 @@ function AppRoutes() {
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/setup" element={<SetupPage />} />
+        <Route path="/register" element={<RegisterPage />} />
+        <Route path="/pending" element={<PendingPage />} />
         <Route
           path="/"
           element={
@@ -92,6 +102,7 @@ function AppRoutes() {
           <Route path="ip-catalog" element={<IpCatalogPage />} />
           <Route path="profiles" element={<Navigate to="/egress" replace />} />
           <Route path="adblock" element={<AdBlockPage />} />
+          <Route path="users" element={<UsersPage />} />
           <Route path="pia" element={<PIAPage />} />
           <Route path="backup" element={<BackupPage />} />
         </Route>

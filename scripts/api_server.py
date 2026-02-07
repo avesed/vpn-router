@@ -17,6 +17,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+import uuid
 
 import base64
 import io
@@ -686,7 +688,11 @@ _rate_limit_lock = threading.Lock()
 # 速率限制配置
 _RATE_LIMIT_GENERAL = 300  # 一般 API: 每分钟 300 次（放宽以支持频繁操作）
 _RATE_LIMIT_LOGIN = 10  # 登录 API: 每分钟 10 次
+_RATE_LIMIT_REGISTER = 5  # 注册 API: 每分钟 5 次（更严格）
 _RATE_LIMIT_WINDOW = 60  # 时间窗口（秒）
+
+# 保留用户名（不允许注册）
+RESERVED_USERNAMES = {"admin", "root", "system", "administrator", "guest", "api", "www", "support"}
 
 
 def _get_client_ip(request: Request) -> str:
@@ -1023,13 +1029,74 @@ def _validate_tunnel_ip(ip: str, subnet: str = "10.200.200.0/24") -> bool:
 # ============ 认证相关模型 ============
 
 class SetupRequest(BaseModel):
-    """首次设置管理员密码"""
+    """首次设置管理员账户"""
+    username: str = Field(default="admin", min_length=3, max_length=32, description="Admin username")
     password: str = Field(..., min_length=8, description="Admin password (min 8 chars)")
 
 
 class LoginRequest(BaseModel):
     """登录请求"""
-    password: str = Field(..., description="Admin password")
+    username: str = Field(default="admin", description="Username")
+    password: str = Field(..., description="Password")
+
+
+class PasswordChangeRequest(BaseModel):
+    """密码修改请求"""
+    current_password: str = Field(..., description="Current password")
+    new_password: str = Field(..., min_length=8, description="New password (min 8 chars)")
+
+
+class RegisterRequest(BaseModel):
+    """用户注册请求"""
+    username: str = Field(..., min_length=3, max_length=32)
+    password: str = Field(..., min_length=8)
+    email: Optional[str] = None
+
+
+class CheckPendingRequest(BaseModel):
+    """检查待审批状态请求"""
+    username: str
+    password: str
+
+
+class RegistrationSettingsRequest(BaseModel):
+    """注册设置请求"""
+    allow_registration: Optional[bool] = None
+    default_role: Optional[str] = None  # "user" or "pending"
+
+
+class UserCreateRequest(BaseModel):
+    """创建用户请求 (仅管理员)"""
+    username: str = Field(..., min_length=3, max_length=32, description="Username")
+    password: str = Field(..., min_length=8, description="Password (min 8 chars)")
+    email: Optional[str] = Field(None, description="Email address")
+    role: str = Field("user", description="Role: 'admin' or 'user'")
+
+    @validator('role')
+    def validate_role(cls, v):
+        if v not in ('admin', 'user'):
+            raise ValueError("Role must be 'admin' or 'user'")
+        return v
+
+    @validator('username')
+    def validate_username(cls, v):
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_-]*$', v):
+            raise ValueError("Username must start with a letter and contain only letters, numbers, underscores, and hyphens")
+        return v
+
+
+class UserUpdateRequest(BaseModel):
+    """更新用户请求"""
+    password: Optional[str] = Field(None, min_length=8, description="New password")
+    email: Optional[str] = Field(None, description="Email address")
+    role: Optional[str] = Field(None, description="Role: 'admin' or 'user' (admin only)")
+    enabled: Optional[bool] = Field(None, description="Enable/disable user (admin only)")
+
+    @validator('role')
+    def validate_role(cls, v):
+        if v is not None and v not in ('admin', 'user'):
+            raise ValueError("Role must be 'admin' or 'user'")
+        return v
 
 
 class TokenResponse(BaseModel):
@@ -1740,11 +1807,60 @@ app.add_middleware(
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
+
+@dataclass
+class UserContext:
+    """用户上下文，从 JWT token 中提取"""
+    user_id: int
+    username: str
+    role: str  # "admin" or "user"
+    jti: str = ""  # Token ID for revocation
+    legacy: bool = False  # True if using old single-admin token
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+
+# Admin-only endpoint prefixes
+ADMIN_ONLY_PREFIXES = [
+    "/api/egress/",        # All egress management (except GET /api/egress)
+    "/api/pia/",           # PIA management
+    "/api/users",          # User management
+    "/api/peers",          # Peer node management
+    "/api/chains",         # Chain management
+    "/api/outbound-groups",# ECMP groups
+    "/api/backup/",        # Backup/restore
+    "/api/settings",       # System settings
+    "/api/ingress/subnet", # Subnet management
+]
+
+
+def _is_admin_only_endpoint(path: str, method: str) -> bool:
+    """检查端点是否仅限管理员访问"""
+    # GET /api/egress returns tag list for users (allowed)
+    if path == "/api/egress" and method == "GET":
+        return False
+
+    # GET /api/outbound-groups returns group list for users (allowed to use in rules)
+    if path == "/api/outbound-groups" and method == "GET":
+        return False
+
+    # Check admin-only prefixes
+    for prefix in ADMIN_ONLY_PREFIXES:
+        if path.startswith(prefix):
+            return True
+
+    return False
+
+
 # 公开端点（不需要认证）
 PUBLIC_PATHS = {
     "/api/auth/status",
     "/api/auth/setup",
     "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/check-pending",
     "/api/health",
     # NOTE: /api/peer-auth/validate 和 /api/peer-auth/exchange 端点已移除（PSK 认证已废弃）
     # 节点间连接通知端点（隧道 IP 认证）
@@ -1797,12 +1913,17 @@ def _verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode(), password_hash.encode())
 
 
-def _create_token(secret: str) -> tuple:
-    """创建 JWT token，返回 (token, expires_in_seconds)"""
+def _create_user_token(secret: str, user_id: int, username: str, role: str,
+                       token_version: int = 1) -> tuple:
+    """创建多用户 JWT token，返回 (token, expires_in_seconds)"""
     from datetime import timedelta
     expires_at = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
     payload = {
-        "sub": "admin",
+        "jti": str(uuid.uuid4()),  # Token ID for revocation
+        "sub": str(user_id),       # User ID
+        "username": username,       # Username for display
+        "role": role,               # Role for authorization
+        "token_version": token_version,  # For password change invalidation
         "exp": expires_at,
         "iat": datetime.now(timezone.utc)
     }
@@ -1811,14 +1932,66 @@ def _create_token(secret: str) -> tuple:
     return token, expires_in
 
 
+# Keep old function for backward compatibility during transition
+def _create_token(secret: str) -> tuple:
+    """创建 JWT token（旧版，兼容单管理员模式）"""
+    return _create_user_token(secret, user_id=1, username="admin", role="admin", token_version=1)
+
+
+def _verify_token_enhanced(token: str, secret: str, db) -> Optional[UserContext]:
+    """验证 JWT token 并返回用户上下文"""
+    try:
+        payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+
+        # Legacy token support (old single-admin format)
+        if payload.get("sub") == "admin" and "role" not in payload:
+            return UserContext(user_id=1, username="admin", role="admin", jti="", legacy=True)
+
+        # New multi-user token format
+        user_id = int(payload.get("sub", 0))
+        if user_id == 0:
+            return None
+
+        # Check token blacklist
+        jti = payload.get("jti", "")
+        if jti and db.is_token_revoked(jti):
+            return None
+
+        # Check token_version matches current user
+        user = db.get_user(user_id)
+        if not user:
+            return None
+
+        if not user.get("enabled"):
+            return None
+
+        # Check if token was issued before password change
+        token_version = payload.get("token_version", 1)
+        if token_version != user.get("token_version", 1):
+            return None
+
+        return UserContext(
+            user_id=user_id,
+            username=payload.get("username", user.get("username", "")),
+            role=payload.get("role", user.get("role", "user")),
+            jti=jti,
+            legacy=False
+        )
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+    except Exception:
+        return None
+
+
+# Keep old function signature for compatibility
 def _verify_token(token: str, secret: str) -> bool:
-    """验证 JWT token"""
+    """验证 JWT token（旧版兼容）"""
     try:
         jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
         return True
-    except jwt.ExpiredSignatureError:
-        return False
-    except jwt.InvalidTokenError:
+    except:
         return False
 
 
@@ -1835,13 +2008,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # API 速率限制 (H3)
         if path.startswith("/api/"):
             client_ip = _get_client_ip(request)
-            # 登录端点使用更严格的限制
-            if path == "/api/auth/login":
+            # 登录/注册端点使用更严格的限制
+            if path in {"/api/auth/login", "/api/auth/setup"}:
                 limit = _RATE_LIMIT_LOGIN
+            elif path == "/api/auth/register":
+                limit = _RATE_LIMIT_REGISTER
             else:
                 limit = _RATE_LIMIT_GENERAL
 
             if not _check_rate_limit(client_ip, limit):
+                logging.warning(f"Rate limit exceeded: ip={client_ip}, path={path}, limit={limit}")
                 return Response(
                     content='{"detail":"Too many requests, please try again later"}',
                     status_code=429,
@@ -1861,10 +2037,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not path.startswith("/api/"):
             return await call_next(request)
 
-        # 检查是否已设置密码，未设置则允许访问
+        # 检查是否已设置用户，未设置则允许访问
         try:
             db = _get_db()
-            if not db.is_admin_setup():
+            if db.get_user_count() == 0:
                 return await call_next(request)
         except Exception as e:
             # 数据库错误时拒绝访问（安全优先，fail-closed）
@@ -1888,7 +2064,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
         token = auth_header.split(" ")[1]
         secret = db.get_or_create_jwt_secret()
 
-        if not _verify_token(token, secret):
+        # Enhanced token verification with user context extraction
+        user_context = _verify_token_enhanced(token, secret, db)
+        if not user_context:
             return Response(
                 content='{"detail":"Invalid or expired token"}',
                 status_code=401,
@@ -1896,7 +2074,83 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"}
             )
 
+        # Check if account is locked
+        if db.is_account_locked(user_context.user_id):
+            return Response(
+                content='{"detail":"Account is locked. Please try again later."}',
+                status_code=401,
+                media_type="application/json"
+            )
+
+        # Check if user is pending approval
+        if user_context.role == "pending":
+            # Pending users can only access auth endpoints
+            if not path.startswith("/api/auth/"):
+                logging.debug(f"Pending user blocked: user_id={user_context.user_id}, username={user_context.username}, path={path}")
+                return Response(
+                    content='{"detail":"Account pending approval"}',
+                    status_code=403,
+                    media_type="application/json"
+                )
+
+        # Store user context in request state
+        request.state.user = user_context
+
+        # Check admin-only endpoints
+        if _is_admin_only_endpoint(path, request.method) and not user_context.is_admin:
+            return Response(
+                content='{"detail":"Admin access required"}',
+                status_code=403,
+                media_type="application/json"
+            )
+
         return await call_next(request)
+
+
+def get_user_context(request: Request) -> UserContext:
+    """从请求中获取当前用户上下文"""
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+def get_owner_filter(request: Request) -> Optional[int]:
+    """获取用于过滤的 owner_id
+
+    管理员返回 None（可以看到所有资源），普通用户返回其 user_id（只能看到自己的资源）
+    """
+    user = get_user_context(request)
+    return None if user.is_admin else user.user_id
+
+
+def get_owner_id(request: Request) -> int:
+    """获取用于资源创建的 owner_id
+
+    始终返回当前用户的 user_id，用于设置新创建资源的所有者。
+    与 get_owner_filter 不同，此函数始终返回用户 ID（即使是管理员）。
+    """
+    user = get_user_context(request)
+    return user.user_id
+
+
+def check_resource_ownership(request: Request, resource: Optional[dict], resource_name: str = "Resource") -> None:
+    """检查资源所有权
+
+    如果资源不存在或用户无权访问，抛出 404 异常（防止信息泄露）
+
+    Args:
+        request: HTTP 请求
+        resource: 资源字典（需要包含 owner_id 字段）
+        resource_name: 资源名称（用于错误消息）
+    """
+    if not resource:
+        raise HTTPException(404, f"{resource_name} not found")
+
+    user = get_user_context(request)
+    if not user.is_admin and resource.get("owner_id") != user.user_id:
+        # 返回 404 而非 403 以防止信息泄露
+        raise HTTPException(404, f"{resource_name} not found")
 
 
 # 添加认证中间件（在 CORS 之后）
@@ -3336,35 +3590,46 @@ def parse_wireguard_conf(content: str) -> Dict[str, Any]:
 
 @app.get("/api/auth/status")
 def api_auth_status():
-    """检查认证状态：是否已设置密码
+    """检查认证状态：是否已设置管理员账户
 
     此端点始终公开，用于确定显示登录页还是设置页
     """
     try:
         db = _get_db()
-        is_setup = db.is_admin_setup()
+        user_count = db.get_user_count()
+        is_setup = user_count > 0
+
+        # 获取注册设置
+        allow_registration = db.get_setting("allow_self_registration", "false").lower() == "true"
+        registration_default_role = db.get_setting("registration_default_role", "pending")
     except Exception:
         is_setup = False
+        allow_registration = False
+        registration_default_role = "pending"
 
     return {
         "is_setup": is_setup,
-        "requires_auth": True
+        "requires_auth": True,
+        "allow_registration": allow_registration,
+        "registration_default_role": registration_default_role
     }
 
 
 @app.post("/api/auth/setup")
-def api_auth_setup(request: SetupRequest):
-    """首次设置：创建管理员密码
+def api_auth_setup(http_request: Request, request: SetupRequest):
+    """初始化管理员账户（首次设置）
 
-    仅在密码未设置时可用
+    仅在没有用户时可用
     """
     db = _get_db()
 
-    if db.is_admin_setup():
-        raise HTTPException(
-            status_code=400,
-            detail="Admin password already set"
-        )
+    # 检查是否已有用户
+    if db.get_user_count() > 0:
+        raise HTTPException(status_code=400, detail="Admin already exists")
+
+    # 验证用户名格式
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]{2,31}$', request.username):
+        raise HTTPException(status_code=400, detail="Invalid username format")
 
     if len(request.password) < 8:
         raise HTTPException(
@@ -3372,56 +3637,307 @@ def api_auth_setup(request: SetupRequest):
             detail="Password must be at least 8 characters"
         )
 
+    # 创建管理员用户
     password_hash = _hash_password(request.password)
-    db.set_admin_password(password_hash)
+    user_id = db.add_user(
+        username=request.username,
+        password_hash=password_hash,
+        role="admin"
+    )
 
-    # 创建并返回 token
+    # 创建 token
     secret = db.get_or_create_jwt_secret()
-    token, expires_in = _create_token(secret)
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_id,
+        username=request.username,
+        role="admin",
+        token_version=1
+    )
+
+    # 记录审计日志
+    client_ip = _get_client_ip(http_request)
+    db.add_audit_log(
+        action="setup",
+        user_id=user_id,
+        resource_type="user",
+        resource_id=str(user_id),
+        ip_address=client_ip
+    )
 
     return {
-        "message": "Admin password set successfully",
+        "message": "Admin account created successfully",
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": expires_in
+        "expires_in": expires_in,
+        "user": {
+            "id": user_id,
+            "username": request.username,
+            "role": "admin"
+        }
     }
 
 
 @app.post("/api/auth/login")
-def api_auth_login(request: LoginRequest):
-    """登录获取 JWT token"""
+def api_auth_login(http_request: Request, request: LoginRequest):
+    """用户登录"""
     db = _get_db()
+    client_ip = _get_client_ip(http_request)
 
-    if not db.is_admin_setup():
-        raise HTTPException(
-            status_code=400,
-            detail="Admin password not set, use /api/auth/setup first"
+    # 查找用户
+    user = db.get_user_by_username(request.username)
+
+    # 防止时序攻击：即使用户不存在也执行密码验证
+    if not user:
+        bcrypt.checkpw(b"dummy_password", bcrypt.gensalt())
+        db.add_audit_log(
+            action="login_failed",
+            details='{"reason": "user_not_found"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # 检查账户是否被锁定
+    if db.is_account_locked(user["id"]):
+        db.add_audit_log(
+            action="login_failed",
+            user_id=user["id"],
+            details='{"reason": "account_locked"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Account is locked. Please try again later.")
+
+    # 检查账户是否启用
+    if not user.get("enabled"):
+        db.add_audit_log(
+            action="login_failed",
+            user_id=user["id"],
+            details='{"reason": "account_disabled"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Account is disabled")
+
+    # 验证密码
+    if not _verify_password(request.password, user["password_hash"]):
+        # 记录失败并可能锁定账户
+        failed_count = db.record_failed_login(user["id"])
+        if failed_count >= 5:
+            db.lock_account(user["id"], lock_minutes=30)
+            db.add_audit_log(
+                action="account_locked",
+                user_id=user["id"],
+                details=f'{{"failed_attempts": {failed_count}}}',
+                ip_address=client_ip
+            )
+
+        db.add_audit_log(
+            action="login_failed",
+            user_id=user["id"],
+            details=f'{{"reason": "invalid_password", "attempt": {failed_count}}}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # 检查是否为待审批用户
+    if user["role"] == "pending":
+        # 记录待审批用户登录尝试
+        db.add_audit_log(
+            action="login_pending",
+            user_id=user["id"],
+            ip_address=client_ip,
+            details=json.dumps({"username": request.username})
+        )
+        return JSONResponse(
+            status_code=200,  # 200, not 403 - login succeeded but account is pending
+            content={
+                "status": "pending",
+                "message": "Your account is pending approval",
+                "user": {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "role": "pending"
+                }
+            }
         )
 
-    password_hash = db.get_admin_password_hash()
-    if not password_hash or not _verify_password(request.password, password_hash):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid credentials"
-        )
+    # 登录成功
+    db.reset_failed_login(user["id"])
+    db.update_user(user["id"], last_login_at=datetime.now(timezone.utc).isoformat())
 
+    # 创建 token
     secret = db.get_or_create_jwt_secret()
-    token, expires_in = _create_token(secret)
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user["id"],
+        username=user["username"],
+        role=user["role"],
+        token_version=user.get("token_version", 1)
+    )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="login",
+        user_id=user["id"],
+        ip_address=client_ip
+    )
 
     return {
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": expires_in
+        "expires_in": expires_in,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"]
+        }
     }
+
+
+@app.post("/api/auth/register")
+def api_auth_register(http_request: Request, request: RegisterRequest):
+    """用户自助注册"""
+    db = _get_db()
+    client_ip = _get_client_ip(http_request)
+
+    # 检查是否启用注册
+    if db.get_setting("allow_self_registration", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Registration is disabled")
+
+    # 验证用户名格式（字母开头，只允许字母、数字、下划线、短横线）
+    if not re.match(r'^[a-zA-Z][a-zA-Z0-9_-]{2,31}$', request.username):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid username format. Must start with a letter and contain only letters, numbers, underscores, and hyphens."
+        )
+
+    # 检查保留用户名
+    if request.username.lower() in RESERVED_USERNAMES:
+        raise HTTPException(status_code=400, detail="Username is reserved")
+
+    # 密码复杂度检查
+    if not (re.search(r'[A-Z]', request.password) and
+            re.search(r'[a-z]', request.password) and
+            re.search(r'\d', request.password)):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain uppercase, lowercase, and number"
+        )
+
+    # 检查用户名唯一性
+    if db.get_user_by_username(request.username):
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # 获取默认角色
+    default_role = db.get_setting("registration_default_role", "pending")
+    if default_role not in ("user", "pending"):
+        default_role = "pending"  # 安全回退
+
+    # 创建用户
+    password_hash = _hash_password(request.password)
+    user_id = db.add_user(
+        username=request.username,
+        password_hash=password_hash,
+        email=request.email,
+        role=default_role
+    )
+
+    # 创建默认配额
+    db.set_user_quota(user_id)
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="self_register",
+        user_id=user_id,
+        ip_address=client_ip,
+        details=json.dumps({"username": request.username, "role": default_role})
+    )
+
+    # 如果是待审批状态，返回成功但不返回 token
+    if default_role == "pending":
+        logging.info(f"User registration (pending): username={request.username}, user_id={user_id}, ip={client_ip}")
+        return {
+            "status": "pending",
+            "message": "Registration successful. Please wait for admin approval.",
+            "user": {
+                "id": user_id,
+                "username": request.username,
+                "role": "pending"
+            }
+        }
+
+    # 如果直接是用户角色，创建 token 以便立即登录
+    user = db.get_user(user_id)
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_id,
+        username=request.username,
+        role="user",
+        token_version=user["token_version"]
+    )
+
+    # 更新最后登录时间
+    db.update_user(user_id, last_login_at=datetime.now(timezone.utc).isoformat())
+
+    logging.info(f"User registration (direct): username={request.username}, user_id={user_id}, ip={client_ip}")
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "user": {
+            "id": user_id,
+            "username": request.username,
+            "role": "user",
+            "email": request.email
+        }
+    }
+
+
+@app.post("/api/auth/check-pending")
+def api_check_pending_status(http_request: Request, request: CheckPendingRequest):
+    """检查待审批用户状态（无需 token）"""
+    db = _get_db()
+    user = db.get_user_by_username(request.username)
+
+    # 防止时序攻击：即使用户不存在也执行密码验证
+    if not user:
+        _verify_password("dummy", "$2b$12$dummy.hash.for.timing.attack.prevention")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not _verify_password(request.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not user["enabled"]:
+        raise HTTPException(status_code=401, detail="Account disabled")
+
+    if user["role"] == "pending":
+        return {"status": "pending", "message": "Account still pending approval"}
+    elif user["role"] in ("user", "admin"):
+        return {"status": "approved", "message": "Account approved! Please login."}
+    else:
+        raise HTTPException(status_code=400, detail="Invalid account state")
 
 
 @app.post("/api/auth/refresh")
 def api_auth_refresh(request: Request):
-    """刷新 JWT token（延长会话）"""
-    # 验证当前 token（由中间件完成）
+    """刷新 JWT token"""
+    user = get_user_context(request)
     db = _get_db()
+
+    # 获取最新用户信息
+    user_data = db.get_user(user.user_id)
+    if not user_data or not user_data.get("enabled"):
+        raise HTTPException(status_code=401, detail="User not found or disabled")
+
+    # 创建新 token
     secret = db.get_or_create_jwt_secret()
-    token, expires_in = _create_token(secret)
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_data["id"],
+        username=user_data["username"],
+        role=user_data["role"],
+        token_version=user_data.get("token_version", 1)
+    )
 
     return {
         "access_token": token,
@@ -3431,12 +3947,513 @@ def api_auth_refresh(request: Request):
 
 
 @app.get("/api/auth/me")
-def api_auth_me():
-    """获取当前用户信息（验证 token 有效性）"""
+def api_auth_me(request: Request):
+    """获取当前用户信息"""
+    user = get_user_context(request)
+    db = _get_db()
+
+    # 获取完整用户信息
+    user_data = db.get_user(user.user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
     return {
-        "username": "admin",
-        "role": "admin"
+        "id": user_data["id"],
+        "username": user_data["username"],
+        "email": user_data.get("email"),
+        "role": user_data["role"],
+        "created_at": user_data.get("created_at"),
+        "last_login_at": user_data.get("last_login_at")
     }
+
+
+@app.post("/api/auth/password")
+def api_auth_change_password(request: Request, payload: PasswordChangeRequest):
+    """修改当前用户密码"""
+    user = get_user_context(request)
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    # 获取用户信息
+    user_data = db.get_user(user.user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 验证当前密码
+    if not _verify_password(payload.current_password, user_data["password_hash"]):
+        db.add_audit_log(
+            action="password_change_failed",
+            user_id=user.user_id,
+            details='{"reason": "invalid_current_password"}',
+            ip_address=client_ip
+        )
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # 更新密码并递增 token_version 使旧 token 失效
+    new_hash = _hash_password(payload.new_password)
+    db.update_user(user.user_id, password_hash=new_hash)
+    db.increment_token_version(user.user_id)
+
+    # 获取更新后的用户信息
+    user_data = db.get_user(user.user_id)
+
+    # 创建新 token
+    secret = db.get_or_create_jwt_secret()
+    token, expires_in = _create_user_token(
+        secret=secret,
+        user_id=user_data["id"],
+        username=user_data["username"],
+        role=user_data["role"],
+        token_version=user_data.get("token_version", 1)
+    )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="password_change",
+        user_id=user.user_id,
+        ip_address=client_ip
+    )
+
+    return {
+        "message": "Password changed successfully",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in
+    }
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request):
+    """注销当前会话（撤销 token）"""
+    from datetime import timedelta
+    user = get_user_context(request)
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    # 如果 token 有 jti，将其加入黑名单
+    if user.jti:
+        # 计算 token 过期时间（当前时间 + JWT_EXPIRY_HOURS）
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)).isoformat()
+        db.add_revoked_token(
+            jti=user.jti,
+            user_id=user.user_id,
+            expires_at=expires_at,
+            reason="logout"
+        )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="logout",
+        user_id=user.user_id,
+        ip_address=client_ip
+    )
+
+    return {"message": "Logged out successfully"}
+
+
+# ============ 用户管理端点 (仅管理员) ============
+
+def _user_to_dict(user: dict, include_sensitive: bool = False) -> dict:
+    """转换用户记录为 API 响应格式"""
+    result = {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user.get("email"),
+        "role": user["role"],
+        "enabled": bool(user.get("enabled", 1)),
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+        "last_login_at": user.get("last_login_at"),
+        "created_by": user.get("created_by"),
+    }
+    if include_sensitive:
+        result["failed_login_count"] = user.get("failed_login_count", 0)
+        result["locked_until"] = user.get("locked_until")
+    return result
+
+
+@app.get("/api/users")
+def api_list_users(request: Request):
+    """列出所有用户 (仅管理员)"""
+    user = get_user_context(request)
+    if not user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    users = db.get_users()
+
+    return {
+        "users": [_user_to_dict(u, include_sensitive=True) for u in users],
+        "total": len(users),
+    }
+
+
+@app.post("/api/users")
+def api_create_user(request: Request, payload: UserCreateRequest):
+    """创建新用户 (仅管理员)"""
+    user = get_user_context(request)
+    if not user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    # 检查用户名是否已存在
+    if db.get_user_by_username(payload.username):
+        raise HTTPException(400, f"Username '{payload.username}' already exists")
+
+    # 哈希密码
+    password_hash = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+
+    # 创建用户
+    try:
+        new_user_id = db.add_user(
+            username=payload.username,
+            password_hash=password_hash,
+            email=payload.email,
+            role=payload.role,
+            created_by=user.user_id,
+        )
+    except Exception as e:
+        logging.error(f"Failed to create user: {e}")
+        raise HTTPException(500, "Failed to create user")
+
+    # 创建默认配额
+    db.cursor.execute(
+        "INSERT OR IGNORE INTO user_quotas (user_id) VALUES (?)",
+        (new_user_id,)
+    )
+    db.conn.commit()
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="create_user",
+        user_id=user.user_id,
+        resource_type="user",
+        resource_id=str(new_user_id),
+        details=json.dumps({"username": payload.username, "role": payload.role}),
+        ip_address=client_ip,
+    )
+
+    new_user = db.get_user(new_user_id)
+    return {
+        "message": "User created successfully",
+        "user": _user_to_dict(new_user),
+    }
+
+
+# ============ 待审批用户管理端点 ============
+# NOTE: 这些端点必须在 /api/users/{user_id} 之前定义，否则 FastAPI 会将 "pending" 当作 user_id 参数
+
+@app.get("/api/users/pending")
+def api_get_pending_users(request: Request):
+    """获取待审批用户列表（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    pending_users = db.get_users_by_role("pending")
+    return {"users": pending_users}
+
+
+@app.get("/api/users/pending/count")
+def api_get_pending_count(request: Request):
+    """获取待审批用户数量（用于徽章显示）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    count = db.count_users_by_role("pending")
+    return {"count": count}
+
+
+@app.get("/api/users/{user_id}")
+def api_get_user(request: Request, user_id: int):
+    """获取用户详情 (仅管理员)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    target_user = db.get_user(user_id)
+
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    return {"user": _user_to_dict(target_user, include_sensitive=True)}
+
+
+@app.put("/api/users/{user_id}")
+def api_update_user(request: Request, user_id: int, payload: UserUpdateRequest):
+    """更新用户信息 (管理员可更新所有字段，普通用户只能改自己的密码)"""
+    current_user = get_user_context(request)
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    target_user = db.get_user(user_id)
+
+    # 安全检查：用户不存在或无权限时返回 404（防止信息泄露）
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 非管理员只能更新自己
+    if not current_user.is_admin and current_user.user_id != user_id:
+        raise HTTPException(404, "User not found")
+
+    # 非管理员只能更新密码
+    if not current_user.is_admin:
+        if payload.role is not None or payload.enabled is not None or payload.email is not None:
+            raise HTTPException(403, "You can only change your own password")
+
+    updates = {}
+    audit_details = {}
+
+    # 密码更新
+    if payload.password is not None:
+        updates["password_hash"] = bcrypt.hashpw(payload.password.encode(), bcrypt.gensalt()).decode()
+        audit_details["password_changed"] = True
+        # 密码更改后递增 token_version 以使旧 token 失效
+        db.increment_token_version(user_id)
+
+    # 邮箱更新 (仅管理员或本人)
+    if payload.email is not None and current_user.is_admin:
+        updates["email"] = payload.email
+        audit_details["email"] = payload.email
+
+    # 角色更新 (仅管理员)
+    if payload.role is not None and current_user.is_admin:
+        # 防止降级最后一个管理员
+        if target_user["role"] == "admin" and payload.role == "user":
+            admin_count = db.count_users_by_role("admin")
+            if admin_count <= 1:
+                raise HTTPException(400, "Cannot demote the last admin")
+        updates["role"] = payload.role
+        audit_details["role"] = payload.role
+
+    # 启用/禁用 (仅管理员)
+    if payload.enabled is not None and current_user.is_admin:
+        # 防止禁用自己
+        if user_id == current_user.user_id and not payload.enabled:
+            raise HTTPException(400, "Cannot disable your own account")
+        updates["enabled"] = 1 if payload.enabled else 0
+        audit_details["enabled"] = payload.enabled
+
+    if not updates:
+        raise HTTPException(400, "No valid fields to update")
+
+    # 执行更新
+    if not db.update_user(user_id, **updates):
+        raise HTTPException(500, "Failed to update user")
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="update_user",
+        user_id=current_user.user_id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details=json.dumps(audit_details),
+        ip_address=client_ip,
+    )
+
+    updated_user = db.get_user(user_id)
+    return {
+        "message": "User updated successfully",
+        "user": _user_to_dict(updated_user),
+    }
+
+
+@app.delete("/api/users/{user_id}")
+def api_delete_user(request: Request, user_id: int):
+    """删除用户 (仅管理员，级联删除所有用户资源)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    target_user = db.get_user(user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 防止删除自己
+    if user_id == current_user.user_id:
+        raise HTTPException(400, "Cannot delete your own account")
+
+    # 防止删除最后一个管理员
+    if target_user["role"] == "admin":
+        admin_count = db.count_users_by_role("admin")
+        if admin_count <= 1:
+            raise HTTPException(400, "Cannot delete the last admin")
+
+    username = target_user["username"]
+
+    # 级联删除用户及其所有资源
+    if not db.delete_user(user_id):
+        raise HTTPException(500, "Failed to delete user")
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="delete_user",
+        user_id=current_user.user_id,
+        resource_type="user",
+        resource_id=str(user_id),
+        details=json.dumps({"username": username, "role": target_user["role"]}),
+        ip_address=client_ip,
+    )
+
+    return {"message": f"User '{username}' deleted successfully"}
+
+
+@app.get("/api/users/{user_id}/quotas")
+def api_get_user_quotas(request: Request, user_id: int):
+    """获取用户配额 (仅管理员)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    target_user = db.get_user(user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 获取配额
+    quotas = db.get_user_quota(user_id)
+    if not quotas:
+        # 返回默认配额
+        quotas = {
+            "max_peers": 10,
+            "max_rules": 100,
+            "max_rule_sets": 10,
+        }
+
+    return {"quotas": quotas}
+
+
+@app.put("/api/users/{user_id}/quotas")
+def api_update_user_quotas(request: Request, user_id: int, quotas: dict = Body(...)):
+    """更新用户配额 (仅管理员)"""
+    current_user = get_user_context(request)
+    if not current_user.is_admin:
+        raise HTTPException(403, "Admin access required")
+
+    db = _get_db()
+    client_ip = _get_client_ip(request)
+
+    target_user = db.get_user(user_id)
+    if not target_user:
+        raise HTTPException(404, "User not found")
+
+    # 验证配额字段
+    valid_fields = {"max_peers", "max_rules", "max_rule_sets"}
+    updates = {k: v for k, v in quotas.items() if k in valid_fields and isinstance(v, int) and v >= 0}
+
+    if not updates:
+        raise HTTPException(400, "No valid quota fields to update")
+
+    # 获取当前配额，合并更新
+    current = db.get_user_quota(user_id) or {"max_peers": 10, "max_rules": 100, "max_rule_sets": 10}
+    merged = {**current, **updates}
+
+    # 更新配额
+    db.set_user_quota(
+        user_id,
+        max_peers=merged.get("max_peers", 10),
+        max_rules=merged.get("max_rules", 100),
+        max_rule_sets=merged.get("max_rule_sets", 10),
+    )
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="update_user_quotas",
+        user_id=current_user.user_id,
+        resource_type="user_quotas",
+        resource_id=str(user_id),
+        details=json.dumps(updates),
+        ip_address=client_ip,
+    )
+
+    return {"message": "Quotas updated successfully", "quotas": updates}
+
+
+# ============ 用户审批操作端点 ============
+
+@app.post("/api/users/{user_id}/approve")
+def api_approve_user(user_id: int, request: Request):
+    """审批通过待审批用户（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+
+    # 使用原子更新防止竞态条件
+    with db.user._get_conn() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET role = 'user', updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND role = 'pending'
+        """, (user_id,))
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=400, detail="User not found or not pending")
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="approve_user",
+        user_id=user_id,
+        details=json.dumps({"approved_by": user_ctx.user_id})
+    )
+
+    user = db.get_user(user_id)
+    logging.info(f"User approved: user_id={user_id}, username={user['username']}, approved_by={user_ctx.user_id}")
+    return {"message": "User approved", "user": {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user.get("email"),
+        "role": user["role"],
+        "enabled": user["enabled"],
+        "created_at": user["created_at"]
+    }}
+
+
+@app.post("/api/users/{user_id}/reject")
+def api_reject_user(user_id: int, request: Request):
+    """拒绝待审批用户（删除）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    user = db.get_user(user_id)
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user["role"] != "pending":
+        raise HTTPException(status_code=400, detail="User is not pending")
+
+    username = user["username"]
+
+    # 删除待审批用户（级联清理相关记录）
+    db.delete_user(user_id)
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="reject_user",
+        user_id=None,  # User is deleted
+        details=json.dumps({
+            "rejected_by": user_ctx.user_id,
+            "username": username,
+            "original_user_id": user_id
+        })
+    )
+
+    logging.info(f"User rejected: user_id={user_id}, username={username}, rejected_by={user_ctx.user_id}")
+    return {"message": "User rejected and removed"}
 
 
 # ============ 系统状态端点 ============
@@ -4078,8 +5095,13 @@ def api_delete_profile(tag: str):
 # ============ Route Rules Management APIs ============
 
 @app.get("/api/rules")
-def api_get_rules():
-    """获取路由规则配置（从数据库读取）"""
+def api_get_rules(request: Request):
+    """获取路由规则配置（从数据库读取）
+
+    普通用户只能看到自己创建的规则，管理员可以看到所有规则。
+    """
+    owner_filter = get_owner_filter(request)
+
     # 从配置中提取可用出口
     generated_config = Path("/etc/sing-box/sing-box.generated.json")
     config_path = generated_config if generated_config.exists() else CONFIG_PATH
@@ -4161,10 +5183,10 @@ def api_get_rules():
                     if tag and tag != "wg-server" and tag not in available_outbounds:
                         available_outbounds.append(tag)
 
-    # 从数据库读取自定义规则
+    # 从数据库读取自定义规则（按用户过滤）
     if HAS_DATABASE and USER_DB_PATH.exists():
         db = _get_db()
-        db_rules = db.get_routing_rules(enabled_only=True)
+        db_rules = db.get_routing_rules(enabled_only=True, owner_id=owner_filter)
 
         # 按 tag 分组规则（使用数据库中的实际 tag）
         rules_by_tag = {}
@@ -4217,11 +5239,12 @@ def api_get_rules():
         rules = custom.get("rules", [])
 
     # Add rule_sets summary (return all, including disabled, so UI can manage them)
+    # 按用户过滤规则集
     rule_sets_summary = []
     if HAS_DATABASE and USER_DB_PATH.exists():
         try:
             db = _get_db()
-            rule_sets = db.get_rule_sets(enabled_only=False)
+            rule_sets = db.get_rule_sets(enabled_only=False, owner_id=owner_filter)
             for rs in rule_sets:
                 rule_sets_summary.append({
                     "id": rs["id"],
@@ -4244,18 +5267,23 @@ def api_get_rules():
 
 
 @app.put("/api/rules")
-def api_update_rules(payload: RouteRulesUpdateRequest):
+def api_update_rules(request: Request, payload: RouteRulesUpdateRequest):
     """更新路由规则（数据库版本，使用批量操作优化性能）
 
     Returns structured response with sync_success/sync_error fields.
     Raises HTTP 502 on sync failure instead of silently succeeding.
+    普通用户只能更新自己的规则，管理员可以更新所有规则。
     """
+    # Get current user's owner_id for resource filtering
+    owner_id = get_owner_id(request)
+
     if HAS_DATABASE and USER_DB_PATH.exists():
         # 使用数据库存储（方案 B）
         db = _get_db()
 
-        # 批量删除所有规则，但保留 __adblock__ 前缀的规则（由广告拦截页面管理）
-        deleted_count = db.delete_all_routing_rules(preserve_adblock=True)
+        # 批量删除规则，但保留 __adblock__ 前缀的规则（由广告拦截页面管理）
+        # 普通用户只删除自己的规则，管理员删除所有规则
+        deleted_count = db.delete_all_routing_rules(preserve_adblock=True, owner_id=owner_id)
 
         # 收集所有规则用于批量插入
         # 格式: (rule_type, target, outbound, tag, priority)
@@ -4299,7 +5327,7 @@ def api_update_rules(payload: RouteRulesUpdateRequest):
                     batch_rules.append(("port_range", port_range, rule.outbound, tag, 0))
 
         # 批量插入所有规则（使用 executemany）
-        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
+        added_count = db.add_routing_rules_batch(batch_rules, owner_id=owner_id) if batch_rules else 0
 
         # 保存默认出口到数据库
         db.set_setting("default_outbound", payload.default_outbound)
@@ -4581,14 +5609,19 @@ def api_get_default_outbound():
 
 
 @app.post("/api/rules")
-def api_add_rule(payload: CustomRuleRequest):
+def api_add_rule(request: Request, payload: CustomRuleRequest):
     """添加路由规则（别名，等同于 POST /api/rules/custom）"""
-    return api_add_custom_rule(payload)
+    return api_add_custom_rule(request, payload)
 
 
 @app.post("/api/rules/custom")
-def api_add_custom_rule(payload: CustomRuleRequest):
-    """添加自定义路由规则（数据库版本，使用批量操作优化性能）"""
+def api_add_custom_rule(request: Request, payload: CustomRuleRequest):
+    """添加自定义路由规则（数据库版本，使用批量操作优化性能）
+
+    规则归属于创建它的用户。
+    """
+    user = get_user_context(request)
+
     # 验证至少有一种匹配规则
     has_domain_rules = payload.domains or payload.domain_keywords or payload.ip_cidrs
     has_protocol_rules = payload.protocols or payload.network or payload.ports or payload.port_ranges
@@ -4658,8 +5691,8 @@ def api_add_custom_rule(payload: CustomRuleRequest):
             for port_range in payload.port_ranges:
                 batch_rules.append(("port_range", port_range, payload.outbound, payload.tag, 0))
 
-        # 批量插入所有规则
-        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
+        # 批量插入所有规则（包含 owner_id）
+        added_count = db.add_routing_rules_batch(batch_rules, owner_id=user.user_id) if batch_rules else 0
 
         # Sync rules to rust-router via IPC with proper error handling
         db_message = f"自定义规则 '{payload.tag}' 已添加到数据库（{added_count} 条）"
@@ -4788,13 +5821,17 @@ def api_delete_custom_rule_by_tag(tag: str):
 
 
 @app.put("/api/rules/custom/by-tag/{tag}")
-def api_update_custom_rule_by_tag(tag: str, payload: CustomRuleRequest):
+def api_update_custom_rule_by_tag(request: Request, tag: str, payload: CustomRuleRequest):
     """更新自定义路由规则（通过 tag）
-    
+
     删除所有现有规则后重新添加新规则，保持相同的 tag。
+    普通用户只能更新自己的规则。
     """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
+
+    # Get current user's owner_id
+    owner_id = get_owner_id(request)
 
     # 验证至少有一种匹配规则
     has_domain_rules = payload.domains or payload.domain_keywords or payload.ip_cidrs
@@ -4824,9 +5861,9 @@ def api_update_custom_rule_by_tag(tag: str, payload: CustomRuleRequest):
     db = _get_db()
 
     try:
-        # 先删除现有规则
-        deleted_count = db.delete_routing_rules_by_tag(tag)
-        
+        # 先删除现有规则（只删除当前用户的规则）
+        deleted_count = db.delete_routing_rules_by_tag(tag, owner_id=owner_id)
+
         if deleted_count == 0:
             raise HTTPException(status_code=404, detail=f"未找到标签为 '{tag}' 的规则")
 
@@ -4871,7 +5908,7 @@ def api_update_custom_rule_by_tag(tag: str, payload: CustomRuleRequest):
                 batch_rules.append(("port_range", port_range, payload.outbound, rule_tag, 0))
 
         # 批量插入所有新规则
-        added_count = db.add_routing_rules_batch(batch_rules) if batch_rules else 0
+        added_count = db.add_routing_rules_batch(batch_rules, owner_id=owner_id) if batch_rules else 0
 
         # Sync rules to rust-router via IPC with proper error handling
         db_message = f"规则 '{tag}' 已更新（删除 {deleted_count} 条，添加 {added_count} 条）"
@@ -5125,13 +6162,17 @@ def api_list_wireguard_peers():
 # ============ Rule Sets API ============
 
 @app.get("/api/rule-sets")
-def api_get_rule_sets():
-    """获取所有规则集"""
+def api_get_rule_sets(request: Request):
+    """获取所有规则集
+
+    普通用户只能看到自己创建的规则集，管理员可以看到所有规则集。
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
+    owner_filter = get_owner_filter(request)
     db = _get_db()
-    rule_sets = db.get_rule_sets(enabled_only=False)
+    rule_sets = db.get_rule_sets(enabled_only=False, owner_id=owner_filter)
 
     # Add loader status if available
     result = []
@@ -5146,6 +6187,7 @@ def api_get_rule_sets():
             "status": rs["status"],
             "enabled": rs["enabled"],
             "priority": rs.get("priority", 0),
+            "owner_id": rs.get("owner_id"),
             "created_at": rs.get("created_at"),
             "updated_at": rs.get("updated_at"),
         }
@@ -5228,13 +6270,16 @@ def api_get_rule_set(set_id: str):
 
 
 @app.post("/api/rule-sets")
-async def api_create_rule_set(payload: RuleSetCreateRequest):
+async def api_create_rule_set(request: Request, payload: RuleSetCreateRequest):
     """创建规则集（大规则集使用二进制存储）"""
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="数据库不可用")
 
     if not HAS_RULE_BINARY:
         raise HTTPException(status_code=503, detail="规则二进制存储模块不可用")
+
+    # Get current user's owner_id for resource ownership
+    owner_id = get_owner_id(request)
 
     # Generate ID if not provided
     if payload.id:
@@ -5285,7 +6330,8 @@ async def api_create_rule_set(payload: RuleSetCreateRequest):
         rule_count=len(payload.rules),
         file_path=file_name,
         checksum=checksum,
-        priority=payload.priority
+        priority=payload.priority,
+        owner_id=owner_id
     )
 
     if not success:
@@ -6215,8 +7261,11 @@ def _sync_userspace_peer_from_codes(
 
 
 @app.get("/api/ingress")
-def api_get_ingress():
-    """获取入口 WireGuard 配置和状态"""
+def api_get_ingress(request: Request):
+    """获取入口 WireGuard 配置和状态
+
+    多用户隔离：普通用户只能看到自己创建的 peers，管理员可以看到所有 peers
+    """
     config = load_ingress_config()
     interface = config.get("interface", {})
 
@@ -6228,9 +7277,29 @@ def api_get_ingress():
     handshakes = {k: v.get("last_handshake", 0) for k, v in rust_router_status.items()}
     transfers = {k: {"rx": v.get("rx_bytes", 0), "tx": v.get("tx_bytes", 0)} for k, v in rust_router_status.items()}
 
+    # 获取用户上下文和数据库连接
+    db = _get_db() if HAS_DATABASE and USER_DB_PATH.exists() else None
+    owner_filter = get_owner_filter(request)
+
+    # 构建 peer 名称到 owner_id 的映射（用于多用户过滤）
+    peer_ownership = {}
+    if db and owner_filter is not None:
+        # 只有普通用户需要过滤，获取数据库中的 peer 所有权信息
+        db_peers = db.get_wireguard_peers(enabled_only=False)
+        peer_ownership = {p["name"]: p.get("owner_id") for p in db_peers}
+
     # 丰富 peer 信息
     peers = []
     for peer in config.get("peers", []):
+        peer_name = peer.get("name", "unknown")
+
+        # 多用户过滤：普通用户只能看到自己的 peers
+        if owner_filter is not None:
+            peer_owner = peer_ownership.get(peer_name)
+            # 如果 peer 不在数据库中或不属于当前用户，跳过
+            if peer_owner is None or peer_owner != owner_filter:
+                continue
+
         pubkey = peer.get("public_key", "")
         last_handshake = handshakes.get(pubkey, 0)
         transfer = transfers.get(pubkey, {"rx": 0, "tx": 0})
@@ -6241,7 +7310,7 @@ def api_get_ingress():
         is_online = last_handshake > 0 and (now - last_handshake) < _PEER_ONLINE_GRACE_PERIOD
 
         peers.append({
-            "name": peer.get("name", "unknown"),
+            "name": peer_name,
             "public_key": pubkey,
             "allowed_ips": peer.get("allowed_ips", []),
             "last_handshake": last_handshake,
@@ -6254,7 +7323,6 @@ def api_get_ingress():
         })
 
     # 获取本地节点标识
-    db = _get_db() if HAS_DATABASE and USER_DB_PATH.exists() else None
     local_node_tag = _get_local_node_tag(db) if db else None
 
     return {
@@ -6321,8 +7389,12 @@ def calculate_allowed_ips_excluding_subnet(exclude_subnet: str, vpn_subnet: str 
 
 
 @app.post("/api/ingress/peers")
-def api_add_ingress_peer(payload: IngressPeerCreateRequest):
-    """添加新的入口 peer（客户端）到数据库"""
+def api_add_ingress_peer(request: Request, payload: IngressPeerCreateRequest):
+    """添加新的入口 peer（客户端）到数据库
+
+    peer 归属于创建它的用户。
+    """
+    user = get_user_context(request)
     config = load_ingress_config()
 
     # 检查名称是否已存在
@@ -6356,7 +7428,8 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
             allowed_ips=f"{peer_ip}/32",
             allow_lan=payload.allow_lan,
             lan_subnet=lan_subnet,
-            default_outbound=payload.default_outbound
+            default_outbound=payload.default_outbound,
+            owner_id=user.user_id
         )
     else:
         # 降级到配置文件
@@ -6390,8 +7463,11 @@ def api_add_ingress_peer(payload: IngressPeerCreateRequest):
 
 
 @app.delete("/api/ingress/peers/{peer_name}")
-def api_delete_ingress_peer(peer_name: str):
-    """删除入口 peer（从数据库）"""
+def api_delete_ingress_peer(request: Request, peer_name: str):
+    """删除入口 peer（从数据库）
+
+    普通用户只能删除自己创建的 peer。
+    """
     config = load_ingress_config()
 
     # 查找 peer
@@ -6403,6 +7479,9 @@ def api_delete_ingress_peer(peer_name: str):
 
     if not peer_to_delete:
         raise HTTPException(status_code=404, detail=f"客户端 '{peer_name}' 不存在")
+
+    # 检查所有权
+    check_resource_ownership(request, peer_to_delete, "客户端")
 
     # 从数据库删除
     if HAS_DATABASE and USER_DB_PATH.exists():
@@ -6425,16 +7504,19 @@ def api_delete_ingress_peer(peer_name: str):
 
 
 @app.put("/api/ingress/peers/{peer_name}")
-def api_update_ingress_peer(peer_name: str, payload: IngressPeerUpdateRequest):
-    """更新入口 peer 配置（如默认出口）"""
+def api_update_ingress_peer(request: Request, peer_name: str, payload: IngressPeerUpdateRequest):
+    """更新入口 peer 配置（如默认出口）
+
+    普通用户只能更新自己创建的 peer。
+    """
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=500, detail="数据库不可用")
 
     db = _get_db()
     peer = db.get_wireguard_peer_by_name(peer_name)
 
-    if not peer:
-        raise HTTPException(status_code=404, detail=f"客户端 '{peer_name}' 不存在")
+    # 检查所有权
+    check_resource_ownership(request, peer, "客户端")
 
     # 准备更新参数
     update_kwargs = {}
@@ -6481,8 +7563,17 @@ def api_update_ingress_peer(peer_name: str, payload: IngressPeerUpdateRequest):
 
 
 @app.get("/api/ingress/peers/{peer_name}/config", response_class=PlainTextResponse)
-def api_get_peer_config(peer_name: str, private_key: Optional[str] = None):
-    """获取客户端 WireGuard 配置文件"""
+def api_get_peer_config(request: Request, peer_name: str, private_key: Optional[str] = None):
+    """获取客户端 WireGuard 配置文件
+
+    多用户隔离：普通用户只能获取自己创建的 peer 的配置文件
+    """
+    # 多用户权限检查
+    if HAS_DATABASE and USER_DB_PATH.exists():
+        db = _get_db()
+        db_peer = db.get_wireguard_peer_by_name(peer_name)
+        check_resource_ownership(request, db_peer, "客户端")
+
     config = load_ingress_config()
     interface = config.get("interface", {})
 
@@ -6589,13 +7680,16 @@ PersistentKeepalive = 25
 
 
 @app.get("/api/ingress/peers/{peer_name}/qrcode")
-def api_get_peer_qrcode(peer_name: str, private_key: Optional[str] = None):
-    """获取客户端配置的 QR 码（PNG 图片）"""
+def api_get_peer_qrcode(request: Request, peer_name: str, private_key: Optional[str] = None):
+    """获取客户端配置的 QR 码（PNG 图片）
+
+    多用户隔离：普通用户只能获取自己创建的 peer 的 QR 码
+    """
     if not HAS_QRCODE:
         raise HTTPException(status_code=501, detail="QR 码功能不可用，请安装 qrcode 库")
 
-    # 获取配置内容
-    config_text = api_get_peer_config(peer_name, private_key)
+    # 获取配置内容（内部会进行权限检查）
+    config_text = api_get_peer_config(request, peer_name, private_key)
 
     # 生成 QR 码
     qr = qrcode.QRCode(version=1, box_size=10, border=4)
@@ -7048,6 +8142,50 @@ def api_update_settings(payload: SettingsUpdateRequest):
 
     save_settings(settings)
     return {"message": "设置已保存", "settings": settings}
+
+
+@app.get("/api/settings/registration")
+def api_get_registration_settings(request: Request):
+    """获取注册设置（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+    return {
+        "allow_registration": db.get_setting("allow_self_registration", "false").lower() == "true",
+        "default_role": db.get_setting("registration_default_role", "pending")
+    }
+
+
+@app.put("/api/settings/registration")
+def api_update_registration_settings(request: Request, settings: RegistrationSettingsRequest):
+    """更新注册设置（管理员）"""
+    user_ctx = get_user_context(request)
+    if not user_ctx.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    db = _get_db()
+
+    if settings.allow_registration is not None:
+        db.set_setting("allow_self_registration", "true" if settings.allow_registration else "false")
+
+    if settings.default_role is not None:
+        if settings.default_role not in ("user", "pending"):
+            raise HTTPException(status_code=400, detail="Invalid role. Must be 'user' or 'pending'")
+        db.set_setting("registration_default_role", settings.default_role)
+
+    # 记录审计日志
+    db.add_audit_log(
+        action="update_registration_settings",
+        user_id=user_ctx.user_id,
+        details=json.dumps({
+            "allow_registration": settings.allow_registration,
+            "default_role": settings.default_role
+        })
+    )
+
+    return api_get_registration_settings(request)
 
 
 @app.post("/api/settings/announce-port-change")
@@ -9014,12 +10152,16 @@ def api_trigger_group_health_check(tag: str):
 # ============ V2Ray Inbound APIs ============
 
 @app.get("/api/ingress/v2ray")
-def api_get_v2ray_inbound():
-    """获取 V2Ray 入口配置和用户列表"""
+def api_get_v2ray_inbound(request: Request):
+    """获取 V2Ray 入口配置和用户列表
+
+    多用户隔离：普通用户只能看到自己创建的 V2Ray 用户，管理员可以看到所有用户
+    """
     db = _get_db()
+    owner_filter = get_owner_filter(request)
 
     config = db.get_v2ray_inbound_config()
-    users = db.get_v2ray_users(enabled_only=False)
+    users = db.get_v2ray_users(enabled_only=False, owner_id=owner_filter)
 
     # 隐藏用户密码
     for user in users:
@@ -9254,10 +10396,14 @@ def api_get_v2ray_users_online():
 
 
 @app.post("/api/ingress/v2ray/users")
-def api_add_v2ray_user(payload: V2RayUserCreateRequest):
-    """添加 V2Ray 用户"""
+def api_add_v2ray_user(request: Request, payload: V2RayUserCreateRequest):
+    """添加 V2Ray 用户
+
+    用户归属于创建它的账户。
+    """
     import uuid as uuid_module
 
+    user = get_user_context(request)
     db = _get_db()
 
     # 检查用户名是否已存在
@@ -9275,6 +10421,7 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
         password=None,  # VLESS doesn't use password
         alter_id=None,  # VLESS doesn't use alter_id
         flow=payload.flow,
+        owner_id=user.user_id,
     )
 
     # 重新渲染配置并重载
@@ -9294,14 +10441,16 @@ def api_add_v2ray_user(payload: V2RayUserCreateRequest):
 
 
 @app.put("/api/ingress/v2ray/users/{user_id}")
-def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
-    """更新 V2Ray 用户"""
+def api_update_v2ray_user(request: Request, user_id: int, payload: V2RayUserUpdateRequest):
+    """更新 V2Ray 用户
+
+    普通用户只能更新自己创建的用户。
+    """
     db = _get_db()
 
-    # 检查用户是否存在
-    user = db.get_v2ray_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+    # 检查用户是否存在并检查所有权
+    v2ray_user = db.get_v2ray_user(user_id)
+    check_resource_ownership(request, v2ray_user, "V2Ray user")
 
     # 构建更新字段
     updates = {}
@@ -9326,14 +10475,16 @@ def api_update_v2ray_user(user_id: int, payload: V2RayUserUpdateRequest):
 
 
 @app.delete("/api/ingress/v2ray/users/{user_id}")
-def api_delete_v2ray_user(user_id: int):
-    """删除 V2Ray 用户"""
+def api_delete_v2ray_user(request: Request, user_id: int):
+    """删除 V2Ray 用户
+
+    普通用户只能删除自己创建的用户。
+    """
     db = _get_db()
 
-    # 检查用户是否存在
-    user = db.get_v2ray_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail=f"User ID {user_id} not found")
+    # 检查用户是否存在并检查所有权
+    v2ray_user = db.get_v2ray_user(user_id)
+    check_resource_ownership(request, v2ray_user, "V2Ray user")
 
     # 删除用户
     db.delete_v2ray_user(user_id)
@@ -11317,10 +12468,14 @@ class AdblockRuleSetCreateRequest(BaseModel):
 
 
 @app.get("/api/adblock/rules")
-def api_list_adblock_rules(category: Optional[str] = None):
-    """列出所有广告拦截规则集"""
+def api_list_adblock_rules(request: Request, category: Optional[str] = None):
+    """列出广告拦截规则集
+
+    普通用户只能看到自己的规则集，管理员可以看到所有规则集。
+    """
     db = _get_db()
-    rules = db.get_remote_rule_sets(enabled_only=False, category=category)
+    owner_filter = get_owner_filter(request)
+    rules = db.get_remote_rule_sets(enabled_only=False, category=category, owner_id=owner_filter)
 
     # 添加加载状态
     for rule in rules:
@@ -11348,11 +12503,20 @@ def api_list_adblock_rules(category: Optional[str] = None):
 
 
 @app.get("/api/adblock/rules/{tag}")
-def api_get_adblock_rule(tag: str):
-    """获取单个广告拦截规则集"""
+def api_get_adblock_rule(request: Request, tag: str):
+    """获取单个广告拦截规则集
+
+    普通用户只能查看自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
+
     rule = db.get_remote_rule_set(tag)
     if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能查看自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     # 添加加载状态
@@ -11365,13 +12529,21 @@ def api_get_adblock_rule(tag: str):
 
 
 @app.put("/api/adblock/rules/{tag}/toggle")
-def api_toggle_adblock_rule(tag: str):
-    """切换广告拦截规则集启用状态"""
+def api_toggle_adblock_rule(request: Request, tag: str):
+    """切换广告拦截规则集启用状态
+
+    普通用户只能切换自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
     rule = db.get_remote_rule_set(tag)
     if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     # 切换状态
@@ -11386,12 +12558,21 @@ def api_toggle_adblock_rule(tag: str):
 
 
 @app.put("/api/adblock/rules/{tag}")
-def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
-    """更新广告拦截规则集"""
+def api_update_adblock_rule(request: Request, tag: str, payload: AdblockRuleSetUpdateRequest):
+    """更新广告拦截规则集
+
+    普通用户只能更新自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
-    if not db.get_remote_rule_set(tag):
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     # 更新
@@ -11403,9 +12584,13 @@ def api_update_adblock_rule(tag: str, payload: AdblockRuleSetUpdateRequest):
 
 
 @app.post("/api/adblock/rules")
-def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
-    """创建新的广告拦截规则集"""
+def api_create_adblock_rule(request: Request, payload: AdblockRuleSetCreateRequest):
+    """创建新的广告拦截规则集
+
+    新创建的规则集归属于当前用户。
+    """
     db = _get_db()
+    owner_id = get_owner_id(request)
 
     # 检查 tag 是否已存在
     if db.get_remote_rule_set(payload.tag):
@@ -11421,19 +12606,29 @@ def api_create_adblock_rule(payload: AdblockRuleSetCreateRequest):
         outbound=payload.outbound,
         category=payload.category,
         region=payload.region,
-        priority=payload.priority
+        priority=payload.priority,
+        owner_id=owner_id
     )
 
     return {"message": f"规则集 '{payload.tag}' 已创建", "tag": payload.tag}
 
 
 @app.delete("/api/adblock/rules/{tag}")
-async def api_delete_adblock_rule(tag: str):
-    """删除广告拦截规则集"""
+async def api_delete_adblock_rule(request: Request, tag: str):
+    """删除广告拦截规则集
+
+    普通用户只能删除自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
-    if not db.get_remote_rule_set(tag):
+    rule = db.get_remote_rule_set(tag)
+    if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     # 先从 rule_loader 卸载（如果已加载）
@@ -11444,9 +12639,8 @@ async def api_delete_adblock_rule(tag: str):
             logging.warning(f"Failed to unload remote rule set {tag}: {e}")
 
     # 删除二进制文件（如果存在）
-    rule_set = db.get_remote_rule_set(tag)
-    if rule_set and rule_set.get("file_path"):
-        file_path = RULES_DIR / rule_set["file_path"]
+    if rule.get("file_path"):
+        file_path = RULES_DIR / rule["file_path"]
         try:
             file_path.unlink(missing_ok=True)
         except Exception as e:
@@ -11459,13 +12653,21 @@ async def api_delete_adblock_rule(tag: str):
 
 
 @app.post("/api/adblock/rules/{tag}/reload")
-async def api_reload_adblock_rule(tag: str):
-    """重新下载并加载单个广告拦截规则集（使用 msgpack 二进制格式）"""
+async def api_reload_adblock_rule(request: Request, tag: str):
+    """重新下载并加载单个广告拦截规则集（使用 msgpack 二进制格式）
+
+    普通用户只能重新加载自己的规则集。
+    """
     db = _get_db()
+    user = get_user_context(request)
 
     # 检查规则是否存在
     rule = db.get_remote_rule_set(tag)
     if not rule:
+        raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
+
+    # 检查权限：非管理员只能操作自己的资源
+    if not user.is_admin and rule.get("owner_id") != user.user_id:
         raise HTTPException(status_code=404, detail=f"规则集 '{tag}' 不存在")
 
     if not _rule_loader:
@@ -12251,11 +13453,14 @@ def is_adblock_list(list_id: str) -> bool:
 
 
 @app.post("/api/domain-catalog/quick-rule")
-def api_create_quick_rule(payload: QuickRuleRequest):
+def api_create_quick_rule(request: Request, payload: QuickRuleRequest):
     """从域名列表快速创建路由规则"""
     # 使用数据库存储
     if not HAS_DATABASE or not USER_DB_PATH.exists():
         raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Get current user's owner_id for resource ownership
+    owner_id = get_owner_id(request)
 
     db = _get_db()
 
@@ -12291,7 +13496,7 @@ def api_create_quick_rule(payload: QuickRuleRequest):
     # 批量添加域名到数据库（使用 executemany 一次性插入）
     # 格式: (rule_type, target, outbound, tag, priority)
     rules = [("domain", domain, payload.outbound, tag, 0) for domain in all_domains]
-    added_count = db.add_routing_rules_batch(rules)
+    added_count = db.add_routing_rules_batch(rules, owner_id=owner_id)
 
     return {
         "message": f"快速规则已创建，添加了 {added_count} 个域名到数据库",
@@ -12529,16 +13734,19 @@ class IpQuickRuleRequest(BaseModel):
     country_codes: List[str] = Field(..., description="国家代码列表")
     outbound: str = Field(..., description="出口线路 tag")
     tag: Optional[str] = Field(None, description="规则集标签")
+    name: Optional[str] = Field(None, description="规则集名称（可选，不提供则自动生成）")
     ipv4_only: bool = Field(True, description="仅 IPv4")
 
 
 @app.post("/api/ip-catalog/quick-rule")
-def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
+def api_create_ip_quick_rule(request: Request, payload: IpQuickRuleRequest):
     """从 IP 列表快速创建路由规则
 
     当 CIDR 数量 >= RULE_SET_THRESHOLD 时，使用二进制规则集存储以提高性能。
     否则使用传统数据库行存储。
     """
+    # Get current user's owner_id for resource ownership
+    owner_id = get_owner_id(request)
     all_cidrs = []
 
     for cc in payload.country_codes:
@@ -12601,8 +13809,8 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
             logging.error(f"Failed to write binary file for rule set {set_id}: {e}")
             raise HTTPException(status_code=500, detail=f"写入规则文件失败: {e}") from e
 
-        # Add to database
-        name = f"GeoIP {' '.join(cc.upper() for cc in payload.country_codes[:5])}"
+        # Add to database - use user-provided name or auto-generate
+        name = payload.name if payload.name else f"GeoIP {' '.join(cc.upper() for cc in payload.country_codes[:5])}"
         success = db.add_rule_set(
             set_id=set_id,
             name=name,
@@ -12611,7 +13819,8 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
             rule_count=len(all_cidrs),
             file_path=file_name,
             checksum=checksum,
-            priority=0
+            priority=0,
+            owner_id=owner_id
         )
 
         if not success:
@@ -12647,7 +13856,7 @@ def api_create_ip_quick_rule(payload: IpQuickRuleRequest):
     # 批量添加 IP CIDR 到数据库（使用 executemany 一次性插入）
     # 格式: (rule_type, target, outbound, tag, priority)
     rules = [("ip", cidr, payload.outbound, tag, 0) for cidr in all_cidrs]
-    added_count = db.add_routing_rules_batch(rules)
+    added_count = db.add_routing_rules_batch(rules, owner_id=owner_id)
 
     return {
         "message": f"IP 快速规则已创建，添加了 {added_count} 个 CIDR 到数据库",

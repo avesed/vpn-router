@@ -23,15 +23,17 @@ import {
 } from "lucide-react";
 import { usePeerNodes, useConnectPeerNode, useDisconnectPeerNode } from "../../api/hooks/usePeerNodes";
 import { useAllEgress, useTestEgress } from "../../api/hooks/useEgress";
+import { useAuth } from "../../providers/AuthProvider";
 
 export function CommandPalette() {
   const { open, setOpen } = useCommandPalette();
   const navigate = useNavigate();
   const { t } = useTranslation();
+  const { isAdmin } = useAuth();
   const [query, setQuery] = useState("");
 
-  // Data hooks
-  const { data: peerData } = usePeerNodes();
+  // Data hooks - peer nodes are admin-only
+  const { data: peerData } = usePeerNodes({ enabled: isAdmin });
   const { data: egressData } = useAllEgress();
   
   // Mutations

@@ -8,6 +8,7 @@ import { useAllEgress } from "../../api/hooks/useEgress";
 import { useDomainCatalog } from "../../api/hooks/useDomainCatalog";
 import { usePeerNodes } from "../../api/hooks/usePeerNodes";
 import { useNodeChains } from "../../api/hooks/useChains";
+import { useAuth } from "../../providers/AuthProvider";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "../ui/dialog";
 import { Button } from "../ui/button";
 import { Form, FormField, FormItem, FormLabel, FormControl, FormMessage } from "../ui/form";
@@ -32,16 +33,19 @@ interface RuleEditDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   rule?: RouteRule; // Optional rule for edit mode
+  availableOutbounds?: string[]; // Optional - if provided, used as base outbound list
 }
 
-export function RuleEditDialog({ open, onOpenChange, rule }: RuleEditDialogProps) {
+export function RuleEditDialog({ open, onOpenChange, rule, availableOutbounds: providedOutbounds }: RuleEditDialogProps) {
   const { t } = useTranslation();
+  const { isAdmin } = useAuth();
   const addRule = useAddCustomRule();
   const updateRule = useUpdateCustomRule();
   const { data: allEgress } = useAllEgress();
   const { data: domainCatalog } = useDomainCatalog();
-  const { data: peerNodes } = usePeerNodes();
-  const { data: nodeChains } = useNodeChains();
+  // Peer nodes and chains are admin-only features
+  const { data: peerNodes } = usePeerNodes({ enabled: isAdmin });
+  const { data: nodeChains } = useNodeChains({ enabled: isAdmin });
   const [selectedCatalogLists, setSelectedCatalogLists] = useState<string[]>([]);
 
   const isEditMode = !!rule;
@@ -140,25 +144,37 @@ export function RuleEditDialog({ open, onOpenChange, rule }: RuleEditDialogProps
     }
   };
 
-  // Combine all egress options: VPN providers, peer nodes, and multi-hop chains
-  const availableOutbounds = [
-    // VPN egress options
-    ...(allEgress?.pia.map((e) => e.tag) || []),
-    ...(allEgress?.custom.map((e) => e.tag) || []),
-    ...(allEgress?.direct.map((e) => e.tag) || []),
-    ...(allEgress?.warp || []).map((e) => e.tag),
-    ...(allEgress?.openvpn.map((e) => e.tag) || []),
-    ...(allEgress?.v2ray.map((e) => e.tag) || []),
-    // Peer nodes (only connected peers can be used as outbound)
-    // Use direct tag - sing-box uses the peer tag directly
-    ...(peerNodes?.nodes
-      ?.filter((p) => p.tunnel_status === "connected" && p.enabled)
-      .map((p) => p.tag) || []),
-    // Multi-hop chains (only active chains)
-    ...(nodeChains?.chains
-      ?.filter((c) => c.chain_state === "active" && c.enabled)
-      .map((c) => c.tag) || []),
-  ];
+  // Combine all egress options: use provided list or construct from API data
+  // providedOutbounds comes from /api/rules which includes all egress types + outbound groups
+  const availableOutbounds = providedOutbounds && providedOutbounds.length > 0
+    ? [
+        ...providedOutbounds,
+        // Admin-only: add peer nodes (only connected peers)
+        ...(isAdmin && peerNodes?.nodes
+          ?.filter((p) => p.tunnel_status === "connected" && p.enabled)
+          .map((p) => p.tag) || []),
+        // Admin-only: add multi-hop chains (only active chains)
+        ...(isAdmin && nodeChains?.chains
+          ?.filter((c) => c.chain_state === "active" && c.enabled)
+          .map((c) => c.tag) || []),
+      ]
+    : [
+        // Fallback: construct from individual API data
+        ...(allEgress?.pia.map((e) => e.tag) || []),
+        ...(allEgress?.custom.map((e) => e.tag) || []),
+        ...(allEgress?.direct.map((e) => e.tag) || []),
+        ...(allEgress?.warp || []).map((e) => e.tag),
+        ...(allEgress?.openvpn.map((e) => e.tag) || []),
+        ...(allEgress?.v2ray.map((e) => e.tag) || []),
+        // Peer nodes (only connected peers, admin-only)
+        ...(isAdmin && peerNodes?.nodes
+          ?.filter((p) => p.tunnel_status === "connected" && p.enabled)
+          .map((p) => p.tag) || []),
+        // Multi-hop chains (only active chains, admin-only)
+        ...(isAdmin && nodeChains?.chains
+          ?.filter((c) => c.chain_state === "active" && c.enabled)
+          .map((c) => c.tag) || []),
+      ];
 
   // Get domain catalog categories
   const catalogCategories = domainCatalog?.categories ? Object.entries(domainCatalog.categories) : [];

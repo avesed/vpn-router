@@ -11,9 +11,10 @@ import { RuleEditDialog } from "./RuleEditDialog";
 
 interface RulesListProps {
   rules: RouteRule[];
+  availableOutbounds?: string[];
 }
 
-export function RulesList({ rules }: RulesListProps) {
+export function RulesList({ rules, availableOutbounds }: RulesListProps) {
   const { t } = useTranslation();
   const deleteRule = useDeleteCustomRule();
   const [editingRule, setEditingRule] = useState<RouteRule | null>(null);
@@ -117,6 +118,7 @@ export function RulesList({ rules }: RulesListProps) {
         open={!!editingRule}
         onOpenChange={(open) => !open && setEditingRule(null)}
         rule={editingRule || undefined}
+        availableOutbounds={availableOutbounds}
       />
     </>
   );

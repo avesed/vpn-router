@@ -83,6 +83,23 @@ import type {
   ShadowsocksInboundStatus,
   ShadowsocksInboundConfigUpdateRequest,
   ShadowsocksInboundConfigResponse,
+  // User Management types
+  User,
+  UserCreateRequest,
+  UserUpdateRequest,
+  UserListResponse,
+  UserQuota,
+  UserQuotaUpdateRequest,
+  // Registration types
+  AuthStatusResponse,
+  RegisterRequest,
+  RegisterResponse,
+  CheckPendingRequest,
+  CheckPendingResponse,
+  RegistrationSettings,
+  PendingUsersResponse,
+  PendingCountResponse,
+  ApproveRejectResponse,
   // Outbound Groups types
   OutboundGroup,
   OutboundGroupCreateRequest,
@@ -198,7 +215,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       // 4xx 客户端错误 - 尝试解析 FastAPI 的 JSON 错误响应
       try {
         const errorJson = JSON.parse(text);
-        safeMessage = errorJson.detail || errorJson.message || text?.slice(0, 200);
+        // FastAPI 验证错误返回 detail 数组，需要特殊处理
+        if (typeof errorJson.detail === 'string') {
+          safeMessage = errorJson.detail;
+        } else if (Array.isArray(errorJson.detail)) {
+          // FastAPI validation error format: [{loc: [...], msg: "...", type: "..."}]
+          safeMessage = errorJson.detail.map((e: { msg?: string }) => e.msg || 'Validation error').join(', ');
+        } else if (errorJson.message) {
+          safeMessage = errorJson.message;
+        } else {
+          safeMessage = text?.slice(0, 200) || `Request failed: ${response.status}`;
+        }
       } catch {
         // 非 JSON 响应，使用原始文本
         safeMessage = text?.slice(0, 200) || `Request failed: ${response.status}`;
@@ -348,7 +375,7 @@ export const api = {
     }),
 
   // Rule Sets (binary rule storage for large rule sets)
-  updateRuleSet: (id: string, updates: { enabled?: boolean; outbound?: string }) =>
+  updateRuleSet: (id: string, updates: { name?: string; enabled?: boolean; outbound?: string }) =>
     request<{ message: string; rule_set: RuleSet }>(`/rule-sets/${encodeURIComponent(id)}`, {
       method: "PUT",
       body: updates
@@ -439,7 +466,7 @@ export const api = {
   createIpQuickRule: (countryCodes: string[], outbound: string, tag?: string, ipv4Only = true) =>
     request<IpQuickRuleResponse>("/ip-catalog/quick-rule", {
       method: "POST",
-      body: { country_codes: countryCodes, outbound, tag, ipv4_only: ipv4Only }
+      body: { country_codes: countryCodes, outbound, tag, name: tag, ipv4_only: ipv4Only }
     }),
 
   // Custom Rules
@@ -971,5 +998,83 @@ export const api = {
     }>("/ingress/shadowsocks/outbound", {
       method: "PUT",
       body: { outbound }
+    }),
+
+  // ============ User Management ============
+  getUsers: () => request<UserListResponse>("/users"),
+
+  getUser: (id: number) =>
+    request<{ user: User }>(`/users/${id}`),
+
+  createUser: (data: UserCreateRequest) =>
+    request<{ message: string; user: User }>("/users", {
+      method: "POST",
+      body: data
+    }),
+
+  updateUser: (id: number, data: UserUpdateRequest) =>
+    request<{ message: string; user: User }>(`/users/${id}`, {
+      method: "PUT",
+      body: data
+    }),
+
+  deleteUser: (id: number) =>
+    request<{ message: string }>(`/users/${id}`, {
+      method: "DELETE"
+    }),
+
+  getUserQuota: (id: number) =>
+    request<{ quota: UserQuota }>(`/users/${id}/quotas`),
+
+  updateUserQuota: (id: number, data: UserQuotaUpdateRequest) =>
+    request<{ message: string; quota: UserQuota }>(`/users/${id}/quotas`, {
+      method: "PUT",
+      body: data
+    }),
+
+  // ============ Authentication & Registration ============
+
+  // Auth status (public endpoint)
+  getAuthStatus: () => request<AuthStatusResponse>("/auth/status"),
+
+  // Register (public when enabled)
+  register: (data: RegisterRequest) =>
+    request<RegisterResponse>("/auth/register", {
+      method: "POST",
+      body: data
+    }),
+
+  // Check pending status (public, for pending users)
+  checkPendingStatus: (data: CheckPendingRequest) =>
+    request<CheckPendingResponse>("/auth/check-pending", {
+      method: "POST",
+      body: data
+    }),
+
+  // Registration settings (admin only)
+  getRegistrationSettings: () =>
+    request<RegistrationSettings>("/settings/registration"),
+
+  updateRegistrationSettings: (data: Partial<RegistrationSettings>) =>
+    request<RegistrationSettings>("/settings/registration", {
+      method: "PUT",
+      body: data
+    }),
+
+  // Pending users management (admin only)
+  getPendingUsers: () =>
+    request<PendingUsersResponse>("/users/pending"),
+
+  getPendingCount: () =>
+    request<PendingCountResponse>("/users/pending/count"),
+
+  approveUser: (userId: number) =>
+    request<ApproveRejectResponse>(`/users/${userId}/approve`, {
+      method: "POST"
+    }),
+
+  rejectUser: (userId: number) =>
+    request<ApproveRejectResponse>(`/users/${userId}/reject`, {
+      method: "POST"
     }),
 };

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useIngressConfig } from "@/api/hooks/useIngress";
+import { useAuth } from "@/providers/AuthProvider";
 import { IngressSettings } from "@/components/ingress/IngressSettings";
 import { ClientTable } from "@/components/ingress/ClientTable";
 import { AddClientDialog } from "@/components/ingress/AddClientDialog";
@@ -12,6 +13,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 
 export default function IngressPage() {
   const { t } = useTranslation();
+  const { isAdmin } = useAuth();
   const { data: ingressData, isLoading } = useIngressConfig();
   const [isAddClientOpen, setIsAddClientOpen] = useState(false);
   const [configClientName, setConfigClientName] = useState<string | null>(null);
@@ -43,7 +45,7 @@ export default function IngressPage() {
       <Tabs defaultValue="clients" className="space-y-4">
         <TabsList>
           <TabsTrigger value="clients">{t("common.clients", "Clients")}</TabsTrigger>
-          <TabsTrigger value="settings">{t("ingress.serverSettings")}</TabsTrigger>
+          {isAdmin && <TabsTrigger value="settings">{t("ingress.serverSettings")}</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="clients" className="space-y-4">
@@ -60,9 +62,11 @@ export default function IngressPage() {
           </Card>
         </TabsContent>
 
-        <TabsContent value="settings">
-          <IngressSettings />
-        </TabsContent>
+        {isAdmin && (
+          <TabsContent value="settings">
+            <IngressSettings />
+          </TabsContent>
+        )}
       </Tabs>
 
       <AddClientDialog 

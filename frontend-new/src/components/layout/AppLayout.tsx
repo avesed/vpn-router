@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import {
   LayoutDashboard,
   Users,
+  UsersRound,
   Server,
   ServerCog,
   Link2,
@@ -59,12 +60,14 @@ interface NavItem {
   labelKey: string;
   path: string;
   icon: React.ComponentType<{ className?: string }>;
+  adminOnly?: boolean;
 }
 
 interface NavGroup {
   labelKey: string;
   icon: React.ComponentType<{ className?: string }>;
   items: NavItem[];
+  adminOnly?: boolean;
 }
 
 const standaloneItems: NavItem[] = [
@@ -78,18 +81,18 @@ const navGroups: NavGroup[] = [
     items: [
       { labelKey: "nav.ingressClient", path: "/ingress", icon: Users },
       { labelKey: "nav.v2rayIngress", path: "/ingress-v2ray", icon: Server },
-      { labelKey: "nav.ssIngress", path: "/ingress-shadowsocks", icon: Shield },
-      { labelKey: "nav.peerNodes", path: "/peers", icon: ServerCog },
-      { labelKey: "nav.nodeChains", path: "/chains", icon: Link2 },
-      { labelKey: "nav.topology", path: "/topology", icon: Map },
+      { labelKey: "nav.ssIngress", path: "/ingress-shadowsocks", icon: Shield, adminOnly: true },
+      { labelKey: "nav.peerNodes", path: "/peers", icon: ServerCog, adminOnly: true },
+      { labelKey: "nav.nodeChains", path: "/chains", icon: Link2, adminOnly: true },
+      { labelKey: "nav.topology", path: "/topology", icon: Map, adminOnly: true },
     ],
   },
   {
     labelKey: "nav.egress",
     icon: ArrowRightFromLine,
     items: [
-      { labelKey: "nav.egressLines", path: "/egress", icon: Server },
-      { labelKey: "nav.loadBalance", path: "/groups", icon: Scale },
+      { labelKey: "nav.egressLines", path: "/egress", icon: Server, adminOnly: true },
+      { labelKey: "nav.loadBalance", path: "/groups", icon: Scale, adminOnly: true },
       { labelKey: "nav.routeRules", path: "/rules", icon: Sliders },
       { labelKey: "nav.ruleCatalog", path: "/domain-catalog", icon: Layers },
       { labelKey: "nav.adblock", path: "/adblock", icon: ShieldAlert },
@@ -98,7 +101,9 @@ const navGroups: NavGroup[] = [
   {
     labelKey: "nav.system",
     icon: Settings,
+    adminOnly: true,
     items: [
+      { labelKey: "nav.users", path: "/users", icon: UsersRound },
       { labelKey: "nav.piaLogin", path: "/pia", icon: Key },
       { labelKey: "nav.backup", path: "/backup", icon: CloudUpload },
     ],
@@ -115,8 +120,17 @@ function AppSidebar() {
   const { t } = useTranslation();
   const location = useLocation();
   const navigate = useNavigate();
-  const { logout } = useAuth();
+  const { logout, isAdmin } = useAuth();
   const currentPath = location.pathname;
+
+  // Filter nav groups and items based on user role
+  const filteredNavGroups = navGroups
+    .filter((group) => !group.adminOnly || isAdmin)
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !item.adminOnly || isAdmin),
+    }))
+    .filter((group) => group.items.length > 0);
 
   const handleLogout = () => {
     logout();
@@ -166,7 +180,7 @@ function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
 
-        {navGroups.map((group) => {
+        {filteredNavGroups.map((group) => {
           const GroupIcon = group.icon;
           const hasActiveItem = group.items.some((item) =>
             isPathActive(currentPath, item.path)

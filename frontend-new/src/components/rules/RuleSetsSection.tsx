@@ -33,6 +33,7 @@ import { Button } from "../ui/button";
 import { Badge } from "../ui/badge";
 import { Switch } from "../ui/switch";
 import { Label } from "../ui/label";
+import { Input } from "../ui/input";
 import {
   ChevronDown,
   ChevronRight,
@@ -58,6 +59,7 @@ export function RuleSetsSection({ ruleSets, availableOutbounds }: RuleSetsSectio
   const { t } = useTranslation();
   const [isOpen, setIsOpen] = useState(ruleSets.length > 0);
   const [editingRuleSet, setEditingRuleSet] = useState<RuleSet | null>(null);
+  const [newName, setNewName] = useState<string>("");
   const [newOutbound, setNewOutbound] = useState<string>("");
   const updateRuleSet = useUpdateRuleSet();
   const deleteRuleSet = useDeleteRuleSet();
@@ -95,17 +97,29 @@ export function RuleSetsSection({ ruleSets, availableOutbounds }: RuleSetsSectio
 
   const handleEdit = (ruleSet: RuleSet) => {
     setEditingRuleSet(ruleSet);
+    setNewName(ruleSet.name);
     setNewOutbound(ruleSet.outbound);
   };
 
   const handleSaveEdit = () => {
     if (!editingRuleSet || !newOutbound) return;
 
+    // Only include name if it changed
+    const updates: { id: string; name?: string; outbound?: string } = {
+      id: editingRuleSet.id,
+    };
+    if (newName !== editingRuleSet.name) {
+      updates.name = newName;
+    }
+    if (newOutbound !== editingRuleSet.outbound) {
+      updates.outbound = newOutbound;
+    }
+
     toast.promise(
-      updateRuleSet.mutateAsync({ id: editingRuleSet.id, outbound: newOutbound }),
+      updateRuleSet.mutateAsync(updates),
       {
         loading: t("common.saving"),
-        success: t("ruleSets.outboundChanged", { id: editingRuleSet.id, outbound: newOutbound }),
+        success: t("ruleSets.updated", { id: editingRuleSet.id }),
         error: t("common.saveFailed"),
       }
     );
@@ -195,6 +209,7 @@ export function RuleSetsSection({ ruleSets, availableOutbounds }: RuleSetsSectio
                 <TableRow>
                   <TableHead className="w-12">{t("common.enabled")}</TableHead>
                   <TableHead>ID</TableHead>
+                  <TableHead>{t("common.name")}</TableHead>
                   <TableHead>{t("common.type")}</TableHead>
                   <TableHead className="text-right">
                     {t("ruleSets.ruleCount")}
@@ -215,6 +230,7 @@ export function RuleSetsSection({ ruleSets, availableOutbounds }: RuleSetsSectio
                       />
                     </TableCell>
                     <TableCell className="font-medium">{ruleSet.id}</TableCell>
+                    <TableCell className="text-muted-foreground">{ruleSet.name}</TableCell>
                     <TableCell>{getTypeBadge(ruleSet.rule_type)}</TableCell>
                     <TableCell className="text-right font-mono">
                       {formatCount(ruleSet.count)}
@@ -278,6 +294,19 @@ export function RuleSetsSection({ ruleSets, availableOutbounds }: RuleSetsSectio
 
           <div className="grid gap-4 py-4">
             <div className="grid grid-cols-4 items-center gap-4">
+              <Label htmlFor="name" className="text-right">
+                {t("common.name")}
+              </Label>
+              <Input
+                id="name"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                className="col-span-3"
+                placeholder={t("ruleSets.namePlaceholder")}
+              />
+            </div>
+
+            <div className="grid grid-cols-4 items-center gap-4">
               <Label htmlFor="outbound" className="text-right">
                 {t("rules.outbound")}
               </Label>
@@ -311,7 +340,7 @@ export function RuleSetsSection({ ruleSets, availableOutbounds }: RuleSetsSectio
             </Button>
             <Button
               onClick={handleSaveEdit}
-              disabled={updateRuleSet.isPending || newOutbound === editingRuleSet?.outbound}
+              disabled={updateRuleSet.isPending || (newName === editingRuleSet?.name && newOutbound === editingRuleSet?.outbound)}
             >
               {t("common.save")}
             </Button>

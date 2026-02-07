@@ -41,10 +41,10 @@ export default function RulesPage() {
 
       <div className="space-y-4">
         <h2 className="text-xl font-semibold tracking-tight">{t("rules.title")}</h2>
-        <RulesList rules={rules} />
+        <RulesList rules={rules} availableOutbounds={availableOutbounds} />
       </div>
 
-      <RuleEditDialog open={showAddDialog} onOpenChange={setShowAddDialog} />
+      <RuleEditDialog open={showAddDialog} onOpenChange={setShowAddDialog} availableOutbounds={availableOutbounds} />
     </div>
   );
 }

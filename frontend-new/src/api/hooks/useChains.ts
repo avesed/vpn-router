@@ -10,10 +10,11 @@ export const chainKeys = {
 };
 
 // Hooks
-export function useNodeChains() {
+export function useNodeChains(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: chainKeys.all,
     queryFn: api.getNodeChains,
+    enabled: options?.enabled !== false, // Default to true, can be disabled
   });
 }
 

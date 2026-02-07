@@ -1617,4 +1617,132 @@ export interface RouteRulesWithSetsResponse {
   available_outbounds: string[];
 }
 
+// ============ User Management Types ============
+
+export type UserRole = "admin" | "user" | "pending";
+
+export interface User {
+  id: number;
+  username: string;
+  email?: string;
+  role: UserRole;
+  enabled: boolean;
+  created_at?: string;
+  last_login_at?: string;
+  created_by?: number;
+}
+
+export interface UserQuota {
+  user_id: number;
+  max_peers: number;
+  max_rules: number;
+  max_rule_sets: number;
+}
+
+export interface UserCreateRequest {
+  username: string;
+  password: string;
+  email?: string;
+  role?: UserRole;
+}
+
+export interface UserUpdateRequest {
+  password?: string;
+  email?: string;
+  role?: UserRole;
+  enabled?: boolean;
+}
+
+export interface UserQuotaUpdateRequest {
+  max_peers?: number;
+  max_rules?: number;
+  max_rule_sets?: number;
+}
+
+export interface UserListResponse {
+  users: User[];
+}
+
+export interface UserResponse {
+  user: User;
+}
+
+export interface UserQuotaResponse {
+  quota: UserQuota;
+}
+
+// ============ Registration Types ============
+
+// Auth status response includes registration settings
+export interface AuthStatusResponse {
+  is_setup: boolean;
+  requires_auth: boolean;
+  allow_registration: boolean;
+  registration_default_role: "user" | "pending";
+}
+
+// Registration request
+export interface RegisterRequest {
+  username: string;
+  password: string;
+  email?: string;
+}
+
+// Registration response (can be success with token or pending)
+export interface RegisterResponse {
+  // If direct user (role = user)
+  access_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  user?: User;
+  // If pending (role = pending)
+  status?: "pending";
+  message?: string;
+}
+
+// Login response (can include pending status)
+export interface LoginResponse {
+  // Normal login
+  access_token?: string;
+  token_type?: string;
+  expires_in?: number;
+  user?: User;
+  // Pending login
+  status?: "pending";
+  message?: string;
+}
+
+// Check pending status request/response
+export interface CheckPendingRequest {
+  username: string;
+  password: string;
+}
+
+export interface CheckPendingResponse {
+  status: "pending" | "approved";
+  message: string;
+}
+
+// Registration settings (admin only)
+export interface RegistrationSettings {
+  allow_registration: boolean;
+  default_role: "user" | "pending";
+}
+
+// Pending user list response
+export interface PendingUsersResponse {
+  users: User[];
+}
+
+// Pending count response
+export interface PendingCountResponse {
+  count: number;
+}
+
+// Approve/reject response
+export interface ApproveRejectResponse {
+  message: string;
+  user?: User;
+}
+
 // Updated types

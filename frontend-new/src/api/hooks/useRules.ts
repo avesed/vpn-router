@@ -83,8 +83,8 @@ export function useDeleteCustomRule() {
 export function useUpdateRuleSet() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, enabled, outbound }: { id: string; enabled?: boolean; outbound?: string }) =>
-      api.updateRuleSet(id, { enabled, outbound }),
+    mutationFn: ({ id, name, enabled, outbound }: { id: string; name?: string; enabled?: boolean; outbound?: string }) =>
+      api.updateRuleSet(id, { name, enabled, outbound }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ruleKeys.all });
     },

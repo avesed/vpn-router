@@ -11,10 +11,11 @@ import type {
 } from "../../types";
 import { toast } from "sonner";
 
-export function usePeerNodes() {
+export function usePeerNodes(options?: { enabled?: boolean }) {
   return useQuery<{ nodes: PeerNode[] }>({
     queryKey: ["peers"],
     queryFn: api.getPeerNodes,
+    enabled: options?.enabled !== false, // Default to true, can be disabled
   });
 }
 

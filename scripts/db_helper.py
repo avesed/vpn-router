@@ -386,6 +386,9 @@ class UserDatabase:
                 timeout=30.0
             )
             self._apply_encryption(conn)
+            # [MU-001] 启用外键约束 - 必须在每个连接上设置（SQLite 默认禁用）
+            # 这对于 ON DELETE CASCADE（如删除用户时级联删除其资源）至关重要
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
             logger.debug(f"Created new database connection for thread {threading.current_thread().name}")
@@ -456,41 +459,57 @@ class UserDatabase:
 
     # ============ 路由规则管理 ============
 
-    def get_routing_rules(self, enabled_only: bool = True) -> List[Dict]:
-        """获取路由规则"""
+    def get_routing_rules(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取路由规则
+
+        Args:
+            enabled_only: 只返回启用的规则
+            owner_id: 如果指定，只返回该用户的规则；如果为 None，返回所有规则
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute("""
-                    SELECT id, rule_type, target, outbound, tag, priority, enabled, created_at, updated_at
-                    FROM routing_rules
-                    WHERE enabled = 1
-                    ORDER BY priority DESC, id ASC
-                """).fetchall()
-            else:
-                rows = cursor.execute("""
-                    SELECT id, rule_type, target, outbound, tag, priority, enabled, created_at, updated_at
-                    FROM routing_rules
-                    ORDER BY priority DESC, id ASC
-                """).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT id, rule_type, target, outbound, tag, priority, enabled, owner_id, created_at, updated_at
+                FROM routing_rules
+                {where_clause}
+                ORDER BY priority DESC, id ASC
+            """, params).fetchall()
             return [dict(row) for row in rows]
 
-    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0, tag: Optional[str] = None) -> int:
-        """添加路由规则"""
+    def add_routing_rule(self, rule_type: str, target: str, outbound: str,
+                        priority: int = 0, tag: Optional[str] = None,
+                        owner_id: Optional[int] = None) -> int:
+        """添加路由规则
+
+        Args:
+            owner_id: 规则所有者 ID，如果为 None 则插入 NULL（系统规则或旧数据兼容）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO routing_rules (rule_type, target, outbound, tag, priority)
-                VALUES (?, ?, ?, ?, ?)
-            """, (rule_type, target, outbound, tag, priority))
+                INSERT INTO routing_rules (rule_type, target, outbound, tag, priority, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (rule_type, target, outbound, tag, priority, owner_id))
             conn.commit()
             return cursor.lastrowid
 
-    def add_routing_rules_batch(self, rules: List[tuple]) -> int:
+    def add_routing_rules_batch(self, rules: List[tuple], owner_id: Optional[int] = None) -> int:
         """批量添加路由规则（使用事务确保原子性）
 
         Args:
             rules: [(rule_type, target, outbound, tag, priority), ...]
+            owner_id: 规则所有者 ID，如果为 None 则插入 NULL（允许无所有者规则）
 
         Returns:
             成功插入的数量
@@ -500,12 +519,15 @@ class UserDatabase:
         """
         if not rules:
             return 0
+        # 为每条规则添加 owner_id（None 会被转为 SQL NULL，不触发 FK 检查）
+        rules_with_owner = [(r[0], r[1], r[2], r[3], r[4], owner_id) for r in rules]
+
         # M4 修复: 使用事务确保批量操作的原子性
         with self._transaction() as (conn, cursor):
             cursor.executemany("""
-                INSERT OR IGNORE INTO routing_rules (rule_type, target, outbound, tag, priority)
-                VALUES (?, ?, ?, ?, ?)
-            """, rules)
+                INSERT OR IGNORE INTO routing_rules (rule_type, target, outbound, tag, priority, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, rules_with_owner)
             return cursor.rowcount
 
     def update_routing_rule(
@@ -553,30 +575,46 @@ class UserDatabase:
             conn.commit()
             return cursor.rowcount > 0
 
-    def delete_routing_rules_by_tag(self, tag: str) -> int:
+    def delete_routing_rules_by_tag(self, tag: str, owner_id: Optional[int] = None) -> int:
         """通过 tag 删除路由规则（删除所有匹配的规则）
-        
+
+        Args:
+            tag: 规则标签
+            owner_id: 如果指定，只删除该用户的规则；如果为 None，删除所有用户的规则
+
         Returns:
             删除的规则数量
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM routing_rules WHERE tag = ?", (tag,))
+            if owner_id is not None:
+                cursor.execute("DELETE FROM routing_rules WHERE tag = ? AND owner_id = ?", (tag, owner_id))
+            else:
+                cursor.execute("DELETE FROM routing_rules WHERE tag = ?", (tag,))
             conn.commit()
             return cursor.rowcount
 
-    def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
+    def delete_all_routing_rules(self, preserve_adblock: bool = False, owner_id: Optional[int] = None) -> int:
         """删除所有路由规则（用于备份恢复的替换模式）
 
         Args:
             preserve_adblock: 如果为 True，保留以 __adblock__ 开头的规则
+            owner_id: 如果指定，只删除该用户的规则；如果为 None，删除所有用户的规则
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if preserve_adblock:
-                cursor.execute("DELETE FROM routing_rules WHERE tag NOT LIKE '__adblock__%'")
-            else:
-                cursor.execute("DELETE FROM routing_rules")
+                conditions.append("tag NOT LIKE '__adblock__%'")
+
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            cursor.execute(f"DELETE FROM routing_rules {where_clause}", params)
             conn.commit()
             return cursor.rowcount
 
@@ -585,34 +623,37 @@ class UserDatabase:
     # 有效的规则集状态
     VALID_RULE_SET_STATUSES = frozenset({'pending', 'loading', 'loaded', 'error'})
 
-    def get_rule_sets(self, enabled_only: bool = True) -> List[Dict]:
+    def get_rule_sets(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
         """获取规则集列表
 
         Args:
             enabled_only: 是否只返回启用的规则集
+            owner_id: 如果指定，只返回该用户的规则集；如果为 None，返回所有
 
         Returns:
             规则集列表
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute("""
-                    SELECT id, name, rule_type, outbound, rule_count, file_path,
-                           checksum, status, error_message, enabled, priority,
-                           created_at, updated_at
-                    FROM rule_sets
-                    WHERE enabled = 1
-                    ORDER BY priority DESC, name ASC
-                """).fetchall()
-            else:
-                rows = cursor.execute("""
-                    SELECT id, name, rule_type, outbound, rule_count, file_path,
-                           checksum, status, error_message, enabled, priority,
-                           created_at, updated_at
-                    FROM rule_sets
-                    ORDER BY priority DESC, name ASC
-                """).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT id, name, rule_type, outbound, rule_count, file_path,
+                       checksum, status, error_message, enabled, priority, owner_id,
+                       created_at, updated_at
+                FROM rule_sets
+                {where_clause}
+                ORDER BY priority DESC, name ASC
+            """, params).fetchall()
             return [dict(row) for row in rows]
 
     def get_rule_set(self, set_id: str) -> Optional[Dict]:
@@ -644,7 +685,8 @@ class UserDatabase:
         rule_count: int,
         file_path: str,
         checksum: str,
-        priority: int = 0
+        priority: int = 0,
+        owner_id: Optional[int] = None
     ) -> bool:
         """添加规则集
 
@@ -657,6 +699,7 @@ class UserDatabase:
             file_path: 二进制文件的相对路径
             checksum: SHA256 校验和
             priority: 优先级（默认 0）
+            owner_id: 所有者 ID，如果为 None 则默认为 1
 
         Returns:
             是否成功添加
@@ -665,9 +708,9 @@ class UserDatabase:
             try:
                 cursor.execute("""
                     INSERT INTO rule_sets (id, name, rule_type, outbound, rule_count,
-                                          file_path, checksum, priority)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (set_id, name, rule_type, outbound, rule_count, file_path, checksum, priority))
+                                          file_path, checksum, priority, owner_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (set_id, name, rule_type, outbound, rule_count, file_path, checksum, priority, owner_id))
                 logger.info(f"添加规则集: {set_id} (类型={rule_type}, 规则数={rule_count})")
                 return True
             except sqlite3.IntegrityError:
@@ -916,23 +959,32 @@ class UserDatabase:
 
     # ============ WireGuard 对等点（客户端）管理 ============
 
-    def get_wireguard_peers(self, enabled_only: bool = True) -> List[Dict]:
-        """获取 WireGuard 对等点列表"""
+    def get_wireguard_peers(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取 WireGuard 对等点列表
+
+        Args:
+            enabled_only: 只返回启用的 peers
+            owner_id: 如果指定，只返回该用户的 peers；如果为 None，返回所有 peers
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
-                    FROM wireguard_peers
-                    WHERE enabled = 1
-                    ORDER BY name
-                """).fetchall()
-            else:
-                rows = cursor.execute("""
-                    SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
-                    FROM wireguard_peers
-                    ORDER BY name
-                """).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, owner_id, created_at, updated_at
+                FROM wireguard_peers
+                {where_clause}
+                ORDER BY name
+            """, params).fetchall()
             return [dict(row) for row in rows]
 
     def get_wireguard_peer(self, peer_id: int) -> Optional[Dict]:
@@ -940,7 +992,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, owner_id, created_at, updated_at
                 FROM wireguard_peers
                 WHERE id = ?
             """, (peer_id,)).fetchone()
@@ -951,7 +1003,7 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             row = cursor.execute("""
-                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, created_at, updated_at
+                SELECT id, name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, enabled, owner_id, created_at, updated_at
                 FROM wireguard_peers
                 WHERE name = ?
             """, (name,)).fetchone()
@@ -961,18 +1013,20 @@ class UserDatabase:
                           preshared_key: Optional[str] = None,
                           allow_lan: bool = False,
                           lan_subnet: Optional[str] = None,
-                          default_outbound: Optional[str] = None) -> int:
+                          default_outbound: Optional[str] = None,
+                          owner_id: Optional[int] = None) -> int:
         """添加 WireGuard 对等点
 
         Args:
             default_outbound: 此客户端的默认出口（None=使用入口默认或全局默认）
+            owner_id: 所有者 ID，如果为 None 则插入 NULL（系统级 peer 或旧数据兼容）
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet, default_outbound))
+                INSERT INTO wireguard_peers (name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (name, public_key, allowed_ips, preshared_key, 1 if allow_lan else 0, lan_subnet, default_outbound, owner_id))
             conn.commit()
             return cursor.lastrowid
 
@@ -1406,6 +1460,279 @@ class UserDatabase:
             self.set_setting("jwt_secret_key", secret)
         return secret
 
+    # ============ 用户管理 ============
+
+    def get_users(self) -> List[Dict]:
+        """获取所有用户（不包含密码哈希）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, username, email, role, enabled, token_version,
+                       failed_login_count, locked_until, created_at, updated_at,
+                       last_login_at, created_by
+                FROM users
+                ORDER BY id
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """根据 ID 获取用户（包含密码哈希）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, username, email, password_hash, role, enabled, token_version,
+                       failed_login_count, locked_until, created_at, updated_at, last_login_at
+                FROM users WHERE id = ?
+            """, (user_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """根据用户名获取用户（包含密码哈希）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT id, username, email, password_hash, role, enabled, token_version,
+                       failed_login_count, locked_until, created_at, updated_at, last_login_at
+                FROM users WHERE username = ?
+            """, (username,)).fetchone()
+            return dict(row) if row else None
+
+    def get_user_count(self) -> int:
+        """获取用户总数"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("SELECT COUNT(*) FROM users").fetchone()
+            return row[0] if row else 0
+
+    def count_users_by_role(self, role: str) -> int:
+        """统计指定角色的用户数量"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT COUNT(*) FROM users WHERE role = ? AND enabled = 1",
+                (role,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    def get_users_by_role(self, role: str) -> List[Dict]:
+        """获取指定角色的用户列表"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, username, email, role, enabled, created_at, last_login_at
+                FROM users WHERE role = ? ORDER BY created_at DESC
+            """, (role,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def add_user(self, username: str, password_hash: str, email: Optional[str] = None,
+                 role: str = "user", created_by: Optional[int] = None) -> int:
+        """添加新用户"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (username, email, password_hash, role, created_by)
+                VALUES (?, ?, ?, ?, ?)
+            """, (username, email, password_hash, role, created_by))
+            conn.commit()
+            return cursor.lastrowid
+
+    def update_user(self, user_id: int, **kwargs) -> bool:
+        """更新用户字段"""
+        allowed = {"password_hash", "email", "role", "enabled", "token_version",
+                   "failed_login_count", "locked_until", "last_login_at"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        values = list(updates.values()) + [user_id]
+
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE users SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def increment_token_version(self, user_id: int) -> bool:
+        """递增用户的 token_version（用于密码更改后使旧 token 失效）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (user_id,)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_user(self, user_id: int) -> bool:
+        """删除用户（级联删除其资源）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    # ============ Token 黑名单 ============
+
+    def add_revoked_token(self, jti: str, user_id: int, expires_at: str, reason: str = None) -> bool:
+        """添加已撤销的 token"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    INSERT INTO token_blacklist (jti, user_id, expires_at, reason)
+                    VALUES (?, ?, ?, ?)
+                """, (jti, user_id, expires_at, reason))
+                conn.commit()
+                return True
+            except Exception:
+                return False
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """检查 token 是否已被撤销"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT 1 FROM token_blacklist WHERE jti = ?",
+                (jti,)
+            ).fetchone()
+            return row is not None
+
+    def cleanup_expired_tokens(self) -> int:
+        """清理过期的 token 黑名单记录"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM token_blacklist WHERE expires_at < datetime('now')"
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    # ============ 审计日志 ============
+
+    def add_audit_log(self, action: str, user_id: Optional[int] = None,
+                      resource_type: Optional[str] = None, resource_id: Optional[str] = None,
+                      details: Optional[str] = None, ip_address: Optional[str] = None) -> int:
+        """添加审计日志"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit_log (user_id, action, resource_type, resource_id, details, ip_address)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (user_id, action, resource_type, resource_id, details, ip_address))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_audit_logs(self, user_id: Optional[int] = None, action: Optional[str] = None,
+                       limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取审计日志"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            conditions = []
+            params = []
+
+            if user_id is not None:
+                conditions.append("user_id = ?")
+                params.append(user_id)
+            if action:
+                conditions.append("action = ?")
+                params.append(action)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            params.extend([limit, offset])
+
+            rows = cursor.execute(f"""
+                SELECT * FROM audit_log
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+            """, params).fetchall()
+
+            return [dict(row) for row in rows]
+
+    # ============ 用户配额 ============
+
+    def get_user_quota(self, user_id: int) -> Optional[Dict]:
+        """获取用户配额"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT * FROM user_quotas WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_user_quota(self, user_id: int, max_peers: int = 10,
+                       max_rules: int = 100, max_rule_sets: int = 10) -> bool:
+        """设置用户配额"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO user_quotas (user_id, max_peers, max_rules, max_rule_sets)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, max_peers, max_rules, max_rule_sets))
+            conn.commit()
+            return True
+
+    # ============ 账户锁定 ============
+
+    def record_failed_login(self, user_id: int) -> int:
+        """记录登录失败并返回失败次数"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET failed_login_count = failed_login_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (user_id,))
+            conn.commit()
+
+            row = cursor.execute(
+                "SELECT failed_login_count FROM users WHERE id = ?",
+                (user_id,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    def lock_account(self, user_id: int, lock_minutes: int = 30) -> bool:
+        """锁定账户指定分钟数"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET locked_until = datetime('now', '+' || ? || ' minutes'),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (lock_minutes, user_id))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def reset_failed_login(self, user_id: int) -> bool:
+        """重置登录失败计数（登录成功后调用）"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users
+                SET failed_login_count = 0, locked_until = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def is_account_locked(self, user_id: int) -> bool:
+        """检查账户是否被锁定"""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("""
+                SELECT locked_until FROM users
+                WHERE id = ? AND locked_until > datetime('now')
+            """, (user_id,)).fetchone()
+            return row is not None
+
     # ============ Custom Egress 方法 ============
 
     def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
@@ -1509,8 +1836,15 @@ class UserDatabase:
 
     # ============ Remote Rule Sets 管理 ============
 
-    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None) -> List[Dict]:
-        """获取远程规则集列表"""
+    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None,
+                               owner_id: Optional[int] = None) -> List[Dict]:
+        """获取远程规则集列表
+
+        Args:
+            enabled_only: 仅返回启用的规则集
+            category: 按分类过滤
+            owner_id: 按所有者过滤（用于多用户资源隔离）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             query = "SELECT * FROM remote_rule_sets"
@@ -1522,6 +1856,9 @@ class UserDatabase:
             if category:
                 conditions.append("category = ?")
                 params.append(category)
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
 
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
@@ -1543,15 +1880,27 @@ class UserDatabase:
             columns = [desc[0] for desc in cursor.description]
             return dict(zip(columns, row))
 
-    def toggle_remote_rule_set(self, tag: str) -> bool:
-        """切换远程规则集启用状态"""
+    def toggle_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        """切换远程规则集启用状态
+
+        Args:
+            tag: 规则集标签
+            owner_id: 所有者ID（用于权限检查，None表示不检查）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE remote_rule_sets
-                SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
-                WHERE tag = ?
-            """, (tag,))
+            if owner_id is not None:
+                cursor.execute("""
+                    UPDATE remote_rule_sets
+                    SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
+                    WHERE tag = ? AND owner_id = ?
+                """, (tag, owner_id))
+            else:
+                cursor.execute("""
+                    UPDATE remote_rule_sets
+                    SET enabled = 1 - enabled, updated_at = CURRENT_TIMESTAMP
+                    WHERE tag = ?
+                """, (tag,))
             conn.commit()
             return cursor.rowcount > 0
 
@@ -1610,23 +1959,45 @@ class UserDatabase:
     def add_remote_rule_set(self, tag: str, name: str, url: str,
                             description: str = "", format: str = "adblock",
                             outbound: str = "block", category: str = "general",
-                            region: Optional[str] = None, priority: int = 0) -> int:
-        """添加远程规则集"""
+                            region: Optional[str] = None, priority: int = 0,
+                            owner_id: Optional[int] = None) -> int:
+        """添加远程规则集
+
+        Args:
+            tag: 规则集标签（唯一）
+            name: 规则集名称
+            url: 规则文件URL
+            description: 描述
+            format: 格式（adblock/hosts/domains）
+            outbound: 出口（默认block）
+            category: 分类
+            region: 地区代码
+            priority: 优先级
+            owner_id: 所有者用户ID（多用户模式）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO remote_rule_sets
-                (tag, name, description, url, format, outbound, category, region, priority)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (tag, name, description, url, format, outbound, category, region, priority))
+                (tag, name, description, url, format, outbound, category, region, priority, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (tag, name, description, url, format, outbound, category, region, priority, owner_id))
             conn.commit()
             return cursor.lastrowid
 
-    def delete_remote_rule_set(self, tag: str) -> bool:
-        """删除远程规则集"""
+    def delete_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        """删除远程规则集
+
+        Args:
+            tag: 规则集标签
+            owner_id: 所有者ID（用于权限检查，None表示不检查）
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ?", (tag,))
+            if owner_id is not None:
+                cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ? AND owner_id = ?", (tag, owner_id))
+            else:
+                cursor.execute("DELETE FROM remote_rule_sets WHERE tag = ?", (tag,))
             conn.commit()
             return cursor.rowcount > 0
 
@@ -2826,18 +3197,31 @@ class UserDatabase:
 
     # ============ V2Ray 用户管理 ============
 
-    def get_v2ray_users(self, enabled_only: bool = True) -> List[Dict]:
-        """获取所有 V2Ray 用户"""
+    def get_v2ray_users(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        """获取所有 V2Ray 用户
+
+        Args:
+            enabled_only: 只返回启用的用户
+            owner_id: 如果指定，只返回该用户的 V2Ray 用户；如果为 None，返回所有
+        """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            conditions = []
+            params = []
+
             if enabled_only:
-                rows = cursor.execute(
-                    "SELECT * FROM v2ray_users WHERE enabled = 1 ORDER BY name"
-                ).fetchall()
-            else:
-                rows = cursor.execute(
-                    "SELECT * FROM v2ray_users ORDER BY name"
-                ).fetchall()
+                conditions.append("enabled = 1")
+            if owner_id is not None:
+                conditions.append("owner_id = ?")
+                params.append(owner_id)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            rows = cursor.execute(f"""
+                SELECT * FROM v2ray_users
+                {where_clause}
+                ORDER BY name
+            """, params).fetchall()
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
 
@@ -2872,9 +3256,13 @@ class UserDatabase:
         password: Optional[str] = None,
         email: Optional[str] = None,
         alter_id: int = 0,
-        flow: Optional[str] = None
+        flow: Optional[str] = None,
+        owner_id: Optional[int] = None
     ) -> int:
         """添加 V2Ray 用户
+
+        Args:
+            owner_id: 所有者 ID，如果为 None 则插入 NULL（系统用户或旧数据兼容）
 
         Returns:
             新创建记录的 ID
@@ -2882,9 +3270,9 @@ class UserDatabase:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO v2ray_users (name, uuid, password, email, alter_id, flow)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (name, uuid, password, email, alter_id, flow))
+                INSERT INTO v2ray_users (name, uuid, password, email, alter_id, flow, owner_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, uuid, password, email, alter_id, flow, owner_id))
             conn.commit()
             return cursor.lastrowid
 
@@ -4234,6 +4622,8 @@ class UserDatabase:
         try:
             # 应用 SQLCipher 加密和性能 PRAGMA
             self._apply_encryption(conn)
+            # [MU-001] 启用外键约束
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -5089,14 +5479,16 @@ class DatabaseManager:
         return self.geodata.search_domain_lists(query, limit)
 
     # 用户数据（读写）
-    def get_routing_rules(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_routing_rules(enabled_only)
+    def get_routing_rules(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_routing_rules(enabled_only, owner_id)
 
-    def add_routing_rule(self, rule_type: str, target: str, outbound: str, priority: int = 0, tag: Optional[str] = None) -> int:
-        return self.user.add_routing_rule(rule_type, target, outbound, priority, tag)
+    def add_routing_rule(self, rule_type: str, target: str, outbound: str,
+                        priority: int = 0, tag: Optional[str] = None,
+                        owner_id: Optional[int] = None) -> int:
+        return self.user.add_routing_rule(rule_type, target, outbound, priority, tag, owner_id)
 
-    def add_routing_rules_batch(self, rules: List[tuple]) -> int:
-        return self.user.add_routing_rules_batch(rules)
+    def add_routing_rules_batch(self, rules: List[tuple], owner_id: Optional[int] = None) -> int:
+        return self.user.add_routing_rules_batch(rules, owner_id)
 
     def update_routing_rule(self, rule_id: int, outbound: Optional[str] = None,
                           priority: Optional[int] = None, enabled: Optional[bool] = None) -> bool:
@@ -5105,15 +5497,15 @@ class DatabaseManager:
     def delete_routing_rule(self, rule_id: int) -> bool:
         return self.user.delete_routing_rule(rule_id)
 
-    def delete_routing_rules_by_tag(self, tag: str) -> int:
-        return self.user.delete_routing_rules_by_tag(tag)
+    def delete_routing_rules_by_tag(self, tag: str, owner_id: Optional[int] = None) -> int:
+        return self.user.delete_routing_rules_by_tag(tag, owner_id)
 
-    def delete_all_routing_rules(self, preserve_adblock: bool = False) -> int:
-        return self.user.delete_all_routing_rules(preserve_adblock)
+    def delete_all_routing_rules(self, preserve_adblock: bool = False, owner_id: Optional[int] = None) -> int:
+        return self.user.delete_all_routing_rules(preserve_adblock, owner_id)
 
     # Rule Sets (规则集)
-    def get_rule_sets(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_rule_sets(enabled_only)
+    def get_rule_sets(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_rule_sets(enabled_only, owner_id)
 
     def get_rule_set(self, set_id: str) -> Optional[Dict]:
         return self.user.get_rule_set(set_id)
@@ -5127,10 +5519,11 @@ class DatabaseManager:
         rule_count: int,
         file_path: str,
         checksum: str,
-        priority: int = 0
+        priority: int = 0,
+        owner_id: Optional[int] = None
     ) -> bool:
         return self.user.add_rule_set(set_id, name, rule_type, outbound, rule_count,
-                                      file_path, checksum, priority)
+                                      file_path, checksum, priority, owner_id)
 
     def update_rule_set(
         self,
@@ -5182,8 +5575,8 @@ class DatabaseManager:
         return self.user.set_wireguard_server(interface_name, address, listen_port, mtu, private_key, default_outbound)
 
     # WireGuard 对等点
-    def get_wireguard_peers(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_wireguard_peers(enabled_only)
+    def get_wireguard_peers(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_wireguard_peers(enabled_only, owner_id)
 
     def get_wireguard_peer(self, peer_id: int) -> Optional[Dict]:
         return self.user.get_wireguard_peer(peer_id)
@@ -5195,8 +5588,9 @@ class DatabaseManager:
                           preshared_key: Optional[str] = None,
                           allow_lan: bool = False,
                           lan_subnet: Optional[str] = None,
-                          default_outbound: Optional[str] = None) -> int:
-        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound)
+                          default_outbound: Optional[str] = None,
+                          owner_id: Optional[int] = None) -> int:
+        return self.user.add_wireguard_peer(name, public_key, allowed_ips, preshared_key, allow_lan, lan_subnet, default_outbound, owner_id)
 
     def update_wireguard_peer(self, peer_id: int, name: Optional[str] = None,
                              allowed_ips: Optional[str] = None, enabled: Optional[bool] = None,
@@ -5287,6 +5681,100 @@ class DatabaseManager:
         """获取 JWT 密钥，不存在则创建"""
         return self.user.get_or_create_jwt_secret()
 
+    # User Management (用户管理)
+    def get_users(self) -> List[Dict]:
+        """获取所有用户（不包含密码哈希）"""
+        return self.user.get_users()
+
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """根据 ID 获取用户（包含密码哈希）"""
+        return self.user.get_user(user_id)
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """根据用户名获取用户（包含密码哈希）"""
+        return self.user.get_user_by_username(username)
+
+    def get_user_count(self) -> int:
+        """获取用户总数"""
+        return self.user.get_user_count()
+
+    def count_users_by_role(self, role: str) -> int:
+        """统计指定角色的用户数量"""
+        return self.user.count_users_by_role(role)
+
+    def get_users_by_role(self, role: str) -> List[Dict]:
+        """获取指定角色的用户列表"""
+        return self.user.get_users_by_role(role)
+
+    def add_user(self, username: str, password_hash: str, email: Optional[str] = None,
+                 role: str = "user", created_by: Optional[int] = None) -> int:
+        """添加新用户"""
+        return self.user.add_user(username, password_hash, email, role, created_by)
+
+    def update_user(self, user_id: int, **kwargs) -> bool:
+        """更新用户字段"""
+        return self.user.update_user(user_id, **kwargs)
+
+    def increment_token_version(self, user_id: int) -> bool:
+        """递增用户的 token_version（用于密码更改后使旧 token 失效）"""
+        return self.user.increment_token_version(user_id)
+
+    def delete_user(self, user_id: int) -> bool:
+        """删除用户（级联删除其资源）"""
+        return self.user.delete_user(user_id)
+
+    # Token Blacklist (Token 黑名单)
+    def add_revoked_token(self, jti: str, user_id: int, expires_at: str, reason: str = None) -> bool:
+        """添加已撤销的 token"""
+        return self.user.add_revoked_token(jti, user_id, expires_at, reason)
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """检查 token 是否已被撤销"""
+        return self.user.is_token_revoked(jti)
+
+    def cleanup_expired_tokens(self) -> int:
+        """清理过期的 token 黑名单记录"""
+        return self.user.cleanup_expired_tokens()
+
+    # Audit Log (审计日志)
+    def add_audit_log(self, action: str, user_id: Optional[int] = None,
+                      resource_type: Optional[str] = None, resource_id: Optional[str] = None,
+                      details: Optional[str] = None, ip_address: Optional[str] = None) -> int:
+        """添加审计日志"""
+        return self.user.add_audit_log(action, user_id, resource_type, resource_id, details, ip_address)
+
+    def get_audit_logs(self, user_id: Optional[int] = None, action: Optional[str] = None,
+                       limit: int = 100, offset: int = 0) -> List[Dict]:
+        """获取审计日志"""
+        return self.user.get_audit_logs(user_id, action, limit, offset)
+
+    # User Quotas (用户配额)
+    def get_user_quota(self, user_id: int) -> Optional[Dict]:
+        """获取用户配额"""
+        return self.user.get_user_quota(user_id)
+
+    def set_user_quota(self, user_id: int, max_peers: int = 10,
+                       max_rules: int = 100, max_rule_sets: int = 10) -> bool:
+        """设置用户配额"""
+        return self.user.set_user_quota(user_id, max_peers, max_rules, max_rule_sets)
+
+    # Account Lockout (账户锁定)
+    def record_failed_login(self, user_id: int) -> int:
+        """记录登录失败并返回失败次数"""
+        return self.user.record_failed_login(user_id)
+
+    def lock_account(self, user_id: int, lock_minutes: int = 30) -> bool:
+        """锁定账户指定分钟数"""
+        return self.user.lock_account(user_id, lock_minutes)
+
+    def reset_failed_login(self, user_id: int) -> bool:
+        """重置登录失败计数（登录成功后调用）"""
+        return self.user.reset_failed_login(user_id)
+
+    def is_account_locked(self, user_id: int) -> bool:
+        """检查账户是否被锁定"""
+        return self.user.is_account_locked(user_id)
+
     # Custom Egress
     def get_custom_egress_list(self, enabled_only: bool = False) -> List[Dict]:
         return self.user.get_custom_egress_list(enabled_only)
@@ -5310,14 +5798,15 @@ class DatabaseManager:
         return self.user.delete_custom_egress(tag)
 
     # Remote Rule Sets
-    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None) -> List[Dict]:
-        return self.user.get_remote_rule_sets(enabled_only, category)
+    def get_remote_rule_sets(self, enabled_only: bool = False, category: Optional[str] = None,
+                               owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_remote_rule_sets(enabled_only, category, owner_id)
 
     def get_remote_rule_set(self, tag: str) -> Optional[Dict]:
         return self.user.get_remote_rule_set(tag)
 
-    def toggle_remote_rule_set(self, tag: str) -> bool:
-        return self.user.toggle_remote_rule_set(tag)
+    def toggle_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        return self.user.toggle_remote_rule_set(tag, owner_id)
 
     def update_remote_rule_set(self, tag: str, **kwargs) -> bool:
         return self.user.update_remote_rule_set(tag, **kwargs)
@@ -5325,12 +5814,13 @@ class DatabaseManager:
     def add_remote_rule_set(self, tag: str, name: str, url: str,
                             description: str = "", format: str = "adblock",
                             outbound: str = "block", category: str = "general",
-                            region: Optional[str] = None, priority: int = 0) -> int:
+                            region: Optional[str] = None, priority: int = 0,
+                            owner_id: Optional[int] = None) -> int:
         return self.user.add_remote_rule_set(tag, name, url, description, format,
-                                             outbound, category, region, priority)
+                                             outbound, category, region, priority, owner_id)
 
-    def delete_remote_rule_set(self, tag: str) -> bool:
-        return self.user.delete_remote_rule_set(tag)
+    def delete_remote_rule_set(self, tag: str, owner_id: Optional[int] = None) -> bool:
+        return self.user.delete_remote_rule_set(tag, owner_id)
 
     def update_remote_rule_set_status(self, tag: str, status: str, error_message: Optional[str] = None) -> bool:
         return self.user.update_remote_rule_set_status(tag, status, error_message)
@@ -5665,8 +6155,8 @@ class DatabaseManager:
         return self.user.update_v2ray_inbound_config(**kwargs)
 
     # V2Ray Users
-    def get_v2ray_users(self, enabled_only: bool = True) -> List[Dict]:
-        return self.user.get_v2ray_users(enabled_only)
+    def get_v2ray_users(self, enabled_only: bool = True, owner_id: Optional[int] = None) -> List[Dict]:
+        return self.user.get_v2ray_users(enabled_only, owner_id)
 
     def get_v2ray_user(self, user_id: int) -> Optional[Dict]:
         return self.user.get_v2ray_user(user_id)
@@ -5681,9 +6171,10 @@ class DatabaseManager:
         password: Optional[str] = None,
         email: Optional[str] = None,
         alter_id: int = 0,
-        flow: Optional[str] = None
+        flow: Optional[str] = None,
+        owner_id: Optional[int] = None
     ) -> int:
-        return self.user.add_v2ray_user(name, uuid, password, email, alter_id, flow)
+        return self.user.add_v2ray_user(name, uuid, password, email, alter_id, flow, owner_id)
 
     def update_v2ray_user(self, user_id: int, **kwargs) -> bool:
         return self.user.update_v2ray_user(user_id, **kwargs)
